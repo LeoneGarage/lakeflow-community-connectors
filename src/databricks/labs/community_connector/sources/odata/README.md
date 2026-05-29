@@ -18,7 +18,7 @@ automatically from the service's `$metadata` endpoint.
 
 ```python
 from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.catalog import ConnectionType, CreateConnection
+from databricks.sdk.service.catalog import ConnectionType
 from enum import Enum
 
 class ConnectionTypeEx(Enum):
@@ -26,17 +26,15 @@ class ConnectionTypeEx(Enum):
 
 w = WorkspaceClient()
 w.connections.create(
-    CreateConnection(
-        name="odata_connection",
-        connection_type=ConnectionTypeEx.GENERIC_LAKEFLOW_CONNECT,
-        options={
-            "sourceName": "odata",
-            "service_url": "https://services.odata.org/V4/TripPinServiceRW/",
-            "auth_method": "bearer",
-            "token": "<token>",
-            "externalOptionsAllowList": "cursor_field,select,filter,page_size,max_records_per_batch",
-        },
-    )
+    name="odata_connection",
+    connection_type=ConnectionTypeEx.GENERIC_LAKEFLOW_CONNECT,
+    options={
+        "sourceName": "odata",
+        "service_url": "https://services.odata.org/V4/TripPinServiceRW/",
+        "auth_method": "bearer",
+        "token": "<token>",
+        "externalOptionsAllowList": "cursor_field,select,filter,page_size,max_records_per_batch",
+    },
 )
 ```
 
