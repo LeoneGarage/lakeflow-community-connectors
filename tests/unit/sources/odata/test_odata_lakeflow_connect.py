@@ -138,8 +138,7 @@ def test_snapshot_walks_nextlink_and_strips_control_props():
     page1 = {
         "@odata.context": "ignored",
         "value": [
-            {"Id": 1, "Name": "A", "ModifiedAt": "2024-01-01T00:00:00Z",
-             "@odata.etag": "drop-me"},
+            {"Id": 1, "Name": "A", "ModifiedAt": "2024-01-01T00:00:00Z", "@odata.etag": "drop-me"},
         ],
         "@odata.nextLink": f"{SERVICE_URL}Customers?$skiptoken=p2",
     }
@@ -148,8 +147,7 @@ def test_snapshot_walks_nextlink_and_strips_control_props():
             {"Id": 2, "Name": "B", "ModifiedAt": "2024-02-01T00:00:00Z"},
         ],
     }
-    responses.add(responses.GET, f"{SERVICE_URL}Customers", json=page1,
-                  match_querystring=False)
+    responses.add(responses.GET, f"{SERVICE_URL}Customers", json=page1, match_querystring=False)
     responses.get(f"{SERVICE_URL}Customers?$skiptoken=p2", json=page2)
 
     c = _make()
@@ -160,6 +158,71 @@ def test_snapshot_walks_nextlink_and_strips_control_props():
         {"Id": 1, "Name": "A", "ModifiedAt": "2024-01-01T00:00:00Z"},
         {"Id": 2, "Name": "B", "ModifiedAt": "2024-02-01T00:00:00Z"},
     ]
+
+
+@responses.activate
+def test_snapshot_resolves_relative_nextlink_against_request_url():
+    """Some OData servers return @odata.nextLink as a relative URL
+    (e.g. just 'Customers?$skiptoken=...'). The connector must resolve
+    it against the request URL rather than issuing a request with no
+    scheme/host."""
+    _mock_metadata()
+    page1 = {
+        "value": [
+            {"Id": 1, "Name": "A", "ModifiedAt": "2024-01-01T00:00:00Z"},
+        ],
+        # Relative URL — only path + query, no scheme/host.
+        "@odata.nextLink": "Customers?$skiptoken=p2",
+    }
+    page2 = {
+        "value": [
+            {"Id": 2, "Name": "B", "ModifiedAt": "2024-02-01T00:00:00Z"},
+        ],
+    }
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        json=page1,
+        match_querystring=False,
+    )
+    # The resolved next URL must include the service root.
+    responses.get(f"{SERVICE_URL}Customers?$skiptoken=p2", json=page2)
+
+    c = _make()
+    records, _ = c.read_table("Customers", None, {})
+    rows = list(records)
+    assert [r["Id"] for r in rows] == [1, 2]
+
+
+@responses.activate
+def test_snapshot_path_absolute_nextlink_resolves_against_host():
+    """A nextLink starting with '/' is resolved against the request's
+    scheme+host, replacing the service-root path."""
+    _mock_metadata()
+    page1 = {
+        "value": [{"Id": 1, "Name": "A", "ModifiedAt": "2024-01-01T00:00:00Z"}],
+        "@odata.nextLink": "/V4/Northwind/Northwind.svc/Customers?$skiptoken=p2",
+    }
+    page2 = {
+        "value": [{"Id": 2, "Name": "B", "ModifiedAt": "2024-02-01T00:00:00Z"}],
+    }
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        json=page1,
+        match_querystring=False,
+    )
+    # SERVICE_URL is https://example.com/odata/ ; the path-absolute next
+    # link replaces /odata/ with /V4/Northwind/Northwind.svc/Customers...
+    responses.get(
+        "https://example.com/V4/Northwind/Northwind.svc/Customers?$skiptoken=p2",
+        json=page2,
+    )
+
+    c = _make()
+    records, _ = c.read_table("Customers", None, {})
+    rows = list(records)
+    assert [r["Id"] for r in rows] == [1, 2]
 
 
 # ---------------------------------------------------------------------------
@@ -176,8 +239,7 @@ def test_incremental_first_call_uses_le_init_filter():
         captured["url"] = request.url
         return (200, {}, '{"value": [{"Id": 1, "ModifiedAt": "2024-03-01T00:00:00Z"}]}')
 
-    responses.add_callback(responses.GET, f"{SERVICE_URL}Customers",
-                           callback=_callback)
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Customers", callback=_callback)
 
     c = _make()
     records, offset = c.read_table(
@@ -203,8 +265,7 @@ def test_incremental_resume_uses_gt_filter_and_terminates():
         # Return no new rows so termination kicks in.
         return (200, {}, '{"value": []}')
 
-    responses.add_callback(responses.GET, f"{SERVICE_URL}Customers",
-                           callback=_callback)
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Customers", callback=_callback)
 
     c = _make()
     start = {"cursor": "2024-03-01T00:00:00Z"}
@@ -227,9 +288,7 @@ def test_incremental_skips_call_when_caught_up_to_init_ts():
     c = _make()
     # Far-future cursor > init_ts → short-circuit.
     start = {"cursor": "9999-01-01T00:00:00Z"}
-    records, offset = c.read_table(
-        "Customers", start, {"cursor_field": "ModifiedAt"}
-    )
+    records, offset = c.read_table("Customers", start, {"cursor_field": "ModifiedAt"})
     assert list(records) == []
     assert offset == start
 
@@ -240,19 +299,25 @@ def test_incremental_trims_cursor_collision_at_batch_boundary():
     value, the trailing same-cursor records must be dropped so the next
     call's `cursor gt <last>` filter doesn't skip their siblings."""
     _mock_metadata()
-    responses.add(responses.GET, f"{SERVICE_URL}Customers", json={
-        "value": [
-            {"Id": 1, "ModifiedAt": "2024-05-01T00:00:00Z"},
-            {"Id": 2, "ModifiedAt": "2024-05-02T00:00:00Z"},
-            {"Id": 3, "ModifiedAt": "2024-05-03T00:00:00Z"},
-            {"Id": 4, "ModifiedAt": "2024-05-03T00:00:00Z"},  # collision
-            {"Id": 5, "ModifiedAt": "2024-05-03T00:00:00Z"},  # collision (cap)
-        ]
-    }, match_querystring=False)
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        json={
+            "value": [
+                {"Id": 1, "ModifiedAt": "2024-05-01T00:00:00Z"},
+                {"Id": 2, "ModifiedAt": "2024-05-02T00:00:00Z"},
+                {"Id": 3, "ModifiedAt": "2024-05-03T00:00:00Z"},
+                {"Id": 4, "ModifiedAt": "2024-05-03T00:00:00Z"},  # collision
+                {"Id": 5, "ModifiedAt": "2024-05-03T00:00:00Z"},  # collision (cap)
+            ]
+        },
+        match_querystring=False,
+    )
 
     c = _make()
     records, offset = c.read_table(
-        "Customers", None,
+        "Customers",
+        None,
         {"cursor_field": "ModifiedAt", "max_records_per_batch": "5"},
     )
     rows = list(records)
@@ -267,18 +332,24 @@ def test_incremental_all_same_cursor_raises():
     """If max_records_per_batch is smaller than the largest same-cursor cohort,
     we cannot make progress without skipping data — surface that loudly."""
     _mock_metadata()
-    responses.add(responses.GET, f"{SERVICE_URL}Customers", json={
-        "value": [
-            {"Id": 1, "ModifiedAt": "2024-05-01T00:00:00Z"},
-            {"Id": 2, "ModifiedAt": "2024-05-01T00:00:00Z"},
-            {"Id": 3, "ModifiedAt": "2024-05-01T00:00:00Z"},
-        ]
-    }, match_querystring=False)
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        json={
+            "value": [
+                {"Id": 1, "ModifiedAt": "2024-05-01T00:00:00Z"},
+                {"Id": 2, "ModifiedAt": "2024-05-01T00:00:00Z"},
+                {"Id": 3, "ModifiedAt": "2024-05-01T00:00:00Z"},
+            ]
+        },
+        match_querystring=False,
+    )
 
     c = _make()
     with pytest.raises(RuntimeError, match="max_records_per_batch"):
         records, _ = c.read_table(
-            "Customers", None,
+            "Customers",
+            None,
             {"cursor_field": "ModifiedAt", "max_records_per_batch": "3"},
         )
         list(records)  # force iteration
@@ -289,17 +360,23 @@ def test_incremental_no_trim_when_below_cap():
     """Natural exhaustion (len(records) < max) shouldn't trigger boundary
     trimming — even if the tail records share a cursor."""
     _mock_metadata()
-    responses.add(responses.GET, f"{SERVICE_URL}Customers", json={
-        "value": [
-            {"Id": 1, "ModifiedAt": "2024-05-01T00:00:00Z"},
-            {"Id": 2, "ModifiedAt": "2024-05-02T00:00:00Z"},
-            {"Id": 3, "ModifiedAt": "2024-05-02T00:00:00Z"},  # ok, not trimmed
-        ]
-    }, match_querystring=False)
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        json={
+            "value": [
+                {"Id": 1, "ModifiedAt": "2024-05-01T00:00:00Z"},
+                {"Id": 2, "ModifiedAt": "2024-05-02T00:00:00Z"},
+                {"Id": 3, "ModifiedAt": "2024-05-02T00:00:00Z"},  # ok, not trimmed
+            ]
+        },
+        match_querystring=False,
+    )
 
     c = _make()
     records, offset = c.read_table(
-        "Customers", None,
+        "Customers",
+        None,
         {"cursor_field": "ModifiedAt", "max_records_per_batch": "100"},
     )
     rows = list(records)
@@ -313,17 +390,23 @@ def test_incremental_max_records_caps_batch_with_boundary_drop():
     record at the boundary value) is always dropped. The next call will
     re-fetch it via `cursor gt <prev_distinct>`."""
     _mock_metadata()
-    responses.add(responses.GET, f"{SERVICE_URL}Customers", json={
-        "value": [
-            {"Id": 1, "ModifiedAt": "2024-04-01T00:00:00Z"},
-            {"Id": 2, "ModifiedAt": "2024-04-02T00:00:00Z"},
-            {"Id": 3, "ModifiedAt": "2024-04-03T00:00:00Z"},
-        ]
-    }, match_querystring=False)
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        json={
+            "value": [
+                {"Id": 1, "ModifiedAt": "2024-04-01T00:00:00Z"},
+                {"Id": 2, "ModifiedAt": "2024-04-02T00:00:00Z"},
+                {"Id": 3, "ModifiedAt": "2024-04-03T00:00:00Z"},
+            ]
+        },
+        match_querystring=False,
+    )
 
     c = _make()
     records, offset = c.read_table(
-        "Customers", None,
+        "Customers",
+        None,
         {"cursor_field": "ModifiedAt", "max_records_per_batch": "2"},
     )
     rows = list(records)
@@ -350,11 +433,13 @@ def test_bearer_auth_attaches_header():
 @responses.activate
 def test_api_key_custom_header():
     _mock_metadata()
-    c = _make({
-        "auth_type": "api_key",
-        "api_key": "k",
-        "api_key_header": "X-My-Key",
-    })
+    c = _make(
+        {
+            "auth_type": "api_key",
+            "api_key": "k",
+            "api_key_header": "X-My-Key",
+        }
+    )
     c.list_tables()
     assert c._get_session().headers["X-My-Key"] == "k"
 
@@ -366,12 +451,14 @@ def test_oauth2_fetches_token():
         json={"access_token": "minted", "token_type": "Bearer"},
     )
     _mock_metadata()
-    c = _make({
-        "auth_type": "oauth2",
-        "oauth2_token_url": "https://idp.example.com/token",
-        "oauth2_client_id": "id",
-        "oauth2_client_secret": "secret",
-    })
+    c = _make(
+        {
+            "auth_type": "oauth2",
+            "oauth2_token_url": "https://idp.example.com/token",
+            "oauth2_client_id": "id",
+            "oauth2_client_secret": "secret",
+        }
+    )
     c.list_tables()
     assert c._get_session().headers["Authorization"] == "Bearer minted"
 

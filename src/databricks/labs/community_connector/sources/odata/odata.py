@@ -25,6 +25,7 @@ import base64
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Iterator
+from urllib.parse import urljoin
 from xml.etree import ElementTree as ET
 
 import requests
@@ -266,7 +267,15 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces):
         return f"{base}?{'&'.join(params)}"
 
     def _fetch_pages(self, url: str) -> Iterator[dict]:
-        """Walk @odata.nextLink, yielding raw JSON dicts (no coercion)."""
+        """Walk @odata.nextLink, yielding raw JSON dicts (no coercion).
+
+        The OData v4 spec allows @odata.nextLink to be either an absolute
+        URL or a relative one (resolved against the request URL). Some
+        services (e.g. SAP NetWeaver Gateway, certain self-hosted Olingo
+        deployments) return just ``Customers?$skiptoken=...`` and rely on
+        the client to prepend the service root. urljoin handles both
+        cases — absolutes pass through unchanged.
+        """
         session = self._get_session()
         next_url: str | None = url
         while next_url:
@@ -276,7 +285,8 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces):
             for item in payload.get("value", []):
                 # Strip OData control properties that aren't real fields.
                 yield {k: v for k, v in item.items() if not k.startswith("@odata.")}
-            next_url = payload.get("@odata.nextLink")
+            raw_next = payload.get("@odata.nextLink")
+            next_url = urljoin(resp.url, raw_next) if raw_next else None
 
     # ------------------------------------------------------------------
     # Auth session
@@ -376,9 +386,7 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces):
                     out.append((ns, es.get("Name")))
         return out
 
-    def _entity_type_for(
-        self, table_name: str, namespace: str | None = None
-    ) -> ET.Element:
+    def _entity_type_for(self, table_name: str, namespace: str | None = None) -> ET.Element:
         """Find the EntityType element backing ``table_name``.
 
         When ``namespace`` is None and the same name is declared in more
@@ -433,9 +441,7 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces):
             f"{table_name!r} in schema {schema_ns!r}) not found in $metadata."
         )
 
-    def _fields_for(
-        self, table_name: str, namespace: str | None = None
-    ) -> list[StructField]:
+    def _fields_for(self, table_name: str, namespace: str | None = None) -> list[StructField]:
         et = self._entity_type_for(table_name, namespace)
         fields: list[StructField] = []
         for prop in et.findall(f"{_NS_EDM}Property"):
@@ -446,9 +452,7 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces):
             fields.append(StructField(name, spark_type, nullable))
         return fields
 
-    def _primary_keys_for(
-        self, table_name: str, namespace: str | None = None
-    ) -> list[str]:
+    def _primary_keys_for(self, table_name: str, namespace: str | None = None) -> list[str]:
         et = self._entity_type_for(table_name, namespace)
         key = et.find(f"{_NS_EDM}Key")
         if key is None:
