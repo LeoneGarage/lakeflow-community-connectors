@@ -101,15 +101,18 @@ build_pipeline(
     connector_cls=ODataLakeflowConnect,
     tables=[
         {
-            "name": "Customers",
-            "options": {},  # snapshot
+            "table": {
+                "source_table": "Customers",
+            }
         },
         {
-            "name": "Orders",
-            "options": {
-                "cursor_field": "OrderDate",
-                "max_records_per_batch": "5000",
-            },
+            "table": {
+                "source_table": "Orders",
+                "table_configuration": {
+                    "cursor_field": "OrderDate",
+                    "max_records_per_batch": "5000",
+                },
+            }
         },
     ],
 )
