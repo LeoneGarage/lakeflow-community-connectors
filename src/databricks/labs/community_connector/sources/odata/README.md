@@ -32,7 +32,7 @@ export DATABRICKS_CONFIG_PROFILE=<your-profile>
 
 community-connector create_connection odata odata_connection \
   -o '{
-        "service_url": "https://services.odata.org/V4/TripPinServiceRW/",
+        "service_url": "https://services.odata.org/V4/Northwind/Northwind.svc/",
         "token": "<bearer-token>"
       }' \
   --spec ./src/databricks/labs/community_connector/sources/odata/connector_spec.yaml
@@ -65,7 +65,7 @@ w.api_client.do(
         "comment": "OData v4 community connector",
         "options": {
             "sourceName": "odata",
-            "service_url": "https://services.odata.org/V4/TripPinServiceRW/",
+            "service_url": "https://services.odata.org/V4/Northwind/Northwind.svc/",
             "token": "<bearer-token>",
             "externalOptionsAllowList": (
                 "namespace,cursor_field,select,filter,page_size,max_records_per_batch"
