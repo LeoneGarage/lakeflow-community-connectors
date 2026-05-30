@@ -218,25 +218,46 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces):
         )
         max_records = int(table_options.get("max_records_per_batch", "5000"))
 
-        # Strict-`>` semantics: server already filters `cursor gt since`,
-        # but a defensive client-side check guards against precision drift,
-        # cached replicas, or any OData server that interprets `gt` loosely.
-        # Each record is emitted at most once across batches — important
-        # when the destination doesn't dedupe (e.g. empty primary_keys).
-        # Trade-off: rows added at the boundary cursor value between
-        # batches won't be picked up, so the cursor field needs enough
-        # cardinality to make that race acceptable.
         records: list[dict] = []
+        truncated = False
         for row in self._fetch_pages(url):
             rec_cursor = row.get(cursor_field)
             if since is not None and rec_cursor is not None and rec_cursor <= since:
                 continue
             records.append(row)
             if len(records) >= max_records:
+                truncated = True
                 break
 
         if not records:
             return iter([]), start_offset or {}
+
+        # Cursor boundary safety: the next call resumes with
+        # `cursor gt <last_cursor>`, so if the trailing records share that
+        # cursor with unseen records on the next page — OR with concurrently
+        # inserted siblings that arrive before the next call — the `gt`
+        # filter would silently drop them. Trim back to the last distinct
+        # cursor on every batch (not just truncated ones), so a stop/restart
+        # or natural completion can't lose same-cursor inserts at the boundary.
+        # Re-fetched rows on the next call are deduped at the destination
+        # via apply_changes' MERGE on the primary key.
+        trimmed = _trim_to_distinct_cursor_boundary(records, cursor_field)
+        if not trimmed:
+            # Every record in this batch shares one cursor value.
+            if truncated:
+                raise RuntimeError(
+                    f"max_records_per_batch ({max_records}) is too small for "
+                    f"{table_name!r}: every record in the batch shares cursor "
+                    f"value {records[-1].get(cursor_field)!r}. Increase "
+                    f"max_records_per_batch above the largest same-cursor "
+                    f"cohort, or choose a higher-cardinality cursor field."
+                )
+            # Natural exhaustion of a single-cursor cohort. Emit as-is —
+            # trimming would lose data with no way to re-fetch. There's a
+            # residual race for same-cursor rows added between now and any
+            # future call, which is unavoidable without finer cursor resolution.
+        else:
+            records = trimmed
 
         # OData responses ordered by the cursor — last record carries the max.
         last_cursor = records[-1].get(cursor_field)
@@ -483,6 +504,30 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces):
 # ---------------------------------------------------------------------------
 # Helpers (module-level, no class state — easier to unit-test)
 # ---------------------------------------------------------------------------
+
+
+def _trim_to_distinct_cursor_boundary(
+    records: list[dict],
+    cursor_field: str,
+) -> list[dict]:
+    """Drop trailing records that share the boundary cursor value.
+
+    Walks back from the tail until the cursor value changes, leaving a clean
+    boundary that the next call's ``cursor gt <last>`` filter will pick up
+    cleanly. Drops the boundary record itself — we can't tell whether the
+    next page (or a concurrent insert before the next call) holds more
+    records sharing that cursor value, so we surrender the whole group and
+    let `cursor gt <prev_distinct>` re-fetch them.
+
+    Returns an empty list when every record shares one cursor value; the
+    caller decides whether that's recoverable (natural exhaustion) or a hard
+    failure (truncated batch with too-small cap).
+    """
+    boundary = records[-1].get(cursor_field)
+    trim_idx = len(records)
+    while trim_idx > 0 and records[trim_idx - 1].get(cursor_field) == boundary:
+        trim_idx -= 1
+    return records[:trim_idx]
 
 
 def _require(options: dict[str, str], key: str) -> str:

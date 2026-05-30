@@ -294,15 +294,11 @@ def test_incremental_skips_call_when_caught_up_to_init_ts():
 
 
 @responses.activate
-def test_incremental_emits_full_batch_advances_to_last_cursor():
-    """Pattern 2: no boundary trim. Every record returned by the server
-    flows through, and the offset advances to the last record's cursor.
-
-    Trade-off: a same-cursor row added between this batch and the next
-    won't be picked up (the next call uses strict `>`). The cursor field
-    is expected to be high-cardinality enough to make that race
-    negligible. In return, no row is ever emitted twice — important when
-    the destination doesn't dedupe (empty primary_keys)."""
+def test_incremental_trims_trailing_same_cursor_cohort_when_truncated():
+    """Cap-hit boundary: trim the trailing same-cursor cohort so the next
+    call's `cursor gt <last>` doesn't drop the cohort's unread siblings.
+    Re-fetched cohort members are deduped at the destination by MERGE on
+    the primary key."""
     _mock_metadata()
     responses.add(
         responses.GET,
@@ -312,8 +308,8 @@ def test_incremental_emits_full_batch_advances_to_last_cursor():
                 {"Id": 1, "ModifiedAt": "2024-05-01T00:00:00Z"},
                 {"Id": 2, "ModifiedAt": "2024-05-02T00:00:00Z"},
                 {"Id": 3, "ModifiedAt": "2024-05-03T00:00:00Z"},
-                {"Id": 4, "ModifiedAt": "2024-05-03T00:00:00Z"},
-                {"Id": 5, "ModifiedAt": "2024-05-03T00:00:00Z"},
+                {"Id": 4, "ModifiedAt": "2024-05-03T00:00:00Z"},  # trimmed
+                {"Id": 5, "ModifiedAt": "2024-05-03T00:00:00Z"},  # trimmed (cap)
             ]
         },
         match_querystring=False,
@@ -326,8 +322,101 @@ def test_incremental_emits_full_batch_advances_to_last_cursor():
         {"cursor_field": "ModifiedAt", "max_records_per_batch": "5"},
     )
     rows = list(records)
-    assert [r["Id"] for r in rows] == [1, 2, 3, 4, 5]
-    assert offset == {"cursor": "2024-05-03T00:00:00Z"}
+    assert [r["Id"] for r in rows] == [1, 2]
+    assert offset == {"cursor": "2024-05-02T00:00:00Z"}
+
+
+@responses.activate
+def test_incremental_trims_boundary_cohort_on_natural_exhaustion_too():
+    """Trim also runs on naturally-exhausted batches. With a
+    low-cardinality cursor, same-cursor siblings could arrive between
+    this batch and a future call (stop/restart, concurrent insert) —
+    trimming forces the next call's `cursor gt <previous_distinct>` to
+    re-fetch the whole cohort plus any new arrivals."""
+    _mock_metadata()
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        json={
+            "value": [
+                {"Id": 1, "ModifiedAt": "2024-05-01T00:00:00Z"},
+                {"Id": 2, "ModifiedAt": "2024-05-02T00:00:00Z"},  # trimmed
+                {"Id": 3, "ModifiedAt": "2024-05-02T00:00:00Z"},  # trimmed
+            ]
+        },
+        match_querystring=False,
+    )
+
+    c = _make()
+    records, offset = c.read_table(
+        "Customers",
+        None,
+        {"cursor_field": "ModifiedAt", "max_records_per_batch": "100"},
+    )
+    rows = list(records)
+    assert [r["Id"] for r in rows] == [1]
+    assert offset == {"cursor": "2024-05-01T00:00:00Z"}
+
+
+@responses.activate
+def test_incremental_all_same_cursor_truncated_raises():
+    """If the whole truncated batch shares one cursor, the cap is smaller
+    than the same-cursor cohort and we can't trim without losing data —
+    surface that loudly."""
+    _mock_metadata()
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        json={
+            "value": [
+                {"Id": 1, "ModifiedAt": "2024-05-01T00:00:00Z"},
+                {"Id": 2, "ModifiedAt": "2024-05-01T00:00:00Z"},
+                {"Id": 3, "ModifiedAt": "2024-05-01T00:00:00Z"},
+            ]
+        },
+        match_querystring=False,
+    )
+
+    c = _make()
+    with pytest.raises(RuntimeError, match="max_records_per_batch"):
+        records, _ = c.read_table(
+            "Customers",
+            None,
+            {"cursor_field": "ModifiedAt", "max_records_per_batch": "3"},
+        )
+        list(records)
+
+
+@responses.activate
+def test_incremental_all_same_cursor_natural_exhaustion_emits_as_is():
+    """When the whole batch shares one cursor AND it's the natural end
+    of the result set, there's nowhere to retreat to — emit the cohort
+    rather than losing it. Accept the residual race that same-cursor
+    rows arriving later won't be picked up; resolved by giving the
+    cursor field higher cardinality."""
+    _mock_metadata()
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        json={
+            "value": [
+                {"Id": 1, "ModifiedAt": "2024-05-01T00:00:00Z"},
+                {"Id": 2, "ModifiedAt": "2024-05-01T00:00:00Z"},
+                {"Id": 3, "ModifiedAt": "2024-05-01T00:00:00Z"},
+            ]
+        },
+        match_querystring=False,
+    )
+
+    c = _make()
+    records, offset = c.read_table(
+        "Customers",
+        None,
+        {"cursor_field": "ModifiedAt", "max_records_per_batch": "100"},
+    )
+    rows = list(records)
+    assert [r["Id"] for r in rows] == [1, 2, 3]
+    assert offset == {"cursor": "2024-05-01T00:00:00Z"}
 
 
 @responses.activate
@@ -367,7 +456,8 @@ def test_incremental_orderby_appends_primary_key_tiebreaker():
 def test_incremental_client_strict_gt_drops_boundary_row():
     """A defensive client-side strict-`>` filter guards against any
     server returning a record equal to `since`. The previous batch's
-    boundary record never appears twice in the destination."""
+    boundary record never appears twice — the client filter drops it
+    before the trim runs."""
     _mock_metadata()
     responses.add(
         responses.GET,
@@ -391,15 +481,18 @@ def test_incremental_client_strict_gt_drops_boundary_row():
         {"cursor_field": "ModifiedAt"},
     )
     rows = list(records)
-    assert [r["Id"] for r in rows] == [2, 3]
-    assert offset == {"cursor": "2024-05-03T00:00:00Z"}
+    # Id 1 dropped by the strict-`>` client filter. Id 3 (the trailing
+    # cohort at 2024-05-03) is then trimmed so the next call's
+    # `cursor gt 2024-05-02` re-fetches it.
+    assert [r["Id"] for r in rows] == [2]
+    assert offset == {"cursor": "2024-05-02T00:00:00Z"}
 
 
 @responses.activate
-def test_incremental_max_records_caps_batch_and_advances_offset():
-    """Pattern 2: when the cap is hit, emit exactly `max_records` records
-    and advance the offset to the last emitted record's cursor. The
-    next call resumes from there with a strict `>` filter."""
+def test_incremental_max_records_caps_batch_with_boundary_trim():
+    """When the cap is hit, the trailing same-cursor cohort (here just one
+    distinct row at the boundary) is trimmed. The next call re-fetches it
+    via `cursor gt <prev_distinct>` and the destination MERGEs on PK."""
     _mock_metadata()
     responses.add(
         responses.GET,
@@ -421,8 +514,8 @@ def test_incremental_max_records_caps_batch_and_advances_offset():
         {"cursor_field": "ModifiedAt", "max_records_per_batch": "2"},
     )
     rows = list(records)
-    assert [r["Id"] for r in rows] == [1, 2]
-    assert offset == {"cursor": "2024-04-02T00:00:00Z"}
+    assert [r["Id"] for r in rows] == [1]
+    assert offset == {"cursor": "2024-04-01T00:00:00Z"}
 
 
 # ---------------------------------------------------------------------------
