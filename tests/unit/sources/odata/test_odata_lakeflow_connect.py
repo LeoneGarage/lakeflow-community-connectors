@@ -269,6 +269,167 @@ def test_snapshot_path_absolute_nextlink_resolves_against_host():
 
 
 # ---------------------------------------------------------------------------
+# Snapshot batch-hash dedup
+# ---------------------------------------------------------------------------
+
+# Snapshot tables re-fetch the entire table every trigger. When the
+# fetched content is byte-identical to the previous trigger's, the
+# connector caches a SHA-256 over the batch and returns an empty
+# iterator on subsequent triggers — the destination already has this
+# data, no point handing it back for another full-refresh write. The
+# cache lives on the connector instance, so it survives across
+# micro-batches in the same streaming run and resets on pipeline
+# restart.
+
+
+@responses.activate
+def test_snapshot_first_call_emits_all_records_and_primes_cache():
+    """Cold cache → emit everything, populate the hash for the table."""
+    _mock_metadata()
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        json={
+            "value": [
+                {"Id": 1, "Name": "A", "ModifiedAt": "x"},
+                {"Id": 2, "Name": "B", "ModifiedAt": "x"},
+            ]
+        },
+        match_querystring=False,
+    )
+    c = _make()
+    records, offset = c.read_table("Customers", None, {})
+    assert [r["Id"] for r in list(records)] == [1, 2]
+    assert offset == {}
+    # Cache entry created for the (namespace, table) pair.
+    assert ("", "Customers") in c._snapshot_batch_hashes
+
+
+@responses.activate
+def test_snapshot_second_call_with_identical_batch_returns_empty():
+    """Hot cache + unchanged source content → no rows handed back, so
+    the framework's snapshot write doesn't rewrite the destination."""
+    _mock_metadata()
+    body = {
+        "value": [
+            {"Id": 1, "Name": "A", "ModifiedAt": "x"},
+            {"Id": 2, "Name": "B", "ModifiedAt": "x"},
+        ]
+    }
+    responses.add(responses.GET, f"{SERVICE_URL}Customers", json=body, match_querystring=False)
+    responses.add(responses.GET, f"{SERVICE_URL}Customers", json=body, match_querystring=False)
+
+    c = _make()
+    rows1, _ = c.read_table("Customers", None, {})
+    assert [r["Id"] for r in list(rows1)] == [1, 2]
+
+    rows2, offset2 = c.read_table("Customers", {}, {})
+    assert list(rows2) == []
+    assert offset2 == {}
+
+
+@responses.activate
+def test_snapshot_emits_when_content_changes_and_updates_cache():
+    """Any change to the batch (added row, modified field, removed row)
+    busts the cache and emits the new batch."""
+    _mock_metadata()
+    initial = {"value": [{"Id": 1, "Name": "A", "ModifiedAt": "x"}]}
+    changed = {
+        "value": [
+            {"Id": 1, "Name": "A", "ModifiedAt": "x"},
+            {"Id": 2, "Name": "B", "ModifiedAt": "y"},
+        ]
+    }
+    responses.add(responses.GET, f"{SERVICE_URL}Customers", json=initial, match_querystring=False)
+    responses.add(responses.GET, f"{SERVICE_URL}Customers", json=changed, match_querystring=False)
+
+    c = _make()
+    _, _ = c.read_table("Customers", None, {})
+    hash_after_initial = c._snapshot_batch_hashes[("", "Customers")]
+
+    rows2, _ = c.read_table("Customers", {}, {})
+    assert [r["Id"] for r in list(rows2)] == [1, 2]
+    assert c._snapshot_batch_hashes[("", "Customers")] != hash_after_initial
+
+
+@responses.activate
+def test_snapshot_per_table_caches_are_independent():
+    """Two snapshot tables on the same connector instance have
+    independent cache entries — a change to one doesn't bust the
+    other's no-op short-circuit."""
+    _mock_metadata()
+    customers_body = {"value": [{"Id": 1, "Name": "A", "ModifiedAt": "x"}]}
+    orders_v1 = {"value": [{"OrderId": 100, "Total": "10.00"}]}
+    orders_v2 = {"value": [{"OrderId": 100, "Total": "11.00"}]}
+
+    responses.add(
+        responses.GET, f"{SERVICE_URL}Customers", json=customers_body, match_querystring=False
+    )
+    responses.add(
+        responses.GET, f"{SERVICE_URL}Customers", json=customers_body, match_querystring=False
+    )
+    responses.add(responses.GET, f"{SERVICE_URL}Orders", json=orders_v1, match_querystring=False)
+    responses.add(responses.GET, f"{SERVICE_URL}Orders", json=orders_v2, match_querystring=False)
+
+    c = _make()
+    list(c.read_table("Customers", None, {})[0])
+    list(c.read_table("Orders", None, {})[0])
+
+    # Customers unchanged → short-circuit; Orders changed → emit.
+    customers2, _ = c.read_table("Customers", {}, {})
+    orders2, _ = c.read_table("Orders", {}, {})
+    assert list(customers2) == []
+    assert [r["OrderId"] for r in list(orders2)] == [100]
+
+
+@responses.activate
+def test_snapshot_namespaced_tables_have_independent_caches():
+    """Same entity-set name in two schemas (Sales.Customers vs
+    HR.Customers) must not share a cache entry."""
+    _mock_multi_metadata()
+    sales = {"value": [{"Id": 1, "Account": "S1"}]}
+    hr_v1 = {"value": [{"EmployeeId": 9, "Department": "Eng"}]}
+    hr_v2 = {"value": [{"EmployeeId": 9, "Department": "Sales"}]}
+
+    # ``responses`` queues responses by registration order against a
+    # single URL — Sales and HR Customers both hit the same path, so
+    # the queue must match the actual call order below.
+    responses.add(responses.GET, f"{SERVICE_URL}Customers", json=sales, match_querystring=False)
+    responses.add(responses.GET, f"{SERVICE_URL}Customers", json=hr_v1, match_querystring=False)
+    responses.add(responses.GET, f"{SERVICE_URL}Customers", json=sales, match_querystring=False)
+    responses.add(responses.GET, f"{SERVICE_URL}Customers", json=hr_v2, match_querystring=False)
+
+    c = _make()
+    list(c.read_table("Customers", None, {"namespace": "Sales"})[0])  # sales
+    list(c.read_table("Customers", None, {"namespace": "HR"})[0])  # hr_v1
+    assert ("Sales", "Customers") in c._snapshot_batch_hashes
+    assert ("HR", "Customers") in c._snapshot_batch_hashes
+
+    # Sales unchanged → empty; HR changed (Eng→Sales) → emit.
+    sales2, _ = c.read_table("Customers", {}, {"namespace": "Sales"})  # sales
+    hr2, _ = c.read_table("Customers", {}, {"namespace": "HR"})  # hr_v2
+    assert list(sales2) == []
+    assert [r["Department"] for r in list(hr2)] == ["Sales"]
+
+
+@responses.activate
+def test_snapshot_empty_source_caches_empty_hash():
+    """Empty source on first call still primes the cache; a second
+    empty call short-circuits. (Hash over an empty list is well-defined
+    and stable.)"""
+    _mock_metadata()
+    empty = {"value": []}
+    responses.add(responses.GET, f"{SERVICE_URL}Customers", json=empty, match_querystring=False)
+    responses.add(responses.GET, f"{SERVICE_URL}Customers", json=empty, match_querystring=False)
+
+    c = _make()
+    rows1, _ = c.read_table("Customers", None, {})
+    assert list(rows1) == []
+    rows2, _ = c.read_table("Customers", {}, {})
+    assert list(rows2) == []
+
+
+# ---------------------------------------------------------------------------
 # Incremental read
 # ---------------------------------------------------------------------------
 

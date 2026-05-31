@@ -122,6 +122,28 @@ def _next_sequence() -> str:
     return f"{now}_{next(_SEQUENCE_COUNTER):012d}"
 
 
+def _hash_snapshot_batch(records: list[dict]) -> str:
+    """SHA-256 over a canonical JSON serialization of a snapshot batch.
+
+    Used by ``_read_snapshot`` to short-circuit re-emission when the
+    full-table snapshot is byte-identical to the previous trigger's.
+    Canonical form: sorted dict keys, no insignificant whitespace.
+    Non-JSON-native values (datetimes, bytes, custom objects) fall
+    back to ``str()`` so the hash is stable across pickling /
+    serialization boundaries the framework may impose.
+    """
+    import hashlib
+    import json as _json
+
+    canonical = _json.dumps(
+        records,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces):
     """LakeflowConnect implementation for OData v4 services.
 
@@ -152,6 +174,16 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces):
         # ``enabled`` mode trusts the user and skips the cache; ``disabled``
         # mode never touches it.
         self._delta_capable: dict[tuple[str, str], bool] = {}
+        # Snapshot batch-hash cache. Keyed by ``(namespace, table_name)``,
+        # value is the SHA-256 over the most recently emitted batch. On
+        # the next call for the same table, if the new batch's hash
+        # matches the cached one, the connector returns an empty
+        # iterator — the destination already has this data and there's
+        # no point re-writing it. The cache lives on the instance, so
+        # it survives across micro-batches in the same streaming run
+        # but resets on pipeline restart (cold-start re-emits once and
+        # repopulates the cache).
+        self._snapshot_batch_hashes: dict[tuple[str, str], str] = {}
 
     # ------------------------------------------------------------------
     # LakeflowConnect interface
@@ -264,6 +296,26 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces):
     ) -> tuple[Iterator[dict], dict]:
         url = self._build_url(table_name, table_options)
         records = list(self._fetch_pages(url))
+
+        # Batch-hash dedup: snapshot tables re-fetch the entire table
+        # every trigger, but if the batch content hasn't changed since
+        # the last call there's no point handing it back to the
+        # framework for another full-refresh write. Hash the whole
+        # batch (canonical JSON over the record list), compare to the
+        # last hash we emitted for this table, and short-circuit when
+        # they match.
+        #
+        # Cache lives on the connector instance, so it survives across
+        # micro-batches in the same streaming run. It resets on
+        # pipeline restart — the first call after a restart will
+        # always emit, re-priming the cache. That one-shot re-emit is
+        # cheap relative to the steady-state savings.
+        namespace = (table_options or {}).get("namespace") or ""
+        cache_key = (namespace, table_name)
+        batch_hash = _hash_snapshot_batch(records)
+        if self._snapshot_batch_hashes.get(cache_key) == batch_hash:
+            return iter([]), {}
+        self._snapshot_batch_hashes[cache_key] = batch_hash
         return iter(records), {}
 
     def _read_incremental(
