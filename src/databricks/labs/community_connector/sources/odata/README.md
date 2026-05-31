@@ -103,12 +103,19 @@ w.api_client.do(
             "service_url": service_url,
             "token": "<bearer-token>",
             "externalOptionsAllowList": (
-                "namespace,cursor_field,select,filter,page_size,max_records_per_batch"
+                "namespace,cursor_field,select,filter,"
+                "page_size,max_records_per_batch,delta_tracking"
             ),
         },
     },
 )
 ```
+
+The `externalOptionsAllowList` must match the connector spec's
+`external_options_allowlist`. The CLI in Option A reads the spec and
+sets this automatically; with the SDK you set it explicitly — keep
+it in sync with the spec or table-level options like
+`delta_tracking` get silently stripped at runtime.
 
 The connector reads its auth credentials directly from these option
 keys; no `auth_method` / `auth_type` discriminator is needed when only
@@ -135,17 +142,36 @@ from databricks.labs.community_connector.sources.odata import ODataLakeflowConne
 build_pipeline(
     connector_cls=ODataLakeflowConnect,
     tables=[
+        # Snapshot — re-read in full on every trigger. Use for small,
+        # mostly-static tables; for large ones run them in a separate
+        # triggered pipeline with a lower-frequency schedule.
         {
             "table": {
                 "source_table": "Customers",
             }
         },
+        # Cursor-based incremental — `cursor_field` drives a
+        # `field gt <last>` filter and an `$orderby field, <pk>`
+        # request. Works against any OData v4 service.
         {
             "table": {
                 "source_table": "Orders",
                 "table_configuration": {
                     "cursor_field": "OrderDate",
                     "max_records_per_batch": "100000",
+                },
+            }
+        },
+        # Delta tracking — server-driven change stream. Requires the
+        # source to honor `Prefer: odata.track-changes` (MS Graph,
+        # Dataverse, SAP S/4HANA Cloud …). Emits in-band tombstones
+        # via the synthetic `_deleted` column. See "Delta tracking"
+        # section below for the contract.
+        {
+            "table": {
+                "source_table": "Suppliers",
+                "table_configuration": {
+                    "delta_tracking": "enabled",
                 },
             }
         },
