@@ -49,15 +49,35 @@ For other auth methods, swap `token` for the relevant fields:
 | `oauth2` (client credentials) | `oauth2_token_url`, `oauth2_client_id`, `oauth2_client_secret` (optionally `oauth2_scope`) | Server-to-server. Mints a fresh access token at session start; re-mints pre-emptively when `expires_in` is exhausted (60 s safety buffer). |
 | `oauth2` (authorization code) | Same as above **plus** `oauth2_refresh_token` (and optionally `oauth2_access_token`) | User-delegated. The pre-issued access token is used directly, then refreshed via `grant_type=refresh_token` either pre-emptively when the deadline approaches or reactively on a 401 from the source. Rotated refresh tokens are tracked automatically. |
 
-OAuth error handling:
+Auth error handling:
 
-- Token-endpoint 4xx during the refresh-token grant raises a `ValueError`
-  naming `oauth2_refresh_token` + `oauth2_client_id` as the fields to check,
-  with the OAuth `error` + `error_description` echoed from the server.
-- Source 401 *after* a successful refresh raises a `PermissionError` —
-  the access token isn't the problem; check `oauth2_scope`, principal
-  permissions, and any tenant/instance identifier in `service_url` or
-  `extra_headers`.
+- **Token-endpoint 4xx during the OAuth refresh-token grant** raises a
+  `ValueError` naming `oauth2_refresh_token` + `oauth2_client_id` as
+  the fields to check, with the OAuth `error` + `error_description`
+  echoed verbatim from the server.
+- **Source 401 *after* a successful OAuth refresh** raises a
+  `PermissionError` — the access token isn't the problem; check
+  `oauth2_scope`, principal permissions, and any tenant/instance
+  identifier in `service_url` or `extra_headers`.
+- **Source 401 or 403 with no automatic refresh path available**
+  raises a `PermissionError` with auth-mode-specific remediation
+  hints, naming the exact connection options to check. The server
+  response body is echoed truncated so high-privilege error codes
+  (`InvalidAuthenticationToken`, `Forbidden`, scope-related errors)
+  come through. Behavior per auth mode:
+  - `bearer` — pre-acquired tokens have no refresh path; the error
+    suggests replacing `token` with a fresh value or upgrading to
+    `auth_type=oauth2` with `oauth2_client_id` + `oauth2_client_secret`
+    so the connector mints and refreshes tokens automatically.
+  - `basic` — names `username` / `password` and the principal's
+    permissions at the source.
+  - `api_key` — names `api_key` (may have been rotated) and
+    `api_key_header` (some services expect a non-default header).
+  - `oauth2` without `oauth2_client_id`/`secret` and without
+    `oauth2_refresh_token` — names the missing parameter pairs that
+    would enable auto-refresh, plus `oauth2_scope`.
+  - No `auth_type` set — names the four valid `auth_type` values so
+    the operator can pick the right one for the source.
 
 ### Option B — Python SDK
 
