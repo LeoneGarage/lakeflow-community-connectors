@@ -165,10 +165,13 @@ The cursor filter is:
 
 | State | `$filter` clause for the cursor |
 | --- | --- |
-| First call (no checkpoint) | `<cursor_field> le <init_ts>` |
-| Resume after checkpoint `since` | `<cursor_field> gt <since> and <cursor_field> le <init_ts>` |
+| First call (no checkpoint) | *(no cursor filter)* — server returns rows from the natural start of the table |
+| Resume after checkpoint `since` | `<cursor_field> gt <since>` |
 
-`<init_ts>` is captured once when the connector instance is constructed (a fresh instance is created on every trigger). This freezes the upper bound for the duration of one trigger so a long-running read never chases newly-inserted data past the boundary it started with.
+There is **no wall-clock ceiling** on the cursor. `max_records_per_batch` is the only per-call cap. Two consequences:
+
+* **Continuous SDP pipelines work.** A single connector instance can live for the entire stream and still see fresh source state on every micro-batch, because the connector never freezes a "snapshot at startup" timestamp that would shut out later-arriving rows.
+* **The cursor column doesn't have to be a timestamp.** Monotonic integer IDs, GUIDs, lexicographic strings — anything the server can order in `$orderby` and compare in `$filter` works the same way. The connector emits the cursor value verbatim using `_odata_literal`, so an `Edm.Int32` cursor produces `OrderID gt 10248` (no quotes), an `Edm.DateTimeOffset` cursor produces `ModifiedAt gt 2024-03-01T00:00:00Z`, and so on.
 
 ### Why primary keys are appended to `$orderby`
 
@@ -290,18 +293,18 @@ build_pipeline(
 
 ### What happens at runtime for `Orders`
 
-1. The connector instance is constructed and captures `init_ts` (current UTC time, ISO-8601).
-2. `read_table_metadata("Orders", ...)` reads `$metadata`, finds `EntityType="NorthwindModel.Order"`, returns `primary_keys=["OrderID"]`, `cursor_field="OrderDate"`, `ingestion_type="cdc"`.
-3. `get_table_schema("Orders", ...)` returns a `StructType` with `OrderID: int`, `CustomerID: string`, `OrderDate: timestamp`, `ShippedDate: timestamp`, etc., derived from the `<Property>` children of `NorthwindModel.Order`.
-4. First call to `read_table` has no `start_offset`. The URL is:
+1. `read_table_metadata("Orders", ...)` reads `$metadata`, finds `EntityType="NorthwindModel.Order"`, returns `primary_keys=["OrderID"]`, `cursor_field="OrderDate"`, `ingestion_type="cdc"`.
+2. `get_table_schema("Orders", ...)` returns a `StructType` with `OrderID: int`, `CustomerID: string`, `OrderDate: timestamp`, `ShippedDate: timestamp`, etc., derived from the `<Property>` children of `NorthwindModel.Order`.
+3. First call to `read_table` has no `start_offset`. The URL is:
    ```
    .../Orders?$top=500
-            &$filter=(OrderDate le <init_ts>)
             &$orderby=OrderDate asc, OrderID asc
    ```
-5. Rows stream in via `@odata.nextLink` pagination. The connector accumulates up to 5000 rows.
-6. The boundary trim runs. Many Northwind orders share an `OrderDate` (date-precision), so the trailing same-day cohort is dropped. The end offset is the last *distinct* `OrderDate` seen.
-7. Next call resumes with `OrderDate gt <prev_distinct> and OrderDate le <init_ts>`. The previously-dropped same-day cohort is re-fetched. `apply_changes` MERGEs them by `OrderID`, so the destination has each order exactly once.
+   No cursor `$filter` on the first call — the connector pulls from the natural start of the table and lets `max_records_per_batch` (5000) cap the call.
+4. Rows stream in via `@odata.nextLink` pagination. The connector accumulates up to 5000 rows.
+5. The boundary trim runs. Many Northwind orders share an `OrderDate` (date-precision), so the trailing same-day cohort is dropped. The end offset is the last *distinct* `OrderDate` seen.
+6. Next call resumes with `OrderDate gt <prev_distinct>`. The previously-dropped same-day cohort is re-fetched. `apply_changes` MERGEs them by `OrderID`, so the destination has each order exactly once.
+7. Continuous mode: when the source grows under the running stream, subsequent calls keep advancing `<prev_distinct>` past the new rows. No timestamp ceiling has to expire for that to happen.
 
 ### Why `OrderDate` works as a cursor even though many rows share each date
 
