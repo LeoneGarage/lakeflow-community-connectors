@@ -336,6 +336,14 @@ the offset. Mid-batch ``max_records_per_batch`` truncation parks a
 ``parent_idx`` in the offset so the next call resumes at the same
 parent.
 
+If the leaf entity doesn't declare ``cursor_field`` as a property,
+the connector walks leaf → root looking for the closest ancestor
+that does have it, filters at that ancestor level instead, and
+stamps the ancestor's cursor value onto every emitted leaf row.
+``get_table_schema`` adds the cursor column to the leaf schema with
+the ancestor's declared type. Set ``cursor_field`` to a column name
+that isn't anywhere on the path → ``ValueError``.
+
 Known limitation: no same-cursor boundary trim across truncation. Set
 ``max_records_per_batch`` above the largest expected same-cursor cohort
 per parent, or pick a higher-cardinality cursor.

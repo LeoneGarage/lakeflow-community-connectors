@@ -217,6 +217,14 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces, ContainedNavMixi
             segments = _parse_contained_path(table_name) or [table_name]
             fk_names = set(self._resolve_fk_columns(segments, namespace).values())
             fields = [f for f in fields if f.name in fk_names or f.name in wanted]
+        # Contained path + cursor_field lives on an ancestor → propagate
+        # the ancestor's cursor column type onto the leaf schema. The
+        # incremental read path stamps the value onto each emitted row.
+        cursor_field = (table_options or {}).get("cursor_field")
+        if cursor_field:
+            ancestor_cursor = self._ancestor_cursor_field(table_name, namespace, cursor_field)
+            if ancestor_cursor is not None and ancestor_cursor.name not in {f.name for f in fields}:
+                fields = list(fields) + [ancestor_cursor]
         if not fields:
             raise ValueError(
                 f"Could not derive a non-empty schema for entity set {table_name!r}. "

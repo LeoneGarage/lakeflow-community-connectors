@@ -282,17 +282,109 @@ class ContainedNavMixin:
         chain: list[dict[str, Any]],
         fk_columns: dict[tuple[str, str], str],
     ) -> None:
-        """Write ancestor primary-key values onto ``row`` under the
-        resolved FK column names. Only ancestors present in
-        ``fk_columns`` are materialized — ``_resolve_fk_columns`` decides
-        which (just the immediate parent by default; every ancestor
-        when ``include_ancestor_ids=true``)."""
+        """Write every ancestor's primary-key values onto ``row`` under
+        the resolved FK column names from ``fk_columns``."""
         for idx, ancestor_keys in enumerate(chain):
             seg = segments[idx]
             for pk_name, pk_val in ancestor_keys.items():
                 col = fk_columns.get((seg, pk_name))
                 if col is not None:
                     row[col] = pk_val
+
+    def _find_cursor_level(
+        self,
+        segments: list[str],
+        namespace: str | None,
+        cursor_field: str,
+    ) -> int:
+        """Return the segment index whose entity type declares
+        ``cursor_field`` as a property. Walk leaf → root; the closest
+        match wins. Returns ``-1`` if no segment has it."""
+        for idx in range(len(segments) - 1, -1, -1):
+            et = self._entity_type_for(CONTAINED_PATH_SEP.join(segments[: idx + 1]), namespace)
+            if any(f.name == cursor_field for f in self._own_fields_for_et(et)):
+                return idx
+        return -1
+
+    def _ancestor_cursor_field(
+        self, table_name: str, namespace: str | None, cursor_field: str
+    ) -> StructField | None:
+        """``StructField`` for ``cursor_field`` when it lives on a non-leaf
+        ancestor of a contained path; ``None`` when the leaf owns it or
+        the path is flat. Used by ``get_table_schema`` to add the column
+        to the leaf schema."""
+        segments = parse_contained_path(table_name) or [table_name]
+        if len(segments) < 2:
+            return None
+        cursor_level = self._find_cursor_level(segments, namespace, cursor_field)
+        if cursor_level in (-1, len(segments) - 1):
+            return None
+        ancestor_et = self._entity_type_for(
+            CONTAINED_PATH_SEP.join(segments[: cursor_level + 1]), namespace
+        )
+        for field in self._own_fields_for_et(ancestor_et):
+            if field.name == cursor_field:
+                return field
+        return None
+
+    def _iter_parent_chains_with_cursor(
+        self,
+        segments: list[str],
+        namespace: str | None,
+        table_options: dict[str, str] | None,
+        cursor_level: int,
+        cursor_field: str,
+        since: Any,
+    ) -> Iterator[tuple[list[dict[str, Any]], Any]]:
+        """Like ``_iter_parent_key_chains`` but applies a cursor filter at
+        the ancestor that owns ``cursor_field``. Yields
+        ``(chain, ancestor_cursor_value)`` pairs; the cursor value is the
+        value at ``cursor_level`` for that chain."""
+
+        def _walk(level: int, chain: list[dict[str, Any]], cur_val: Any):
+            if level == len(segments) - 1:
+                yield list(chain), cur_val
+                return
+            sub_segments = segments[: level + 1]
+            ancestor_et = self._entity_type_for(CONTAINED_PATH_SEP.join(sub_segments), namespace)
+            ancestor_pks = self._own_primary_keys_for_et(ancestor_et)
+            if not ancestor_pks:
+                raise ValueError(
+                    f"Cannot walk contained path: segment {segments[level]!r} "
+                    f"has no primary key declared in $metadata."
+                )
+            select_cols = list(ancestor_pks)
+            extra_filter: str | None = None
+            order_by: str | None = None
+            if level == cursor_level:
+                if cursor_field not in select_cols:
+                    select_cols.append(cursor_field)
+                extra_filter = self._cursor_filter(cursor_field, since)
+                terms = [f"{cursor_field} asc"]
+                terms.extend(f"{pk} asc" for pk in ancestor_pks if pk != cursor_field)
+                order_by = ",".join(terms)
+            opts = {
+                "page_size": (table_options or {}).get("page_size", "1000"),
+                "select": ",".join(select_cols),
+            }
+            url = (
+                self._build_url(segments[0], opts, extra_filter=extra_filter, order_by=order_by)
+                if level == 0
+                else self._build_contained_url(
+                    sub_segments,
+                    chain,
+                    opts,
+                    extra_filter=extra_filter,
+                    order_by=order_by,
+                )
+            )
+            for row in self._fetch_pages(url):
+                next_cur = row.get(cursor_field) if level == cursor_level else cur_val
+                chain.append({pk: row.get(pk) for pk in ancestor_pks})
+                yield from _walk(level + 1, chain, next_cur)
+                chain.pop()
+
+        yield from _walk(0, [], None)
 
     def _iter_parent_key_chains(
         self,
@@ -458,9 +550,36 @@ class ContainedNavMixin:
     ) -> tuple[Iterator[dict], dict]:
         """Walk every parent tuple with ``$filter=cursor gt since``; track
         global max cursor in the offset. Truncation parks ``parent_idx``
-        for next-call resume."""
+        for next-call resume. When the leaf entity doesn't declare
+        ``cursor_field``, the closest ancestor that does owns the filter
+        and its cursor value is propagated onto each leaf row."""
         segments = parse_contained_path(table_name) or [table_name]
         namespace = (table_options or {}).get("namespace")
+        cursor_level = self._find_cursor_level(segments, namespace, cursor_field)
+        if cursor_level == -1:
+            raise ValueError(
+                f"cursor_field {cursor_field!r} is not a property on "
+                f"{table_name!r} or any of its ancestors. Pick a column "
+                f"declared on the leaf or one of the parent segments."
+            )
+        if cursor_level == len(segments) - 1:
+            return self._read_contained_incremental_leaf_cursor(
+                segments, start_offset, table_options, cursor_field
+            )
+        return self._read_contained_incremental_ancestor_cursor(
+            segments, start_offset, table_options, cursor_field, cursor_level
+        )
+
+    def _read_contained_incremental_leaf_cursor(
+        self,
+        segments: list[str],
+        start_offset: dict,
+        table_options: dict[str, str],
+        cursor_field: str,
+    ) -> tuple[Iterator[dict], dict]:
+        """Cursor lives on the leaf entity — filter at the leaf fetch."""
+        namespace = (table_options or {}).get("namespace")
+        table_name = CONTAINED_PATH_SEP.join(segments)
         since = (start_offset or {}).get("cursor")
         max_records = int((table_options or {}).get("max_records_per_batch", "100000"))
         order_by = self._leaf_cursor_order_by(table_name, namespace, cursor_field)
@@ -478,6 +597,58 @@ class ContainedNavMixin:
             max_records,
             self._resolve_fk_columns(segments, namespace),
         )
+        if not emitted:
+            return iter([]), start_offset or {}
+        cursors = [r.get(cursor_field) for r in emitted if r.get(cursor_field) is not None]
+        end_offset: dict = {"cursor": max(cursors) if cursors else since}
+        if truncated:
+            end_offset["parent_idx"] = parent_idx
+        if start_offset and start_offset == end_offset:
+            return iter([]), start_offset
+        return iter(emitted), end_offset
+
+    def _read_contained_incremental_ancestor_cursor(
+        self,
+        segments: list[str],
+        start_offset: dict,
+        table_options: dict[str, str],
+        cursor_field: str,
+        cursor_level: int,
+    ) -> tuple[Iterator[dict], dict]:
+        """Cursor lives on a non-leaf ancestor. Filter at that ancestor
+        level (changed subtrees only), fetch full leaf collections under
+        each filtered ancestor, and stamp the ancestor's cursor value
+        onto every emitted leaf row."""
+        namespace = (table_options or {}).get("namespace")
+        since = (start_offset or {}).get("cursor")
+        max_records = int((table_options or {}).get("max_records_per_batch", "100000"))
+        fk_columns = self._resolve_fk_columns(segments, namespace)
+        chains_with_cursor = list(
+            self._iter_parent_chains_with_cursor(
+                segments,
+                namespace,
+                table_options,
+                cursor_level,
+                cursor_field,
+                since,
+            )
+        )
+        parent_idx = int((start_offset or {}).get("parent_idx", 0))
+        emitted: list[dict] = []
+        truncated = False
+        while parent_idx < len(chains_with_cursor):
+            chain, ancestor_cursor = chains_with_cursor[parent_idx]
+            url = self._build_contained_url(segments, chain, table_options)
+            for row in self._fetch_pages(url):
+                self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
+                row[cursor_field] = ancestor_cursor
+                emitted.append(row)
+                if len(emitted) >= max_records:
+                    truncated = True
+                    break
+            if truncated:
+                break
+            parent_idx += 1
         if not emitted:
             return iter([]), start_offset or {}
         cursors = [r.get(cursor_field) for r in emitted if r.get(cursor_field) is not None]

@@ -2519,6 +2519,117 @@ def test_contained_incremental_truncation_returns_parent_idx_offset():
     assert offset["cursor"] == "2024-01-02T00:00:00Z"
 
 
+# --- ancestor-cursor incremental ---
+
+
+@responses.activate
+def test_ancestor_cursor_schema_adds_cursor_column_from_ancestor():
+    """Notes doesn't have ModifiedAt; Children does. The schema should
+    surface ModifiedAt (from Children's type) on the leaf rows."""
+    _mock_nested_metadata()
+    c = _make()
+    schema = c.get_table_schema("Parents__Children__Notes", {"cursor_field": "ModifiedAt"})
+    names = [f.name for f in schema.fields]
+    assert "ModifiedAt" in names
+    # The ancestor-supplied column carries Children's type (TimestampType).
+    cursor_type = type(schema["ModifiedAt"].dataType).__name__
+    assert cursor_type == "TimestampType"
+
+
+@responses.activate
+def test_ancestor_cursor_incremental_filters_at_ancestor_level():
+    """Cursor lives on Children (the ancestor). Filter should apply
+    when fetching Children's keys; leaf (Notes) is fetched unfiltered
+    under each matching ancestor and stamped with the ancestor's cursor."""
+    _mock_nested_metadata()
+    # Top-level Parents enumeration (no cursor filter at this level).
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}]})
+    # Children fetch — cursor_field is in $select and $filter at this level.
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={
+            "value": [
+                {"Id": 10, "ModifiedAt": "2024-01-01T00:00:00Z"},
+                {"Id": 11, "ModifiedAt": "2024-01-02T00:00:00Z"},
+            ]
+        },
+        match_querystring=False,
+    )
+    # Leaf fetches for each filtered Child.
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children(10)/Notes",
+        json={"value": [{"Id": 100, "Text": "a"}, {"Id": 101, "Text": "b"}]},
+    )
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children(11)/Notes",
+        json={"value": [{"Id": 200, "Text": "c"}]},
+    )
+    c = _make()
+    records, offset = c.read_table("Parents__Children__Notes", None, {"cursor_field": "ModifiedAt"})
+    rows = list(records)
+    # All 3 leaf rows emitted; cursor value propagated from ancestor.
+    assert len(rows) == 3
+    assert all(r["ModifiedAt"] for r in rows)
+    # Children with Id=10 stamps its ModifiedAt onto its two notes.
+    notes_under_10 = [r for r in rows if r["Children_Id"] == 10]
+    assert all(r["ModifiedAt"] == "2024-01-01T00:00:00Z" for r in notes_under_10)
+    # Offset advances to max ancestor cursor.
+    assert offset == {"cursor": "2024-01-02T00:00:00Z"}
+    # Children call carries $orderby + ModifiedAt in $select.
+    # First call has no $filter because since=None (the resume test covers that).
+    # Call order: 0=$metadata, 1=Parents (PKs), 2=Children (cursor level), 3,4=leaf fetches.
+    children_call = responses.calls[2].request.url
+    assert "ModifiedAt" in children_call
+    assert "%24orderby" in children_call or "$orderby" in children_call
+
+
+@responses.activate
+def test_ancestor_cursor_incremental_resume_filters_with_since():
+    """A resumed call passes `cursor gt since` to the ancestor fetch
+    and skips ancestors whose cursor is below the offset."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}]})
+    # Children fetch returns only the newer Child (the older one filtered server-side).
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={
+            "value": [
+                {"Id": 11, "ModifiedAt": "2024-01-02T00:00:00Z"},
+            ]
+        },
+        match_querystring=False,
+    )
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children(11)/Notes",
+        json={"value": [{"Id": 200, "Text": "c"}]},
+    )
+    c = _make()
+    records, offset = c.read_table(
+        "Parents__Children__Notes",
+        {"cursor": "2024-01-01T00:00:00Z"},
+        {"cursor_field": "ModifiedAt"},
+    )
+    rows = list(records)
+    assert len(rows) == 1
+    assert rows[0]["ModifiedAt"] == "2024-01-02T00:00:00Z"
+    assert offset == {"cursor": "2024-01-02T00:00:00Z"}
+    # Cursor filter present on the Children call (call index 2).
+    children_call = responses.calls[2].request.url
+    assert "ModifiedAt%20gt%20" in children_call or "ModifiedAt+gt+" in children_call
+
+
+@responses.activate
+def test_cursor_field_not_on_any_segment_raises():
+    """When cursor_field isn't a property anywhere along the contained
+    path, the connector should raise with an actionable message."""
+    _mock_nested_metadata()
+    c = _make()
+    with pytest.raises(ValueError, match="not a property"):
+        c.read_table("Parents__Children__Notes", None, {"cursor_field": "DoesNotExist"})
+
+
 # --- read_table_metadata for contained paths ---
 
 
