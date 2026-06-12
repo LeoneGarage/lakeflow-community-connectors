@@ -2472,6 +2472,34 @@ def test_contained_expand_with_ancestor_cursor_injects_filter_into_expand():
 
 
 @responses.activate
+def test_contained_expand_injects_select_for_cursor_inside_expand():
+    """The cursor's segment $expand clause must include $select=<pks>,
+    <cursor> to force the server to project the cursor column. Without
+    this, some OData servers omit declared properties from $expand
+    responses by default, leaving the connector unable to stamp the
+    cursor onto leaf rows."""
+    _mock_nested_metadata()
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Parents",
+        json={"value": []},
+        match_querystring=False,
+    )
+    c = _make()
+    list(
+        c.read_table(
+            "Parents__Children__Notes",
+            None,
+            {"expand_contained": "true", "cursor_field": "ModifiedAt"},
+        )[0]
+    )
+    call_url = responses.calls[1].request.url
+    # cursor lives on Children (level 1). Children's $expand carries
+    # $select=Id,ModifiedAt (Children's PK + cursor).
+    assert "%24select=Id,ModifiedAt" in call_url or "$select=Id,ModifiedAt" in call_url
+
+
+@responses.activate
 def test_contained_expand_cursor_orderby_includes_level_pks():
     """The $orderby injected at the cursor level uses ``cursor asc``
     plus that segment's primary keys as tie-breakers (proving

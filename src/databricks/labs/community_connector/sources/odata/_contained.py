@@ -227,14 +227,19 @@ class ContainedNavMixin:
         cursor_level: int | None = None,
         cursor_filter: str | None = None,
         cursor_order: str | None = None,
+        cursor_select: str | None = None,
     ) -> str:
         """``A?...&$expand=B($expand=C($expand=D))`` for the full chain.
 
-        When ``cursor_level`` is set, ``cursor_filter``/``cursor_order``
-        are injected at the segment that owns the cursor — at the
-        top-level URL when ``cursor_level == 0``, or inside the
-        corresponding ``$expand`` clause otherwise. OData v4 §5.1.1.13:
-        inner ``$expand`` options are separated by ``;``."""
+        When ``cursor_level`` is set, ``cursor_filter``/``cursor_order``/
+        ``cursor_select`` are injected at the segment that owns the
+        cursor — at the top-level URL when ``cursor_level == 0``, or
+        inside the corresponding ``$expand`` clause otherwise. The
+        ``$select`` is necessary because some OData servers omit
+        properties from ``$expand`` responses by default; explicitly
+        requesting the cursor guarantees the server projects it onto
+        the ancestor rows so it can be stamped onto leaf rows. OData
+        v4 §5.1.1.13: inner ``$expand`` options are separated by ``;``."""
         top, *children = segments
         base = join_url(self.service_url, top)
         if cursor_level == 0:
@@ -247,6 +252,8 @@ class ContainedNavMixin:
         for i in range(len(children) - 1, -1, -1):
             parts: list[str] = []
             if cursor_level == i + 1:
+                if cursor_select:
+                    parts.append(f"$select={cursor_select}")
                 if cursor_filter:
                     parts.append(f"$filter={cursor_filter}")
                 if cursor_order:
@@ -476,7 +483,7 @@ class ContainedNavMixin:
             raise ValueError(f"expand_contained requires a contained path; {table_name!r} is flat.")
         namespace = (table_options or {}).get("namespace")
         cursor_field = (table_options or {}).get("cursor_field")
-        cursor_level, cursor_filter, cursor_order = self._cursor_expand_clause(
+        cursor_level, cursor_filter, cursor_order, cursor_select = self._cursor_expand_clause(
             segments, namespace, cursor_field, (start_offset or {}).get("cursor")
         )
         if cursor_field and cursor_level == -1:
@@ -501,6 +508,7 @@ class ContainedNavMixin:
             cursor_level=cursor_level if cursor_field else None,
             cursor_filter=cursor_filter,
             cursor_order=cursor_order,
+            cursor_select=cursor_select,
         )
         emitted: list[dict] = []
         ctx = (cursor_field, cursor_level, None) if cursor_field else None
@@ -524,22 +532,36 @@ class ContainedNavMixin:
         namespace: str | None,
         cursor_field: str | None,
         since: Any,
-    ) -> tuple[int, str | None, str | None]:
-        """``(cursor_level, $filter, $orderby)`` for ``$expand`` mode.
-        Returns ``(-1, None, None)`` when no cursor is set; the caller
-        raises if the cursor isn't a property of any segment."""
+    ) -> tuple[int, str | None, str | None, str | None]:
+        """``(cursor_level, $filter, $orderby, $select)`` for ``$expand``
+        mode. Returns ``(-1, None, None, None)`` when no cursor is set;
+        the caller raises if the cursor isn't a property of any segment.
+        ``$select`` is non-empty only when the cursor lives on a non-top
+        segment — it forces the server to project the cursor column on
+        the expanded ancestor (some servers default-omit it)."""
         if not cursor_field:
-            return -1, None, None
+            return -1, None, None, None
         cursor_level = self._find_cursor_level(segments, namespace, cursor_field)
         if cursor_level == -1:
-            return -1, None, None
+            return -1, None, None, None
         level_et = self._entity_type_for(
             CONTAINED_PATH_SEP.join(segments[: cursor_level + 1]), namespace
         )
         level_pks = self._own_primary_keys_for_et(level_et)
         order_terms = [f"{cursor_field} asc"]
         order_terms.extend(f"{p} asc" for p in level_pks if p != cursor_field)
-        return cursor_level, self._cursor_filter(cursor_field, since), ",".join(order_terms)
+        cursor_select: str | None = None
+        if cursor_level > 0:
+            select_cols = list(level_pks)
+            if cursor_field not in select_cols:
+                select_cols.append(cursor_field)
+            cursor_select = ",".join(select_cols)
+        return (
+            cursor_level,
+            self._cursor_filter(cursor_field, since),
+            ",".join(order_terms),
+            cursor_select,
+        )
 
     def _flatten_expand_response(
         self,
