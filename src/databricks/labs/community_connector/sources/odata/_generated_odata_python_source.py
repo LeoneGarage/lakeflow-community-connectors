@@ -793,19 +793,44 @@ def register_lakeflow_source(spark):
             self,
             segments: list[str],
             table_options: dict[str, str],
-            extra_filter: str | None = None,
-            order_by: str | None = None,
+            cursor_level: int | None = None,
+            cursor_filter: str | None = None,
+            cursor_order: str | None = None,
+            cursor_select: str | None = None,
         ) -> str:
-            """``A?...&$expand=B($expand=C($expand=D))`` for the full chain."""
+            """``A?...&$expand=B($expand=C($expand=D))`` for the full chain.
+
+            When ``cursor_level`` is set, ``cursor_filter``/``cursor_order``/
+            ``cursor_select`` are injected at the segment that owns the
+            cursor — at the top-level URL when ``cursor_level == 0``, or
+            inside the corresponding ``$expand`` clause otherwise. The
+            ``$select`` is necessary because some OData servers omit
+            properties from ``$expand`` responses by default; explicitly
+            requesting the cursor guarantees the server projects it onto
+            the ancestor rows so it can be stamped onto leaf rows. OData
+            v4 §5.1.1.13: inner ``$expand`` options are separated by ``;``."""
             top, *children = segments
             base = join_url(self.service_url, top)
-            query = self._format_query_params(table_options, extra_filter, order_by)
+            if cursor_level == 0:
+                query = self._format_query_params(table_options, cursor_filter, cursor_order)
+            else:
+                query = self._format_query_params(table_options, None, None)
             if not children:
                 return f"{base}?{query}"
-            expand = ""
-            for child in reversed(children):
-                expand = f"{child}($expand={expand})" if expand else child
-            return f"{base}?{query}&$expand={expand}"
+            inner = ""
+            for i in range(len(children) - 1, -1, -1):
+                parts: list[str] = []
+                if cursor_level == i + 1:
+                    if cursor_select:
+                        parts.append(f"$select={cursor_select}")
+                    if cursor_filter:
+                        parts.append(f"$filter={cursor_filter}")
+                    if cursor_order:
+                        parts.append(f"$orderby={cursor_order}")
+                if inner:
+                    parts.append(f"$expand={inner}")
+                inner = f"{children[i]}({';'.join(parts)})" if parts else children[i]
+            return f"{base}?{query}&$expand={inner}"
 
         # --- read paths --------------------------------------------------------
 
@@ -1009,15 +1034,32 @@ def register_lakeflow_source(spark):
             return iter(emitted), {}
 
         def _read_contained_expand(
-            self, table_name: str, table_options: dict[str, str]
+            self,
+            table_name: str,
+            start_offset: dict,
+            table_options: dict[str, str],
         ) -> tuple[Iterator[dict], dict]:
             """Single GET with nested ``$expand``; flatten the response into
-            leaf rows tagged with ancestor FKs. Server depth caps surface as
-            HTTP 4xx — no client-side fallback."""
+            leaf rows tagged with ancestor FKs. When ``cursor_field`` is
+            set, a ``$filter``/``$orderby`` is injected at the closest
+            segment that owns the cursor (top-level query or inner
+            ``$expand``), restricting the response to changed subtrees.
+            Emitted leaf rows are stamped with the cursor value from that
+            segment when they don't carry it themselves. Server depth caps
+            surface as HTTP 4xx — no client-side fallback."""
             segments = parse_contained_path(table_name) or [table_name]
             if len(segments) < 2:
                 raise ValueError(f"expand_contained requires a contained path; {table_name!r} is flat.")
             namespace = (table_options or {}).get("namespace")
+            cursor_field = (table_options or {}).get("cursor_field")
+            cursor_level, cursor_filter, cursor_order, cursor_select = self._cursor_expand_clause(
+                segments, namespace, cursor_field, (start_offset or {}).get("cursor")
+            )
+            if cursor_field and cursor_level == -1:
+                raise ValueError(
+                    f"cursor_field={cursor_field!r} is not a property of any "
+                    f"segment in {table_name!r}."
+                )
             pks_per_level: list[list[str]] = []
             for idx in range(len(segments) - 1):
                 et = self._entity_type_for(CONTAINED_PATH_SEP.join(segments[: idx + 1]), namespace)
@@ -1029,12 +1071,66 @@ def register_lakeflow_source(spark):
                     )
                 pks_per_level.append(pks)
             fk_columns = self._resolve_fk_columns(segments, namespace)
+            url = self._build_expand_url(
+                segments,
+                table_options,
+                cursor_level=cursor_level if cursor_field else None,
+                cursor_filter=cursor_filter,
+                cursor_order=cursor_order,
+                cursor_select=cursor_select,
+            )
             emitted: list[dict] = []
-            for top_row in self._fetch_pages(self._build_expand_url(segments, table_options)):
+            ctx = (cursor_field, cursor_level, None) if cursor_field else None
+            for top_row in self._fetch_pages(url):
                 self._flatten_expand_response(
-                    0, top_row, segments, pks_per_level, [], fk_columns, emitted
+                    0, top_row, segments, pks_per_level, [], fk_columns, emitted, ctx
                 )
-            return iter(emitted), {}
+            if not cursor_field:
+                return iter(emitted), {}
+            if not emitted:
+                return iter([]), start_offset or {}
+            cursors = [r.get(cursor_field) for r in emitted if r.get(cursor_field) is not None]
+            end_offset: dict = {"cursor": max(cursors)} if cursors else dict(start_offset or {})
+            if start_offset and start_offset == end_offset:
+                return iter([]), start_offset
+            return iter(emitted), end_offset
+
+        def _cursor_expand_clause(
+            self,
+            segments: list[str],
+            namespace: str | None,
+            cursor_field: str | None,
+            since: Any,
+        ) -> tuple[int, str | None, str | None, str | None]:
+            """``(cursor_level, $filter, $orderby, $select)`` for ``$expand``
+            mode. Returns ``(-1, None, None, None)`` when no cursor is set;
+            the caller raises if the cursor isn't a property of any segment.
+            ``$select`` is non-empty only when the cursor lives on a non-top
+            segment — it forces the server to project the cursor column on
+            the expanded ancestor (some servers default-omit it)."""
+            if not cursor_field:
+                return -1, None, None, None
+            cursor_level = self._find_cursor_level(segments, namespace, cursor_field)
+            if cursor_level == -1:
+                return -1, None, None, None
+            level_et = self._entity_type_for(
+                CONTAINED_PATH_SEP.join(segments[: cursor_level + 1]), namespace
+            )
+            level_pks = self._own_primary_keys_for_et(level_et)
+            order_terms = [f"{cursor_field} asc"]
+            order_terms.extend(f"{p} asc" for p in level_pks if p != cursor_field)
+            # No ``$select`` injection: the cursor column is returned by
+            # default projection on declared CSDL properties, so it isn't
+            # needed for stamping. Adding it silently trims other columns
+            # the user didn't opt out of — particularly harmful when the
+            # cursor segment is also the leaf (2-segment paths). Users who
+            # want to trim can set ``select`` themselves on the leaf side.
+            return (
+                cursor_level,
+                self._cursor_filter(cursor_field, since),
+                ",".join(order_terms),
+                None,
+            )
 
         def _flatten_expand_response(
             self,
@@ -1045,18 +1141,30 @@ def register_lakeflow_source(spark):
             chain: list[dict[str, Any]],
             fk_columns: dict[tuple[str, str], str],
             out: list[dict],
+            cursor_ctx: tuple[str | None, int, Any] | None = None,
         ) -> None:
-            """Recurse into the nested $expand payload; tag and emit leaf rows."""
+            """Recurse into the nested $expand payload; tag and emit leaf rows.
+            ``cursor_ctx`` is ``(cursor_field, cursor_level, captured_value)``
+            threaded down the recursion: when ``level == cursor_level`` the
+            captured value snaps to ``row[cursor_field]`` and propagates to
+            every leaf row beneath, stamped only when the leaf doesn't
+            already carry the column."""
+            cur_field, cur_level, cur_val = cursor_ctx or (None, -1, None)
+            if cur_field and level == cur_level:
+                cur_val = row.get(cur_field)
             if level == len(segments) - 1:
                 clean = {k: v for k, v in row.items() if not k.startswith("@odata.")}
                 self._tag_with_ancestor_fks(clean, segments, chain, fk_columns)
+                if cur_field and cur_val is not None and clean.get(cur_field) is None:
+                    clean[cur_field] = cur_val
                 out.append(clean)
                 return
             pks = pks_per_level[level]
             chain.append({pk: row.get(pk) for pk in pks})
+            next_ctx = (cur_field, cur_level, cur_val) if cur_field else None
             for child in row.get(segments[level + 1]) or []:
                 self._flatten_expand_response(
-                    level + 1, child, segments, pks_per_level, chain, fk_columns, out
+                    level + 1, child, segments, pks_per_level, chain, fk_columns, out, next_ctx
                 )
             chain.pop()
 
@@ -1427,7 +1535,7 @@ def register_lakeflow_source(spark):
                         "or ingest the parent set directly."
                     )
                 if self._expand_contained_active(opts):
-                    return self._read_contained_expand(table_name, opts)
+                    return self._read_contained_expand(table_name, offset, opts)
                 if opts.get("cursor_field"):
                     return self._read_contained_incremental(
                         table_name, offset, opts, opts["cursor_field"]
