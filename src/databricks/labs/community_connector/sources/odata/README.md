@@ -105,7 +105,7 @@ w.api_client.do(
             "externalOptionsAllowList": (
                 "namespace,cursor_field,select,filter,"
                 "page_size,max_records_per_batch,delta_tracking,"
-                "expand_contained"
+                "expand_contained,include_ancestor_ids"
             ),
         },
     },
@@ -312,6 +312,21 @@ as ``_Children_Id`` and the leaf property would keep its original name.
 The URL traversal still passes through every ancestor (the wire path
 is ``Parents(p)/Children(c)/Notes``), but only the immediate parent's
 key shows up as a column on the destination row.
+
+Set ``include_ancestor_ids: "true"`` on the table to opt into the
+full ancestor chain instead — every non-leaf ancestor's PKs get
+their own ``<seg>_<pk>`` columns, and all of them join the composite
+primary key. Use this when leaf IDs aren't unique across grandparent
+branches:
+
+```
+Parents_Id    Int — full ancestor chain
+Children_Id   Int
+Id            Int — Notes' own primary key
+Text          String
+```
+
+Primary key becomes ``[Parents_Id, Children_Id, Id]``.
 
 ### Read modes
 

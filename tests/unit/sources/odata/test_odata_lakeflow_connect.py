@@ -2119,6 +2119,60 @@ def test_get_table_schema_for_three_level_contained_immediate_parent_only():
 
 
 @responses.activate
+def test_get_table_schema_with_include_ancestor_ids_emits_full_chain():
+    """``include_ancestor_ids=true`` puts every non-leaf ancestor's PK
+    columns back onto the row."""
+    _mock_nested_metadata()
+    c = _make()
+    schema = c.get_table_schema("Parents__Children__Notes", {"include_ancestor_ids": "true"})
+    names = [f.name for f in schema.fields]
+    assert names == ["Parents_Id", "Children_Id", "Id", "Text"]
+
+
+@responses.activate
+def test_primary_keys_with_include_ancestor_ids_full_chain():
+    _mock_nested_metadata()
+    c = _make()
+    meta = c.read_table_metadata("Parents__Children__Notes", {"include_ancestor_ids": "true"})
+    assert meta["primary_keys"] == ["Parents_Id", "Children_Id", "Id"]
+
+
+@responses.activate
+def test_contained_snapshot_with_include_ancestor_ids_tags_full_chain():
+    """N+1 snapshot read tags rows with every ancestor's PK when
+    ``include_ancestor_ids=true``."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}]})
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={"value": [{"Id": 10}]},
+    )
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children(10)/Notes",
+        json={"value": [{"Id": 100, "Text": "x"}]},
+    )
+    c = _make()
+    records, _ = c.read_table("Parents__Children__Notes", None, {"include_ancestor_ids": "true"})
+    rows = list(records)
+    assert rows == [
+        {
+            "Parents_Id": 1,
+            "Children_Id": 10,
+            "Id": 100,
+            "Text": "x",
+        }
+    ]
+
+
+@responses.activate
+def test_include_ancestor_ids_rejects_invalid_value():
+    _mock_nested_metadata()
+    c = _make()
+    with pytest.raises(ValueError, match="Invalid include_ancestor_ids"):
+        c.read_table_metadata("Parents__Children__Notes", {"include_ancestor_ids": "yes"})
+
+
+@responses.activate
 def test_get_table_schema_for_contained_with_composite_parent_pk():
     """Parents__Tags has a composite-key leaf; FK prepend on a single-PK
     parent yields exactly one ancestor column. Inverse test (composite
