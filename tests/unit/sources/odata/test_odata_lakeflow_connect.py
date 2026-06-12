@@ -2644,3 +2644,35 @@ def test_contained_fk_default_naming_without_prefix():
     names = [f.name for f in schema.fields]
     assert names[0] == "Parents_Id"  # default form, no prefix
     assert not names[0].startswith("_")
+
+
+@responses.activate
+def test_lookup_in_type_only_namespace_lists_namespaces_with_entity_sets():
+    """When the user picks a type-only namespace (no <EntityContainer>),
+    "Available in this namespace: []" is unhelpful. The error should
+    list the namespaces that DO contain entity sets so the user can
+    pick the right one."""
+    type_only_xml = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema xmlns="http://docs.oasis-open.org/odata/ns/edm" Namespace="My.Types.V1">
+      <EntityType Name="Thing">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+      </EntityType>
+    </Schema>
+    <Schema xmlns="http://docs.oasis-open.org/odata/ns/edm" Namespace="My.Service.V1">
+      <EntityContainer Name="Container">
+        <EntitySet Name="Things" EntityType="My.Types.V1.Thing"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+    responses.get(f"{SERVICE_URL}$metadata", body=type_only_xml, status=200)
+    c = _make()
+    with pytest.raises(
+        ValueError,
+        match=r"declares no entity sets.*Namespaces with entity sets:.*My\.Service\.V1",
+    ):
+        c.read_table_metadata("Things", {"namespace": "My.Types.V1"})

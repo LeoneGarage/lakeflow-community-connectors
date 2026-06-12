@@ -2183,6 +2183,18 @@ def register_lakeflow_source(spark):
                 available = self._entity_set_index()
                 if namespace is not None:
                     hint = sorted({es for ns, es in available if ns == namespace})
+                    if not hint:
+                        # The requested namespace has zero entity sets — common
+                        # confusion when the user picks a type-only schema
+                        # (e.g. one declaring BaseType references) instead of
+                        # the schema whose <EntityContainer> declares the sets.
+                        others = sorted({ns for ns, _ in available if ns})
+                        raise ValueError(
+                            f"Entity set {table_name!r} not found in namespace "
+                            f"{namespace!r}. Namespace {namespace!r} declares "
+                            f"no entity sets (probably a type-only schema). "
+                            f"Namespaces with entity sets: {others}."
+                        )
                     raise ValueError(
                         f"Entity set {table_name!r} not found in namespace "
                         f"{namespace!r}. Available in this namespace: {hint}"
