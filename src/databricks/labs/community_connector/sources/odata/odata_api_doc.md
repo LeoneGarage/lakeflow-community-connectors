@@ -135,7 +135,7 @@ These are passed to the connector via the pipeline's `table_configuration` block
 | Option | Default | Description |
 | --- | --- | --- |
 | `namespace` | — | Selects the `<Schema Namespace="...">` block that declares this entity set. Required only when the same entity-set name appears in multiple schemas. |
-| `cursor_field` | — | Column to drive incremental reads. Absent → snapshot. Must be a top-level property of the entity type and naturally ordered by OData `$orderby` (timestamps and monotonic IDs are typical). |
+| `cursor_field` | — | Column to drive incremental reads. Absent → snapshot. Must be naturally ordered by OData `$orderby` (timestamps and monotonic IDs are typical). On flat tables, the column must be a property of the entity. On contained paths, the connector first checks the leaf entity for the column; if missing, it walks leaf→root to find the **closest ancestor** that has it, filters at that ancestor level, and propagates the ancestor's cursor value onto every emitted leaf row. |
 | `select` | all properties | Comma-separated `$select` projection. Both the on-wire OData query and the derived Spark schema are filtered to these columns. On contained paths, synthetic ancestor-FK columns (default form `<seg>_<pk>`) are always preserved regardless of `select`. |
 | `filter` | — | Additional OData `$filter` expression, AND-ed with any cursor filter the connector generates. Applies to the leaf collection only on contained paths. |
 | `page_size` | `1000` | Value of `$top` sent on each HTTP request. Sets the maximum rows per OData page. Some servers cap this server-side (see *Known limits*). |
@@ -406,6 +406,18 @@ Offset shape: `{"cursor": "<max_seen_value>"}` on natural completion, plus `"par
 Termination: when an end_offset equal to the start_offset would be returned (no new rows anywhere), the connector emits zero rows and the same offset, satisfying the framework's "no progress" stop condition.
 
 Known limitation: no same-cursor boundary trim across the truncation point (the flat path's `_trim_to_distinct_cursor_boundary` does not apply across parents). If a parent has more same-cursor rows than `max_records_per_batch`, the tail is lost on resume. Set `max_records_per_batch` above the largest expected same-cursor cohort per parent, or pick a higher-cardinality cursor.
+
+### Ancestor-cursor fallback
+
+When the leaf entity doesn't declare `cursor_field` as a property but one of its ancestors does, the connector falls through to **ancestor-level filtering**:
+
+1. `_find_cursor_level` walks `segments` leaf → root and returns the index of the closest segment whose entity type has the column.
+2. The chain walk at that level includes `cursor_field` in `$select`, applies `$filter=<cursor> gt <since>` (on resume) and `$orderby=<cursor> asc, <pks> asc`. Other ancestor levels still fetch just their PKs.
+3. For each matching ancestor tuple, the leaf collection is fetched **unfiltered** (the leaf doesn't have the column to filter by), and every emitted leaf row is stamped with the ancestor's cursor value under `cursor_field`.
+4. `get_table_schema` includes `cursor_field` in the leaf schema with the ancestor's declared type (e.g. `TimestampType` for `Edm.DateTimeOffset`).
+5. The offset tracks the max ancestor-cursor seen across the batch, same shape as the leaf-cursor case.
+
+If `cursor_field` isn't a property anywhere along the path, `read_table` raises a `ValueError` naming the table.
 
 ### Mutex with delta tracking
 
