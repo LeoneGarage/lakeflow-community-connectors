@@ -130,19 +130,20 @@ OData-MaxVersion: 4.0
 
 ## Per-table options
 
-These are passed to the connector via the pipeline's `table_configuration` block. Every key listed below must appear in `external_options_allowlist` on the UC connection (the spec already includes all six).
+These are passed to the connector via the pipeline's `table_configuration` block. Every key listed below must appear in `external_options_allowlist` on the UC connection (the spec already includes all of them).
 
 | Option | Default | Description |
 | --- | --- | --- |
 | `namespace` | — | Selects the `<Schema Namespace="...">` block that declares this entity set. Required only when the same entity-set name appears in multiple schemas. |
 | `cursor_field` | — | Column to drive incremental reads. Absent → snapshot. Must be a top-level property of the entity type and naturally ordered by OData `$orderby` (timestamps and monotonic IDs are typical). |
-| `select` | all properties | Comma-separated `$select` projection. Both the on-wire OData query and the derived Spark schema are filtered to these columns. |
-| `filter` | — | Additional OData `$filter` expression, AND-ed with any cursor filter the connector generates. |
+| `select` | all properties | Comma-separated `$select` projection. Both the on-wire OData query and the derived Spark schema are filtered to these columns. On contained paths, synthetic `_parent_<seg>_<pk>` ancestor-FK columns are always preserved regardless of `select`. |
+| `filter` | — | Additional OData `$filter` expression, AND-ed with any cursor filter the connector generates. Applies to the leaf collection only on contained paths. |
 | `page_size` | `1000` | Value of `$top` sent on each HTTP request. Sets the maximum rows per OData page. Some servers cap this server-side (see *Known limits*). |
 | `max_records_per_batch` | `100000` | Client-side cap on records returned per `read_table` call. The connector truncates and returns control to the framework once this limit is hit. Independent of `page_size`. |
-| `delta_tracking` | `disabled` | Opt-in OData v4 delta queries. `disabled` keeps the existing snapshot / cursor behavior; `auto` probes the server's `Prefer: odata.track-changes` support once per table and falls back if missing; `enabled` requires support and errors on the first read if the server doesn't acknowledge. See [Delta tracking](#delta-tracking-contract). |
+| `delta_tracking` | `disabled` | Opt-in OData v4 delta queries. `disabled` keeps the existing snapshot / cursor behavior; `auto` probes the server's `Prefer: odata.track-changes` support once per table and falls back if missing; `enabled` requires support and errors on the first read if the server doesn't acknowledge. See [Delta tracking](#delta-tracking-contract). Mutually exclusive with contained-path tables. |
+| `expand_contained` | `false` | For contained-collection paths (`Parent/Child/...`). When `true`, a single `GET Parent?$expand=Child(...)` replaces the default N+1 per-parent traversal. See [Contained navigation properties](#contained-navigation-properties). |
 
-`namespace` is consumed by the connector before the request is built; the other six all influence the URL, the per-batch loop, or the request semantics.
+`namespace` is consumed by the connector before the request is built; the rest all influence the URL, the per-batch loop, or the request semantics.
 
 ---
 
@@ -336,6 +337,79 @@ GET https://graph.microsoft.com/v1.0/users?$deltatoken=B
 ```
 
 Emitted: zero rows. Offset: `{"delta_link": "https://...users?$deltatoken=B"}` — prior link preserved by the rotation guard, so the framework sees no progress and the trigger terminates.
+
+---
+
+## Contained navigation properties
+
+OData v4 §13.4.3 defines `<NavigationProperty ContainsTarget="true">` on an EntityType: a collection that is *owned by* the parent entity rather than declared as a top-level EntitySet. The contained collection is addressed by traversing the parent's key — `GET Parent(<key>)/ContainedNavProp` — and each parent has its own independent contained collection. The protocol allows recursive containment, so a service can declare `Parent → Child → Grandchild → ...` chains.
+
+The connector surfaces these as slash-pathed tables alongside top-level entity sets, e.g. `Parents/Children/Notes`, up to **5 segments deep** (the depth cap prevents pathological discovery walks on services that declare circular containment; cycles within the cap are also detected and broken). Path parsing rejects empty segments and over-depth paths at `read_table_metadata` / `get_table_schema` time.
+
+### Discovery
+
+`list_tables_in_namespace([<schema>])` returns both:
+
+- Top-level entity sets declared in the schema's `<EntityContainer>`.
+- Every contained-collection path reachable from those sets via a BFS through `ContainsTarget="true"` navigation properties (inherited from base types too), capped at `_MAX_CONTAINED_DEPTH = 5` and with cycle detection on the type-qualified name set.
+
+Output is deterministic — flat sets sorted first, then contained paths sorted.
+
+### Schema augmentation
+
+For a path with N segments, the leaf entity's own properties are preceded by synthetic ancestor-FK columns, one set per non-leaf segment:
+
+```
+_parent_<segment1>_<pkname1...>   ← primary keys of segment 1's entity type
+_parent_<segment2>_<pkname2...>   ← primary keys of segment 2
+...
+<leaf's own properties>
+```
+
+The composite primary key reported in `read_table_metadata` is the full chain: every ancestor FK column followed by the leaf's own primary-key columns. This lets `apply_changes` uniquely identify rows across the parent fan-out.
+
+When a parent has a composite primary key, every key column gets its own `_parent_<seg>_<pk>` field. Names cannot collide because each segment label is part of the column name (`_parent_Parents_Id` vs `_parent_Children_Id`).
+
+`select` on a contained path filters only the leaf entity's own properties — the synthetic ancestor-FK columns are always preserved.
+
+### Read modes
+
+Selected via `expand_contained`:
+
+**Default — N+1 traversal (`expand_contained=false`).** For a path `A/B/C/D`:
+
+1. `GET A?$select=<A_pks>&$top=<page_size>` — enumerate top-level parent keys.
+2. For each `A_key`: `GET A(<A_key>)/B?$select=<B_pks>` — enumerate level-2 parents.
+3. For each `(A_key, B_key)`: `GET A(<A_key>)/B(<B_key>)/C?$select=<C_pks>` — enumerate level-3.
+4. For each `(A_key, B_key, C_key)`: `GET A(<A_key>)/B(<B_key>)/C(<C_key>)/D?<query>` — fetch leaves.
+
+Pagination (`@odata.nextLink`) walks happen *within* each per-parent fetch. Cost is O(product of parent fanouts) HTTP round trips; bandwidth is proportional to leaf row count plus a small overhead for the PK-only enumerations.
+
+Key predicate quoting: single-key parents use the bare form `(value)`; composite-key parents use the named form `(K1=v1,K2=v2)`. String values pass through `_odata_literal` for single-quote escaping; timestamps pass through bare per OData v4 §5.1.1.6.1.
+
+**Opt-in — single `$expand` chain (`expand_contained=true`).** One HTTP request per pipeline trigger:
+
+```
+GET A?$select=...&$top=...&$expand=B($expand=C($expand=D))
+```
+
+The connector flattens the nested JSON response recursively: for each top row, descend into the named nav-property array on each level, extracting and propagating ancestor PK values until the leaf level is reached. `@odata.*` control properties are stripped from leaf rows during flattening (the top-level `_fetch_pages` strip is applied only to outermost rows).
+
+Most OData servers cap `$expand` depth at 1; deeper expands surface as HTTP 4xx and propagate verbatim. Known to honor depth ≥ 2: Microsoft Graph (some endpoints), SAP S/4HANA Cloud (per-service configuration). Don't enable against a server you haven't verified.
+
+### Cursor-based incremental on contained paths
+
+Set `cursor_field` to a column on the leaf entity. The connector walks every parent tuple per `read_table` call, applies `$filter=cursor gt since` and `$orderby=cursor asc, leaf_pk asc` to each per-parent fetch, and tracks the global max cursor across all parents in the offset's `cursor` key.
+
+Offset shape: `{"cursor": "<max_seen_value>"}` on natural completion, plus `"parent_idx": <int>` when truncated mid-walk by `max_records_per_batch`. The mid-walk resume re-walks from `parent_idx` with the advanced cursor, so rows already emitted within that parent are elided by the filter.
+
+Termination: when an end_offset equal to the start_offset would be returned (no new rows anywhere), the connector emits zero rows and the same offset, satisfying the framework's "no progress" stop condition.
+
+Known limitation: no same-cursor boundary trim across the truncation point (the flat path's `_trim_to_distinct_cursor_boundary` does not apply across parents). If a parent has more same-cursor rows than `max_records_per_batch`, the tail is lost on resume. Set `max_records_per_batch` above the largest expected same-cursor cohort per parent, or pick a higher-cardinality cursor.
+
+### Mutex with delta tracking
+
+`delta_tracking=enabled` on a contained path raises `ValueError` at `read_table` dispatch — server-driven change tracking is defined against top-level entity sets in OData v4 §11.3, not parent-keyed traversals. `delta_tracking=auto` silently resolves to disabled on contained paths (the auto-probe is skipped; the URL shape isn't compatible with the probe's GET).
 
 ---
 

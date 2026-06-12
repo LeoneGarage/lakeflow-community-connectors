@@ -593,6 +593,399 @@ def register_lakeflow_source(spark):
 
 
     ########################################################
+    # src/databricks/labs/community_connector/sources/odata/_contained.py
+    ########################################################
+
+    CONTAINED_PATH_SEP = "/"
+    PARENT_FK_PREFIX = "_parent_"
+    # Cap on path depth. Prevents pathological discovery walks on services
+    # with cyclic containment graphs; cycles within the cap are also
+    # detected via target-type tracking.
+    MAX_CONTAINED_DEPTH = 5
+
+
+    def join_url(base: str, suffix: str) -> str:
+        """Append ``suffix`` to ``base`` with at most one slash."""
+        return f"{base}{suffix}" if base.endswith("/") else f"{base}/{suffix}"
+
+
+    def looks_like_iso8601(s: str) -> bool:
+        """Cheap ISO-8601 sniff used by ``odata_literal`` to render bare timestamps."""
+        if len(s) < 10 or s[4] != "-" or s[7] != "-":
+            return False
+        try:
+            datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return True
+        except ValueError:
+            return False
+
+
+    def odata_literal(value: Any) -> str:
+        """Render a Python value as an OData v4 literal for $filter."""
+        if isinstance(value, datetime):
+            return value.isoformat().replace("+00:00", "Z")
+        if isinstance(value, date):
+            return value.isoformat()
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, int | float | Decimal):
+            return str(value)
+        s = str(value)
+        if looks_like_iso8601(s):
+            return s
+        return "'" + s.replace("'", "''") + "'"
+
+
+    # Re-export of the EDM namespace prefix used by the main module.
+    _NS_EDM = "{http://docs.oasis-open.org/odata/ns/edm}"
+
+
+    def parse_contained_path(table_name: str) -> list[str] | None:
+        """Split slash-delimited path; ``None`` for flat single-segment names."""
+        if CONTAINED_PATH_SEP not in table_name:
+            return None
+        segments = table_name.split(CONTAINED_PATH_SEP)
+        if any(not s for s in segments):
+            raise ValueError(
+                f"Empty path segment in contained table name {table_name!r}; "
+                "expected 'Parent/Child' or 'Parent/Child/Grandchild' form."
+            )
+        if len(segments) > MAX_CONTAINED_DEPTH:
+            raise ValueError(
+                f"Contained path {table_name!r} exceeds max depth "
+                f"{MAX_CONTAINED_DEPTH} (got {len(segments)})."
+            )
+        return segments
+
+
+    def contained_nav_props(entity_type: ET.Element) -> list[tuple[str, str]]:
+        """``[(nav_name, target_type_ref), ...]`` for ContainsTarget collection
+        nav props declared directly on this type; singletons skipped."""
+        out: list[tuple[str, str]] = []
+        for np in entity_type.findall(f"{_NS_EDM}NavigationProperty"):
+            if (np.get("ContainsTarget") or "").lower() != "true":
+                continue
+            type_ref = np.get("Type", "")
+            if not (type_ref.startswith("Collection(") and type_ref.endswith(")")):
+                continue
+            out.append((np.get("Name"), type_ref[len("Collection(") : -1]))
+        return out
+
+
+    def fk_column_name(segment: str, pk_name: str) -> str:
+        """``_parent_<segment>_<pkname>`` — keeps same-named PKs distinct across ancestors."""
+        return f"{PARENT_FK_PREFIX}{segment}_{pk_name}"
+
+
+    class ContainedNavMixin:
+        """Mixin providing contained-collection support for the OData connector.
+
+        Plug in via ``class ODataLakeflowConnect(LakeflowConnect,
+        SupportsNamespaces, ContainedNavMixin):``. All methods duck-type
+        against the concrete class for HTTP/URL/metadata helpers.
+        """
+
+        def _all_contained_nav_props(self, entity_type: ET.Element) -> list[tuple[str, str]]:
+            """Contained nav props on the type and its base chain (closest-
+            descendant wins on name collision)."""
+            out: dict[str, str] = {}
+            for type_el in self._resolve_base_chain(entity_type):
+                for name, ref in contained_nav_props(type_el):
+                    out.setdefault(name, ref)
+            return list(out.items())
+
+        def _enumerate_contained_paths(self, top_level_set: str, namespace: str | None) -> list[str]:
+            """BFS contained nav-property graph; cap at MAX_CONTAINED_DEPTH;
+            break cycles via target-type set."""
+            try:
+                root_et = self._flat_entity_type_for(top_level_set, namespace)
+            except ValueError:
+                return []
+            paths: list[str] = []
+            root = self._metadata_root()
+            type_to_qname: dict[ET.Element, str] = {
+                et: f"{schema.get('Namespace') or ''}.{et.get('Name')}"
+                for schema in root.iter(f"{_NS_EDM}Schema")
+                for et in schema.findall(f"{_NS_EDM}EntityType")
+            }
+            queue: list[tuple[list[str], ET.Element, set[str]]] = [
+                ([top_level_set], root_et, {type_to_qname.get(root_et, "")})
+            ]
+            while queue:
+                segments, et, seen = queue.pop(0)
+                if len(segments) >= MAX_CONTAINED_DEPTH:
+                    continue
+                for nav_name, target_ref in self._all_contained_nav_props(et):
+                    if target_ref in seen:
+                        continue
+                    target_et = self._resolve_type_ref(target_ref)
+                    if target_et is None:
+                        continue
+                    new_segments = segments + [nav_name]
+                    paths.append(CONTAINED_PATH_SEP.join(new_segments))
+                    queue.append((new_segments, target_et, seen | {target_ref}))
+            return paths
+
+        # --- option parsing ----------------------------------------------------
+
+        def _expand_contained_active(self, table_options: dict[str, str] | None) -> bool:
+            """Parse the boolean ``expand_contained`` table option."""
+            raw = ((table_options or {}).get("expand_contained") or "false").strip().lower()
+            if raw not in {"true", "false"}:
+                raise ValueError(f"Invalid expand_contained={raw!r}. Expected one of: true, false.")
+            return raw == "true"
+
+        # --- URL construction --------------------------------------------------
+
+        def _format_key_predicate(self, pk_values: dict[str, Any]) -> str:
+            """``(value)`` for single key; ``(K1=v1,K2=v2)`` for composite."""
+            if len(pk_values) == 1:
+                return f"({odata_literal(next(iter(pk_values.values())))})"
+            return "(" + ",".join(f"{k}={odata_literal(v)}" for k, v in pk_values.items()) + ")"
+
+        def _build_contained_path(self, segments: list[str], key_chain: list[dict[str, Any]]) -> str:
+            """``A(1)/B('x')/C`` — leaf segment has no key; ``key_chain`` len = N-1."""
+            if len(key_chain) != len(segments) - 1:
+                raise ValueError(
+                    f"key_chain length {len(key_chain)} does not match "
+                    f"non-leaf segment count {len(segments) - 1}"
+                )
+            return CONTAINED_PATH_SEP.join(
+                f"{seg}{self._format_key_predicate(key_chain[i])}" if i < len(key_chain) else seg
+                for i, seg in enumerate(segments)
+            )
+
+        def _build_contained_url(
+            self,
+            segments: list[str],
+            key_chain: list[dict[str, Any]],
+            table_options: dict[str, str],
+            extra_filter: str | None = None,
+            order_by: str | None = None,
+        ) -> str:
+            """Full URL for a contained-collection read at one parent tuple."""
+            base = join_url(self.service_url, self._build_contained_path(segments, key_chain))
+            return f"{base}?{self._format_query_params(table_options, extra_filter, order_by)}"
+
+        def _build_expand_url(
+            self,
+            segments: list[str],
+            table_options: dict[str, str],
+            extra_filter: str | None = None,
+            order_by: str | None = None,
+        ) -> str:
+            """``A?...&$expand=B($expand=C($expand=D))`` for the full chain."""
+            top, *children = segments
+            base = join_url(self.service_url, top)
+            query = self._format_query_params(table_options, extra_filter, order_by)
+            if not children:
+                return f"{base}?{query}"
+            expand = ""
+            for child in reversed(children):
+                expand = f"{child}($expand={expand})" if expand else child
+            return f"{base}?{query}&$expand={expand}"
+
+        # --- read paths --------------------------------------------------------
+
+        def _tag_with_ancestor_fks(
+            self,
+            row: dict,
+            segments: list[str],
+            chain: list[dict[str, Any]],
+        ) -> None:
+            """Add ``_parent_<seg>_<pk>`` keys to ``row`` in place."""
+            for idx, ancestor_keys in enumerate(chain):
+                seg = segments[idx]
+                for pk_name, pk_val in ancestor_keys.items():
+                    row[fk_column_name(seg, pk_name)] = pk_val
+
+        def _iter_parent_key_chains(
+            self,
+            segments: list[str],
+            namespace: str | None,
+            table_options: dict[str, str] | None,
+        ) -> Iterator[list[dict[str, Any]]]:
+            """Yield every ancestor key chain (len = len(segments) - 1) reaching
+            the leaf. Each level fetched with ``$select=<pks>``; user ``filter``
+            not forwarded."""
+
+            def _walk(level: int, chain: list[dict[str, Any]]):
+                if level == len(segments) - 1:
+                    yield list(chain)
+                    return
+                sub_segments = segments[: level + 1]
+                ancestor_et = self._entity_type_for(CONTAINED_PATH_SEP.join(sub_segments), namespace)
+                ancestor_pks = self._own_primary_keys_for_et(ancestor_et)
+                if not ancestor_pks:
+                    raise ValueError(
+                        f"Cannot walk contained path: segment {segments[level]!r} "
+                        f"has no primary key declared in $metadata."
+                    )
+                opts = {
+                    "page_size": (table_options or {}).get("page_size", "1000"),
+                    "select": ",".join(ancestor_pks),
+                }
+                url = (
+                    self._build_url(segments[0], opts)
+                    if level == 0
+                    else self._build_contained_url(sub_segments, chain, opts)
+                )
+                for row in self._fetch_pages(url):
+                    chain.append({pk: row.get(pk) for pk in ancestor_pks})
+                    yield from _walk(level + 1, chain)
+                    chain.pop()
+
+            yield from _walk(0, [])
+
+        def _read_contained_snapshot(
+            self, table_name: str, table_options: dict[str, str]
+        ) -> tuple[Iterator[dict], dict]:
+            """Walk the parent-key tree N+1 and emit leaf rows tagged with
+            ancestor FKs. Full result in one call."""
+            segments = parse_contained_path(table_name) or [table_name]
+            namespace = (table_options or {}).get("namespace")
+            emitted: list[dict] = []
+            for chain in self._iter_parent_key_chains(segments, namespace, table_options):
+                for row in self._fetch_pages(self._build_contained_url(segments, chain, table_options)):
+                    self._tag_with_ancestor_fks(row, segments, chain)
+                    emitted.append(row)
+            return iter(emitted), {}
+
+        def _read_contained_expand(
+            self, table_name: str, table_options: dict[str, str]
+        ) -> tuple[Iterator[dict], dict]:
+            """Single GET with nested ``$expand``; flatten the response into
+            leaf rows tagged with ancestor FKs. Server depth caps surface as
+            HTTP 4xx — no client-side fallback."""
+            segments = parse_contained_path(table_name) or [table_name]
+            if len(segments) < 2:
+                raise ValueError(f"expand_contained requires a contained path; {table_name!r} is flat.")
+            namespace = (table_options or {}).get("namespace")
+            pks_per_level: list[list[str]] = []
+            for idx in range(len(segments) - 1):
+                et = self._entity_type_for(CONTAINED_PATH_SEP.join(segments[: idx + 1]), namespace)
+                pks = self._own_primary_keys_for_et(et)
+                if not pks:
+                    raise ValueError(
+                        f"Cannot $expand contained path: segment {segments[idx]!r} "
+                        f"has no primary key declared in $metadata."
+                    )
+                pks_per_level.append(pks)
+            emitted: list[dict] = []
+            for top_row in self._fetch_pages(self._build_expand_url(segments, table_options)):
+                self._flatten_expand_response(0, top_row, segments, pks_per_level, [], emitted)
+            return iter(emitted), {}
+
+        def _flatten_expand_response(
+            self,
+            level: int,
+            row: dict,
+            segments: list[str],
+            pks_per_level: list[list[str]],
+            chain: list[dict[str, Any]],
+            out: list[dict],
+        ) -> None:
+            """Recurse into the nested $expand payload; tag and emit leaf rows."""
+            if level == len(segments) - 1:
+                clean = {k: v for k, v in row.items() if not k.startswith("@odata.")}
+                self._tag_with_ancestor_fks(clean, segments, chain)
+                out.append(clean)
+                return
+            pks = pks_per_level[level]
+            chain.append({pk: row.get(pk) for pk in pks})
+            for child in row.get(segments[level + 1]) or []:
+                self._flatten_expand_response(level + 1, child, segments, pks_per_level, chain, out)
+            chain.pop()
+
+        def _leaf_cursor_order_by(
+            self, table_name: str, namespace: str | None, cursor_field: str
+        ) -> str:
+            """``cursor asc, pk1 asc, ...`` — unique total order so server
+            skiptokens don't split same-cursor cohorts."""
+            leaf_pks = self._own_primary_keys_for_et(self._entity_type_for(table_name, namespace))
+            terms = [f"{cursor_field} asc"]
+            terms.extend(f"{pk} asc" for pk in leaf_pks if pk != cursor_field)
+            return ",".join(terms)
+
+        def _walk_contained_with_cursor(
+            self,
+            segments: list[str],
+            chains: list[list[dict[str, Any]]],
+            parent_idx_start: int,
+            table_options: dict[str, str],
+            extra_filter: str | None,
+            order_by: str,
+            cursor_field: str,
+            since: Any,
+            max_records: int,
+        ) -> tuple[list[dict], bool, int]:
+            """Drive the per-parent fetch loop; return (rows, truncated, parent_idx)."""
+            emitted: list[dict] = []
+            truncated = False
+            parent_idx = parent_idx_start
+            while parent_idx < len(chains):
+                chain = chains[parent_idx]
+                url = self._build_contained_url(
+                    segments,
+                    chain,
+                    table_options,
+                    extra_filter=extra_filter,
+                    order_by=order_by,
+                )
+                for row in self._fetch_pages(url):
+                    rec_cursor = row.get(cursor_field)
+                    if since is not None and rec_cursor is not None and rec_cursor <= since:
+                        continue
+                    self._tag_with_ancestor_fks(row, segments, chain)
+                    emitted.append(row)
+                    if len(emitted) >= max_records:
+                        truncated = True
+                        break
+                if truncated:
+                    break
+                parent_idx += 1
+            return emitted, truncated, parent_idx
+
+        def _read_contained_incremental(
+            self,
+            table_name: str,
+            start_offset: dict,
+            table_options: dict[str, str],
+            cursor_field: str,
+        ) -> tuple[Iterator[dict], dict]:
+            """Walk every parent tuple with ``$filter=cursor gt since``; track
+            global max cursor in the offset. Truncation parks ``parent_idx``
+            for next-call resume."""
+            segments = parse_contained_path(table_name) or [table_name]
+            namespace = (table_options or {}).get("namespace")
+            since = (start_offset or {}).get("cursor")
+            max_records = int((table_options or {}).get("max_records_per_batch", "100000"))
+            order_by = self._leaf_cursor_order_by(table_name, namespace, cursor_field)
+            extra_filter = self._cursor_filter(cursor_field, since)
+            chains = list(self._iter_parent_key_chains(segments, namespace, table_options))
+            emitted, truncated, parent_idx = self._walk_contained_with_cursor(
+                segments,
+                chains,
+                int((start_offset or {}).get("parent_idx", 0)),
+                table_options,
+                extra_filter,
+                order_by,
+                cursor_field,
+                since,
+                max_records,
+            )
+            if not emitted:
+                return iter([]), start_offset or {}
+            cursors = [r.get(cursor_field) for r in emitted if r.get(cursor_field) is not None]
+            end_offset: dict = {"cursor": max(cursors) if cursors else since}
+            if truncated:
+                end_offset["parent_idx"] = parent_idx
+            if start_offset and start_offset == end_offset:
+                return iter([]), start_offset
+            return iter(emitted), end_offset
+
+
+    ########################################################
     # src/databricks/labs/community_connector/sources/odata/odata.py
     ########################################################
 
@@ -651,7 +1044,7 @@ def register_lakeflow_source(spark):
         return f"{now}_{next(_SEQUENCE_COUNTER):012d}"
 
 
-    class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces):
+    class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces, ContainedNavMixin):
         """LakeflowConnect implementation for OData v4 services.
 
         OData ``$metadata`` documents can declare multiple ``<Schema>`` blocks,
@@ -689,13 +1082,14 @@ def register_lakeflow_source(spark):
         def list_tables(self) -> list[str]:
             """Flat fallback used by the framework when SupportsNamespaces is absent.
 
-            Returns deduped entity set names across every schema. The
-            namespace-aware methods below are what the framework actually
-            prefers when ``SupportsNamespaces`` is in the MRO.
+            Includes both top-level entity sets and contained collections
+            reachable via ``ContainsTarget="true"`` navigation properties
+            (slash-pathed, e.g. ``Instances/Assets/AssetDocuments``).
             """
             names: set[str] = set()
             for ns, es_name in self._entity_set_index():
                 names.add(es_name)
+                names.update(self._enumerate_contained_paths(es_name, ns))
             return sorted(names)
 
         def list_namespaces(self, prefix: list[str] | None = None) -> list[list[str]]:
@@ -714,7 +1108,11 @@ def register_lakeflow_source(spark):
                 # attribute; root-level tables don't exist in OData v4.
                 return []
             target = namespace[0]
-            return sorted({es for ns, es in index if ns == target})
+            flat = sorted({es for ns, es in index if ns == target})
+            contained: set[str] = set()
+            for es_name in flat:
+                contained.update(self._enumerate_contained_paths(es_name, target))
+            return flat + sorted(contained)
 
         def get_table_schema(self, table_name: str, table_options: dict[str, str]) -> StructType:
             namespace = (table_options or {}).get("namespace")
@@ -722,7 +1120,10 @@ def register_lakeflow_source(spark):
             select = (table_options or {}).get("select")
             if select:
                 wanted = {c.strip() for c in select.split(",")}
-                fields = [f for f in fields if f.name in wanted]
+                # Always preserve synthetic ancestor FK columns on contained
+                # paths — ``select`` filters the leaf entity's own columns,
+                # not the parent linkage.
+                fields = [f for f in fields if f.name.startswith(_PARENT_FK_PREFIX) or f.name in wanted]
             if not fields:
                 raise ValueError(
                     f"Could not derive a non-empty schema for entity set {table_name!r}. "
@@ -744,14 +1145,11 @@ def register_lakeflow_source(spark):
             namespace = (table_options or {}).get("namespace")
             primary_keys = self._primary_keys_for(table_name, namespace)
             user_cursor = (table_options or {}).get("cursor_field")
-            if self._delta_active_for(table_name, table_options):
-                # Delta-tracked tables: server delivers change events, the
-                # connector adds ``_deleted`` for tombstones and uses the
-                # synthetic ``_lc_sequence`` so apply_changes has a
-                # deterministic sequence column. ``cdc`` (not
-                # ``cdc_with_deletes``) — following the microsoft_teams
-                # convention of in-band deletes — keeps the framework's
-                # read_table / read_table_deletes split out of the picture.
+            # Contained paths skip the delta probe (server delta is for
+            # top-level sets only; mutex enforced in dispatch below).
+            if _parse_contained_path(table_name) is None and self._delta_active_for(
+                table_name, table_options
+            ):
                 return {
                     "primary_keys": primary_keys,
                     "cursor_field": _SEQUENCE_COL,
@@ -768,12 +1166,24 @@ def register_lakeflow_source(spark):
         ) -> tuple[Iterator[dict], dict]:
             opts = table_options or {}
             offset = start_offset or {}
-            # Dispatch on (a) what the prior offset says we're mid-stream of,
-            # and (b) whether delta tracking is active for this table. The
-            # offset-shape check covers both modes resuming from a
-            # checkpointed offset and the very first call after delta got
-            # turned on (offset is empty either way until delta produces a
-            # link).
+            if _parse_contained_path(table_name) is not None:
+                if self._delta_setting(opts) == "enabled":
+                    raise ValueError(
+                        "delta_tracking=enabled is not supported on contained-"
+                        "collection paths (server change tracking only applies "
+                        "to top-level entity sets). Set delta_tracking=disabled "
+                        "or ingest the parent set directly."
+                    )
+                if self._expand_contained_active(opts):
+                    return self._read_contained_expand(table_name, opts)
+                if opts.get("cursor_field"):
+                    return self._read_contained_incremental(
+                        table_name, offset, opts, opts["cursor_field"]
+                    )
+                return self._read_contained_snapshot(table_name, opts)
+            # Offset-shape check ahead of the delta predicate so a resumed
+            # delta stream (offset carries delta_link / next_link) takes the
+            # delta path even if delta_tracking is no longer set in options.
             if (
                 "delta_link" in offset
                 or "next_link" in offset
@@ -1315,24 +1725,25 @@ def register_lakeflow_source(spark):
             order_by: str | None = None,
         ) -> str:
             base = _join_url(self.service_url, table_name)
-            params = []
+            return f"{base}?{self._format_query_params(table_options, extra_filter, order_by)}"
 
-            page_size = table_options.get("page_size", "1000")
-            params.append(f"$top={page_size}")
-
-            select = table_options.get("select")
-            if select:
-                params.append(f"$select={select}")
-
-            filters = [f for f in (table_options.get("filter"), extra_filter) if f]
+        def _format_query_params(
+            self,
+            table_options: dict[str, str],
+            extra_filter: str | None = None,
+            order_by: str | None = None,
+        ) -> str:
+            """Compose $top/$select/$filter/$orderby; shared across all URL builders."""
+            opts = table_options or {}
+            params = [f"$top={opts.get('page_size', '1000')}"]
+            if opts.get("select"):
+                params.append(f"$select={opts['select']}")
+            filters = [f for f in (opts.get("filter"), extra_filter) if f]
             if filters:
-                joined = " and ".join(f"({f})" for f in filters)
-                params.append(f"$filter={joined}")
-
+                params.append(f"$filter={' and '.join(f'({f})' for f in filters)}")
             if order_by:
                 params.append(f"$orderby={order_by}")
-
-            return f"{base}?{'&'.join(params)}"
+            return "&".join(params)
 
         def _fetch_pages(self, url: str) -> Iterator[dict]:
             """Walk @odata.nextLink, yielding raw JSON dicts (no coercion).
@@ -1665,14 +2076,33 @@ def register_lakeflow_source(spark):
             return out
 
         def _entity_type_for(self, table_name: str, namespace: str | None = None) -> ET.Element:
-            """Find the EntityType element backing ``table_name``.
+            """Resolve flat names or contained paths (segment-by-segment via
+            contained nav props on the base-type chain)."""
+            segments = _parse_contained_path(table_name) or [table_name]
+            et = self._flat_entity_type_for(segments[0], namespace)
+            for idx, child_segment in enumerate(segments[1:], start=1):
+                nav_props = self._all_contained_nav_props(et)
+                target_ref = next((r for n, r in nav_props if n == child_segment), None)
+                if target_ref is None:
+                    walked = _CONTAINED_PATH_SEP.join(segments[:idx])
+                    raise ValueError(
+                        f"{child_segment!r} is not a contained-collection navigation "
+                        f"property on {walked!r}. Available contained collections: "
+                        f"{sorted(n for n, _ in nav_props)}"
+                    )
+                target_et = self._resolve_type_ref(target_ref)
+                if target_et is None:
+                    raise ValueError(
+                        f"Contained navigation target {target_ref!r} (referenced by "
+                        f"{child_segment!r} on {segments[idx - 1]!r}) not found in $metadata."
+                    )
+                et = target_et
+            return et
 
-            When ``namespace`` is None and the same name is declared in more
-            than one schema, this raises so the caller passes ``namespace``
-            in *table_options* to disambiguate.
-            """
+        def _flat_entity_type_for(self, table_name: str, namespace: str | None = None) -> ET.Element:
+            """Resolve a top-level entity-set name to its EntityType element."""
             root = self._metadata_root()
-            matches: list[tuple[str, str]] = []  # (schema_ns, qualified_type_ref)
+            matches: list[tuple[str, str]] = []
             for schema in root.iter(f"{_NS_EDM}Schema"):
                 ns = schema.get("Namespace") or ""
                 if namespace is not None and ns != namespace:
@@ -1681,7 +2111,6 @@ def register_lakeflow_source(spark):
                     for es in container.iter(f"{_NS_EDM}EntitySet"):
                         if es.get("Name") == table_name:
                             matches.append((ns, es.get("EntityType")))
-
             if not matches:
                 available = self._entity_set_index()
                 if namespace is not None:
@@ -1700,7 +2129,6 @@ def register_lakeflow_source(spark):
                     f"Entity set {table_name!r} is declared in multiple namespaces: "
                     f"{namespaces}. Set 'namespace' in table_options to disambiguate."
                 )
-
             schema_ns, type_ref = matches[0]
             et = self._resolve_type_ref(type_ref)
             if et is None:
@@ -1786,37 +2214,66 @@ def register_lakeflow_source(spark):
             return chain
 
         def _fields_for(self, table_name: str, namespace: str | None = None) -> list[StructField]:
-            et = self._entity_type_for(table_name, namespace)
-            # Aggregate properties across the inheritance chain. Walk from
-            # the root base type down to the leaf so inherited fields
-            # (typically ``id`` and any timestamp fields on
-            # ``graph.directoryObject``) appear before the leaf's own
-            # additions — matches the order a developer reading the CSDL
-            # would expect. Derived types can ADD properties; spec forbids
-            # them from REDEFINING base properties, so we de-dupe by name
-            # and let the closest-to-root declaration win.
+            segments = _parse_contained_path(table_name) or [table_name]
+            own_fields = self._own_fields_for_et(self._entity_type_for(table_name, namespace))
+            if len(segments) == 1:
+                return own_fields
+            # Prepend ``_parent_<seg>_<pk>`` columns for each non-leaf segment.
+            fk_fields: list[StructField] = []
+            for idx in range(len(segments) - 1):
+                ancestor_et = self._entity_type_for(
+                    _CONTAINED_PATH_SEP.join(segments[: idx + 1]), namespace
+                )
+                own = {f.name: f.dataType for f in self._own_fields_for_et(ancestor_et)}
+                for pk in self._own_primary_keys_for_et(ancestor_et):
+                    fk_fields.append(
+                        StructField(
+                            _fk_column_name(segments[idx], pk),
+                            own.get(pk, StringType()),
+                            False,
+                        )
+                    )
+            return fk_fields + own_fields
+
+        def _own_fields_for_et(self, et: ET.Element) -> list[StructField]:
+            """Property fields on ``et`` and its base chain. Walks root → leaf
+            so inherited fields appear before leaf's own additions; de-dupes
+            by name with closest-to-root winning (spec forbids redeclaration)."""
             fields: list[StructField] = []
-            seen_names: set[str] = set()
+            seen: set[str] = set()
             for type_el in reversed(self._resolve_base_chain(et)):
                 for prop in type_el.findall(f"{_NS_EDM}Property"):
                     name = prop.get("Name")
-                    if name in seen_names:
+                    if name in seen:
                         continue
-                    seen_names.add(name)
-                    edm_type = prop.get("Type", "Edm.String")
-                    nullable = prop.get("Nullable", "true").lower() != "false"
-                    spark_type = _EDM_TO_SPARK.get(edm_type, StringType())
-                    fields.append(StructField(name, spark_type, nullable))
+                    seen.add(name)
+                    fields.append(
+                        StructField(
+                            name,
+                            _EDM_TO_SPARK.get(prop.get("Type", "Edm.String"), StringType()),
+                            prop.get("Nullable", "true").lower() != "false",
+                        )
+                    )
             return fields
 
         def _primary_keys_for(self, table_name: str, namespace: str | None = None) -> list[str]:
-            et = self._entity_type_for(table_name, namespace)
-            # OData v4 §8.4: derived types inherit Keys from their base.
-            # First Key found while walking from this type up to its root
-            # ancestor wins — that's the spec's overriding-derived-wins
-            # semantics for the rare case where multiple layers in the
-            # chain redeclare Key (technically forbidden but services do
-            # ship malformed CSDL).
+            segments = _parse_contained_path(table_name) or [table_name]
+            leaf_pks = self._own_primary_keys_for_et(self._entity_type_for(table_name, namespace))
+            if len(segments) == 1:
+                return leaf_pks
+            composite: list[str] = []
+            for idx in range(len(segments) - 1):
+                ancestor_et = self._entity_type_for(
+                    _CONTAINED_PATH_SEP.join(segments[: idx + 1]), namespace
+                )
+                for pk in self._own_primary_keys_for_et(ancestor_et):
+                    composite.append(_fk_column_name(segments[idx], pk))
+            composite.extend(leaf_pks)
+            return composite
+
+        def _own_primary_keys_for_et(self, et: ET.Element) -> list[str]:
+            """Primary-key property names (OData v4 §8.4: derived types inherit
+            Keys; closest-to-leaf Key wins where multiple levels redeclare)."""
             for type_el in self._resolve_base_chain(et):
                 key = type_el.find(f"{_NS_EDM}Key")
                 if key is not None:
@@ -1911,43 +2368,18 @@ def register_lakeflow_source(spark):
         return val
 
 
-    def _join_url(base: str, suffix: str) -> str:
-        if base.endswith("/"):
-            return f"{base}{suffix}"
-        return f"{base}/{suffix}"
-
-
-    def _odata_literal(value: Any) -> str:
-        """Render a Python value as an OData v4 literal for $filter."""
-        if isinstance(value, datetime):
-            return value.isoformat().replace("+00:00", "Z")
-        if isinstance(value, date):
-            return value.isoformat()
-        if isinstance(value, bool):
-            return "true" if value else "false"
-        if isinstance(value, int | float | Decimal):
-            return str(value)
-        # ISO-8601 timestamp strings render bare; everything else is quoted.
-        s = str(value)
-        if _looks_like_iso8601(s):
-            return s
-        return "'" + s.replace("'", "''") + "'"
-
-
-    def _looks_like_iso8601(s: str) -> bool:
-        if len(s) < 10 or s[4] != "-" or s[7] != "-":
-            return False
-        try:
-            datetime.fromisoformat(s.replace("Z", "+00:00"))
-            return True
-        except ValueError:
-            return False
-
-
     # Re-export base64/binary helper for any downstream caller that wants
     # to materialize Edm.Binary fields into Python bytes prior to Spark.
     def _decode_binary(value: str) -> bytes:
         return base64.b64decode(value)
+
+
+    _CONTAINED_PATH_SEP = CONTAINED_PATH_SEP
+    _PARENT_FK_PREFIX = PARENT_FK_PREFIX
+    _fk_column_name = fk_column_name
+    _join_url = join_url
+    _odata_literal = odata_literal
+    _parse_contained_path = parse_contained_path
 
 
     ########################################################
