@@ -276,7 +276,7 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces, ContainedNavMixi
                     "or ingest the parent set directly."
                 )
             if self._expand_contained_active(opts):
-                return self._read_contained_expand(table_name, opts)
+                return self._read_contained_expand(table_name, offset, opts)
             if opts.get("cursor_field"):
                 return self._read_contained_incremental(
                     table_name, offset, opts, opts["cursor_field"]
