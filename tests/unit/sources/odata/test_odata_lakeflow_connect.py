@@ -2714,6 +2714,119 @@ def test_contained_incremental_truncation_resume_uses_chain_cursor():
     )
 
 
+@responses.activate
+def test_contained_incremental_truncation_uses_nextlink_at_page_boundary():
+    """When the per-parent walk hits ``max_records_per_batch`` exactly at
+    a page boundary and the chain has more pages, the connector parks
+    ``chain_next_link`` (the server's @odata.nextLink) in the offset
+    rather than rebuilding the URL with ``cursor gt …``. The resumed
+    call hands the link back to the server unchanged."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}, {"Id": 2}]})
+    next_link = f"{SERVICE_URL}Parents(1)/Children?$skiptoken=opaque-token"
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={
+            "value": [
+                {"Id": 11, "Label": "a", "ModifiedAt": "2024-01-01T00:00:00Z"},
+                {"Id": 12, "Label": "b", "ModifiedAt": "2024-01-02T00:00:00Z"},
+            ],
+            "@odata.nextLink": next_link,
+        },
+        match_querystring=False,
+    )
+    c = _make()
+    records, offset = c.read_table(
+        "Parents__Children",
+        None,
+        {"cursor_field": "ModifiedAt", "max_records_per_batch": "2"},
+    )
+    rows = list(records)
+    # Whole page emitted (page-boundary truncation; no Option A trim).
+    assert len(rows) == 2
+    assert offset == {
+        "parent_idx": 0,
+        "chain_next_link": next_link,
+    }
+
+
+@responses.activate
+def test_contained_incremental_resume_from_chain_next_link():
+    """A resumed read with ``chain_next_link`` in the offset hits the
+    skiptoken URL directly (no URL rebuild), then carries on to the
+    next chain when that page indicates the chain is done."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}, {"Id": 2}]})
+    skip_url = f"{SERVICE_URL}Parents(1)/Children?$skiptoken=opaque-token"
+    responses.add(
+        responses.GET,
+        skip_url,
+        json={"value": [{"Id": 13, "Label": "c", "ModifiedAt": "2024-01-03T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Parents(2)/Children",
+        json={"value": [{"Id": 21, "Label": "x", "ModifiedAt": "2024-01-05T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    records, offset = c.read_table(
+        "Parents__Children",
+        {"parent_idx": 0, "chain_next_link": skip_url},
+        {"cursor_field": "ModifiedAt"},
+    )
+    rows = list(records)
+    assert {r["ModifiedAt"] for r in rows} == {
+        "2024-01-03T00:00:00Z",
+        "2024-01-05T00:00:00Z",
+    }
+    assert offset == {"cursor": "2024-01-05T00:00:00Z"}
+    # Resumed URL is the skiptoken — no `$filter=` reconstruction.
+    skip_call = next(c for c in responses.calls if "skiptoken" in c.request.url)
+    assert skip_call is not None
+
+
+@responses.activate
+def test_ancestor_cursor_truncation_parks_chain_next_link():
+    """Ancestor-cursor mode has no Option A fallback (every leaf under a
+    chain shares the chain's stamped cursor by construction). On
+    truncation it relies solely on the server's @odata.nextLink to
+    resume the chain's leaf fetch."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}]})
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={"value": [{"Id": 11, "ModifiedAt": "2024-01-01T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    notes_next = f"{SERVICE_URL}Parents(1)/Children(11)/Notes?$skiptoken=tok"
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children(11)/Notes",
+        json={
+            "value": [{"Id": 100, "Text": "a"}, {"Id": 101, "Text": "b"}],
+            "@odata.nextLink": notes_next,
+        },
+        match_querystring=False,
+    )
+    c = _make()
+    records, offset = c.read_table(
+        "Parents__Children__Notes",
+        None,
+        {"cursor_field": "ModifiedAt", "max_records_per_batch": "2"},
+    )
+    rows = list(records)
+    assert len(rows) == 2
+    # All leaf rows stamped with the ancestor cursor (unchanged behavior).
+    assert all(r["ModifiedAt"] == "2024-01-01T00:00:00Z" for r in rows)
+    # New: offset carries the nextLink for the truncated chain.
+    assert offset["chain_next_link"] == notes_next
+    assert offset["parent_idx"] == 0
+
+
 # --- ancestor-cursor incremental ---
 
 

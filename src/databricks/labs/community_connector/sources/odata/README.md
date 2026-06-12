@@ -344,24 +344,32 @@ stamps the ancestor's cursor value onto every emitted leaf row.
 the ancestor's declared type. Set ``cursor_field`` to a column name
 that isn't anywhere on the path → ``ValueError``.
 
-Truncation handling (leaf-cursor mode): when a per-parent walk hits the
-``max_records_per_batch`` cap, the connector trims the trailing
-same-cursor cohort within the truncated parent only and parks both
-``parent_idx`` and a ``truncated_chain_cursor`` in the offset. The
-resumed call uses ``cursor gt truncated_chain_cursor`` for that one
-parent (so the boundary cohort isn't skipped) and the original
-``cursor`` for every subsequent parent — per-parent cursor distributions
-are independent. After the resumed walk completes naturally the offset
+Truncation handling: when a per-parent walk hits the
+``max_records_per_batch`` cap, the connector prefers a **nextLink-based
+mid-chain resume**. The server's @odata.nextLink for the partially-paged
+chain is parked in the offset as ``chain_next_link``; the resumed call
+hands that link back to the server, which picks up exactly where it
+stopped without reconstructing ``$filter``/``$orderby``/``$select`` state.
+Subsequent parents in the same resume keep using the original ``cursor``
+``since``. After the resumed walk completes naturally, the offset
 collapses back to ``{"cursor": <max>}``; ``apply_changes`` dedupes any
-cross-batch repeats. If even one parent's same-cursor cohort exceeds
-``max_records_per_batch``, the connector raises ``RuntimeError`` — raise
-the cap, or pick a higher-cardinality cursor.
+cross-batch repeats.
 
-The ancestor-cursor fallback still has the older limitation; chain
-walks under it are interleaved by parent enumeration, so a same-cursor
-trim isn't safely scoped to one chain. Same workaround applies: keep
-``max_records_per_batch`` above the largest cohort, or pick a finer
-cursor.
+In leaf-cursor mode, when the chain ended on the truncating page (no
+nextLink available), the connector falls back to **Option A trim**: the
+trailing same-cursor cohort within that chain's emit is dropped and a
+``truncated_chain_cursor`` is parked. The resumed call rebuilds the URL
+with ``cursor gt truncated_chain_cursor`` for that one parent. If even
+one parent's same-cursor cohort exceeds ``max_records_per_batch``, the
+connector raises ``RuntimeError`` — raise the cap, or pick a
+higher-cardinality cursor.
+
+In ancestor-cursor mode there is no Option A fallback (every leaf under
+a chain shares the chain's stamped cursor by construction, so a
+within-chain ``cursor gt`` rebuild can't split it). The mode relies
+solely on ``chain_next_link``; if a server doesn't return durable
+@odata.nextLink values, raise ``max_records_per_batch`` above the
+largest per-chain leaf count.
 
 ### Disallowed combinations
 

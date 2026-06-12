@@ -20,7 +20,7 @@ from decimal import Decimal
 from typing import Any, Iterator
 from xml.etree import ElementTree as ET
 
-from pyspark.sql.types import StringType, StructField
+from pyspark.sql.types import StructField
 
 
 # Path-segment separator. ``__`` (double underscore), not ``/``, so
@@ -638,50 +638,87 @@ class ContainedNavMixin:
         cursor_field: str,
         since: Any,
         truncated_chain_cursor: Any,
+        chain_next_link: str | None,
         max_records: int,
         fk_columns: dict[tuple[str, str], str],
-    ) -> tuple[list[dict], bool, int, int]:
-        """Drive the per-parent fetch loop. Each chain uses ``cursor gt
-        since`` *except* the chain at ``parent_idx_start`` when
-        ``truncated_chain_cursor`` is set — that chain uses ``cursor gt
-        truncated_chain_cursor`` to re-pick up its boundary cohort from
-        the last truncation. Returns ``(rows, truncated, parent_idx,
-        truncated_chain_start_idx)`` where the last value is the index
-        in ``emitted`` where the truncated chain's emissions started
-        (so the caller can trim within that chain only)."""
+    ) -> tuple[list[dict], bool, int, int, str | None]:
+        """Drive the per-parent fetch loop (leaf-cursor mode).
+
+        Resume preference, applied to ``chains[parent_idx_start]`` only:
+
+        1. ``chain_next_link`` (server skiptoken) — fetched directly,
+           bypassing URL rebuild. Used when the previous batch parked
+           at a page boundary mid-chain.
+        2. ``truncated_chain_cursor`` — used as ``cursor gt <value>``
+           in a freshly-built URL. Used when the previous batch had
+           to apply the Option A boundary trim at mid-page truncation
+           (server skiptoken couldn't represent the row-level position).
+        3. Otherwise the global ``since`` is used.
+
+        Pagination is page-aware: rows are emitted as each page arrives,
+        and a truncation that lands at a page boundary checkpoints with
+        the response's @odata.nextLink. Mid-page truncations leave
+        ``chain_next_link_out`` as ``None`` so the caller falls back to
+        the Option A trim path.
+
+        Returns ``(rows, truncated, parent_idx, truncated_chain_start_idx,
+        chain_next_link_out)``."""
         emitted: list[dict] = []
         truncated = False
         parent_idx = parent_idx_start
         chain_start_idx = 0
+        chain_next_link_out: str | None = None
         while parent_idx < len(chains):
             chain = chains[parent_idx]
             chain_start_idx = len(emitted)
             chain_since: Any
-            if parent_idx == parent_idx_start and truncated_chain_cursor is not None:
-                chain_since = truncated_chain_cursor
+            initial_url: str
+            if parent_idx == parent_idx_start and chain_next_link is not None:
+                # Resume from the server's own skiptoken; no client-side
+                # filter — the link already encodes filter/order state.
+                chain_since = None
+                initial_url = chain_next_link
             else:
-                chain_since = since
-            extra_filter = self._cursor_filter(cursor_field, chain_since)
-            url = self._build_contained_url(
-                segments,
-                chain,
-                table_options,
-                extra_filter=extra_filter,
-                order_by=order_by,
-            )
-            for row in self._fetch_pages(url):
-                rec_cursor = row.get(cursor_field)
-                if chain_since is not None and rec_cursor is not None and rec_cursor <= chain_since:
-                    continue
-                self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
-                emitted.append(row)
-                if len(emitted) >= max_records:
+                if parent_idx == parent_idx_start and truncated_chain_cursor is not None:
+                    chain_since = truncated_chain_cursor
+                else:
+                    chain_since = since
+                initial_url = self._build_contained_url(
+                    segments,
+                    chain,
+                    table_options,
+                    extra_filter=self._cursor_filter(cursor_field, chain_since),
+                    order_by=order_by,
+                )
+            cap_hit_in_page = False
+            page_next_url: str | None = None
+            for page_rows, page_next_url in self._fetch_pages_with_links(initial_url):
+                for row in page_rows:
+                    rec_cursor = row.get(cursor_field)
+                    if (
+                        chain_since is not None
+                        and rec_cursor is not None
+                        and rec_cursor <= chain_since
+                    ):
+                        continue
+                    self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
+                    emitted.append(row)
+                    if len(emitted) >= max_records:
+                        cap_hit_in_page = True
+                if cap_hit_in_page:
+                    # Finish the current page so the server's nextLink
+                    # (page-after-this-one) is a clean checkpoint, but
+                    # don't fetch any more pages for this chain.
                     truncated = True
+                    # ``page_next_url`` is None ⇒ chain ended on this page;
+                    # caller falls back to Option A trim. Non-None ⇒
+                    # caller parks chain_next_link.
+                    chain_next_link_out = page_next_url
                     break
             if truncated:
                 break
             parent_idx += 1
-        return emitted, truncated, parent_idx, chain_start_idx
+        return emitted, truncated, parent_idx, chain_start_idx, chain_next_link_out
 
     def _read_contained_incremental(
         self,
@@ -721,28 +758,43 @@ class ContainedNavMixin:
     ) -> tuple[Iterator[dict], dict]:
         """Cursor lives on the leaf entity — filter at the leaf fetch.
 
-        Truncation handling (Option A boundary trim, scoped to the
-        truncated chain only):
+        Truncation has two recovery shapes, applied to the truncated
+        chain only (subsequent chains keep using the original
+        ``since``, since per-chain cursor distributions are
+        independent):
 
-        * When the per-parent walk hits ``max_records_per_batch`` mid-
-          chain, the trailing same-cursor cohort of that chain's emit
-          is dropped via ``_trim_to_distinct_cursor_boundary``.
-        * If trimming leaves the chain with zero rows, the boundary
-          cohort exceeded ``max_records_per_batch`` on its own — raise
-          to match the flat-path failure mode.
-        * Offset carries the original ``since`` for subsequent chains
-          (their cursor distributions are independent of the truncated
-          chain) plus ``truncated_chain_cursor`` so the truncated chain
-          alone resumes from inside its own cohort boundary.
+        * **NextLink (preferred)**: when truncation lands on a page
+          boundary, the server's @odata.nextLink is parked in the
+          offset as ``chain_next_link`` and the resumed call hands it
+          straight back to the server. No client-side filter
+          reconstruction; no boundary-cohort math.
+        * **Option A trim (fallback)**: when truncation lands
+          mid-page (the skiptoken can't represent a row-level
+          position), the trailing same-cursor cohort within the
+          truncated chain's emit is dropped and the chain's last
+          distinct cursor is parked as ``truncated_chain_cursor``.
+          The resumed call rebuilds the URL with
+          ``cursor gt truncated_chain_cursor`` for that chain only.
+          If trimming leaves the chain with zero rows, the cohort
+          exceeded ``max_records_per_batch`` on its own and the
+          connector raises ``RuntimeError`` — same shape as the
+          flat-path failure mode.
         """
         namespace = (table_options or {}).get("namespace")
         table_name = CONTAINED_PATH_SEP.join(segments)
         since = (start_offset or {}).get("cursor")
         truncated_chain_cursor_in = (start_offset or {}).get("truncated_chain_cursor")
+        chain_next_link_in = (start_offset or {}).get("chain_next_link")
         max_records = int((table_options or {}).get("max_records_per_batch", "100000"))
         order_by = self._leaf_cursor_order_by(table_name, namespace, cursor_field)
         chains = list(self._iter_parent_key_chains(segments, namespace, table_options))
-        emitted, truncated, parent_idx, chain_start_idx = self._walk_contained_with_cursor(
+        (
+            emitted,
+            truncated,
+            parent_idx,
+            chain_start_idx,
+            chain_next_link_out,
+        ) = self._walk_contained_with_cursor(
             segments,
             chains,
             int((start_offset or {}).get("parent_idx", 0)),
@@ -751,27 +803,37 @@ class ContainedNavMixin:
             cursor_field,
             since,
             truncated_chain_cursor_in,
+            chain_next_link_in,
             max_records,
             self._resolve_fk_columns(segments, namespace),
         )
         if truncated:
-            trimmed_chain = _trim_to_distinct_cursor_boundary(
-                emitted[chain_start_idx:], cursor_field
-            )
-            if not trimmed_chain:
-                raise RuntimeError(
-                    f"max_records_per_batch={max_records} is smaller than the "
-                    f"largest same-cursor cohort under one parent in contained "
-                    f"path {table_name!r}. Raise max_records_per_batch above "
-                    f"that cohort, or pick a higher-cardinality cursor."
+            if chain_next_link_out is not None:
+                end_offset: dict = {
+                    "parent_idx": parent_idx,
+                    "chain_next_link": chain_next_link_out,
+                }
+                if since is not None:
+                    end_offset["cursor"] = since
+            else:
+                trimmed_chain = _trim_to_distinct_cursor_boundary(
+                    emitted[chain_start_idx:], cursor_field
                 )
-            emitted = emitted[:chain_start_idx] + trimmed_chain
-            end_offset: dict = {
-                "parent_idx": parent_idx,
-                "truncated_chain_cursor": trimmed_chain[-1].get(cursor_field),
-            }
-            if since is not None:
-                end_offset["cursor"] = since
+                if not trimmed_chain:
+                    raise RuntimeError(
+                        f"max_records_per_batch={max_records} is smaller than "
+                        f"the largest same-cursor cohort under one parent in "
+                        f"contained path {table_name!r}. Raise "
+                        f"max_records_per_batch above that cohort, or pick a "
+                        f"higher-cardinality cursor."
+                    )
+                emitted = emitted[:chain_start_idx] + trimmed_chain
+                end_offset = {
+                    "parent_idx": parent_idx,
+                    "truncated_chain_cursor": trimmed_chain[-1].get(cursor_field),
+                }
+                if since is not None:
+                    end_offset["cursor"] = since
         else:
             if not emitted:
                 return iter([]), start_offset or {}
@@ -792,9 +854,27 @@ class ContainedNavMixin:
         """Cursor lives on a non-leaf ancestor. Filter at that ancestor
         level (changed subtrees only), fetch full leaf collections under
         each filtered ancestor, and stamp the ancestor's cursor value
-        onto every emitted leaf row."""
+        onto every emitted leaf row.
+
+        Truncation uses **nextLink-based mid-chain resume** exclusively.
+        Every leaf under a chain shares that chain's stamped cursor by
+        construction, so a within-chain ``cursor gt`` rebuild would
+        either re-fetch the whole chain or skip the whole chain — there
+        is no meaningful split. The server's @odata.nextLink, on the
+        other hand, encodes the chain's pagination position
+        independently of cursor values, so the resumed call hands it
+        back and the server picks up exactly where it stopped.
+
+        On a truncation:
+
+        * If we stopped at a page boundary mid-chain (next page exists),
+          park ``chain_next_link`` in the offset.
+        * If we stopped because the chain happened to end on the
+          truncating page, just advance ``parent_idx`` past it.
+        """
         namespace = (table_options or {}).get("namespace")
         since = (start_offset or {}).get("cursor")
+        chain_next_link_in = (start_offset or {}).get("chain_next_link")
         max_records = int((table_options or {}).get("max_records_per_batch", "100000"))
         fk_columns = self._resolve_fk_columns(segments, namespace)
         chains_with_cursor = list(
@@ -807,20 +887,35 @@ class ContainedNavMixin:
                 since,
             )
         )
-        parent_idx = int((start_offset or {}).get("parent_idx", 0))
+        parent_idx_start = int((start_offset or {}).get("parent_idx", 0))
+        parent_idx = parent_idx_start
         emitted: list[dict] = []
         truncated = False
+        chain_next_link_out: str | None = None
         while parent_idx < len(chains_with_cursor):
             chain, ancestor_cursor = chains_with_cursor[parent_idx]
-            url = self._build_contained_url(segments, chain, table_options)
-            for row in self._fetch_pages(url):
-                self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
-                row[cursor_field] = ancestor_cursor
-                emitted.append(row)
+            if parent_idx == parent_idx_start and chain_next_link_in is not None:
+                initial_url = chain_next_link_in
+            else:
+                initial_url = self._build_contained_url(segments, chain, table_options)
+            page_next_url: str | None = None
+            for page_rows, page_next_url in self._fetch_pages_with_links(initial_url):
+                for row in page_rows:
+                    self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
+                    row[cursor_field] = ancestor_cursor
+                    emitted.append(row)
                 if len(emitted) >= max_records:
                     truncated = True
                     break
             if truncated:
+                # Page-boundary checkpoint: mid-chain only if the chain has
+                # more pages left. Otherwise the chain finished on the
+                # truncating page and we can simply advance parent_idx.
+                if page_next_url is not None:
+                    chain_next_link_out = page_next_url
+                else:
+                    parent_idx += 1
+                    chain_next_link_out = None
                 break
             parent_idx += 1
         if not emitted:
@@ -829,6 +924,8 @@ class ContainedNavMixin:
         end_offset: dict = {"cursor": max(cursors) if cursors else since}
         if truncated:
             end_offset["parent_idx"] = parent_idx
+            if chain_next_link_out is not None:
+                end_offset["chain_next_link"] = chain_next_link_out
         if start_offset and start_offset == end_offset:
             return iter([]), start_offset
         return iter(emitted), end_offset
