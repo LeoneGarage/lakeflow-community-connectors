@@ -105,7 +105,7 @@ w.api_client.do(
             "externalOptionsAllowList": (
                 "namespace,cursor_field,select,filter,"
                 "page_size,max_records_per_batch,delta_tracking,"
-                "expand_contained,include_ancestor_ids"
+                "expand_contained"
             ),
         },
     },
@@ -291,42 +291,25 @@ Parents__Tags
 
 ### Schema augmentation
 
-Each contained-collection table prepends synthetic FK columns
-carrying the **immediate parent's** primary keys. Grandparent and
-higher-level ancestor IDs are intentionally dropped from the leaf
-row. Default name is ``<segment>_<pkname>``; a leading ``_`` is
-added only if it would collide with a leaf property. For
-``Parents__Children__Notes``:
+Each contained-collection table prepends synthetic FK columns for
+**every non-leaf ancestor**. This is required for global uniqueness —
+OData v4 §13.4.3 makes contained-entity keys unique only within their
+immediate parent, so collapsing on the leaf's own PK collides across
+sibling parent branches. Default name is ``<segment>_<pkname>``; a
+leading ``_`` is added only if it would collide with a leaf property.
+For ``Parents__Children__Notes``:
 
 ```
-Children_Id   Int — Children's primary key (immediate parent of Notes)
+Parents_Id    Int — top-level ancestor PK
+Children_Id   Int — intermediate ancestor PK
 Id            Int — Notes' own primary key
 Text          String
 ```
 
-The composite primary key reported in ``read_table_metadata`` is
-``[Children_Id, Id]`` — immediate parent FK + leaf PK. If the leaf
-had its own property named ``Children_Id``, the FK would be emitted
-as ``_Children_Id`` and the leaf property would keep its original name.
-
-The URL traversal still passes through every ancestor (the wire path
-is ``Parents(p)/Children(c)/Notes``), but only the immediate parent's
-key shows up as a column on the destination row.
-
-Set ``include_ancestor_ids: "true"`` on the table to opt into the
-full ancestor chain instead — every non-leaf ancestor's PKs get
-their own ``<seg>_<pk>`` columns, and all of them join the composite
-primary key. Use this when leaf IDs aren't unique across grandparent
-branches:
-
-```
-Parents_Id    Int — full ancestor chain
-Children_Id   Int
-Id            Int — Notes' own primary key
-Text          String
-```
-
-Primary key becomes ``[Parents_Id, Children_Id, Id]``.
+The composite primary key reported in ``read_table_metadata`` is the
+full chain: ``[Parents_Id, Children_Id, Id]``. If the leaf had its
+own property named ``Children_Id``, the FK would be emitted as
+``_Children_Id`` and the leaf property would keep its original name.
 
 ### Read modes
 

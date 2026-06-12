@@ -188,20 +188,6 @@ class ContainedNavMixin:
             raise ValueError(f"Invalid expand_contained={raw!r}. Expected one of: true, false.")
         return raw == "true"
 
-    def _include_ancestor_ids_active(self, table_options: dict[str, str] | None) -> bool:
-        """Parse the boolean ``include_ancestor_ids`` table option.
-
-        When false (default), only the immediate parent's PK columns are
-        materialized on the leaf row. When true, every non-leaf
-        ancestor's PK columns appear — useful when leaf IDs are only
-        unique within a grandparent branch and merge collisions need
-        to be disambiguated by the full chain.
-        """
-        raw = ((table_options or {}).get("include_ancestor_ids") or "false").strip().lower()
-        if raw not in {"true", "false"}:
-            raise ValueError(f"Invalid include_ancestor_ids={raw!r}. Expected one of: true, false.")
-        return raw == "true"
-
     # --- URL construction --------------------------------------------------
 
     def _format_key_predicate(self, pk_values: dict[str, Any]) -> str:
@@ -255,25 +241,16 @@ class ContainedNavMixin:
     # --- read paths --------------------------------------------------------
 
     def _resolve_fk_columns(
-        self,
-        segments: list[str],
-        namespace: str | None,
-        table_options: dict[str, str] | None = None,
+        self, segments: list[str], namespace: str | None
     ) -> dict[tuple[str, str], str]:
-        """Map ``(segment, pk_name) → unique FK column name``.
+        """Map ``(segment, pk_name) → unique FK column name`` for every
+        non-leaf ancestor.
 
-        Which ancestors get FK columns depends on
-        ``include_ancestor_ids``:
-
-        * default (``false``) → immediate parent only. For ``A/B/C/D``
-          returns FKs for ``C``.
-        * ``true`` → every non-leaf ancestor. For ``A/B/C/D``
-          returns FKs for ``A``, ``B``, and ``C``.
-
-        Default name is ``<segment>_<pk>``; collisions with leaf
-        properties (or with other FK columns, in the all-ancestors
-        case) get a leading ``_`` until unique. Empty mapping for flat
-        tables.
+        OData v4 §13.4.3 makes contained-entity keys unique only within
+        their immediate parent, so the destination composite key needs
+        the full ancestor chain to be globally unique. Default name is
+        ``<segment>_<pk>``; collisions get a leading ``_`` until unique.
+        Empty mapping for flat tables.
         """
         if len(segments) < 2:
             return {}
@@ -284,12 +261,8 @@ class ContainedNavMixin:
             )
         }
         used = set(leaf_field_names)
-        if self._include_ancestor_ids_active(table_options):
-            ancestor_indices = list(range(len(segments) - 1))
-        else:
-            ancestor_indices = [len(segments) - 2]
         resolved: dict[tuple[str, str], str] = {}
-        for idx in ancestor_indices:
+        for idx in range(len(segments) - 1):
             ancestor_et = self._entity_type_for(
                 CONTAINED_PATH_SEP.join(segments[: idx + 1]), namespace
             )
@@ -366,7 +339,7 @@ class ContainedNavMixin:
         ancestor FKs. Full result in one call."""
         segments = parse_contained_path(table_name) or [table_name]
         namespace = (table_options or {}).get("namespace")
-        fk_columns = self._resolve_fk_columns(segments, namespace, table_options)
+        fk_columns = self._resolve_fk_columns(segments, namespace)
         emitted: list[dict] = []
         for chain in self._iter_parent_key_chains(segments, namespace, table_options):
             for row in self._fetch_pages(self._build_contained_url(segments, chain, table_options)):
@@ -394,7 +367,7 @@ class ContainedNavMixin:
                     f"has no primary key declared in $metadata."
                 )
             pks_per_level.append(pks)
-        fk_columns = self._resolve_fk_columns(segments, namespace, table_options)
+        fk_columns = self._resolve_fk_columns(segments, namespace)
         emitted: list[dict] = []
         for top_row in self._fetch_pages(self._build_expand_url(segments, table_options)):
             self._flatten_expand_response(
@@ -503,7 +476,7 @@ class ContainedNavMixin:
             cursor_field,
             since,
             max_records,
-            self._resolve_fk_columns(segments, namespace, table_options),
+            self._resolve_fk_columns(segments, namespace),
         )
         if not emitted:
             return iter([]), start_offset or {}

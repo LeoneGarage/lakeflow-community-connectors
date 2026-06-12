@@ -142,7 +142,6 @@ These are passed to the connector via the pipeline's `table_configuration` block
 | `max_records_per_batch` | `100000` | Client-side cap on records returned per `read_table` call. The connector truncates and returns control to the framework once this limit is hit. Independent of `page_size`. |
 | `delta_tracking` | `disabled` | Opt-in OData v4 delta queries. `disabled` keeps the existing snapshot / cursor behavior; `auto` probes the server's `Prefer: odata.track-changes` support once per table and falls back if missing; `enabled` requires support and errors on the first read if the server doesn't acknowledge. See [Delta tracking](#delta-tracking-contract). Mutually exclusive with contained-path tables. |
 | `expand_contained` | `false` | For contained-collection paths (`Parent__Child__...`). When `true`, a single `GET Parent?$expand=Child(...)` replaces the default N+1 per-parent traversal. See [Contained navigation properties](#contained-navigation-properties). |
-| `include_ancestor_ids` | `false` | For contained-collection paths only. By default only the leaf's **immediate parent** PK columns are materialised on the row. When `true`, every non-leaf ancestor's PK columns appear (and join the composite primary key). Use when leaf IDs aren't unique across grandparent branches and the full chain is needed to disambiguate. |
 
 `namespace` is consumed by the connector before the request is built; the rest all influence the URL, the per-batch loop, or the request semantics.
 
@@ -358,20 +357,20 @@ Output is deterministic — flat sets sorted first, then contained paths sorted.
 
 ### Schema augmentation
 
-For a path with N segments, the leaf entity's own properties are preceded by synthetic FK columns carrying the **immediate parent's** primary keys only. Grandparent and higher-level ancestor IDs are intentionally dropped from the leaf row. The default name is `<segment>_<pkname>` (no fixed prefix). When that name would collide with a leaf property, the connector prepends a leading `_` until the name is unique.
+For a path with N segments, the leaf entity's own properties are preceded by synthetic FK columns for **every non-leaf ancestor**. OData v4 §13.4.3 makes contained-entity keys unique only within their immediate parent, so the destination composite key must include the full chain to be globally unique. The default name is `<segment>_<pkname>` (no fixed prefix). When that name would collide with a leaf property or with another FK, the connector prepends a leading `_` until the name is unique.
 
 ```
 <parent_segment>_<parent_pkname...>   ← primary keys of the leaf's IMMEDIATE parent
 <leaf's own properties>
 ```
 
-The composite primary key reported in `read_table_metadata` is `[immediate_parent_FKs..., leaf_PKs...]`. This is sufficient when leaf primary keys are unique within their immediate parent; if leaf IDs repeat across grandparent branches you'll see merge collisions — set `include_ancestor_ids=true` on the table to materialise every ancestor's PK columns (and append them to the composite primary key), or pick a different cursor / contained path.
+The composite primary key reported in `read_table_metadata` is the full chain: every ancestor's FK columns followed by the leaf's own primary keys. This is what makes `apply_changes_from_snapshot` see one row per key on tables where leaf IDs only repeat within a grandparent branch (a common case in services like Intergraph SCApi).
 
-When the immediate parent has a composite primary key, every key column gets its own `<seg>_<pk>` field. The URL traversal still passes through every ancestor's keys (the OData wire path is `A(a)/B(b)/C(c)/D`), but only `C`'s keys are materialized as columns on the destination D rows by default; with `include_ancestor_ids=true` every ancestor's keys are materialised.
+When an ancestor has a composite primary key, every key column gets its own `<seg>_<pk>` field. The URL traversal passes through every ancestor's keys (the OData wire path is `A(a)/B(b)/C(c)/D`), and every ancestor's keys are also materialised as columns on the destination D rows.
 
 **Collision example.** If `Items` has its own property `Owners_Id` and the path is `Owners__Items`, the connector emits `_Owners_Id` (FK, leading underscore) and `Owners_Id` (the leaf's own property, untouched). With multiple collisions, more leading underscores are added until unique.
 
-`select` on a contained path filters only the leaf entity's own properties — the immediate-parent FK columns are always preserved (the resolved names are compared against the leaf-only set, not against the input `select` list).
+`select` on a contained path filters only the leaf entity's own properties — every ancestor's FK columns are always preserved (the resolved names are compared against the leaf-only set, not against the input `select` list).
 
 ### Read modes
 

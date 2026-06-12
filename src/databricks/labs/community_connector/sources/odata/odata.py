@@ -209,13 +209,13 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces, ContainedNavMixi
 
     def get_table_schema(self, table_name: str, table_options: dict[str, str]) -> StructType:
         namespace = (table_options or {}).get("namespace")
-        fields = self._fields_for(table_name, namespace, table_options)
+        fields = self._fields_for(table_name, namespace)
         select = (table_options or {}).get("select")
         if select:
             wanted = {c.strip() for c in select.split(",")}
             # ``select`` filters leaf columns only; FK columns survive.
             segments = _parse_contained_path(table_name) or [table_name]
-            fk_names = set(self._resolve_fk_columns(segments, namespace, table_options).values())
+            fk_names = set(self._resolve_fk_columns(segments, namespace).values())
             fields = [f for f in fields if f.name in fk_names or f.name in wanted]
         if not fields:
             raise ValueError(
@@ -236,7 +236,7 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces, ContainedNavMixi
 
     def read_table_metadata(self, table_name: str, table_options: dict[str, str]) -> dict:
         namespace = (table_options or {}).get("namespace")
-        primary_keys = self._primary_keys_for(table_name, namespace, table_options)
+        primary_keys = self._primary_keys_for(table_name, namespace)
         user_cursor = (table_options or {}).get("cursor_field")
         # Contained paths skip the delta probe (server delta is for
         # top-level sets only; mutex enforced in dispatch below).
@@ -1318,20 +1318,14 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces, ContainedNavMixi
             current = parent
         return chain
 
-    def _fields_for(
-        self,
-        table_name: str,
-        namespace: str | None = None,
-        table_options: dict[str, str] | None = None,
-    ) -> list[StructField]:
+    def _fields_for(self, table_name: str, namespace: str | None = None) -> list[StructField]:
         segments = _parse_contained_path(table_name) or [table_name]
         own_fields = self._own_fields_for_et(self._entity_type_for(table_name, namespace))
         if len(segments) == 1:
             return own_fields
-        # ``_resolve_fk_columns`` decides which ancestors emit FKs (just
-        # the immediate parent by default; all of them when
-        # ``include_ancestor_ids=true``). Iterate same set, same order.
-        fk_columns = self._resolve_fk_columns(segments, namespace, table_options)
+        # Every non-leaf ancestor contributes FK columns (OData v4
+        # §13.4.3 — contained-entity keys are unique within parent only).
+        fk_columns = self._resolve_fk_columns(segments, namespace)
         fk_fields: list[StructField] = []
         for idx in range(len(segments) - 1):
             seg = segments[idx]
@@ -1372,18 +1366,13 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces, ContainedNavMixi
                 )
         return fields
 
-    def _primary_keys_for(
-        self,
-        table_name: str,
-        namespace: str | None = None,
-        table_options: dict[str, str] | None = None,
-    ) -> list[str]:
+    def _primary_keys_for(self, table_name: str, namespace: str | None = None) -> list[str]:
         segments = _parse_contained_path(table_name) or [table_name]
         leaf_pks = self._own_primary_keys_for_et(self._entity_type_for(table_name, namespace))
         if len(segments) == 1:
             return leaf_pks
-        # Composite: FKs ``_resolve_fk_columns`` emits + leaf's own PKs.
-        fk_columns = self._resolve_fk_columns(segments, namespace, table_options)
+        # Composite: every ancestor's FK columns + leaf's own PKs.
+        fk_columns = self._resolve_fk_columns(segments, namespace)
         composite: list[str] = []
         for idx in range(len(segments) - 1):
             seg = segments[idx]
