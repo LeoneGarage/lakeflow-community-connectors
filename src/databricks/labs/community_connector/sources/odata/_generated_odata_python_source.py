@@ -875,6 +875,35 @@ def register_lakeflow_source(spark):
                     return idx
             return -1
 
+        def _leaf_options_with_cursor_select(
+            self,
+            segments: list[str],
+            namespace: str | None,
+            table_options: dict[str, str] | None,
+            cursor_field: str,
+        ) -> dict[str, str]:
+            """Return a copy of ``table_options`` with ``cursor_field`` added
+            to the ``select`` list.
+
+            If the user already configured ``select``, append the cursor.
+            If not, populate ``select`` with the leaf's declared columns
+            plus the cursor — this preserves all declared schema data and
+            explicitly asks the server to project the ancestor's cursor
+            column onto the OpenType leaf rows."""
+            opts = dict(table_options or {})
+            user_select = opts.get("select")
+            if user_select:
+                cols = [c.strip() for c in user_select.split(",") if c.strip()]
+                if cursor_field not in cols:
+                    cols.append(cursor_field)
+            else:
+                leaf_et = self._entity_type_for(CONTAINED_PATH_SEP.join(segments), namespace)
+                cols = [f.name for f in self._own_fields_for_et(leaf_et)]
+                if cursor_field not in cols:
+                    cols.append(cursor_field)
+            opts["select"] = ",".join(cols)
+            return opts
+
         def _ancestor_cursor_field(
             self, table_name: str, namespace: str | None, cursor_field: str
         ) -> StructField | None:
@@ -1205,12 +1234,21 @@ def register_lakeflow_source(spark):
             parent_idx = int((start_offset or {}).get("parent_idx", 0))
             emitted: list[dict] = []
             truncated = False
+            # Inject the ancestor cursor column into the leaf fetch's $select
+            # so OpenType leaves return their own per-row value when the
+            # server has one. Falls back to the ancestor's value when the
+            # leaf row doesn't carry it (declared-only schemas, or non-Open
+            # leaves that ignore the projected open-type column).
+            leaf_options = self._leaf_options_with_cursor_select(
+                segments, namespace, table_options, cursor_field
+            )
             while parent_idx < len(chains_with_cursor):
                 chain, ancestor_cursor = chains_with_cursor[parent_idx]
-                url = self._build_contained_url(segments, chain, table_options)
+                url = self._build_contained_url(segments, chain, leaf_options)
                 for row in self._fetch_pages(url):
                     self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
-                    row[cursor_field] = ancestor_cursor
+                    if row.get(cursor_field) is None:
+                        row[cursor_field] = ancestor_cursor
                     emitted.append(row)
                     if len(emitted) >= max_records:
                         truncated = True

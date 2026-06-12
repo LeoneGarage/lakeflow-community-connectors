@@ -2630,6 +2630,77 @@ def test_cursor_field_not_on_any_segment_raises():
         c.read_table("Parents__Children__Notes", None, {"cursor_field": "DoesNotExist"})
 
 
+@responses.activate
+def test_ancestor_cursor_injects_cursor_into_leaf_select():
+    """When the cursor lives on an ancestor, the leaf fetch URL's
+    $select includes ``cursor_field`` so OpenType leaves carrying the
+    column return it. The leaf's own value takes precedence over the
+    ancestor's when stamping rows."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}]})
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={"value": [{"Id": 10, "ModifiedAt": "2024-01-01T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children(10)/Notes",
+        json={
+            "value": [
+                # OpenType-style leaf that returns its own ModifiedAt — wins
+                # over the ancestor cursor when stamping the row.
+                {"Id": 100, "Text": "a", "ModifiedAt": "2024-02-15T00:00:00Z"},
+                # Plain leaf without an own ModifiedAt — falls back to ancestor.
+                {"Id": 101, "Text": "b"},
+            ]
+        },
+        match_querystring=False,
+    )
+    c = _make()
+    records, _ = c.read_table("Parents__Children__Notes", None, {"cursor_field": "ModifiedAt"})
+    rows = list(records)
+    # Leaf URL had ModifiedAt in $select. Call order:
+    # 0=$metadata, 1=Parents (PKs), 2=Children (ancestor cursor), 3=Notes (leaf).
+    leaf_call = responses.calls[3].request.url
+    assert "ModifiedAt" in leaf_call
+    assert "%24select" in leaf_call or "$select" in leaf_call
+    # Leaf-returned value wins; absent-value row falls back to ancestor.
+    assert rows[0]["ModifiedAt"] == "2024-02-15T00:00:00Z"
+    assert rows[1]["ModifiedAt"] == "2024-01-01T00:00:00Z"
+
+
+@responses.activate
+def test_ancestor_cursor_appends_to_user_supplied_leaf_select():
+    """When the user has already configured ``select`` on the leaf,
+    the cursor is appended to that list rather than replacing it."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}]})
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={"value": [{"Id": 10, "ModifiedAt": "2024-01-01T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children(10)/Notes",
+        json={"value": [{"Id": 100, "Text": "x"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    list(
+        c.read_table(
+            "Parents__Children__Notes",
+            None,
+            {"cursor_field": "ModifiedAt", "select": "Id,Text"},
+        )[0]
+    )
+    leaf_call = responses.calls[3].request.url
+    assert "Id" in leaf_call and "Text" in leaf_call and "ModifiedAt" in leaf_call
+
+
 # --- read_table_metadata for contained paths ---
 
 
