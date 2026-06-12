@@ -2611,7 +2611,12 @@ def test_contained_incremental_terminates_when_offset_unchanged():
 
 
 @responses.activate
-def test_contained_incremental_truncation_returns_parent_idx_offset():
+def test_contained_incremental_truncation_trims_boundary_cohort():
+    """When the per-parent walk truncates, the trailing same-cursor cohort
+    of the truncated chain is trimmed and the offset carries a
+    ``truncated_chain_cursor`` so the resumed call re-picks up exactly
+    that cohort without skipping it (Option A boundary trim, scoped to
+    the truncated chain only)."""
     _mock_nested_metadata()
     responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}, {"Id": 2}]})
     responses.get(
@@ -2631,10 +2636,82 @@ def test_contained_incremental_truncation_returns_parent_idx_offset():
         {"cursor_field": "ModifiedAt", "max_records_per_batch": "2"},
     )
     rows = list(records)
-    assert len(rows) == 2
-    # Capped mid-walk: parent_idx parked so resume continues at parent 1.
-    assert offset["parent_idx"] == 0  # truncated while walking parent index 0
-    assert offset["cursor"] == "2024-01-02T00:00:00Z"
+    # Trim drops the c2 boundary cohort; only c1 is emitted.
+    assert len(rows) == 1
+    assert rows[0]["ModifiedAt"] == "2024-01-01T00:00:00Z"
+    # Resume re-fetches parent 0 from cursor gt c1, picking up c2 + beyond.
+    assert offset == {
+        "parent_idx": 0,
+        "truncated_chain_cursor": "2024-01-01T00:00:00Z",
+    }
+
+
+@responses.activate
+def test_contained_incremental_truncation_raises_when_cohort_exceeds_cap():
+    """If max_records_per_batch is smaller than a single same-cursor
+    cohort within one parent, trimming leaves zero rows and we surface
+    an actionable RuntimeError (same shape as the flat path)."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}]})
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={
+            "value": [
+                {"Id": 11, "Label": "a", "ModifiedAt": "2024-01-01T00:00:00Z"},
+                {"Id": 12, "Label": "b", "ModifiedAt": "2024-01-01T00:00:00Z"},
+                {"Id": 13, "Label": "c", "ModifiedAt": "2024-01-01T00:00:00Z"},
+            ]
+        },
+        match_querystring=False,
+    )
+    c = _make()
+    with pytest.raises(RuntimeError, match="largest same-cursor cohort"):
+        records, _ = c.read_table(
+            "Parents__Children",
+            None,
+            {"cursor_field": "ModifiedAt", "max_records_per_batch": "2"},
+        )
+        list(records)
+
+
+@responses.activate
+def test_contained_incremental_truncation_resume_uses_chain_cursor():
+    """A resumed read with ``truncated_chain_cursor`` issues
+    ``cursor gt <chain_cursor>`` to the truncated chain only — subsequent
+    chains keep using the outer ``cursor`` value, since per-parent cursor
+    distributions are independent."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}, {"Id": 2}]})
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={"value": [{"Id": 12, "Label": "b", "ModifiedAt": "2024-01-02T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Parents(2)/Children",
+        json={"value": [{"Id": 21, "Label": "x", "ModifiedAt": "2024-01-05T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    records, offset = c.read_table(
+        "Parents__Children",
+        {"parent_idx": 0, "truncated_chain_cursor": "2024-01-01T00:00:00Z"},
+        {"cursor_field": "ModifiedAt"},
+    )
+    rows = list(records)
+    # Both chains' rows come through; offset is back to natural-completion shape.
+    assert {r["ModifiedAt"] for r in rows} == {
+        "2024-01-02T00:00:00Z",
+        "2024-01-05T00:00:00Z",
+    }
+    assert offset == {"cursor": "2024-01-05T00:00:00Z"}
+    # First leaf call uses the chain cursor; second uses the outer cursor (None here).
+    p1_call = next(c for c in responses.calls if "Parents(1)/Children" in c.request.url)
+    assert "ModifiedAt%20gt%202024-01-01" in p1_call.request.url or (
+        "ModifiedAt+gt+2024-01-01" in p1_call.request.url
+    )
 
 
 # --- ancestor-cursor incremental ---

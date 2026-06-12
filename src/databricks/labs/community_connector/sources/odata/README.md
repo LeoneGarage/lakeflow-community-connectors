@@ -344,9 +344,24 @@ stamps the ancestor's cursor value onto every emitted leaf row.
 the ancestor's declared type. Set ``cursor_field`` to a column name
 that isn't anywhere on the path → ``ValueError``.
 
-Known limitation: no same-cursor boundary trim across truncation. Set
-``max_records_per_batch`` above the largest expected same-cursor cohort
-per parent, or pick a higher-cardinality cursor.
+Truncation handling (leaf-cursor mode): when a per-parent walk hits the
+``max_records_per_batch`` cap, the connector trims the trailing
+same-cursor cohort within the truncated parent only and parks both
+``parent_idx`` and a ``truncated_chain_cursor`` in the offset. The
+resumed call uses ``cursor gt truncated_chain_cursor`` for that one
+parent (so the boundary cohort isn't skipped) and the original
+``cursor`` for every subsequent parent — per-parent cursor distributions
+are independent. After the resumed walk completes naturally the offset
+collapses back to ``{"cursor": <max>}``; ``apply_changes`` dedupes any
+cross-batch repeats. If even one parent's same-cursor cohort exceeds
+``max_records_per_batch``, the connector raises ``RuntimeError`` — raise
+the cap, or pick a higher-cardinality cursor.
+
+The ancestor-cursor fallback still has the older limitation; chain
+walks under it are interleaved by parent enumeration, so a same-cursor
+trim isn't safely scoped to one chain. Same workaround applies: keep
+``max_records_per_batch`` above the largest cohort, or pick a finer
+cursor.
 
 ### Disallowed combinations
 

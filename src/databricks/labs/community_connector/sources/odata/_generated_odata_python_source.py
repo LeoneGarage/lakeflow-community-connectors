@@ -597,6 +597,25 @@ def register_lakeflow_source(spark):
     ########################################################
 
     CONTAINED_PATH_SEP = "__"
+
+
+    def _trim_to_distinct_cursor_boundary(
+        records: list[dict],
+        cursor_field: str,
+    ) -> list[dict]:
+        """Drop trailing records sharing the boundary cursor value. Same
+        semantics as the flat-path helper in ``odata.py`` — duplicated here
+        to avoid a circular import. Returns empty list when every record
+        shares one cursor; caller decides recoverable vs hard failure."""
+        if not records:
+            return records
+        boundary = records[-1].get(cursor_field)
+        trim_idx = len(records)
+        while trim_idx > 0 and records[trim_idx - 1].get(cursor_field) == boundary:
+            trim_idx -= 1
+        return records[:trim_idx]
+
+
     # Inside generated OData request URLs the segment separator is always
     # a forward slash (the wire format the spec mandates).
     _URL_SEGMENT_SEP = "/"
@@ -1184,19 +1203,34 @@ def register_lakeflow_source(spark):
             chains: list[list[dict[str, Any]]],
             parent_idx_start: int,
             table_options: dict[str, str],
-            extra_filter: str | None,
             order_by: str,
             cursor_field: str,
             since: Any,
+            truncated_chain_cursor: Any,
             max_records: int,
             fk_columns: dict[tuple[str, str], str],
-        ) -> tuple[list[dict], bool, int]:
-            """Drive the per-parent fetch loop; return (rows, truncated, parent_idx)."""
+        ) -> tuple[list[dict], bool, int, int]:
+            """Drive the per-parent fetch loop. Each chain uses ``cursor gt
+            since`` *except* the chain at ``parent_idx_start`` when
+            ``truncated_chain_cursor`` is set — that chain uses ``cursor gt
+            truncated_chain_cursor`` to re-pick up its boundary cohort from
+            the last truncation. Returns ``(rows, truncated, parent_idx,
+            truncated_chain_start_idx)`` where the last value is the index
+            in ``emitted`` where the truncated chain's emissions started
+            (so the caller can trim within that chain only)."""
             emitted: list[dict] = []
             truncated = False
             parent_idx = parent_idx_start
+            chain_start_idx = 0
             while parent_idx < len(chains):
                 chain = chains[parent_idx]
+                chain_start_idx = len(emitted)
+                chain_since: Any
+                if parent_idx == parent_idx_start and truncated_chain_cursor is not None:
+                    chain_since = truncated_chain_cursor
+                else:
+                    chain_since = since
+                extra_filter = self._cursor_filter(cursor_field, chain_since)
                 url = self._build_contained_url(
                     segments,
                     chain,
@@ -1206,7 +1240,7 @@ def register_lakeflow_source(spark):
                 )
                 for row in self._fetch_pages(url):
                     rec_cursor = row.get(cursor_field)
-                    if since is not None and rec_cursor is not None and rec_cursor <= since:
+                    if chain_since is not None and rec_cursor is not None and rec_cursor <= chain_since:
                         continue
                     self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                     emitted.append(row)
@@ -1216,7 +1250,7 @@ def register_lakeflow_source(spark):
                 if truncated:
                     break
                 parent_idx += 1
-            return emitted, truncated, parent_idx
+            return emitted, truncated, parent_idx, chain_start_idx
 
         def _read_contained_incremental(
             self,
@@ -1254,32 +1288,64 @@ def register_lakeflow_source(spark):
             table_options: dict[str, str],
             cursor_field: str,
         ) -> tuple[Iterator[dict], dict]:
-            """Cursor lives on the leaf entity — filter at the leaf fetch."""
+            """Cursor lives on the leaf entity — filter at the leaf fetch.
+
+            Truncation handling (Option A boundary trim, scoped to the
+            truncated chain only):
+
+            * When the per-parent walk hits ``max_records_per_batch`` mid-
+              chain, the trailing same-cursor cohort of that chain's emit
+              is dropped via ``_trim_to_distinct_cursor_boundary``.
+            * If trimming leaves the chain with zero rows, the boundary
+              cohort exceeded ``max_records_per_batch`` on its own — raise
+              to match the flat-path failure mode.
+            * Offset carries the original ``since`` for subsequent chains
+              (their cursor distributions are independent of the truncated
+              chain) plus ``truncated_chain_cursor`` so the truncated chain
+              alone resumes from inside its own cohort boundary.
+            """
             namespace = (table_options or {}).get("namespace")
             table_name = CONTAINED_PATH_SEP.join(segments)
             since = (start_offset or {}).get("cursor")
+            truncated_chain_cursor_in = (start_offset or {}).get("truncated_chain_cursor")
             max_records = int((table_options or {}).get("max_records_per_batch", "100000"))
             order_by = self._leaf_cursor_order_by(table_name, namespace, cursor_field)
-            extra_filter = self._cursor_filter(cursor_field, since)
             chains = list(self._iter_parent_key_chains(segments, namespace, table_options))
-            emitted, truncated, parent_idx = self._walk_contained_with_cursor(
+            emitted, truncated, parent_idx, chain_start_idx = self._walk_contained_with_cursor(
                 segments,
                 chains,
                 int((start_offset or {}).get("parent_idx", 0)),
                 table_options,
-                extra_filter,
                 order_by,
                 cursor_field,
                 since,
+                truncated_chain_cursor_in,
                 max_records,
                 self._resolve_fk_columns(segments, namespace),
             )
-            if not emitted:
-                return iter([]), start_offset or {}
-            cursors = [r.get(cursor_field) for r in emitted if r.get(cursor_field) is not None]
-            end_offset: dict = {"cursor": max(cursors) if cursors else since}
             if truncated:
-                end_offset["parent_idx"] = parent_idx
+                trimmed_chain = _trim_to_distinct_cursor_boundary(
+                    emitted[chain_start_idx:], cursor_field
+                )
+                if not trimmed_chain:
+                    raise RuntimeError(
+                        f"max_records_per_batch={max_records} is smaller than the "
+                        f"largest same-cursor cohort under one parent in contained "
+                        f"path {table_name!r}. Raise max_records_per_batch above "
+                        f"that cohort, or pick a higher-cardinality cursor."
+                    )
+                emitted = emitted[:chain_start_idx] + trimmed_chain
+                end_offset: dict = {
+                    "parent_idx": parent_idx,
+                    "truncated_chain_cursor": trimmed_chain[-1].get(cursor_field),
+                }
+                if since is not None:
+                    end_offset["cursor"] = since
+            else:
+                if not emitted:
+                    return iter([]), start_offset or {}
+                cursors = [r.get(cursor_field) for r in emitted if r.get(cursor_field) is not None]
+                end_offset = {"cursor": max(cursors) if cursors else since}
             if start_offset and start_offset == end_offset:
                 return iter([]), start_offset
             return iter(emitted), end_offset
