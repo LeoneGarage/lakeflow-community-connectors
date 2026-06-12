@@ -35,13 +35,13 @@ Per-table options (allowlisted via externalOptionsAllowList):
 import base64
 import itertools
 import time
-from datetime import date, datetime, timezone
-from decimal import Decimal
+from datetime import datetime, timezone
 from typing import Any, Iterator
 from urllib.parse import urljoin
 from xml.etree import ElementTree as ET
 
 import requests
+from requests.auth import HTTPBasicAuth
 from pyspark.sql.types import (
     BinaryType,
     BooleanType,
@@ -65,6 +65,9 @@ from databricks.labs.community_connector.interface.supports_namespaces import (
 # Contained navigation-property support lives in ``_contained.py`` to keep
 # this module under its line-count budget. Re-exported under the original
 # private names so the rest of this file can keep using them as before.
+from databricks.labs.community_connector.sources.odata._helpers import (
+    trim_to_distinct_cursor_boundary as _trim_to_distinct_cursor_boundary,
+)
 from databricks.labs.community_connector.sources.odata._contained import (
     CONTAINED_PATH_SEP as _CONTAINED_PATH_SEP,
     MAX_CONTAINED_DEPTH as _MAX_CONTAINED_DEPTH,
@@ -1057,8 +1060,6 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces, ContainedNavMixi
         if auth_type == "bearer":
             session.headers["Authorization"] = f"Bearer {_require(self.options, 'token')}"
         elif auth_type == "basic":
-            from requests.auth import HTTPBasicAuth
-
             session.auth = HTTPBasicAuth(
                 _require(self.options, "username"),
                 _require(self.options, "password"),
@@ -1442,30 +1443,6 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces, ContainedNavMixi
 # ---------------------------------------------------------------------------
 # Helpers (module-level, no class state — easier to unit-test)
 # ---------------------------------------------------------------------------
-
-
-def _trim_to_distinct_cursor_boundary(
-    records: list[dict],
-    cursor_field: str,
-) -> list[dict]:
-    """Drop trailing records that share the boundary cursor value.
-
-    Walks back from the tail until the cursor value changes, leaving a clean
-    boundary that the next call's ``cursor gt <last>`` filter will pick up
-    cleanly. Drops the boundary record itself — we can't tell whether the
-    next page (or a concurrent insert before the next call) holds more
-    records sharing that cursor value, so we surrender the whole group and
-    let `cursor gt <prev_distinct>` re-fetch them.
-
-    Returns an empty list when every record shares one cursor value; the
-    caller decides whether that's recoverable (natural exhaustion) or a hard
-    failure (truncated batch with too-small cap).
-    """
-    boundary = records[-1].get(cursor_field)
-    trim_idx = len(records)
-    while trim_idx > 0 and records[trim_idx - 1].get(cursor_field) == boundary:
-        trim_idx -= 1
-    return records[:trim_idx]
 
 
 def _extract_oauth_error_hint(resp: requests.Response) -> str:
