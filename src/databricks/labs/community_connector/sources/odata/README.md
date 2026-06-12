@@ -291,23 +291,27 @@ Parents__Tags
 
 ### Schema augmentation
 
-Each contained-collection table prepends synthetic ancestor-FK
-columns onto every row so the destination Delta table can reconstruct
-the parent linkage. The default name is ``<segment>_<pkname>`` (no
-fixed prefix); a leading ``_`` is added only if the default would
-collide with a leaf property or another FK. For ``Parents__Children__Notes``:
+Each contained-collection table prepends synthetic FK columns
+carrying the **immediate parent's** primary keys. Grandparent and
+higher-level ancestor IDs are intentionally dropped from the leaf
+row. Default name is ``<segment>_<pkname>``; a leading ``_`` is
+added only if it would collide with a leaf property. For
+``Parents__Children__Notes``:
 
 ```
-Parents_Id    Int — Parents' primary key
-Children_Id   Int — Children's primary key
+Children_Id   Int — Children's primary key (immediate parent of Notes)
 Id            Int — Notes' own primary key
 Text          String
 ```
 
-The composite primary key reported in ``read_table_metadata`` is the
-full chain: ``[Parents_Id, Children_Id, Id]``. If the leaf had its
-own property named ``Parents_Id``, the FK would be emitted as
-``_Parents_Id`` and the leaf property would keep its original name.
+The composite primary key reported in ``read_table_metadata`` is
+``[Children_Id, Id]`` — immediate parent FK + leaf PK. If the leaf
+had its own property named ``Children_Id``, the FK would be emitted
+as ``_Children_Id`` and the leaf property would keep its original name.
+
+The URL traversal still passes through every ancestor (the wire path
+is ``Parents(p)/Children(c)/Notes``), but only the immediate parent's
+key shows up as a column on the destination row.
 
 ### Read modes
 

@@ -243,12 +243,13 @@ class ContainedNavMixin:
     def _resolve_fk_columns(
         self, segments: list[str], namespace: str | None
     ) -> dict[tuple[str, str], str]:
-        """Map ``(segment, pk_name) → unique FK column name``.
+        """Map ``(segment, pk_name) → unique FK column name`` for the
+        IMMEDIATE parent only.
 
-        Default form is ``<segment>_<pk>``. If that name collides with
-        a leaf entity property or with another FK column on the same
-        table, a leading ``_`` is prepended until the name is unique.
-        Empty mapping for flat (non-contained) tables.
+        For path ``A/B/C/D``, returns FK columns for ``C`` (the leaf's
+        immediate parent), not for ``A`` or ``B``. Default form is
+        ``<segment>_<pk>``; collisions with leaf properties get a
+        leading ``_`` until unique. Empty mapping for flat tables.
         """
         if len(segments) < 2:
             return {}
@@ -259,18 +260,15 @@ class ContainedNavMixin:
             )
         }
         used = set(leaf_field_names)
+        parent_seg = segments[-2]
+        parent_et = self._entity_type_for(CONTAINED_PATH_SEP.join(segments[:-1]), namespace)
         resolved: dict[tuple[str, str], str] = {}
-        for idx in range(len(segments) - 1):
-            ancestor_et = self._entity_type_for(
-                CONTAINED_PATH_SEP.join(segments[: idx + 1]), namespace
-            )
-            seg = segments[idx]
-            for pk in self._own_primary_keys_for_et(ancestor_et):
-                candidate = fk_column_name(seg, pk)
-                while candidate in used:
-                    candidate = "_" + candidate
-                resolved[(seg, pk)] = candidate
-                used.add(candidate)
+        for pk in self._own_primary_keys_for_et(parent_et):
+            candidate = fk_column_name(parent_seg, pk)
+            while candidate in used:
+                candidate = "_" + candidate
+            resolved[(parent_seg, pk)] = candidate
+            used.add(candidate)
         return resolved
 
     def _tag_with_ancestor_fks(
@@ -280,12 +278,18 @@ class ContainedNavMixin:
         chain: list[dict[str, Any]],
         fk_columns: dict[tuple[str, str], str],
     ) -> None:
-        """Write ancestor primary-key values onto ``row`` under the
-        resolved FK column names from ``fk_columns``."""
-        for idx, ancestor_keys in enumerate(chain):
-            seg = segments[idx]
-            for pk_name, pk_val in ancestor_keys.items():
-                row[fk_columns[(seg, pk_name)]] = pk_val
+        """Write only the IMMEDIATE-parent primary-key values onto ``row``.
+
+        ``chain`` still carries the full ancestor key tuple (the URL
+        builder needs it), but only the last entry (the leaf's
+        immediate parent) is materialized as FK columns. Grandparent
+        and higher-level ancestor IDs are intentionally dropped.
+        """
+        if not chain:
+            return
+        parent_seg = segments[-2]
+        for pk_name, pk_val in chain[-1].items():
+            row[fk_columns[(parent_seg, pk_name)]] = pk_val
 
     def _iter_parent_key_chains(
         self,

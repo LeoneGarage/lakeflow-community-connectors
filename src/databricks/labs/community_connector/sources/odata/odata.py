@@ -1325,23 +1325,20 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces, ContainedNavMixi
         own_fields = self._own_fields_for_et(self._entity_type_for(table_name, namespace))
         if len(segments) == 1:
             return own_fields
-        # Prepend ancestor FK columns; names resolved by ``_resolve_fk_columns``
-        # so clashes with leaf properties or other FKs get a ``_`` prefix.
+        # Prepend only the IMMEDIATE parent's PK columns. Grandparent
+        # IDs are intentionally dropped for multi-level paths.
         fk_columns = self._resolve_fk_columns(segments, namespace)
-        fk_fields: list[StructField] = []
-        for idx in range(len(segments) - 1):
-            ancestor_et = self._entity_type_for(
-                _CONTAINED_PATH_SEP.join(segments[: idx + 1]), namespace
+        parent_seg = segments[-2]
+        parent_et = self._entity_type_for(_CONTAINED_PATH_SEP.join(segments[:-1]), namespace)
+        own = {f.name: f.dataType for f in self._own_fields_for_et(parent_et)}
+        fk_fields: list[StructField] = [
+            StructField(
+                fk_columns[(parent_seg, pk)],
+                own.get(pk, StringType()),
+                False,
             )
-            own = {f.name: f.dataType for f in self._own_fields_for_et(ancestor_et)}
-            for pk in self._own_primary_keys_for_et(ancestor_et):
-                fk_fields.append(
-                    StructField(
-                        fk_columns[(segments[idx], pk)],
-                        own.get(pk, StringType()),
-                        False,
-                    )
-                )
+            for pk in self._own_primary_keys_for_et(parent_et)
+        ]
         return fk_fields + own_fields
 
     def _own_fields_for_et(self, et: ET.Element) -> list[StructField]:
@@ -1370,14 +1367,14 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces, ContainedNavMixi
         leaf_pks = self._own_primary_keys_for_et(self._entity_type_for(table_name, namespace))
         if len(segments) == 1:
             return leaf_pks
+        # Composite PK: immediate parent's FK columns + leaf's own PKs.
+        # Grandparent IDs are not part of the destination key.
         fk_columns = self._resolve_fk_columns(segments, namespace)
-        composite: list[str] = []
-        for idx in range(len(segments) - 1):
-            ancestor_et = self._entity_type_for(
-                _CONTAINED_PATH_SEP.join(segments[: idx + 1]), namespace
-            )
-            for pk in self._own_primary_keys_for_et(ancestor_et):
-                composite.append(fk_columns[(segments[idx], pk)])
+        parent_seg = segments[-2]
+        parent_et = self._entity_type_for(_CONTAINED_PATH_SEP.join(segments[:-1]), namespace)
+        composite = [
+            fk_columns[(parent_seg, pk)] for pk in self._own_primary_keys_for_et(parent_et)
+        ]
         composite.extend(leaf_pks)
         return composite
 

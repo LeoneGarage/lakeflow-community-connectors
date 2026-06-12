@@ -2106,17 +2106,16 @@ def test_get_table_schema_for_two_level_contained():
 
 
 @responses.activate
-def test_get_table_schema_for_three_level_contained():
+def test_get_table_schema_for_three_level_contained_immediate_parent_only():
+    """For ``A__B__C`` only the IMMEDIATE parent's PK columns are
+    prepended — grandparent IDs are intentionally dropped."""
     _mock_nested_metadata()
     c = _make()
     schema = c.get_table_schema("Parents__Children__Notes", {})
     names = [f.name for f in schema.fields]
-    assert names == [
-        "Parents_Id",
-        "Children_Id",
-        "Id",
-        "Text",
-    ]
+    # Only Children_Id (the immediate parent of Notes); Parents_Id absent.
+    assert names == ["Children_Id", "Id", "Text"]
+    assert "Parents_Id" not in names
 
 
 @responses.activate
@@ -2142,15 +2141,13 @@ def test_primary_keys_for_two_level_contained():
 
 
 @responses.activate
-def test_primary_keys_for_three_level_contained_includes_all_ancestors():
+def test_primary_keys_for_three_level_contained_immediate_parent_only():
+    """Composite PK is immediate-parent FK + leaf PK — grandparent
+    columns are dropped, matching the schema."""
     _mock_nested_metadata()
     c = _make()
     meta = c.read_table_metadata("Parents__Children__Notes", {})
-    assert meta["primary_keys"] == [
-        "Parents_Id",
-        "Children_Id",
-        "Id",
-    ]
+    assert meta["primary_keys"] == ["Children_Id", "Id"]
 
 
 @responses.activate
@@ -2287,13 +2284,14 @@ def test_contained_snapshot_three_level_walks_full_chain():
     records, _ = c.read_table("Parents__Children__Notes", None, {})
     rows = list(records)
     assert len(rows) == 3
-    # All three FK chains populated
+    # Only immediate-parent FK (Children_Id) tagged onto the row;
+    # Parents_Id is intentionally absent for multi-level paths.
     assert rows[0] == {
-        "Parents_Id": 1,
         "Children_Id": 10,
         "Id": 100,
         "Text": "a",
     }
+    assert "Parents_Id" not in rows[0]
     assert rows[2]["Children_Id"] == 20
     assert rows[2]["Id"] == 200
 
@@ -2372,7 +2370,9 @@ def test_contained_expand_three_level_flattens_nested():
     records, _ = c.read_table("Parents__Children__Notes", None, {"expand_contained": "true"})
     rows = list(records)
     assert len(rows) == 2
-    assert all(r["Parents_Id"] == 1 and r["Children_Id"] == 10 for r in rows)
+    # Only the immediate parent's FK (Children_Id) is materialized; the
+    # grandparent's Parents_Id is dropped even though $expand traversed it.
+    assert all(r["Children_Id"] == 10 and "Parents_Id" not in r for r in rows)
     assert {r["Id"] for r in rows} == {100, 101}
 
 
