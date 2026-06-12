@@ -645,13 +645,28 @@ def register_lakeflow_source(spark):
 
     def parse_contained_path(table_name: str) -> list[str] | None:
         """Split double-underscore-delimited path; ``None`` for flat names."""
+        if _URL_SEGMENT_SEP in table_name:
+            # OData entity-set names cannot contain ``/`` (CSDL allows only
+            # letters/digits/underscores), so a slash here always means the
+            # caller used the wrong separator. Spell out the fix — the
+            # generic "not found" error otherwise buries the cause under a
+            # 200-entry "Available:" list.
+            suggested = table_name.replace(_URL_SEGMENT_SEP, CONTAINED_PATH_SEP)
+            raise ValueError(
+                f"Contained-collection table names use {CONTAINED_PATH_SEP!r} "
+                f"(double underscore) as the segment separator, not "
+                f"{_URL_SEGMENT_SEP!r} — slashes aren't valid in Spark SQL "
+                f"identifiers, which the SDP framework uses for view names. "
+                f"Rename {table_name!r} to {suggested!r} in the pipeline "
+                f"config."
+            )
         if CONTAINED_PATH_SEP not in table_name:
             return None
         segments = table_name.split(CONTAINED_PATH_SEP)
         if any(not s for s in segments):
             raise ValueError(
                 f"Empty path segment in contained table name {table_name!r}; "
-                "expected 'Parent/Child' or 'Parent/Child/Grandchild' form."
+                "expected 'Parent__Child' or 'Parent__Child__Grandchild' form."
             )
         if len(segments) > MAX_CONTAINED_DEPTH:
             raise ValueError(

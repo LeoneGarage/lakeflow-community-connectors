@@ -2039,6 +2039,22 @@ def test_parse_contained_path_rejects_empty_segment():
         _parse_contained_path("A____B")
 
 
+def test_parse_contained_path_rejects_slash_with_actionable_message():
+    """Old-form slash paths are common when the user copied the table
+    name from OData URL syntax or from a pre-fix version of
+    ``list_tables``. The error must spell out the rename so the user
+    isn't left staring at a "not found" with a 200-entry available list.
+    """
+    from databricks.labs.community_connector.sources.odata.odata import (
+        _parse_contained_path,
+    )
+
+    with pytest.raises(
+        ValueError, match="Rename 'Instances/AssetPacks' to 'Instances__AssetPacks'"
+    ):
+        _parse_contained_path("Instances/AssetPacks")
+
+
 def test_parse_contained_path_rejects_over_depth():
     from databricks.labs.community_connector.sources.odata.odata import (
         _parse_contained_path,
