@@ -41,6 +41,7 @@ from pyspark.sql.types import (
     VariantType,
     VariantVal,
 )
+from requests.auth import HTTPBasicAuth
 from urllib.parse import urljoin
 from xml.etree import ElementTree as ET
 import base64
@@ -593,20 +594,27 @@ def register_lakeflow_source(spark):
 
 
     ########################################################
-    # src/databricks/labs/community_connector/sources/odata/_contained.py
+    # src/databricks/labs/community_connector/sources/odata/_helpers.py
     ########################################################
 
-    CONTAINED_PATH_SEP = "__"
-
-
-    def _trim_to_distinct_cursor_boundary(
+    def trim_to_distinct_cursor_boundary(
         records: list[dict],
         cursor_field: str,
     ) -> list[dict]:
-        """Drop trailing records sharing the boundary cursor value. Same
-        semantics as the flat-path helper in ``odata.py`` — duplicated here
-        to avoid a circular import. Returns empty list when every record
-        shares one cursor; caller decides recoverable vs hard failure."""
+        """Drop trailing records sharing the boundary cursor value.
+
+        Walks back from the tail until the cursor value changes, leaving a
+        clean boundary that the next call's ``cursor gt <last>`` filter
+        will pick up cleanly. Drops the boundary record itself — we can't
+        tell whether the next page (or a concurrent insert before the next
+        call) holds more records sharing that cursor value, so we
+        surrender the whole group and let ``cursor gt <prev_distinct>``
+        re-fetch them.
+
+        Returns an empty list when every record shares one cursor value;
+        the caller decides whether that's recoverable (natural exhaustion)
+        or a hard failure (truncated batch with too-small cap).
+        """
         if not records:
             return records
         boundary = records[-1].get(cursor_field)
@@ -614,6 +622,23 @@ def register_lakeflow_source(spark):
         while trim_idx > 0 and records[trim_idx - 1].get(cursor_field) == boundary:
             trim_idx -= 1
         return records[:trim_idx]
+
+
+    def max_or(a: Any, b: Any) -> Any:
+        """Max of two values where either may be ``None``. Returns the other
+        when one is ``None``; ``None`` only if both are."""
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return max(a, b)
+
+
+    ########################################################
+    # src/databricks/labs/community_connector/sources/odata/_contained.py
+    ########################################################
+
+    CONTAINED_PATH_SEP = "__"
 
 
     # Inside generated OData request URLs the segment separator is always
@@ -1429,34 +1454,46 @@ def register_lakeflow_source(spark):
             Every leaf under a chain shares that chain's stamped cursor by
             construction, so a within-chain ``cursor gt`` rebuild would
             either re-fetch the whole chain or skip the whole chain — there
-            is no meaningful split. The server's @odata.nextLink, on the
-            other hand, encodes the chain's pagination position
-            independently of cursor values, so the resumed call hands it
-            back and the server picks up exactly where it stopped.
-
-            On a truncation:
-
-            * If we stopped at a page boundary mid-chain (next page exists),
-              park ``chain_next_link`` in the offset.
-            * If we stopped because the chain happened to end on the
-              truncating page, just advance ``parent_idx`` past it.
+            is no meaningful split.
             """
             namespace = (table_options or {}).get("namespace")
             since = (start_offset or {}).get("cursor")
-            chain_next_link_in = (start_offset or {}).get("chain_next_link")
-            max_records = int((table_options or {}).get("max_records_per_batch", "100000"))
-            fk_columns = self._resolve_fk_columns(segments, namespace)
             chains_with_cursor = list(
                 self._iter_parent_chains_with_cursor(
-                    segments,
-                    namespace,
-                    table_options,
-                    cursor_level,
-                    cursor_field,
-                    since,
+                    segments, namespace, table_options, cursor_level, cursor_field, since
                 )
             )
-            parent_idx_start = int((start_offset or {}).get("parent_idx", 0))
+            walk_state = self._walk_ancestor_chains(
+                segments,
+                chains_with_cursor,
+                table_options,
+                cursor_field,
+                int((start_offset or {}).get("parent_idx", 0)),
+                (start_offset or {}).get("chain_next_link"),
+                int((table_options or {}).get("max_records_per_batch", "100000")),
+                self._resolve_fk_columns(segments, namespace),
+            )
+            end_offset = self._ancestor_cursor_offset(walk_state, start_offset, since, cursor_field)
+            if start_offset and start_offset == end_offset:
+                return iter([]), start_offset
+            return iter(walk_state["emitted"]), end_offset
+
+        def _walk_ancestor_chains(
+            self,
+            segments: list[str],
+            chains_with_cursor: list[tuple[list[dict[str, Any]], Any]],
+            table_options: dict[str, str],
+            cursor_field: str,
+            parent_idx_start: int,
+            chain_next_link_in: str | None,
+            max_records: int,
+            fk_columns: dict[tuple[str, str], str],
+        ) -> dict[str, Any]:
+            """Walk ancestor chains, fetching each chain's leaf collection
+            and stamping rows with the chain's cursor. Page-aware: a
+            truncation at a page boundary parks the chain's @odata.nextLink;
+            when the chain happens to end on the truncating page,
+            ``parent_idx`` simply advances past it."""
             parent_idx = parent_idx_start
             emitted: list[dict] = []
             truncated = False
@@ -1477,62 +1514,56 @@ def register_lakeflow_source(spark):
                         truncated = True
                         break
                 if truncated:
-                    # Page-boundary checkpoint: mid-chain only if the chain has
-                    # more pages left. Otherwise the chain finished on the
-                    # truncating page and we can simply advance parent_idx.
                     if page_next_url is not None:
                         chain_next_link_out = page_next_url
                     else:
                         parent_idx += 1
-                        chain_next_link_out = None
                     break
                 parent_idx += 1
-            # Offset semantics:
-            #
-            # * On truncation, preserve the **original** ``since`` (start
-            #   offset's cursor) so the resumed call's chain rebuild covers
-            #   the same set as the prior batch. Ancestor cursors interleave
-            #   across top-level parents (depth-first walk), so advancing
-            #   ``since`` to the global max would silently skip lower-cursor
-            #   chains under not-yet-walked parents.
-            # * Carry ``running_max`` across resume batches: every batch
-            #   max-merges its own emitted cursors with what's already in
-            #   ``running_max``. On natural completion that accumulated
-            #   value becomes the next regular trigger's ``cursor`` floor —
-            #   without it, completing a resume that originated from
-            #   ``since=None`` would drop the cursor entirely and re-walk
-            #   the whole table on the next trigger.
-            # * Cross-batch re-emission of already-seen chains during the
-            #   resume cycle is deduped by ``apply_changes`` on the
-            #   composite PK; correctness over minimal bandwidth.
-            end_offset: dict
+            return {
+                "emitted": emitted,
+                "truncated": truncated,
+                "parent_idx": parent_idx,
+                "chain_next_link": chain_next_link_out,
+            }
+
+        def _ancestor_cursor_offset(
+            self,
+            walk_state: dict[str, Any],
+            start_offset: dict | None,
+            since: Any,
+            cursor_field: str,
+        ) -> dict:
+            """Build the offset for the ancestor-cursor read path.
+
+            On truncation: preserve original ``since`` (the chain enumeration
+            interleaves cursors across top-level parents, so advancing
+            ``since`` to the global max would silently skip lower-cursor
+            chains under not-yet-walked parents). Accumulate ``running_max``
+            across resume batches so natural completion records the actual
+            highest cursor seen — without it, a resume that started from
+            ``since=None`` would lose the cursor on completion and re-walk
+            the whole table on the next trigger.
+            """
+            emitted = walk_state["emitted"]
             cursors = [r.get(cursor_field) for r in emitted if r.get(cursor_field) is not None]
             this_batch_max = max(cursors) if cursors else None
             prev_running_max = (start_offset or {}).get("running_max")
-            if this_batch_max is not None and prev_running_max is not None:
-                new_running_max: Any = max(this_batch_max, prev_running_max)
-            elif this_batch_max is not None:
-                new_running_max = this_batch_max
-            else:
-                new_running_max = prev_running_max
-            if truncated:
-                end_offset = {"parent_idx": parent_idx}
+            new_running_max = _max_or(this_batch_max, prev_running_max)
+            if walk_state["truncated"]:
+                offset: dict = {"parent_idx": walk_state["parent_idx"]}
                 if since is not None:
-                    end_offset["cursor"] = since
-                if chain_next_link_out is not None:
-                    end_offset["chain_next_link"] = chain_next_link_out
+                    offset["cursor"] = since
+                if walk_state["chain_next_link"] is not None:
+                    offset["chain_next_link"] = walk_state["chain_next_link"]
                 if new_running_max is not None:
-                    end_offset["running_max"] = new_running_max
-            else:
-                if new_running_max is not None:
-                    end_offset = {"cursor": new_running_max}
-                elif since is not None:
-                    end_offset = {"cursor": since}
-                else:
-                    end_offset = {}
-            if start_offset and start_offset == end_offset:
-                return iter([]), start_offset
-            return iter(emitted), end_offset
+                    offset["running_max"] = new_running_max
+                return offset
+            if new_running_max is not None:
+                return {"cursor": new_running_max}
+            if since is not None:
+                return {"cursor": since}
+            return {}
 
 
     ########################################################
@@ -2514,8 +2545,6 @@ def register_lakeflow_source(spark):
             if auth_type == "bearer":
                 session.headers["Authorization"] = f"Bearer {_require(self.options, 'token')}"
             elif auth_type == "basic":
-                from requests.auth import HTTPBasicAuth
-
                 session.auth = HTTPBasicAuth(
                     _require(self.options, "username"),
                     _require(self.options, "password"),
@@ -2901,30 +2930,6 @@ def register_lakeflow_source(spark):
     # ---------------------------------------------------------------------------
 
 
-    def _trim_to_distinct_cursor_boundary(
-        records: list[dict],
-        cursor_field: str,
-    ) -> list[dict]:
-        """Drop trailing records that share the boundary cursor value.
-
-        Walks back from the tail until the cursor value changes, leaving a clean
-        boundary that the next call's ``cursor gt <last>`` filter will pick up
-        cleanly. Drops the boundary record itself — we can't tell whether the
-        next page (or a concurrent insert before the next call) holds more
-        records sharing that cursor value, so we surrender the whole group and
-        let `cursor gt <prev_distinct>` re-fetch them.
-
-        Returns an empty list when every record shares one cursor value; the
-        caller decides whether that's recoverable (natural exhaustion) or a hard
-        failure (truncated batch with too-small cap).
-        """
-        boundary = records[-1].get(cursor_field)
-        trim_idx = len(records)
-        while trim_idx > 0 and records[trim_idx - 1].get(cursor_field) == boundary:
-            trim_idx -= 1
-        return records[:trim_idx]
-
-
     def _extract_oauth_error_hint(resp: requests.Response) -> str:
         """Pull the most informative error description out of an OAuth2 response.
 
@@ -2971,6 +2976,9 @@ def register_lakeflow_source(spark):
         return base64.b64decode(value)
 
 
+    _max_or = max_or
+    _trim_to_distinct_cursor_boundary = trim_to_distinct_cursor_boundary
+    _trim_to_distinct_cursor_boundary = trim_to_distinct_cursor_boundary
     _CONTAINED_PATH_SEP = CONTAINED_PATH_SEP
     _join_url = join_url
     _odata_literal = odata_literal
