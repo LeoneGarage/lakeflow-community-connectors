@@ -2027,7 +2027,7 @@ def test_parse_contained_path_multi_segment():
         _parse_contained_path,
     )
 
-    assert _parse_contained_path("A/B/C") == ["A", "B", "C"]
+    assert _parse_contained_path("A__B__C") == ["A", "B", "C"]
 
 
 def test_parse_contained_path_rejects_empty_segment():
@@ -2036,7 +2036,7 @@ def test_parse_contained_path_rejects_empty_segment():
     )
 
     with pytest.raises(ValueError, match="Empty path segment"):
-        _parse_contained_path("A//B")
+        _parse_contained_path("A____B")
 
 
 def test_parse_contained_path_rejects_over_depth():
@@ -2045,7 +2045,7 @@ def test_parse_contained_path_rejects_over_depth():
     )
 
     with pytest.raises(ValueError, match="exceeds max depth"):
-        _parse_contained_path("A/B/C/D/E/F")
+        _parse_contained_path("A__B__C__D__E__F")
 
 
 @responses.activate
@@ -2055,9 +2055,9 @@ def test_list_tables_includes_nested_paths():
     flat = c.list_tables()
     # Top-level + every reachable contained path.
     assert "Parents" in flat
-    assert "Parents/Children" in flat
-    assert "Parents/Tags" in flat
-    assert "Parents/Children/Notes" in flat
+    assert "Parents__Children" in flat
+    assert "Parents__Tags" in flat
+    assert "Parents__Children__Notes" in flat
 
 
 @responses.activate
@@ -2067,9 +2067,9 @@ def test_list_tables_in_namespace_includes_nested_paths():
     tables = c.list_tables_in_namespace(["Nested"])
     assert tables == [
         "Parents",
-        "Parents/Children",
-        "Parents/Children/Notes",
-        "Parents/Tags",
+        "Parents__Children",
+        "Parents__Children__Notes",
+        "Parents__Tags",
     ]
 
 
@@ -2080,7 +2080,7 @@ def test_list_tables_in_namespace_includes_nested_paths():
 def test_get_table_schema_for_two_level_contained():
     _mock_nested_metadata()
     c = _make()
-    schema = c.get_table_schema("Parents/Children", {})
+    schema = c.get_table_schema("Parents__Children", {})
     names = [f.name for f in schema.fields]
     # Parent FK prepended, then child's own fields in CSDL order.
     assert names == ["_parent_Parents_Id", "Id", "Label", "ModifiedAt"]
@@ -2093,7 +2093,7 @@ def test_get_table_schema_for_two_level_contained():
 def test_get_table_schema_for_three_level_contained():
     _mock_nested_metadata()
     c = _make()
-    schema = c.get_table_schema("Parents/Children/Notes", {})
+    schema = c.get_table_schema("Parents__Children__Notes", {})
     names = [f.name for f in schema.fields]
     assert names == [
         "_parent_Parents_Id",
@@ -2105,13 +2105,13 @@ def test_get_table_schema_for_three_level_contained():
 
 @responses.activate
 def test_get_table_schema_for_contained_with_composite_parent_pk():
-    """Parents/Tags has a composite-key leaf; FK prepend on a single-PK
+    """Parents__Tags has a composite-key leaf; FK prepend on a single-PK
     parent yields exactly one ancestor column. Inverse test (composite
     parent) requires a different fixture — covered indirectly via the
     Tag leaf's own composite key showing up in primary_keys_for."""
     _mock_nested_metadata()
     c = _make()
-    schema = c.get_table_schema("Parents/Tags", {})
+    schema = c.get_table_schema("Parents__Tags", {})
     names = [f.name for f in schema.fields]
     assert names == ["_parent_Parents_Id", "Category", "Value"]
 
@@ -2120,7 +2120,7 @@ def test_get_table_schema_for_contained_with_composite_parent_pk():
 def test_primary_keys_for_two_level_contained():
     _mock_nested_metadata()
     c = _make()
-    meta = c.read_table_metadata("Parents/Children", {})
+    meta = c.read_table_metadata("Parents__Children", {})
     assert meta["primary_keys"] == ["_parent_Parents_Id", "Id"]
     assert meta["ingestion_type"] == "snapshot"
 
@@ -2129,7 +2129,7 @@ def test_primary_keys_for_two_level_contained():
 def test_primary_keys_for_three_level_contained_includes_all_ancestors():
     _mock_nested_metadata()
     c = _make()
-    meta = c.read_table_metadata("Parents/Children/Notes", {})
+    meta = c.read_table_metadata("Parents__Children__Notes", {})
     assert meta["primary_keys"] == [
         "_parent_Parents_Id",
         "_parent_Children_Id",
@@ -2141,7 +2141,7 @@ def test_primary_keys_for_three_level_contained_includes_all_ancestors():
 def test_primary_keys_for_composite_leaf_in_contained():
     _mock_nested_metadata()
     c = _make()
-    meta = c.read_table_metadata("Parents/Tags", {})
+    meta = c.read_table_metadata("Parents__Tags", {})
     # Composite PK on the leaf — both columns surface alongside parent FK.
     assert meta["primary_keys"] == ["_parent_Parents_Id", "Category", "Value"]
 
@@ -2151,7 +2151,7 @@ def test_entity_type_for_invalid_nav_prop_raises():
     _mock_nested_metadata()
     c = _make()
     with pytest.raises(ValueError, match="not a contained-collection"):
-        c.read_table_metadata("Parents/NotAThing", {})
+        c.read_table_metadata("Parents__NotAThing", {})
 
 
 # --- URL construction ---
@@ -2240,7 +2240,7 @@ def test_contained_snapshot_two_level_walks_parents_and_tags_fks():
         },
     )
     c = _make()
-    records, offset = c.read_table("Parents/Children", None, {})
+    records, offset = c.read_table("Parents__Children", None, {})
     rows = list(records)
     assert offset == {}
     assert len(rows) == 3
@@ -2268,7 +2268,7 @@ def test_contained_snapshot_three_level_walks_full_chain():
         json={"value": [{"Id": 200, "Text": "c"}]},
     )
     c = _make()
-    records, _ = c.read_table("Parents/Children/Notes", None, {})
+    records, _ = c.read_table("Parents__Children__Notes", None, {})
     rows = list(records)
     assert len(rows) == 3
     # All three FK chains populated
@@ -2284,9 +2284,9 @@ def test_contained_snapshot_three_level_walks_full_chain():
 
 @responses.activate
 def test_contained_snapshot_composite_parent_key_in_url():
-    """When the parent has a composite key (Parents/Tags has Tag as a
+    """When the parent has a composite key (Parents__Tags has Tag as a
     composite-PK contained type), the key predicate on nested traversal
-    must use the named form. This test uses Parents/Children/Notes which
+    must use the named form. This test uses Parents__Children__Notes which
     has single-key parents — for composite parent URL coverage see
     test_key_predicate_composite + a hand-crafted metadata."""
     # Covered by unit test on _format_key_predicate above; this is a
@@ -2321,7 +2321,7 @@ def test_contained_expand_two_level_flattens_nested_response():
         },
     )
     c = _make()
-    records, _ = c.read_table("Parents/Children", None, {"expand_contained": "true"})
+    records, _ = c.read_table("Parents__Children", None, {"expand_contained": "true"})
     rows = list(records)
     assert len(rows) == 2
     assert rows[0]["_parent_Parents_Id"] == 1
@@ -2353,7 +2353,7 @@ def test_contained_expand_three_level_flattens_nested():
         },
     )
     c = _make()
-    records, _ = c.read_table("Parents/Children/Notes", None, {"expand_contained": "true"})
+    records, _ = c.read_table("Parents__Children__Notes", None, {"expand_contained": "true"})
     rows = list(records)
     assert len(rows) == 2
     assert all(r["_parent_Parents_Id"] == 1 and r["_parent_Children_Id"] == 10 for r in rows)
@@ -2383,7 +2383,7 @@ def test_contained_expand_strips_odata_annotations_on_leaf_rows():
         },
     )
     c = _make()
-    records, _ = c.read_table("Parents/Children", None, {"expand_contained": "true"})
+    records, _ = c.read_table("Parents__Children", None, {"expand_contained": "true"})
     rows = list(records)
     assert rows == [
         {
@@ -2400,7 +2400,7 @@ def test_contained_expand_invalid_value_raises():
     _mock_nested_metadata()
     c = _make()
     with pytest.raises(ValueError, match="Invalid expand_contained"):
-        c.read_table("Parents/Children", None, {"expand_contained": "yes"})
+        c.read_table("Parents__Children", None, {"expand_contained": "yes"})
 
 
 # --- Cursor incremental on contained ---
@@ -2421,7 +2421,7 @@ def test_contained_incremental_first_call_no_filter():
         match_querystring=False,
     )
     c = _make()
-    records, offset = c.read_table("Parents/Children", None, {"cursor_field": "ModifiedAt"})
+    records, offset = c.read_table("Parents__Children", None, {"cursor_field": "ModifiedAt"})
     rows = list(records)
     assert len(rows) == 2
     assert offset == {"cursor": "2024-01-02T00:00:00Z"}
@@ -2444,7 +2444,7 @@ def test_contained_incremental_resume_applies_cursor_filter():
     )
     c = _make()
     records, offset = c.read_table(
-        "Parents/Children",
+        "Parents__Children",
         {"cursor": "2024-01-02T00:00:00Z"},
         {"cursor_field": "ModifiedAt"},
     )
@@ -2468,7 +2468,7 @@ def test_contained_incremental_terminates_when_offset_unchanged():
     )
     c = _make()
     records, offset = c.read_table(
-        "Parents/Children",
+        "Parents__Children",
         {"cursor": "2024-01-02T00:00:00Z"},
         {"cursor_field": "ModifiedAt"},
     )
@@ -2492,7 +2492,7 @@ def test_contained_incremental_truncation_returns_parent_idx_offset():
     )
     c = _make()
     records, offset = c.read_table(
-        "Parents/Children",
+        "Parents__Children",
         None,
         {"cursor_field": "ModifiedAt", "max_records_per_batch": "2"},
     )
@@ -2510,7 +2510,7 @@ def test_contained_incremental_truncation_returns_parent_idx_offset():
 def test_contained_metadata_snapshot_when_no_cursor():
     _mock_nested_metadata()
     c = _make()
-    meta = c.read_table_metadata("Parents/Children", {})
+    meta = c.read_table_metadata("Parents__Children", {})
     assert meta["ingestion_type"] == "snapshot"
     assert meta["cursor_field"] is None
     assert meta["primary_keys"] == ["_parent_Parents_Id", "Id"]
@@ -2520,7 +2520,7 @@ def test_contained_metadata_snapshot_when_no_cursor():
 def test_contained_metadata_cdc_when_cursor_field_set():
     _mock_nested_metadata()
     c = _make()
-    meta = c.read_table_metadata("Parents/Children", {"cursor_field": "ModifiedAt"})
+    meta = c.read_table_metadata("Parents__Children", {"cursor_field": "ModifiedAt"})
     assert meta["ingestion_type"] == "cdc"
     assert meta["cursor_field"] == "ModifiedAt"
 
@@ -2530,7 +2530,7 @@ def test_contained_delta_tracking_enabled_raises():
     _mock_nested_metadata()
     c = _make()
     with pytest.raises(ValueError, match="not supported on contained"):
-        c.read_table("Parents/Children", None, {"delta_tracking": "enabled"})
+        c.read_table("Parents__Children", None, {"delta_tracking": "enabled"})
 
 
 @responses.activate
@@ -2540,7 +2540,7 @@ def test_contained_select_preserves_parent_fk_columns():
     Delta tables reconstruct the parent linkage."""
     _mock_nested_metadata()
     c = _make()
-    schema = c.get_table_schema("Parents/Children", {"select": "Id,Label"})
+    schema = c.get_table_schema("Parents__Children", {"select": "Id,Label"})
     names = [f.name for f in schema.fields]
     # FK column survives select; ModifiedAt is filtered out.
     assert "_parent_Parents_Id" in names
@@ -2572,4 +2572,4 @@ def test_contained_path_cycle_detection_in_discovery():
     c = _make()
     tables = c.list_tables_in_namespace(["Cycle"])
     # Self appears once (depth 2) but no further recursion.
-    assert tables == ["Nodes", "Nodes/Self"]
+    assert tables == ["Nodes", "Nodes__Self"]

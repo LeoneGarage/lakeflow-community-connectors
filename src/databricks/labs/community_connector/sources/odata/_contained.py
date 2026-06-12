@@ -2,8 +2,9 @@
 
 OData v4 ``<NavigationProperty ContainsTarget="true">`` declares a
 parent-owned collection accessed as ``GET Parent(<key>)/ContainedNavProp``.
-The connector exposes these as slash-pathed tables
-(``Parent/Child/.../Leaf``) with ``_parent_<seg>_<pk>`` ancestor-FK
+The connector exposes these as double-underscore-pathed tables
+(``Parent__Child__...__Leaf``) — slash isn't valid in Spark SQL
+identifiers — with ``_parent_<seg>_<pk>`` ancestor-FK
 columns prepended onto each row. The split keeps the main connector
 file under its line cap; the methods here are mixed into
 ``ODataLakeflowConnect`` via ``ContainedNavMixin``.
@@ -23,7 +24,14 @@ from pyspark.sql.types import StringType, StructField
 
 
 # Path-segment separator and ancestor-FK column-name prefix.
-CONTAINED_PATH_SEP = "/"
+# ``__`` (double underscore), not ``/``, so the framework can interpolate
+# slash-free table names directly into Spark SQL identifiers (view names,
+# temp views). The OData URL path still uses ``/`` — that's hardcoded
+# in ``_build_contained_path``.
+CONTAINED_PATH_SEP = "__"
+# Inside generated OData request URLs the segment separator is always
+# a forward slash (the wire format the spec mandates).
+_URL_SEGMENT_SEP = "/"
 PARENT_FK_PREFIX = "_parent_"
 # Cap on path depth. Prevents pathological discovery walks on services
 # with cyclic containment graphs; cycles within the cap are also
@@ -68,7 +76,7 @@ _NS_EDM = "{http://docs.oasis-open.org/odata/ns/edm}"
 
 
 def parse_contained_path(table_name: str) -> list[str] | None:
-    """Split slash-delimited path; ``None`` for flat single-segment names."""
+    """Split double-underscore-delimited path; ``None`` for flat names."""
     if CONTAINED_PATH_SEP not in table_name:
         return None
     segments = table_name.split(CONTAINED_PATH_SEP)
@@ -177,7 +185,7 @@ class ContainedNavMixin:
                 f"key_chain length {len(key_chain)} does not match "
                 f"non-leaf segment count {len(segments) - 1}"
             )
-        return CONTAINED_PATH_SEP.join(
+        return _URL_SEGMENT_SEP.join(
             f"{seg}{self._format_key_predicate(key_chain[i])}" if i < len(key_chain) else seg
             for i, seg in enumerate(segments)
         )

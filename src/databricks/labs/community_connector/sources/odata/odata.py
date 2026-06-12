@@ -178,7 +178,7 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces, ContainedNavMixi
 
         Includes both top-level entity sets and contained collections
         reachable via ``ContainsTarget="true"`` navigation properties
-        (slash-pathed, e.g. ``Instances/Assets/AssetDocuments``).
+        (double-underscore-pathed, e.g. ``Instances__Assets__AssetDocuments``).
         """
         names: set[str] = set()
         for ns, es_name in self._entity_set_index():

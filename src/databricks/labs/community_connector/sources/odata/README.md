@@ -191,7 +191,7 @@ build_pipeline(
 | `page_size`             | 1000    | `$top` per HTTP request. |
 | `max_records_per_batch` | 100000  | Per-call upper bound on rows returned. The connector has **no wall-clock ceiling** — `max_records_per_batch` is the only cap on a single batch. Each batch fetches `cursor gt <last>` and pulls up to this many rows, then commits the offset. Smaller values give continuous-mode pipelines lower latency per micro-batch at the cost of more round trips; larger values amortize HTTP overhead. The default of 100000 fits roughly 100 `$top=1000` pages per batch and prioritises throughput; lower it (e.g. to 5000) if you want tighter per-batch latency in a continuous pipeline. |
 | `delta_tracking`        | disabled | Opt-in OData v4 delta queries. Values: `disabled` (default — no behavior change), `auto` (probe once, fall back to cursor/snapshot if the server doesn't acknowledge), `enabled` (require support; error if the server doesn't acknowledge). See [Delta tracking](#delta-tracking) below. |
-| `expand_contained`      | false   | For contained-collection tables (`Parent/Child/...` paths). When `true`, the connector issues a single `GET Parent?$expand=Child($expand=...)` per pipeline trigger instead of the default N+1 traversal (one parent fetch + one per-parent leaf fetch). See [Contained navigation properties](#contained-navigation-properties) below. |
+| `expand_contained`      | false   | For contained-collection tables (`Parent__Child__...` paths). When `true`, the connector issues a single `GET Parent?$expand=Child($expand=...)` per pipeline trigger instead of the default N+1 traversal (one parent fetch + one per-parent leaf fetch). See [Contained navigation properties](#contained-navigation-properties) below. |
 
 ## Delta tracking
 
@@ -279,21 +279,21 @@ addressed by traversing the parent's key:
 ``GET Parent(<key>)/ContainedNavProp``. Common examples: order line
 items, address records on a customer, asset documents on an asset.
 
-The connector exposes these as slash-pathed tables alongside the
+The connector exposes these as double-underscore-pathed tables alongside the
 top-level entity sets, up to 5 segments deep:
 
 ```
 Parents
-Parents/Children
-Parents/Children/Notes
-Parents/Tags
+Parents__Children
+Parents__Children__Notes
+Parents__Tags
 ```
 
 ### Schema augmentation
 
 Each contained-collection table prepends synthetic ``_parent_<segment>_<pkname>``
 columns onto every row so the destination Delta table can reconstruct
-the parent linkage. For ``Parents/Children/Notes``:
+the parent linkage. For ``Parents__Children__Notes``:
 
 ```
 _parent_Parents_Id    Int — Parents' primary key
@@ -347,7 +347,7 @@ per parent, or pick a higher-cardinality cursor.
 ```python
 {
     "table": {
-        "source_table": "Parents/Children/Notes",
+        "source_table": "Parents__Children__Notes",
         "table_configuration": {
             "cursor_field": "ModifiedAt",
             "max_records_per_batch": "5000",

@@ -141,7 +141,7 @@ These are passed to the connector via the pipeline's `table_configuration` block
 | `page_size` | `1000` | Value of `$top` sent on each HTTP request. Sets the maximum rows per OData page. Some servers cap this server-side (see *Known limits*). |
 | `max_records_per_batch` | `100000` | Client-side cap on records returned per `read_table` call. The connector truncates and returns control to the framework once this limit is hit. Independent of `page_size`. |
 | `delta_tracking` | `disabled` | Opt-in OData v4 delta queries. `disabled` keeps the existing snapshot / cursor behavior; `auto` probes the server's `Prefer: odata.track-changes` support once per table and falls back if missing; `enabled` requires support and errors on the first read if the server doesn't acknowledge. See [Delta tracking](#delta-tracking-contract). Mutually exclusive with contained-path tables. |
-| `expand_contained` | `false` | For contained-collection paths (`Parent/Child/...`). When `true`, a single `GET Parent?$expand=Child(...)` replaces the default N+1 per-parent traversal. See [Contained navigation properties](#contained-navigation-properties). |
+| `expand_contained` | `false` | For contained-collection paths (`Parent__Child__...`). When `true`, a single `GET Parent?$expand=Child(...)` replaces the default N+1 per-parent traversal. See [Contained navigation properties](#contained-navigation-properties). |
 
 `namespace` is consumed by the connector before the request is built; the rest all influence the URL, the per-batch loop, or the request semantics.
 
@@ -344,7 +344,7 @@ Emitted: zero rows. Offset: `{"delta_link": "https://...users?$deltatoken=B"}` �
 
 OData v4 §13.4.3 defines `<NavigationProperty ContainsTarget="true">` on an EntityType: a collection that is *owned by* the parent entity rather than declared as a top-level EntitySet. The contained collection is addressed by traversing the parent's key — `GET Parent(<key>)/ContainedNavProp` — and each parent has its own independent contained collection. The protocol allows recursive containment, so a service can declare `Parent → Child → Grandchild → ...` chains.
 
-The connector surfaces these as slash-pathed tables alongside top-level entity sets, e.g. `Parents/Children/Notes`, up to **5 segments deep** (the depth cap prevents pathological discovery walks on services that declare circular containment; cycles within the cap are also detected and broken). Path parsing rejects empty segments and over-depth paths at `read_table_metadata` / `get_table_schema` time.
+The connector surfaces these as double-underscore-pathed tables (`__` between segments — slash isn't valid in Spark SQL identifiers, which the framework uses for view names) alongside top-level entity sets, e.g. `Parents__Children__Notes`, up to **5 segments deep** (the depth cap prevents pathological discovery walks on services that declare circular containment; cycles within the cap are also detected and broken). Path parsing rejects empty segments and over-depth paths at `read_table_metadata` / `get_table_schema` time.
 
 ### Discovery
 

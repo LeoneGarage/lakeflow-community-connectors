@@ -596,7 +596,10 @@ def register_lakeflow_source(spark):
     # src/databricks/labs/community_connector/sources/odata/_contained.py
     ########################################################
 
-    CONTAINED_PATH_SEP = "/"
+    CONTAINED_PATH_SEP = "__"
+    # Inside generated OData request URLs the segment separator is always
+    # a forward slash (the wire format the spec mandates).
+    _URL_SEGMENT_SEP = "/"
     PARENT_FK_PREFIX = "_parent_"
     # Cap on path depth. Prevents pathological discovery walks on services
     # with cyclic containment graphs; cycles within the cap are also
@@ -641,7 +644,7 @@ def register_lakeflow_source(spark):
 
 
     def parse_contained_path(table_name: str) -> list[str] | None:
-        """Split slash-delimited path; ``None`` for flat single-segment names."""
+        """Split double-underscore-delimited path; ``None`` for flat names."""
         if CONTAINED_PATH_SEP not in table_name:
             return None
         segments = table_name.split(CONTAINED_PATH_SEP)
@@ -750,7 +753,7 @@ def register_lakeflow_source(spark):
                     f"key_chain length {len(key_chain)} does not match "
                     f"non-leaf segment count {len(segments) - 1}"
                 )
-            return CONTAINED_PATH_SEP.join(
+            return _URL_SEGMENT_SEP.join(
                 f"{seg}{self._format_key_predicate(key_chain[i])}" if i < len(key_chain) else seg
                 for i, seg in enumerate(segments)
             )
@@ -1084,7 +1087,7 @@ def register_lakeflow_source(spark):
 
             Includes both top-level entity sets and contained collections
             reachable via ``ContainsTarget="true"`` navigation properties
-            (slash-pathed, e.g. ``Instances/Assets/AssetDocuments``).
+            (double-underscore-pathed, e.g. ``Instances__Assets__AssetDocuments``).
             """
             names: set[str] = set()
             for ns, es_name in self._entity_set_index():
