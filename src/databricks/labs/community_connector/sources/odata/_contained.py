@@ -550,23 +550,17 @@ class ContainedNavMixin:
         level_pks = self._own_primary_keys_for_et(level_et)
         order_terms = [f"{cursor_field} asc"]
         order_terms.extend(f"{p} asc" for p in level_pks if p != cursor_field)
-        # Trim the ancestor projection to PKs + cursor when the cursor
-        # is on a non-top segment. Per OData v4 §11.2.5.1, a nested
-        # ``$expand`` keeps its expanded value in the response regardless
-        # of ``$select`` — so the navigation chain still works while
-        # payload shrinks to the columns we actually consume (PKs go to
-        # FK columns, cursor is stamped onto leaf rows).
-        cursor_select: str | None = None
-        if cursor_level > 0:
-            select_cols = list(level_pks)
-            if cursor_field not in select_cols:
-                select_cols.append(cursor_field)
-            cursor_select = ",".join(select_cols)
+        # No ``$select`` injection: the cursor column is returned by
+        # default projection on declared CSDL properties, so it isn't
+        # needed for stamping. Adding it silently trims other columns
+        # the user didn't opt out of — particularly harmful when the
+        # cursor segment is also the leaf (2-segment paths). Users who
+        # want to trim can set ``select`` themselves on the leaf side.
         return (
             cursor_level,
             self._cursor_filter(cursor_field, since),
             ",".join(order_terms),
-            cursor_select,
+            None,
         )
 
     def _flatten_expand_response(

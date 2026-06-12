@@ -2472,11 +2472,12 @@ def test_contained_expand_with_ancestor_cursor_injects_filter_into_expand():
 
 
 @responses.activate
-def test_contained_expand_injects_select_pks_and_cursor_at_cursor_segment():
-    """The cursor segment's $expand carries $select=<pks>,<cursor> to
-    trim the ancestor projection. OData v4 §11.2.5.1 keeps nested
-    $expand values in the response regardless of $select, so the
-    deeper navigation chain still flows through."""
+def test_contained_expand_does_not_inject_select_inside_cursor_expand():
+    """The connector must not inject $select inside the cursor segment's
+    $expand clause. The cursor column is returned by default; injecting
+    $select would silently strip every other column the user didn't
+    explicitly opt out of — broken on the leaf-cursor case (2-segment
+    paths) where the cursor segment is the destination."""
     _mock_nested_metadata()
     responses.add(
         responses.GET,
@@ -2493,9 +2494,9 @@ def test_contained_expand_injects_select_pks_and_cursor_at_cursor_segment():
         )[0]
     )
     call_url = responses.calls[1].request.url
-    # cursor on Children (level 1): Children's $expand has
-    # $select=Id,ModifiedAt (Children's PK + cursor).
-    assert "%24select=Id,ModifiedAt" in call_url or "$select=Id,ModifiedAt" in call_url
+    assert "%24select" not in call_url and "$select" not in call_url
+    # $filter/$orderby remain — they're load-bearing for incremental.
+    assert "%24orderby" in call_url or "$orderby" in call_url
 
 
 @responses.activate
