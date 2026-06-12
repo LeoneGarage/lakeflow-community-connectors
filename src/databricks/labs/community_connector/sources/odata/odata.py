@@ -62,6 +62,21 @@ from databricks.labs.community_connector.interface.supports_namespaces import (
     SupportsNamespaces,
 )
 
+# Contained navigation-property support lives in ``_contained.py`` to keep
+# this module under its line-count budget. Re-exported under the original
+# private names so the rest of this file can keep using them as before.
+from databricks.labs.community_connector.sources.odata._contained import (
+    CONTAINED_PATH_SEP as _CONTAINED_PATH_SEP,
+    MAX_CONTAINED_DEPTH as _MAX_CONTAINED_DEPTH,
+    ContainedNavMixin,
+    contained_nav_props as _contained_nav_props,
+    fk_column_name as _fk_column_name,
+    join_url as _join_url,
+    looks_like_iso8601 as _looks_like_iso8601,
+    odata_literal as _odata_literal,
+    parse_contained_path as _parse_contained_path,
+)
+
 
 # ---------------------------------------------------------------------------
 # EDM (CSDL) → Spark type mapping
@@ -122,7 +137,7 @@ def _next_sequence() -> str:
     return f"{now}_{next(_SEQUENCE_COUNTER):012d}"
 
 
-class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces):
+class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces, ContainedNavMixin):
     """LakeflowConnect implementation for OData v4 services.
 
     OData ``$metadata`` documents can declare multiple ``<Schema>`` blocks,
@@ -160,13 +175,14 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces):
     def list_tables(self) -> list[str]:
         """Flat fallback used by the framework when SupportsNamespaces is absent.
 
-        Returns deduped entity set names across every schema. The
-        namespace-aware methods below are what the framework actually
-        prefers when ``SupportsNamespaces`` is in the MRO.
+        Includes both top-level entity sets and contained collections
+        reachable via ``ContainsTarget="true"`` navigation properties
+        (double-underscore-pathed, e.g. ``Instances__Assets__AssetDocuments``).
         """
         names: set[str] = set()
         for ns, es_name in self._entity_set_index():
             names.add(es_name)
+            names.update(self._enumerate_contained_paths(es_name, ns))
         return sorted(names)
 
     def list_namespaces(self, prefix: list[str] | None = None) -> list[list[str]]:
@@ -185,7 +201,11 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces):
             # attribute; root-level tables don't exist in OData v4.
             return []
         target = namespace[0]
-        return sorted({es for ns, es in index if ns == target})
+        flat = sorted({es for ns, es in index if ns == target})
+        contained: set[str] = set()
+        for es_name in flat:
+            contained.update(self._enumerate_contained_paths(es_name, target))
+        return flat + sorted(contained)
 
     def get_table_schema(self, table_name: str, table_options: dict[str, str]) -> StructType:
         namespace = (table_options or {}).get("namespace")
@@ -193,7 +213,10 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces):
         select = (table_options or {}).get("select")
         if select:
             wanted = {c.strip() for c in select.split(",")}
-            fields = [f for f in fields if f.name in wanted]
+            # ``select`` filters leaf columns only; FK columns survive.
+            segments = _parse_contained_path(table_name) or [table_name]
+            fk_names = set(self._resolve_fk_columns(segments, namespace).values())
+            fields = [f for f in fields if f.name in fk_names or f.name in wanted]
         if not fields:
             raise ValueError(
                 f"Could not derive a non-empty schema for entity set {table_name!r}. "
@@ -215,14 +238,11 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces):
         namespace = (table_options or {}).get("namespace")
         primary_keys = self._primary_keys_for(table_name, namespace)
         user_cursor = (table_options or {}).get("cursor_field")
-        if self._delta_active_for(table_name, table_options):
-            # Delta-tracked tables: server delivers change events, the
-            # connector adds ``_deleted`` for tombstones and uses the
-            # synthetic ``_lc_sequence`` so apply_changes has a
-            # deterministic sequence column. ``cdc`` (not
-            # ``cdc_with_deletes``) — following the microsoft_teams
-            # convention of in-band deletes — keeps the framework's
-            # read_table / read_table_deletes split out of the picture.
+        # Contained paths skip the delta probe (server delta is for
+        # top-level sets only; mutex enforced in dispatch below).
+        if _parse_contained_path(table_name) is None and self._delta_active_for(
+            table_name, table_options
+        ):
             return {
                 "primary_keys": primary_keys,
                 "cursor_field": _SEQUENCE_COL,
@@ -239,12 +259,24 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces):
     ) -> tuple[Iterator[dict], dict]:
         opts = table_options or {}
         offset = start_offset or {}
-        # Dispatch on (a) what the prior offset says we're mid-stream of,
-        # and (b) whether delta tracking is active for this table. The
-        # offset-shape check covers both modes resuming from a
-        # checkpointed offset and the very first call after delta got
-        # turned on (offset is empty either way until delta produces a
-        # link).
+        if _parse_contained_path(table_name) is not None:
+            if self._delta_setting(opts) == "enabled":
+                raise ValueError(
+                    "delta_tracking=enabled is not supported on contained-"
+                    "collection paths (server change tracking only applies "
+                    "to top-level entity sets). Set delta_tracking=disabled "
+                    "or ingest the parent set directly."
+                )
+            if self._expand_contained_active(opts):
+                return self._read_contained_expand(table_name, opts)
+            if opts.get("cursor_field"):
+                return self._read_contained_incremental(
+                    table_name, offset, opts, opts["cursor_field"]
+                )
+            return self._read_contained_snapshot(table_name, opts)
+        # Offset-shape check ahead of the delta predicate so a resumed
+        # delta stream (offset carries delta_link / next_link) takes the
+        # delta path even if delta_tracking is no longer set in options.
         if (
             "delta_link" in offset
             or "next_link" in offset
@@ -786,24 +818,25 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces):
         order_by: str | None = None,
     ) -> str:
         base = _join_url(self.service_url, table_name)
-        params = []
+        return f"{base}?{self._format_query_params(table_options, extra_filter, order_by)}"
 
-        page_size = table_options.get("page_size", "1000")
-        params.append(f"$top={page_size}")
-
-        select = table_options.get("select")
-        if select:
-            params.append(f"$select={select}")
-
-        filters = [f for f in (table_options.get("filter"), extra_filter) if f]
+    def _format_query_params(
+        self,
+        table_options: dict[str, str],
+        extra_filter: str | None = None,
+        order_by: str | None = None,
+    ) -> str:
+        """Compose $top/$select/$filter/$orderby; shared across all URL builders."""
+        opts = table_options or {}
+        params = [f"$top={opts.get('page_size', '1000')}"]
+        if opts.get("select"):
+            params.append(f"$select={opts['select']}")
+        filters = [f for f in (opts.get("filter"), extra_filter) if f]
         if filters:
-            joined = " and ".join(f"({f})" for f in filters)
-            params.append(f"$filter={joined}")
-
+            params.append(f"$filter={' and '.join(f'({f})' for f in filters)}")
         if order_by:
             params.append(f"$orderby={order_by}")
-
-        return f"{base}?{'&'.join(params)}"
+        return "&".join(params)
 
     def _fetch_pages(self, url: str) -> Iterator[dict]:
         """Walk @odata.nextLink, yielding raw JSON dicts (no coercion).
@@ -1136,14 +1169,33 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces):
         return out
 
     def _entity_type_for(self, table_name: str, namespace: str | None = None) -> ET.Element:
-        """Find the EntityType element backing ``table_name``.
+        """Resolve flat names or contained paths (segment-by-segment via
+        contained nav props on the base-type chain)."""
+        segments = _parse_contained_path(table_name) or [table_name]
+        et = self._flat_entity_type_for(segments[0], namespace)
+        for idx, child_segment in enumerate(segments[1:], start=1):
+            nav_props = self._all_contained_nav_props(et)
+            target_ref = next((r for n, r in nav_props if n == child_segment), None)
+            if target_ref is None:
+                walked = _CONTAINED_PATH_SEP.join(segments[:idx])
+                raise ValueError(
+                    f"{child_segment!r} is not a contained-collection navigation "
+                    f"property on {walked!r}. Available contained collections: "
+                    f"{sorted(n for n, _ in nav_props)}"
+                )
+            target_et = self._resolve_type_ref(target_ref)
+            if target_et is None:
+                raise ValueError(
+                    f"Contained navigation target {target_ref!r} (referenced by "
+                    f"{child_segment!r} on {segments[idx - 1]!r}) not found in $metadata."
+                )
+            et = target_et
+        return et
 
-        When ``namespace`` is None and the same name is declared in more
-        than one schema, this raises so the caller passes ``namespace``
-        in *table_options* to disambiguate.
-        """
+    def _flat_entity_type_for(self, table_name: str, namespace: str | None = None) -> ET.Element:
+        """Resolve a top-level entity-set name to its EntityType element."""
         root = self._metadata_root()
-        matches: list[tuple[str, str]] = []  # (schema_ns, qualified_type_ref)
+        matches: list[tuple[str, str]] = []
         for schema in root.iter(f"{_NS_EDM}Schema"):
             ns = schema.get("Namespace") or ""
             if namespace is not None and ns != namespace:
@@ -1152,11 +1204,22 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces):
                 for es in container.iter(f"{_NS_EDM}EntitySet"):
                     if es.get("Name") == table_name:
                         matches.append((ns, es.get("EntityType")))
-
         if not matches:
             available = self._entity_set_index()
             if namespace is not None:
                 hint = sorted({es for ns, es in available if ns == namespace})
+                if not hint:
+                    # The requested namespace has zero entity sets — common
+                    # confusion when the user picks a type-only schema
+                    # (e.g. one declaring BaseType references) instead of
+                    # the schema whose <EntityContainer> declares the sets.
+                    others = sorted({ns for ns, _ in available if ns})
+                    raise ValueError(
+                        f"Entity set {table_name!r} not found in namespace "
+                        f"{namespace!r}. Namespace {namespace!r} declares "
+                        f"no entity sets (probably a type-only schema). "
+                        f"Namespaces with entity sets: {others}."
+                    )
                 raise ValueError(
                     f"Entity set {table_name!r} not found in namespace "
                     f"{namespace!r}. Available in this namespace: {hint}"
@@ -1171,7 +1234,6 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces):
                 f"Entity set {table_name!r} is declared in multiple namespaces: "
                 f"{namespaces}. Set 'namespace' in table_options to disambiguate."
             )
-
         schema_ns, type_ref = matches[0]
         et = self._resolve_type_ref(type_ref)
         if et is None:
@@ -1257,37 +1319,76 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces):
         return chain
 
     def _fields_for(self, table_name: str, namespace: str | None = None) -> list[StructField]:
-        et = self._entity_type_for(table_name, namespace)
-        # Aggregate properties across the inheritance chain. Walk from
-        # the root base type down to the leaf so inherited fields
-        # (typically ``id`` and any timestamp fields on
-        # ``graph.directoryObject``) appear before the leaf's own
-        # additions — matches the order a developer reading the CSDL
-        # would expect. Derived types can ADD properties; spec forbids
-        # them from REDEFINING base properties, so we de-dupe by name
-        # and let the closest-to-root declaration win.
+        segments = _parse_contained_path(table_name) or [table_name]
+        own_fields = self._own_fields_for_et(self._entity_type_for(table_name, namespace))
+        if len(segments) == 1:
+            return own_fields
+        # Every non-leaf ancestor contributes FK columns (OData v4
+        # §13.4.3 — contained-entity keys are unique within parent only).
+        fk_columns = self._resolve_fk_columns(segments, namespace)
+        fk_fields: list[StructField] = []
+        for idx in range(len(segments) - 1):
+            seg = segments[idx]
+            if not any(k[0] == seg for k in fk_columns):
+                continue
+            ancestor_et = self._entity_type_for(
+                _CONTAINED_PATH_SEP.join(segments[: idx + 1]), namespace
+            )
+            own = {f.name: f.dataType for f in self._own_fields_for_et(ancestor_et)}
+            for pk in self._own_primary_keys_for_et(ancestor_et):
+                fk_fields.append(
+                    StructField(
+                        fk_columns[(seg, pk)],
+                        own.get(pk, StringType()),
+                        False,
+                    )
+                )
+        return fk_fields + own_fields
+
+    def _own_fields_for_et(self, et: ET.Element) -> list[StructField]:
+        """Property fields on ``et`` and its base chain. Walks root → leaf
+        so inherited fields appear before leaf's own additions; de-dupes
+        by name with closest-to-root winning (spec forbids redeclaration)."""
         fields: list[StructField] = []
-        seen_names: set[str] = set()
+        seen: set[str] = set()
         for type_el in reversed(self._resolve_base_chain(et)):
             for prop in type_el.findall(f"{_NS_EDM}Property"):
                 name = prop.get("Name")
-                if name in seen_names:
+                if name in seen:
                     continue
-                seen_names.add(name)
-                edm_type = prop.get("Type", "Edm.String")
-                nullable = prop.get("Nullable", "true").lower() != "false"
-                spark_type = _EDM_TO_SPARK.get(edm_type, StringType())
-                fields.append(StructField(name, spark_type, nullable))
+                seen.add(name)
+                fields.append(
+                    StructField(
+                        name,
+                        _EDM_TO_SPARK.get(prop.get("Type", "Edm.String"), StringType()),
+                        prop.get("Nullable", "true").lower() != "false",
+                    )
+                )
         return fields
 
     def _primary_keys_for(self, table_name: str, namespace: str | None = None) -> list[str]:
-        et = self._entity_type_for(table_name, namespace)
-        # OData v4 §8.4: derived types inherit Keys from their base.
-        # First Key found while walking from this type up to its root
-        # ancestor wins — that's the spec's overriding-derived-wins
-        # semantics for the rare case where multiple layers in the
-        # chain redeclare Key (technically forbidden but services do
-        # ship malformed CSDL).
+        segments = _parse_contained_path(table_name) or [table_name]
+        leaf_pks = self._own_primary_keys_for_et(self._entity_type_for(table_name, namespace))
+        if len(segments) == 1:
+            return leaf_pks
+        # Composite: every ancestor's FK columns + leaf's own PKs.
+        fk_columns = self._resolve_fk_columns(segments, namespace)
+        composite: list[str] = []
+        for idx in range(len(segments) - 1):
+            seg = segments[idx]
+            if not any(k[0] == seg for k in fk_columns):
+                continue
+            ancestor_et = self._entity_type_for(
+                _CONTAINED_PATH_SEP.join(segments[: idx + 1]), namespace
+            )
+            for pk in self._own_primary_keys_for_et(ancestor_et):
+                composite.append(fk_columns[(seg, pk)])
+        composite.extend(leaf_pks)
+        return composite
+
+    def _own_primary_keys_for_et(self, et: ET.Element) -> list[str]:
+        """Primary-key property names (OData v4 §8.4: derived types inherit
+        Keys; closest-to-leaf Key wins where multiple levels redeclare)."""
         for type_el in self._resolve_base_chain(et):
             key = type_el.find(f"{_NS_EDM}Key")
             if key is not None:
@@ -1380,39 +1481,6 @@ def _require(options: dict[str, str], key: str) -> str:
     if not val:
         raise ValueError(f"Required option {key!r} is missing.")
     return val
-
-
-def _join_url(base: str, suffix: str) -> str:
-    if base.endswith("/"):
-        return f"{base}{suffix}"
-    return f"{base}/{suffix}"
-
-
-def _odata_literal(value: Any) -> str:
-    """Render a Python value as an OData v4 literal for $filter."""
-    if isinstance(value, datetime):
-        return value.isoformat().replace("+00:00", "Z")
-    if isinstance(value, date):
-        return value.isoformat()
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int | float | Decimal):
-        return str(value)
-    # ISO-8601 timestamp strings render bare; everything else is quoted.
-    s = str(value)
-    if _looks_like_iso8601(s):
-        return s
-    return "'" + s.replace("'", "''") + "'"
-
-
-def _looks_like_iso8601(s: str) -> bool:
-    if len(s) < 10 or s[4] != "-" or s[7] != "-":
-        return False
-    try:
-        datetime.fromisoformat(s.replace("Z", "+00:00"))
-        return True
-    except ValueError:
-        return False
 
 
 # Re-export base64/binary helper for any downstream caller that wants

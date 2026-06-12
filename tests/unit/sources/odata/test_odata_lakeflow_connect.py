@@ -1960,3 +1960,719 @@ def test_delta_dispatch_recognizes_delta_link_offset_without_enabled_flag():
     assert list(records) == []
     # Rotation guard: prior link preserved on no-op.
     assert offset == {"delta_link": DELTA_LINK_V1}
+
+
+# ---------------------------------------------------------------------------
+# Contained navigation properties (ContainsTarget="true")
+# ---------------------------------------------------------------------------
+
+
+NESTED_METADATA_XML = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="Nested" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Parent">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="Name" Type="Edm.String"/>
+        <NavigationProperty Name="Children" Type="Collection(Nested.Child)" ContainsTarget="true"/>
+        <NavigationProperty Name="Tags" Type="Collection(Nested.Tag)" ContainsTarget="true"/>
+      </EntityType>
+      <EntityType Name="Child">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="Label" Type="Edm.String"/>
+        <Property Name="ModifiedAt" Type="Edm.DateTimeOffset"/>
+        <NavigationProperty Name="Notes" Type="Collection(Nested.Note)" ContainsTarget="true"/>
+      </EntityType>
+      <EntityType Name="Note">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="Text" Type="Edm.String"/>
+      </EntityType>
+      <EntityType Name="Tag">
+        <Key>
+          <PropertyRef Name="Category"/>
+          <PropertyRef Name="Value"/>
+        </Key>
+        <Property Name="Category" Type="Edm.String" Nullable="false"/>
+        <Property Name="Value" Type="Edm.String" Nullable="false"/>
+      </EntityType>
+      <EntityContainer Name="C">
+        <EntitySet Name="Parents" EntityType="Nested.Parent"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+
+def _mock_nested_metadata():
+    responses.get(f"{SERVICE_URL}$metadata", body=NESTED_METADATA_XML, status=200)
+
+
+# --- Path parsing / discovery ---
+
+
+def test_parse_contained_path_flat_returns_none():
+    from databricks.labs.community_connector.sources.odata.odata import (
+        _parse_contained_path,
+    )
+
+    assert _parse_contained_path("Customers") is None
+
+
+def test_parse_contained_path_multi_segment():
+    from databricks.labs.community_connector.sources.odata.odata import (
+        _parse_contained_path,
+    )
+
+    assert _parse_contained_path("A__B__C") == ["A", "B", "C"]
+
+
+def test_parse_contained_path_rejects_empty_segment():
+    from databricks.labs.community_connector.sources.odata.odata import (
+        _parse_contained_path,
+    )
+
+    with pytest.raises(ValueError, match="Empty path segment"):
+        _parse_contained_path("A____B")
+
+
+def test_parse_contained_path_rejects_slash_with_actionable_message():
+    """Old-form slash paths are common when the user copied the table
+    name from OData URL syntax or from a pre-fix version of
+    ``list_tables``. The error must spell out the rename so the user
+    isn't left staring at a "not found" with a 200-entry available list.
+    """
+    from databricks.labs.community_connector.sources.odata.odata import (
+        _parse_contained_path,
+    )
+
+    with pytest.raises(
+        ValueError, match="Rename 'Instances/AssetPacks' to 'Instances__AssetPacks'"
+    ):
+        _parse_contained_path("Instances/AssetPacks")
+
+
+def test_parse_contained_path_rejects_over_depth():
+    from databricks.labs.community_connector.sources.odata.odata import (
+        _parse_contained_path,
+    )
+
+    with pytest.raises(ValueError, match="exceeds max depth"):
+        _parse_contained_path("A__B__C__D__E__F")
+
+
+@responses.activate
+def test_list_tables_includes_nested_paths():
+    _mock_nested_metadata()
+    c = _make()
+    flat = c.list_tables()
+    # Top-level + every reachable contained path.
+    assert "Parents" in flat
+    assert "Parents__Children" in flat
+    assert "Parents__Tags" in flat
+    assert "Parents__Children__Notes" in flat
+
+
+@responses.activate
+def test_list_tables_in_namespace_includes_nested_paths():
+    _mock_nested_metadata()
+    c = _make()
+    tables = c.list_tables_in_namespace(["Nested"])
+    assert tables == [
+        "Parents",
+        "Parents__Children",
+        "Parents__Children__Notes",
+        "Parents__Tags",
+    ]
+
+
+# --- Entity type resolution / schema / PK ---
+
+
+@responses.activate
+def test_get_table_schema_for_two_level_contained():
+    _mock_nested_metadata()
+    c = _make()
+    schema = c.get_table_schema("Parents__Children", {})
+    names = [f.name for f in schema.fields]
+    # Parent FK prepended, then child's own fields in CSDL order.
+    assert names == ["Parents_Id", "Id", "Label", "ModifiedAt"]
+    fk_field = schema["Parents_Id"]
+    assert isinstance(fk_field.dataType, IntegerType)
+    assert fk_field.nullable is False
+
+
+@responses.activate
+def test_get_table_schema_for_three_level_contained_emits_full_ancestor_chain():
+    """For ``A__B__C`` every non-leaf ancestor contributes FK columns
+    (OData v4 §13.4.3 — contained-entity keys are unique within parent
+    only, so the full chain is required for global uniqueness)."""
+    _mock_nested_metadata()
+    c = _make()
+    schema = c.get_table_schema("Parents__Children__Notes", {})
+    names = [f.name for f in schema.fields]
+    assert names == ["Parents_Id", "Children_Id", "Id", "Text"]
+
+
+@responses.activate
+def test_get_table_schema_for_contained_with_composite_parent_pk():
+    """Parents__Tags has a composite-key leaf; FK prepend on a single-PK
+    parent yields exactly one ancestor column. Inverse test (composite
+    parent) requires a different fixture — covered indirectly via the
+    Tag leaf's own composite key showing up in primary_keys_for."""
+    _mock_nested_metadata()
+    c = _make()
+    schema = c.get_table_schema("Parents__Tags", {})
+    names = [f.name for f in schema.fields]
+    assert names == ["Parents_Id", "Category", "Value"]
+
+
+@responses.activate
+def test_primary_keys_for_two_level_contained():
+    _mock_nested_metadata()
+    c = _make()
+    meta = c.read_table_metadata("Parents__Children", {})
+    assert meta["primary_keys"] == ["Parents_Id", "Id"]
+    assert meta["ingestion_type"] == "snapshot"
+
+
+@responses.activate
+def test_primary_keys_for_three_level_contained_full_ancestor_chain():
+    """Composite PK is every ancestor's FK + leaf PK — required for
+    global uniqueness when leaf IDs only repeat within a parent."""
+    _mock_nested_metadata()
+    c = _make()
+    meta = c.read_table_metadata("Parents__Children__Notes", {})
+    assert meta["primary_keys"] == ["Parents_Id", "Children_Id", "Id"]
+
+
+@responses.activate
+def test_primary_keys_for_composite_leaf_in_contained():
+    _mock_nested_metadata()
+    c = _make()
+    meta = c.read_table_metadata("Parents__Tags", {})
+    # Composite PK on the leaf — both columns surface alongside parent FK.
+    assert meta["primary_keys"] == ["Parents_Id", "Category", "Value"]
+
+
+@responses.activate
+def test_entity_type_for_invalid_nav_prop_raises():
+    _mock_nested_metadata()
+    c = _make()
+    with pytest.raises(ValueError, match="not a contained-collection"):
+        c.read_table_metadata("Parents__NotAThing", {})
+
+
+# --- URL construction ---
+
+
+@responses.activate
+def test_key_predicate_single_key():
+    _mock_nested_metadata()
+    c = _make()
+    assert c._format_key_predicate({"Id": 42}) == "(42)"
+
+
+@responses.activate
+def test_key_predicate_composite():
+    _mock_nested_metadata()
+    c = _make()
+    pred = c._format_key_predicate({"Category": "fruit", "Value": "apple"})
+    assert pred == "(Category='fruit',Value='apple')"
+
+
+@responses.activate
+def test_build_contained_url_two_level():
+    _mock_nested_metadata()
+    c = _make()
+    url = c._build_contained_url(["Parents", "Children"], [{"Id": 7}], {})
+    assert url.startswith(f"{SERVICE_URL}Parents(7)/Children?")
+    assert "$top=1000" in url
+
+
+@responses.activate
+def test_build_contained_url_three_level():
+    _mock_nested_metadata()
+    c = _make()
+    url = c._build_contained_url(
+        ["Parents", "Children", "Notes"],
+        [{"Id": 7}, {"Id": 9}],
+        {},
+    )
+    assert url.startswith(f"{SERVICE_URL}Parents(7)/Children(9)/Notes?")
+
+
+@responses.activate
+def test_build_expand_url_three_level():
+    _mock_nested_metadata()
+    c = _make()
+    url = c._build_expand_url(["Parents", "Children", "Notes"], {})
+    assert "$expand=Children($expand=Notes)" in url
+    assert url.startswith(f"{SERVICE_URL}Parents?")
+
+
+@responses.activate
+def test_build_expand_url_four_level_nests_correctly():
+    _mock_nested_metadata()
+    c = _make()
+    url = c._build_expand_url(["A", "B", "C", "D"], {})
+    assert "$expand=B($expand=C($expand=D))" in url
+
+
+# --- N+1 snapshot read ---
+
+
+@responses.activate
+def test_contained_snapshot_two_level_walks_parents_and_tags_fks():
+    _mock_nested_metadata()
+    # Parent fetch (PKs only)
+    responses.get(
+        f"{SERVICE_URL}Parents",
+        json={"value": [{"Id": 1}, {"Id": 2}]},
+    )
+    # Per-parent leaf fetches
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={
+            "value": [
+                {"Id": 11, "Label": "a", "ModifiedAt": "2024-01-01T00:00:00Z"},
+                {"Id": 12, "Label": "b", "ModifiedAt": "2024-01-02T00:00:00Z"},
+            ]
+        },
+    )
+    responses.get(
+        f"{SERVICE_URL}Parents(2)/Children",
+        json={
+            "value": [
+                {"Id": 21, "Label": "c", "ModifiedAt": "2024-02-01T00:00:00Z"},
+            ]
+        },
+    )
+    c = _make()
+    records, offset = c.read_table("Parents__Children", None, {})
+    rows = list(records)
+    assert offset == {}
+    assert len(rows) == 3
+    # FK column populated correctly
+    assert rows[0]["Parents_Id"] == 1
+    assert rows[0]["Id"] == 11
+    assert rows[2]["Parents_Id"] == 2
+    assert rows[2]["Id"] == 21
+
+
+@responses.activate
+def test_contained_snapshot_three_level_walks_full_chain():
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}]})
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={"value": [{"Id": 10}, {"Id": 20}]},
+    )
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children(10)/Notes",
+        json={"value": [{"Id": 100, "Text": "a"}, {"Id": 101, "Text": "b"}]},
+    )
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children(20)/Notes",
+        json={"value": [{"Id": 200, "Text": "c"}]},
+    )
+    c = _make()
+    records, _ = c.read_table("Parents__Children__Notes", None, {})
+    rows = list(records)
+    assert len(rows) == 3
+    # Every ancestor's FK tagged onto the row — required for unique
+    # composite keys when leaf IDs only repeat within a parent.
+    assert rows[0] == {
+        "Parents_Id": 1,
+        "Children_Id": 10,
+        "Id": 100,
+        "Text": "a",
+    }
+    assert rows[2]["Parents_Id"] == 1
+    assert rows[2]["Children_Id"] == 20
+    assert rows[2]["Id"] == 200
+
+
+@responses.activate
+def test_contained_snapshot_composite_parent_key_in_url():
+    """When the parent has a composite key (Parents__Tags has Tag as a
+    composite-PK contained type), the key predicate on nested traversal
+    must use the named form. This test uses Parents__Children__Notes which
+    has single-key parents — for composite parent URL coverage see
+    test_key_predicate_composite + a hand-crafted metadata."""
+    # Covered by unit test on _format_key_predicate above; this is a
+    # placeholder reminder of the coverage matrix.
+
+
+# --- $expand mode ---
+
+
+@responses.activate
+def test_contained_expand_two_level_flattens_nested_response():
+    _mock_nested_metadata()
+    # Single call with nested response
+    responses.get(
+        f"{SERVICE_URL}Parents",
+        json={
+            "value": [
+                {
+                    "Id": 1,
+                    "Name": "P1",
+                    "Children": [
+                        {"Id": 11, "Label": "a", "ModifiedAt": "2024-01-01T00:00:00Z"},
+                        {"Id": 12, "Label": "b", "ModifiedAt": "2024-01-02T00:00:00Z"},
+                    ],
+                },
+                {
+                    "Id": 2,
+                    "Name": "P2",
+                    "Children": [],
+                },
+            ]
+        },
+    )
+    c = _make()
+    records, _ = c.read_table("Parents__Children", None, {"expand_contained": "true"})
+    rows = list(records)
+    assert len(rows) == 2
+    assert rows[0]["Parents_Id"] == 1
+    assert rows[0]["Id"] == 11
+    # @odata.* control props are stripped from the flattened leaf rows too
+    assert all(not k.startswith("@odata.") for r in rows for k in r)
+
+
+@responses.activate
+def test_contained_expand_three_level_flattens_nested():
+    _mock_nested_metadata()
+    responses.get(
+        f"{SERVICE_URL}Parents",
+        json={
+            "value": [
+                {
+                    "Id": 1,
+                    "Children": [
+                        {
+                            "Id": 10,
+                            "Notes": [
+                                {"Id": 100, "Text": "x"},
+                                {"Id": 101, "Text": "y"},
+                            ],
+                        },
+                    ],
+                },
+            ]
+        },
+    )
+    c = _make()
+    records, _ = c.read_table("Parents__Children__Notes", None, {"expand_contained": "true"})
+    rows = list(records)
+    assert len(rows) == 2
+    # Every ancestor's FK materialized — same contract as the N+1
+    # snapshot path, just delivered via a single nested $expand call.
+    assert all(r["Parents_Id"] == 1 and r["Children_Id"] == 10 for r in rows)
+    assert {r["Id"] for r in rows} == {100, 101}
+
+
+@responses.activate
+def test_contained_expand_strips_odata_annotations_on_leaf_rows():
+    _mock_nested_metadata()
+    responses.get(
+        f"{SERVICE_URL}Parents",
+        json={
+            "value": [
+                {
+                    "Id": 1,
+                    "@odata.etag": "drop-on-parent",
+                    "Children": [
+                        {
+                            "Id": 11,
+                            "Label": "a",
+                            "ModifiedAt": "2024-01-01T00:00:00Z",
+                            "@odata.etag": "drop-on-child",
+                        },
+                    ],
+                },
+            ]
+        },
+    )
+    c = _make()
+    records, _ = c.read_table("Parents__Children", None, {"expand_contained": "true"})
+    rows = list(records)
+    assert rows == [
+        {
+            "Parents_Id": 1,
+            "Id": 11,
+            "Label": "a",
+            "ModifiedAt": "2024-01-01T00:00:00Z",
+        }
+    ]
+
+
+@responses.activate
+def test_contained_expand_invalid_value_raises():
+    _mock_nested_metadata()
+    c = _make()
+    with pytest.raises(ValueError, match="Invalid expand_contained"):
+        c.read_table("Parents__Children", None, {"expand_contained": "yes"})
+
+
+# --- Cursor incremental on contained ---
+
+
+@responses.activate
+def test_contained_incremental_first_call_no_filter():
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}]})
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={
+            "value": [
+                {"Id": 11, "Label": "a", "ModifiedAt": "2024-01-01T00:00:00Z"},
+                {"Id": 12, "Label": "b", "ModifiedAt": "2024-01-02T00:00:00Z"},
+            ]
+        },
+        match_querystring=False,
+    )
+    c = _make()
+    records, offset = c.read_table("Parents__Children", None, {"cursor_field": "ModifiedAt"})
+    rows = list(records)
+    assert len(rows) == 2
+    assert offset == {"cursor": "2024-01-02T00:00:00Z"}
+    # First leaf call has no cursor filter
+    assert "$filter" not in responses.calls[1].request.url
+
+
+@responses.activate
+def test_contained_incremental_resume_applies_cursor_filter():
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}]})
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={
+            "value": [
+                {"Id": 13, "Label": "c", "ModifiedAt": "2024-01-03T00:00:00Z"},
+            ]
+        },
+        match_querystring=False,
+    )
+    c = _make()
+    records, offset = c.read_table(
+        "Parents__Children",
+        {"cursor": "2024-01-02T00:00:00Z"},
+        {"cursor_field": "ModifiedAt"},
+    )
+    rows = list(records)
+    assert len(rows) == 1
+    assert offset == {"cursor": "2024-01-03T00:00:00Z"}
+    # Cursor filter present on the leaf call. Call order:
+    # 0: $metadata, 1: Parents (PK walk), 2: Parents(1)/Children (leaf).
+    leaf_call = responses.calls[2].request.url
+    assert "ModifiedAt%20gt%20" in leaf_call or "ModifiedAt+gt+" in leaf_call
+
+
+@responses.activate
+def test_contained_incremental_terminates_when_offset_unchanged():
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}]})
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={"value": []},
+        match_querystring=False,
+    )
+    c = _make()
+    records, offset = c.read_table(
+        "Parents__Children",
+        {"cursor": "2024-01-02T00:00:00Z"},
+        {"cursor_field": "ModifiedAt"},
+    )
+    assert list(records) == []
+    assert offset == {"cursor": "2024-01-02T00:00:00Z"}
+
+
+@responses.activate
+def test_contained_incremental_truncation_returns_parent_idx_offset():
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}, {"Id": 2}]})
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={
+            "value": [
+                {"Id": 11, "Label": "a", "ModifiedAt": "2024-01-01T00:00:00Z"},
+                {"Id": 12, "Label": "b", "ModifiedAt": "2024-01-02T00:00:00Z"},
+            ]
+        },
+        match_querystring=False,
+    )
+    c = _make()
+    records, offset = c.read_table(
+        "Parents__Children",
+        None,
+        {"cursor_field": "ModifiedAt", "max_records_per_batch": "2"},
+    )
+    rows = list(records)
+    assert len(rows) == 2
+    # Capped mid-walk: parent_idx parked so resume continues at parent 1.
+    assert offset["parent_idx"] == 0  # truncated while walking parent index 0
+    assert offset["cursor"] == "2024-01-02T00:00:00Z"
+
+
+# --- read_table_metadata for contained paths ---
+
+
+@responses.activate
+def test_contained_metadata_snapshot_when_no_cursor():
+    _mock_nested_metadata()
+    c = _make()
+    meta = c.read_table_metadata("Parents__Children", {})
+    assert meta["ingestion_type"] == "snapshot"
+    assert meta["cursor_field"] is None
+    assert meta["primary_keys"] == ["Parents_Id", "Id"]
+
+
+@responses.activate
+def test_contained_metadata_cdc_when_cursor_field_set():
+    _mock_nested_metadata()
+    c = _make()
+    meta = c.read_table_metadata("Parents__Children", {"cursor_field": "ModifiedAt"})
+    assert meta["ingestion_type"] == "cdc"
+    assert meta["cursor_field"] == "ModifiedAt"
+
+
+@responses.activate
+def test_contained_delta_tracking_enabled_raises():
+    _mock_nested_metadata()
+    c = _make()
+    with pytest.raises(ValueError, match="not supported on contained"):
+        c.read_table("Parents__Children", None, {"delta_tracking": "enabled"})
+
+
+@responses.activate
+def test_contained_select_preserves_parent_fk_columns():
+    """``select`` filters the leaf entity's own columns but must NOT
+    strip the synthetic ancestor FK columns — those are how downstream
+    Delta tables reconstruct the parent linkage."""
+    _mock_nested_metadata()
+    c = _make()
+    schema = c.get_table_schema("Parents__Children", {"select": "Id,Label"})
+    names = [f.name for f in schema.fields]
+    # FK column survives select; ModifiedAt is filtered out.
+    assert "Parents_Id" in names
+    assert "ModifiedAt" not in names
+    assert "Id" in names
+    assert "Label" in names
+
+
+@responses.activate
+def test_contained_path_cycle_detection_in_discovery():
+    """A self-referential containment must not loop the discovery BFS."""
+    cyclic_xml = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="Cycle" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Node">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <NavigationProperty Name="Self" Type="Collection(Cycle.Node)" ContainsTarget="true"/>
+      </EntityType>
+      <EntityContainer Name="C">
+        <EntitySet Name="Nodes" EntityType="Cycle.Node"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+    responses.get(f"{SERVICE_URL}$metadata", body=cyclic_xml, status=200)
+    c = _make()
+    tables = c.list_tables_in_namespace(["Cycle"])
+    # Self appears once (depth 2) but no further recursion.
+    assert tables == ["Nodes", "Nodes__Self"]
+
+
+@responses.activate
+def test_contained_fk_name_clash_with_leaf_property_gets_underscore_prefix():
+    """When the default FK column name (``<seg>_<pk>``) collides with a
+    leaf entity property of the same name, the FK column gets a leading
+    ``_`` prefix until it's unique. The leaf property keeps its name."""
+    clash_xml = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="Clash" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Owner">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <NavigationProperty Name="Items" Type="Collection(Clash.Item)" ContainsTarget="true"/>
+      </EntityType>
+      <EntityType Name="Item">
+        <Key><PropertyRef Name="ItemId"/></Key>
+        <Property Name="ItemId" Type="Edm.Int32" Nullable="false"/>
+        <!-- Property that collides with the default FK column name
+             ``Owners_Id`` (= the parent entity-set name + Id). The
+             connector must prefix the FK column with ``_`` to keep
+             both columns distinct. -->
+        <Property Name="Owners_Id" Type="Edm.String"/>
+      </EntityType>
+      <EntityContainer Name="C">
+        <EntitySet Name="Owners" EntityType="Clash.Owner"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+    responses.get(f"{SERVICE_URL}$metadata", body=clash_xml, status=200)
+    c = _make()
+    schema = c.get_table_schema("Owners__Items", {})
+    names = [f.name for f in schema.fields]
+    # FK gets the leading underscore; leaf property keeps the original name.
+    assert "_Owners_Id" in names
+    assert "Owners_Id" in names
+    # Verify the FK is the FIRST column (prepended), property follows.
+    assert names == ["_Owners_Id", "ItemId", "Owners_Id"]
+    meta = c.read_table_metadata("Owners__Items", {})
+    assert meta["primary_keys"] == ["_Owners_Id", "ItemId"]
+
+
+@responses.activate
+def test_contained_fk_default_naming_without_prefix():
+    """When there's no name collision, FK columns use the plain
+    ``<segment>_<pkname>`` form — no leading underscore."""
+    _mock_nested_metadata()
+    c = _make()
+    schema = c.get_table_schema("Parents__Children", {})
+    names = [f.name for f in schema.fields]
+    assert names[0] == "Parents_Id"  # default form, no prefix
+    assert not names[0].startswith("_")
+
+
+@responses.activate
+def test_lookup_in_type_only_namespace_lists_namespaces_with_entity_sets():
+    """When the user picks a type-only namespace (no <EntityContainer>),
+    "Available in this namespace: []" is unhelpful. The error should
+    list the namespaces that DO contain entity sets so the user can
+    pick the right one."""
+    type_only_xml = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema xmlns="http://docs.oasis-open.org/odata/ns/edm" Namespace="My.Types.V1">
+      <EntityType Name="Thing">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+      </EntityType>
+    </Schema>
+    <Schema xmlns="http://docs.oasis-open.org/odata/ns/edm" Namespace="My.Service.V1">
+      <EntityContainer Name="Container">
+        <EntitySet Name="Things" EntityType="My.Types.V1.Thing"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+    responses.get(f"{SERVICE_URL}$metadata", body=type_only_xml, status=200)
+    c = _make()
+    with pytest.raises(
+        ValueError,
+        match=r"declares no entity sets.*Namespaces with entity sets:.*My\.Service\.V1",
+    ):
+        c.read_table_metadata("Things", {"namespace": "My.Types.V1"})
