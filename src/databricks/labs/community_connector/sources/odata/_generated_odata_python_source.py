@@ -600,7 +600,6 @@ def register_lakeflow_source(spark):
     # Inside generated OData request URLs the segment separator is always
     # a forward slash (the wire format the spec mandates).
     _URL_SEGMENT_SEP = "/"
-    PARENT_FK_PREFIX = "_parent_"
     # Cap on path depth. Prevents pathological discovery walks on services
     # with cyclic containment graphs; cycles within the cap are also
     # detected via target-type tracking.
@@ -691,8 +690,13 @@ def register_lakeflow_source(spark):
 
 
     def fk_column_name(segment: str, pk_name: str) -> str:
-        """``_parent_<segment>_<pkname>`` — keeps same-named PKs distinct across ancestors."""
-        return f"{PARENT_FK_PREFIX}{segment}_{pk_name}"
+        """Default ancestor-FK column name: ``<segment>_<pkname>``.
+
+        The actual column the connector writes may be further disambiguated
+        (prefixed with leading underscores) if it collides with a leaf
+        property or another FK column. See ``ContainedNavMixin._resolve_fk_columns``.
+        """
+        return f"{segment}_{pk_name}"
 
 
     class ContainedNavMixin:
@@ -805,17 +809,52 @@ def register_lakeflow_source(spark):
 
         # --- read paths --------------------------------------------------------
 
+        def _resolve_fk_columns(
+            self, segments: list[str], namespace: str | None
+        ) -> dict[tuple[str, str], str]:
+            """Map ``(segment, pk_name) → unique FK column name``.
+
+            Default form is ``<segment>_<pk>``. If that name collides with
+            a leaf entity property or with another FK column on the same
+            table, a leading ``_`` is prepended until the name is unique.
+            Empty mapping for flat (non-contained) tables.
+            """
+            if len(segments) < 2:
+                return {}
+            leaf_field_names = {
+                f.name
+                for f in self._own_fields_for_et(
+                    self._entity_type_for(CONTAINED_PATH_SEP.join(segments), namespace)
+                )
+            }
+            used = set(leaf_field_names)
+            resolved: dict[tuple[str, str], str] = {}
+            for idx in range(len(segments) - 1):
+                ancestor_et = self._entity_type_for(
+                    CONTAINED_PATH_SEP.join(segments[: idx + 1]), namespace
+                )
+                seg = segments[idx]
+                for pk in self._own_primary_keys_for_et(ancestor_et):
+                    candidate = fk_column_name(seg, pk)
+                    while candidate in used:
+                        candidate = "_" + candidate
+                    resolved[(seg, pk)] = candidate
+                    used.add(candidate)
+            return resolved
+
         def _tag_with_ancestor_fks(
             self,
             row: dict,
             segments: list[str],
             chain: list[dict[str, Any]],
+            fk_columns: dict[tuple[str, str], str],
         ) -> None:
-            """Add ``_parent_<seg>_<pk>`` keys to ``row`` in place."""
+            """Write ancestor primary-key values onto ``row`` under the
+            resolved FK column names from ``fk_columns``."""
             for idx, ancestor_keys in enumerate(chain):
                 seg = segments[idx]
                 for pk_name, pk_val in ancestor_keys.items():
-                    row[fk_column_name(seg, pk_name)] = pk_val
+                    row[fk_columns[(seg, pk_name)]] = pk_val
 
         def _iter_parent_key_chains(
             self,
@@ -862,10 +901,11 @@ def register_lakeflow_source(spark):
             ancestor FKs. Full result in one call."""
             segments = parse_contained_path(table_name) or [table_name]
             namespace = (table_options or {}).get("namespace")
+            fk_columns = self._resolve_fk_columns(segments, namespace)
             emitted: list[dict] = []
             for chain in self._iter_parent_key_chains(segments, namespace, table_options):
                 for row in self._fetch_pages(self._build_contained_url(segments, chain, table_options)):
-                    self._tag_with_ancestor_fks(row, segments, chain)
+                    self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                     emitted.append(row)
             return iter(emitted), {}
 
@@ -889,9 +929,12 @@ def register_lakeflow_source(spark):
                         f"has no primary key declared in $metadata."
                     )
                 pks_per_level.append(pks)
+            fk_columns = self._resolve_fk_columns(segments, namespace)
             emitted: list[dict] = []
             for top_row in self._fetch_pages(self._build_expand_url(segments, table_options)):
-                self._flatten_expand_response(0, top_row, segments, pks_per_level, [], emitted)
+                self._flatten_expand_response(
+                    0, top_row, segments, pks_per_level, [], fk_columns, emitted
+                )
             return iter(emitted), {}
 
         def _flatten_expand_response(
@@ -901,18 +944,21 @@ def register_lakeflow_source(spark):
             segments: list[str],
             pks_per_level: list[list[str]],
             chain: list[dict[str, Any]],
+            fk_columns: dict[tuple[str, str], str],
             out: list[dict],
         ) -> None:
             """Recurse into the nested $expand payload; tag and emit leaf rows."""
             if level == len(segments) - 1:
                 clean = {k: v for k, v in row.items() if not k.startswith("@odata.")}
-                self._tag_with_ancestor_fks(clean, segments, chain)
+                self._tag_with_ancestor_fks(clean, segments, chain, fk_columns)
                 out.append(clean)
                 return
             pks = pks_per_level[level]
             chain.append({pk: row.get(pk) for pk in pks})
             for child in row.get(segments[level + 1]) or []:
-                self._flatten_expand_response(level + 1, child, segments, pks_per_level, chain, out)
+                self._flatten_expand_response(
+                    level + 1, child, segments, pks_per_level, chain, fk_columns, out
+                )
             chain.pop()
 
         def _leaf_cursor_order_by(
@@ -936,6 +982,7 @@ def register_lakeflow_source(spark):
             cursor_field: str,
             since: Any,
             max_records: int,
+            fk_columns: dict[tuple[str, str], str],
         ) -> tuple[list[dict], bool, int]:
             """Drive the per-parent fetch loop; return (rows, truncated, parent_idx)."""
             emitted: list[dict] = []
@@ -954,7 +1001,7 @@ def register_lakeflow_source(spark):
                     rec_cursor = row.get(cursor_field)
                     if since is not None and rec_cursor is not None and rec_cursor <= since:
                         continue
-                    self._tag_with_ancestor_fks(row, segments, chain)
+                    self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                     emitted.append(row)
                     if len(emitted) >= max_records:
                         truncated = True
@@ -991,6 +1038,7 @@ def register_lakeflow_source(spark):
                 cursor_field,
                 since,
                 max_records,
+                self._resolve_fk_columns(segments, namespace),
             )
             if not emitted:
                 return iter([]), start_offset or {}
@@ -1141,7 +1189,9 @@ def register_lakeflow_source(spark):
                 # Always preserve synthetic ancestor FK columns on contained
                 # paths — ``select`` filters the leaf entity's own columns,
                 # not the parent linkage.
-                fields = [f for f in fields if f.name.startswith(_PARENT_FK_PREFIX) or f.name in wanted]
+                segments = _parse_contained_path(table_name) or [table_name]
+                fk_names = set(self._resolve_fk_columns(segments, namespace).values())
+                fields = [f for f in fields if f.name in fk_names or f.name in wanted]
             if not fields:
                 raise ValueError(
                     f"Could not derive a non-empty schema for entity set {table_name!r}. "
@@ -2236,7 +2286,9 @@ def register_lakeflow_source(spark):
             own_fields = self._own_fields_for_et(self._entity_type_for(table_name, namespace))
             if len(segments) == 1:
                 return own_fields
-            # Prepend ``_parent_<seg>_<pk>`` columns for each non-leaf segment.
+            # Prepend ancestor FK columns; names resolved by ``_resolve_fk_columns``
+            # so clashes with leaf properties or other FKs get a ``_`` prefix.
+            fk_columns = self._resolve_fk_columns(segments, namespace)
             fk_fields: list[StructField] = []
             for idx in range(len(segments) - 1):
                 ancestor_et = self._entity_type_for(
@@ -2246,7 +2298,7 @@ def register_lakeflow_source(spark):
                 for pk in self._own_primary_keys_for_et(ancestor_et):
                     fk_fields.append(
                         StructField(
-                            _fk_column_name(segments[idx], pk),
+                            fk_columns[(segments[idx], pk)],
                             own.get(pk, StringType()),
                             False,
                         )
@@ -2279,13 +2331,14 @@ def register_lakeflow_source(spark):
             leaf_pks = self._own_primary_keys_for_et(self._entity_type_for(table_name, namespace))
             if len(segments) == 1:
                 return leaf_pks
+            fk_columns = self._resolve_fk_columns(segments, namespace)
             composite: list[str] = []
             for idx in range(len(segments) - 1):
                 ancestor_et = self._entity_type_for(
                     _CONTAINED_PATH_SEP.join(segments[: idx + 1]), namespace
                 )
                 for pk in self._own_primary_keys_for_et(ancestor_et):
-                    composite.append(_fk_column_name(segments[idx], pk))
+                    composite.append(fk_columns[(segments[idx], pk)])
             composite.extend(leaf_pks)
             return composite
 
@@ -2393,8 +2446,6 @@ def register_lakeflow_source(spark):
 
 
     _CONTAINED_PATH_SEP = CONTAINED_PATH_SEP
-    _PARENT_FK_PREFIX = PARENT_FK_PREFIX
-    _fk_column_name = fk_column_name
     _join_url = join_url
     _odata_literal = odata_literal
     _parse_contained_path = parse_contained_path

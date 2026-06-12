@@ -291,19 +291,23 @@ Parents__Tags
 
 ### Schema augmentation
 
-Each contained-collection table prepends synthetic ``_parent_<segment>_<pkname>``
+Each contained-collection table prepends synthetic ancestor-FK
 columns onto every row so the destination Delta table can reconstruct
-the parent linkage. For ``Parents__Children__Notes``:
+the parent linkage. The default name is ``<segment>_<pkname>`` (no
+fixed prefix); a leading ``_`` is added only if the default would
+collide with a leaf property or another FK. For ``Parents__Children__Notes``:
 
 ```
-_parent_Parents_Id    Int — Parents' primary key
-_parent_Children_Id   Int — Children's primary key
-Id                    Int — Notes' own primary key
-Text                  String
+Parents_Id    Int — Parents' primary key
+Children_Id   Int — Children's primary key
+Id            Int — Notes' own primary key
+Text          String
 ```
 
 The composite primary key reported in ``read_table_metadata`` is the
-full chain: ``[_parent_Parents_Id, _parent_Children_Id, Id]``.
+full chain: ``[Parents_Id, Children_Id, Id]``. If the leaf had its
+own property named ``Parents_Id``, the FK would be emitted as
+``_Parents_Id`` and the leaf property would keep its original name.
 
 ### Read modes
 

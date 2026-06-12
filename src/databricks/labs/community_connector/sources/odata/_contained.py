@@ -4,7 +4,7 @@ OData v4 ``<NavigationProperty ContainsTarget="true">`` declares a
 parent-owned collection accessed as ``GET Parent(<key>)/ContainedNavProp``.
 The connector exposes these as double-underscore-pathed tables
 (``Parent__Child__...__Leaf``) — slash isn't valid in Spark SQL
-identifiers — with ``_parent_<seg>_<pk>`` ancestor-FK
+identifiers — with ``<seg>_<pk>`` ancestor-FK
 columns prepended onto each row. The split keeps the main connector
 file under its line cap; the methods here are mixed into
 ``ODataLakeflowConnect`` via ``ContainedNavMixin``.
@@ -23,16 +23,14 @@ from xml.etree import ElementTree as ET
 from pyspark.sql.types import StringType, StructField
 
 
-# Path-segment separator and ancestor-FK column-name prefix.
-# ``__`` (double underscore), not ``/``, so the framework can interpolate
-# slash-free table names directly into Spark SQL identifiers (view names,
-# temp views). The OData URL path still uses ``/`` — that's hardcoded
-# in ``_build_contained_path``.
+# Path-segment separator. ``__`` (double underscore), not ``/``, so
+# the framework can interpolate slash-free table names directly into
+# Spark SQL identifiers (view names, temp views). The OData URL path
+# still uses ``/`` — that's hardcoded in ``_build_contained_path``.
 CONTAINED_PATH_SEP = "__"
 # Inside generated OData request URLs the segment separator is always
 # a forward slash (the wire format the spec mandates).
 _URL_SEGMENT_SEP = "/"
-PARENT_FK_PREFIX = "_parent_"
 # Cap on path depth. Prevents pathological discovery walks on services
 # with cyclic containment graphs; cycles within the cap are also
 # detected via target-type tracking.
@@ -123,8 +121,13 @@ def contained_nav_props(entity_type: ET.Element) -> list[tuple[str, str]]:
 
 
 def fk_column_name(segment: str, pk_name: str) -> str:
-    """``_parent_<segment>_<pkname>`` — keeps same-named PKs distinct across ancestors."""
-    return f"{PARENT_FK_PREFIX}{segment}_{pk_name}"
+    """Default ancestor-FK column name: ``<segment>_<pkname>``.
+
+    The actual column the connector writes may be further disambiguated
+    (prefixed with leading underscores) if it collides with a leaf
+    property or another FK column. See ``ContainedNavMixin._resolve_fk_columns``.
+    """
+    return f"{segment}_{pk_name}"
 
 
 class ContainedNavMixin:
@@ -237,17 +240,52 @@ class ContainedNavMixin:
 
     # --- read paths --------------------------------------------------------
 
+    def _resolve_fk_columns(
+        self, segments: list[str], namespace: str | None
+    ) -> dict[tuple[str, str], str]:
+        """Map ``(segment, pk_name) → unique FK column name``.
+
+        Default form is ``<segment>_<pk>``. If that name collides with
+        a leaf entity property or with another FK column on the same
+        table, a leading ``_`` is prepended until the name is unique.
+        Empty mapping for flat (non-contained) tables.
+        """
+        if len(segments) < 2:
+            return {}
+        leaf_field_names = {
+            f.name
+            for f in self._own_fields_for_et(
+                self._entity_type_for(CONTAINED_PATH_SEP.join(segments), namespace)
+            )
+        }
+        used = set(leaf_field_names)
+        resolved: dict[tuple[str, str], str] = {}
+        for idx in range(len(segments) - 1):
+            ancestor_et = self._entity_type_for(
+                CONTAINED_PATH_SEP.join(segments[: idx + 1]), namespace
+            )
+            seg = segments[idx]
+            for pk in self._own_primary_keys_for_et(ancestor_et):
+                candidate = fk_column_name(seg, pk)
+                while candidate in used:
+                    candidate = "_" + candidate
+                resolved[(seg, pk)] = candidate
+                used.add(candidate)
+        return resolved
+
     def _tag_with_ancestor_fks(
         self,
         row: dict,
         segments: list[str],
         chain: list[dict[str, Any]],
+        fk_columns: dict[tuple[str, str], str],
     ) -> None:
-        """Add ``_parent_<seg>_<pk>`` keys to ``row`` in place."""
+        """Write ancestor primary-key values onto ``row`` under the
+        resolved FK column names from ``fk_columns``."""
         for idx, ancestor_keys in enumerate(chain):
             seg = segments[idx]
             for pk_name, pk_val in ancestor_keys.items():
-                row[fk_column_name(seg, pk_name)] = pk_val
+                row[fk_columns[(seg, pk_name)]] = pk_val
 
     def _iter_parent_key_chains(
         self,
@@ -294,10 +332,11 @@ class ContainedNavMixin:
         ancestor FKs. Full result in one call."""
         segments = parse_contained_path(table_name) or [table_name]
         namespace = (table_options or {}).get("namespace")
+        fk_columns = self._resolve_fk_columns(segments, namespace)
         emitted: list[dict] = []
         for chain in self._iter_parent_key_chains(segments, namespace, table_options):
             for row in self._fetch_pages(self._build_contained_url(segments, chain, table_options)):
-                self._tag_with_ancestor_fks(row, segments, chain)
+                self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                 emitted.append(row)
         return iter(emitted), {}
 
@@ -321,9 +360,12 @@ class ContainedNavMixin:
                     f"has no primary key declared in $metadata."
                 )
             pks_per_level.append(pks)
+        fk_columns = self._resolve_fk_columns(segments, namespace)
         emitted: list[dict] = []
         for top_row in self._fetch_pages(self._build_expand_url(segments, table_options)):
-            self._flatten_expand_response(0, top_row, segments, pks_per_level, [], emitted)
+            self._flatten_expand_response(
+                0, top_row, segments, pks_per_level, [], fk_columns, emitted
+            )
         return iter(emitted), {}
 
     def _flatten_expand_response(
@@ -333,18 +375,21 @@ class ContainedNavMixin:
         segments: list[str],
         pks_per_level: list[list[str]],
         chain: list[dict[str, Any]],
+        fk_columns: dict[tuple[str, str], str],
         out: list[dict],
     ) -> None:
         """Recurse into the nested $expand payload; tag and emit leaf rows."""
         if level == len(segments) - 1:
             clean = {k: v for k, v in row.items() if not k.startswith("@odata.")}
-            self._tag_with_ancestor_fks(clean, segments, chain)
+            self._tag_with_ancestor_fks(clean, segments, chain, fk_columns)
             out.append(clean)
             return
         pks = pks_per_level[level]
         chain.append({pk: row.get(pk) for pk in pks})
         for child in row.get(segments[level + 1]) or []:
-            self._flatten_expand_response(level + 1, child, segments, pks_per_level, chain, out)
+            self._flatten_expand_response(
+                level + 1, child, segments, pks_per_level, chain, fk_columns, out
+            )
         chain.pop()
 
     def _leaf_cursor_order_by(
@@ -368,6 +413,7 @@ class ContainedNavMixin:
         cursor_field: str,
         since: Any,
         max_records: int,
+        fk_columns: dict[tuple[str, str], str],
     ) -> tuple[list[dict], bool, int]:
         """Drive the per-parent fetch loop; return (rows, truncated, parent_idx)."""
         emitted: list[dict] = []
@@ -386,7 +432,7 @@ class ContainedNavMixin:
                 rec_cursor = row.get(cursor_field)
                 if since is not None and rec_cursor is not None and rec_cursor <= since:
                     continue
-                self._tag_with_ancestor_fks(row, segments, chain)
+                self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                 emitted.append(row)
                 if len(emitted) >= max_records:
                     truncated = True
@@ -423,6 +469,7 @@ class ContainedNavMixin:
             cursor_field,
             since,
             max_records,
+            self._resolve_fk_columns(segments, namespace),
         )
         if not emitted:
             return iter([]), start_offset or {}

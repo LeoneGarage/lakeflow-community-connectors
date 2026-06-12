@@ -2099,8 +2099,8 @@ def test_get_table_schema_for_two_level_contained():
     schema = c.get_table_schema("Parents__Children", {})
     names = [f.name for f in schema.fields]
     # Parent FK prepended, then child's own fields in CSDL order.
-    assert names == ["_parent_Parents_Id", "Id", "Label", "ModifiedAt"]
-    fk_field = schema["_parent_Parents_Id"]
+    assert names == ["Parents_Id", "Id", "Label", "ModifiedAt"]
+    fk_field = schema["Parents_Id"]
     assert isinstance(fk_field.dataType, IntegerType)
     assert fk_field.nullable is False
 
@@ -2112,8 +2112,8 @@ def test_get_table_schema_for_three_level_contained():
     schema = c.get_table_schema("Parents__Children__Notes", {})
     names = [f.name for f in schema.fields]
     assert names == [
-        "_parent_Parents_Id",
-        "_parent_Children_Id",
+        "Parents_Id",
+        "Children_Id",
         "Id",
         "Text",
     ]
@@ -2129,7 +2129,7 @@ def test_get_table_schema_for_contained_with_composite_parent_pk():
     c = _make()
     schema = c.get_table_schema("Parents__Tags", {})
     names = [f.name for f in schema.fields]
-    assert names == ["_parent_Parents_Id", "Category", "Value"]
+    assert names == ["Parents_Id", "Category", "Value"]
 
 
 @responses.activate
@@ -2137,7 +2137,7 @@ def test_primary_keys_for_two_level_contained():
     _mock_nested_metadata()
     c = _make()
     meta = c.read_table_metadata("Parents__Children", {})
-    assert meta["primary_keys"] == ["_parent_Parents_Id", "Id"]
+    assert meta["primary_keys"] == ["Parents_Id", "Id"]
     assert meta["ingestion_type"] == "snapshot"
 
 
@@ -2147,8 +2147,8 @@ def test_primary_keys_for_three_level_contained_includes_all_ancestors():
     c = _make()
     meta = c.read_table_metadata("Parents__Children__Notes", {})
     assert meta["primary_keys"] == [
-        "_parent_Parents_Id",
-        "_parent_Children_Id",
+        "Parents_Id",
+        "Children_Id",
         "Id",
     ]
 
@@ -2159,7 +2159,7 @@ def test_primary_keys_for_composite_leaf_in_contained():
     c = _make()
     meta = c.read_table_metadata("Parents__Tags", {})
     # Composite PK on the leaf — both columns surface alongside parent FK.
-    assert meta["primary_keys"] == ["_parent_Parents_Id", "Category", "Value"]
+    assert meta["primary_keys"] == ["Parents_Id", "Category", "Value"]
 
 
 @responses.activate
@@ -2261,9 +2261,9 @@ def test_contained_snapshot_two_level_walks_parents_and_tags_fks():
     assert offset == {}
     assert len(rows) == 3
     # FK column populated correctly
-    assert rows[0]["_parent_Parents_Id"] == 1
+    assert rows[0]["Parents_Id"] == 1
     assert rows[0]["Id"] == 11
-    assert rows[2]["_parent_Parents_Id"] == 2
+    assert rows[2]["Parents_Id"] == 2
     assert rows[2]["Id"] == 21
 
 
@@ -2289,12 +2289,12 @@ def test_contained_snapshot_three_level_walks_full_chain():
     assert len(rows) == 3
     # All three FK chains populated
     assert rows[0] == {
-        "_parent_Parents_Id": 1,
-        "_parent_Children_Id": 10,
+        "Parents_Id": 1,
+        "Children_Id": 10,
         "Id": 100,
         "Text": "a",
     }
-    assert rows[2]["_parent_Children_Id"] == 20
+    assert rows[2]["Children_Id"] == 20
     assert rows[2]["Id"] == 200
 
 
@@ -2340,7 +2340,7 @@ def test_contained_expand_two_level_flattens_nested_response():
     records, _ = c.read_table("Parents__Children", None, {"expand_contained": "true"})
     rows = list(records)
     assert len(rows) == 2
-    assert rows[0]["_parent_Parents_Id"] == 1
+    assert rows[0]["Parents_Id"] == 1
     assert rows[0]["Id"] == 11
     # @odata.* control props are stripped from the flattened leaf rows too
     assert all(not k.startswith("@odata.") for r in rows for k in r)
@@ -2372,7 +2372,7 @@ def test_contained_expand_three_level_flattens_nested():
     records, _ = c.read_table("Parents__Children__Notes", None, {"expand_contained": "true"})
     rows = list(records)
     assert len(rows) == 2
-    assert all(r["_parent_Parents_Id"] == 1 and r["_parent_Children_Id"] == 10 for r in rows)
+    assert all(r["Parents_Id"] == 1 and r["Children_Id"] == 10 for r in rows)
     assert {r["Id"] for r in rows} == {100, 101}
 
 
@@ -2403,7 +2403,7 @@ def test_contained_expand_strips_odata_annotations_on_leaf_rows():
     rows = list(records)
     assert rows == [
         {
-            "_parent_Parents_Id": 1,
+            "Parents_Id": 1,
             "Id": 11,
             "Label": "a",
             "ModifiedAt": "2024-01-01T00:00:00Z",
@@ -2529,7 +2529,7 @@ def test_contained_metadata_snapshot_when_no_cursor():
     meta = c.read_table_metadata("Parents__Children", {})
     assert meta["ingestion_type"] == "snapshot"
     assert meta["cursor_field"] is None
-    assert meta["primary_keys"] == ["_parent_Parents_Id", "Id"]
+    assert meta["primary_keys"] == ["Parents_Id", "Id"]
 
 
 @responses.activate
@@ -2559,7 +2559,7 @@ def test_contained_select_preserves_parent_fk_columns():
     schema = c.get_table_schema("Parents__Children", {"select": "Id,Label"})
     names = [f.name for f in schema.fields]
     # FK column survives select; ModifiedAt is filtered out.
-    assert "_parent_Parents_Id" in names
+    assert "Parents_Id" in names
     assert "ModifiedAt" not in names
     assert "Id" in names
     assert "Label" in names
@@ -2589,3 +2589,58 @@ def test_contained_path_cycle_detection_in_discovery():
     tables = c.list_tables_in_namespace(["Cycle"])
     # Self appears once (depth 2) but no further recursion.
     assert tables == ["Nodes", "Nodes__Self"]
+
+
+@responses.activate
+def test_contained_fk_name_clash_with_leaf_property_gets_underscore_prefix():
+    """When the default FK column name (``<seg>_<pk>``) collides with a
+    leaf entity property of the same name, the FK column gets a leading
+    ``_`` prefix until it's unique. The leaf property keeps its name."""
+    clash_xml = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="Clash" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Owner">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <NavigationProperty Name="Items" Type="Collection(Clash.Item)" ContainsTarget="true"/>
+      </EntityType>
+      <EntityType Name="Item">
+        <Key><PropertyRef Name="ItemId"/></Key>
+        <Property Name="ItemId" Type="Edm.Int32" Nullable="false"/>
+        <!-- Property that collides with the default FK column name
+             ``Owners_Id`` (= the parent entity-set name + Id). The
+             connector must prefix the FK column with ``_`` to keep
+             both columns distinct. -->
+        <Property Name="Owners_Id" Type="Edm.String"/>
+      </EntityType>
+      <EntityContainer Name="C">
+        <EntitySet Name="Owners" EntityType="Clash.Owner"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+    responses.get(f"{SERVICE_URL}$metadata", body=clash_xml, status=200)
+    c = _make()
+    schema = c.get_table_schema("Owners__Items", {})
+    names = [f.name for f in schema.fields]
+    # FK gets the leading underscore; leaf property keeps the original name.
+    assert "_Owners_Id" in names
+    assert "Owners_Id" in names
+    # Verify the FK is the FIRST column (prepended), property follows.
+    assert names == ["_Owners_Id", "ItemId", "Owners_Id"]
+    meta = c.read_table_metadata("Owners__Items", {})
+    assert meta["primary_keys"] == ["_Owners_Id", "ItemId"]
+
+
+@responses.activate
+def test_contained_fk_default_naming_without_prefix():
+    """When there's no name collision, FK columns use the plain
+    ``<segment>_<pkname>`` form — no leading underscore."""
+    _mock_nested_metadata()
+    c = _make()
+    schema = c.get_table_schema("Parents__Children", {})
+    names = [f.name for f in schema.fields]
+    assert names[0] == "Parents_Id"  # default form, no prefix
+    assert not names[0].startswith("_")

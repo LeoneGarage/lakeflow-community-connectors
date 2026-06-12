@@ -67,7 +67,6 @@ from databricks.labs.community_connector.interface.supports_namespaces import (
 # private names so the rest of this file can keep using them as before.
 from databricks.labs.community_connector.sources.odata._contained import (
     CONTAINED_PATH_SEP as _CONTAINED_PATH_SEP,
-    PARENT_FK_PREFIX as _PARENT_FK_PREFIX,
     MAX_CONTAINED_DEPTH as _MAX_CONTAINED_DEPTH,
     ContainedNavMixin,
     contained_nav_props as _contained_nav_props,
@@ -217,7 +216,9 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces, ContainedNavMixi
             # Always preserve synthetic ancestor FK columns on contained
             # paths — ``select`` filters the leaf entity's own columns,
             # not the parent linkage.
-            fields = [f for f in fields if f.name.startswith(_PARENT_FK_PREFIX) or f.name in wanted]
+            segments = _parse_contained_path(table_name) or [table_name]
+            fk_names = set(self._resolve_fk_columns(segments, namespace).values())
+            fields = [f for f in fields if f.name in fk_names or f.name in wanted]
         if not fields:
             raise ValueError(
                 f"Could not derive a non-empty schema for entity set {table_name!r}. "
@@ -1312,7 +1313,9 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces, ContainedNavMixi
         own_fields = self._own_fields_for_et(self._entity_type_for(table_name, namespace))
         if len(segments) == 1:
             return own_fields
-        # Prepend ``_parent_<seg>_<pk>`` columns for each non-leaf segment.
+        # Prepend ancestor FK columns; names resolved by ``_resolve_fk_columns``
+        # so clashes with leaf properties or other FKs get a ``_`` prefix.
+        fk_columns = self._resolve_fk_columns(segments, namespace)
         fk_fields: list[StructField] = []
         for idx in range(len(segments) - 1):
             ancestor_et = self._entity_type_for(
@@ -1322,7 +1325,7 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces, ContainedNavMixi
             for pk in self._own_primary_keys_for_et(ancestor_et):
                 fk_fields.append(
                     StructField(
-                        _fk_column_name(segments[idx], pk),
+                        fk_columns[(segments[idx], pk)],
                         own.get(pk, StringType()),
                         False,
                     )
@@ -1355,13 +1358,14 @@ class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces, ContainedNavMixi
         leaf_pks = self._own_primary_keys_for_et(self._entity_type_for(table_name, namespace))
         if len(segments) == 1:
             return leaf_pks
+        fk_columns = self._resolve_fk_columns(segments, namespace)
         composite: list[str] = []
         for idx in range(len(segments) - 1):
             ancestor_et = self._entity_type_for(
                 _CONTAINED_PATH_SEP.join(segments[: idx + 1]), namespace
             )
             for pk in self._own_primary_keys_for_et(ancestor_et):
-                composite.append(_fk_column_name(segments[idx], pk))
+                composite.append(fk_columns[(segments[idx], pk)])
         composite.extend(leaf_pks)
         return composite
 

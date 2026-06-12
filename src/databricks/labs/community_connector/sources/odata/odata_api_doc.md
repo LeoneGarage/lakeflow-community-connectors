@@ -136,7 +136,7 @@ These are passed to the connector via the pipeline's `table_configuration` block
 | --- | --- | --- |
 | `namespace` | — | Selects the `<Schema Namespace="...">` block that declares this entity set. Required only when the same entity-set name appears in multiple schemas. |
 | `cursor_field` | — | Column to drive incremental reads. Absent → snapshot. Must be a top-level property of the entity type and naturally ordered by OData `$orderby` (timestamps and monotonic IDs are typical). |
-| `select` | all properties | Comma-separated `$select` projection. Both the on-wire OData query and the derived Spark schema are filtered to these columns. On contained paths, synthetic `_parent_<seg>_<pk>` ancestor-FK columns are always preserved regardless of `select`. |
+| `select` | all properties | Comma-separated `$select` projection. Both the on-wire OData query and the derived Spark schema are filtered to these columns. On contained paths, synthetic ancestor-FK columns (default form `<seg>_<pk>`) are always preserved regardless of `select`. |
 | `filter` | — | Additional OData `$filter` expression, AND-ed with any cursor filter the connector generates. Applies to the leaf collection only on contained paths. |
 | `page_size` | `1000` | Value of `$top` sent on each HTTP request. Sets the maximum rows per OData page. Some servers cap this server-side (see *Known limits*). |
 | `max_records_per_batch` | `100000` | Client-side cap on records returned per `read_table` call. The connector truncates and returns control to the framework once this limit is hit. Independent of `page_size`. |
@@ -357,20 +357,22 @@ Output is deterministic — flat sets sorted first, then contained paths sorted.
 
 ### Schema augmentation
 
-For a path with N segments, the leaf entity's own properties are preceded by synthetic ancestor-FK columns, one set per non-leaf segment:
+For a path with N segments, the leaf entity's own properties are preceded by synthetic ancestor-FK columns, one set per non-leaf segment. The default name is `<segment>_<pkname>` (no fixed prefix). When that name would collide with a leaf property or with another ancestor FK, the connector prepends a leading `_` until the name is unique.
 
 ```
-_parent_<segment1>_<pkname1...>   ← primary keys of segment 1's entity type
-_parent_<segment2>_<pkname2...>   ← primary keys of segment 2
+<segment1>_<pkname1...>   ← primary keys of segment 1's entity type
+<segment2>_<pkname2...>   ← primary keys of segment 2
 ...
 <leaf's own properties>
 ```
 
-The composite primary key reported in `read_table_metadata` is the full chain: every ancestor FK column followed by the leaf's own primary-key columns. This lets `apply_changes` uniquely identify rows across the parent fan-out.
+The composite primary key reported in `read_table_metadata` is the full chain: every (resolved) ancestor FK column followed by the leaf's own primary-key columns. This lets `apply_changes` uniquely identify rows across the parent fan-out.
 
-When a parent has a composite primary key, every key column gets its own `_parent_<seg>_<pk>` field. Names cannot collide because each segment label is part of the column name (`_parent_Parents_Id` vs `_parent_Children_Id`).
+When a parent has a composite primary key, every key column gets its own `<seg>_<pk>` field. Names are kept distinct because each segment label is part of the column name (`Parents_Id` vs `Children_Id`).
 
-`select` on a contained path filters only the leaf entity's own properties — the synthetic ancestor-FK columns are always preserved.
+**Collision example.** If `Items` has its own property `Owners_Id` and the path is `Owners__Items`, the connector emits `_Owners_Id` (FK, leading underscore) and `Owners_Id` (the leaf's own property, untouched). With multiple collisions, more leading underscores are added until unique.
+
+`select` on a contained path filters only the leaf entity's own properties — the synthetic ancestor-FK columns are always preserved (the resolved names are compared against the leaf-only set, not against the input `select` list).
 
 ### Read modes
 
