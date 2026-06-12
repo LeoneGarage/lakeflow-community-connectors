@@ -104,7 +104,8 @@ w.api_client.do(
             "token": "<bearer-token>",
             "externalOptionsAllowList": (
                 "namespace,cursor_field,select,filter,"
-                "page_size,max_records_per_batch,delta_tracking"
+                "page_size,max_records_per_batch,delta_tracking,"
+                "expand_contained"
             ),
         },
     },
@@ -190,6 +191,7 @@ build_pipeline(
 | `page_size`             | 1000    | `$top` per HTTP request. |
 | `max_records_per_batch` | 100000  | Per-call upper bound on rows returned. The connector has **no wall-clock ceiling** — `max_records_per_batch` is the only cap on a single batch. Each batch fetches `cursor gt <last>` and pulls up to this many rows, then commits the offset. Smaller values give continuous-mode pipelines lower latency per micro-batch at the cost of more round trips; larger values amortize HTTP overhead. The default of 100000 fits roughly 100 `$top=1000` pages per batch and prioritises throughput; lower it (e.g. to 5000) if you want tighter per-batch latency in a continuous pipeline. |
 | `delta_tracking`        | disabled | Opt-in OData v4 delta queries. Values: `disabled` (default — no behavior change), `auto` (probe once, fall back to cursor/snapshot if the server doesn't acknowledge), `enabled` (require support; error if the server doesn't acknowledge). See [Delta tracking](#delta-tracking) below. |
+| `expand_contained`      | false   | For contained-collection tables (`Parent__Child__...` paths). When `true`, the connector issues a single `GET Parent?$expand=Child($expand=...)` per pipeline trigger instead of the default N+1 traversal (one parent fetch + one per-parent leaf fetch). See [Contained navigation properties](#contained-navigation-properties) below. |
 
 ## Delta tracking
 
@@ -263,6 +265,99 @@ detects this and falls back to whatever cursor/snapshot config is set.
         "source_table": "users",
         "table_configuration": {
             "delta_tracking": "enabled",
+        },
+    }
+}
+```
+
+## Contained navigation properties
+
+OData v4 lets entity types declare ``<NavigationProperty
+ContainsTarget="true">`` collections that are *owned* by the parent
+entity rather than living as their own top-level entity sets. They're
+addressed by traversing the parent's key:
+``GET Parent(<key>)/ContainedNavProp``. Common examples: order line
+items, address records on a customer, asset documents on an asset.
+
+The connector exposes these as double-underscore-pathed tables alongside the
+top-level entity sets, up to 5 segments deep:
+
+```
+Parents
+Parents__Children
+Parents__Children__Notes
+Parents__Tags
+```
+
+### Schema augmentation
+
+Each contained-collection table prepends synthetic FK columns for
+**every non-leaf ancestor**. This is required for global uniqueness —
+OData v4 §13.4.3 makes contained-entity keys unique only within their
+immediate parent, so collapsing on the leaf's own PK collides across
+sibling parent branches. Default name is ``<segment>_<pkname>``; a
+leading ``_`` is added only if it would collide with a leaf property.
+For ``Parents__Children__Notes``:
+
+```
+Parents_Id    Int — top-level ancestor PK
+Children_Id   Int — intermediate ancestor PK
+Id            Int — Notes' own primary key
+Text          String
+```
+
+The composite primary key reported in ``read_table_metadata`` is the
+full chain: ``[Parents_Id, Children_Id, Id]``. If the leaf had its
+own property named ``Children_Id``, the FK would be emitted as
+``_Children_Id`` and the leaf property would keep its original name.
+
+### Read modes
+
+Two modes via the ``expand_contained`` table option:
+
+**Default (`expand_contained=false`)** — N+1 traversal. The connector
+issues one ``GET Parents?$select=<pks>`` to enumerate parent keys, then
+one ``GET Parents(<key>)/Children?...`` per parent. For deep paths the
+fan-out multiplies. Works against every OData v4 server.
+
+**Opt-in (`expand_contained=true`)** — single nested ``$expand`` call:
+``GET Parents?$expand=Children($expand=Notes)``. The connector flattens
+the nested response into leaf rows tagged with all ancestor FKs. Most
+servers cap ``$expand`` depth at 1; deeper expands surface server errors
+verbatim. Use only against servers known to honor the depth you need
+(Microsoft Graph, SAP S/4HANA Cloud).
+
+### Cursor-based incremental on contained tables
+
+Set ``cursor_field`` on the leaf entity's column. The connector walks
+every parent tuple per trigger, filters each leaf fetch with
+``$filter=<cursor> gt <since>``, and tracks the global max cursor in
+the offset. Mid-batch ``max_records_per_batch`` truncation parks a
+``parent_idx`` in the offset so the next call resumes at the same
+parent.
+
+Known limitation: no same-cursor boundary trim across truncation. Set
+``max_records_per_batch`` above the largest expected same-cursor cohort
+per parent, or pick a higher-cardinality cursor.
+
+### Disallowed combinations
+
+- ``delta_tracking=enabled`` + a contained path → ``ValueError``.
+  Server-driven change tracking is defined against top-level entity
+  sets.
+- Depth > 5 → ``ValueError`` at parse time. Cap exists to prevent
+  pathological discovery walks; raise if you have a real use case.
+
+### Configuration example
+
+```python
+{
+    "table": {
+        "source_table": "Parents__Children__Notes",
+        "table_configuration": {
+            "cursor_field": "ModifiedAt",
+            "max_records_per_batch": "5000",
+            # Optional: expand_contained: "true" for $expand mode
         },
     }
 }
