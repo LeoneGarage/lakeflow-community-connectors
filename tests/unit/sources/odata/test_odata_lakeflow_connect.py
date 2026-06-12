@@ -2419,6 +2419,124 @@ def test_contained_expand_invalid_value_raises():
         c.read_table("Parents__Children", None, {"expand_contained": "yes"})
 
 
+@responses.activate
+def test_contained_expand_with_ancestor_cursor_injects_filter_into_expand():
+    """expand_contained + cursor on a middle ancestor injects
+    $filter/$orderby into the ``$expand`` clause for that ancestor.
+    Top-level URL has no $filter (cursor isn't on the top entity set)."""
+    _mock_nested_metadata()
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Parents",
+        json={
+            "value": [
+                {
+                    "Id": 1,
+                    "Children": [
+                        {
+                            "Id": 11,
+                            "ModifiedAt": "2024-01-02T00:00:00Z",
+                            "Notes": [{"Id": 111, "Text": "a"}],
+                        }
+                    ],
+                }
+            ]
+        },
+        match_querystring=False,
+    )
+    c = _make()
+    records, offset = c.read_table(
+        "Parents__Children__Notes",
+        {"cursor": "2024-01-01T00:00:00Z"},
+        {"expand_contained": "true", "cursor_field": "ModifiedAt"},
+    )
+    rows = list(records)
+    call_url = responses.calls[1].request.url
+    # cursor is on Children (level 1), so $filter/$orderby live inside
+    # the Children $expand, not at the top level.
+    assert "%24expand=Children" in call_url or "$expand=Children" in call_url
+    # $filter inside the expand uses the cursor; ' gt ' encoded as %20gt%20 or +gt+.
+    assert "ModifiedAt%20gt%20" in call_url or "ModifiedAt+gt+" in call_url
+    assert "%24orderby" in call_url or "$orderby" in call_url
+    # Leaf row was stamped with the ancestor's cursor value.
+    assert rows == [
+        {
+            "Parents_Id": 1,
+            "Children_Id": 11,
+            "Id": 111,
+            "Text": "a",
+            "ModifiedAt": "2024-01-02T00:00:00Z",
+        }
+    ]
+    assert offset == {"cursor": "2024-01-02T00:00:00Z"}
+
+
+@responses.activate
+def test_contained_expand_does_not_inject_select_inside_cursor_expand():
+    """The connector must not inject $select inside the cursor segment's
+    $expand clause. The cursor column is returned by default; injecting
+    $select would silently strip every other column the user didn't
+    explicitly opt out of — broken on the leaf-cursor case (2-segment
+    paths) where the cursor segment is the destination."""
+    _mock_nested_metadata()
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Parents",
+        json={"value": []},
+        match_querystring=False,
+    )
+    c = _make()
+    list(
+        c.read_table(
+            "Parents__Children__Notes",
+            None,
+            {"expand_contained": "true", "cursor_field": "ModifiedAt"},
+        )[0]
+    )
+    call_url = responses.calls[1].request.url
+    assert "%24select" not in call_url and "$select" not in call_url
+    # $filter/$orderby remain — they're load-bearing for incremental.
+    assert "%24orderby" in call_url or "$orderby" in call_url
+
+
+@responses.activate
+def test_contained_expand_cursor_orderby_includes_level_pks():
+    """The $orderby injected at the cursor level uses ``cursor asc``
+    plus that segment's primary keys as tie-breakers (proving
+    `_find_cursor_level` returns the right level, not just the leaf)."""
+    _mock_nested_metadata()
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Parents",
+        json={"value": []},
+        match_querystring=False,
+    )
+    c = _make()
+    records, _ = c.read_table(
+        "Parents__Children__Notes",
+        None,
+        {"expand_contained": "true", "cursor_field": "ModifiedAt"},
+    )
+    list(records)
+    call_url = responses.calls[1].request.url
+    # $orderby inside the Children expand includes Id (Children's PK).
+    assert "ModifiedAt" in call_url and ("Id%20asc" in call_url or "Id+asc" in call_url)
+
+
+@responses.activate
+def test_contained_expand_cursor_not_on_any_segment_raises():
+    """expand_contained + cursor_field that's not a property on any
+    segment surfaces an actionable ValueError, same as N+1 mode."""
+    _mock_nested_metadata()
+    c = _make()
+    with pytest.raises(ValueError, match="not a property"):
+        c.read_table(
+            "Parents__Children__Notes",
+            None,
+            {"expand_contained": "true", "cursor_field": "DoesNotExist"},
+        )
+
+
 # --- Cursor incremental on contained ---
 
 
