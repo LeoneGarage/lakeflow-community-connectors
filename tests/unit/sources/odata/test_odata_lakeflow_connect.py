@@ -2827,6 +2827,67 @@ def test_ancestor_cursor_truncation_parks_chain_next_link():
     assert offset["parent_idx"] == 0
 
 
+@responses.activate
+def test_ancestor_cursor_truncation_preserves_original_since():
+    """On truncation in ancestor-cursor mode, the offset's ``cursor``
+    preserves the original ``since`` rather than advancing to the global
+    max emitted. This is the fix for the cross-chain interleaved-cursor
+    bug: chain enumeration is depth-first by top-level parent, so
+    ancestor cursors interleave across parents. If we used max(emitted)
+    we'd filter out lower-cursor chains under later top-level parents
+    on resume — even though they were never emitted."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}, {"Id": 2}]})
+    # Under Parent(1): Children with HIGHER cursors first (filtered/ordered server-side).
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={
+            "value": [
+                {"Id": 11, "ModifiedAt": "2024-01-10T00:00:00Z"},
+                {"Id": 12, "ModifiedAt": "2024-01-20T00:00:00Z"},
+            ]
+        },
+        match_querystring=False,
+    )
+    # Under Parent(2): Children with LOWER cursors — these interleave below
+    # Parent(1)'s already-emitted max.
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Parents(2)/Children",
+        json={
+            "value": [
+                {"Id": 21, "ModifiedAt": "2024-01-05T00:00:00Z"},
+            ]
+        },
+        match_querystring=False,
+    )
+    # Each Children's Notes (under Parent 1 only — Parent 2 not reached on batch 1).
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children(11)/Notes",
+        json={"value": [{"Id": 100, "Text": "a"}]},
+        match_querystring=False,
+    )
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children(12)/Notes",
+        json={"value": [{"Id": 200, "Text": "b"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    records, offset = c.read_table(
+        "Parents__Children__Notes",
+        # since=2023-01-01 chosen to ensure the live filter includes all chains.
+        {"cursor": "2023-01-01T00:00:00Z"},
+        {"cursor_field": "ModifiedAt", "max_records_per_batch": "2"},
+    )
+    list(records)
+    # Truncated: preserved since (NOT max emitted 2024-01-20).
+    assert offset.get("cursor") == "2023-01-01T00:00:00Z"
+    assert offset.get("parent_idx") is not None
+
+
 # --- ancestor-cursor incremental ---
 
 

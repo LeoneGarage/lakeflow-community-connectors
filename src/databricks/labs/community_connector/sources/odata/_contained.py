@@ -918,14 +918,49 @@ class ContainedNavMixin:
                     chain_next_link_out = None
                 break
             parent_idx += 1
-        if not emitted:
-            return iter([]), start_offset or {}
+        # Offset semantics:
+        #
+        # * On truncation, preserve the **original** ``since`` (start
+        #   offset's cursor) so the resumed call's chain rebuild covers
+        #   the same set as the prior batch. Ancestor cursors interleave
+        #   across top-level parents (depth-first walk), so advancing
+        #   ``since`` to the global max would silently skip lower-cursor
+        #   chains under not-yet-walked parents.
+        # * Carry ``running_max`` across resume batches: every batch
+        #   max-merges its own emitted cursors with what's already in
+        #   ``running_max``. On natural completion that accumulated
+        #   value becomes the next regular trigger's ``cursor`` floor —
+        #   without it, completing a resume that originated from
+        #   ``since=None`` would drop the cursor entirely and re-walk
+        #   the whole table on the next trigger.
+        # * Cross-batch re-emission of already-seen chains during the
+        #   resume cycle is deduped by ``apply_changes`` on the
+        #   composite PK; correctness over minimal bandwidth.
+        end_offset: dict
         cursors = [r.get(cursor_field) for r in emitted if r.get(cursor_field) is not None]
-        end_offset: dict = {"cursor": max(cursors) if cursors else since}
+        this_batch_max = max(cursors) if cursors else None
+        prev_running_max = (start_offset or {}).get("running_max")
+        if this_batch_max is not None and prev_running_max is not None:
+            new_running_max: Any = max(this_batch_max, prev_running_max)
+        elif this_batch_max is not None:
+            new_running_max = this_batch_max
+        else:
+            new_running_max = prev_running_max
         if truncated:
-            end_offset["parent_idx"] = parent_idx
+            end_offset = {"parent_idx": parent_idx}
+            if since is not None:
+                end_offset["cursor"] = since
             if chain_next_link_out is not None:
                 end_offset["chain_next_link"] = chain_next_link_out
+            if new_running_max is not None:
+                end_offset["running_max"] = new_running_max
+        else:
+            if new_running_max is not None:
+                end_offset = {"cursor": new_running_max}
+            elif since is not None:
+                end_offset = {"cursor": since}
+            else:
+                end_offset = {}
         if start_offset and start_offset == end_offset:
             return iter([]), start_offset
         return iter(emitted), end_offset

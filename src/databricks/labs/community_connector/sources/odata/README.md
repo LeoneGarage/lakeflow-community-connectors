@@ -371,6 +371,23 @@ solely on ``chain_next_link``; if a server doesn't return durable
 @odata.nextLink values, raise ``max_records_per_batch`` above the
 largest per-chain leaf count.
 
+Cross-chain interleaving: ancestor-cursor mode walks chains depth-first
+by top-level parent, so ancestor cursors interleave across top-level
+parents (sibling chains under one parent are cursor-ordered, but
+Parent 2's lowest cursor can be below Parent 1's highest). On
+truncation the connector therefore preserves the **original** ``since``
+in the offset rather than advancing to the global max emitted, so the
+resumed call's rebuild of ``chains_with_cursor`` includes every chain
+that batch 1 saw — including any lower-cursor chains under later
+parents that hadn't been reached yet. A ``running_max`` is accumulated
+across resume batches so when the resume completes naturally the
+next regular trigger gets the actual highest cursor seen as its filter
+floor (a fresh first-ever resume that originated from ``since=None``
+would otherwise drop the cursor entirely on completion and re-walk
+the table on the next trigger). Cross-batch re-emission of
+already-seen chains is deduped by ``apply_changes`` on the composite
+primary key.
+
 ### Disallowed combinations
 
 - ``delta_tracking=enabled`` + a contained path → ``ValueError``.
