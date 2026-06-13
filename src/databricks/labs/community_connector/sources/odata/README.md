@@ -144,7 +144,7 @@ w.api_client.do(
             "externalOptionsAllowList": (
                 "namespace,cursor_field,select,filter,"
                 "page_size,max_records_per_batch,delta_tracking,"
-                "expand_contained"
+                "expand_contained,num_partitions"
             ),
         },
     },
@@ -207,7 +207,7 @@ w.api_client.do(
             "externalOptionsAllowList": (
                 "namespace,cursor_field,select,filter,"
                 "page_size,max_records_per_batch,delta_tracking,"
-                "expand_contained"
+                "expand_contained,num_partitions"
             ),
         },
     },
@@ -235,6 +235,12 @@ databricks --profile <your-profile> connections get odata_connection
 The response must show `connection_type: COMMUNITY` and `options.sourceName: odata`.
 If either is missing, the UI won't list the connection under the OData tile —
 delete it and re-create.
+
+### Optional connection options
+
+| Option                        | Default | Description |
+| ----------------------------- | ------- | ----------- |
+| `metadata_cache_ttl_seconds`  | 60      | TTL for the on-disk pickle cache of the parsed CSDL (`$metadata`) document at `${TMPDIR}/odata_csdl_<sha256(service_url)>.pickle`. Shared across the forked `pyspark.daemon` workers that SDP spawns for schema inference, so the connector pays the fetch + parse cost once per pipeline init instead of once per `.load()`. Set to `0` to disable file-backed caching (process and instance caches still apply). |
 
 ## Pipeline (ingest.py)
 
@@ -294,6 +300,7 @@ build_pipeline(
 | `max_records_per_batch` | 100000  | Per-call upper bound on rows returned. The connector has **no wall-clock ceiling** — `max_records_per_batch` is the only cap on a single batch. Each batch fetches `cursor gt <last>` and pulls up to this many rows, then commits the offset. Smaller values give continuous-mode pipelines lower latency per micro-batch at the cost of more round trips; larger values amortize HTTP overhead. The default of 100000 fits roughly 100 `$top=1000` pages per batch and prioritises throughput; lower it (e.g. to 5000) if you want tighter per-batch latency in a continuous pipeline. |
 | `delta_tracking`        | disabled | Opt-in OData v4 delta queries. Values: `disabled` (default — no behavior change), `auto` (probe once, fall back to cursor/snapshot if the server doesn't acknowledge), `enabled` (require support; error if the server doesn't acknowledge). See [Delta tracking](#delta-tracking) below. |
 | `expand_contained`      | false   | For contained-collection tables (`Parent__Child__...` paths). When `true`, the connector issues a single `GET Parent?$expand=Child($expand=...)` per pipeline trigger instead of the default N+1 traversal (one parent fetch + one per-parent leaf fetch). See [Contained navigation properties](#contained-navigation-properties) below. |
+| `num_partitions`        | 4       | Number of Spark partitions for parallel reads of contained-collection tables. Honored only when the table qualifies for `SupportsPartitionedStream` (contained path, `expand_contained=false`, `delta_tracking=disabled`, and any `cursor_field` lives on the top-level entity). Top-level rows are bin-packed into this many contiguous slices; each Spark task walks only its assigned subtrees. Ignored for non-partitionable tables (they fall back to single-task reads). |
 
 ## Delta tracking
 
@@ -382,7 +389,7 @@ addressed by traversing the parent's key:
 items, address records on a customer, asset documents on an asset.
 
 The connector exposes these as double-underscore-pathed tables alongside the
-top-level entity sets, up to 5 segments deep:
+top-level entity sets, up to 10 segments deep:
 
 ```
 Parents
@@ -495,8 +502,9 @@ primary key.
 - ``delta_tracking=enabled`` + a contained path → ``ValueError``.
   Server-driven change tracking is defined against top-level entity
   sets.
-- Depth > 5 → ``ValueError`` at parse time. Cap exists to prevent
-  pathological discovery walks; raise if you have a real use case.
+- Depth > 10 → ``ValueError`` at parse time. Cap exists to bound
+  discovery walks against cyclic schemas (cycles are independently
+  detected via target-type tracking); raise if you have a real use case.
 
 ### Configuration example
 
@@ -527,8 +535,16 @@ entity set name appears in two schemas, set the `namespace` table option:
 
 ## Limitations
 
-- Single-partition pagination via `@odata.nextLink`. Skiptokens are opaque,
-  so we can't safely parallelize. Throughput is bounded by the source.
+- Contained-collection tables parallelize reads across Spark executors
+  via `SupportsPartitionedStream`: the connector enumerates top-level
+  parent rows once, bin-packs them into `num_partitions` contiguous
+  slices (default 4), and each task walks only its assigned subtrees.
+  Activation is gated to contained paths with `expand_contained=false`
+  and `delta_tracking=disabled`; configs outside that envelope fall
+  back to a single-task read. Top-level / flat tables stay
+  single-partition because `@odata.nextLink` skiptokens are opaque and
+  can't be safely split. Throughput on a flat table is bounded by the
+  source.
 - Delete tombstones are synthesized only when `delta_tracking` is active.
   In snapshot and cursor-based modes, the connector never returns
   `cdc_with_deletes`. OData services without delta-query support don't
