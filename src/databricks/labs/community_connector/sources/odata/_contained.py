@@ -162,15 +162,11 @@ class ContainedNavMixin:
         except ValueError:
             return []
         paths: list[str] = []
-        root = self._metadata_root()
-        type_to_qname: dict[ET.Element, str] = {
-            et: f"{schema.get('Namespace') or ''}.{et.get('Name')}"
-            for schema in root.iter(f"{_NS_EDM}Schema")
-            for et in schema.findall(f"{_NS_EDM}EntityType")
-        }
-        queue: list[tuple[list[str], ET.Element, set[str]]] = [
-            ([top_level_set], root_et, {type_to_qname.get(root_et, "")})
-        ]
+        # Cycle detection: start with an empty ``seen`` so the very first
+        # self-reference (e.g. ``Node.Self → Node``) still emits a depth-1
+        # path. Recursion is bounded by adding each traversed type to
+        # ``seen`` before recursing.
+        queue: list[tuple[list[str], ET.Element, set[str]]] = [([top_level_set], root_et, set())]
         while queue:
             segments, et, seen = queue.pop(0)
             if len(segments) >= MAX_CONTAINED_DEPTH:
@@ -460,16 +456,25 @@ class ContainedNavMixin:
         self, table_name: str, table_options: dict[str, str]
     ) -> tuple[Iterator[dict], dict]:
         """Walk the parent-key tree N+1 and emit leaf rows tagged with
-        ancestor FKs. Full result in one call."""
+        ancestor FKs, streamed lazily.
+
+        Rows are yielded as each leaf page is fetched; no full
+        materialisation. On wide subtrees (many parents, many pages
+        per parent) this keeps peak memory bounded by one page worth
+        of rows rather than the whole result set.
+        """
         segments = parse_contained_path(table_name) or [table_name]
         namespace = (table_options or {}).get("namespace")
         fk_columns = self._resolve_fk_columns(segments, namespace)
-        emitted: list[dict] = []
-        for chain in self._iter_parent_key_chains(segments, namespace, table_options):
-            for row in self._fetch_pages(self._build_contained_url(segments, chain, table_options)):
-                self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
-                emitted.append(row)
-        return iter(emitted), {}
+
+        def _emit() -> Iterator[dict]:
+            for chain in self._iter_parent_key_chains(segments, namespace, table_options):
+                url = self._build_contained_url(segments, chain, table_options)
+                for row in self._fetch_pages(url):
+                    self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
+                    yield row
+
+        return _emit(), {}
 
     def _read_contained_expand(
         self,

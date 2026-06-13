@@ -6,11 +6,13 @@
 # ==============================================================================
 
 from abc import ABC, abstractmethod
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Iterator, Sequence
 import itertools
 import json
+import os
+import pickle
 import time
 
 from pyspark.sql import Row
@@ -45,7 +47,9 @@ from requests.auth import HTTPBasicAuth
 from urllib.parse import urljoin
 from xml.etree import ElementTree as ET
 import base64
+import hashlib
 import requests
+import tempfile
 
 
 def register_lakeflow_source(spark):
@@ -768,15 +772,11 @@ def register_lakeflow_source(spark):
             except ValueError:
                 return []
             paths: list[str] = []
-            root = self._metadata_root()
-            type_to_qname: dict[ET.Element, str] = {
-                et: f"{schema.get('Namespace') or ''}.{et.get('Name')}"
-                for schema in root.iter(f"{_NS_EDM}Schema")
-                for et in schema.findall(f"{_NS_EDM}EntityType")
-            }
-            queue: list[tuple[list[str], ET.Element, set[str]]] = [
-                ([top_level_set], root_et, {type_to_qname.get(root_et, "")})
-            ]
+            # Cycle detection: start with an empty ``seen`` so the very first
+            # self-reference (e.g. ``Node.Self → Node``) still emits a depth-1
+            # path. Recursion is bounded by adding each traversed type to
+            # ``seen`` before recursing.
+            queue: list[tuple[list[str], ET.Element, set[str]]] = [([top_level_set], root_et, set())]
             while queue:
                 segments, et, seen = queue.pop(0)
                 if len(segments) >= MAX_CONTAINED_DEPTH:
@@ -1066,16 +1066,25 @@ def register_lakeflow_source(spark):
             self, table_name: str, table_options: dict[str, str]
         ) -> tuple[Iterator[dict], dict]:
             """Walk the parent-key tree N+1 and emit leaf rows tagged with
-            ancestor FKs. Full result in one call."""
+            ancestor FKs, streamed lazily.
+
+            Rows are yielded as each leaf page is fetched; no full
+            materialisation. On wide subtrees (many parents, many pages
+            per parent) this keeps peak memory bounded by one page worth
+            of rows rather than the whole result set.
+            """
             segments = parse_contained_path(table_name) or [table_name]
             namespace = (table_options or {}).get("namespace")
             fk_columns = self._resolve_fk_columns(segments, namespace)
-            emitted: list[dict] = []
-            for chain in self._iter_parent_key_chains(segments, namespace, table_options):
-                for row in self._fetch_pages(self._build_contained_url(segments, chain, table_options)):
-                    self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
-                    emitted.append(row)
-            return iter(emitted), {}
+
+            def _emit() -> Iterator[dict]:
+                for chain in self._iter_parent_key_chains(segments, namespace, table_options):
+                    url = self._build_contained_url(segments, chain, table_options)
+                    for row in self._fetch_pages(url):
+                        self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
+                        yield row
+
+            return _emit(), {}
 
         def _read_contained_expand(
             self,
@@ -1613,16 +1622,65 @@ def register_lakeflow_source(spark):
     # in one batch (e.g. update then delete arriving back-to-back).
     _SEQUENCE_COUNTER = itertools.count()
 
+    # Process-wide CSDL cache, keyed by service_url. SDP creates a fresh
+    # ``LakeflowSource`` (and ``ODataLakeflowConnect``) for every
+    # ``spark.readStream.format("lakeflow_connect").load()`` call; within
+    # a single Python process this cache makes all instances share one
+    # parse.
+    _METADATA_CACHE: dict[str, tuple[str, ET.Element]] = {}
+
+    # On-disk CSDL cache. PySpark's Python Data Source forks a fresh
+    # ``pyspark.daemon`` worker for schema inference on every ``.load()``
+    # call, so the process-wide cache above doesn't survive — each fork
+    # starts with an empty dict. On a pipeline with N tables that means
+    # N HTTP fetches and N multi-MB XML parses during INITIALIZING. The
+    # file cache lets each forked worker read a pickled parsed tree from
+    # tempdir instead, saving the HTTP RT + parse on every fork after the
+    # first. The TTL is short so subsequent pipeline triggers pick up
+    # upstream schema changes; per-trigger we still pay one fresh fetch.
+    _METADATA_FILE_CACHE_TTL_SECONDS = 60
+
+
+    def _metadata_cache_path(service_url: str) -> str:
+        """Tempdir path for the pickled CSDL of ``service_url``."""
+        digest = hashlib.sha256(service_url.encode("utf-8")).hexdigest()[:16]
+        return os.path.join(tempfile.gettempdir(), f"odata_csdl_{digest}.pickle")
+
+
+    def _clear_metadata_cache() -> None:
+        """Clear the in-process CSDL cache and remove any on-disk pickle
+        files. Tests use this between cases that reuse a ``service_url``
+        with different mocked ``$metadata`` bodies."""
+        _METADATA_CACHE.clear()
+        # Best-effort cleanup of all on-disk cache files. Tests don't know
+        # the service_url hash in advance, so wipe the whole pattern.
+        tmpdir = tempfile.gettempdir()
+        try:
+            for entry in os.listdir(tmpdir):
+                if entry.startswith("odata_csdl_") and entry.endswith(".pickle"):
+                    try:
+                        os.remove(os.path.join(tmpdir, entry))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
 
     def _next_sequence() -> str:
         """Strictly-increasing per-record sequence value for apply_changes.
 
-        ISO-8601 prefix keeps the value human-readable and sortable
-        lexicographically across pipeline restarts; the integer suffix
-        distinguishes records emitted in the same microsecond.
+        Format: ``<ns_since_epoch:020d>_<counter:012d>``. Both parts
+        are zero-padded so the lexicographic string ordering used by
+        ``apply_changes`` matches the underlying numeric ordering. The
+        nanosecond timestamp tracks wall-clock so values stay ordered
+        across process restarts (latest data wins per key); the counter
+        breaks ties for records emitted in the same nanosecond.
+
+        ``time.time_ns()`` skips the ``datetime`` + ``strftime`` round-
+        trip the previous ISO-8601 format paid per row — meaningful for
+        delta-tracked tables that synthesise a sequence on every record.
         """
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-        return f"{now}_{next(_SEQUENCE_COUNTER):012d}"
+        return f"{time.time_ns():020d}_{next(_SEQUENCE_COUNTER):012d}"
 
 
     class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces, ContainedNavMixin):
@@ -1644,6 +1702,7 @@ def register_lakeflow_source(spark):
             self.timeout = int(options.get("timeout_seconds", "60"))
             self._session: requests.Session | None = None
             self._metadata_xml: str | None = None
+            self._metadata_root_cache: ET.Element | None = None
             # Monotonic deadline (seconds) for the current OAuth access token.
             # Set when the token endpoint returns ``expires_in``; `None` means we
             # don't know the expiry (user-supplied access token without metadata)
@@ -1790,9 +1849,14 @@ def register_lakeflow_source(spark):
         def _read_snapshot(
             self, table_name: str, table_options: dict[str, str]
         ) -> tuple[Iterator[dict], dict]:
+            # Return the page generator directly. Spark's
+            # LakeflowBatchReader.read consumes it lazily through a
+            # map(parse_value, ...), so each page is fetched, parsed, and
+            # streamed out before the next page is requested. Materialising
+            # the whole result into a list (the prior shape) pinned every
+            # row in memory at once on large tables.
             url = self._build_url(table_name, table_options)
-            records = list(self._fetch_pages(url))
-            return iter(records), {}
+            return self._fetch_pages(url), {}
 
         def _read_incremental(
             self,
@@ -2660,13 +2724,97 @@ def register_lakeflow_source(spark):
         # ------------------------------------------------------------------
 
         def _metadata_root(self) -> ET.Element:
+            """Return the parsed CSDL root, fetching + parsing on first call
+            only.
+
+            Four cache layers, checked in order:
+
+            1. Instance ``_metadata_root_cache`` — re-used across every
+               downstream lookup on this connector instance.
+            2. Module ``_METADATA_CACHE`` keyed by ``service_url`` — shared
+               across all connector instances in the same Python process.
+            3. On-disk pickle at ``_metadata_cache_path(service_url)`` —
+               shared across forked ``pyspark.daemon`` workers (PySpark's
+               Python Data Source forks one per ``.load()`` schema
+               inference, so the in-memory caches don't survive). TTL is
+               short enough that the next pipeline trigger validates the
+               upstream schema.
+            4. Network — the actual ``GET $metadata``, taken only when no
+               cache has it.
+            """
+            if self._metadata_root_cache is not None:
+                return self._metadata_root_cache
+            cached = _METADATA_CACHE.get(self.service_url)
+            if cached is not None:
+                self._metadata_xml, self._metadata_root_cache = cached
+                return self._metadata_root_cache
+            file_cached = self._read_metadata_file_cache()
+            if file_cached is not None:
+                self._metadata_xml, self._metadata_root_cache = file_cached
+                _METADATA_CACHE[self.service_url] = file_cached
+                return self._metadata_root_cache
             if self._metadata_xml is None:
                 session = self._get_session()
                 url = _join_url(self.service_url, "$metadata")
                 resp = self._http_get(session, url, headers={"Accept": "application/xml"})
                 resp.raise_for_status()
                 self._metadata_xml = resp.text
-            return ET.fromstring(self._metadata_xml)
+            self._metadata_root_cache = ET.fromstring(self._metadata_xml)
+            _METADATA_CACHE[self.service_url] = (
+                self._metadata_xml,
+                self._metadata_root_cache,
+            )
+            self._write_metadata_file_cache(self._metadata_xml, self._metadata_root_cache)
+            return self._metadata_root_cache
+
+        def _read_metadata_file_cache(self) -> tuple[str, ET.Element] | None:
+            """Return the cached ``(xml_text, parsed_root)`` from the
+            on-disk pickle if it exists and is within the TTL. Returns
+            ``None`` for any miss (missing, expired, unreadable,
+            unpicklable). All failures are silent — the caller falls
+            through to the network."""
+            path = _metadata_cache_path(self.service_url)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                return None
+            if time.time() - mtime > _METADATA_FILE_CACHE_TTL_SECONDS:
+                return None
+            try:
+                with open(path, "rb") as fh:
+                    payload = pickle.load(fh)
+            except (OSError, pickle.UnpicklingError, EOFError, ValueError):
+                return None
+            # Defensive shape check — a corrupt or wrong-shape pickle
+            # shouldn't crash the connector.
+            if (
+                not isinstance(payload, tuple)
+                or len(payload) != 2
+                or not isinstance(payload[0], str)
+                or not isinstance(payload[1], ET.Element)
+            ):
+                return None
+            return payload
+
+        def _write_metadata_file_cache(self, xml_text: str, root: ET.Element) -> None:
+            """Best-effort write of ``(xml_text, parsed_root)`` to the
+            on-disk pickle. Uses atomic rename so a concurrent reader
+            either sees the old file or the fully-written new one, never
+            a torn write."""
+            path = _metadata_cache_path(self.service_url)
+            tmp_path = f"{path}.{os.getpid()}.tmp"
+            try:
+                with open(tmp_path, "wb") as fh:
+                    pickle.dump((xml_text, root), fh, protocol=pickle.HIGHEST_PROTOCOL)
+                os.replace(tmp_path, path)
+            except (OSError, pickle.PicklingError):
+                # File cache is purely an optimization. If anything goes
+                # wrong (read-only tempdir, disk full, pickling failure)
+                # the connector still works — just slower.
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
         def _entity_set_index(self) -> list[tuple[str, str]]:
             """All (schema_namespace, entity_set_name) pairs declared in $metadata."""
