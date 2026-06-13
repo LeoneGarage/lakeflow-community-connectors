@@ -117,16 +117,22 @@ Notes:
 #### Python SDK form (any OAuth2 variant)
 
 ```python
+from databricks.sdk import WorkspaceClient
+
+w = WorkspaceClient()
+
+service_url = "https://your-host/odata/v4/"
+
 w.api_client.do(
     "POST",
     "/api/2.1/unity-catalog/connections",
     body={
         "name": "odata_connection",
         "connection_type": "COMMUNITY",
-        "comment": "service_url=https://your-host/odata/v4/",
+        "comment": f"service_url={service_url}",
         "options": {
             "sourceName": "odata",
-            "service_url": "https://your-host/odata/v4/",
+            "service_url": service_url,
             "auth_type": "oauth2",
             "oauth2_token_url": "https://login.example.com/oauth/token",
             "oauth2_client_id": "<client-id>",
