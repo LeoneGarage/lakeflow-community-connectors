@@ -2060,8 +2060,9 @@ def test_parse_contained_path_rejects_over_depth():
         _parse_contained_path,
     )
 
+    # 11 segments exceeds the depth-10 cap.
     with pytest.raises(ValueError, match="exceeds max depth"):
-        _parse_contained_path("A__B__C__D__E__F")
+        _parse_contained_path("A__B__C__D__E__F__G__H__I__J__K")
 
 
 @responses.activate
@@ -3156,3 +3157,136 @@ def test_lookup_in_type_only_namespace_lists_namespaces_with_entity_sets():
         match=r"declares no entity sets.*Namespaces with entity sets:.*My\.Service\.V1",
     ):
         c.read_table_metadata("Things", {"namespace": "My.Types.V1"})
+
+
+# ---------------------------------------------------------------------------
+# Partitioning (SupportsPartitionedStream)
+# ---------------------------------------------------------------------------
+
+
+@responses.activate
+def test_partition_is_partitioned_rejects_flat_table():
+    """Flat tables aren't partitioned — we'd be partitioning a single
+    keyspace without distribution info."""
+    _mock_nested_metadata()
+    c = _make()
+    assert c.is_partitioned("Parents") is False
+
+
+@responses.activate
+def test_partition_is_partitioned_rejects_expand_contained():
+    """expand_contained does the whole table in one HTTP — no fan-out."""
+    _mock_nested_metadata()
+    c = _make({"expand_contained": "true"})
+    assert c.is_partitioned("Parents__Children") is False
+
+
+@responses.activate
+def test_partition_is_partitioned_accepts_contained_snapshot():
+    """Contained N+1 snapshot reads are the prime partition target."""
+    _mock_nested_metadata()
+    c = _make()
+    assert c.is_partitioned("Parents__Children") is True
+
+
+@responses.activate
+def test_partition_get_partitions_bin_packs_contained_snapshot():
+    """Snapshot batch path: top-level rows are bin-packed across
+    ``num_partitions`` descriptors, each carrying its slice of parents."""
+    _mock_nested_metadata()
+    responses.get(
+        f"{SERVICE_URL}Parents",
+        json={"value": [{"Id": i} for i in range(1, 9)]},
+    )
+    c = _make()
+    parts = c.get_partitions("Parents__Children", {"num_partitions": "4"})
+    assert len(parts) == 4
+    # Slices contiguous and exhaustive.
+    flat = [row for p in parts for row in p["top_parent_rows"]]
+    assert [r["Id"] for r in flat] == list(range(1, 9))
+
+
+@responses.activate
+def test_partition_read_partition_walks_only_assigned_parents():
+    """Executor never fetches level-0 leaves outside its partition.
+    Parents(99)/Children is deliberately unregistered — if the
+    partition walker over-fetches the test fails."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}, {"Id": 99}]})
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={"value": [{"Id": 11, "Label": "a", "ModifiedAt": "2024-01-01T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    partition = {"top_parent_rows": [{"Id": 1}], "cursor_lower": None}
+    rows = list(c.read_partition("Parents__Children", partition, {}))
+    assert len(rows) == 1
+    assert rows[0]["Id"] == 11
+    # Verify no Parents(99)/Children call was made.
+    leaf_urls = [c.request.url for c in responses.calls]
+    assert not any("Parents(99)" in u for u in leaf_urls)
+
+
+@responses.activate
+def test_partition_empty_descriptor_falls_back_to_read_table():
+    """get_partitions returns ``[{}]`` for flat tables; read_partition
+    on that descriptor must produce the same rows as serial read_table."""
+    _mock_metadata()
+    responses.get(
+        f"{SERVICE_URL}Customers",
+        json={"value": [{"Id": 1, "Name": "x"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    rows = list(c.read_partition("Customers", {}, {}))
+    assert rows == [{"Id": 1, "Name": "x"}]
+
+
+@responses.activate
+def test_partition_latest_offset_probes_top_level_max_cursor():
+    """In streaming mode the fence comes from a single
+    ``?$top=1&$orderby=<cursor> desc`` probe against the top set."""
+    _mock_nested_metadata()
+    # Probe response: the max cursor row.
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Parents",
+        json={"value": [{"Id": 9, "Name": "z"}]},
+        match_querystring=False,
+    )
+    # Add a Name property to the metadata-mocked Parent so the probe
+    # finds a column. The nested metadata declares Parent.Name already.
+    c = _make()
+    offset = c.latest_offset(
+        "Parents__Children",
+        {"cursor_field": "Name"},
+        None,
+    )
+    assert offset == {"cursor": "z"}
+
+
+@responses.activate
+def test_partition_latest_offset_snapshot_returns_wall_clock():
+    """Without a cursor_field, snapshot streams advance via wall-clock
+    epoch so Spark sees fresh end != start and triggers each batch."""
+    _mock_nested_metadata()
+    c = _make()
+    offset = c.latest_offset("Parents__Children", {}, None)
+    assert "snapshot_id" in offset
+    assert isinstance(offset["snapshot_id"], int)
+
+
+@responses.activate
+def test_partition_get_partitions_empty_when_offsets_equal():
+    """Streaming: when start_offset == end_offset Spark expects an
+    empty partition list — no work to do."""
+    _mock_nested_metadata()
+    c = _make()
+    parts = c.get_partitions(
+        "Parents__Children",
+        {"cursor_field": "Name"},
+        {"cursor": "z"},
+        {"cursor": "z"},
+    )
+    assert parts == []

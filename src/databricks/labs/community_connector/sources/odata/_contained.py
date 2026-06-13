@@ -41,7 +41,7 @@ _URL_SEGMENT_SEP = "/"
 # Cap on path depth. Prevents pathological discovery walks on services
 # with cyclic containment graphs; cycles within the cap are also
 # detected via target-type tracking.
-MAX_CONTAINED_DEPTH = 5
+MAX_CONTAINED_DEPTH = 10
 
 
 def join_url(base: str, suffix: str) -> str:
@@ -369,11 +369,19 @@ class ContainedNavMixin:
         cursor_level: int,
         cursor_field: str,
         since: Any,
+        top_parent_rows: list[dict] | None = None,
     ) -> Iterator[tuple[list[dict[str, Any]], Any]]:
         """Like ``_iter_parent_key_chains`` but applies a cursor filter at
         the ancestor that owns ``cursor_field``. Yields
         ``(chain, ancestor_cursor_value)`` pairs; the cursor value is the
-        value at ``cursor_level`` for that chain."""
+        value at ``cursor_level`` for that chain.
+
+        ``top_parent_rows`` lets a partitioned caller (PartitionMixin)
+        supply a pre-discovered subset of level-0 rows instead of
+        fetching the whole top-level set. Each row dict must carry the
+        top-level entity's PKs (and, when ``cursor_level == 0``, the
+        cursor value). The supplied subset is consumed in order without
+        re-fetching."""
 
         def _walk(level: int, chain: list[dict[str, Any]], cur_val: Any):
             if level == len(segments) - 1:
@@ -387,32 +395,39 @@ class ContainedNavMixin:
                     f"Cannot walk contained path: segment {segments[level]!r} "
                     f"has no primary key declared in $metadata."
                 )
-            select_cols = list(ancestor_pks)
-            extra_filter: str | None = None
-            order_by: str | None = None
-            if level == cursor_level:
-                if cursor_field not in select_cols:
-                    select_cols.append(cursor_field)
-                extra_filter = self._cursor_filter(cursor_field, since)
-                terms = [f"{cursor_field} asc"]
-                terms.extend(f"{pk} asc" for pk in ancestor_pks if pk != cursor_field)
-                order_by = ",".join(terms)
-            opts = {
-                "page_size": (table_options or {}).get("page_size", "1000"),
-                "select": ",".join(select_cols),
-            }
-            url = (
-                self._build_url(segments[0], opts, extra_filter=extra_filter, order_by=order_by)
-                if level == 0
-                else self._build_contained_url(
-                    sub_segments,
-                    chain,
-                    opts,
-                    extra_filter=extra_filter,
-                    order_by=order_by,
+            row_source: Iterator[dict]
+            if level == 0 and top_parent_rows is not None:
+                # Skip the level-0 fetch; the partitioned caller has
+                # already discovered + filtered + selected this subset.
+                row_source = iter(top_parent_rows)
+            else:
+                select_cols = list(ancestor_pks)
+                extra_filter: str | None = None
+                order_by: str | None = None
+                if level == cursor_level:
+                    if cursor_field not in select_cols:
+                        select_cols.append(cursor_field)
+                    extra_filter = self._cursor_filter(cursor_field, since)
+                    terms = [f"{cursor_field} asc"]
+                    terms.extend(f"{pk} asc" for pk in ancestor_pks if pk != cursor_field)
+                    order_by = ",".join(terms)
+                opts = {
+                    "page_size": (table_options or {}).get("page_size", "1000"),
+                    "select": ",".join(select_cols),
+                }
+                url = (
+                    self._build_url(segments[0], opts, extra_filter=extra_filter, order_by=order_by)
+                    if level == 0
+                    else self._build_contained_url(
+                        sub_segments,
+                        chain,
+                        opts,
+                        extra_filter=extra_filter,
+                        order_by=order_by,
+                    )
                 )
-            )
-            for row in self._fetch_pages(url):
+                row_source = self._fetch_pages(url)
+            for row in row_source:
                 next_cur = row.get(cursor_field) if level == cursor_level else cur_val
                 chain.append({pk: row.get(pk) for pk in ancestor_pks})
                 yield from _walk(level + 1, chain, next_cur)
@@ -425,10 +440,15 @@ class ContainedNavMixin:
         segments: list[str],
         namespace: str | None,
         table_options: dict[str, str] | None,
+        top_parent_rows: list[dict] | None = None,
     ) -> Iterator[list[dict[str, Any]]]:
         """Yield every ancestor key chain (len = len(segments) - 1) reaching
         the leaf. Each level fetched with ``$select=<pks>``; user ``filter``
-        not forwarded."""
+        not forwarded.
+
+        ``top_parent_rows`` lets a partitioned caller supply a pre-
+        discovered subset of level-0 rows; when provided, the level-0
+        HTTP fetch is skipped and the rows are consumed in order."""
 
         def _walk(level: int, chain: list[dict[str, Any]]):
             if level == len(segments) - 1:
@@ -442,16 +462,21 @@ class ContainedNavMixin:
                     f"Cannot walk contained path: segment {segments[level]!r} "
                     f"has no primary key declared in $metadata."
                 )
-            opts = {
-                "page_size": (table_options or {}).get("page_size", "1000"),
-                "select": ",".join(ancestor_pks),
-            }
-            url = (
-                self._build_url(segments[0], opts)
-                if level == 0
-                else self._build_contained_url(sub_segments, chain, opts)
-            )
-            for row in self._fetch_pages(url):
+            row_source: Iterator[dict]
+            if level == 0 and top_parent_rows is not None:
+                row_source = iter(top_parent_rows)
+            else:
+                opts = {
+                    "page_size": (table_options or {}).get("page_size", "1000"),
+                    "select": ",".join(ancestor_pks),
+                }
+                url = (
+                    self._build_url(segments[0], opts)
+                    if level == 0
+                    else self._build_contained_url(sub_segments, chain, opts)
+                )
+                row_source = self._fetch_pages(url)
+            for row in row_source:
                 chain.append({pk: row.get(pk) for pk in ancestor_pks})
                 yield from _walk(level + 1, chain)
                 chain.pop()

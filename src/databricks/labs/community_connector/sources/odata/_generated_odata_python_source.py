@@ -652,7 +652,7 @@ def register_lakeflow_source(spark):
     # Cap on path depth. Prevents pathological discovery walks on services
     # with cyclic containment graphs; cycles within the cap are also
     # detected via target-type tracking.
-    MAX_CONTAINED_DEPTH = 5
+    MAX_CONTAINED_DEPTH = 10
 
 
     def join_url(base: str, suffix: str) -> str:
@@ -980,11 +980,19 @@ def register_lakeflow_source(spark):
             cursor_level: int,
             cursor_field: str,
             since: Any,
+            top_parent_rows: list[dict] | None = None,
         ) -> Iterator[tuple[list[dict[str, Any]], Any]]:
             """Like ``_iter_parent_key_chains`` but applies a cursor filter at
             the ancestor that owns ``cursor_field``. Yields
             ``(chain, ancestor_cursor_value)`` pairs; the cursor value is the
-            value at ``cursor_level`` for that chain."""
+            value at ``cursor_level`` for that chain.
+
+            ``top_parent_rows`` lets a partitioned caller (PartitionMixin)
+            supply a pre-discovered subset of level-0 rows instead of
+            fetching the whole top-level set. Each row dict must carry the
+            top-level entity's PKs (and, when ``cursor_level == 0``, the
+            cursor value). The supplied subset is consumed in order without
+            re-fetching."""
 
             def _walk(level: int, chain: list[dict[str, Any]], cur_val: Any):
                 if level == len(segments) - 1:
@@ -998,32 +1006,39 @@ def register_lakeflow_source(spark):
                         f"Cannot walk contained path: segment {segments[level]!r} "
                         f"has no primary key declared in $metadata."
                     )
-                select_cols = list(ancestor_pks)
-                extra_filter: str | None = None
-                order_by: str | None = None
-                if level == cursor_level:
-                    if cursor_field not in select_cols:
-                        select_cols.append(cursor_field)
-                    extra_filter = self._cursor_filter(cursor_field, since)
-                    terms = [f"{cursor_field} asc"]
-                    terms.extend(f"{pk} asc" for pk in ancestor_pks if pk != cursor_field)
-                    order_by = ",".join(terms)
-                opts = {
-                    "page_size": (table_options or {}).get("page_size", "1000"),
-                    "select": ",".join(select_cols),
-                }
-                url = (
-                    self._build_url(segments[0], opts, extra_filter=extra_filter, order_by=order_by)
-                    if level == 0
-                    else self._build_contained_url(
-                        sub_segments,
-                        chain,
-                        opts,
-                        extra_filter=extra_filter,
-                        order_by=order_by,
+                row_source: Iterator[dict]
+                if level == 0 and top_parent_rows is not None:
+                    # Skip the level-0 fetch; the partitioned caller has
+                    # already discovered + filtered + selected this subset.
+                    row_source = iter(top_parent_rows)
+                else:
+                    select_cols = list(ancestor_pks)
+                    extra_filter: str | None = None
+                    order_by: str | None = None
+                    if level == cursor_level:
+                        if cursor_field not in select_cols:
+                            select_cols.append(cursor_field)
+                        extra_filter = self._cursor_filter(cursor_field, since)
+                        terms = [f"{cursor_field} asc"]
+                        terms.extend(f"{pk} asc" for pk in ancestor_pks if pk != cursor_field)
+                        order_by = ",".join(terms)
+                    opts = {
+                        "page_size": (table_options or {}).get("page_size", "1000"),
+                        "select": ",".join(select_cols),
+                    }
+                    url = (
+                        self._build_url(segments[0], opts, extra_filter=extra_filter, order_by=order_by)
+                        if level == 0
+                        else self._build_contained_url(
+                            sub_segments,
+                            chain,
+                            opts,
+                            extra_filter=extra_filter,
+                            order_by=order_by,
+                        )
                     )
-                )
-                for row in self._fetch_pages(url):
+                    row_source = self._fetch_pages(url)
+                for row in row_source:
                     next_cur = row.get(cursor_field) if level == cursor_level else cur_val
                     chain.append({pk: row.get(pk) for pk in ancestor_pks})
                     yield from _walk(level + 1, chain, next_cur)
@@ -1036,10 +1051,15 @@ def register_lakeflow_source(spark):
             segments: list[str],
             namespace: str | None,
             table_options: dict[str, str] | None,
+            top_parent_rows: list[dict] | None = None,
         ) -> Iterator[list[dict[str, Any]]]:
             """Yield every ancestor key chain (len = len(segments) - 1) reaching
             the leaf. Each level fetched with ``$select=<pks>``; user ``filter``
-            not forwarded."""
+            not forwarded.
+
+            ``top_parent_rows`` lets a partitioned caller supply a pre-
+            discovered subset of level-0 rows; when provided, the level-0
+            HTTP fetch is skipped and the rows are consumed in order."""
 
             def _walk(level: int, chain: list[dict[str, Any]]):
                 if level == len(segments) - 1:
@@ -1053,16 +1073,21 @@ def register_lakeflow_source(spark):
                         f"Cannot walk contained path: segment {segments[level]!r} "
                         f"has no primary key declared in $metadata."
                     )
-                opts = {
-                    "page_size": (table_options or {}).get("page_size", "1000"),
-                    "select": ",".join(ancestor_pks),
-                }
-                url = (
-                    self._build_url(segments[0], opts)
-                    if level == 0
-                    else self._build_contained_url(sub_segments, chain, opts)
-                )
-                for row in self._fetch_pages(url):
+                row_source: Iterator[dict]
+                if level == 0 and top_parent_rows is not None:
+                    row_source = iter(top_parent_rows)
+                else:
+                    opts = {
+                        "page_size": (table_options or {}).get("page_size", "1000"),
+                        "select": ",".join(ancestor_pks),
+                    }
+                    url = (
+                        self._build_url(segments[0], opts)
+                        if level == 0
+                        else self._build_contained_url(sub_segments, chain, opts)
+                    )
+                    row_source = self._fetch_pages(url)
+                for row in row_source:
                     chain.append({pk: row.get(pk) for pk in ancestor_pks})
                     yield from _walk(level + 1, chain)
                     chain.pop()
@@ -1604,6 +1629,339 @@ def register_lakeflow_source(spark):
 
 
     ########################################################
+    # src/databricks/labs/community_connector/sources/odata/_partition.py
+    ########################################################
+
+    _DEFAULT_NUM_PARTITIONS = 4
+    _OPT_NUM_PARTITIONS = "num_partitions"
+
+
+    class PartitionMixin(SupportsPartitionedStream):
+        """Mixes ``SupportsPartitionedStream`` into ``ODataLakeflowConnect``.
+
+        Only methods specific to partitioning live here. Discovery of
+        top-level parent keys, leaf walking, and FK tagging are delegated
+        back into the rest of the connector via duck-typed ``self.*``
+        calls (same pattern as ``ContainedNavMixin``).
+        """
+
+        # ------------------------------------------------------------------
+        # SupportsPartitionedStream interface
+        # ------------------------------------------------------------------
+
+        def is_partitioned(self, table_name: str) -> bool:
+            """Opt this table into the partitioned read path.
+
+            Streaming + partitioning has a stricter precondition than batch
+            + partitioning because the connector has to fence each micro-
+            batch's cursor window upfront in ``latest_offset`` — there's no
+            way to communicate "max cursor observed" back from executors.
+            For batch reads any contained N+1 path is partitionable; for
+            streaming reads we additionally require the cursor to live on
+            the top-level entity so a single probe can compute the fence.
+
+            The framework calls this without table_options, so we read
+            them from ``self.options`` — safe because each
+            ``LakeflowSource`` instance carries one table's options.
+            """
+            if parse_contained_path(table_name) is None:
+                return False
+            opts = getattr(self, "options", {}) or {}
+            if opts.get("expand_contained", "false").strip().lower() == "true":
+                return False
+            if self._delta_setting(opts) != "disabled":
+                return False
+            # If a cursor is set, it must live at the top level for the
+            # streaming fence probe to make sense. Snapshot reads (no
+            # cursor_field) clear this trivially.
+            cursor_field = opts.get("cursor_field")
+            if cursor_field:
+                segments = parse_contained_path(table_name) or [table_name]
+                namespace = opts.get("namespace")
+                if self._find_cursor_level(segments, namespace, cursor_field) != 0:
+                    return False
+            return True
+
+        def latest_offset(
+            self,
+            table_name: str,
+            table_options: dict[str, str],
+            start_offset: dict | None = None,
+        ) -> dict:
+            """Probe the top-level entity for the current max cursor value.
+
+            Each micro-batch reads ``(start_cursor, end_cursor]`` — the
+            ``end`` returned here becomes ``start`` of the next batch when
+            Spark commits, so cursor progression is monotonic.
+
+            For snapshot streams (no ``cursor_field``) the offset is a
+            wall-clock epoch — there's no source-side notion of "what's
+            new" without a cursor, so each trigger reads a full snapshot
+            and Spark commits the new epoch.
+            """
+            opts = table_options or {}
+            cursor_field = opts.get("cursor_field")
+            if not cursor_field:
+                return {"snapshot_id": _wall_clock_ns()}
+            segments = parse_contained_path(table_name) or [table_name]
+            namespace = opts.get("namespace")
+            max_cursor = self._probe_top_level_max_cursor(segments[0], namespace, cursor_field)
+            prior = (start_offset or {}).get("cursor")
+            if max_cursor is None:
+                # Empty top set or all-null cursor column. Keep the prior
+                # value so Spark sees no progress and skips the batch.
+                return {"cursor": prior} if prior is not None else {}
+            return {"cursor": max_cursor}
+
+        def get_partitions(
+            self,
+            table_name: str,
+            table_options: dict[str, str],
+            start_offset: dict | None = None,
+            end_offset: dict | None = None,
+        ) -> Sequence[dict]:
+            """Return partition descriptors covering this read.
+
+            Two invocation shapes (PySpark dispatches both into the same
+            method):
+
+            * ``get_partitions(table, options)`` — batch path. Returns
+              partitions over the full top-level set.
+            * ``get_partitions(table, options, start, end)`` — streaming
+              path. Returns partitions filtered to the cursor window
+              ``(start.cursor, end.cursor]``.
+
+            For tables ``is_partitioned`` rejects, the framework still
+            invokes this on the batch path; in that case we hand back a
+            single empty descriptor so ``read_partition`` falls through
+            to the existing serial ``read_table`` semantics.
+            """
+            if parse_contained_path(table_name) is None:
+                # Flat table — let the existing serial path handle it.
+                return [{}]
+            opts = table_options or {}
+            if opts.get("expand_contained", "false").strip().lower() == "true":
+                return [{}]
+            if self._delta_setting(opts) != "disabled":
+                return [{}]
+            if start_offset == end_offset and start_offset is not None:
+                # Streaming: no new data — no work to partition.
+                return []
+            segments = parse_contained_path(table_name) or [table_name]
+            namespace = opts.get("namespace")
+            cursor_field = opts.get("cursor_field")
+            # ``cursor_lower`` is "what we've already read up to" — used
+            # by read_partition as ``cursor gt cursor_lower``. ``end`` is
+            # the previously-probed fence; we stamp it onto each row's
+            # cursor column so the next batch's ``cursor_lower`` matches.
+            cursor_lower = (start_offset or {}).get("cursor")
+            top_rows = self._discover_top_parent_rows(
+                segments, namespace, opts, cursor_field, cursor_lower
+            )
+            if not top_rows:
+                return []
+            num_partitions = max(1, int(opts.get(_OPT_NUM_PARTITIONS, _DEFAULT_NUM_PARTITIONS)))
+            return _bin_pack(top_rows, num_partitions, cursor_lower)
+
+        def read_partition(
+            self,
+            table_name: str,
+            partition: dict,
+            table_options: dict[str, str],
+        ) -> Iterator[dict]:
+            """Walk one partition's slice of top-level parents.
+
+            An empty descriptor ``{}`` (returned by ``get_partitions`` for
+            unsupported configurations) falls back to the existing serial
+            ``read_table`` — same shape as the simple-reader path. With a
+            ``top_parent_rows`` key, the chain enumeration starts from
+            that subset instead of fetching the whole level-0 set.
+            """
+            opts = table_options or {}
+            if not partition or "top_parent_rows" not in partition:
+                # Single-partition fallback: defer to read_table which
+                # returns (iter, offset). Drop the offset; partitioned
+                # mode commits offsets via latest_offset, not per-read.
+                records, _ = self.read_table(table_name, None, opts)
+                return records
+            segments = parse_contained_path(table_name) or [table_name]
+            cursor_field = opts.get("cursor_field")
+            top_parent_rows = partition["top_parent_rows"]
+            cursor_lower = partition.get("cursor_lower")
+            return self._iter_partition_rows(
+                segments, opts, top_parent_rows, cursor_field, cursor_lower
+            )
+
+        # ------------------------------------------------------------------
+        # Per-table helpers (called by the methods above)
+        # ------------------------------------------------------------------
+
+        def _probe_top_level_max_cursor(
+            self,
+            top_set: str,
+            namespace: str | None,
+            cursor_field: str,
+        ):
+            """One HTTP probe: ``$top=1&$orderby=<cursor> desc`` → max value.
+
+            Returns ``None`` when the top set is empty or every row has a
+            null cursor. The caller decides whether that means "no new
+            data" or "first call against an empty source."
+            """
+            # Use the existing URL builder + page-fetch plumbing so OAuth,
+            # extra_headers, retries, etc. all carry through unchanged.
+            et = self._entity_type_for(top_set, namespace)
+            own_fields = self._own_fields_for_et(et)
+            if not any(f.name == cursor_field for f in own_fields):
+                return None
+            opts = {
+                "page_size": "1",
+                "select": cursor_field,
+            }
+            url = self._build_url(top_set, opts, order_by=f"{cursor_field} desc")
+            for row in self._fetch_pages(url):
+                value = row.get(cursor_field)
+                if value is not None:
+                    return value
+            return None
+
+        def _discover_top_parent_rows(
+            self,
+            segments: list[str],
+            namespace: str | None,
+            table_options: dict[str, str],
+            cursor_field: str | None,
+            cursor_lower,
+        ) -> list[dict]:
+            """Fetch the rows of the top-level entity set that bound this
+            read. Returns level-0 PK dicts (plus the cursor column when a
+            cursor is present, so executors can stamp rows without re-
+            fetching). Apply the cursor filter at the top set when the
+            cursor lives at level 0; otherwise no filter is applied here
+            and per-leaf filtering picks up the slack in the executor."""
+            top_set = segments[0]
+            ancestor_et = self._entity_type_for(top_set, namespace)
+            ancestor_pks = self._own_primary_keys_for_et(ancestor_et)
+            select_cols = list(ancestor_pks)
+            extra_filter = None
+            order_by = None
+            if cursor_field:
+                own_fields = self._own_fields_for_et(ancestor_et)
+                if any(f.name == cursor_field for f in own_fields):
+                    if cursor_field not in select_cols:
+                        select_cols.append(cursor_field)
+                    if cursor_lower is not None:
+                        extra_filter = self._cursor_filter(cursor_field, cursor_lower)
+                    terms = [f"{cursor_field} asc"]
+                    terms.extend(f"{pk} asc" for pk in ancestor_pks if pk != cursor_field)
+                    order_by = ",".join(terms)
+            opts = {
+                "page_size": table_options.get("page_size", "1000"),
+                "select": ",".join(select_cols),
+            }
+            url = self._build_url(top_set, opts, extra_filter=extra_filter, order_by=order_by)
+            return list(self._fetch_pages(url))
+
+        def _iter_partition_rows(
+            self,
+            segments: list[str],
+            table_options: dict[str, str],
+            top_parent_rows: list[dict],
+            cursor_field: str | None,
+            cursor_lower,
+        ) -> Iterator[dict]:
+            """Stream leaf rows for one partition's slice of parents.
+
+            Dispatch mirrors ``read_table``'s contained branches: cursor on
+            a non-leaf ancestor → ancestor-cursor walk with stamped cursor
+            values; cursor on the leaf → per-leaf cursor filter; no
+            cursor → full snapshot per chain.
+            """
+            namespace = (table_options or {}).get("namespace")
+            fk_columns = self._resolve_fk_columns(segments, namespace)
+            if not cursor_field:
+                for chain in self._iter_parent_key_chains(
+                    segments, namespace, table_options, top_parent_rows=top_parent_rows
+                ):
+                    url = self._build_contained_url(segments, chain, table_options)
+                    for row in self._fetch_pages(url):
+                        self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
+                        yield row
+                return
+            cursor_level = self._find_cursor_level(segments, namespace, cursor_field)
+            if cursor_level == -1:
+                raise ValueError(
+                    f"cursor_field {cursor_field!r} is not a property on "
+                    f"the contained path or any of its ancestors."
+                )
+            # Partition activation requires cursor at level 0 for the
+            # streaming probe to make sense; this branch is the only one
+            # reached in practice. We still go through the with-cursor
+            # iterator so the cursor column is stamped onto leaf rows.
+            chains_iter = self._iter_parent_chains_with_cursor(
+                segments,
+                namespace,
+                table_options,
+                cursor_level,
+                cursor_field,
+                cursor_lower,
+                top_parent_rows=top_parent_rows,
+            )
+            for chain, ancestor_cursor in chains_iter:
+                url = self._build_contained_url(segments, chain, table_options)
+                for row in self._fetch_pages(url):
+                    self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
+                    if cursor_level == len(segments) - 1:
+                        # Leaf-cursor mode: filter per row by ``cursor gt
+                        # cursor_lower``. (Server-side filter would be
+                        # cheaper, but partition activation gates this to
+                        # cursor_level==0; this branch exists for
+                        # completeness only.)
+                        rec = row.get(cursor_field)
+                        if cursor_lower is not None and rec is not None and rec <= cursor_lower:
+                            continue
+                    else:
+                        row[cursor_field] = ancestor_cursor
+                    yield row
+
+
+    def _bin_pack(rows: list[dict], num_partitions: int, cursor_lower) -> list[dict]:
+        """Split ``rows`` into ``num_partitions`` partition descriptors.
+
+        Round-robin assignment with each partition carrying a contiguous
+        slice — keeps cursor ordering stable within a partition (the
+        ``_discover_top_parent_rows`` caller sorts by cursor when one is
+        set). Empty bins are dropped so the framework doesn't spawn
+        no-op executors.
+        """
+        if not rows:
+            return []
+        bin_size = max(1, (len(rows) + num_partitions - 1) // num_partitions)
+        partitions: list[dict] = []
+        for i in range(0, len(rows), bin_size):
+            partitions.append(
+                {
+                    "top_parent_rows": rows[i : i + bin_size],
+                    "cursor_lower": cursor_lower,
+                }
+            )
+        return partitions
+
+
+    def _wall_clock_ns() -> int:
+        """Wall-clock nanoseconds for snapshot-stream offset progression.
+
+        Imported lazily here so ``_partition.py`` has no module-level
+        import-time work — the connector is forked + re-imported per
+        PySpark Python Data Source ``.load()`` call, and import cost is
+        on the hot path.
+        """
+        import time  # pylint: disable=import-outside-toplevel
+
+        return time.time_ns()
+
+
+    ########################################################
     # src/databricks/labs/community_connector/sources/odata/odata.py
     ########################################################
 
@@ -1839,7 +2197,12 @@ def register_lakeflow_source(spark):
         return f"{time.time_ns():020d}_{next(_SEQUENCE_COUNTER):012d}"
 
 
-    class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces, ContainedNavMixin):
+    class ODataLakeflowConnect(
+        LakeflowConnect,
+        SupportsNamespaces,
+        PartitionMixin,
+        ContainedNavMixin,
+    ):
         """LakeflowConnect implementation for OData v4 services.
 
         OData ``$metadata`` documents can declare multiple ``<Schema>`` blocks,

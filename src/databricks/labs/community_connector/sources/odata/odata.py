@@ -83,6 +83,9 @@ from databricks.labs.community_connector.sources.odata._contained import (
     odata_literal as _odata_literal,
     parse_contained_path as _parse_contained_path,
 )
+from databricks.labs.community_connector.sources.odata._partition import (
+    PartitionMixin,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +324,12 @@ def _next_sequence() -> str:
     return f"{time.time_ns():020d}_{next(_SEQUENCE_COUNTER):012d}"
 
 
-class ODataLakeflowConnect(LakeflowConnect, SupportsNamespaces, ContainedNavMixin):
+class ODataLakeflowConnect(
+    LakeflowConnect,
+    SupportsNamespaces,
+    PartitionMixin,
+    ContainedNavMixin,
+):
     """LakeflowConnect implementation for OData v4 services.
 
     OData ``$metadata`` documents can declare multiple ``<Schema>`` blocks,
