@@ -2870,6 +2870,45 @@ def test_contained_npp_filter_at_index_form_equivalent():
 
 
 @responses.activate
+def test_contained_expand_user_filter_lands_in_leaf_expand_not_top():
+    """The table's ``filter`` option is the leaf filter in both modes.
+    In expand mode it lands inside the innermost ``$expand(...)``,
+    NOT on the top URL — same semantic as N+1 mode, where it goes
+    to the leaf URL. Stripping it from the top is what makes
+    ``filter_at_<top>`` and ``filter`` compose correctly on a
+    table like ``Instances__Projects``."""
+    _mock_nested_metadata()
+    captured = []
+
+    def callback(req):
+        captured.append(req.url)
+        return (200, {}, json.dumps({"value": []}))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=callback)
+    c = _make()
+    records, _ = c.read_table(
+        "Parents__Children",
+        None,
+        {
+            "expand_contained": "true",
+            "filter": "Id eq 3",
+            "filter_at_Parents": "Id eq 1",
+        },
+    )
+    list(records)
+    from urllib.parse import unquote
+
+    url = unquote(captured[0])
+    # filter_at_Parents lands at the top URL; user `filter` lands
+    # inside $expand=Children(...).
+    assert "Parents?$top=1000&$filter=Id eq 1" in url
+    assert "$expand=Children($top=1000;$filter=Id eq 3" in url
+    # User filter must NOT be at the top URL.
+    assert "(Id eq 1) and (Id eq 3)" not in url
+    assert "(Id eq 3) and (Id eq 1)" not in url
+
+
+@responses.activate
 def test_contained_expand_filter_at_top_lands_on_top_url():
     _mock_nested_metadata()
     captured = []

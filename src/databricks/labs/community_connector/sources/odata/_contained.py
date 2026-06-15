@@ -342,25 +342,35 @@ class ContainedNavMixin:
         segment_filters = resolve_segment_filters(table_options, segments)
         top, *children = segments
         base = join_url(self.service_url, top)
+        # The table's ``filter`` option is the leaf filter — same as
+        # N+1 mode, where it lands at the leaf URL — so strip it from
+        # the top-URL query params when there are children. It re-enters
+        # at the innermost ``$expand(...)`` clause below. Without this
+        # split, ``filter="Id eq 3"`` on a ``Instances__Projects`` table
+        # would land at Instances (wrong segment) and 400 the server.
+        opts = table_options or {}
+        top_opts = {k: v for k, v in opts.items() if k != "filter"} if children else opts
         top_extra = combine_filters(
             cursor_filter if cursor_level == 0 else None,
             segment_filters.get(0),
         )
         query = self._format_query_params(
-            table_options,
+            top_opts,
             top_extra,
             cursor_order if cursor_level == 0 else None,
         )
         if not children:
             return f"{base}?{query}"
-        opts = table_options or {}
         inner_top = opts.get("expand_inner_page_size", opts.get("page_size", "1000"))
+        user_leaf_filter = opts.get("filter")
         inner = ""
         for i in range(len(children) - 1, -1, -1):
+            is_leaf = i == len(children) - 1
             parts: list[str] = [f"$top={inner_top}"]
             level_filter = combine_filters(
                 cursor_filter if cursor_level == i + 1 else None,
                 segment_filters.get(i + 1),
+                user_leaf_filter if is_leaf else None,
             )
             if cursor_level == i + 1 and cursor_select:
                 parts.append(f"$select={cursor_select}")
