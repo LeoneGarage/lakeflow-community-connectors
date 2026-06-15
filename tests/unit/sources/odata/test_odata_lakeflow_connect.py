@@ -2422,9 +2422,13 @@ def test_contained_expand_invalid_value_raises():
 
 @responses.activate
 def test_contained_expand_with_ancestor_cursor_injects_filter_into_expand():
-    """expand_contained + cursor on a middle ancestor injects
-    $filter/$orderby into the ``$expand`` clause for that ancestor.
-    Top-level URL has no $filter (cursor isn't on the top entity set)."""
+    """expand_contained + cursor on a middle ancestor injects $filter
+    inside the matching ``$expand`` clause. $orderby is intentionally
+    not emitted at non-top levels (Hexagon SCApi and other servers
+    reject ``$orderby`` inside ``$expand`` with HTTP 400, and the
+    connector doesn't paginate nested expand results so ordering
+    isn't load-bearing). Top-level URL has no $filter (cursor isn't
+    on the top entity set)."""
     _mock_nested_metadata()
     responses.add(
         responses.GET,
@@ -2453,12 +2457,15 @@ def test_contained_expand_with_ancestor_cursor_injects_filter_into_expand():
     )
     rows = list(records)
     call_url = responses.calls[1].request.url
-    # cursor is on Children (level 1), so $filter/$orderby live inside
-    # the Children $expand, not at the top level.
+    # cursor is on Children (level 1), so $filter lives inside the
+    # Children $expand.
     assert "%24expand=Children" in call_url or "$expand=Children" in call_url
     # $filter inside the expand uses the cursor; ' gt ' encoded as %20gt%20 or +gt+.
     assert "ModifiedAt%20gt%20" in call_url or "ModifiedAt+gt+" in call_url
-    assert "%24orderby" in call_url or "$orderby" in call_url
+    # $orderby must NOT appear anywhere — neither top-level (cursor
+    # isn't there) nor inside the inner $expand (Hexagon SCApi rejects
+    # this with 400 Bad Request).
+    assert "%24orderby" not in call_url and "$orderby" not in call_url
     # Leaf row was stamped with the ancestor's cursor value.
     assert rows == [
         {
@@ -2496,15 +2503,18 @@ def test_contained_expand_does_not_inject_select_inside_cursor_expand():
     )
     call_url = responses.calls[1].request.url
     assert "%24select" not in call_url and "$select" not in call_url
-    # $filter/$orderby remain — they're load-bearing for incremental.
-    assert "%24orderby" in call_url or "$orderby" in call_url
+    # $orderby is also intentionally omitted on nested levels (servers
+    # like Hexagon SCApi reject ``$orderby`` inside ``$expand`` with 400,
+    # and the connector doesn't paginate nested results).
+    assert "%24orderby" not in call_url and "$orderby" not in call_url
 
 
 @responses.activate
-def test_contained_expand_cursor_orderby_includes_level_pks():
-    """The $orderby injected at the cursor level uses ``cursor asc``
-    plus that segment's primary keys as tie-breakers (proving
-    `_find_cursor_level` returns the right level, not just the leaf)."""
+def test_contained_expand_omits_orderby_inside_expand():
+    """Regression: the connector must not emit ``$orderby`` inside an
+    ``$expand(...)`` clause. Hexagon SCApi and other servers reject
+    that with HTTP 400, and ordering isn't needed because the
+    connector doesn't paginate the nested expanded collection."""
     _mock_nested_metadata()
     responses.add(
         responses.GET,
@@ -2520,8 +2530,8 @@ def test_contained_expand_cursor_orderby_includes_level_pks():
     )
     list(records)
     call_url = responses.calls[1].request.url
-    # $orderby inside the Children expand includes Id (Children's PK).
-    assert "ModifiedAt" in call_url and ("Id%20asc" in call_url or "Id+asc" in call_url)
+    assert "%24expand=Children" in call_url or "$expand=Children" in call_url
+    assert "%24orderby" not in call_url and "$orderby" not in call_url
 
 
 @responses.activate
@@ -3463,3 +3473,144 @@ def test_retry_disabled_when_max_retries_zero(monkeypatch):
     with pytest.raises(RuntimeError):
         list(rows)
     assert sleeps == []
+
+
+# ---------------------------------------------------------------------------
+# Transient network errors (TCP reset / timeout / mid-body disconnect)
+# ---------------------------------------------------------------------------
+
+
+@responses.activate
+def test_retry_connection_error_recovers(monkeypatch):
+    """``RemoteDisconnected`` mid-request retries on backoff (no header)."""
+    import requests as _requests
+
+    _mock_metadata()
+    sleeps = _patch_sleep(monkeypatch)
+    # First call: simulate the exact failure pattern observed in
+    # production (RemoteDisconnected -> ConnectionError). Second call:
+    # legitimate 200 with rows.
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        body=_requests.exceptions.ConnectionError("Connection aborted."),
+    )
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        json={"value": [{"Id": 1, "Name": "A"}]},
+        status=200,
+    )
+    c = _make({"token": "t"})
+    rows, _ = c.read_table("Customers", None, {})
+    assert [r["Id"] for r in rows] == [1]
+    # No Retry-After possible on a connection error -> exponential.
+    assert sleeps == [1.0]
+
+
+@responses.activate
+def test_retry_read_timeout_recovers(monkeypatch):
+    """``requests.Timeout`` is treated like ConnectionError."""
+    import requests as _requests
+
+    _mock_metadata()
+    sleeps = _patch_sleep(monkeypatch)
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        body=_requests.exceptions.ReadTimeout("server slow"),
+    )
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        json={"value": [{"Id": 7}]},
+        status=200,
+    )
+    c = _make({"token": "t"})
+    rows, _ = c.read_table("Customers", None, {})
+    assert [r["Id"] for r in rows] == [7]
+    assert sleeps == [1.0]
+
+
+@responses.activate
+def test_retry_chunked_encoding_error_recovers(monkeypatch):
+    """Mid-body server disconnect surfaces as ChunkedEncodingError."""
+    import requests as _requests
+
+    _mock_metadata()
+    sleeps = _patch_sleep(monkeypatch)
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        body=_requests.exceptions.ChunkedEncodingError("incomplete response"),
+    )
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        json={"value": [{"Id": 3}]},
+        status=200,
+    )
+    c = _make({"token": "t"})
+    rows, _ = c.read_table("Customers", None, {})
+    assert [r["Id"] for r in rows] == [3]
+    assert sleeps == [1.0]
+
+
+@responses.activate
+def test_retry_connection_error_exhausted_reraises_same_type(monkeypatch):
+    """After max_retries+1 ConnectionErrors, re-raise as ConnectionError
+    (not RuntimeError) so callers catching ConnectionError keep working."""
+    import requests as _requests
+
+    _mock_metadata()
+    sleeps = _patch_sleep(monkeypatch)
+    for _ in range(3):  # max_retries=2 -> 3 attempts total
+        responses.add(
+            responses.GET,
+            f"{SERVICE_URL}Customers",
+            body=_requests.exceptions.ConnectionError("Connection aborted."),
+        )
+    c = _make({"token": "t", "max_retries": "2"})
+    rows, _ = c.read_table("Customers", None, {})
+    with pytest.raises(_requests.exceptions.ConnectionError) as ei:
+        list(rows)
+    msg = str(ei.value)
+    assert "3 attempts" in msg
+    assert "max_retries" in msg
+    assert sleeps == [1.0, 2.0]
+
+
+@responses.activate
+def test_retry_connection_error_then_throttle_then_success(monkeypatch):
+    """ConnectionError -> 429 -> 200 in the same logical request all
+    flow through the same retry loop without losing track of the
+    attempt counter."""
+    import requests as _requests
+
+    _mock_metadata()
+    sleeps = _patch_sleep(monkeypatch)
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        body=_requests.exceptions.ConnectionError("aborted"),
+    )
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        status=429,
+        headers={"Retry-After": "3"},
+        body="",
+    )
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        json={"value": [{"Id": 1}]},
+        status=200,
+    )
+    c = _make({"token": "t"})
+    rows, _ = c.read_table("Customers", None, {})
+    assert [r["Id"] for r in rows] == [1]
+    # Attempt 0: ConnectionError -> 1s backoff.
+    # Attempt 1: 429 with Retry-After: 3 -> 3s.
+    # Attempt 2: 200 -> done.
+    assert sleeps == [1.0, 3.0]

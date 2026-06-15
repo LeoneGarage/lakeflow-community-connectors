@@ -155,6 +155,18 @@ _METADATA_CACHE: dict[str, tuple[str, ET.Element, "_CsdlIndex"]] = {}
 # upstream schema changes; per-trigger we still pay one fresh fetch.
 _METADATA_FILE_CACHE_TTL_SECONDS = 60
 
+# Network-level exceptions treated as transient by ``_http_get``'s retry
+# loop. ``ConnectionError`` covers TCP resets, DNS failures, and remote
+# disconnects (e.g. the server killed the keep-alive connection mid-
+# request). ``Timeout`` covers both connect and read timeouts.
+# ``ChunkedEncodingError`` covers servers that close mid-body during a
+# chunked transfer (seen in practice with Hexagon SCApi under load).
+_TRANSIENT_NETWORK_ERRORS = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
+
 
 def _metadata_cache_path(service_url: str) -> str:
     """Tempdir path for the pickled CSDL of ``service_url``."""
@@ -1105,16 +1117,27 @@ class ODataLakeflowConnect(
             next_url = new_next
 
     def _http_get(self, session: requests.Session, url: str, **kwargs: Any) -> requests.Response:
-        """GET with auth-aware 401/403 handling + 429/503 retry-with-backoff.
+        """GET with auth-aware 401/403 handling + transient-failure retry.
 
-        Outer loop: retry on transient server-side failures (HTTP 429
-        throttling, 503 unavailable). Honours the ``Retry-After`` header
-        when the server provides one (integer seconds or HTTP-date),
-        capped at ``retry_max_delay_seconds`` so a misbehaving server
-        can't pin a Spark task for an hour. When the header is missing,
-        falls back to exponential backoff (1, 2, 4, 8, 16 s …), same
-        cap. After ``max_retries`` attempts, raises :class:`RuntimeError`
-        with the last server response truncated into the message.
+        Outer loop retries on two classes of transient failure, both
+        capped by ``retry_max_delay_seconds`` per attempt:
+
+        * **HTTP 429 / 503** — throttling or service unavailable.
+          Honours the ``Retry-After`` header when present (integer
+          seconds or HTTP-date), otherwise exponential backoff
+          (1, 2, 4, 8, 16 s …). After ``max_retries`` attempts, raises
+          :class:`RuntimeError` with the last response truncated into
+          the message.
+        * **Connection-level exceptions** —
+          :class:`requests.ConnectionError`,
+          :class:`requests.Timeout`,
+          :class:`requests.ChunkedEncodingError`. The server didn't
+          finish sending an HTTP response (TCP reset, remote disconnect,
+          read/connect timeout, half-closed mid-body), so there's no
+          ``Retry-After`` to honour — pure exponential backoff. After
+          ``max_retries`` attempts, re-raises the original exception
+          type with the attempt count appended; ``__cause__`` preserves
+          the original traceback for triage.
 
         Inner per-attempt logic (see ``_http_get_once``):
 
@@ -1141,7 +1164,22 @@ class ODataLakeflowConnect(
         """
         attempts = self.max_retries + 1
         for attempt in range(attempts):
-            resp = self._http_get_once(session, url, **kwargs)
+            try:
+                resp = self._http_get_once(session, url, **kwargs)
+            except _TRANSIENT_NETWORK_ERRORS as exc:
+                # Server closed the TCP connection / DNS failed / read
+                # timed out — no HTTP response, so no Retry-After to
+                # consult. Pure exponential backoff. Preserve the
+                # original exception type so callers that catch
+                # ConnectionError specifically still match.
+                if attempt >= self.max_retries:
+                    raise type(exc)(
+                        f"{exc} (after {attempt + 1} attempts on {url!r}; "
+                        f"raise 'max_retries' on the connection if the "
+                        f"source needs more retries)"
+                    ) from exc
+                time.sleep(self._backoff_delay(attempt))
+                continue
             if resp.status_code in (429, 503):
                 if attempt >= self.max_retries:
                     raise RuntimeError(self._throttle_exhausted_error(resp, url, attempt + 1))
@@ -1152,6 +1190,16 @@ class ODataLakeflowConnect(
         raise RuntimeError(  # pragma: no cover
             f"Exhausted retries for {url!r} without producing a response."
         )
+
+    def _backoff_delay(self, attempt: int) -> float:
+        """Exponential backoff capped at ``retry_max_delay_seconds``.
+
+        Used for transient network failures where the server never
+        sent a response, so there's no ``Retry-After`` to honour (the
+        429/503 path prefers the server hint via
+        ``_retry_after_delay``).
+        """
+        return min(float(2**attempt), float(self.retry_max_delay_seconds))
 
     def _http_get_once(
         self, session: requests.Session, url: str, **kwargs: Any

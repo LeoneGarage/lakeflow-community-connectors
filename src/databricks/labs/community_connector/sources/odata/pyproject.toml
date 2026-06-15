@@ -76,4 +76,4 @@ max-attributes = 12
 # refactoring; further splitting fights the mixin layout
 # (``ContainedNavMixin`` already lives in its own file). 1850 is the
 # soft cap.
-max-module-lines = 1950
+max-module-lines = 2000
