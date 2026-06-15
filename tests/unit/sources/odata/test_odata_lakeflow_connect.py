@@ -3921,6 +3921,48 @@ def test_partition_get_partitions_bin_packs_contained_snapshot():
 
 
 @responses.activate
+def test_partition_get_partitions_applies_filter_at_top():
+    """``filter_at_<top>`` (or its lowercased form from the framework)
+    is applied to the partition pre-fetch so we don't bin-pack — and
+    later walk — parents the user explicitly excluded."""
+    _mock_nested_metadata()
+    responses.get(
+        f"{SERVICE_URL}Parents",
+        json={"value": [{"Id": 5}]},
+        match=[
+            responses.matchers.query_param_matcher(
+                {"$top": "1000", "$select": "Id", "$filter": "Id eq 5"}
+            )
+        ],
+    )
+    c = _make()
+    parts = c.get_partitions(
+        "Parents__Children",
+        {"num_partitions": "4", "filter_at_Parents": "Id eq 5"},
+    )
+    flat = [row for p in parts for row in p["top_parent_rows"]]
+    assert [r["Id"] for r in flat] == [5]
+
+
+@responses.activate
+def test_partition_read_partition_applies_filter_at_leaf():
+    """``filter_at_<leaf>`` is applied at the leaf URL inside the
+    partitioned walk, not just in the non-partitioned snapshot path."""
+    _mock_nested_metadata()
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={"value": [{"Id": 11, "Label": "a", "ModifiedAt": "2024-01-01T00:00:00Z"}]},
+        match=[responses.matchers.query_param_matcher({"$top": "1000", "$filter": "Label eq 'a'"})],
+    )
+    c = _make()
+    partition = {"top_parent_rows": [{"Id": 1}], "cursor_lower": None}
+    rows = list(
+        c.read_partition("Parents__Children", partition, {"filter_at_Children": "Label eq 'a'"})
+    )
+    assert [r["Id"] for r in rows] == [11]
+
+
+@responses.activate
 def test_partition_read_partition_walks_only_assigned_parents():
     """Executor never fetches level-0 leaves outside its partition.
     Parents(99)/Children is deliberately unregistered — if the

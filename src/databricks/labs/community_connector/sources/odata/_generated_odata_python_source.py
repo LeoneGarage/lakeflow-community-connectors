@@ -2003,7 +2003,7 @@ def register_lakeflow_source(spark):
             ancestor_et = self._entity_type_for(top_set, namespace)
             ancestor_pks = self._own_primary_keys_for_et(ancestor_et)
             select_cols = list(ancestor_pks)
-            extra_filter = None
+            cursor_extra: str | None = None
             order_by = None
             if cursor_field:
                 own_fields = self._own_fields_for_et(ancestor_et)
@@ -2011,10 +2011,19 @@ def register_lakeflow_source(spark):
                     if cursor_field not in select_cols:
                         select_cols.append(cursor_field)
                     if cursor_lower is not None:
-                        extra_filter = self._cursor_filter(cursor_field, cursor_lower)
+                        cursor_extra = self._cursor_filter(cursor_field, cursor_lower)
                     terms = [f"{cursor_field} asc"]
                     terms.extend(f"{pk} asc" for pk in ancestor_pks if pk != cursor_field)
                     order_by = ",".join(terms)
+            # AND the level-0 segment filter (``filter_at_<top>``) with any
+            # cursor filter. Without this the partition pre-fetch returns
+            # every parent, then per-partition leaf fetches issue one
+            # request per parent — even though the user explicitly told us
+            # which parents to walk. The leaf filter then matches inside
+            # every unfiltered parent, surfacing rows that should have been
+            # excluded by the top filter.
+            segment_filters = resolve_segment_filters(table_options, segments)
+            extra_filter = combine_filters(cursor_extra, segment_filters.get(0))
             opts = {
                 "page_size": table_options.get("page_size", "1000"),
                 "select": ",".join(select_cols),
@@ -2039,11 +2048,15 @@ def register_lakeflow_source(spark):
             """
             namespace = (table_options or {}).get("namespace")
             fk_columns = self._resolve_fk_columns(segments, namespace)
+            segment_filters = resolve_segment_filters(table_options, segments)
+            leaf_seg_filter = segment_filters.get(len(segments) - 1)
             if not cursor_field:
                 for chain in self._iter_parent_key_chains(
                     segments, namespace, table_options, top_parent_rows=top_parent_rows
                 ):
-                    url = self._build_contained_url(segments, chain, table_options)
+                    url = self._build_contained_url(
+                        segments, chain, table_options, extra_filter=leaf_seg_filter
+                    )
                     for row in self._fetch_pages(url):
                         self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                         yield row
@@ -2068,7 +2081,9 @@ def register_lakeflow_source(spark):
                 top_parent_rows=top_parent_rows,
             )
             for chain, ancestor_cursor in chains_iter:
-                url = self._build_contained_url(segments, chain, table_options)
+                url = self._build_contained_url(
+                    segments, chain, table_options, extra_filter=leaf_seg_filter
+                )
                 for row in self._fetch_pages(url):
                     self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                     if cursor_level == len(segments) - 1:
