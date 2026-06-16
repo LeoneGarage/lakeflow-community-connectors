@@ -361,7 +361,13 @@ class ODataLakeflowConnect(
     def __init__(self, options: dict[str, str]) -> None:
         super().__init__(options)
         self.service_url = _require(options, "service_url")
-        self.timeout = int(options.get("timeout_seconds", "60"))
+        # Default 180s (3 min). Deep ``expand_contained=true`` chains
+        # (3+ segments) materialise a large cross-product server-side
+        # before responding; 60s isn't long enough for most real
+        # deployments and the previous default surfaced as
+        # ``ReadTimeout`` retried-to-exhaustion failures. Connection
+        # option ``timeout_seconds`` overrides per deployment.
+        self.timeout = int(options.get("timeout_seconds", "180"))
         # On-disk pickle TTL. The default suits typical 1-minute SDP
         # trigger intervals — each trigger spawns a fresh forked
         # worker, the file cache survives, but stale state is bounded.

@@ -2211,7 +2211,7 @@ def test_build_expand_url_three_level():
     _mock_nested_metadata()
     c = _make()
     url = c._build_expand_url(["Parents", "Children", "Notes"], {})
-    assert "$expand=Children($top=1000;$expand=Notes($top=1000))" in url
+    assert "$expand=Children($top=300;$expand=Notes($top=300))" in url
     assert url.startswith(f"{SERVICE_URL}Parents?")
 
 
@@ -2220,25 +2220,27 @@ def test_build_expand_url_four_level_nests_correctly():
     _mock_nested_metadata()
     c = _make()
     url = c._build_expand_url(["A", "B", "C", "D"], {})
-    assert "$expand=B($top=1000;$expand=C($top=1000;$expand=D($top=1000)))" in url
+    assert "$expand=B($top=300;$expand=C($top=300;$expand=D($top=300)))" in url
 
 
 @responses.activate
-def test_build_expand_url_inner_top_inherits_page_size():
-    """Inner ``$top`` defaults to the top-level ``page_size`` so the
-    single-knob case stays simple."""
+def test_build_expand_url_inner_top_defaults_to_300_independent_of_page_size():
+    """Inner ``$top`` defaults to 300, independent of the top-level
+    ``page_size``. The two knobs are intentionally decoupled because
+    the inner cross-product grows multiplicatively with the expand
+    chain; ``page_size=1000`` at every level would be unreasonable."""
     _mock_nested_metadata()
     c = _make()
     url = c._build_expand_url(["Parents", "Children"], {"page_size": "250"})
-    assert "$top=250" in url
-    assert "$expand=Children($top=250)" in url
+    assert "Parents?$top=250" in url
+    assert "$expand=Children($top=300)" in url
 
 
 @responses.activate
 def test_build_expand_url_inner_top_override():
-    """``expand_inner_page_size`` overrides ``page_size`` for the inner
-    ``$expand`` clauses only; the top-level ``$top`` keeps using
-    ``page_size``."""
+    """``expand_inner_page_size`` overrides the 300 default for the
+    inner ``$expand`` clauses only; the top-level ``$top`` keeps
+    using ``page_size``."""
     _mock_nested_metadata()
     c = _make()
     url = c._build_expand_url(
@@ -2262,7 +2264,9 @@ def test_build_expand_url_inner_top_with_cursor_clause():
         cursor_filter="ModifiedAt gt 2024-01-01T00:00:00Z",
         cursor_order="ModifiedAt asc,Id asc",
     )
-    assert "$top=500" in url.split("$expand=")[1]
+    # Inner $top defaults to 300 (the new expand-mode default); $filter
+    # and $orderby compose with it at the cursor's level.
+    assert "$expand=Children($top=300" in url
     assert "$filter=ModifiedAt gt 2024-01-01T00:00:00Z" in url
     assert "$orderby=ModifiedAt asc,Id asc" in url
 
@@ -2902,7 +2906,7 @@ def test_contained_expand_user_filter_lands_in_leaf_expand_not_top():
     # filter_at_Parents lands at the top URL; user `filter` lands
     # inside $expand=Children(...).
     assert "Parents?$top=1000&$filter=Id eq 1" in url
-    assert "$expand=Children($top=1000;$filter=Id eq 3" in url
+    assert "$expand=Children($top=300;$filter=Id eq 3" in url
     # User filter must NOT be at the top URL.
     assert "(Id eq 1) and (Id eq 3)" not in url
     assert "(Id eq 3) and (Id eq 1)" not in url
@@ -2981,7 +2985,7 @@ def test_contained_expand_filter_at_middle_lands_inside_expand():
     list(records)
     from urllib.parse import unquote
 
-    assert "Children($top=1000;$filter=Id eq 10" in unquote(captured[0])
+    assert "Children($top=300;$filter=Id eq 10" in unquote(captured[0])
 
 
 @responses.activate
@@ -3018,7 +3022,7 @@ def test_contained_expand_filter_at_leaf_lands_in_innermost_expand():
     list(records)
     from urllib.parse import unquote
 
-    assert "Notes($top=1000;$filter=Id eq 100" in unquote(captured[0])
+    assert "Notes($top=300;$filter=Id eq 100" in unquote(captured[0])
 
 
 # --- Composition ---

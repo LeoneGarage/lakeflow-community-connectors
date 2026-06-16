@@ -945,10 +945,16 @@ def register_lakeflow_source(spark):
             whatever default it likes (e.g. Hexagon SCApi defaults to 100,
             which means an 8x request fan-out via ``<NavProp>@odata.nextLink``
             for a parent with 800 children). ``expand_inner_page_size``
-            overrides; falls back to the top-level ``page_size`` so the
-            single-knob case stays simple. Servers that don't honour
-            ``$top`` inside ``$expand`` ignore it — the wire format is
-            still valid OData v4.
+            overrides; defaults to ``300``. The default is decoupled from
+            the top-level ``page_size`` (which defaults to 1000) because
+            the inner cross-product grows multiplicatively with the chain:
+            ``$top=1000`` at every level of a 3-segment ``$expand`` asks
+            the server to compose up to 1B leaf rows in a single response,
+            which tips most servers over their request timeout. 300 keeps
+            per-response work to ~27M rows worst-case while still being
+            large enough to amortise per-request overhead. Servers that
+            don't honour ``$top`` inside ``$expand`` ignore it — the wire
+            format is still valid OData v4.
             """
             segment_filters = resolve_segment_filters(table_options, segments)
             top, *children = segments
@@ -972,7 +978,7 @@ def register_lakeflow_source(spark):
             )
             if not children:
                 return f"{base}?{query}"
-            inner_top = opts.get("expand_inner_page_size", opts.get("page_size", "1000"))
+            inner_top = opts.get("expand_inner_page_size", "300")
             user_leaf_filter = opts.get("filter")
             inner = ""
             for i in range(len(children) - 1, -1, -1):
@@ -2405,7 +2411,13 @@ def register_lakeflow_source(spark):
         def __init__(self, options: dict[str, str]) -> None:
             super().__init__(options)
             self.service_url = _require(options, "service_url")
-            self.timeout = int(options.get("timeout_seconds", "60"))
+            # Default 180s (3 min). Deep ``expand_contained=true`` chains
+            # (3+ segments) materialise a large cross-product server-side
+            # before responding; 60s isn't long enough for most real
+            # deployments and the previous default surfaced as
+            # ``ReadTimeout`` retried-to-exhaustion failures. Connection
+            # option ``timeout_seconds`` overrides per deployment.
+            self.timeout = int(options.get("timeout_seconds", "180"))
             # On-disk pickle TTL. The default suits typical 1-minute SDP
             # trigger intervals — each trigger spawns a fresh forked
             # worker, the file cache survives, but stale state is bounded.
