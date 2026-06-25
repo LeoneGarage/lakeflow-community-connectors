@@ -673,8 +673,44 @@ def test_incremental_coalesce_default_emits_null_rows_and_advances():
     assert [r["Id"] for r in rows] == [1, 2]
     # The real null is preserved in the emitted rows (synthetic is internal).
     assert all(r["ModifiedAt"] is None for r in rows)
-    # Watermark advanced to a synthetic floor (year-0001), not {}.
+    # Watermark advanced to the default synthetic floor (year 2000), not {}.
     assert offset["cursor"].startswith("2000-01-01T00:00:00.")
+
+
+@responses.activate
+def test_incremental_coalesce_floor_year_configurable():
+    """``cursor_nulls=coalesce:<YYYY>`` overrides the temporal synthetic
+    floor year (default 2000)."""
+    _mock_metadata()
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        json={"value": [{"Id": 1, "ModifiedAt": None}]},
+        match_querystring=False,
+    )
+    c = _make()
+    records, offset = c.read_table(
+        "Customers", {}, {"cursor_field": "ModifiedAt", "cursor_nulls": "coalesce:1990"}
+    )
+    rows = list(records)
+    assert [r["Id"] for r in rows] == [1]
+    assert rows[0]["ModifiedAt"] is None
+    assert offset["cursor"].startswith("1990-01-01T00:00:00.")
+
+
+@responses.activate
+def test_cursor_nulls_floor_year_with_non_coalesce_raises():
+    _mock_metadata()
+    responses.get(
+        f"{SERVICE_URL}Customers",
+        json={"value": [{"Id": 1, "ModifiedAt": "2024-01-01T00:00:00Z"}]},
+    )
+    c = _make()
+    with pytest.raises(ValueError, match="floor year is only valid with 'coalesce'"):
+        records, _ = c.read_table(
+            "Customers", {}, {"cursor_field": "ModifiedAt", "cursor_nulls": "error:1990"}
+        )
+        list(records)
 
 
 @responses.activate

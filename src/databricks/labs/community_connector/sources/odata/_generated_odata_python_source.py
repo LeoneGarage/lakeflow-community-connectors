@@ -4844,18 +4844,44 @@ def register_lakeflow_source(spark):
         # Null-cursor policy (``cursor_nulls``)
         # ------------------------------------------------------------------
 
-        def _cursor_nulls_mode(self, table_options: dict[str, str] | None) -> str:
-            """``cursor_nulls`` policy: ``coalesce`` (default), ``error`` or
-            ``ignore``. Raises on an unrecognised value."""
-            mode = (table_options or {}).get("cursor_nulls", "coalesce").strip().lower()
+        _DEFAULT_COALESCE_FLOOR_YEAR = 2000
+
+        def _parse_cursor_nulls(self, table_options: dict[str, str] | None) -> tuple[str, int]:
+            """Parse the ``cursor_nulls`` option into ``(mode, floor_year)``.
+
+            Forms: ``coalesce`` (default), ``error``, ``ignore``, and
+            ``coalesce:<YYYY>`` to override the temporal synthetic floor year
+            (default ``2000``). The year suffix is only valid with
+            ``coalesce``. Raises on an unrecognised mode or a malformed year.
+            """
+            raw = (table_options or {}).get("cursor_nulls", "coalesce").strip().lower()
+            mode, _, floor = raw.partition(":")
+            mode = mode.strip()
             if mode not in ("coalesce", "error", "ignore"):
                 raise ValueError(
-                    f"cursor_nulls must be one of 'coalesce', 'error', 'ignore'; got {mode!r}."
+                    f"cursor_nulls mode must be one of 'coalesce', 'error', 'ignore'; got {mode!r}."
                 )
-            return mode
+            floor_year = self._DEFAULT_COALESCE_FLOOR_YEAR
+            if floor:
+                floor = floor.strip()
+                if mode != "coalesce":
+                    raise ValueError(
+                        f"cursor_nulls floor year is only valid with 'coalesce'; got {raw!r}."
+                    )
+                if not (floor.isdigit() and len(floor) == 4):
+                    raise ValueError(
+                        f"cursor_nulls floor must be a 4-digit year (e.g. 'coalesce:1990'); "
+                        f"got {floor!r}."
+                    )
+                floor_year = int(floor)
+            return mode, floor_year
 
         def _cursor_floor(
-            self, table_name: str, namespace: str | None, cursor_field: str
+            self,
+            table_name: str,
+            namespace: str | None,
+            cursor_field: str,
+            floor_year: int = _DEFAULT_COALESCE_FLOOR_YEAR,
         ) -> tuple[Any, str]:
             """Deterministic floor used to substitute a null cursor under
             ``cursor_nulls=coalesce``. Returns ``(floor, kind)`` where the
@@ -4866,13 +4892,15 @@ def register_lakeflow_source(spark):
             values aren't representable, so same-floor nulls fall back to the
             complete-cohort handling).
 
-            Temporal floors use ``2000-01-01`` rather than the EDM minimum:
-            modification/created timestamps are comfortably after it, every
-            OData server parses it cleanly, and it keeps the synthetic
-            watermark readable. (A real cursor value *before* 2000-01-01 only
-            matters if a synthetic floor is ever committed as the watermark —
-            i.e. a batch with no real-cursor rows — which doesn't arise for
-            the modification-timestamp cursors this targets.)
+            Temporal floors use ``<floor_year>-01-01`` (default ``2000``,
+            configurable via ``cursor_nulls=coalesce:<YYYY>``) rather than the
+            EDM minimum: modification/created timestamps are comfortably after
+            it, every OData server parses it cleanly, and it keeps the
+            synthetic watermark readable. (A real cursor value *before* the
+            floor only matters if a synthetic floor is ever committed as the
+            watermark — i.e. a batch with no real-cursor rows — which doesn't
+            arise for the modification-timestamp cursors this targets; lower
+            the year if your data predates it.)
 
             Raises ``ValueError`` for cursor types with no well-defined floor
             (boolean/binary/etc.); pick ``cursor_nulls=ignore``/``error`` or a
@@ -4883,9 +4911,9 @@ def register_lakeflow_source(spark):
                 (f.dataType for f in self._own_fields_for_et(et) if f.name == cursor_field), None
             )
             if isinstance(dtype, TimestampType):
-                return "2000-01-01T00:00:00", "datetime"
+                return f"{floor_year:04d}-01-01T00:00:00", "datetime"
             if isinstance(dtype, DateType):
-                return "2000-01-01", "date"
+                return f"{floor_year:04d}-01-01", "date"
             if isinstance(dtype, (IntegerType, LongType)):
                 return -(2**63), "int"
             if isinstance(dtype, (DecimalType, DoubleType, FloatType)):
@@ -4923,13 +4951,13 @@ def register_lakeflow_source(spark):
             * ``ignore`` — ``skip_null`` is True; null-cursor rows are dropped
               (never emitted), so they don't block watermark progress.
             """
-            mode = self._cursor_nulls_mode(table_options)
+            mode, floor_year = self._parse_cursor_nulls(table_options)
             if mode == "ignore":
                 return True, (lambda row: row.get(cursor_field))
             if mode == "error":
                 return False, (lambda row: row.get(cursor_field))
             try:
-                floor, kind = self._cursor_floor(table_name, namespace, cursor_field)
+                floor, kind = self._cursor_floor(table_name, namespace, cursor_field, floor_year)
             except ValueError:
                 # No synthesisable floor for this cursor type. ``coalesce`` is
                 # the default, so silently fall back to ``error`` behaviour
