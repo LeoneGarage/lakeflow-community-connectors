@@ -52,6 +52,14 @@ MAX_CONTAINED_DEPTH = 10
 # ``@odata.nextLink`` chase at every level.
 MIN_DYNAMIC_TOP = 5
 
+# Default ``page_size`` applied to **cursor-based** reads (cursor_field
+# or delta) when the user didn't set one, so a ``$top`` is still sent.
+# Snapshot reads deliberately omit ``$top`` entirely when ``page_size``
+# is unset (see ``_format_query_params``) — letting the server choose
+# its page size avoids servers that reject an explicit ``$top``. Cursor
+# reads keep a bounded page for predictable incremental batches.
+DEFAULT_PAGE_SIZE = "1000"
+
 
 _TOP_PARAM_RE = re.compile(r"(?<=[?&])(\$top=|%24top=)\d+", re.IGNORECASE)
 

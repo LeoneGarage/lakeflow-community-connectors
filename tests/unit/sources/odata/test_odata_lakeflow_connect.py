@@ -2544,6 +2544,29 @@ def test_top_emitted_when_page_size_set():
 
 
 @responses.activate
+def test_page_size_default_split_by_ingest_type():
+    """``read_table`` defaults ``page_size`` only for cursor-based ingest:
+    a ``cursor_field`` read with no ``page_size`` still sends ``$top=1000``
+    (bounded incremental pages), while a snapshot read with no
+    ``page_size`` sends no ``$top`` at all (server picks the page size)."""
+    _mock_metadata()
+    captured = []
+
+    def cb(req):
+        captured.append(req.url)
+        return (200, {}, json.dumps({"value": []}))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Customers", callback=cb)
+    c = _make()
+    # Snapshot (no cursor_field, no page_size) → no $top.
+    list(c.read_table("Customers", None, {})[0])
+    assert "$top" not in captured[-1]
+    # Cursor-based (cursor_field, no page_size) → default $top=1000.
+    list(c.read_table("Customers", {}, {"cursor_field": "ModifiedAt"})[0])
+    assert "$top=1000" in captured[-1]
+
+
+@responses.activate
 def test_build_contained_url_three_level():
     _mock_nested_metadata()
     c = _make()
@@ -4151,6 +4174,8 @@ def test_contained_npp_filter_at_composes_with_cursor_at_same_level():
         match=[
             responses.matchers.query_param_matcher(
                 {
+                    # Cursor-based read → default page_size, so $top is sent.
+                    "$top": "1000",
                     "$filter": "(ModifiedAt gt 2024-01-01T00:00:00Z) and (Label eq 'a')",
                     "$orderby": "ModifiedAt asc,Id asc",
                 }

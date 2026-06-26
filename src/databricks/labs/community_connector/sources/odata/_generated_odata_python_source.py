@@ -671,6 +671,14 @@ def register_lakeflow_source(spark):
     # ``@odata.nextLink`` chase at every level.
     MIN_DYNAMIC_TOP = 5
 
+    # Default ``page_size`` applied to **cursor-based** reads (cursor_field
+    # or delta) when the user didn't set one, so a ``$top`` is still sent.
+    # Snapshot reads deliberately omit ``$top`` entirely when ``page_size``
+    # is unset (see ``_format_query_params``) — letting the server choose
+    # its page size avoids servers that reject an explicit ``$top``. Cursor
+    # reads keep a bounded page for predictable incremental batches.
+    DEFAULT_PAGE_SIZE = "1000"
+
 
     _TOP_PARAM_RE = re.compile(r"(?<=[?&])(\$top=|%24top=)\d+", re.IGNORECASE)
 
@@ -2701,6 +2709,10 @@ def register_lakeflow_source(spark):
             segments = parse_contained_path(table_name) or [table_name]
             namespace = opts.get("namespace")
             cursor_field = opts.get("cursor_field")
+            if cursor_field:
+                # Cursor-based read: default page_size so a $top is sent.
+                # Snapshot partitioning leaves it unset → no $top.
+                opts = {**opts, "page_size": opts.get("page_size", DEFAULT_PAGE_SIZE)}
             # ``cursor_lower`` is "what we've already read up to" — used
             # by read_partition as ``cursor gt cursor_lower``. ``end`` is
             # the previously-probed fence; we stamp it onto each row's
@@ -2737,6 +2749,10 @@ def register_lakeflow_source(spark):
                 return records
             segments = parse_contained_path(table_name) or [table_name]
             cursor_field = opts.get("cursor_field")
+            if cursor_field:
+                # Cursor-based read: default page_size so a $top is sent.
+                # Snapshot partitioning leaves it unset → no $top.
+                opts = {**opts, "page_size": opts.get("page_size", DEFAULT_PAGE_SIZE)}
             top_parent_rows = partition["top_parent_rows"]
             cursor_lower = partition.get("cursor_lower")
             return self._iter_partition_rows(
@@ -3438,8 +3454,15 @@ def register_lakeflow_source(spark):
                         "or ingest the parent set directly."
                     )
                 if self._expand_contained_active(opts):
+                    # Cursor-based expand keeps a default $top (page_size);
+                    # snapshot expand omits $top when page_size is unset.
+                    if opts.get("cursor_field"):
+                        opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
                     return self._read_contained_expand(table_name, start_offset, opts)
                 if opts.get("cursor_field"):
+                    # Cursor-based read: default page_size so a $top is sent.
+                    # Snapshot (the branch below) leaves it unset → no $top.
+                    opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
                     return self._read_contained_incremental(
                         table_name, start_offset, opts, opts["cursor_field"]
                     )
@@ -3452,8 +3475,13 @@ def register_lakeflow_source(spark):
                 or "next_link" in offset
                 or self._delta_active_for(table_name, opts)
             ):
+                # Delta (CDC) is cursor-based — keep a default $top.
+                opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
                 return self._read_incremental_delta(table_name, offset, opts)
             if opts.get("cursor_field"):
+                # Cursor-based read: default page_size so a $top is sent.
+                # Snapshot (the branch below) leaves it unset → no $top.
+                opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
                 return self._read_incremental(table_name, start_offset, opts, opts["cursor_field"])
             return self._read_snapshot(table_name, opts)
 
@@ -5363,6 +5391,7 @@ def register_lakeflow_source(spark):
     _trim_to_distinct_cursor_boundary = trim_to_distinct_cursor_boundary
     _trim_to_distinct_cursor_boundary = trim_to_distinct_cursor_boundary
     _CONTAINED_PATH_SEP = CONTAINED_PATH_SEP
+    _DEFAULT_PAGE_SIZE = DEFAULT_PAGE_SIZE
     _combine_filters = combine_filters
     _join_url = join_url
     _odata_literal = odata_literal

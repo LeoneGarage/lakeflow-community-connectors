@@ -18,7 +18,8 @@ Per-table options (allowlisted via externalOptionsAllowList):
     cursor_field          column to drive incremental reads; absent → snapshot
     select                comma-separated $select projection
     filter                additional $filter expression
-    page_size             $top per request; unset → no $top sent (server default)
+    page_size             $top per request; unset → no $top for snapshot
+                          ingest (server default), 1000 for cursor/delta ingest
     max_records_per_batch cap rows returned per read_table call (default 10000)
     delta_tracking        disabled (default) | auto | enabled. Opt-in.
                           When the source honours ``Prefer: odata.track-changes``
@@ -78,6 +79,7 @@ from databricks.labs.community_connector.sources.odata._helpers import (
 )
 from databricks.labs.community_connector.sources.odata._contained import (
     CONTAINED_PATH_SEP as _CONTAINED_PATH_SEP,
+    DEFAULT_PAGE_SIZE as _DEFAULT_PAGE_SIZE,
     MAX_CONTAINED_DEPTH as _MAX_CONTAINED_DEPTH,
     ContainedNavMixin,
     combine_filters as _combine_filters,
@@ -595,8 +597,15 @@ class ODataLakeflowConnect(
                     "or ingest the parent set directly."
                 )
             if self._expand_contained_active(opts):
+                # Cursor-based expand keeps a default $top (page_size);
+                # snapshot expand omits $top when page_size is unset.
+                if opts.get("cursor_field"):
+                    opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
                 return self._read_contained_expand(table_name, start_offset, opts)
             if opts.get("cursor_field"):
+                # Cursor-based read: default page_size so a $top is sent.
+                # Snapshot (the branch below) leaves it unset → no $top.
+                opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
                 return self._read_contained_incremental(
                     table_name, start_offset, opts, opts["cursor_field"]
                 )
@@ -609,8 +618,13 @@ class ODataLakeflowConnect(
             or "next_link" in offset
             or self._delta_active_for(table_name, opts)
         ):
+            # Delta (CDC) is cursor-based — keep a default $top.
+            opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
             return self._read_incremental_delta(table_name, offset, opts)
         if opts.get("cursor_field"):
+            # Cursor-based read: default page_size so a $top is sent.
+            # Snapshot (the branch below) leaves it unset → no $top.
+            opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
             return self._read_incremental(table_name, start_offset, opts, opts["cursor_field"])
         return self._read_snapshot(table_name, opts)
 
