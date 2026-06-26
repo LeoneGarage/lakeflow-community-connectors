@@ -643,19 +643,17 @@ entity set name appears in two schemas, set the `namespace` table option:
   commits at every parent-walk boundary.
 - Batch reads (`LakeflowBatchReader`, used by
   `spark.read.format("lakeflow_connect")`) call `read_table` with
-  `start_offset=None` and discard the returned end-offset. Because the
-  offset never survives to resume from, `max_records_per_batch` can
-  only truncate the read and silently drop the remainder there — it
-  can do nothing *correct*. So in batch mode the connector
-  **always disables the cap**, even when the user sets one explicitly
-  (a `WARNING` names the ignored value), and the chain drains fully in
-  one call. To bound memory while it does, the cursor read paths
-  **stream lazily** in batch mode (flat, contained N+1, and
-  `expand_contained=true`): leaf rows are yielded a page (or one
-  flattened `$expand` response) at a time instead of being
-  materialised into one list, so an uncapped batch's peak memory is a
-  single response, not the whole result set. If you need a genuine
-  per-batch cap with resume, use a **streaming** table (the SDP
-  default) — streaming triggers always pass a dict offset, keep the
-  cap, and park continuation state (`chain_next_link` /
-  `pending_fetches`) across micro-batches.
+  `start_offset=None` and discard the returned end-offset. Since there
+  is no offset to resume from, the connector **reads the whole table in
+  one call** rather than across capped batches: `max_records_per_batch`
+  is disabled in batch mode (a `WARNING` notes when an explicitly-set
+  value is being ignored) so the chain drains fully. To keep memory
+  bounded while it does, the cursor read paths **stream lazily** in
+  batch mode (flat, contained N+1, and `expand_contained=true`): leaf
+  rows are yielded a page (or one flattened `$expand` response) at a
+  time instead of being collected into one list, so peak memory is a
+  single response, not the whole result set. For a per-batch cap with
+  resume across batches, use a **streaming** table (the SDP default) —
+  streaming triggers pass a dict offset, honour the cap, and park
+  continuation state (`chain_next_link` / `pending_fetches`) across
+  micro-batches.
