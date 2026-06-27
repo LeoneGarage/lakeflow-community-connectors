@@ -2950,6 +2950,50 @@ def test_pagination_keyset_inner_expand_continuation_resumes_across_batches():
 
 
 @responses.activate
+def test_pagination_no_progress_guard_stops_repeated_keyset_page(caplog):
+    """A server that returns the same full page regardless of the keyset
+    seek would loop forever. The no-progress guard detects the identical
+    continuation page and stops, emitting each row exactly once and
+    logging a warning."""
+    _mock_metadata()
+    calls = []
+
+    def cb(req):
+        calls.append(req.url)
+        # Always the same full page (== $top=2), no nextLink, $filter ignored.
+        return (200, {}, json.dumps({"value": [{"Id": 1, "Name": "a"}, {"Id": 2, "Name": "b"}]}))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Customers", callback=cb)
+    c = _make()
+    with caplog.at_level(logging.WARNING):
+        records, _ = c.read_table("Customers", None, {"pagination": "keyset", "page_size": "2"})
+        rows = list(records)
+    assert [r["Id"] for r in rows] == [1, 2]  # emitted once, not duplicated/looped
+    assert len(calls) == 2  # page 1 + the one dup-detection fetch, then stop
+    assert "made no progress" in caplog.text
+
+
+@responses.activate
+def test_pagination_no_progress_guard_stops_ignored_skip():
+    """``skip`` against a server that ignores ``$skip`` returns the same
+    page each time; the guard stops instead of looping (no $orderby keys,
+    so the keyset path never engages — this exercises the skip branch)."""
+    _mock_metadata()
+    calls = []
+
+    def cb(req):
+        calls.append(req.url)
+        return (200, {}, json.dumps({"value": [{"Id": 1, "Name": "a"}, {"Id": 2, "Name": "b"}]}))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Customers", callback=cb)
+    c = _make()
+    records, _ = c.read_table("Customers", None, {"pagination": "skip", "page_size": "2"})
+    rows = list(records)
+    assert [r["Id"] for r in rows] == [1, 2]
+    assert len(calls) == 2
+
+
+@responses.activate
 def test_build_contained_url_three_level():
     _mock_nested_metadata()
     c = _make()

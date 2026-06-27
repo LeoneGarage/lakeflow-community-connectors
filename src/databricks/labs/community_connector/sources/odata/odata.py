@@ -1410,7 +1410,11 @@ class ODataLakeflowConnect(
           back to keyset (when the ``$orderby`` has keys) or skip.
 
         Termination is a short page (``len < $top``); ``$top`` must be
-        present (callers force a default ``page_size`` in these modes).
+        present (callers force a default ``page_size`` in these modes). A
+        no-progress guard also stops the walk if a client-computed
+        continuation returns a page identical to the one it continued from —
+        a server that ignores the seek/``$skip`` would otherwise loop
+        forever.
         """
         session = self._get_session()
         top = _pg_parse_top(url)
@@ -1419,20 +1423,40 @@ class ODataLakeflowConnect(
         base_skip = int(_pg_get_query(url, "$skip") or _pg_get_query(url, "%24skip") or 0)
         fetched = 0
         cur_url: str | None = url
+        # Fingerprint of the page we last issued a client-computed continuation
+        # from. If the next fetch returns an identical page, the server is
+        # ignoring our seek/$skip and we'd loop forever — stop instead (without
+        # re-yielding the duplicate, which was already emitted last iteration).
+        prev_fp: int | None = None
         while cur_url is not None:
             resp, payload = self._fetch_page_payload(session, cur_url)
             page_rows = [
                 {k: v for k, v in item.items() if not k.startswith("@odata.")}
                 for item in payload.get("value", [])
             ]
-            fetched += len(page_rows)
             raw_next = payload.get("@odata.nextLink")
             if mode == "auto" and raw_next:
-                # Server is paginating — defer to its link for this step.
+                # Server is paginating — defer to its link for this step. Not a
+                # client-computed continuation, so reset the no-progress guard.
+                fetched += len(page_rows)
+                prev_fp = None
                 nxt = self._resolve_next_link(resp.url, raw_next)
                 yield page_rows, nxt
                 cur_url = nxt
                 continue
+            fp = hash(repr(page_rows))
+            if page_rows and prev_fp is not None and fp == prev_fp:
+                _LOG.warning(
+                    "pagination=%s made no progress on %r: the continuation "
+                    "returned an identical page, so the server is ignoring the "
+                    "seek/$skip. Stopping this collection to avoid an infinite "
+                    "loop; some rows may be unread. Use pagination=nextlink if "
+                    "the server emits @odata.nextLink.",
+                    mode,
+                    cur_url,
+                )
+                return
+            fetched += len(page_rows)
             if top is None or not page_rows or len(page_rows) < top:
                 # Short page (or unsized) ⇒ collection exhausted.
                 yield page_rows, None
@@ -1449,6 +1473,9 @@ class ODataLakeflowConnect(
                     nxt = _pg_set_query(url, "$skip", str(base_skip + fetched))
             else:
                 nxt = _pg_set_query(url, "$skip", str(base_skip + fetched))
+            # Remember this page so the next fetch can detect a server that
+            # returns it again (ignoring the continuation we just built).
+            prev_fp = fp
             yield page_rows, nxt
             cur_url = nxt
 
