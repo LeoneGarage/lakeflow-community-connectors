@@ -77,11 +77,22 @@ from databricks.labs.community_connector.interface.supports_namespaces import (
 from databricks.labs.community_connector.sources.odata._helpers import (
     trim_to_distinct_cursor_boundary as _trim_to_distinct_cursor_boundary,
 )
+
+# Note: the ``_pg_*`` client-side pagination URL helpers live in ``_contained``
+# (so the inner-``$expand`` continuation builder can share them without an
+# import cycle); they're re-exported here for ``_client_paginate_pages`` and
+# existing ``from ...odata.odata import _pg_*`` callers.
 from databricks.labs.community_connector.sources.odata._contained import (
     CONTAINED_PATH_SEP as _CONTAINED_PATH_SEP,
     DEFAULT_PAGE_SIZE as _DEFAULT_PAGE_SIZE,
     MAX_CONTAINED_DEPTH as _MAX_CONTAINED_DEPTH,
     ContainedNavMixin,
+    _pg_get_query,
+    _pg_keyset_filter,
+    _pg_orderby_keys,
+    _pg_parse_top,
+    _pg_set_query,
+    _pg_with_extra_filter,
     combine_filters as _combine_filters,
     contained_nav_props as _contained_nav_props,
     fk_column_name as _fk_column_name,
@@ -143,6 +154,22 @@ _SEQUENCE_COL = "_lc_sequence"
 # only ever compares ``<= len(emitted)``; any value larger than what a
 # single ingestion could plausibly buffer works.
 _BATCH_UNCAPPED = 10**12
+
+# Pagination strategy for walking a collection's pages:
+#   * nextlink (default) — follow the server's ``@odata.nextLink``; the
+#     spec-compliant default, byte-identical to historical behaviour.
+#   * keyset — ignore ``@odata.nextLink``; seek the next page via a
+#     ``(k gt last)`` predicate on the ``$orderby`` key set. For servers
+#     that page-limit a response but omit the continuation link.
+#   * skip — ignore ``@odata.nextLink``; page via ``$top`` + ``$skip``.
+#     The keyless fallback (entities with no unique sort key); O(n)
+#     offsets and fragile under concurrent writes.
+#   * auto — follow ``@odata.nextLink`` while emitted; if a *full* page
+#     (``len == $top``) arrives with no link, fall back to keyset (when
+#     the ``$orderby`` has keys) or skip for the rest of that collection.
+# keyset/skip/auto require a ``$top`` to size pages and detect
+# truncation, so they force a default ``page_size`` when none is set.
+_PAGINATION_MODES = frozenset({"nextlink", "keyset", "skip", "auto"})
 # Monotonic across the whole process — guarantees each emitted record
 # has a strictly increasing sequence value, so apply_changes can pick a
 # deterministic winner when the same primary key appears multiple times
@@ -569,6 +596,16 @@ class ODataLakeflowConnect(
         # ``_read_contained_expand``) so an uncapped batch doesn't
         # materialise the whole result set in memory.
         opts = dict(table_options or {})
+        # Pagination strategy for this read. keyset/skip/auto drive
+        # pagination client-side (for servers that omit @odata.nextLink)
+        # and need a $top to size pages, so force a default page_size when
+        # the user left it unset. Held on ``self`` for the duration of the
+        # read so the shared fetch primitives pick it up without threading
+        # it through every call site; defaults to nextlink (today's
+        # behaviour) for any path that doesn't set it.
+        self._pagination = self._parse_pagination(opts)
+        if self._pagination != "nextlink":
+            opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
         if start_offset is None:
             if "max_records_per_batch" in opts:
                 _LOG.warning(
@@ -1292,29 +1329,44 @@ class ODataLakeflowConnect(
         return "&".join(params)
 
     def _fetch_pages(self, url: str) -> Iterator[dict]:
-        """Walk @odata.nextLink, yielding raw JSON dicts (no coercion).
+        """Walk a collection's pages, yielding raw JSON dicts (no coercion).
 
-        The OData v4 spec allows @odata.nextLink to be either an absolute
-        URL or a relative one (resolved against the request URL). Some
-        services (e.g. SAP NetWeaver Gateway, certain self-hosted Olingo
-        deployments) return just ``Customers?$skiptoken=...`` and rely on
-        the client to prepend the service root. urljoin handles both
-        cases — absolutes pass through unchanged.
+        Thin row-flattening wrapper over :meth:`_fetch_pages_with_links`,
+        which handles the pagination strategy (nextlink / keyset / skip /
+        auto). The whole collection is drained within this call.
         """
         for page_rows, _ in self._fetch_pages_with_links(url):
             yield from page_rows
 
-    def _fetch_pages_with_links(self, url: str) -> Iterator[tuple[list[dict], str | None]]:
-        """Page-aware variant of ``_fetch_pages``: yields
-        ``(page_rows, next_url)`` for each HTTP response.
+    def _parse_pagination(self, table_options: dict[str, str] | None) -> str:
+        """Parse + validate the ``pagination`` table option."""
+        raw = ((table_options or {}).get("pagination") or "nextlink").strip().lower()
+        if raw not in _PAGINATION_MODES:
+            raise ValueError(
+                f"Invalid pagination={raw!r}. Expected one of: " f"{sorted(_PAGINATION_MODES)}."
+            )
+        return raw
 
-        Lets callers checkpoint at page boundaries — the yielded
-        ``next_url`` is the resolved @odata.nextLink (or ``None`` when
-        the chain is exhausted). Resuming from that link on a later
-        call hands the server back its own opaque skiptoken; the server
-        picks up exactly where it left off without the caller needing
-        to reconstruct ``$filter``/``$orderby``/``$select`` state.
+    def _fetch_pages_with_links(self, url: str) -> Iterator[tuple[list[dict], str | None]]:
+        """Page-aware fetch: yields ``(page_rows, next_url)`` per response,
+        where ``next_url`` resumes the next page (``None`` at the end).
+
+        The yielded ``next_url`` is an opaque resume checkpoint — callers
+        park it to continue across batches without reconstructing query
+        state. What it *is* depends on ``pagination`` (``self._pagination``,
+        default ``nextlink``):
+
+        * ``nextlink`` — the server's resolved ``@odata.nextLink`` (its own
+          opaque skiptoken). Spec-compliant default.
+        * ``keyset`` / ``skip`` / ``auto`` — a connector-built URL (a
+          ``(k gt last)`` seek on the ``$orderby`` key set, or ``$top`` +
+          ``$skip``), for servers that page-limit a response but omit the
+          continuation link. See :meth:`_client_paginate_pages`.
         """
+        mode = getattr(self, "_pagination", "nextlink")
+        if mode != "nextlink":
+            yield from self._client_paginate_pages(url, mode)
+            return
         session = self._get_session()
         next_url: str | None = url
         while next_url:
@@ -1327,6 +1379,69 @@ class ODataLakeflowConnect(
             new_next = self._resolve_next_link(resp.url, raw_next) if raw_next else None
             yield page_rows, new_next
             next_url = new_next
+
+    def _client_paginate_pages(
+        self, url: str, mode: str
+    ) -> Iterator[tuple[list[dict], str | None]]:
+        """Client-driven pagination for servers that don't (always) emit
+        ``@odata.nextLink``. Yields ``(page_rows, next_url)`` like
+        :meth:`_fetch_pages_with_links`, where ``next_url`` is a
+        connector-built resume URL (``None`` at the end):
+
+        * ``keyset`` — seek the next page with a ``(k gt last)`` predicate
+          on the ``$orderby`` key set, rebuilt from the original URL each
+          page (so a same-collection walk never accumulates seeks). Commits
+          to ``$skip`` for the rest of the collection if a boundary value is
+          null (no comparable seek).
+        * ``skip`` — ``$top`` + ``$skip`` offset paging, continuing from any
+          ``$skip`` already on the URL (so a parked checkpoint resumes at
+          the right offset).
+        * ``auto`` — trust ``@odata.nextLink`` whenever the server emits it;
+          when a *full* page (``len == $top``) arrives with no link, fall
+          back to keyset (when the ``$orderby`` has keys) or skip.
+
+        Termination is a short page (``len < $top``); ``$top`` must be
+        present (callers force a default ``page_size`` in these modes).
+        """
+        session = self._get_session()
+        top = _pg_parse_top(url)
+        order_keys = _pg_orderby_keys(url)
+        can_keyset = mode in ("keyset", "auto") and bool(order_keys)
+        base_skip = int(_pg_get_query(url, "$skip") or _pg_get_query(url, "%24skip") or 0)
+        fetched = 0
+        cur_url: str | None = url
+        while cur_url is not None:
+            resp, payload = self._fetch_page_payload(session, cur_url)
+            page_rows = [
+                {k: v for k, v in item.items() if not k.startswith("@odata.")}
+                for item in payload.get("value", [])
+            ]
+            fetched += len(page_rows)
+            raw_next = payload.get("@odata.nextLink")
+            if mode == "auto" and raw_next:
+                # Server is paginating — defer to its link for this step.
+                nxt = self._resolve_next_link(resp.url, raw_next)
+                yield page_rows, nxt
+                cur_url = nxt
+                continue
+            if top is None or not page_rows or len(page_rows) < top:
+                # Short page (or unsized) ⇒ collection exhausted.
+                yield page_rows, None
+                return
+            if can_keyset:
+                seek = _pg_keyset_filter(order_keys, page_rows[-1])
+                if seek is not None:
+                    nxt = _pg_with_extra_filter(url, seek)
+                else:
+                    # Null boundary value — no comparable keyset seek;
+                    # commit to offset paging for the rest of this walk so
+                    # keyset and skip positions can't interleave.
+                    can_keyset = False
+                    nxt = _pg_set_query(url, "$skip", str(base_skip + fetched))
+            else:
+                nxt = _pg_set_query(url, "$skip", str(base_skip + fetched))
+            yield page_rows, nxt
+            cur_url = nxt
 
     def _resolve_next_link(self, request_url: str, raw_next: str) -> str:
         """Resolve an ``@odata.nextLink`` against the request URL.
