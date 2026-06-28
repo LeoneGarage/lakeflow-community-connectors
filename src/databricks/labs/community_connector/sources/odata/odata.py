@@ -2705,7 +2705,7 @@ class ODataLakeflowConnect(
             raise ValueError(f"cursor_lookback_max_seconds must be > 0; got {val}.")
         return val
 
-    def _resolve_active_lookback(self, start_offset: dict | None) -> int:
+    def _resolve_active_lookback(self, start_offset: dict | None) -> float:
         """Seconds to subtract from the committed watermark for THIS read.
 
         Static mode → the configured integer. ``auto`` → the **max** walk
@@ -2714,7 +2714,14 @@ class ODataLakeflowConnect(
         to ``cursor_lookback_max_seconds``; ``0`` until the first walk has
         been measured. Held on ``self`` for the read so
         ``_apply_cursor_lookback`` can read it without threading the offset
-        through ``_cursor_expand_clause``."""
+        through ``_cursor_expand_clause``.
+
+        The ``auto`` value keeps **sub-second (down to nanosecond) precision**
+        — a fast walk only needs a fast overlap, and the mid-walk-arrival
+        window is itself sub-second on a small/fast source, so flooring to
+        whole seconds would collapse a 0.3s walk's window to a useless 0 and
+        strand rows that landed a few ms below the watermark. ``timedelta`` (in
+        ``_apply_cursor_lookback``) accepts the float directly."""
         mode = getattr(self, "_cursor_lookback", "auto")
         if mode != "auto":
             return int(mode)
@@ -2725,7 +2732,7 @@ class ODataLakeflowConnect(
         ceiling = getattr(
             self, "_cursor_lookback_max_seconds", _LOOKBACK_AUTO_DEFAULT_CEILING_SECONDS
         )
-        return min(round(max(history) * factor), ceiling)
+        return min(round(max(history) * factor, 9), ceiling)
 
     def _attach_lookback_state(
         self, out_offset: dict, start_offset: dict | None, in_flight: bool, elapsed: float
@@ -2734,18 +2741,23 @@ class ODataLakeflowConnect(
         No-op for static/off modes (nothing to measure).
 
         ``lb_history`` is a rolling list of the last ``_LOOKBACK_AUTO_WINDOW``
-        completed-walk durations (seconds); ``_resolve_active_lookback`` sizes
-        the window from its max.
+        completed-walk durations (seconds, down to nanosecond precision);
+        ``_resolve_active_lookback`` sizes the window from its max.
 
         * In-flight (the walk spans more cap-resume batches): carry the prior
           history unchanged so the read floor stays stable until completion.
         * Idled (``out_offset is start_offset`` — quiescent overlap re-read):
           keep the prior history; a quiescent walk only re-reads the small
           overlap and would under-represent a real walk.
-        * Completed a progressing walk >= 1s: append this batch's wall-clock
-          ``elapsed`` (capped to the last N). Sub-second walks aren't
-          recorded — the offset stays minimal and a fast source behaves like
-          the no-overlap default.
+        * Completed a progressing walk: append this batch's wall-clock
+          ``elapsed`` (rounded to nanoseconds, capped to the last N).
+          Sub-second walks ARE recorded — on a small/fast source the
+          mid-walk-arrival window is itself sub-second, so a sub-second
+          overlap is exactly what recovers rows that landed just below the
+          committed watermark; the old whole-second rounding floored those to
+          a zero window and stranded them. Idle/empty batches never reach
+          here (``out_offset is start_offset``), so only real walks are
+          captured — never a no-op zero.
         """
         if getattr(self, "_cursor_lookback", "auto") != "auto":
             return out_offset
@@ -2753,8 +2765,8 @@ class ODataLakeflowConnect(
             return out_offset
         history = list((start_offset or {}).get("lb_history") or [])
         if not in_flight:
-            measured = round(elapsed)
-            if measured >= 1:
+            measured = round(elapsed, 9)
+            if measured > 0:
                 history.append(measured)
                 history = history[-_LOOKBACK_AUTO_WINDOW:]
         if not history:

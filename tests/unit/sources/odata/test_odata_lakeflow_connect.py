@@ -96,6 +96,14 @@ def _make(options=None):
     return ODataLakeflowConnect(base)
 
 
+def _drop_lb(offset):
+    """Strip the ``auto`` cursor_lookback bookkeeping (``lb_history``) from an
+    offset for stable equality asserts. Its value is the measured wall-clock of
+    the (now sub-second-recorded) walk, so it's non-deterministic across runs —
+    tests assert the cursor/resume state, not the timing bookkeeping."""
+    return {k: v for k, v in (offset or {}).items() if k != "lb_history"}
+
+
 # ---------------------------------------------------------------------------
 # Static helpers
 # ---------------------------------------------------------------------------
@@ -2962,7 +2970,7 @@ def test_pagination_keyset_splits_same_cursor_cohort_in_contained_leaf_walk():
         {"cursor_field": "ModifiedAt", "pagination": "keyset", "page_size": "2"},
     )
     assert [r["Id"] for r in rows] == [11, 12, 13]
-    assert offset == {"cursor": same}
+    assert _drop_lb(offset) == {"cursor": same}
 
 
 @responses.activate
@@ -3319,6 +3327,11 @@ def test_cursor_lookback_auto_resolve_max_of_recent_scaled_clamped():
     assert c._resolve_active_lookback({}) == 0  # no history yet
     assert c._resolve_active_lookback({"lb_history": [40, 100, 60]}) == 150  # max(100) × 1.5
     assert c._resolve_active_lookback({"lb_history": [100000]}) == 3600  # clamped
+    # sub-second history -> sub-second window (no floor to 0)
+    assert c._resolve_active_lookback({"lb_history": [0.3]}) == 0.45  # max(0.3) × 1.5
+    assert c._resolve_active_lookback({"lb_history": [0.02, 0.3, 0.1]}) == 0.45  # max(0.3) × 1.5
+    # nanosecond-scale history survives (9 dp), not floored to zero
+    assert c._resolve_active_lookback({"lb_history": [0.000000002]}) == 0.000000003  # ×1.5
     # custom factor / ceiling
     c._cursor_lookback_factor = 3.0
     c._cursor_lookback_max_seconds = 250
@@ -3329,12 +3342,12 @@ def test_cursor_lookback_auto_resolve_max_of_recent_scaled_clamped():
 
 
 def test_cursor_lookback_auto_attach_history():
-    """``auto`` appends a >=1s walk to a rolling last-N history, omits
-    sub-second walks, carries prior while in-flight, leaves idle/static
-    offsets untouched."""
+    """``auto`` appends every completed progressing walk (including sub-second,
+    at ms precision) to a rolling last-N history, carries prior while
+    in-flight, leaves idle/static offsets untouched."""
     c = _make()
     c._cursor_lookback = "auto"
-    # completed progressing walk >= 1s -> append
+    # completed progressing walk -> append
     assert c._attach_lookback_state({"cursor": "X"}, {}, False, 12.0) == {
         "cursor": "X",
         "lb_history": [12],
@@ -3346,11 +3359,16 @@ def test_cursor_lookback_auto_attach_history():
         "cursor": "X",
         "lb_history": [2, 3, 4, 5, 9],
     }
-    # sub-second walk -> not recorded; empty prior stays clean, prior carried
-    assert c._attach_lookback_state({"cursor": "X"}, {}, False, 0.2) == {"cursor": "X"}
-    assert c._attach_lookback_state({"cursor": "X"}, {"lb_history": [7]}, False, 0.2) == {
+    # sub-second walk -> NOW recorded (down to nanosecond precision), so a fast
+    # source still gets a (fast) overlap window instead of zero
+    assert c._attach_lookback_state({"cursor": "X"}, {}, False, 0.2) == {
         "cursor": "X",
-        "lb_history": [7],
+        "lb_history": [0.2],
+    }
+    # nanosecond-scale walk is kept (rounded to 9 dp), not floored to zero
+    assert c._attach_lookback_state({"cursor": "X"}, {"lb_history": [7]}, False, 0.000000123) == {
+        "cursor": "X",
+        "lb_history": [7, 0.000000123],
     }
     # in-flight carries the prior history unchanged
     assert c._attach_lookback_state({"pending_fetches": []}, {"lb_history": [9]}, True, 0.0) == {
@@ -3895,7 +3913,7 @@ def test_pagination_keyset_drains_server_pages_below_requested_top():
         {"cursor_field": "ModifiedAt", "pagination": "keyset", "page_size": "1000"},
     )
     assert [r["Id"] for r in rows] == [10, 11, 12, 13, 14, 15, 16]  # all 7, not just first 3
-    assert offset == {"cursor": "2024-01-07T00:00:00Z"}
+    assert _drop_lb(offset) == {"cursor": "2024-01-07T00:00:00Z"}
 
 
 @responses.activate
@@ -4687,7 +4705,7 @@ def test_contained_expand_cursor_chain_completion_advances_watermark():
         {"expand_contained": "true", "cursor_field": "ModifiedAt"},
     )
     list(records)
-    assert offset == {"cursor": "2024-07-10T00:00:00Z"}
+    assert _drop_lb(offset) == {"cursor": "2024-07-10T00:00:00Z"}
 
 
 @responses.activate
@@ -4722,7 +4740,7 @@ def test_contained_expand_cursor_resume_with_empty_chain_advances_offset():
     assert rows == []
     # Offset MUST advance — empty dict signals chain terminal so the
     # framework stops re-issuing the same resume offset.
-    assert offset == {}
+    assert _drop_lb(offset) == {}
     # Follow-up trigger with the new (empty) offset must not loop: a
     # fresh top-level fetch returns whatever the table has now and
     # the connector goes through the first-call path without a
@@ -4735,7 +4753,7 @@ def test_contained_expand_cursor_resume_with_empty_chain_advances_offset():
         {"expand_contained": "true", "cursor_field": "ModifiedAt"},
     )
     assert list(records2) == []
-    assert offset2 == {}
+    assert _drop_lb(offset2) == {}
 
 
 @responses.activate
@@ -5786,7 +5804,7 @@ def test_contained_expand_with_ancestor_cursor_injects_filter_into_expand():
             "ModifiedAt": "2024-01-02T00:00:00Z",
         }
     ]
-    assert offset == {"cursor": "2024-01-02T00:00:00Z"}
+    assert _drop_lb(offset) == {"cursor": "2024-01-02T00:00:00Z"}
 
 
 @responses.activate
@@ -5876,7 +5894,7 @@ def test_contained_incremental_first_call_no_filter():
     records, offset = c.read_table("Parents__Children", {}, {"cursor_field": "ModifiedAt"})
     rows = list(records)
     assert len(rows) == 2
-    assert offset == {"cursor": "2024-01-02T00:00:00Z"}
+    assert _drop_lb(offset) == {"cursor": "2024-01-02T00:00:00Z"}
     # First leaf call has no cursor filter
     assert "$filter" not in responses.calls[1].request.url
 
@@ -5902,7 +5920,7 @@ def test_contained_incremental_resume_applies_cursor_filter():
     )
     rows = list(records)
     assert len(rows) == 1
-    assert offset == {"cursor": "2024-01-03T00:00:00Z"}
+    assert _drop_lb(offset) == {"cursor": "2024-01-03T00:00:00Z"}
     # Cursor filter present on the leaf call. Call order:
     # 0: $metadata, 1: Parents (PK walk), 2: Parents(1)/Children (leaf).
     leaf_call = responses.calls[2].request.url
@@ -6069,7 +6087,7 @@ def test_contained_leaf_cursor_ignore_skips_null_rows():
     )
     rows = list(records)
     assert [r["Id"] for r in rows] == [11]
-    assert offset == {"cursor": "2024-02-01T00:00:00Z"}
+    assert _drop_lb(offset) == {"cursor": "2024-02-01T00:00:00Z"}
 
 
 @responses.activate
@@ -6146,7 +6164,7 @@ def test_contained_incremental_complete_parent_single_cursor_emits_all():
     assert [r["Id"] for r in rows] == [11, 12, 13]
     # ... and the watermark advances to that value with the terminal
     # offset shape — no parent_idx / truncated_chain_cursor parked.
-    assert offset == {"cursor": "2024-01-01T00:00:00Z"}
+    assert _drop_lb(offset) == {"cursor": "2024-01-01T00:00:00Z"}
 
 
 @responses.activate
@@ -6285,7 +6303,7 @@ def test_contained_incremental_truncation_resume_uses_chain_cursor():
         "2024-01-02T00:00:00Z",
         "2024-01-05T00:00:00Z",
     }
-    assert offset == {"cursor": "2024-01-05T00:00:00Z"}
+    assert _drop_lb(offset) == {"cursor": "2024-01-05T00:00:00Z"}
     # First leaf call uses the chain cursor; second uses the outer cursor (None here).
     p1_call = next(c for c in responses.calls if "Parents(1)/Children" in c.request.url)
     assert "ModifiedAt%20gt%202024-01-01" in p1_call.request.url or (
@@ -6361,7 +6379,7 @@ def test_contained_incremental_resume_from_chain_next_link():
         "2024-01-03T00:00:00Z",
         "2024-01-05T00:00:00Z",
     }
-    assert offset == {"cursor": "2024-01-05T00:00:00Z"}
+    assert _drop_lb(offset) == {"cursor": "2024-01-05T00:00:00Z"}
     # Resumed URL is the skiptoken — no `$filter=` reconstruction.
     skip_call = next(c for c in responses.calls if "skiptoken" in c.request.url)
     assert skip_call is not None
