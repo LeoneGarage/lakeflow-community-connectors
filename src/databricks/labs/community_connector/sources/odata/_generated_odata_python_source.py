@@ -694,6 +694,11 @@ def register_lakeflow_source(spark):
 
     _TOP_PARAM_RE = re.compile(r"(?<=[?&])(\$top=|%24top=)\d+", re.IGNORECASE)
 
+    # How many leaf-parents the cursor_probe capability preflight inspects looking
+    # for a discriminating sample (>= 2 distinct leaf cursors) before giving up and
+    # allowing the read (inconclusive). Bounds the preflight's request cost.
+    _CURSOR_PROBE_PREFLIGHT_SCAN = 50
+
 
     def rewrite_top_in_url(url: str, new_top: int) -> str:
         """Rewrite the ``$top=<N>`` (or url-encoded ``%24top=<N>``) parameter
@@ -1195,6 +1200,83 @@ def register_lakeflow_source(spark):
                 raise ValueError(f"Invalid expand_contained={raw!r}. Expected one of: true, false.")
             return raw == "true"
 
+        def _cursor_probe_active(self, table_options: dict[str, str] | None) -> bool:
+            """Parse the boolean ``cursor_probe`` table option (default **false**).
+
+            When active, a leaf-owned cursor read first issues one shallow
+            ``$expand(<leaf>($orderby=cursor desc;$top=1;$select=cursor))`` probe
+            per leaf-grandparent tuple to find the newest leaf under each
+            leaf-parent, marks the leaf-parent dirty when that leaf's cursor is
+            ``> since`` (compared client-side), then runs the normal N+1 leaf walk
+            over only the dirty leaf-parents — replacing "one leaf fetch per
+            leaf-parent" with "one probe per parent + one hydrate per dirty
+            parent". A request-count optimisation for deep paths with sparse
+            changes; the hydrate is a normal N+1 walk, so the rows emitted are
+            identical to ``cursor_probe=false`` *provided the probe identifies the
+            dirty parents correctly*.
+
+            **Default on**, but guarded: the identify step relies on the server
+            honouring ``$orderby``/``$top`` *inside* ``$expand`` (optional OData v4
+            features). A server that ignores ``$orderby`` could return a non-newest
+            leaf and under-report a dirty parent → dropped rows. Rather than risk
+            that silently, the connector runs a one-time behavioural capability
+            check before engaging (:meth:`_verify_cursor_probe_support`) and
+            **raises** a clear error if the server mishandles inner-``$expand``
+            ordering — so misuse fails fast instead of losing data. (An earlier
+            ``$top=1;$filter`` shape was worse still: servers that slice ``$top``
+            before applying the inner ``$filter`` dropped any parent whose changed
+            leaf wasn't first by default order — ordering by the cursor and
+            comparing client-side removes that trap.) Set ``cursor_probe=false`` to
+            force the plain N+1 walk (e.g. when the check fails, or when changes are
+            dense and the per-parent probe is pure overhead). It engages only where
+            it can pay off (see :meth:`_cursor_probe_applicable`); an explicit
+            ``cursor_probe=true`` on a config that can't use it raises to catch the
+            misconfig."""
+            raw = ((table_options or {}).get("cursor_probe") or "true").strip().lower()
+            if raw not in {"true", "false"}:
+                raise ValueError(f"Invalid cursor_probe={raw!r}. Expected one of: true, false.")
+            return raw == "true"
+
+        def _cursor_probe_applicable(
+            self,
+            segments: list[str],
+            namespace: str | None,
+            cursor_field: str,
+            cursor_level: int,
+        ) -> bool:
+            """Whether the probe can actually save work on this path.
+
+            Two conditions:
+
+            1. The cursor lives on the **leaf** (``cursor_level`` is the last
+               segment). An ancestor cursor already filters whole subtrees, so
+               there's nothing to probe.
+            2. The **distance from the leaf to the nearest batch-snapshot
+               ancestor is > 1** — i.e. the leaf's *parent* collection is
+               itself a cursor-bearing (incremental, typically high-fan-out)
+               entity. The savings come from skipping leaf hydrates for *clean*
+               leaf-parents; when the leaf-parent is a snapshot structural level
+               (e.g. ``.../Projects/WorkPackageDetails`` where only the leaf
+               carries the cursor), it has few rows that all read as dirty, so
+               the probe only adds ``$expand`` payload with nothing to skip.
+
+            A "snapshot ancestor" is one whose entity type does not declare
+            ``cursor_field``. ``snapshot_idx`` is the deepest such ancestor
+            (``-1`` if every ancestor declares it); the probe engages when
+            ``leaf_idx - snapshot_idx > 1``.
+            """
+            leaf_idx = len(segments) - 1
+            if cursor_level != leaf_idx:
+                return False
+            snapshot_idx = -1
+            for idx in range(leaf_idx):  # ancestors only, leaf excluded
+                ancestor_et = self._entity_type_for(
+                    CONTAINED_PATH_SEP.join(segments[: idx + 1]), namespace
+                )
+                if not any(f.name == cursor_field for f in self._own_fields_for_et(ancestor_et)):
+                    snapshot_idx = idx
+            return (leaf_idx - snapshot_idx) > 1
+
         # --- URL construction --------------------------------------------------
 
         def _format_key_predicate(self, pk_values: dict[str, Any]) -> str:
@@ -1695,6 +1777,289 @@ def register_lakeflow_source(spark):
                     chain.pop()
 
             yield from _walk(0, [])
+
+        def _build_probe_url(
+            self,
+            segments: list[str],
+            parent_chain: list[dict[str, Any]],
+            table_options: dict[str, str],
+            cursor_field: str,
+        ) -> str:
+            """Shallow change-probe over one leaf-parent collection.
+
+            ``parent_chain`` (len = ``len(segments) - 2``) addresses the
+            leaf-parent *collection* under its grandparent tuple; the URL asks
+            only for the leaf-parent PKs plus the **single newest leaf by
+            cursor**::
+
+                A(a)/B(b)/C?$top=<page>&$select=<Cpk>&$orderby=<Cpk> asc
+                           &$expand=D($orderby=<cursor> desc;$top=1;$select=<cursor>)
+
+            The caller (:meth:`_iter_dirty_leaf_parent_chains`) marks a leaf-parent
+            dirty when that newest leaf's cursor is ``> since`` — the change test
+            is done **client-side**, with no inner ``$filter`` at all. Ordering the
+            inner ``$expand`` by the cursor descending makes the one returned row
+            the MAX-cursor leaf *by construction*, so a server that applies
+            ``$top`` before anything else still returns the right row. That is the
+            whole point: an earlier ``$top=1;$filter`` shape let servers slice the
+            first expanded row *before* applying the inner ``$filter``, so a
+            leaf-parent whose changed leaf wasn't first by default order was
+            wrongly reported clean and its leaves silently dropped. Comparing the
+            max cursor client-side removes that trap.
+
+            NB: relies on the server honouring ``$orderby``/``$top`` *inside*
+            ``$expand`` (basic expand options). A server that ignores ``$orderby``
+            could return a non-newest row and under-report — that residual
+            server-dependence is why ``cursor_probe`` is opt-in (default off):
+            enable it only where the source is known to honour inner-``$expand``
+            options. A ``filter_at_<leaf>`` segment filter is deliberately NOT
+            applied in the probe (it has no inner ``$filter``); at worst that
+            over-fetches a parent whose recent changes the filter excludes — the
+            hydrate then emits nothing, never a miss.
+            """
+            namespace = (table_options or {}).get("namespace")
+            parent_segments = segments[:-1]
+            leaf_nav = segments[-1]
+            segment_filters = resolve_segment_filters(table_options, segments)
+            lp_pks = self._own_primary_keys_for_et(
+                self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
+            )
+            inner = [f"$orderby={cursor_field} desc", "$top=1", f"$select={cursor_field}"]
+            outer = []
+            if (table_options or {}).get("page_size"):
+                outer.append(f"$top={table_options['page_size']}")
+            outer.append(f"$select={','.join(lp_pks)}")
+            lp_filter = segment_filters.get(len(parent_segments) - 1)
+            if lp_filter:
+                outer.append(f"$filter={lp_filter}")
+            order_by = _ancestor_pk_order_by(lp_pks)
+            if order_by:
+                outer.append(f"$orderby={order_by}")
+            outer.append(f"$expand={leaf_nav}({';'.join(inner)})")
+            base = join_url(self.service_url, self._build_contained_path(parent_segments, parent_chain))
+            return f"{base}?{'&'.join(outer)}"
+
+        def _iter_dirty_leaf_parent_chains(
+            self,
+            segments: list[str],
+            namespace: str | None,
+            table_options: dict[str, str] | None,
+            cursor_field: str,
+            since: Any,
+        ) -> Iterator[list[dict[str, Any]]]:
+            """``cursor_probe`` chain source: yield only the full key chains
+            (len = ``len(segments) - 1``) whose leaf collection has ≥1 changed
+            row since ``since``.
+
+            A drop-in for :meth:`_iter_parent_key_chains` in the leaf-cursor
+            read: it enumerates leaf-grandparent tuples the same way, then runs
+            one :meth:`_build_probe_url` per tuple and emits the leaf-parent key
+            (extending the chain) only for parents the probe flags dirty. Like
+            the plain enumerator it is consumed lazily and is deterministic for
+            a fixed ``since``, so the leaf-cursor walk's flat ``parent_idx``
+            resume works unchanged — a resumed batch re-probes the skipped
+            parents (cheap; no leaf fetches) exactly as the plain walk re-pages
+            skipped ancestors.
+
+            ``since`` is ``None`` on the first batch → every leaf-parent with any
+            leaf reads as dirty, so the first incremental batch behaves like the
+            standard full walk (correct, no speed-up until a watermark exists)."""
+            parent_segments = segments[:-1]
+            leaf_nav = segments[-1]
+            lp_pks = self._own_primary_keys_for_et(
+                self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
+            )
+            for pchain in self._iter_parent_key_chains(parent_segments, namespace, table_options):
+                url = self._build_probe_url(segments, pchain, table_options, cursor_field)
+                for row in self._fetch_pages(url):
+                    # The probe returns the newest leaf (``$orderby cursor desc;
+                    # $top=1``). Max over the returned rows so we're still correct
+                    # if a server ignores ``$top`` and hands back several. Dirty
+                    # when that max cursor exceeds the watermark (or on the first
+                    # batch, ``since is None``, whenever the leaf-parent has a
+                    # leaf at all) — this matches the hydrate's ``cursor gt since``.
+                    max_cursor = None
+                    for child in row.get(leaf_nav) or []:
+                        val = child.get(cursor_field)
+                        if val is not None and (max_cursor is None or val > max_cursor):
+                            max_cursor = val
+                    if max_cursor is not None and (since is None or max_cursor > since):
+                        yield pchain + [{pk: row.get(pk) for pk in lp_pks}]
+
+        def _verify_cursor_probe_support(
+            self,
+            segments: list[str],
+            namespace: str | None,
+            table_options: dict[str, str] | None,
+            cursor_field: str,
+            start_offset: dict | None = None,
+        ) -> bool:
+            """Raise if this server can't be trusted to run the probe correctly;
+            return whether the verdict is a *conclusive* pass the caller may persist.
+
+            ``cursor_probe`` (default on) silently drops rows on a server that
+            mishandles ``$orderby``/``$top`` inside ``$expand``. This behavioural
+            preflight catches that *before* any data is read and turns it into a
+            clear error.
+
+            Result is cached per ``(path, namespace)`` so the check runs once per
+            connector instance. But the Spark Python Data Source recreates the
+            reader per batch, so that instance cache is cold every batch — the
+            preflight's handful of GETs would recur indefinitely. To avoid that, a
+            *conclusive* pass is also persisted in the resume offset as
+            ``cursor_probe_ok``; when a prior batch's offset carries it, the
+            preflight requests are skipped entirely. Only a conclusive pass is
+            trusted this way. An *inconclusive* result — no leaf-parent yet has
+            ``>= 2`` distinct leaf cursors, so ordering can't cause a miss — is
+            re-checked every batch, so a server that begins to mis-order once its
+            data grows discriminating is still caught.
+
+            Returns ``True`` when the server is trusted (via the persisted offset
+            flag or a conclusive preflight pass) so the caller can persist
+            ``cursor_probe_ok``; ``False`` on an inconclusive verdict (don't
+            persist — re-check next batch). Raises on a mis-ordering server."""
+            if (start_offset or {}).get("cursor_probe_ok"):
+                return True
+            cache = self.__dict__.setdefault("_cursor_probe_verified", {})
+            cache_key = (tuple(segments), namespace)
+            if cache_key not in cache:
+                cache[cache_key] = self._run_cursor_probe_preflight(
+                    segments, namespace, table_options, cursor_field
+                )
+            problem, conclusive = cache[cache_key]
+            if problem:
+                raise ValueError(problem)
+            return conclusive
+
+        def _run_cursor_probe_preflight(
+            self,
+            segments: list[str],
+            namespace: str | None,
+            table_options: dict[str, str] | None,
+            cursor_field: str,
+        ) -> tuple[str | None, bool]:
+            """Behavioural capability check for :meth:`_iter_dirty_leaf_parent_chains`.
+
+            Returns ``(problem, conclusive)``: ``problem`` is an actionable error
+            message when the server mishandles inner ``$expand`` ordering (the probe
+            would under-report dirty leaf-parents and drop rows), else ``None``.
+            ``conclusive`` is ``True`` only when a discriminating sample was found
+            AND the probe shape returned the true newest leaf — the verdict the
+            caller may persist across batches (see
+            :meth:`_verify_cursor_probe_support`); ``False`` on an inconclusive
+            scan, which must be re-checked rather than trusted.
+
+            Finds a sample leaf-parent with ≥2 distinct leaf cursors and verifies
+            that the probe's own ``$expand($orderby cursor desc;$top=1)`` returns
+            the true newest leaf — cross-checked against a trusted direct-navigation
+            ``$orderby`` query (basic collection ordering, far more universally
+            honoured than inner-``$expand`` ordering). Inconclusive (no
+            discriminating sample within :data:`_CURSOR_PROBE_PREFLIGHT_SCAN`) →
+            ``(None, False)``: with ≤1 leaf per parent, ordering can't cause a
+            miss."""
+            parent_segments = segments[:-1]
+            leaf_nav = segments[-1]
+            lp_pks = self._own_primary_keys_for_et(
+                self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
+            )
+            if not lp_pks:
+                return (None, False)
+            page_size = (table_options or {}).get("page_size") or DEFAULT_PAGE_SIZE
+            lp_order = _ancestor_pk_order_by(lp_pks)
+            scanned = 0
+            for pchain in self._iter_parent_key_chains(parent_segments, namespace, table_options):
+                lp_base = join_url(
+                    self.service_url, self._build_contained_path(parent_segments, pchain)
+                )
+                next_url: str | None = f"{lp_base}?$select={','.join(lp_pks)}&$top={page_size}"
+                if lp_order:
+                    next_url += f"&$orderby={lp_order}"
+                while next_url:
+                    lp_rows, next_url = self._fetch_one_expand_page(next_url)
+                    for lp_row in lp_rows:
+                        scanned += 1
+                        lp_key = {pk: lp_row.get(pk) for pk in lp_pks}
+                        status, message = self._cursor_probe_check_sample(
+                            parent_segments, pchain, segments, namespace, lp_key, leaf_nav, cursor_field
+                        )
+                        if status == "ok":
+                            return (None, True)
+                        if status == "error":
+                            return (message, False)
+                        if scanned >= _CURSOR_PROBE_PREFLIGHT_SCAN:
+                            return (None, False)
+            return (None, False)
+
+        # pylint: disable=too-many-arguments,too-many-positional-arguments
+        def _cursor_probe_check_sample(
+            self,
+            parent_segments: list[str],
+            pchain: list[dict[str, Any]],
+            segments: list[str],
+            namespace: str | None,
+            lp_key: dict[str, Any],
+            leaf_nav: str,
+            cursor_field: str,
+        ) -> tuple[str, str | None]:
+            """Verify the probe shape against trusted ordering for one leaf-parent.
+
+            Returns ``("skip", None)`` when the sample can't discriminate (< 2
+            distinct leaf cursors), ``("ok", None)`` when the probe's inner
+            ``$expand`` ordering returns the true newest leaf, or
+            ``("error", msg)`` when it does not."""
+            full_chain = pchain + [lp_key]
+            leaf_base = join_url(self.service_url, self._build_contained_path(segments, full_chain))
+            # Trusted reference: direct-navigation ordering on the leaf collection.
+            direct_rows, _ = self._fetch_one_expand_page(
+                f"{leaf_base}?$orderby={cursor_field} desc&$top=2&$select={cursor_field}"
+            )
+            vals = [r.get(cursor_field) for r in direct_rows if r.get(cursor_field) is not None]
+            if len(vals) < 2 or vals[0] == vals[1]:
+                return ("skip", None)
+            direct_max = vals[0]
+            # The probe's own shape, targeted to this leaf-parent via an outer
+            # key $filter (basic collection filtering, not an inner-$expand option).
+            lp_coll = join_url(self.service_url, self._build_contained_path(parent_segments, pchain))
+            pk_filter = " and ".join(f"{k} eq {odata_literal(v)}" for k, v in lp_key.items())
+            lp_pks = self._own_primary_keys_for_et(
+                self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
+            )
+            expand_url = (
+                f"{lp_coll}?$select={','.join(lp_pks)}&$filter={pk_filter}"
+                f"&$expand={leaf_nav}($orderby={cursor_field} desc;$top=1;$select={cursor_field})"
+            )
+            exp_rows, _ = self._fetch_one_expand_page(expand_url)
+            children = (exp_rows[0].get(leaf_nav) if exp_rows else None) or []
+            inner_max = max(
+                (c.get(cursor_field) for c in children if c.get(cursor_field) is not None),
+                default=None,
+            )
+            if inner_max == direct_max:
+                return ("ok", None)
+            return (
+                "error",
+                "cursor_probe=true requires the source to honour $orderby/$top "
+                f"inside $expand, but {self._build_contained_path(segments, full_chain)!r} "
+                f"returned {inner_max!r} as its newest {leaf_nav} via $expand when the "
+                f"true newest is {direct_max!r} (direct navigation). This server "
+                "silently mis-orders inner $expand, so cursor_probe would drop changed "
+                "rows. Set cursor_probe=false to use the robust N+1 walk.",
+            )
+
+        def _with_probe_ok(self, offset: dict) -> dict:
+            """Return ``offset`` carrying the persisted ``cursor_probe_ok`` flag.
+
+            Records that this server's inner-``$expand`` ordering has been verified
+            so a per-batch-recreated reader can skip the capability preflight next
+            batch (see :meth:`_verify_cursor_probe_support`). Never mutates the
+            input — the framework may retain the prior offset object — and is a
+            no-op (returns the same object) when the flag is already present, so an
+            idled overlap re-read that returns ``start_offset`` keeps its identity.
+            The flag carries no cursor progress; :meth:`_finalize_cursor_read`
+            excludes it from the no-progress comparison."""
+            if offset.get("cursor_probe_ok"):
+                return offset
+            return {**offset, "cursor_probe_ok": True}
 
         def _read_contained_snapshot(
             self, table_name: str, table_options: dict[str, str]
@@ -2762,11 +3127,18 @@ def register_lakeflow_source(spark):
             if start_offset is None:
                 return iter(emitted), end_offset
 
-            # Compare progress on the cursor/continuation state only — strip the
-            # ``lb_*`` auto-lookback bookkeeping, whose measurement can fluctuate
-            # batch-to-batch without representing real cursor progress.
+            # Compare progress on the cursor/continuation state only. Strip the
+            # ``lb_*`` auto-lookback bookkeeping (its measurement fluctuates batch
+            # to batch without representing real cursor progress) and the persisted
+            # ``cursor_probe_ok`` capability flag (a one-time-set marker, not
+            # progress) — otherwise a batch that merely bakes in the flag would read
+            # as forward progress and bypass the no-progress guard.
             def _progress_view(off: dict | None) -> dict:
-                return {k: v for k, v in (off or {}).items() if not k.startswith("lb_")}
+                return {
+                    k: v
+                    for k, v in (off or {}).items()
+                    if not k.startswith("lb_") and k != "cursor_probe_ok"
+                }
 
             if _progress_view(start_offset) == _progress_view(end_offset):
                 if emitted:
@@ -2808,6 +3180,33 @@ def register_lakeflow_source(spark):
                     f"{table_name!r} or any of its ancestors. Pick a column "
                     f"declared on the leaf or one of the parent segments."
                 )
+            cursor_probe = self._cursor_probe_active(table_options)
+            probe_applicable = cursor_probe and self._cursor_probe_applicable(
+                segments, namespace, cursor_field, cursor_level
+            )
+            # Strict checks apply only to an EXPLICIT opt-in — the default-on
+            # value is a hint that silently no-ops where it can't engage (see
+            # ``_cursor_probe_active``), so it must not raise on the many reads
+            # that legitimately default it on but can't use it.
+            probe_explicit = "cursor_probe" in (table_options or {})
+            if cursor_probe and probe_explicit and not probe_applicable:
+                if cursor_level != len(segments) - 1:
+                    raise ValueError(
+                        "cursor_probe=true requires cursor_field on the leaf segment "
+                        f"(it lives on ancestor segment {segments[cursor_level]!r} of "
+                        f"{table_name!r}). cursor_probe only accelerates leaf-owned "
+                        "cursor reads; an ancestor cursor already filters whole "
+                        "subtrees, so drop cursor_probe for this table."
+                    )
+                raise ValueError(
+                    f"cursor_probe=true won't help on {table_name!r}: its leaf-parent "
+                    f"collection {segments[-2]!r} is a batch-snapshot level (it does "
+                    f"not declare {cursor_field!r}), so the distance from the leaf to "
+                    "the nearest snapshot ancestor is 1 — every leaf-parent is fetched "
+                    "anyway and there are no clean ones to skip. cursor_probe pays off "
+                    "only when the leaf's parent is itself an incremental, "
+                    "high-cardinality collection. Drop cursor_probe here."
+                )
             if start_offset is None:
                 # Batch reader: offset discarded, ``since`` is None (no cursor
                 # filter), no cap, no no-progress guard — so the ``emitted``
@@ -2822,8 +3221,57 @@ def register_lakeflow_source(spark):
                     {},
                 )
             if cursor_level == len(segments) - 1:
+                # Overlap re-read window for the (non-atomic) leaf-cursor walk: the
+                # probe and the plain N+1 walk have the same mid-walk-arrival gap as
+                # expand mode (a leaf inserted under an already-passed / probed-clean
+                # parent lands below the committed max and is skipped forever by the
+                # next ``cursor gt``). Floor the READ filter to ``committed - window``
+                # while still committing the true max. Resolved here (the leaf
+                # branch) so it never bleeds into the ancestor-cursor path. See
+                # ``_read_contained_incremental_leaf_cursor`` for the read-side use.
+                self._active_lookback_seconds = self._resolve_active_lookback(start_offset)
+                read_since = self._apply_cursor_lookback((start_offset or {}).get("cursor"))
+                # Engage the probe only where it pays off (``probe_applicable``):
+                # the leaf-parent must itself be a cursor-bearing collection, so
+                # there are clean leaf-parents to skip. A snapshot leaf-parent
+                # (e.g. .../Projects/WorkPackageDetails) is enumerated in full
+                # either way, so default-on cursor_probe stays inert there.
+                chains_iter = None
+                persist_probe_ok = False
+                if probe_applicable:
+                    # Fail fast (default-on, but verified): raise if this server
+                    # mishandles inner-$expand ordering rather than silently
+                    # dropping rows. A conclusive pass — or a verdict a prior batch
+                    # already persisted in the offset — lets a per-batch-recreated
+                    # reader skip the preflight's requests next time.
+                    verified = self._verify_cursor_probe_support(
+                        segments, namespace, table_options, cursor_field, start_offset
+                    )
+                    persist_probe_ok = verified or bool((start_offset or {}).get("cursor_probe_ok"))
+                    # The probe prunes nothing until a watermark exists: with
+                    # ``read_since`` None (first batch) every leaf-parent reads as
+                    # dirty, so the per-grandparent probe round-trips would only add
+                    # overhead with nothing to skip. Fall back to the plain
+                    # enumerator then — identical rows, fewer requests — and engage
+                    # the probe once a watermark is established. ``read_since``
+                    # (floored) so the probe re-flags leaf-parents whose newest leaf
+                    # is inside the overlap window as dirty.
+                    if read_since is not None:
+                        chains_iter = self._iter_dirty_leaf_parent_chains(
+                            segments,
+                            namespace,
+                            table_options,
+                            cursor_field,
+                            read_since,
+                        )
                 return self._read_contained_incremental_leaf_cursor(
-                    table_name, segments, start_offset, table_options, cursor_field
+                    table_name,
+                    segments,
+                    start_offset,
+                    table_options,
+                    cursor_field,
+                    chains_iter=chains_iter,
+                    persist_probe_ok=persist_probe_ok,
                 )
             return self._read_contained_incremental_ancestor_cursor(
                 table_name, segments, start_offset, table_options, cursor_field, cursor_level
@@ -2888,8 +3336,17 @@ def register_lakeflow_source(spark):
             start_offset: dict | None,
             table_options: dict[str, str],
             cursor_field: str,
+            chains_iter: Iterator[list[dict[str, Any]]] | None = None,
+            persist_probe_ok: bool = False,
         ) -> tuple[Iterator[dict], dict]:
             """Cursor lives on the leaf entity — filter at the leaf fetch.
+
+            ``chains_iter`` lets a caller substitute the parent-key source
+            (default: every chain via :meth:`_iter_parent_key_chains`). The
+            ``cursor_probe`` path passes :meth:`_iter_dirty_leaf_parent_chains`
+            — the same chains pruned to parents with changed leaves — so the
+            flat ``parent_idx`` resume, watermark and no-progress guard below
+            all work unchanged over the reduced set.
 
             ``_walk_contained_with_cursor`` chooses the truncation
             checkpoint (and trims ``emitted`` to match); this method only
@@ -2912,11 +3369,19 @@ def register_lakeflow_source(spark):
             """
             namespace = (table_options or {}).get("namespace")
             since = (start_offset or {}).get("cursor")
+            # Overlap re-read floor (see ``_read_contained_incremental`` dispatch):
+            # the per-chain ``cursor gt`` filters and the in-walk client trim use
+            # ``read_since`` (= committed − window) so a non-atomic walk re-scans
+            # the overlap; the committed offset below stays the TRUE ``since``/max.
+            # ``_active_lookback_seconds`` was resolved on ``self`` by the dispatch
+            # (0 for a non-lookback read → ``read_since`` is ``since`` unchanged).
+            read_since = self._apply_cursor_lookback(since)
             truncated_chain_cursor_in = (start_offset or {}).get("truncated_chain_cursor")
             chain_next_link_in = (start_offset or {}).get("chain_next_link")
             max_records = int((table_options or {}).get("max_records_per_batch", "10000"))
             order_by = self._leaf_cursor_order_by(table_name, namespace, cursor_field)
-            chains_iter = self._iter_parent_key_chains(segments, namespace, table_options)
+            if chains_iter is None:
+                chains_iter = self._iter_parent_key_chains(segments, namespace, table_options)
             segment_filters = resolve_segment_filters(table_options, segments)
             # ``cursor_nulls`` resolver (synthetic floor for nulls under
             # coalesce; skip nulls under ignore). The cursor lives on the leaf
@@ -2924,6 +3389,9 @@ def register_lakeflow_source(spark):
             skip_null, effective = self._make_cursor_resolver(
                 table_name, namespace, cursor_field, table_options
             )
+            # Wall-clock around the walk feeds the ``auto`` lookback window
+            # (see ``_attach_lookback_state``), exactly as the expand path does.
+            walk_start = time.monotonic()
             (
                 emitted,
                 truncated,
@@ -2937,7 +3405,7 @@ def register_lakeflow_source(spark):
                 table_options,
                 order_by,
                 cursor_field,
-                since,
+                read_since,
                 truncated_chain_cursor_in,
                 chain_next_link_in,
                 max_records,
@@ -2946,6 +3414,7 @@ def register_lakeflow_source(spark):
                 effective=effective,
                 skip_null=skip_null,
             )
+            walk_elapsed = time.monotonic() - walk_start
             if truncated:
                 # The walk has already chosen the checkpoint and trimmed
                 # ``emitted`` accordingly: ``chain_next_link_out`` for a page
@@ -2962,24 +3431,30 @@ def register_lakeflow_source(spark):
                     end_offset["cursor"] = since
             else:
                 if not emitted:
-                    return iter([]), start_offset or {}
+                    empty = start_offset or {}
+                    return iter([]), (self._with_probe_ok(empty) if persist_probe_ok else empty)
                 cursors = [effective(r) for r in emitted if effective(r) is not None]
                 # Mirror ``_build_expand_end_offset`` /
-                # ``_ancestor_cursor_offset``: when there's no cursor data
-                # this batch and no prior ``since`` to carry, the offset is
-                # ``{}`` — not ``{"cursor": None}``. The latter would advance
-                # ``{}`` → ``{"cursor": None}`` on first-batch null-cursor
-                # rows, silently committing one bad batch before the second
-                # trigger (where ``start_offset == end_offset``) raises.
-                if cursors:
-                    end_offset = {"cursor": max(cursors)}
-                elif since is not None:
-                    end_offset = {"cursor": since}
-                else:
-                    end_offset = {}
-            return self._finalize_cursor_read(
+                # ``_ancestor_cursor_offset``: when there's no cursor data this
+                # batch and no prior ``since`` to carry, the offset is ``{}`` —
+                # not ``{"cursor": None}`` (see ``_cursor_max_end_offset``).
+                end_offset = self._cursor_max_end_offset(cursors, since)
+            records, out_offset = self._finalize_cursor_read(
                 start_offset, end_offset, emitted, table_name, cursor_field
             )
+            # Carry the ``auto`` walk-duration history (no-op for static/off and
+            # for the idled overlap re-read). ``truncated`` ⇒ walk in flight, so
+            # its partial duration isn't recorded as a completed walk.
+            out_offset = self._attach_lookback_state(out_offset, start_offset, truncated, walk_elapsed)
+            # Persist the verified cursor_probe capability so a freshly-constructed
+            # reader on the next batch can skip the preflight requests. Applied
+            # AFTER the no-progress finalize (whose comparison ignores
+            # ``cursor_probe_ok`` — see ``_finalize_cursor_read``) so it never reads
+            # as false forward progress, and an idled overlap re-read that already
+            # carries the flag returns ``start_offset`` unchanged.
+            if persist_probe_ok:
+                out_offset = self._with_probe_ok(out_offset)
+            return records, out_offset
 
         def _read_contained_incremental_ancestor_cursor(
             self,
@@ -4073,18 +4548,40 @@ def register_lakeflow_source(spark):
             if (
                 isinstance(self._cursor_lookback, int)
                 and self._cursor_lookback > 0
-                and not (
-                    _parse_contained_path(table_name) is not None
-                    and self._expand_contained_active(opts)
-                    and opts.get("cursor_field")
-                )
+                and not (_parse_contained_path(table_name) is not None and opts.get("cursor_field"))
             ):
                 raise ValueError(
                     "cursor_lookback_seconds (an explicit value) is supported "
-                    "only with expand_contained=true and a cursor_field on a "
-                    "contained path. Use 'auto' (default) or 'off' for other "
-                    "read configurations."
+                    "only with a cursor_field on a contained path — it floors the "
+                    "read filter for the non-atomic expand_contained=true walk and "
+                    "the leaf-cursor N+1 / cursor_probe walk. Use 'auto' (default) "
+                    "or 'off' for other read configurations."
                 )
+            # cursor_probe is default-on (a hint that no-ops where it can't
+            # engage), so these conflict checks fire only on an EXPLICIT
+            # ``cursor_probe=true`` — otherwise every flat / snapshot /
+            # expand_contained read would trip them.
+            if "cursor_probe" in opts and self._cursor_probe_active(opts):
+                if _parse_contained_path(table_name) is None:
+                    raise ValueError(
+                        "cursor_probe=true is supported only on contained-collection "
+                        f"paths; {table_name!r} is a flat entity set, which is "
+                        "already a single filtered request per batch."
+                    )
+                if self._expand_contained_active(opts):
+                    raise ValueError(
+                        "cursor_probe=true conflicts with expand_contained=true: "
+                        "both push the leaf cursor filter down to fetch only changed "
+                        "leaves, by different strategies. Pick one (expand_contained "
+                        "for shallow trees, cursor_probe for deep trees with sparse "
+                        "changes)."
+                    )
+                if not opts.get("cursor_field"):
+                    raise ValueError(
+                        "cursor_probe=true requires a cursor_field (it only changes "
+                        "how a leaf-owned cursor read is executed). Set cursor_field "
+                        "or drop cursor_probe."
+                    )
             if self._pagination != "nextlink":
                 opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
             if start_offset is None:
@@ -4294,12 +4791,7 @@ def register_lakeflow_source(spark):
             # null-only batches (committing ``{"cursor": None}`` would loop
             # because every subsequent trigger re-emits the same nulls).
             cursors = [effective(r) for r in records if effective(r) is not None]
-            if cursors:
-                end_offset = {"cursor": max(cursors)}
-            elif since is not None:
-                end_offset = {"cursor": since}
-            else:
-                end_offset = {}
+            end_offset = self._cursor_max_end_offset(cursors, since)
             return self._finalize_cursor_read(
                 start_offset, end_offset, records, table_name, cursor_field
             )
@@ -5986,6 +6478,22 @@ def register_lakeflow_source(spark):
                 return None
             return f"{cursor_field} gt {_odata_literal(since)}"
 
+        def _cursor_max_end_offset(self, cursors: list, since: Any) -> dict:
+            """End offset for a natural-completion cursor batch: ``{"cursor": max}``
+            over the batch's effective (non-null) cursor values, falling back to the
+            carried ``since`` and then ``{}``.
+
+            Shared by the flat (``_read_incremental``) and contained leaf-cursor
+            (``_read_contained_incremental_leaf_cursor``) reads. ``{"cursor": None}``
+            must never be committed — it would advance ``{}`` → ``{"cursor": None}``
+            on an all-null-cursor batch and then loop the no-progress guard — so a
+            null-only batch yields ``since`` (if carried) or ``{}``."""
+            if cursors:
+                return {"cursor": max(cursors)}
+            if since is not None:
+                return {"cursor": since}
+            return {}
+
         def _parse_cursor_lookback(self, table_options: dict[str, str] | None):
             """Parse the ``cursor_lookback_seconds`` table option.
 
@@ -6152,7 +6660,12 @@ def register_lakeflow_source(spark):
                     f"cursor_lookback_seconds={seconds} requires a datetime/"
                     f"timestamp cursor; got {type(since).__name__} {since!r}."
                 )
-            return dt - timedelta(seconds=seconds)
+            # Return the OData timestamp LITERAL (``...Z``), not a datetime: the
+            # leaf-cursor walk compares it client-side against the rows' own
+            # cursor strings (``rec_cursor <= chain_since``), which would raise on
+            # a str-vs-datetime mix. The string renders bare in the URL exactly as
+            # the datetime did, so the expand path's wire filter is unchanged.
+            return _odata_literal(dt - timedelta(seconds=seconds))
 
         # ------------------------------------------------------------------
         # Null-cursor policy (``cursor_nulls``)

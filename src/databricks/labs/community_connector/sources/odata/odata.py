@@ -685,18 +685,40 @@ class ODataLakeflowConnect(
         if (
             isinstance(self._cursor_lookback, int)
             and self._cursor_lookback > 0
-            and not (
-                _parse_contained_path(table_name) is not None
-                and self._expand_contained_active(opts)
-                and opts.get("cursor_field")
-            )
+            and not (_parse_contained_path(table_name) is not None and opts.get("cursor_field"))
         ):
             raise ValueError(
                 "cursor_lookback_seconds (an explicit value) is supported "
-                "only with expand_contained=true and a cursor_field on a "
-                "contained path. Use 'auto' (default) or 'off' for other "
-                "read configurations."
+                "only with a cursor_field on a contained path — it floors the "
+                "read filter for the non-atomic expand_contained=true walk and "
+                "the leaf-cursor N+1 / cursor_probe walk. Use 'auto' (default) "
+                "or 'off' for other read configurations."
             )
+        # cursor_probe is default-on (a hint that no-ops where it can't
+        # engage), so these conflict checks fire only on an EXPLICIT
+        # ``cursor_probe=true`` — otherwise every flat / snapshot /
+        # expand_contained read would trip them.
+        if "cursor_probe" in opts and self._cursor_probe_active(opts):
+            if _parse_contained_path(table_name) is None:
+                raise ValueError(
+                    "cursor_probe=true is supported only on contained-collection "
+                    f"paths; {table_name!r} is a flat entity set, which is "
+                    "already a single filtered request per batch."
+                )
+            if self._expand_contained_active(opts):
+                raise ValueError(
+                    "cursor_probe=true conflicts with expand_contained=true: "
+                    "both push the leaf cursor filter down to fetch only changed "
+                    "leaves, by different strategies. Pick one (expand_contained "
+                    "for shallow trees, cursor_probe for deep trees with sparse "
+                    "changes)."
+                )
+            if not opts.get("cursor_field"):
+                raise ValueError(
+                    "cursor_probe=true requires a cursor_field (it only changes "
+                    "how a leaf-owned cursor read is executed). Set cursor_field "
+                    "or drop cursor_probe."
+                )
         if self._pagination != "nextlink":
             opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
         if start_offset is None:
@@ -906,12 +928,7 @@ class ODataLakeflowConnect(
         # null-only batches (committing ``{"cursor": None}`` would loop
         # because every subsequent trigger re-emits the same nulls).
         cursors = [effective(r) for r in records if effective(r) is not None]
-        if cursors:
-            end_offset = {"cursor": max(cursors)}
-        elif since is not None:
-            end_offset = {"cursor": since}
-        else:
-            end_offset = {}
+        end_offset = self._cursor_max_end_offset(cursors, since)
         return self._finalize_cursor_read(
             start_offset, end_offset, records, table_name, cursor_field
         )
@@ -2598,6 +2615,22 @@ class ODataLakeflowConnect(
             return None
         return f"{cursor_field} gt {_odata_literal(since)}"
 
+    def _cursor_max_end_offset(self, cursors: list, since: Any) -> dict:
+        """End offset for a natural-completion cursor batch: ``{"cursor": max}``
+        over the batch's effective (non-null) cursor values, falling back to the
+        carried ``since`` and then ``{}``.
+
+        Shared by the flat (``_read_incremental``) and contained leaf-cursor
+        (``_read_contained_incremental_leaf_cursor``) reads. ``{"cursor": None}``
+        must never be committed — it would advance ``{}`` → ``{"cursor": None}``
+        on an all-null-cursor batch and then loop the no-progress guard — so a
+        null-only batch yields ``since`` (if carried) or ``{}``."""
+        if cursors:
+            return {"cursor": max(cursors)}
+        if since is not None:
+            return {"cursor": since}
+        return {}
+
     def _parse_cursor_lookback(self, table_options: dict[str, str] | None):
         """Parse the ``cursor_lookback_seconds`` table option.
 
@@ -2764,7 +2797,12 @@ class ODataLakeflowConnect(
                 f"cursor_lookback_seconds={seconds} requires a datetime/"
                 f"timestamp cursor; got {type(since).__name__} {since!r}."
             )
-        return dt - timedelta(seconds=seconds)
+        # Return the OData timestamp LITERAL (``...Z``), not a datetime: the
+        # leaf-cursor walk compares it client-side against the rows' own
+        # cursor strings (``rec_cursor <= chain_since``), which would raise on
+        # a str-vs-datetime mix. The string renders bare in the URL exactly as
+        # the datetime did, so the expand path's wire filter is unchanged.
+        return _odata_literal(dt - timedelta(seconds=seconds))
 
     # ------------------------------------------------------------------
     # Null-cursor policy (``cursor_nulls``)

@@ -3236,14 +3236,19 @@ def test_expand_cursor_lookback_idles_on_no_progress_instead_of_raising():
 
 
 @responses.activate
-def test_cursor_lookback_requires_expand_contained():
-    _mock_nested_metadata()
+def test_cursor_lookback_explicit_rejected_on_flat_table():
+    """An explicit cursor_lookback_seconds is only meaningful for the non-atomic
+    contained walks (expand or leaf-cursor/probe); on a flat table it has
+    nothing to floor and is rejected. (It IS now allowed on a leaf-cursor
+    contained path without expand_contained — see the leaf-cursor lookback
+    tests.)"""
+    _mock_metadata()
     c = _make()
-    with pytest.raises(ValueError, match="explicit value.*supported only with expand_contained"):
+    with pytest.raises(ValueError, match="explicit value.*contained path"):
         c.read_table(
-            "Parents__Children",
+            "Customers",
             {"cursor": "2024-01-01T00:00:00Z"},
-            {"cursor_field": "ModifiedAt", "cursor_lookback_seconds": "300"},  # no expand_contained
+            {"cursor_field": "ModifiedAt", "cursor_lookback_seconds": "300"},
         )
 
 
@@ -7555,3 +7560,738 @@ def test_retry_connection_error_then_throttle_then_success(monkeypatch):
     # Attempt 1: 429 with Retry-After: 3 -> 3s.
     # Attempt 2: 200 -> done.
     assert sleeps == [1.0, 3.0]
+
+
+# ---------------------------------------------------------------------------
+# cursor_probe — sparse-change optimization for deep leaf-cursor reads
+# ---------------------------------------------------------------------------
+
+PROBE_METADATA_XML = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="Probe" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Root">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <NavigationProperty Name="Mids" Type="Collection(Probe.Mid)" ContainsTarget="true"/>
+        <NavigationProperty Name="Plains" Type="Collection(Probe.Plain)" ContainsTarget="true"/>
+      </EntityType>
+      <EntityType Name="Mid">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="RecordLastModified" Type="Edm.DateTimeOffset"/>
+        <Property Name="MidOnly" Type="Edm.DateTimeOffset"/>
+        <NavigationProperty Name="Leaves" Type="Collection(Probe.Leaf)" ContainsTarget="true"/>
+      </EntityType>
+      <EntityType Name="Leaf">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="RecordLastModified" Type="Edm.DateTimeOffset"/>
+      </EntityType>
+      <EntityType Name="Plain">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <NavigationProperty Name="Items" Type="Collection(Probe.Item)" ContainsTarget="true"/>
+      </EntityType>
+      <EntityType Name="Item">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="RecordLastModified" Type="Edm.DateTimeOffset"/>
+      </EntityType>
+      <EntityContainer Name="C">
+        <EntitySet Name="Roots" EntityType="Probe.Root"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+PROBE_TABLE = "Roots__Mids__Leaves"
+
+
+def _mock_probe_metadata():
+    responses.get(f"{SERVICE_URL}$metadata", body=PROBE_METADATA_XML, status=200)
+
+
+def _skip_probe_preflight(c, table=PROBE_TABLE):
+    """Pre-seed the cursor_probe capability cache as verified, so a test can
+    exercise probe READ behaviour without also mocking the preflight requests.
+    The preflight itself is covered by dedicated tests."""
+    segs = tuple(table.split("__"))
+    # Cache value is ``(problem, conclusive)``: no problem, conclusively verified.
+    c.__dict__.setdefault("_cursor_probe_verified", {})[(segs, None)] = (None, True)
+
+
+def _probe_filter_floor(request):
+    """Parse the ``RecordLastModified gt <iso>`` floor from a request's
+    ``$filter`` (ISO timestamps go on the wire bare). ``None`` when no
+    cursor floor is present (first batch)."""
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    flt = unquote(parse_qs(urlparse(request.url).query).get("$filter", [""])[0])
+    m = re.search(r"RecordLastModified gt ([0-9T:\-.Z]+)", flt)
+    return m.group(1) if m else None
+
+
+@responses.activate
+def test_cursor_probe_hydrates_only_dirty_parents():
+    """The probe issues one shallow ``$expand($orderby=cursor desc;$top=1)`` per
+    leaf-grandparent tuple, reads each leaf-parent's newest leaf, and hydrates
+    ONLY those whose newest leaf cursor is > since. Clean leaf-parents are never
+    fetched (their hydrate URL is unregistered — a request would error)."""
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+
+    # Level-0 enumeration of Roots (nextlink mode → short page is the end).
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}, {"Id": 2}]})
+    # Probe per root returns each Mid's newest leaf cursor. Mid 10 + Mid 21 are
+    # dirty (newest > since); 11 + 20 are clean (newest <= since).
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids",
+        json={
+            "value": [
+                {"Id": 10, "Leaves": [{"RecordLastModified": "2020-06-01T00:00:00Z"}]},
+                {"Id": 11, "Leaves": [{"RecordLastModified": "2019-06-01T00:00:00Z"}]},
+            ]
+        },
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(2)/Mids",
+        json={
+            "value": [
+                {"Id": 20, "Leaves": [{"RecordLastModified": "2019-01-01T00:00:00Z"}]},
+                {"Id": 21, "Leaves": [{"RecordLastModified": "2020-07-01T00:00:00Z"}]},
+            ]
+        },
+    )
+    # Hydrate ONLY the dirty leaf-parents. Clean ones (Mids(11), Mids(20))
+    # are deliberately left unregistered.
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={"value": [{"Id": 1001, "RecordLastModified": "2020-06-01T00:00:00Z"}]},
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(2)/Mids(21)/Leaves",
+        json={"value": [{"Id": 2101, "RecordLastModified": "2020-07-01T00:00:00Z"}]},
+    )
+
+    c = _make()
+    _skip_probe_preflight(c)
+    recs, offset = c.read_table(
+        PROBE_TABLE,
+        {"cursor": since},
+        {"cursor_field": "RecordLastModified", "cursor_probe": "true", "pagination": "nextlink"},
+    )
+    rows = list(recs)
+    # Only the two dirty leaves, each with the full ancestor FK chain.
+    assert sorted((r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in rows) == [
+        (1, 10, 1001),
+        (2, 21, 2101),
+    ]
+    # Watermark advanced to the global max leaf cursor.
+    assert offset["cursor"] == "2020-07-01T00:00:00Z"
+    # The probe orders the inner $expand by the cursor desc and takes top 1 —
+    # the max-cursor leaf by construction, with NO inner $filter to mis-order.
+    from urllib.parse import unquote
+
+    probe_calls = [unquote(c.request.url) for c in responses.calls if "/Mids?" in c.request.url]
+    assert probe_calls
+    for u in probe_calls:
+        assert (
+            "$expand=Leaves($orderby=RecordLastModified desc;$top=1;$select=RecordLastModified)"
+            in u
+        )
+        assert "$filter=" not in u.split("$expand=", 1)[1]  # no inner filter
+    # No hydrate request was ever made for a clean leaf-parent.
+    hydrate_urls = [c.request.url for c in responses.calls if "/Leaves" in c.request.url]
+    assert not any("Mids(11)" in u or "Mids(20)" in u for u in hydrate_urls)
+
+
+@responses.activate
+def test_cursor_probe_first_batch_no_watermark_reads_all():
+    """With no committed cursor yet (first batch, since=None) the probe is
+    bypassed entirely — it would mark every leaf-parent dirty, so its
+    per-grandparent ``$expand`` round-trips prune nothing. The connector falls
+    back to the plain N+1 enumerator: identical full set, no probe requests."""
+    _mock_probe_metadata()
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids",
+        json={
+            "value": [
+                {"Id": 10, "Leaves": [{"RecordLastModified": "2020-06-01T00:00:00Z"}]},
+                {"Id": 11, "Leaves": [{"RecordLastModified": "2020-05-01T00:00:00Z"}]},
+            ]
+        },
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={"value": [{"Id": 1001, "RecordLastModified": "2020-06-01T00:00:00Z"}]},
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(11)/Leaves",
+        json={"value": [{"Id": 1101, "RecordLastModified": "2020-05-01T00:00:00Z"}]},
+    )
+    c = _make()
+    _skip_probe_preflight(c)
+    recs, offset = c.read_table(
+        PROBE_TABLE,
+        {},  # streaming first batch: no cursor
+        {"cursor_field": "RecordLastModified", "cursor_probe": "true", "pagination": "nextlink"},
+    )
+    rows = list(recs)
+    assert sorted(r["Id"] for r in rows) == [1001, 1101]
+    assert offset["cursor"] == "2020-06-01T00:00:00Z"
+    # First batch bypasses the probe: no inner ``$expand`` round-trips at all.
+    assert not any("%24expand" in call.request.url for call in responses.calls)
+
+
+@responses.activate
+def test_cursor_probe_resumes_across_cap_with_dirty_chain_iterator():
+    """The injected dirty-chain iterator composes with the leaf-cursor cap /
+    ``parent_idx`` resume: with ``max_records_per_batch=1`` over two dirty
+    parents (two distinct-cursor leaves each), driving ``read_table`` to
+    completion captures every changed leaf exactly once with its FK chain,
+    re-probing skipped parents on each resumed batch."""
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+    all_leaves = {
+        "Roots(1)/Mids(10)/Leaves": [
+            {"Id": 1001, "RecordLastModified": "2020-03-01T00:00:00Z"},
+            {"Id": 1002, "RecordLastModified": "2020-04-01T00:00:00Z"},
+        ],
+        "Roots(2)/Mids(21)/Leaves": [
+            {"Id": 2101, "RecordLastModified": "2020-05-01T00:00:00Z"},
+            {"Id": 2102, "RecordLastModified": "2020-06-01T00:00:00Z"},
+        ],
+    }
+
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Roots",
+        callback=lambda r: (200, {}, json.dumps({"value": [{"Id": 1}, {"Id": 2}]})),
+    )
+    # Probe returns each Mid's newest leaf cursor (max over its leaves) — both
+    # exceed `since`, so both stay dirty across every re-probe on resume.
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Roots(1)/Mids",
+        callback=lambda r: (
+            200,
+            {},
+            json.dumps(
+                {"value": [{"Id": 10, "Leaves": [{"RecordLastModified": "2020-04-01T00:00:00Z"}]}]}
+            ),
+        ),
+    )
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Roots(2)/Mids",
+        callback=lambda r: (
+            200,
+            {},
+            json.dumps(
+                {"value": [{"Id": 21, "Leaves": [{"RecordLastModified": "2020-06-01T00:00:00Z"}]}]}
+            ),
+        ),
+    )
+
+    def _make_leaf_cb(path):
+        def _cb(request):
+            floor = _probe_filter_floor(request)
+            leaves = [
+                l for l in all_leaves[path] if floor is None or l["RecordLastModified"] > floor
+            ]
+            return (200, {}, json.dumps({"value": leaves}))
+
+        return _cb
+
+    for path in all_leaves:
+        responses.add_callback(responses.GET, f"{SERVICE_URL}{path}", callback=_make_leaf_cb(path))
+
+    c = _make()
+    _skip_probe_preflight(c)
+    opts = {
+        "cursor_field": "RecordLastModified",
+        "cursor_probe": "true",
+        "pagination": "nextlink",
+        "max_records_per_batch": "1",
+    }
+    offset = {"cursor": since}
+    seen = []
+    for _ in range(30):
+        recs, offset = c.read_table(PROBE_TABLE, offset, opts)
+        batch = list(recs)
+        if not batch:
+            break
+        seen.extend(batch)
+    # Every changed leaf captured exactly once, with the full FK chain.
+    assert sorted((r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in seen) == [
+        (1, 10, 1001),
+        (1, 10, 1002),
+        (2, 21, 2101),
+        (2, 21, 2102),
+    ]
+    assert offset["cursor"] == "2020-06-01T00:00:00Z"
+
+
+@responses.activate
+def test_cursor_probe_invalid_value_raises():
+    _mock_probe_metadata()
+    c = _make()
+    with pytest.raises(ValueError, match="Invalid cursor_probe"):
+        c.read_table(
+            PROBE_TABLE,
+            {},
+            {"cursor_field": "RecordLastModified", "cursor_probe": "maybe"},
+        )
+
+
+@responses.activate
+def test_cursor_probe_conflicts_with_expand_contained():
+    _mock_probe_metadata()
+    c = _make()
+    with pytest.raises(ValueError, match="conflicts with expand_contained"):
+        c.read_table(
+            PROBE_TABLE,
+            {},
+            {
+                "cursor_field": "RecordLastModified",
+                "cursor_probe": "true",
+                "expand_contained": "true",
+            },
+        )
+
+
+@responses.activate
+def test_cursor_probe_on_flat_table_raises():
+    _mock_metadata()
+    c = _make()
+    with pytest.raises(ValueError, match="only on contained-collection paths"):
+        c.read_table("Customers", {}, {"cursor_field": "ModifiedAt", "cursor_probe": "true"})
+
+
+@responses.activate
+def test_cursor_probe_without_cursor_field_raises():
+    _mock_probe_metadata()
+    c = _make()
+    with pytest.raises(ValueError, match="requires a cursor_field"):
+        c.read_table(PROBE_TABLE, {}, {"cursor_probe": "true"})
+
+
+@responses.activate
+def test_cursor_probe_with_ancestor_cursor_raises():
+    """``MidOnly`` lives on the Mid ancestor, not the leaf — cursor_probe only
+    accelerates leaf-owned cursors, so it must reject an ancestor cursor."""
+    _mock_probe_metadata()
+    c = _make()
+    with pytest.raises(ValueError, match="requires cursor_field on the leaf"):
+        c.read_table(
+            PROBE_TABLE,
+            {},
+            {"cursor_field": "MidOnly", "cursor_probe": "true"},
+        )
+
+
+@responses.activate
+def test_cursor_probe_explicit_raises_when_leaf_parent_is_snapshot():
+    """``Roots__Plains__Items``: 3 segments, but the leaf-parent ``Plains`` is a
+    batch-snapshot level (no cursor field) — distance from the leaf to the
+    nearest snapshot ancestor is 1, so the probe can't save work. The exact
+    ``Instances/Projects/WorkPackageDetails`` shape: an explicit opt-in is
+    rejected (depth alone does not qualify a path)."""
+    _mock_probe_metadata()
+    c = _make()
+    with pytest.raises(ValueError, match="batch-snapshot level"):
+        c.read_table(
+            "Roots__Plains__Items",
+            {},
+            {"cursor_field": "RecordLastModified", "cursor_probe": "true"},
+        )
+
+
+@responses.activate
+def test_cursor_probe_default_inert_when_leaf_parent_is_snapshot():
+    """Even default-on, a depth-3 path whose leaf-parent is snapshot
+    (``Roots__Plains__Items``) is INAPPLICABLE — distance to the nearest
+    snapshot ancestor is 1 — so it uses the plain N+1 leaf walk, issues NO
+    ``$expand`` probe, and skips the preflight. Matches the user's
+    ``Instances/Projects/WorkPackageDetails`` case."""
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.get(f"{SERVICE_URL}Roots(1)/Plains", json={"value": [{"Id": 5}]})
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Plains(5)/Items",
+        json={"value": [{"Id": 50, "RecordLastModified": "2020-06-01T00:00:00Z"}]},
+    )
+    c = _make()
+    recs, offset = c.read_table(
+        "Roots__Plains__Items",
+        {"cursor": since},
+        {"cursor_field": "RecordLastModified", "pagination": "nextlink"},
+    )
+    rows = list(recs)
+    assert [(r["Roots_Id"], r["Plains_Id"], r["Id"]) for r in rows] == [(1, 5, 50)]
+    assert offset["cursor"] == "2020-06-01T00:00:00Z"
+    assert not any("%24expand" in call.request.url for call in responses.calls)
+
+
+@responses.activate
+def test_cursor_probe_default_on_engages_without_opt_in():
+    """cursor_probe defaults to TRUE: on a probe-eligible deep path it engages
+    with no option set — the probe runs and only dirty leaf-parents are
+    hydrated. (Preflight pre-seeded; covered separately.)"""
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    # Probe: Mid 10 dirty (newest > since), Mid 11 clean (newest <= since).
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids",
+        json={
+            "value": [
+                {"Id": 10, "Leaves": [{"RecordLastModified": "2020-06-01T00:00:00Z"}]},
+                {"Id": 11, "Leaves": [{"RecordLastModified": "2019-06-01T00:00:00Z"}]},
+            ]
+        },
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={"value": [{"Id": 1001, "RecordLastModified": "2020-06-01T00:00:00Z"}]},
+    )
+    c = _make()
+    _skip_probe_preflight(c)
+    recs, offset = c.read_table(
+        PROBE_TABLE,
+        {"cursor": since},
+        # No cursor_probe key — relies on the default (on).
+        {"cursor_field": "RecordLastModified", "pagination": "nextlink"},
+    )
+    rows = list(recs)
+    # Probe engaged: only the dirty Mid 10 hydrated; clean Mid 11 skipped.
+    assert [(r["Mids_Id"], r["Id"]) for r in rows] == [(10, 1001)]
+    assert offset["cursor"] == "2020-06-01T00:00:00Z"
+    assert any("$expand=Leaves" in c.request.url for c in responses.calls)
+    assert not any("Mids(11)/Leaves" in c.request.url for c in responses.calls)
+
+
+@responses.activate
+def test_cursor_probe_skips_parent_whose_newest_leaf_predates_watermark():
+    """The client-side comparison is what fixes the original bug: a leaf-parent
+    that HAS leaves but whose newest leaf cursor is <= since must be skipped.
+    Mid 10's newest leaf is newer than since (dirty → hydrated); Mid 11 has a
+    leaf but its newest predates since (clean → never hydrated)."""
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids",
+        json={
+            "value": [
+                {"Id": 10, "Leaves": [{"RecordLastModified": "2020-06-01T00:00:00Z"}]},
+                {"Id": 11, "Leaves": [{"RecordLastModified": "2019-12-31T00:00:00Z"}]},
+            ]
+        },
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={"value": [{"Id": 1001, "RecordLastModified": "2020-06-01T00:00:00Z"}]},
+    )
+    c = _make()
+    _skip_probe_preflight(c)
+    recs, _ = c.read_table(
+        PROBE_TABLE,
+        {"cursor": since},
+        {"cursor_field": "RecordLastModified", "cursor_probe": "true", "pagination": "nextlink"},
+    )
+    rows = list(recs)
+    assert [(r["Mids_Id"], r["Id"]) for r in rows] == [(10, 1001)]
+    # Mid 11 has a leaf, but its newest predates `since` → never hydrated.
+    assert not any("Mids(11)/Leaves" in c.request.url for c in responses.calls)
+
+
+@responses.activate
+def test_cursor_probe_default_inert_on_two_segment_path():
+    """Even default-on, ``Roots__Mids`` is INAPPLICABLE (the leaf-parent
+    ``Roots`` is a snapshot level, distance 1), so it uses the plain N+1 leaf
+    walk, issues NO ``$expand`` probe, and skips the preflight."""
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids",
+        json={"value": [{"Id": 10, "RecordLastModified": "2020-06-01T00:00:00Z"}]},
+    )
+    c = _make()
+    recs, offset = c.read_table(
+        "Roots__Mids",
+        {"cursor": since},
+        {"cursor_field": "RecordLastModified", "pagination": "nextlink"},
+    )
+    rows = list(recs)
+    assert [(r["Roots_Id"], r["Id"]) for r in rows] == [(1, 10)]
+    assert offset["cursor"] == "2020-06-01T00:00:00Z"
+    # No probe: the standard leaf walk never emits an $expand.
+    assert not any("%24expand" in call.request.url for call in responses.calls)
+
+
+def _probe_mids_callback(inner_expand_newest):
+    """Callback for ``Roots(1)/Mids``: returns Mid 10's key for the preflight's
+    leaf-parent enumeration, and Mid 10 with a probe-shaped ``Leaves`` whose
+    newest cursor is ``inner_expand_newest`` for the inner-$expand check."""
+
+    def _cb(request):
+        from urllib.parse import unquote
+
+        if "$expand=Leaves" in unquote(request.url):
+            return (
+                200,
+                {},
+                json.dumps(
+                    {"value": [{"Id": 10, "Leaves": [{"RecordLastModified": inner_expand_newest}]}]}
+                ),
+            )
+        return (200, {}, json.dumps({"value": [{"Id": 10}]}))
+
+    return _cb
+
+
+@responses.activate
+def test_cursor_probe_preflight_passes_when_inner_orderby_honored():
+    """The capability check passes (no raise, cached verified) when the inner
+    ``$expand($orderby desc;$top=1)`` returns the same newest leaf as trusted
+    direct navigation."""
+    _mock_probe_metadata()
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Roots(1)/Mids",
+        callback=_probe_mids_callback("2020-09-01T00:00:00Z"),  # matches direct max
+    )
+    # Direct-nav desc top2: two distinct cursors → discriminating, true max 2020-09.
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={
+            "value": [
+                {"RecordLastModified": "2020-09-01T00:00:00Z"},
+                {"RecordLastModified": "2020-05-01T00:00:00Z"},
+            ]
+        },
+    )
+    c = _make()
+    verified = c._verify_cursor_probe_support(
+        ["Roots", "Mids", "Leaves"], None, {"page_size": "1000"}, "RecordLastModified"
+    )
+    # Conclusive pass: the discriminating sample's inner-$expand matched the
+    # trusted direct-nav max, so the caller may persist the verdict.
+    assert verified is True
+    assert c.__dict__["_cursor_probe_verified"][(("Roots", "Mids", "Leaves"), None)] == (None, True)
+
+
+@responses.activate
+def test_cursor_probe_read_table_raises_when_server_misorders_inner_expand():
+    """Fail fast: when the inner ``$expand($orderby desc;$top=1)`` returns a
+    non-newest leaf (server ignores inner ordering), read_table raises during
+    the preflight instead of silently dropping rows."""
+    _mock_probe_metadata()
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Roots(1)/Mids",
+        callback=_probe_mids_callback("2020-02-01T00:00:00Z"),  # NOT the true max
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={
+            "value": [
+                {"RecordLastModified": "2020-09-01T00:00:00Z"},
+                {"RecordLastModified": "2020-05-01T00:00:00Z"},
+            ]
+        },
+    )
+    c = _make()
+    with pytest.raises(ValueError, match=r"honour \$orderby/\$top inside \$expand"):
+        c.read_table(
+            PROBE_TABLE,
+            {"cursor": "2020-01-01T00:00:00Z"},
+            {
+                "cursor_field": "RecordLastModified",
+                "cursor_probe": "true",
+                "pagination": "nextlink",
+            },
+        )
+
+
+@responses.activate
+def test_cursor_probe_conclusive_pass_persists_ok_flag_in_offset():
+    """A conclusive preflight pass stamps ``cursor_probe_ok`` into the resume
+    offset, so a per-batch-recreated reader can trust it next batch."""
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    # Probe + preflight enumeration of Mid 10 (one dirty leaf-parent).
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids",
+        json={"value": [{"Id": 10, "Leaves": [{"RecordLastModified": "2020-06-01T00:00:00Z"}]}]},
+    )
+    # Preflight direct-nav reference: two distinct cursors → discriminating,
+    # true max 2020-06 (matches the inner-$expand newest above → conclusive ok).
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={
+            "value": [
+                {"Id": 1001, "RecordLastModified": "2020-06-01T00:00:00Z"},
+                {"Id": 1000, "RecordLastModified": "2020-02-01T00:00:00Z"},
+            ]
+        },
+    )
+    c = _make()  # no _skip_probe_preflight: the real preflight runs and passes
+    _, offset = c.read_table(
+        PROBE_TABLE,
+        {"cursor": since},
+        {"cursor_field": "RecordLastModified", "cursor_probe": "true", "pagination": "nextlink"},
+    )
+    assert offset.get("cursor_probe_ok") is True
+
+
+@responses.activate
+def test_cursor_probe_offset_flag_skips_preflight_requests():
+    """When the resume offset already carries ``cursor_probe_ok`` (set by an
+    earlier batch), a freshly-constructed reader skips the preflight entirely —
+    no direct-navigation capability requests are issued — and still hydrates
+    only the dirty leaf-parent via the probe."""
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    # Probe: Mid 10 dirty, Mid 11 clean.
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids",
+        json={
+            "value": [
+                {"Id": 10, "Leaves": [{"RecordLastModified": "2020-06-01T00:00:00Z"}]},
+                {"Id": 11, "Leaves": [{"RecordLastModified": "2019-06-01T00:00:00Z"}]},
+            ]
+        },
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={"value": [{"Id": 1001, "RecordLastModified": "2020-06-01T00:00:00Z"}]},
+    )
+    # NOTE: Mids(11)/Leaves is left unregistered — the preflight would hit it
+    # (direct-nav reference) if it ran; trusting the offset flag must avoid that.
+    c = _make()  # cold instance cache; trust comes from the offset flag alone
+    recs, offset = c.read_table(
+        PROBE_TABLE,
+        {"cursor": since, "cursor_probe_ok": True},
+        {"cursor_field": "RecordLastModified", "cursor_probe": "true", "pagination": "nextlink"},
+    )
+    rows = list(recs)
+    assert [(r["Mids_Id"], r["Id"]) for r in rows] == [(10, 1001)]
+    assert offset.get("cursor_probe_ok") is True
+    # The preflight's direct-navigation reference query (``$orderby cursor
+    # desc;$top=2``) was never issued — the only leaf fetch is Mid 10's hydrate
+    # (ascending cursor walk, no ``desc``), and the clean Mid 11 is untouched.
+    from urllib.parse import unquote
+
+    leaf_calls = [
+        unquote(call.request.url) for call in responses.calls if "/Leaves" in call.request.url
+    ]
+    assert leaf_calls == [
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves?$top=1000"
+        "&$filter=RecordLastModified gt 2020-01-01T00:00:00Z&$orderby=RecordLastModified asc,Id asc"
+    ]
+    assert not any("desc" in u for u in leaf_calls)
+    assert not any("Mids(11)" in u for u in leaf_calls)
+
+
+@responses.activate
+def test_cursor_probe_lookback_floors_filter_and_reincludes_overlap_parent():
+    """cursor_probe utilises cursor_lookback: with a window set, the probe's
+    dirty-detection AND the hydrate filter floor to (committed - window), so a
+    leaf-parent whose newest leaf fell in the overlap (<= since, > read_since) is
+    re-flagged dirty and re-hydrated — catching a mid-walk arrival. The committed
+    watermark stays the TRUE max (never floored)."""
+    _mock_probe_metadata()
+    since = "2020-06-10T00:00:00Z"  # read_since = since - 1 day = 2020-06-09
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    # Probe newest-leaf per Mid: 10 new (> since), 11 in overlap (> read_since,
+    # <= since), 12 below the window (clean).
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids",
+        json={
+            "value": [
+                {"Id": 10, "Leaves": [{"RecordLastModified": "2020-06-11T00:00:00Z"}]},
+                {"Id": 11, "Leaves": [{"RecordLastModified": "2020-06-09T12:00:00Z"}]},
+                {"Id": 12, "Leaves": [{"RecordLastModified": "2020-06-08T00:00:00Z"}]},
+            ]
+        },
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={"value": [{"Id": 1001, "RecordLastModified": "2020-06-11T00:00:00Z"}]},
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(11)/Leaves",
+        json={"value": [{"Id": 1101, "RecordLastModified": "2020-06-09T12:00:00Z"}]},
+    )
+    c = _make()
+    _skip_probe_preflight(c)
+    recs, offset = c.read_table(
+        PROBE_TABLE,
+        {"cursor": since},
+        {
+            "cursor_field": "RecordLastModified",
+            "cursor_probe": "true",
+            "pagination": "nextlink",
+            "cursor_lookback_seconds": "86400",  # 1 day
+        },
+    )
+    rows = list(recs)
+    # Overlap parent (Mid 11) re-included; below-window parent (Mid 12) skipped.
+    assert sorted((r["Mids_Id"], r["Id"]) for r in rows) == [(10, 1001), (11, 1101)]
+    assert not any("Mids(12)/Leaves" in call.request.url for call in responses.calls)
+    # Committed watermark = TRUE max, not floored.
+    assert offset["cursor"] == "2020-06-11T00:00:00Z"
+    # The hydrate filter floored to read_since (2020-06-09), not `since`.
+    from urllib.parse import unquote
+
+    hydrate = [unquote(c.request.url) for c in responses.calls if "/Mids(1" in c.request.url]
+    assert hydrate and all("2020-06-09" in u for u in hydrate)
+    assert not any("gt 2020-06-10" in u for u in hydrate)
+
+
+@responses.activate
+def test_leaf_cursor_plain_walk_lookback_keeps_overlap_rows():
+    """The plain N+1 leaf-cursor walk (cursor_probe=false) also utilises
+    cursor_lookback: the per-chain `cursor gt` filter floors to read_since, so an
+    overlap leaf (cursor <= since, > read_since) is re-emitted while the
+    committed watermark stays the true max."""
+    _mock_probe_metadata()
+    since = "2020-06-10T00:00:00Z"
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.get(f"{SERVICE_URL}Roots(1)/Mids", json={"value": [{"Id": 10}, {"Id": 11}]})
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={"value": [{"Id": 1001, "RecordLastModified": "2020-06-11T00:00:00Z"}]},
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(11)/Leaves",
+        json={"value": [{"Id": 1101, "RecordLastModified": "2020-06-09T12:00:00Z"}]},  # overlap
+    )
+    c = _make()
+    recs, offset = c.read_table(
+        PROBE_TABLE,
+        {"cursor": since},
+        {
+            "cursor_field": "RecordLastModified",
+            "cursor_probe": "false",  # plain N+1
+            "pagination": "nextlink",
+            "cursor_lookback_seconds": "86400",
+        },
+    )
+    rows = list(recs)
+    # Overlap leaf (1101, <= since) kept thanks to the floored filter.
+    assert sorted(r["Id"] for r in rows) == [1001, 1101]
+    assert offset["cursor"] == "2020-06-11T00:00:00Z"
+    # No probe was issued (cursor_probe=false).
+    assert not any("$expand" in c.request.url for c in responses.calls)
