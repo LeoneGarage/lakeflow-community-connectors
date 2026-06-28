@@ -773,6 +773,9 @@ def test_batch_mode_expand_streams_lazily_and_uncapped():
     )
     # Short top-level page → the drainer probes once more to confirm exhaustion.
     responses.get(f"{SERVICE_URL}Parents", json={"value": []})
+    # Short, link-less inline Children page → the inner drainer probes past the
+    # last inline child to confirm exhaustion (mirrors the top-level auto drain).
+    responses.get(f"{SERVICE_URL}Parents(1)/Children", json={"value": []})
     c = _make()
     records, offset = c.read_table(
         "Parents__Children",
@@ -3029,6 +3032,103 @@ def test_pagination_keyset_continues_inner_expand_when_nextlink_omitted():
 
 
 @responses.activate
+def test_contained_expand_drains_inner_collection_page_limited_below_top():
+    """Regression: a server that page-limits a nested ``$expand`` BELOW the
+    requested ``$top`` and omits its ``<NavProp>@odata.nextLink`` returns a
+    SHORT inline leaf page that is NOT complete. Under the default ``auto``
+    the connector must probe past the short inline page and drain the rest —
+    otherwise the trailing leaf rows (the user-reported missing deep records)
+    are silently lost AND, in a streaming read, the watermark advances past
+    them. Before the fix a short inline page was taken as proof of exhaustion.
+
+    Distinct from ``..._continues_inner_expand_when_nextlink_omitted`` (which
+    truncates on a FULL inline page == ``$top``): here the inline page is
+    SHORT, the case the old full-page-only continuation heuristic missed."""
+    _mock_nested_metadata()
+    # page_size=1000 over a 3-level expand → Notes $top=5 (compute_dynamic_tops).
+    # The server hands back only 3 inline Notes (BELOW $top) with no
+    # Notes@odata.nextLink, while two more (Ids 4,5) exist behind a probe.
+    all_notes = [{"Id": i, "Text": f"n{i}"} for i in range(1, 6)]  # 1..5
+
+    def _floor(request):
+        from urllib.parse import parse_qs, unquote, urlparse
+
+        flt = unquote(parse_qs(urlparse(request.url).query).get("$filter", [""])[0])
+        m = re.search(r"Id gt (\d+)", flt)
+        return int(m.group(1)) if m else 0
+
+    def _parents(request):
+        # Top-level drain probe past the single parent returns empty.
+        if _floor(request):
+            return (200, {}, json.dumps({"value": []}))
+        return (
+            200,
+            {},
+            json.dumps({"value": [{"Id": 1, "Children": [{"Id": 10, "Notes": all_notes[:3]}]}]}),
+        )
+
+    def _notes(request):
+        # The inner drain probe: return Notes after the seek boundary, so the
+        # walk pulls Ids 4,5 then an empty page (Id gt 5) and stops.
+        return (200, {}, json.dumps({"value": [n for n in all_notes if n["Id"] > _floor(request)]}))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents)
+    # The single inline child is itself a short link-less page, so its
+    # collection is probed too — empty (only Child 10 exists).
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children",
+        callback=lambda r: (200, {}, json.dumps({"value": []})),
+    )
+    responses.add_callback(
+        responses.GET, f"{SERVICE_URL}Parents(1)/Children(10)/Notes", callback=_notes
+    )
+    c = _make()
+    records, _ = c.read_table(
+        "Parents__Children__Notes",
+        None,
+        {"expand_contained": "true", "page_size": "1000"},
+    )
+    rows = list(records)
+    assert [r["Id"] for r in rows] == [1, 2, 3, 4, 5]  # none dropped past the short page
+    assert all(r["Parents_Id"] == 1 and r["Children_Id"] == 10 for r in rows)
+
+
+@responses.activate
+def test_contained_expand_nextlink_mode_warns_inner_truncation_risk(caplog):
+    """``expand_contained=true`` + ``pagination=nextlink`` disables the
+    client-driven inner-$expand drain, so a link-omitting server silently
+    truncates. The connector warns so the silent data loss isn't invisible."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": []})
+    c = _make()
+    with caplog.at_level("WARNING"):
+        list(
+            c.read_table(
+                "Parents__Children",
+                None,
+                {"expand_contained": "true", "pagination": "nextlink"},
+            )[0]
+        )
+    assert any(
+        "pagination=nextlink" in r.message and "silently dropped" in r.message
+        for r in caplog.records
+    )
+
+
+@responses.activate
+def test_contained_expand_auto_mode_no_inner_truncation_warning(caplog):
+    """The default ``auto`` self-heals inner collections, so no truncation
+    warning fires — the warning is specific to nextlink mode."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": []})
+    c = _make()
+    with caplog.at_level("WARNING"):
+        list(c.read_table("Parents__Children", None, {"expand_contained": "true"})[0])
+    assert not any("silently dropped" in r.message for r in caplog.records)
+
+
+@responses.activate
 def test_contained_expand_cursor_drains_capped_inner_collection_multi_parent():
     """Regression (xmla_demo): ``expand_contained=true`` + cursor on a server
     that caps every response BELOW the requested $top and omits the
@@ -3212,6 +3312,13 @@ def test_pagination_keyset_continued_inner_expand_reexpands_grandchildren():
 
     responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents)
     responses.add_callback(responses.GET, f"{SERVICE_URL}Parents(1)/Children", callback=_children)
+    # Each child carries a single inline Note (short, link-less) → the inner
+    # drainer probes past it. One empty page per child confirms exhaustion.
+    responses.add_callback(
+        responses.GET,
+        re.compile(rf"{re.escape(SERVICE_URL)}Parents\(1\)/Children\(\d+\)/Notes"),
+        callback=lambda req: (200, {}, json.dumps({"value": []})),
+    )
 
     c = _make()
     records, _ = c.read_table(
@@ -3869,6 +3976,9 @@ def test_contained_expand_two_level_flattens_nested_response():
     # drainer probes one more page to confirm exhaustion — a real server returns
     # empty past the last parent.
     responses.get(f"{SERVICE_URL}Parents", json={"value": []})
+    # Parent 1's inline Children page is short and link-less → the inner drainer
+    # probes past the last child. (Parent 2's Children is empty → no probe.)
+    responses.get(f"{SERVICE_URL}Parents(1)/Children", json={"value": []})
     c = _make()
     records, _ = c.read_table("Parents__Children", None, {"expand_contained": "true"})
     rows = list(records)
@@ -3902,6 +4012,9 @@ def test_contained_expand_three_level_flattens_nested():
         },
     )
     responses.get(f"{SERVICE_URL}Parents", json={"value": []})  # drain probe past last parent
+    # Short, link-less inline child + grandchild pages → inner drain probes.
+    responses.get(f"{SERVICE_URL}Parents(1)/Children", json={"value": []})
+    responses.get(f"{SERVICE_URL}Parents(1)/Children(10)/Notes", json={"value": []})
     c = _make()
     records, _ = c.read_table("Parents__Children__Notes", None, {"expand_contained": "true"})
     rows = list(records)
@@ -3935,6 +4048,7 @@ def test_contained_expand_strips_odata_annotations_on_leaf_rows():
         },
     )
     responses.get(f"{SERVICE_URL}Parents", json={"value": []})  # drain probe past last parent
+    responses.get(f"{SERVICE_URL}Parents(1)/Children", json={"value": []})  # inner drain probe
     c = _make()
     records, _ = c.read_table("Parents__Children", None, {"expand_contained": "true"})
     rows = list(records)
@@ -4059,8 +4173,10 @@ def test_contained_expand_truncates_mid_page_and_parks_pending_fetches():
 @responses.activate
 def test_contained_expand_truncates_at_page_boundary_queues_only_next_page():
     """When the cap happens to fire exactly at a page's last top_row,
-    the current page item is NOT re-queued (it's fully drained); only
-    the server's next-page URL stays in ``pending_fetches``."""
+    the current page item is NOT re-queued (it's fully drained); the
+    server's next-page URL stays in ``pending_fetches`` alongside one
+    inner-collection drain probe per parent whose short, link-less inline
+    Children page wasn't confirmed exhausted before the cap fired."""
     _mock_nested_metadata()
     next_link = f"{SERVICE_URL}Parents?$skiptoken=p2"
 
@@ -4089,7 +4205,14 @@ def test_contained_expand_truncates_at_page_boundary_queues_only_next_page():
     rows = list(records)
     assert len(rows) == 2
     pending = offset.get("pending_fetches")
-    assert pending == [{"url": next_link, "level": 0, "chain": [], "cur_val": None, "skip": 0}]
+    # The fully-drained top-level page is NOT re-queued — no item carries a
+    # skip>0 resume position — and its server next-page URL is parked.
+    assert {"url": next_link, "level": 0, "chain": [], "cur_val": None, "skip": 0} in pending
+    assert all(item["skip"] == 0 for item in pending)
+    # One inner-collection drain probe per parent (Fix: inner collections drain
+    # like the top-level auto walk, so a short link-less inline page is probed).
+    inner = [item for item in pending if item["level"] == 1]
+    assert sorted(item["chain"][0]["Id"] for item in inner) == [1, 2]
     assert "cursor" not in offset
 
 
@@ -4182,6 +4305,9 @@ def test_contained_expand_resumes_from_pending_fetches_skip():
         )
 
     responses.add_callback(responses.GET, page_url, callback=_resume, match_querystring=True)
+    # Only parent 3 is processed (skip=2); its short, link-less inline Children
+    # page triggers an inner drain probe.
+    responses.get(f"{SERVICE_URL}Parents(3)/Children", json={"value": []})
     c = _make()
     records, offset = c.read_table(
         "Parents__Children",
@@ -4218,6 +4344,8 @@ def test_contained_expand_resumes_from_pending_fetches_url():
     responses.add_callback(
         responses.GET, f"{SERVICE_URL}Parents", callback=_bare_top, match_querystring=True
     )
+    # Parent 3's short, link-less inline Children page → inner drain probe.
+    responses.get(f"{SERVICE_URL}Parents(3)/Children", json={"value": []})
     c = _make()
     records, offset = c.read_table(
         "Parents__Children",
@@ -4307,6 +4435,8 @@ def test_contained_expand_cursor_chain_completion_advances_watermark():
 
     resume_url = f"{SERVICE_URL}Parents?$skiptoken=last"
     responses.add_callback(responses.GET, resume_url, callback=_final, match_querystring=True)
+    # Parent 2's short, link-less inline Children page → inner drain probe.
+    responses.get(f"{SERVICE_URL}Parents(2)/Children", json={"value": []})
     c = _make()
     records, offset = c.read_table(
         "Parents__Children",
@@ -4404,6 +4534,9 @@ def test_contained_expand_first_batch_null_cursor_rows_raises():
         )
 
     responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_initial)
+    # Inner drain probe past the single short, link-less inline child so the
+    # chain fully drains and the no-progress guard (not a fetch error) fires.
+    responses.get(f"{SERVICE_URL}Parents(1)/Children", json={"value": []})
     c = _make()
     with pytest.raises(RuntimeError, match="did not advance"):
         records, _ = c.read_table(
@@ -4446,6 +4579,8 @@ def test_contained_expand_batch_mode_null_cursor_rows_emit_without_raise():
         )
 
     responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_initial)
+    # Inner drain probe past the single short, link-less inline child.
+    responses.get(f"{SERVICE_URL}Parents(1)/Children", json={"value": []})
     c = _make()
     records, _ = c.read_table(
         "Parents__Children",
@@ -4677,6 +4812,10 @@ def test_contained_expand_follows_inner_nextlink_at_grandchild_level():
         notes_next,
         json={"value": [{"Id": 101, "Text": "y"}, {"Id": 102, "Text": "z"}]},
     )
+    # The followed Notes page ends short and link-less → probe past Id 102; the
+    # single inline child is also a short, link-less page → probe past it.
+    responses.get(f"{SERVICE_URL}Parents(1)/Children(10)/Notes", json={"value": []})
+    responses.get(f"{SERVICE_URL}Parents(1)/Children", json={"value": []})
     c = _make()
     records, _ = c.read_table("Parents__Children__Notes", None, {"expand_contained": "true"})
     rows = list(records)
@@ -4711,6 +4850,7 @@ def test_contained_expand_strips_inner_nextlink_annotation_from_leaf():
         },
     )
     responses.get(f"{SERVICE_URL}Parents", json={"value": []})  # drain probe past last parent
+    responses.get(f"{SERVICE_URL}Parents(1)/Children", json={"value": []})  # inner drain probe
     c = _make()
     records, _ = c.read_table("Parents__Children", None, {"expand_contained": "true"})
     rows = list(records)
@@ -5139,6 +5279,8 @@ def test_contained_expand_filter_at_top_lands_on_top_url():
         )
 
     responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=callback)
+    # Parent 5's short, link-less inline Children page → inner drain probe.
+    responses.get(f"{SERVICE_URL}Parents(5)/Children", json={"value": []})
     c = _make()
     records, _ = c.read_table(
         "Parents__Children",
@@ -5178,6 +5320,9 @@ def test_contained_expand_filter_at_middle_lands_inside_expand():
         )
 
     responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=callback)
+    # Short, link-less inline child + grandchild pages → inner drain probes.
+    responses.get(f"{SERVICE_URL}Parents(1)/Children", json={"value": []})
+    responses.get(f"{SERVICE_URL}Parents(1)/Children(10)/Notes", json={"value": []})
     c = _make()
     records, _ = c.read_table(
         "Parents__Children__Notes",
@@ -5216,6 +5361,9 @@ def test_contained_expand_filter_at_leaf_lands_in_innermost_expand():
         )
 
     responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=callback)
+    # Short, link-less inline child + grandchild pages → inner drain probes.
+    responses.get(f"{SERVICE_URL}Parents(1)/Children", json={"value": []})
+    responses.get(f"{SERVICE_URL}Parents(1)/Children(10)/Notes", json={"value": []})
     c = _make()
     records, _ = c.read_table(
         "Parents__Children__Notes",
@@ -5374,6 +5522,9 @@ def test_contained_expand_with_ancestor_cursor_injects_filter_into_expand():
         match_querystring=False,
     )
     responses.get(f"{SERVICE_URL}Parents", json={"value": []})  # drain probe past last parent
+    # Short, link-less inline child + grandchild pages → inner drain probes.
+    responses.get(f"{SERVICE_URL}Parents(1)/Children", json={"value": []})
+    responses.get(f"{SERVICE_URL}Parents(1)/Children(11)/Notes", json={"value": []})
     c = _make()
     records, offset = c.read_table(
         "Parents__Children__Notes",

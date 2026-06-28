@@ -20,6 +20,7 @@ against the concrete class.
 # cap; splitting it further would fragment one tightly-coupled feature.
 # pylint: disable=too-many-lines
 
+import logging
 import math
 import re
 from datetime import date, datetime
@@ -34,6 +35,9 @@ from databricks.labs.community_connector.sources.odata._helpers import (
     max_or as _max_or,
     trim_to_distinct_cursor_boundary as _trim_to_distinct_cursor_boundary,
 )
+
+
+_LOG = logging.getLogger(__name__)
 
 
 # Path-segment separator. ``__`` (double underscore), not ``/``, so
@@ -1099,6 +1103,35 @@ class ContainedNavMixin:
 
         return _emit(), {}
 
+    def _warn_expand_inner_truncation_risk(self, segments: list[str]) -> None:
+        """Warn when ``expand_contained=true`` runs under ``pagination=nextlink``.
+
+        In nextlink mode the client-driven inner-``$expand`` continuation is
+        disabled (:meth:`_inner_expand_continuation_url` returns ``None``), so a
+        server that page-limits a nested ``$expand`` while omitting its
+        ``<NavProp>@odata.nextLink`` silently drops the deeper rows (the exact
+        failure this guard exists to surface). The default ``auto`` — and
+        ``keyset``/``skip`` — drain those collections themselves; nextlink mode
+        trusts the server's links entirely.
+
+        (A missing ``$top`` is a related risk — the drainer can't size a
+        continuation without one — but ``read_table`` always defaults
+        ``page_size`` for the client-driven modes, and nextlink mode is caught
+        here regardless, so that case can't independently arise.)
+        """
+        if len(segments) < 2:
+            return
+        if getattr(self, "_pagination", "nextlink") == "nextlink":
+            _LOG.warning(
+                "expand_contained=true with pagination=nextlink on %r: if the "
+                "server page-limits a nested $expand collection without emitting "
+                "its <NavProp>@odata.nextLink, the deeper rows (e.g. changed "
+                "leaf-level records) are silently dropped. Use the default "
+                "pagination=auto so the connector drains inner collections "
+                "itself.",
+                CONTAINED_PATH_SEP.join(segments),
+            )
+
     def _read_contained_expand(
         self,
         table_name: str,
@@ -1197,6 +1230,7 @@ class ContainedNavMixin:
         # the whole chain.
         page_size_opt = (table_options or {}).get("page_size")
         page_size = int(page_size_opt) if page_size_opt else None
+        self._warn_expand_inner_truncation_risk(segments)
         if start_offset is None:
             # Batch reader: offset discarded, ``since`` is None (no cursor
             # filter), cap disabled, guard skipped — so the ``emitted``
@@ -1737,8 +1771,26 @@ class ContainedNavMixin:
         if child_level >= len(segments):
             return None
         children = row.get(segments[child_level]) or []
-        if not children or len(children) < per_level_tops[child_level]:
+        if not children:
+            # Empty inline collection: an ``$expand`` returns ``[]`` for a
+            # genuinely empty child collection, and there's no boundary row
+            # to seek past — nothing to continue.
             return None
+        # A SHORT inline page is NOT proof the collection is complete: a
+        # server may page-limit a nested ``$expand`` below the requested
+        # ``$top`` while omitting its ``<NavProp>@odata.nextLink`` (its
+        # inner page size is smaller than our computed per-level ``$top``).
+        # Mirroring the top-level ``auto`` contract (:meth:`_client_paginate_pages`
+        # — seek until EMPTY, not until short), synthesize a continuation
+        # past the last inline child on ANY non-empty page. When the inline
+        # page was in fact complete the continuation's first page comes back
+        # empty and the walk stops, costing one trailing empty request per
+        # parent — the same price top-level ``auto`` pays. This closes the
+        # silent-truncation hole that drops changed deep-level rows on
+        # servers that don't emit inner-``$expand`` continuation links
+        # (previously this returned ``None`` whenever the inline page was
+        # shorter than the per-level ``$top``, taking a short page as proof
+        # of exhaustion).
         cur_field = cursor_ctx[0] if cursor_ctx else None
         return self._build_expand_continuation_url(
             segments, level, chain, cur_field, mode, children[-1], len(children)
