@@ -4029,17 +4029,21 @@ def register_lakeflow_source(spark):
     _BATCH_UNCAPPED = 10**12
 
     # Pagination strategy for walking a collection's pages:
-    #   * nextlink (default) — follow the server's ``@odata.nextLink``; the
-    #     spec-compliant default, byte-identical to historical behaviour.
+    #   * nextlink — follow the server's ``@odata.nextLink`` only; strictly
+    #     spec-compliant, and the choice for a ``$top``-free snapshot scan.
     #   * keyset — ignore ``@odata.nextLink``; seek the next page via a
     #     ``(k gt last)`` predicate on the ``$orderby`` key set. For servers
     #     that page-limit a response but omit the continuation link.
     #   * skip — ignore ``@odata.nextLink``; page via ``$top`` + ``$skip``.
     #     The keyless fallback (entities with no unique sort key); O(n)
     #     offsets and fragile under concurrent writes.
-    #   * auto — follow ``@odata.nextLink`` while emitted; if a *full* page
-    #     (``len == $top``) arrives with no link, fall back to keyset (when
-    #     the ``$orderby`` has keys) or skip for the rest of that collection.
+    #   * auto (default) — follow ``@odata.nextLink`` while emitted; when the
+    #     server stops linking, drain via a keyset (when the ``$orderby`` has
+    #     keys) or skip seek until an *empty* page. This covers a server that
+    #     page-limits below ``$top`` while omitting the link, and one that
+    #     treats ``$top`` as a total-result limit and propagates the budget
+    #     through its skiptoken links (the chain self-terminates at ``$top``;
+    #     auto seeks past it when ``fetched >= top``).
     # keyset/skip/auto require a ``$top`` to size pages and detect
     # truncation, so they force a default ``page_size`` when none is set.
     _PAGINATION_MODES = frozenset({"nextlink", "keyset", "skip", "auto"})
@@ -4530,10 +4534,12 @@ def register_lakeflow_source(spark):
             self._set_excluded_ancestor_columns(opts)
             # Overlap re-read window for non-atomic walks. Held on ``self`` for
             # the read's duration (like ``_pagination``); the floor is applied
-            # only to the read filter in ``_cursor_expand_clause``, never to the
-            # committed offset. Currently scoped to ``expand_contained=true``
-            # cursor reads — the only path whose walk is long enough and which
-            # has no client-side cursor re-filter to also floor.
+            # only to the read filter (``_apply_cursor_lookback``), never to the
+            # committed offset. Applies to every contained cursor-read path —
+            # ``expand_contained=true``, the N+1 leaf-cursor walk, and the
+            # ``cursor_probe`` hydrate — each of which self-sizes the ``auto``
+            # window from its measured walk duration. No-op for non-timestamp
+            # cursors.
             self._cursor_lookback = self._parse_cursor_lookback(opts)
             # ``auto`` tuning knobs (ignored for static/off modes).
             self._cursor_lookback_factor = self._parse_cursor_lookback_factor(opts)

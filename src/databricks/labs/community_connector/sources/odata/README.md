@@ -83,8 +83,10 @@ requires (or accepts) a `scope` parameter for client_credentials. For
 Azure AD / Entra ID flows the value is typically `<resource>/.default`
 (e.g. `https://graph.microsoft.com/.default`).
 
-If you prefer to leave `auth_type` off, the connector auto-detects
-`oauth2` from the presence of `oauth2_client_id` + `oauth2_client_secret`.
+For OAuth2 you must set `auth_type=oauth2` explicitly. Only `bearer` is
+auto-inferred (from a bare `token`); `oauth2`, `basic`, and `api_key` are
+**not** auto-detected from credential presence, so without `auth_type` the
+connector applies no auth at all.
 
 #### OAuth2 — authorization code (user-delegated, refresh-token rotation)
 
@@ -190,10 +192,11 @@ it in sync with the spec or table-level options like
 `delta_tracking` get silently stripped at runtime.
 
 The connector reads its auth credentials directly from these option
-keys; no `auth_method` / `auth_type` discriminator is needed when only
-one set of credentials is present (the runtime infers `bearer` from the
-presence of `token`, `basic` from `username`+`password`, `api_key` from
-`api_key`, `oauth2` from `oauth2_client_id`+`oauth2_client_secret`).
+keys. Only **`bearer`** is auto-inferred — from the presence of `token`.
+For `basic`, `api_key`, and `oauth2` you must set `auth_type` explicitly;
+if it is omitted (and no `token` is present) the connector builds the
+session with **no auth applied** — which is what anonymous services such
+as the public Northwind reference service want.
 
 ### Verifying the connection
 
@@ -213,7 +216,7 @@ verbatim (truncated to keep the trace readable). Three classes:
 
 | Symptom | Exception | Remediation hint in the message |
 |---|---|---|
-| Token-endpoint 4xx during the OAuth refresh-token grant | `ValueError` | Re-check `oauth2_refresh_token` + `oauth2_client_id`; the OAuth `error` / `error_description` is echoed verbatim. |
+| Token-endpoint 400/401 during an OAuth grant (refresh-token or client-credentials) | `ValueError` | Re-check `oauth2_refresh_token` + `oauth2_client_id`; the OAuth `error` / `error_description` is echoed verbatim. (Other token-endpoint statuses surface as `requests.HTTPError` via `raise_for_status`.) |
 | Source 401 *after* a successful OAuth refresh | `PermissionError` | The access token isn't the problem — check `oauth2_scope`, the principal's permissions, and any tenant/instance identifier in `service_url`. |
 | Source 401/403 with no refresh path available | `PermissionError` | Per auth mode (see below). |
 
@@ -238,7 +241,7 @@ The third row's remediation depends on the configured auth mode:
 | ----------------------------- | ------- | ----------- |
 | `timeout_seconds`             | 180     | Per-request HTTP timeout (seconds) applied to every call to the OData service (`$metadata` fetch and all entity reads). Raise it for slow services or large `$metadata`; lower it to fail fast. |
 | `metadata_cache_ttl_seconds`  | 60      | TTL (seconds) for the on-disk cache of the parsed `$metadata` document, shared across forked workers so the fetch + parse cost is paid once per pipeline init. Set to `0` to disable. |
-| `max_retries`                 | 5       | Retry budget for transient failures. Two classes covered: (1) **HTTP 429 / 503** — throttling or service unavailable; honours the server's `Retry-After` header when present (integer seconds or HTTP-date), otherwise exponential backoff (1, 2, 4, 8, 16 s …). (2) **Connection-level exceptions** — TCP reset / remote disconnect, read or connect timeout, mid-body chunked-encoding error (the server returned no HTTP response at all); always exponential backoff. After `max_retries` consecutive failures the batch raises — `RuntimeError` for 429/503, the original exception type (`ConnectionError`/`Timeout`/`ChunkedEncodingError`) for network failures. Set to `0` to opt out. |
+| `max_retries`                 | 5       | Retry budget for transient failures. Two classes covered: (1) **HTTP 429 / 500 / 502 / 503 / 504** — throttling, service unavailable, and transient gateway/server errors; honours the server's `Retry-After` header when present (integer seconds or HTTP-date), otherwise exponential backoff (1, 2, 4, 8, 16 s …). (2) **Connection-level exceptions** — TCP reset / remote disconnect, read or connect timeout, mid-body chunked-encoding error (the server returned no HTTP response at all); always exponential backoff. After `max_retries` consecutive failures the batch raises — `RuntimeError` for the retryable HTTP statuses, the original exception type (`ConnectionError`/`Timeout`/`ChunkedEncodingError`) for network failures. Set to `0` to opt out. |
 | `retry_max_delay_seconds`     | 60      | Per-retry sleep cap (seconds). Applied to both server-supplied `Retry-After` values and the exponential-backoff fallback, so a misbehaving source emitting an hour-long `Retry-After` can't pin a Spark task. |
 | `verbose_http_logging`        | false   | When `true`, logs each HTTP request/response (method, URL, status, timing) at INFO for troubleshooting. Off by default to keep logs quiet and avoid leaking URL query values. |
 | `verbose_http_log_body_chars` | 500     | When `verbose_http_logging` is on, the maximum number of response-body characters logged per request (truncated beyond this). Only consulted when verbose logging is enabled. |
@@ -300,7 +303,7 @@ build_pipeline(
 | `filter_at_<segment>` <br/> `filter_at_<idx>` | | Per-segment `$filter` for contained-path tables. Each entry is applied to the matching walk level — in N+1 mode the ancestor walks at each level get pruned to matching rows, cascading the savings down the children; in `expand_contained=true` mode the filter is injected inside the corresponding `$expand(...)` clause per OData v4 §5.1.1.6. Two equivalent forms: by segment name (`filter_at_Instances=Id eq 5` — must match a segment in the contained path) or by zero-based index (`filter_at_0=Id eq 5`). Index wins on conflict. Composes with cursor filters (AND-ed at the cursor's segment) and with the existing `filter` option (AND-ed at the leaf in N+1 mode, AND-ed at the top in expand mode). Unknown segment names and out-of-range indices raise `ValueError` at read time. |
 | `page_size`             | 1000 | Maximum per-response row budget. Under the default `pagination=auto` **every** read — snapshot, cursor, and delta — defaults `page_size=1000` (→ `$top=1000`), because `auto` needs a `$top` to detect a page-limited response with no continuation link. The one exception is `pagination=nextlink`: there a **snapshot read** (no `cursor_field`, no delta) with `page_size` unset sends **no `$top` at all** — the server picks its own page size and the connector walks every page via `@odata.nextLink` (this avoids servers that reject or mishandle an explicit `$top`, e.g. a value above their per-page cap, on a full-table scan); cursor/delta reads still default to `1000` even under `nextlink`. Setting `page_size` explicitly applies to every mode and overrides the default. For flat tables the value becomes the `$top` at the single URL. For `expand_contained=true` paths it's distributed across all `$top` points (top URL + every nested `$expand(...)`) with triangular weights — top gets the largest share, each deeper level proportionally less — so the cross-product `top × inner_1 × inner_2 × …` fits in the budget. Each per-level `$top` is floored at 5 (very small pages amplify the `@odata.nextLink` chase at every level); when a deep level would drop below 5 it's pinned to 5 and the remaining budget is divided back across the upper levels, so the cross-product stays at or under `page_size`. Each level (top URL and every nested `$expand(...)`) additionally carries a stable `$orderby` for skiptoken-safe paging — see [Pagination ordering](#pagination-ordering). Examples with `page_size=1000`: depth 2 → `[100, 10]` (product 1000), depth 3 → `[34, 5, 5]` (850), depth 4 → `[8, 5, 5, 5]` (1000). For chains so deep that `5 ** N > page_size` the floor unavoidably wins (e.g. `5**5 = 3125`); raise `page_size` to restore the cap, or switch to `expand_contained=false` so the chain becomes N+1 single-segment fetches. |
 | `max_records_per_batch` | 10000   | Per-call upper bound on rows returned. The connector has **no wall-clock ceiling** — `max_records_per_batch` is the only cap on a single batch. Each batch fetches `cursor gt <last>` and pulls up to this many rows, then commits the offset. Smaller values give continuous-mode pipelines lower latency per micro-batch at the cost of more round trips; larger values amortize HTTP overhead. Honoured by every read path (flat / contained N+1 / contained `expand_contained=true`). On the `expand_contained=true` path the cap is enforced **per HTTP fetch at any depth** via an iterative work queue: each inner-collection `@odata.nextLink` discovered during inline descent is appended to a queue rather than followed inline, and the cap is checked between fetches. Pending fetches are parked in the offset as `pending_fetches` (a list of `{url, level, chain, cur_val, skip}` items) so the next `read()` resumes the queue verbatim. Cap deviation per batch is bounded by one HTTP response's worth of leaf rows (≤ `page_size`), regardless of how deep the chain is or how wide any single parent's inner collection grows. In cursor mode the watermark only advances once the chain fully drains; until then the running max sits in `running_max_cursor`. The default of 10000 balances commit frequency / visibility against HTTP overhead; lower it (e.g. to 100) for tighter per-batch latency or higher (e.g. 100000+) for throughput-oriented batch backfills. |
-| `cursor_nulls`          | coalesce | How a cursor read handles rows whose `cursor_field` is **null**. `coalesce` (default): substitute a deterministic synthetic floor (a `2000-01-01…` timestamp carrying a per-PK sub-second offset, or the type's minimum for date/int/string cursors) for comparison and the watermark — the emitted row keeps its real `null`, the watermark always advances, and null-cursor rows are ingested once on the seed pass (server-side `cursor gt` excludes them thereafter, so null rows inserted *after* the seed aren't re-captured). The temporal floor year is configurable as `coalesce:<YYYY>` (e.g. `coalesce:1990`) — lower it below your oldest data; default `2000`. `error`: raise a no-progress `RuntimeError` when a batch's rows all have a null cursor (the watermark can't advance) — use to catch a misconfigured cursor. `ignore`: drop null-cursor rows entirely (never emitted). Applies to **flat and contained leaf-cursor** paths; ancestor-cursor and `expand_contained=true` paths treat nulls as `error`. For cursor types with no synthesisable floor (boolean/binary/guid) the default silently falls back to `error`; setting `cursor_nulls=coalesce` explicitly on such a cursor raises. |
+| `cursor_nulls`          | coalesce | How a cursor read handles rows whose `cursor_field` is **null**. `coalesce` (default): substitute a deterministic synthetic floor (a `2000-01-01…` timestamp carrying a per-PK sub-second offset, or the type's minimum for date/int/string cursors) for comparison and the watermark — the emitted row keeps its real `null`, the watermark always advances, and null-cursor rows are ingested once on the seed pass (server-side `cursor gt` excludes them thereafter, so null rows inserted *after* the seed aren't re-captured). The temporal floor year is configurable as `coalesce:<YYYY>` (e.g. `coalesce:1990`) — lower it below your oldest data; default `2000`. `error`: raise a no-progress `RuntimeError` when a batch's rows all have a null cursor (the watermark can't advance) — use to catch a misconfigured cursor. `ignore`: drop null-cursor rows entirely (never emitted). Applies to **flat and contained leaf-cursor** paths; ancestor-cursor and `expand_contained=true` paths treat nulls as `error`. For cursor types with no synthesisable floor (boolean/binary) the default silently falls back to `error`; setting `cursor_nulls=coalesce` explicitly on such a cursor raises. |
 | `pagination`            | auto | How the connector walks a collection's pages. `auto` (default): follow the server's `@odata.nextLink` whenever it emits one (identical to `nextlink` for spec-compliant servers); if the server **never** emits a link during a walk, fall back to a keyset seek (if the `$orderby` has keys) or skip and drain until an **empty** page — so a server that silently page-limits responses *below* the `$top` you request *and* omits `@odata.nextLink` (a common non-compliant shape, e.g. one that suppresses the link whenever `$top` is sent) is still read in full, with no per-table override. `nextlink`: follow `@odata.nextLink` only — strictly spec-compliant, and the choice when you want a `$top`-free snapshot scan (some servers reject or mishandle an explicit `$top`). `keyset`: ignore `@odata.nextLink` and always seek the next page with a `(k gt <last>)` predicate on the `$orderby` key set (`cursor`+PK, or PK-only). `skip`: ignore `@odata.nextLink` and page via `$top`+`$skip` — the keyless fallback (entities with no unique sort key); O(n) offsets and fragile under concurrent writes. **Termination differs by mode.** `nextlink` treats a *short* page (`len < $top`) with no continuation link as the end. `auto`, while the server is emitting links, trusts that short link-less final page as the end **only when the chain stopped *before* the `$top` budget was reached** (`fetched < $top`). OData `$top` is a **total-result limit** (§11.2.5.3), not a page size, and a spec-compliant server may propagate the remaining budget through its skiptoken `@odata.nextLink`s (e.g. Northwind: `$top=1000` → page 1's link carries `$top=500` → after 1000 rows no further link, though the collection has more). So if the link chain self-terminates at exactly the budget (`fetched >= $top`), `auto` does **not** trust the short final page — it seeks past the budget (keyset or `$skip`) and keeps draining until empty; otherwise any table larger than `page_size` would be silently capped at `page_size` rows. `auto` (once it has fallen back, i.e. the server gave no link), `keyset`, and `skip` instead drain until an **empty** page — a short non-empty page is NOT exhaustion, because the server's per-response page size may be **smaller than the `$top` you request**. The drain costs **one trailing empty request per collection that ends on a short page**; a spec-compliant server that keeps emitting `@odata.nextLink` incurs no extra request. Use `keyset`/`skip` explicitly only to *force* the seek strategy (e.g. ignore a buggy `@odata.nextLink` entirely). `auto`/`keyset`/`skip` require a `$top`, so they force a default `page_size` when none is set — including on snapshot scans under the default `auto`. A no-progress guard protects **every** mode against infinite loops: a walk stops with a warning if a continuation returns a page identical to the one before it (the server ignored the seek/`$skip`) or if the server hands back a self-referential/cyclic `@odata.nextLink` — this covers the client-driven modes, plain `nextlink`, and the delta-tracking walk. **Applies to every page walk**, including the nested `$expand` chain: flat reads, the contained leaf-cursor cap walk (the compound `(cursor eq V and pk gt last)` seek even drains a same-cursor cohort larger than a page), the ancestor walk, parent/ancestor enumeration, partitioned discovery, the top-level `$expand` collection, **and a parent's *inline child* collection inside `expand_contained=true`**. For the last case: when a parent's inline child page comes back full (`len == inner $top`) but the server omits the `<NavProp>@odata.nextLink`, the connector synthesizes a direct-navigation continuation — `Parent(key)/Child?$top=…&$expand=<grandchildren>` plus the keyset seek (or `$skip`) — and drains the rest, with the grandchildren still expanded and the cursor `$filter`/`$orderby` re-applied. This continuation flows through the same per-fetch work queue, so `max_records_per_batch` and cross-batch `pending_fetches` resume cover it too. `expand_contained=false` (N+1) with `pagination=keyset` remains a valid alternative for these servers. |
 | `delta_tracking`        | disabled | Opt-in OData v4 delta queries. Values: `disabled` (default — no behavior change), `auto` (probe once, fall back to cursor/snapshot if the server doesn't acknowledge), `enabled` (require support; error if the server doesn't acknowledge). See [Delta tracking](#delta-tracking) below. |
 | `expand_contained`      | false   | For contained-collection tables (`Parent__Child__...` paths). When `true`, the connector issues a single `GET Parent?$expand=Child($expand=...)` per pipeline trigger instead of the default N+1 traversal (one parent fetch + one per-parent leaf fetch). See [Contained navigation properties](#contained-navigation-properties) below. |
@@ -413,8 +416,9 @@ Each contained-collection table prepends synthetic FK columns for
 **every non-leaf ancestor**. This is required for global uniqueness —
 OData v4 §13.4.3 makes contained-entity keys unique only within their
 immediate parent, so collapsing on the leaf's own PK collides across
-sibling parent branches. Default name is ``<segment>_<pkname>``; a
-leading ``_`` is added only if it would collide with a leaf property.
+sibling parent branches. Default name is ``<segment>_<pkname>``;
+leading ``_`` characters are prepended (one or more, until unique) if it
+would collide with a leaf property **or** with another ancestor-FK column.
 For ``Parents__Children__Notes``:
 
 ```
@@ -640,17 +644,24 @@ entity set name appears in two schemas, set the `namespace` table option:
   [Per-table options](#per-table-options) for the contained-table
   parallel-read envelope.
 - Delete tombstones are synthesized only when `delta_tracking` is active.
-  In snapshot and cursor-based modes, the connector never returns
-  `cdc_with_deletes`. OData services without delta-query support don't
+  The connector never uses the framework's `cdc_with_deletes` +
+  `read_table_deletes` split in any mode — delta mode emits in-band
+  `_deleted` tombstones instead, and snapshot/cursor modes surface no
+  deletions at all. OData services without delta-query support don't
   expose deletions uniformly.
 - Cursor field (when used) is assumed to be monotonically non-decreasing
   and naturally orderable by `$orderby`. Timestamps and monotonic IDs
-  work; arbitrary fields don't. In streaming mode, if every row in a
-  batch has a null cursor the connector raises `RuntimeError` rather
-  than silently committing rows whose offset can't advance (batch reads
-  / `spark.read.format(...)` are tolerated — the offset is discarded
-  anyway). Add a server-side `filter` to exclude null-cursor rows when
-  the source allows them.
+  work; arbitrary fields don't. In streaming mode, null-cursor handling
+  follows the `cursor_nulls` option (default `coalesce`): null-cursor
+  rows are ingested with a synthetic-floor watermark so the offset still
+  advances — the connector does **not** raise by default. Set
+  `cursor_nulls=error` to instead raise a no-progress `RuntimeError` on a
+  batch whose rows all have a null cursor, or `cursor_nulls=ignore` to
+  drop null-cursor rows entirely. Ancestor-cursor / `expand_contained=true`
+  paths and cursor types with no synthesisable floor (boolean/binary)
+  always treat nulls as `error`. Batch reads / `spark.read.format(...)`
+  discard the offset regardless. You can also add a server-side `filter`
+  to exclude null-cursor rows when the source allows them.
 - The `expand_contained=true` per-HTTP-fetch cap (see the
   `max_records_per_batch` row in [Per-table options](#per-table-options))
   cannot interrupt mid-response because the in-flight HTTP response body
