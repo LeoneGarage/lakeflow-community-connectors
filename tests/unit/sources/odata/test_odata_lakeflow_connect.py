@@ -8620,3 +8620,118 @@ def test_cursor_probe_auto_cascades_to_batch_when_server_misorders_inner_expand(
     assert offset.get("batch_ok") is True
     # Cascaded: the leaf hydrate went through $batch, not the probe.
     assert any("Mids(10)/Leaves" in u for u in responder.seen)
+
+
+# ---------------------------------------------------------------------------
+# contained_fetch — $batch for the full (snapshot / batch-reader) contained walks
+# ---------------------------------------------------------------------------
+
+
+@responses.activate
+def test_contained_fetch_batch_snapshot_hydrates_via_batch():
+    """Snapshot contained read (no cursor) with ``contained_fetch`` defaulting to
+    ``batch``: per-leaf-parent hydrate goes through OData ``$batch`` — no
+    per-parent GET to the leaf collection."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}, {"Id": 2}]})
+    responder = _batch_responder(
+        [
+            ("Parents(1)/Children", {"value": [{"Id": 11, "Label": "a"}]}),
+            ("Parents(2)/Children", {"value": [{"Id": 21, "Label": "b"}]}),
+            ("Parents?$top=1", {"value": [{"Id": 1}]}),  # capability preflight
+        ]
+    )
+    responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=responder)
+
+    c = _make()
+    recs, offset = c.read_table("Parents__Children", {}, {})  # no cursor → snapshot
+    rows = sorted((r["Parents_Id"], r["Id"]) for r in recs)
+    assert rows == [(1, 11), (2, 21)]
+    assert offset == {}
+    # Both leaf collections hydrated via $batch; NO per-parent GET to /Children.
+    assert any("Parents(1)/Children" in u for u in responder.seen)
+    assert any("Parents(2)/Children" in u for u in responder.seen)
+    assert not any(
+        call.request.method == "GET" and "/Children" in call.request.url for call in responses.calls
+    )
+    # No $top on the batched sub-requests (server-driven paging).
+    assert not any("Children" in u and "$top=" in u for u in responder.seen)
+
+
+@responses.activate
+def test_contained_fetch_single_uses_per_parent_gets():
+    """``contained_fetch=single`` keeps the original behaviour: one GET per
+    leaf-parent, and never touches ``$batch``."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}]})
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={"value": [{"Id": 11, "Label": "a"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    recs, _ = c.read_table("Parents__Children", {}, {"contained_fetch": "single"})
+    assert [(r["Parents_Id"], r["Id"]) for r in recs] == [(1, 11)]
+    assert not any(call.request.method == "POST" for call in responses.calls)
+    assert any(
+        call.request.method == "GET" and "Parents(1)/Children" in call.request.url
+        for call in responses.calls
+    )
+
+
+@responses.activate
+def test_contained_fetch_batch_falls_back_to_single_when_unsupported():
+    """``contained_fetch=batch`` (default) against a server that rejects
+    ``$batch`` (405) degrades to the per-parent GET walk — never raises."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}]})
+    responses.post(f"{SERVICE_URL}$batch", json={"detail": "Method Not Allowed"}, status=405)
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={"value": [{"Id": 11, "Label": "a"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    recs, _ = c.read_table("Parents__Children", {}, {})  # batch default → 405 → single
+    assert [(r["Parents_Id"], r["Id"]) for r in recs] == [(1, 11)]
+    assert any(
+        call.request.method == "GET" and "Parents(1)/Children" in call.request.url
+        for call in responses.calls
+    )
+
+
+@responses.activate
+def test_contained_fetch_batch_reader_stream_hydrates_via_batch():
+    """The framework batch-reader stream (``start_offset=None`` on a cursor
+    table) also honours ``contained_fetch=batch``: the lazy full walk hydrates
+    each leaf-parent via ``$batch``."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}]})
+    responder = _batch_responder(
+        [
+            (
+                "Parents(1)/Children",
+                {"value": [{"Id": 11, "Label": "a", "ModifiedAt": "2024-01-01T00:00:00Z"}]},
+            ),
+            ("Parents?$top=1", {"value": [{"Id": 1}]}),
+        ]
+    )
+    responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=responder)
+
+    c = _make()
+    # start_offset=None → LakeflowBatchReader path → _stream_contained_incremental
+    recs, offset = c.read_table("Parents__Children", None, {"cursor_field": "ModifiedAt"})
+    assert [(r["Parents_Id"], r["Id"]) for r in recs] == [(1, 11)]
+    assert offset == {}  # batch reader discards the offset
+    assert any("Parents(1)/Children" in u for u in responder.seen)
+    assert not any(
+        call.request.method == "GET" and "/Children" in call.request.url for call in responses.calls
+    )
+
+
+@responses.activate
+def test_contained_fetch_invalid_value_raises():
+    _mock_nested_metadata()
+    c = _make()
+    with pytest.raises(ValueError, match="Invalid contained_fetch"):
+        c.read_table("Parents__Children", {}, {"contained_fetch": "maybe"})

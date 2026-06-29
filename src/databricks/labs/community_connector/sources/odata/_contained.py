@@ -1572,6 +1572,120 @@ class ContainedNavMixin:
         self.__dict__["_batch_supported"] = ok
         return ok
 
+    def _contained_fetch_mode(self, table_options: dict[str, str] | None) -> str:
+        """Parse the ``contained_fetch`` table option: how the **full** contained
+        walks (the snapshot read and the framework batch-reader stream) hydrate
+        each leaf-parent collection. One of:
+
+        * ``batch`` (**default**) — pack the per-leaf-parent GETs into OData
+          ``$batch`` requests (chunked to :data:`_BATCH_MAX_OPS`, server-driven
+          paging, ``@odata.nextLink`` follow-up), collapsing M round-trips into
+          ``ceil(M / _BATCH_MAX_OPS)``. A one-shot capability preflight gates it;
+          on a server without ``$batch`` it transparently falls back to
+          ``single``.
+        * ``single`` — the original behaviour: one GET per leaf-parent.
+
+        Unlike ``cursor_probe`` (which accelerates the *incremental* leaf-cursor
+        read), this governs the un-cursored full walks; the two are
+        independent."""
+        raw = ((table_options or {}).get("contained_fetch") or "batch").strip().lower()
+        if raw not in {"batch", "single"}:
+            raise ValueError(f"Invalid contained_fetch={raw!r}. Expected one of: batch, single.")
+        return raw
+
+    def _contained_fetch_use_batch(
+        self, segments: list[str], table_options: dict[str, str] | None
+    ) -> bool:
+        """``True`` when the full contained walk should hydrate via ``$batch``:
+        ``contained_fetch=batch`` (default) AND the server passes the ``$batch``
+        capability preflight. ``contained_fetch=single`` (or an unsupported
+        server) → ``False`` (plain one-GET-per-leaf-parent)."""
+        if self._contained_fetch_mode(table_options) != "batch":
+            return False
+        return self._verify_batch_support(segments, table_options)
+
+    def _iter_contained_leaf_rows(
+        self,
+        segments: list[str],
+        chain_meta_iter: Iterator[tuple[list[dict[str, Any]], Any]],
+        table_options: dict[str, str],
+        extra_filter: str | None,
+        order_by: str | None,
+        use_batch: bool,
+    ) -> Iterator[tuple[Any, dict]]:
+        """Hydrate leaf collections for a lazy full walk, yielding
+        ``(meta, raw_row)`` for every leaf row. ``chain_meta_iter`` pairs each
+        key-chain with an opaque ``meta`` the caller needs per row (the chain
+        for FK tagging, plus an ancestor cursor for the ancestor-cursor stream).
+
+        ``single`` mode (``use_batch=False``) is the original behaviour: one
+        :meth:`_fetch_pages` GET per chain (``$top``/pagination honoured).
+        ``batch`` mode buffers chains into groups of :data:`_BATCH_MAX_OPS` and
+        hydrates each group with one ``$batch`` request — ``$top`` stripped so
+        the server drives paging, and any sub-response ``@odata.nextLink`` is
+        re-batched until drained. Lazy at group granularity (≤ one chunk of
+        collections buffered at a time)."""
+        if not use_batch:
+            for chain, meta in chain_meta_iter:
+                url = self._build_contained_url(
+                    segments, chain, table_options, extra_filter=extra_filter, order_by=order_by
+                )
+                for row in self._fetch_pages(url):
+                    yield meta, row
+            return
+        # ``$batch``: drop ``page_size`` so sub-requests carry no ``$top`` and
+        # the server drives paging (the keyset/$skip drain can't run inside a
+        # batch sub-request — overflow comes back as @odata.nextLink instead).
+        leaf_opts = {k: v for k, v in (table_options or {}).items() if k != "page_size"}
+        group: list[tuple[list[dict[str, Any]], Any]] = []
+        for chain, meta in chain_meta_iter:
+            group.append((chain, meta))
+            if len(group) >= _BATCH_MAX_OPS:
+                yield from self._drain_contained_group(
+                    segments, group, leaf_opts, extra_filter, order_by
+                )
+                group = []
+        if group:
+            yield from self._drain_contained_group(
+                segments, group, leaf_opts, extra_filter, order_by
+            )
+
+    def _drain_contained_group(
+        self,
+        segments: list[str],
+        group: list[tuple[list[dict[str, Any]], Any]],
+        leaf_opts: dict[str, str],
+        extra_filter: str | None,
+        order_by: str | None,
+    ) -> Iterator[tuple[Any, dict]]:
+        """Hydrate one group of leaf-parent chains via ``$batch`` (+ nextLink
+        continuations), yielding ``(meta, raw_row)`` with ``@odata.*`` stripped."""
+        pending: list[tuple[int, str]] = []
+        meta_by_key: dict[int, Any] = {}
+        for key, (chain, meta) in enumerate(group):
+            pending.append(
+                (
+                    key,
+                    self._build_contained_url(
+                        segments, chain, leaf_opts, extra_filter=extra_filter, order_by=order_by
+                    ),
+                )
+            )
+            meta_by_key[key] = meta
+        while pending:
+            round_ = pending[:_BATCH_MAX_OPS]
+            pending = pending[_BATCH_MAX_OPS:]
+            responses = self._post_batch([u for _, u in round_])
+            for (key, req_url), resp in zip(round_, responses):
+                body = resp.get("body") if isinstance(resp, dict) else None
+                rows = body.get("value", []) if isinstance(body, dict) else []
+                for row in rows:
+                    clean = {k: v for k, v in row.items() if not k.startswith("@odata.")}
+                    yield meta_by_key[key], clean
+                raw_next = body.get("@odata.nextLink") if isinstance(body, dict) else None
+                if raw_next:
+                    pending.append((key, self._resolve_next_link(req_url, raw_next)))
+
     def _read_contained_snapshot(
         self, table_name: str, table_options: dict[str, str]
     ) -> tuple[Iterator[dict], dict]:
@@ -1589,15 +1703,18 @@ class ContainedNavMixin:
         segment_filters = resolve_segment_filters(table_options, segments)
         leaf_extra = segment_filters.get(len(segments) - 1)
         leaf_order_by = self._leaf_pk_order_by(segments, namespace)
+        use_batch = self._contained_fetch_use_batch(segments, table_options)
 
         def _emit() -> Iterator[dict]:
-            for chain in self._iter_parent_key_chains(segments, namespace, table_options):
-                url = self._build_contained_url(
-                    segments, chain, table_options, extra_filter=leaf_extra, order_by=leaf_order_by
-                )
-                for row in self._fetch_pages(url):
-                    self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
-                    yield row
+            chain_meta = (
+                (chain, chain)
+                for chain in self._iter_parent_key_chains(segments, namespace, table_options)
+            )
+            for chain, row in self._iter_contained_leaf_rows(
+                segments, chain_meta, table_options, leaf_extra, leaf_order_by, use_batch
+            ):
+                self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
+                yield row
 
         return _emit(), {}
 
@@ -2950,33 +3067,36 @@ class ContainedNavMixin:
         fk_columns = self._resolve_fk_columns(segments, namespace)
         segment_filters = resolve_segment_filters(table_options, segments)
         leaf_filter = segment_filters.get(len(segments) - 1)
+        use_batch = self._contained_fetch_use_batch(segments, table_options)
         if cursor_level == len(segments) - 1:
             order_by = self._leaf_cursor_order_by(table_name, namespace, cursor_field)
             skip_null, _effective = self._make_cursor_resolver(
                 table_name, namespace, cursor_field, table_options
             )
-            for chain in self._iter_parent_key_chains(segments, namespace, table_options):
-                url = self._build_contained_url(
-                    segments, chain, table_options, extra_filter=leaf_filter, order_by=order_by
-                )
-                for row in self._fetch_pages(url):
-                    if skip_null and row.get(cursor_field) is None:
-                        continue
-                    self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
-                    yield row
+            chain_meta = (
+                (chain, chain)
+                for chain in self._iter_parent_key_chains(segments, namespace, table_options)
+            )
+            for chain, row in self._iter_contained_leaf_rows(
+                segments, chain_meta, table_options, leaf_filter, order_by, use_batch
+            ):
+                if skip_null and row.get(cursor_field) is None:
+                    continue
+                self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
+                yield row
             return
         leaf_order_by = self._leaf_pk_order_by(segments, namespace)
         chains_iter = self._iter_parent_chains_with_cursor(
             segments, namespace, table_options, cursor_level, cursor_field, None
         )
-        for chain, ancestor_cursor in chains_iter:
-            url = self._build_contained_url(
-                segments, chain, table_options, extra_filter=leaf_filter, order_by=leaf_order_by
-            )
-            for row in self._fetch_pages(url):
-                self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
-                row[cursor_field] = ancestor_cursor
-                yield row
+        # meta = (chain, ancestor_cursor): chain for FK tagging, cursor to stamp.
+        chain_meta = ((chain, (chain, ac)) for chain, ac in chains_iter)
+        for (chain, ancestor_cursor), row in self._iter_contained_leaf_rows(
+            segments, chain_meta, table_options, leaf_filter, leaf_order_by, use_batch
+        ):
+            self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
+            row[cursor_field] = ancestor_cursor
+            yield row
 
     def _read_contained_incremental_leaf_cursor(
         self,
