@@ -326,6 +326,75 @@ def test_contained_leaf_service_root_relative_nextlink_does_not_double_path():
     assert [r["Id"] for r in rows] == [101, 102]
 
 
+@responses.activate
+def test_snapshot_auto_drains_server_that_propagates_top_through_skiptokens():
+    """Regression: a spec-compliant server may treat the connector's
+    ``$top`` as a TOTAL-result limit (OData §11.2.5.3) and propagate the
+    *remaining* budget through its ``@odata.nextLink`` skiptokens — e.g.
+    Northwind: ``$top=1000`` → page 1's link carries ``$top=500`` → after
+    1000 rows it emits no further link, even though the collection has
+    more rows.
+
+    The ``auto`` walk follows that link chain, so it stops when the link
+    disappears. The bug was trusting that link-less short final page as
+    end-of-collection, silently capping any table larger than ``$top`` at
+    exactly ``$top`` rows (observed live: Northwind ``Order_Details`` /
+    ``Invoices`` / ``Order_Details_Extendeds``, 2155 rows each → 1000).
+
+    The fix: when the link chain terminates at exactly the ``$top`` budget
+    (``fetched >= top``), don't trust it — issue a keyset/``$skip`` seek
+    past the budget and keep draining until an empty page.
+
+    This models the server with ``$top``-budget=4 (the connector's
+    ``page_size``) and a server page of 2 over a 10-row corpus, so the
+    full table must drain to all 10 despite the chain self-terminating at
+    every 4-row budget.
+    """
+    _mock_metadata()
+    corpus = [
+        {"Id": i, "Name": f"r{i}", "ModifiedAt": "2024-01-01T00:00:00Z"} for i in range(1, 11)
+    ]
+    SERVER_PAGE = 2
+
+    def _callback(request):
+        url = request.url.replace("%20", " ")
+
+        def _q(name):
+            m = re.search(rf"[?&]\${name}=([^&]+)", url)
+            return m.group(1) if m else None
+
+        top = int(_q("top"))  # the connector always sizes the request
+        skiptoken = _q("skiptoken")
+        # Lower bound = max of the skiptoken (last Id of the prior page in
+        # this budgeted chain) and any keyset-seek `Id gt N` filter.
+        lower = int(skiptoken) if skiptoken is not None else 0
+        fm = re.search(r"Id gt (\d+)", url)
+        if fm:
+            lower = max(lower, int(fm.group(1)))
+        candidate = sorted((r for r in corpus if r["Id"] > lower), key=lambda r: r["Id"])
+        page = candidate[:SERVER_PAGE]
+        body = {"value": page}
+        remaining = top - len(page)
+        # Emit a continuation link ONLY while budget remains AND more rows
+        # exist — and propagate the *decremented* $top, like Northwind.
+        if remaining > 0 and len(candidate) > len(page):
+            link = f"{SERVICE_URL}Customers?$top={remaining}&$skiptoken={page[-1]['Id']}"
+            if fm:
+                link += f"&$filter=Id gt {fm.group(1)}"
+            body["@odata.nextLink"] = link
+        return (200, {}, json.dumps(body))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Customers", callback=_callback)
+
+    c = _make()
+    records, offset = c.read_table("Customers", None, {"page_size": "4"})
+    rows = list(records)
+    assert offset == {}
+    # The whole collection drains despite the $top-budget chain ending at
+    # every 4th row. (Pre-fix: stopped at the first short link-less page → 4.)
+    assert [r["Id"] for r in rows] == list(range(1, 11))
+
+
 # ---------------------------------------------------------------------------
 # Incremental read
 # ---------------------------------------------------------------------------

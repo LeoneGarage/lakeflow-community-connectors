@@ -1660,13 +1660,26 @@ class ODataLakeflowConnect(
                 # request; the modes that need client paging force a $top.)
                 yield page_rows, None
                 return
-            if mode == "auto" and saw_next_link and len(page_rows) < top:
+            if mode == "auto" and saw_next_link and len(page_rows) < top and fetched < top:
                 # The server drove this walk with @odata.nextLink and this SHORT
-                # page carried none — a spec-compliant pager signalling the end.
-                # Don't probe further (no trailing request); trust the absent
-                # link. A *full* no-link page after we've seen links is still
-                # ambiguous (the server may have stopped linking mid-collection),
-                # so it falls through to the keyset/skip fallback below.
+                # page carried none, *before* our $top budget was reached — a
+                # spec-compliant pager signalling the genuine end of the
+                # collection. Don't probe further (no trailing request); trust
+                # the absent link.
+                #
+                # The ``fetched < top`` guard is essential: if the chain instead
+                # terminated at exactly the budget (``fetched >= top``), the
+                # absent link may signal $top exhaustion, NOT end-of-collection.
+                # OData ``$top`` is a TOTAL-result limit (§11.2.5.3), and a
+                # server may propagate the remaining budget through its skiptoken
+                # nextLinks — e.g. Northwind: ``$top=1000`` → page 1's link
+                # carries ``$top=500`` → after 1000 rows no further link, though
+                # the collection has more. Trusting the short final page there
+                # silently caps the table at ``$top`` rows. So we fall through to
+                # the keyset/$skip seek below, which resumes past the budget and
+                # drains the rest (each re-budgeted seek ends on a trailing empty
+                # page). A *full* no-link page after we've seen links is likewise
+                # ambiguous and falls through.
                 yield page_rows, None
                 return
             # auto (never saw a link) / keyset / skip: do NOT stop on a short
