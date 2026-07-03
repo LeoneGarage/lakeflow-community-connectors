@@ -387,11 +387,10 @@ class PartitionMixin(SupportsPartitionedStream):
 def _bin_pack(rows: list[dict], num_partitions: int, cursor_lower) -> list[dict]:
     """Split ``rows`` into ``num_partitions`` partition descriptors.
 
-    Round-robin assignment with each partition carrying a contiguous
-    slice — keeps cursor ordering stable within a partition (the
-    ``_discover_top_parent_rows`` caller sorts by cursor when one is
-    set). Empty bins are dropped so the framework doesn't spawn
-    no-op executors.
+    Each partition carries a contiguous slice — keeps cursor ordering
+    stable within a partition (the ``_discover_top_parent_rows`` caller
+    sorts by cursor when one is set). Empty bins are dropped so the
+    framework doesn't spawn no-op executors.
     """
     if not rows:
         return []

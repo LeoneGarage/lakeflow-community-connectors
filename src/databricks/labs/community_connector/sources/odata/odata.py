@@ -776,7 +776,14 @@ class ODataLakeflowConnect(
                     ),
                     opts,
                 )
-            return self._with_capabilities(self._read_contained_snapshot(table_name, opts), opts)
+            # Snapshot: the terminal offset stays a bare ``{}`` — deliberately
+            # NOT threaded with capability verdicts. A streaming snapshot
+            # quiesces on ``end == start``; merging flags would turn the first
+            # trigger's ``{}`` into ``{"batch_ok": …}`` and buy one extra full
+            # snapshot re-read before settling. The batch reader discards the
+            # offset anyway, and the per-read preflight POST is noise next to
+            # a full snapshot walk.
+            return self._read_contained_snapshot(table_name, opts)
         # Offset-shape check ahead of the delta predicate so a resumed
         # delta stream (offset carries delta_link / next_link) takes the
         # delta path even if delta_tracking is no longer set in options.
@@ -839,18 +846,29 @@ class ODataLakeflowConnect(
     def _scrub_nonauto_verdicts(self, offset: dict, table_options: dict | None) -> dict:
         """Drop persisted preflight verdicts whose governing option is **not**
         ``auto``, so re-selecting ``auto`` later re-runs the preflight instead of
-        reusing a stale verdict. Respective ownership: ``cursor_probe`` owns its
-        nested-``$expand`` probe verdict (``cursor_probe_ok``); ``contained_fetch``
-        owns the ``$batch`` capability + discovered size (``batch_ok`` /
-        ``batch_size_ok``). ``auto`` / ``auto:<N>`` and unset (the default) keep
-        their verdicts. (Trade-off: a pinned non-auto mode re-runs its preflight
-        each microbatch, since its verdict no longer rides the offset.)"""
+        reusing a stale verdict. ``cursor_probe`` owns its nested-``$expand``
+        probe verdict (``cursor_probe_ok``). The ``$batch`` verdicts
+        (``batch_ok`` / ``batch_size_ok``) are **shared**: ``contained_fetch``'s
+        full walks AND the ``cursor_probe`` ``auto`` cascade's hydrate both read
+        and refresh them — so they're kept while ANY auto-mode consumer is live
+        (``contained_fetch`` auto, or ``cursor_probe`` auto with a ``$batch``
+        hydrate not suppressed by an explicit ``contained_fetch=single``/``1``)
+        and scrubbed only when every consumer is pinned non-auto. Without the
+        live-consumer carve-out, ``contained_fetch=batch:<N>`` + default
+        ``cursor_probe`` would re-pay the preflight AND the adaptive
+        size-discovery 400s every microbatch. (Trade-off: an all-pinned config
+        re-runs its preflights each microbatch, since no verdict rides the
+        offset.)"""
         if not isinstance(offset, dict):
             return offset
         drop: set[str] = set()
-        if self._cursor_probe_mode(table_options) != "auto":
+        cp_mode = self._cursor_probe_mode(table_options)
+        if cp_mode != "auto":
             drop.add("cursor_probe_ok")
-        if not self._contained_fetch_is_auto(table_options):
+        batch_live = self._contained_fetch_is_auto(table_options) or (
+            cp_mode == "auto" and not self._contained_fetch_forces_single(table_options)
+        )
+        if not batch_live:
             drop |= {"batch_ok", "batch_size_ok"}
         if not drop:
             return offset

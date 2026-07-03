@@ -12,9 +12,14 @@
     {
       "method": "GET",
       "url": "https://services.odata.org/V4/Northwind/Northwind.svc/Alphabetical_list_of_products",
-      "count": 3,
+      "count": 4,
       "param_shapes": [
         [
+          "$orderby",
+          "$top"
+        ],
+        [
+          "$filter",
           "$orderby",
           "$top"
         ]

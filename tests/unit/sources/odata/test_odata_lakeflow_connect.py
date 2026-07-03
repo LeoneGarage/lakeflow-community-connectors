@@ -8750,7 +8750,10 @@ def test_contained_fetch_batch_snapshot_hydrates_via_batch():
     recs, offset = c.read_table("Parents__Children", {}, {})  # no cursor → snapshot
     rows = sorted((r["Parents_Id"], r["Id"]) for r in recs)
     assert rows == [(1, 11), (2, 21)]
-    assert _drop_lb(offset) == {}
+    # The snapshot's terminal offset stays a bare {} — capability flags are NOT
+    # merged in (a streaming snapshot quiesces on end == start; {} → {batch_ok}
+    # would buy one extra full snapshot re-read).
+    assert offset == {}
     # Both leaf collections hydrated via $batch; NO per-parent GET to /Children.
     assert any("Parents(1)/Children" in u for u in responder.seen)
     assert any("Parents(2)/Children" in u for u in responder.seen)
@@ -9032,6 +9035,14 @@ def test_batch_too_many_parts_falls_back_to_single_gets():
         for call in responses.calls
     )
     assert c.__dict__["_batch_size_cap"] == 1  # give-up sentinel
+    # The plain-GET fall-back re-adds a $top (the $batch-shaped URL carries
+    # none) so the client-driven drain under the default pagination=auto can
+    # page a server that page-limits while omitting @odata.nextLink.
+    assert all(
+        "$top=" in call.request.url
+        for call in responses.calls
+        if call.request.method == "GET" and "/Children" in call.request.url
+    )
 
 
 @responses.activate
@@ -9165,6 +9176,117 @@ def test_batch_overflow_detects_exceeds_maximum_message():
     assert responder.rejections[0] >= 1  # the message was recognized → shrank
     assert all(n <= 2 for n in responder.accepted)
     assert c.__dict__["_batch_size_cap"] == 2
+
+
+@responses.activate
+def test_batch_preflight_transient_failure_not_persisted():
+    """A transient failure of the ``$batch`` capability preflight (e.g. a 503)
+    degrades THIS batch to the plain N+1 walk but records NO verdict — the next
+    read re-probes, instead of persisting ``batch_ok=False`` and permanently
+    pinning the stream to the slow path on a momentary blip. (Contrast the 405
+    tests, where the definitive rejection IS persisted.)"""
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.get(f"{SERVICE_URL}Roots(1)/Mids", json={"value": [{"Id": 10}]})
+    responses.post(f"{SERVICE_URL}$batch", json={"detail": "busy"}, status=503)
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={"value": [{"Id": 1001, "RecordLastModified": "2020-06-01T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    opts = {
+        "cursor_field": "RecordLastModified",
+        "cursor_probe": "batch",
+        "pagination": "nextlink",
+    }
+    recs, offset = c.read_table(PROBE_TABLE, {"cursor": since}, opts)
+    # Degraded to the plain N+1 walk for this batch — rows still correct.
+    assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs] == [(1, 10, 1001)]
+    # Transient → nothing cached on the instance, nothing persisted.
+    assert "batch_ok" not in offset
+    assert "_batch_supported" not in c.__dict__
+    # The next read re-probes: a second preflight POST goes out.
+    list(c.read_table(PROBE_TABLE, {"cursor": since}, opts)[0])
+    posts = [call for call in responses.calls if call.request.method == "POST"]
+    assert len(posts) == 2
+
+
+@responses.activate
+def test_batch_walk_cap_on_final_chunk_resume_clears_checkpoint():
+    """The ``$batch`` walk's cap can fire exactly on its FINAL chunk (dirty
+    parents an exact multiple of the chunk size). The truncated offset parks
+    ``parent_idx`` == the total chain count, so the resumed batch has no
+    re-entry work and emits nothing — it must CLEAR the checkpoint (offset back
+    to the plain watermark) rather than echo it back forever, which would
+    freeze the walk and silently skip all future changes under those parents."""
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.get(f"{SERVICE_URL}Roots(1)/Mids", json={"value": [{"Id": 10}, {"Id": 11}]})
+    responder = _batch_responder(
+        [
+            (
+                "Mids(10)/Leaves",
+                {"value": [{"Id": 1001, "RecordLastModified": "2020-06-01T00:00:00Z"}]},
+            ),
+            (
+                "Mids(11)/Leaves",
+                {"value": [{"Id": 1101, "RecordLastModified": "2020-06-02T00:00:00Z"}]},
+            ),
+            ("Roots?$top=1", {"value": [{"Id": 1}]}),  # capability preflight
+        ]
+    )
+    responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=responder)
+
+    c = _make()
+    opts = {
+        "cursor_field": "RecordLastModified",
+        "cursor_probe": "batch:2",  # chunk size == the number of leaf-parents
+        "max_records_per_batch": "1",  # cap fires as the final chunk drains
+        "pagination": "nextlink",
+    }
+    recs, offset = c.read_table(PROBE_TABLE, {"cursor": since}, opts)
+    assert sorted(r["Id"] for r in recs) == [1001, 1101]  # chunk-aligned overshoot
+    assert offset["parent_idx"] == 2  # truncated at the (final) chunk boundary
+    assert offset["cursor"] == since  # watermark held while "in flight"
+
+    # Resume: every chain is skipped and nothing is left to emit — the parked
+    # checkpoint is cleared so the walk terminates instead of parking forever.
+    recs2, offset2 = c.read_table(PROBE_TABLE, offset, opts)
+    assert list(recs2) == []
+    assert "parent_idx" not in offset2
+    assert offset2["cursor"] == since
+
+
+@responses.activate
+def test_contained_fetch_single_suppresses_auto_batch_cascade():
+    """An explicit ``contained_fetch=single`` also suppresses ``auto``'s
+    no-probe ``$batch`` cascade (the probe is not applicable here — the
+    leaf-parent is a snapshot level): the hydrate goes down the plain N+1 walk
+    and no ``$batch`` POST is ever attempted."""
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.get(f"{SERVICE_URL}Roots(1)/Plains", json={"value": [{"Id": 5}]})
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Plains(5)/Items",
+        json={"value": [{"Id": 501, "RecordLastModified": "2020-06-01T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    recs, _ = c.read_table(
+        "Roots__Plains__Items",
+        {"cursor": since},
+        {
+            "cursor_field": "RecordLastModified",
+            "contained_fetch": "single",
+            "pagination": "nextlink",
+        },
+    )
+    assert [(r["Roots_Id"], r["Plains_Id"], r["Id"]) for r in recs] == [(1, 5, 501)]
+    assert not any(call.request.method == "POST" for call in responses.calls)
 
 
 # ---------------------------------------------------------------------------
@@ -9527,3 +9649,23 @@ def test_capability_verdicts_thread_through_offset():
     c.__dict__.pop("_or_filter_ok", None)
     assert c._verify_or_filter_support("https://x/Coll", ["a"], {"a": 1}) is True
     assert not responses.calls
+
+
+def test_scrub_batch_verdicts_kept_while_auto_consumer_live():
+    """The shared ``$batch`` verdicts (``batch_ok`` / ``batch_size_ok``) survive
+    a pinned ``contained_fetch`` as long as the ``cursor_probe`` auto cascade
+    still consumes them; they are scrubbed only when every consumer is pinned
+    non-auto or the hydrate is suppressed by an explicit ``single``."""
+    c = _make()
+    off = {"cursor": "x", "batch_ok": True, "batch_size_ok": 200}
+    # contained_fetch pinned, but default cursor_probe (auto) still consumes
+    # and refreshes the verdicts → kept (no per-microbatch re-discovery churn).
+    assert c._scrub_nonauto_verdicts(off, {"contained_fetch": "batch:200"}) == off
+    # Explicit single suppresses the auto hydrate → no live consumer → scrub.
+    assert c._scrub_nonauto_verdicts(off, {"contained_fetch": "single"}) == {"cursor": "x"}
+    # Every consumer pinned non-auto → scrub.
+    assert c._scrub_nonauto_verdicts(
+        off, {"contained_fetch": "batch", "cursor_probe": "false"}
+    ) == {"cursor": "x"}
+    # contained_fetch auto keeps the batch verdicts regardless of cursor_probe.
+    assert c._scrub_nonauto_verdicts(off, {"cursor_probe": "false"}) == off

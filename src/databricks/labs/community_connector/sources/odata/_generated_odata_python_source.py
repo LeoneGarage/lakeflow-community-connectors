@@ -716,6 +716,13 @@ def register_lakeflow_source(spark):
     _BATCH_SHRINK_FACTOR = 0.75
     _BATCH_OVERFLOW_RETRIES = 10
 
+    # HTTP statuses that say nothing definitive about a server's capabilities —
+    # throttling and transient server-side failures. A capability preflight that
+    # hits one records NO verdict (the read degrades for this batch only and the
+    # next batch re-probes); only a definitive outcome (a working envelope, or a
+    # hard rejection like 404/405) is cached and persisted as ``batch_ok``.
+    _TRANSIENT_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
 
     class _BatchTooManyParts(RuntimeError):
         """Raised by :meth:`_post_batch` when the server rejects a ``$batch`` for
@@ -2262,7 +2269,18 @@ def register_lakeflow_source(spark):
             """Plain GET fall-back for one leaf-parent, shaped like a ``$batch``
             sub-response (``{"status", "body": {"value": [...]}}``) so the drain loops
             parse it identically. All pages are drained here (no ``@odata.nextLink``
-            returned), so the loop emits every row without re-batching."""
+            returned), so the loop emits every row without re-batching.
+
+            The ``$batch``-shaped URL carries no ``$top`` (the server was meant to
+            drive paging inside the batch). Outside ``$batch`` that starves the
+            client-driven drain: with no ``$top``, ``_client_paginate_pages`` takes
+            a single link-less page as the whole collection, so a server that
+            page-limits while omitting ``@odata.nextLink`` would be silently
+            truncated. Re-add the default ``$top`` under keyset/skip/auto so the
+            drain can size its pages and seek until empty (nextlink mode is left
+            untouched — it trusts the server's links either way)."""
+            if getattr(self, "_pagination", "nextlink") != "nextlink" and _pg_parse_top(url) is None:
+                url = _pg_set_query(url, "$top", DEFAULT_PAGE_SIZE)
             rows = list(self._fetch_pages(url))
             return {"status": 200, "body": {"value": rows}}
 
@@ -2308,42 +2326,67 @@ def register_lakeflow_source(spark):
             table_options: dict[str, str] | None,
             start_offset: dict | None = None,
         ) -> bool:
-            """Whether the server supports OData ``$batch`` (fail-closed).
+            """Whether the server supports OData ``$batch`` (never raises).
 
             Used by ``cursor_probe=batch`` and the ``auto`` cascade to decide
-            between a ``$batch`` hydrate and the plain N+1 walk. A pass is cached per
-            connector instance and persisted in the resume offset as ``batch_ok``
+            between a ``$batch`` hydrate and the plain N+1 walk. A verdict is cached
+            per connector instance and persisted in the resume offset as ``batch_ok``
             (mirrors ``cursor_probe_ok``) so a per-batch-recreated reader skips the
-            capability POST. ANY failure — 405/404, a malformed envelope, a non-200
-            sub-response, or a transport error — returns ``False`` (never raises);
-            the caller degrades to the plain walk."""
+            capability POST — but only a **definitive** verdict is cached/persisted:
+
+            * definitive pass — 2xx envelope whose sub-response is < 400;
+            * definitive fail — a hard rejection (404/405/any non-transient error
+              status, a 2xx body that isn't a ``$batch`` envelope, or a hard-failed
+              sub-response): the server doesn't speak ``$batch``.
+
+            A transient outcome — transport error, auth hiccup, or a retryable
+            status (408/429/5xx, :data:`_TRANSIENT_HTTP_STATUSES`) — returns
+            ``False`` for THIS batch (degrade to the plain walk) but records
+            nothing, so the next batch re-probes instead of permanently pinning the
+            stream to the slow path (or permanently failing a strict
+            ``contained_fetch=batch``) on a momentary blip. The probe is a SINGLE
+            auth-aware attempt (``_http_get_once``, not the retrying ``_http_get``):
+            a capability probe must fail FAST, not stall every ``auto`` read behind
+            the transient-retry backoff loop — and routing through the auth-aware
+            path means an expired OAuth token is refreshed rather than misread as
+            "no ``$batch``"."""
             if (start_offset or {}).get("batch_ok"):
                 return True
             cached = self.__dict__.get("_batch_supported")
             if cached is not None:
                 return cached
             probe_url = join_url(self.service_url, segments[0]) + "?$top=1"
+            payload = {
+                "requests": [{"id": "0", "method": "GET", "url": self._batch_relative(probe_url)}]
+            }
             ok = False
+            definitive = False
             try:
-                session = self._get_session()
-                payload = {
-                    "requests": [{"id": "0", "method": "GET", "url": self._batch_relative(probe_url)}]
-                }
-                # SINGLE attempt (not the retrying ``_http_get``): a capability probe
-                # must fail FAST. A server that lacks ``$batch`` returns 405/404 (or
-                # the transport errors), and running the transient-retry/backoff loop
-                # on that would stall every ``auto`` read by tens of seconds before
-                # giving up. A transient blip here just falls back to the plain walk
-                # for this batch and is re-probed next batch (nothing is persisted).
-                resp = session.post(
-                    join_url(self.service_url, "$batch"), json=payload, timeout=self.timeout
+                resp = self._http_get_once(
+                    self._get_session(),
+                    join_url(self.service_url, "$batch"),
+                    method="POST",
+                    json=payload,
                 )
+            except Exception:  # transport/auth failure — no verdict on $batch itself
+                resp = None
+            if resp is not None:
                 if resp.status_code < 400:
-                    subs = resp.json().get("responses") or []
-                    ok = bool(subs) and int(subs[0].get("status", 0) or 0) < 400
-            except Exception:  # capability probe — any failure means "unsupported"
-                ok = False
-            self.__dict__["_batch_supported"] = ok
+                    try:
+                        subs = resp.json().get("responses") or []
+                        sub_status = int(subs[0].get("status", 0) or 0) if subs else None
+                    except Exception:
+                        sub_status = None
+                    if sub_status is None:
+                        definitive = True  # 2xx, but not a $batch envelope
+                    elif sub_status < 400:
+                        ok = definitive = True
+                    elif sub_status not in _TRANSIENT_HTTP_STATUSES:
+                        definitive = True  # sub-request hard-rejected
+                elif resp.status_code not in _TRANSIENT_HTTP_STATUSES:
+                    definitive = True  # e.g. 404/405 — no $batch endpoint
+            if definitive:
+                self.__dict__["_batch_supported"] = ok
             return ok
 
         def _contained_fetch_batch_size(self, table_options: dict[str, str] | None) -> int:
@@ -2463,10 +2506,13 @@ def register_lakeflow_source(spark):
         def _contained_fetch_forces_single(self, table_options: dict[str, str] | None) -> bool:
             """``True`` when ``contained_fetch`` is **explicitly** set to ``single`` or
             ``1`` — a user signal to avoid OData ``$batch`` for contained leaf
-            hydration. Used to let that signal also force the ``cursor_probe`` probe's
-            dirty-parent hydrate down the plain N+1 walk (the probe still prunes which
-            parents to read; only the ``$batch`` hydrate is suppressed). Unset, or any
-            value ``> 1`` (incl. the ``batch`` default), returns ``False``."""
+            hydration. The leaf-cursor read honours it everywhere: the probe's
+            dirty-parent hydrate AND the ``auto`` no-probe cascade go down the plain
+            N+1 walk (the probe still prunes which parents to read; only the
+            ``$batch`` hydrate is suppressed). The one exception is an explicit
+            ``cursor_probe=batch``, a direct demand for the ``$batch`` hydrate that
+            wins the conflict. Unset, or any value ``> 1`` (incl. the ``auto``
+            default), returns ``False``."""
             if (table_options or {}).get("contained_fetch") is None:
                 return False
             return self._contained_fetch_batch_size(table_options) <= 1
@@ -3866,7 +3912,6 @@ def register_lakeflow_source(spark):
                 persist_probe_ok = False
                 use_batch = False
                 persist_batch_ok = False
-                used_probe = False
                 if mode in ("probe", "auto") and probe_applicable:
                     # Capability-verify the nested-$expand probe. ``probe`` (explicit
                     # ``true``) is STRICT — ``_verify_cursor_probe_support`` raises if
@@ -3884,7 +3929,6 @@ def register_lakeflow_source(spark):
                         strict=(mode == "probe"),
                     )
                     if supported:
-                        used_probe = True
                         persist_probe_ok = conclusive or bool(
                             (start_offset or {}).get("cursor_probe_ok")
                         )
@@ -3911,13 +3955,15 @@ def register_lakeflow_source(spark):
                 # server leaves ``use_batch`` False and the SAME chains fall through to
                 # the plain N+1 walk. ``off`` (force plain walk) never batches.
                 #
-                # An explicit ``contained_fetch=single`` / ``1`` overrides the probe's
-                # $batch hydrate: the probe still prunes to dirty parents, but they are
-                # hydrated via the plain N+1 walk (the preflight is skipped entirely).
-                # Scoped to ``used_probe`` so it never countermands an explicit
-                # ``cursor_probe=batch`` or ``auto``'s no-probe $batch cascade.
+                # An explicit ``contained_fetch=single`` / ``1`` suppresses the $batch
+                # hydrate everywhere on this path — the probe's dirty-parent hydrate
+                # AND ``auto``'s no-probe cascade go down the plain N+1 walk (the
+                # preflight is skipped entirely). The one exception is an explicit
+                # ``cursor_probe=batch``: that is a direct demand for the $batch
+                # hydrate on the incremental read, so it wins the conflict.
                 forces_single = self._contained_fetch_forces_single(table_options)
-                if mode in ("probe", "auto", "batch") and not (used_probe and forces_single):
+                explicit_batch = explicit and mode == "batch"
+                if mode in ("probe", "auto", "batch") and (explicit_batch or not forces_single):
                     if self._verify_batch_support(segments, table_options, start_offset):
                         use_batch = True
                         persist_batch_ok = True
@@ -4129,6 +4175,21 @@ def register_lakeflow_source(spark):
             else:
                 if not emitted:
                     empty = start_offset or {}
+                    # A resumed TRUNCATED walk that completes with nothing more to
+                    # emit must CLEAR its parked checkpoint: echoing the offset back
+                    # unchanged would freeze the walk at ``parent_idx`` forever —
+                    # every later batch skips the first N parents, emits nothing,
+                    # and returns the same offset again, silently dropping future
+                    # changes under the skipped parents. Deterministic for the
+                    # ``$batch`` walk when the cap fired exactly on its final chunk
+                    # (``parent_idx`` == total chain count, so the resume has no
+                    # re-entry work); reachable for the plain walk when the
+                    # checkpointed rows vanish between batches. Dropping the
+                    # checkpoint (keeping ``cursor`` and the bookkeeping keys)
+                    # marks the walk complete so the next batch starts fresh.
+                    checkpoint_keys = ("parent_idx", "chain_next_link", "truncated_chain_cursor")
+                    if any(k in empty for k in checkpoint_keys):
+                        empty = {k: v for k, v in empty.items() if k not in checkpoint_keys}
                     if persist_probe_ok:
                         empty = self._with_probe_ok(empty)
                     if persist_batch_ok:
@@ -4652,11 +4713,10 @@ def register_lakeflow_source(spark):
     def _bin_pack(rows: list[dict], num_partitions: int, cursor_lower) -> list[dict]:
         """Split ``rows`` into ``num_partitions`` partition descriptors.
 
-        Round-robin assignment with each partition carrying a contiguous
-        slice — keeps cursor ordering stable within a partition (the
-        ``_discover_top_parent_rows`` caller sorts by cursor when one is
-        set). Empty bins are dropped so the framework doesn't spawn
-        no-op executors.
+        Each partition carries a contiguous slice — keeps cursor ordering
+        stable within a partition (the ``_discover_top_parent_rows`` caller
+        sorts by cursor when one is set). Empty bins are dropped so the
+        framework doesn't spawn no-op executors.
         """
         if not rows:
             return []
@@ -5344,7 +5404,14 @@ def register_lakeflow_source(spark):
                         ),
                         opts,
                     )
-                return self._with_capabilities(self._read_contained_snapshot(table_name, opts), opts)
+                # Snapshot: the terminal offset stays a bare ``{}`` — deliberately
+                # NOT threaded with capability verdicts. A streaming snapshot
+                # quiesces on ``end == start``; merging flags would turn the first
+                # trigger's ``{}`` into ``{"batch_ok": …}`` and buy one extra full
+                # snapshot re-read before settling. The batch reader discards the
+                # offset anyway, and the per-read preflight POST is noise next to
+                # a full snapshot walk.
+                return self._read_contained_snapshot(table_name, opts)
             # Offset-shape check ahead of the delta predicate so a resumed
             # delta stream (offset carries delta_link / next_link) takes the
             # delta path even if delta_tracking is no longer set in options.
@@ -5407,18 +5474,29 @@ def register_lakeflow_source(spark):
         def _scrub_nonauto_verdicts(self, offset: dict, table_options: dict | None) -> dict:
             """Drop persisted preflight verdicts whose governing option is **not**
             ``auto``, so re-selecting ``auto`` later re-runs the preflight instead of
-            reusing a stale verdict. Respective ownership: ``cursor_probe`` owns its
-            nested-``$expand`` probe verdict (``cursor_probe_ok``); ``contained_fetch``
-            owns the ``$batch`` capability + discovered size (``batch_ok`` /
-            ``batch_size_ok``). ``auto`` / ``auto:<N>`` and unset (the default) keep
-            their verdicts. (Trade-off: a pinned non-auto mode re-runs its preflight
-            each microbatch, since its verdict no longer rides the offset.)"""
+            reusing a stale verdict. ``cursor_probe`` owns its nested-``$expand``
+            probe verdict (``cursor_probe_ok``). The ``$batch`` verdicts
+            (``batch_ok`` / ``batch_size_ok``) are **shared**: ``contained_fetch``'s
+            full walks AND the ``cursor_probe`` ``auto`` cascade's hydrate both read
+            and refresh them — so they're kept while ANY auto-mode consumer is live
+            (``contained_fetch`` auto, or ``cursor_probe`` auto with a ``$batch``
+            hydrate not suppressed by an explicit ``contained_fetch=single``/``1``)
+            and scrubbed only when every consumer is pinned non-auto. Without the
+            live-consumer carve-out, ``contained_fetch=batch:<N>`` + default
+            ``cursor_probe`` would re-pay the preflight AND the adaptive
+            size-discovery 400s every microbatch. (Trade-off: an all-pinned config
+            re-runs its preflights each microbatch, since no verdict rides the
+            offset.)"""
             if not isinstance(offset, dict):
                 return offset
             drop: set[str] = set()
-            if self._cursor_probe_mode(table_options) != "auto":
+            cp_mode = self._cursor_probe_mode(table_options)
+            if cp_mode != "auto":
                 drop.add("cursor_probe_ok")
-            if not self._contained_fetch_is_auto(table_options):
+            batch_live = self._contained_fetch_is_auto(table_options) or (
+                cp_mode == "auto" and not self._contained_fetch_forces_single(table_options)
+            )
+            if not batch_live:
                 drop |= {"batch_ok", "batch_size_ok"}
             if not drop:
                 return offset

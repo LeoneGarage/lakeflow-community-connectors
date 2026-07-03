@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generated_at": "2026-06-29T13:50:14.876885Z",
+  "generated_at": "2026-07-03T07:26:24.699874Z",
   "endpoints": [
     {
       "method": "GET",
@@ -34,6 +34,19 @@
       "mismatched": 0,
       "no_spec": 0,
       "issues": []
+    },
+    {
+      "method": "GET",
+      "spec_path": null,
+      "sample_url": "https://services.odata.org/V4/Northwind/Northwind.svc/Alphabetical_list_of_products?$top=1&$orderby=CategoryName%20asc,Discontinued%20asc,ProductID%20asc,ProductName%20asc&$filter=(CategoryName%20gt%20'Seafood')%20or%20(CategoryName%20eq%20'Seafood'%20and%20Discontinued%20gt%20false)%20or%20(CategoryName%20eq%20'Seafood'%20and%20Discontinued%20eq%20false%20and%20ProductID%20gt%2073)%20or%20(CategoryName%20eq%20'Seafood'%20and%20Discontinued%20eq%20false%20and%20ProductID%20eq%2073%20and%20ProductName%20gt%20'R%C3%B6d%20Kaviar')",
+      "status": "no_spec",
+      "calls": 1,
+      "matched": 0,
+      "mismatched": 0,
+      "no_spec": 1,
+      "issues": [
+        "no matching endpoint spec"
+      ]
     },
     {
       "method": "GET",
@@ -466,9 +479,9 @@
     }
   ],
   "summary": {
-    "endpoints_total": 36,
+    "endpoints_total": 37,
     "endpoints_validated": 3,
     "endpoints_mismatched": 0,
-    "endpoints_missing_spec": 33
+    "endpoints_missing_spec": 34
   }
 }
