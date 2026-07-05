@@ -65,11 +65,11 @@ def cursor_max(values: Any) -> Any:
     value wins ties — matching ``max``'s tie behavior, so an equal-instant
     pair rendered two ways (``…Z`` vs ``…+00:00``) keeps the earlier-seen
     text as the watermark."""
-    result = _SENTINEL = object()
+    result = sentinel = object()
     for value in values:
-        if result is _SENTINEL or cursor_newer(value, result):
+        if result is sentinel or cursor_newer(value, result):
             result = value
-    if result is _SENTINEL:
+    if result is sentinel:
         raise ValueError("cursor_max() arg is an empty sequence")
     return result
 

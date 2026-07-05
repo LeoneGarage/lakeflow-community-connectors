@@ -1747,6 +1747,37 @@ def test_no_auth_configured_401_raises_actionable_permission_error():
     assert "bearer, basic, api_key, oauth2" in msg
 
 
+def test_service_url_with_embedded_credentials_rejected():
+    """The service URL is echoed verbatim in logs and error messages on
+    every request — embedded userinfo credentials would leak everywhere.
+    Reject up front with the remediation (auth_type=basic options)."""
+    for bad in (
+        "https://user:hunter2@example.com/odata/",
+        "https://tokenuser@example.com/odata/",
+    ):
+        with pytest.raises(ValueError, match="must not embed credentials"):
+            _make({"service_url": bad})
+
+
+def test_sequence_counter_is_picklable_and_monotonic():
+    """The ``_lc_sequence`` tie-breaker must survive pickling: in the merged
+    bundle cloudpickle serializes the connector class BY VALUE and walks the
+    closure cell holding this counter — a bare ``itertools.count`` is a
+    TypeError on Python >= 3.14 (see the bundle round-trip test). A clone
+    restarts at zero (benign: the ns timestamp dominates the sequence)."""
+    import pickle
+
+    from databricks.labs.community_connector.sources.odata.odata import (
+        _SEQUENCE_COUNTER,
+        _next_sequence,
+    )
+
+    first, second = _next_sequence(), _next_sequence()
+    assert first < second  # still strictly increasing
+    clone = pickle.loads(pickle.dumps(_SEQUENCE_COUNTER))
+    assert isinstance(next(clone), int)
+
+
 @responses.activate
 def test_403_on_bearer_raises_permission_error():
     """403 means authenticated-but-not-authorized — an *authorization*
@@ -10693,6 +10724,57 @@ def test_metadata_id_keyed_memos_dropped_at_pickle_boundary():
     # Executor-side re-derivation produces identical results.
     assert c2.get_table_schema("Customers", {}) == schema
     assert c2._primary_keys_for("Customers") == pks
+
+
+def test_generated_bundle_registers_and_connector_survives_cloudpickle():
+    """The merged single-file bundle is the artifact that actually deploys
+    (SDP pipelines can't import package modules), yet the unit suite runs
+    against the modules. Execute the bundle for real: register against a
+    fake Spark, instantiate the connector, spot-check behavioral parity,
+    and cloudpickle-round-trip the connector — which is what PySpark does
+    to ship readers to executors. In the bundle every class is
+    function-local, so cloudpickle serializes it BY VALUE, walking closure
+    cells: a module-level ``itertools.count`` there is a TypeError on
+    Python >= 3.14 (this venv) that the module-layout tests can never see."""
+    import os
+    import types
+
+    from pyspark import cloudpickle
+
+    import databricks.labs.community_connector.sources.odata as odata_pkg
+
+    bundle_path = os.path.join(
+        os.path.dirname(odata_pkg.__file__), "_generated_odata_python_source.py"
+    )
+    ns: dict = {"__name__": "_odata_bundle_under_test"}
+    with open(bundle_path, encoding="utf-8") as fh:
+        exec(compile(fh.read(), bundle_path, "exec"), ns)  # pylint: disable=exec-used
+
+    captured: dict = {}
+    fake_spark = types.SimpleNamespace(
+        dataSource=types.SimpleNamespace(register=lambda cls: captured.setdefault("cls", cls))
+    )
+    ns["register_lakeflow_source"](fake_spark)
+    source_cls = captured["cls"]
+
+    ds = source_cls({"service_url": SERVICE_URL})
+    connector = ds.lakeflow_connect
+    assert type(connector).__name__ == "ODataLakeflowConnect"
+    assert connector.service_url == SERVICE_URL
+    # Behavioral parity spot-checks running the BUNDLE's own code: the
+    # round-11 literal encoding through the bundle's _cursor_filter, and
+    # the userinfo rejection through the bundle's __init__.
+    assert (
+        connector._cursor_filter("F", "2025-06-01T12:00:00+10:00")
+        == "F gt 2025-06-01T12:00:00%2B10:00"
+    )
+    with pytest.raises(ValueError, match="must not embed credentials"):
+        source_cls({"service_url": "https://user:secret@example.com/odata/"})
+
+    # The executor-shipping round trip: by-value class serialization.
+    clone = cloudpickle.loads(cloudpickle.dumps(connector))
+    assert clone.service_url == SERVICE_URL
+    assert type(clone).__name__ == "ODataLakeflowConnect"
 
 
 @responses.activate

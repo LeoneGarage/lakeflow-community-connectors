@@ -242,7 +242,39 @@ _LOOKBACK_AUTO_DEFAULT_CEILING_SECONDS = 3600
 # has a strictly increasing sequence value, so apply_changes can pick a
 # deterministic winner when the same primary key appears multiple times
 # in one batch (e.g. update then delete arriving back-to-back).
-_SEQUENCE_COUNTER = itertools.count()
+
+
+class _SequenceCounter:
+    """Pickle-safe wrapper around ``itertools.count`` for the
+    ``_lc_sequence`` tie-breaker.
+
+    A bare module-level ``itertools.count`` breaks the DEPLOYED artifact on
+    Python >= 3.14 (which removed itertools pickling): in the merged
+    single-file bundle every class is function-local, so cloudpickle — what
+    PySpark uses to ship readers to executors — serializes the connector
+    class BY VALUE, walking the closure cells that hold this counter, and
+    raises ``TypeError: cannot pickle 'itertools.count' object``. (The
+    package layout pickles the class by reference and never touches the
+    counter, which is why the module-level unit suite alone can't catch
+    it — see the bundle round-trip test.) The iterator is excluded from
+    the pickled state; an executor copy restarts at zero, which is benign:
+    the nanosecond timestamp dominates ``_next_sequence`` ordering and the
+    counter only breaks same-nanosecond ties within one process."""
+
+    def __init__(self):
+        self._it = itertools.count()
+
+    def __next__(self):
+        return next(self._it)  # GIL-atomic increment, like the bare count
+
+    def __getstate__(self):
+        return {}
+
+    def __setstate__(self, _state):
+        self._it = itertools.count()
+
+
+_SEQUENCE_COUNTER = _SequenceCounter()
 
 # Process-wide CSDL cache, keyed by service_url. SDP creates a fresh
 # ``LakeflowSource`` (and ``ODataLakeflowConnect``) for every
@@ -374,7 +406,36 @@ _CAPABILITY_DISK_MTIME: dict[str, float] = {}
 # on one driver — same ``service_url`` — would race the mutations against the
 # ``json.dump`` / merge iterations. Cheap and uncontended in the common case;
 # re-entrant because store/drop nest load and write under a single hold.
-_CAPABILITY_LOCK = threading.RLock()
+
+
+class _PicklableRLock:
+    """Re-entrant lock that survives pickling by re-creating itself.
+
+    Same deployment constraint as ``_SequenceCounter``: in the merged
+    single-file bundle this lock lives in a closure cell that cloudpickle
+    walks when shipping the connector class BY VALUE to executors, and a
+    bare ``threading.RLock`` raises ``TypeError: cannot pickle
+    '_thread.RLock' object``. A fresh lock per unpickled copy is the
+    CORRECT semantics anyway — a lock guards state within one process,
+    and each executor gets its own process-wide caches to guard."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+
+    def __enter__(self):
+        return self._lock.__enter__()
+
+    def __exit__(self, *exc_info):
+        return self._lock.__exit__(*exc_info)
+
+    def __getstate__(self):
+        return {}
+
+    def __setstate__(self, _state):
+        self._lock = threading.RLock()
+
+
+_CAPABILITY_LOCK = _PicklableRLock()
 
 
 def _capability_cache_path(service_url: str) -> str:
@@ -718,6 +779,18 @@ class ODataLakeflowConnect(
     def __init__(self, options: dict[str, str]) -> None:
         super().__init__(options)
         self.service_url = _require(options, "service_url")
+        parsed_root = urlparse(self.service_url)
+        if parsed_root.username or parsed_root.password:
+            # The URL is echoed verbatim in logs (verbose_http_logging,
+            # every retry/no-progress warning) and in error messages —
+            # embedded credentials would leak on every request.
+            raise ValueError(
+                "service_url must not embed credentials (the "
+                "'user:password@host' userinfo form) — the URL is echoed "
+                "in logs and error messages on every request. Use "
+                "auth_type=basic with the 'username' / 'password' "
+                "connection options instead."
+            )
         # Default 180s (3 min). Deep ``expand_contained=true`` chains
         # (3+ segments) materialise a large cross-product server-side
         # before responding; 60s isn't long enough for most real

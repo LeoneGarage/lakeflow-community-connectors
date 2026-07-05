@@ -112,7 +112,7 @@ These are set on the UC connection (alongside the auth fields above).
 
 | Parameter | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `service_url` | string | Yes | — | OData v4 service root URL. Must end at the service segment; the connector appends entity-set names and `$metadata` directly. Example: `https://services.odata.org/V4/Northwind/Northwind.svc/`. |
+| `service_url` | string | Yes | — | OData v4 service root URL. Must end at the service segment; the connector appends entity-set names and `$metadata` directly. Example: `https://services.odata.org/V4/Northwind/Northwind.svc/`. Must **not** embed credentials (`user:pass@host` userinfo — rejected at init, since the URL is echoed in logs and error messages); use the auth options instead. |
 | `timeout_seconds` | string | No | `180` | HTTP timeout per request, in seconds. |
 | `extra_headers` | string | No | — | Extra request headers as `Key:Value,Key2:Value2`. Useful for tenant IDs, CSRF tokens, or non-standard server discriminators. |
 | `metadata_cache_ttl_seconds` | string | No | `60` | TTL of the shared `$metadata` cache (process dict + on-disk pickle). |
