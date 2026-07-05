@@ -1605,7 +1605,27 @@ class ContainedNavMixin:
             f"{lp_coll}?$select={','.join(lp_pks)}&$filter={pk_filter}"
             f"&$expand={leaf_nav}($orderby={cursor_field} desc;$top=1;$select={cursor_field})"
         )
-        exp_rows, _ = self._fetch_one_expand_page(expand_url)
+        try:
+            exp_rows, _ = self._fetch_one_expand_page(expand_url)
+        except Exception:  # server REJECTED the nested-$expand probe shape
+            # e.g. Hexagon Smart API 400s on inner $orderby/$top/$select rather
+            # than accepting it (or silently mis-ordering). The enumeration and
+            # direct-navigation fetches for this sample just succeeded, so this
+            # is a definitive capability rejection, not a transient blip. Report
+            # it like the mis-order case ("error") so ``auto`` cascades to
+            # $batch / the plain walk (persisting cursor_probe_ok=False) and
+            # ``nested-expand`` raises an actionable error — instead of the raw
+            # HTTP error escaping and failing the read, which would break the
+            # "auto never raises on a capability shortfall" contract.
+            return (
+                "error",
+                "cursor_probe=nested-expand needs the source to accept "
+                "$orderby/$top/$select inside $expand, but "
+                f"{self._build_contained_path(segments, full_chain)!r} rejected the probe "
+                "query with an error (the server does not support these inner-$expand "
+                "options). Use cursor_probe=batch or cursor_probe=auto (which falls back "
+                "to $batch / the plain N+1 walk), or cursor_probe=false for the plain walk.",
+            )
         children = (exp_rows[0].get(leaf_nav) if exp_rows else None) or []
         inner_max = max(
             (c.get(cursor_field) for c in children if c.get(cursor_field) is not None),

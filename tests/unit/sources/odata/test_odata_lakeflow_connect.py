@@ -8189,6 +8189,17 @@ def _probe_mids_callback(inner_expand_newest):
     return _cb
 
 
+def _mids_reject_expand_callback(request):
+    """Callback for ``Roots(1)/Mids``: 400 on the nested-``$expand`` probe (a
+    server that rejects inner ``$orderby``/``$top``/``$select``, e.g. Hexagon
+    Smart API), and a plain Id list for the N+1 enumeration / fallback."""
+    from urllib.parse import unquote
+
+    if "$expand=Leaves" in unquote(request.url):
+        return (400, {}, json.dumps({"error": {"message": "inner $expand not supported"}}))
+    return (200, {}, json.dumps({"value": [{"Id": 10}]}))
+
+
 @responses.activate
 def test_cursor_probe_preflight_passes_when_inner_orderby_honored():
     """The capability check passes (no raise, cached verified) when the inner
@@ -8346,6 +8357,99 @@ def test_cursor_probe_strict_raises_despite_cached_pass():
         c._verify_cursor_probe_support(
             ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified", strict=True
         )
+
+
+@responses.activate
+def test_cursor_probe_auto_cascades_when_server_rejects_expand_probe():
+    """A server that REJECTS the nested-``$expand`` probe with an HTTP error
+    (not a silent mis-order — e.g. Hexagon Smart API 400s on inner-``$expand``
+    options) must make ``auto`` **cascade**, not raise: the preflight returns
+    ``(False, False)`` and records a definitive ``cursor_probe_ok=False`` instead
+    of letting the raw HTTP error escape and fail the read."""
+    _mock_probe_metadata()
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.add_callback(
+        responses.GET, f"{SERVICE_URL}Roots(1)/Mids", callback=_mids_reject_expand_callback
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={
+            "value": [
+                {"RecordLastModified": "2020-09-01T00:00:00Z"},
+                {"RecordLastModified": "2020-05-01T00:00:00Z"},
+            ]
+        },
+    )
+    c = _make()
+    assert c._verify_cursor_probe_support(
+        ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified", strict=False
+    ) == (False, False)
+    assert c._cached_capability("cursor_probe_ok", table_name="Roots__Mids__Leaves") is False
+
+
+@responses.activate
+def test_cursor_probe_strict_raises_actionable_when_server_rejects_expand_probe():
+    """Strict ``nested-expand`` surfaces a ``$expand`` REJECTION as an actionable
+    ``ValueError`` (pointing at cursor_probe=batch/false) — not the raw HTTP
+    error a bare fetch would let escape."""
+    _mock_probe_metadata()
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.add_callback(
+        responses.GET, f"{SERVICE_URL}Roots(1)/Mids", callback=_mids_reject_expand_callback
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={
+            "value": [
+                {"RecordLastModified": "2020-09-01T00:00:00Z"},
+                {"RecordLastModified": "2020-05-01T00:00:00Z"},
+            ]
+        },
+    )
+    c = _make()
+    with pytest.raises(ValueError, match=r"rejected the probe query"):
+        c._verify_cursor_probe_support(
+            ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified", strict=True
+        )
+
+
+@responses.activate
+def test_cursor_probe_auto_read_succeeds_when_server_rejects_expand_probe():
+    """End-to-end: ``read_table`` with ``cursor_probe=auto`` on a server that
+    400s the nested-``$expand`` probe must **complete** via the N+1 fallback
+    (rows emitted, no exception) — the bug was that the raw HTTP error escaped
+    and failed the read. ``contained_fetch=single`` keeps the fallback a plain
+    walk so no ``$batch`` mock is needed."""
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.add_callback(
+        responses.GET, f"{SERVICE_URL}Roots(1)/Mids", callback=_mids_reject_expand_callback
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={
+            "value": [
+                {"Id": 1001, "RecordLastModified": "2020-09-01T00:00:00Z"},
+                {"Id": 1000, "RecordLastModified": "2020-05-01T00:00:00Z"},
+            ]
+        },
+        match_querystring=False,
+    )
+    c = _make()
+    recs, offset = c.read_table(
+        PROBE_TABLE,
+        {"cursor": since},
+        {
+            "cursor_field": "RecordLastModified",
+            "cursor_probe": "auto",
+            "contained_fetch": "single",  # plain N+1 fallback (no $batch)
+            "pagination": "nextlink",
+        },
+    )
+    rows = list(recs)  # must not raise
+    assert sorted(r["Id"] for r in rows) == [1000, 1001]
+    assert offset["cursor"] == "2020-09-01T00:00:00Z"
 
 
 @responses.activate
