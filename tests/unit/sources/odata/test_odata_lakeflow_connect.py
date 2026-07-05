@@ -2310,6 +2310,18 @@ def test_delta_auto_probe_transient_failure_records_nothing():
 
 
 @responses.activate
+def test_delta_auto_probe_408_is_transient_not_a_verdict():
+    """A 408 sits outside the retry set, so ``_http_get`` RETURNS it rather
+    than raising after the budget — the probe must classify it as transient
+    (no verdict cached), not as a definitive "server doesn't acknowledge"."""
+    _mock_metadata()
+    responses.get(f"{SERVICE_URL}Customers", json={"error": "timeout"}, status=408)
+    c = _make()
+    assert c._delta_active_for("Customers", {"delta_tracking": "auto"}) is False
+    assert not c._delta_capable  # transient → no verdict cached, re-probes
+
+
+@responses.activate
 def test_delta_auto_probe_400_falls_back():
     """Servers can outright reject the ``Prefer`` header with 4xx. The
     probe surfaces False and the connector falls back to snapshot."""
@@ -11588,6 +11600,19 @@ def test_or_filter_probe_transient_fails_open_without_persisting():
     c = _make()
     assert c._verify_or_filter_support(f"{SERVICE_URL}Coll", ["a", "b"], {"a": 1, "b": 2}) is True
     assert calls["n"] == 1  # probed once (single attempt, no retry storm)
+    assert "_or_filter_ok" not in c.__dict__  # nothing cached on the instance
+    assert c._cached_capability("or_filter_ok") is None  # nothing persisted
+
+
+@responses.activate
+def test_or_filter_probe_408_is_transient_not_a_verdict():
+    """A 408 (request timeout) is transient like 429/5xx but sits outside the
+    retry set — it must still fail OPEN and record nothing. Pre-fix it fell
+    through to the 4xx test and persisted a definitive or_filter_ok=False,
+    which has NO reset path: one timeout durably pinned the $skip walk."""
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Coll", callback=lambda _r: (408, {}, ""))
+    c = _make()
+    assert c._verify_or_filter_support(f"{SERVICE_URL}Coll", ["a", "b"], {"a": 1, "b": 2}) is True
     assert "_or_filter_ok" not in c.__dict__  # nothing cached on the instance
     assert c._cached_capability("or_filter_ok") is None  # nothing persisted
 

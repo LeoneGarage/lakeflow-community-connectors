@@ -7252,12 +7252,12 @@ def register_lakeflow_source(spark):
             Returns a DEFINITIVE verdict only when the probe actually reached
             the server: ``True`` on a 200 acknowledging the preference,
             ``False`` when the server answered but didn't acknowledge (missing
-            header, or a non-retryable non-200 — ``_http_get`` only returns
-            such responses; retryable statuses raise after the retry budget).
-            Returns ``None`` — no verdict, the caller caches nothing and
-            re-probes next call — on a transport/auth failure or an exhausted
-            transient, matching the definitive-only discipline of the other
-            capability probes.
+            header, or a non-transient non-200). Returns ``None`` — no verdict,
+            the caller caches nothing and re-probes next call — on a
+            transport/auth failure, an exhausted transient, or a transient
+            status the retry loop passes through (408, which ``_http_get``
+            doesn't retry), matching the definitive-only discipline of the
+            other capability probes.
             """
             # Force ``$top=1`` for the probe so the response stays small even
             # against entity sets with millions of rows. We only care about
@@ -7273,6 +7273,11 @@ def register_lakeflow_source(spark):
                 )
             except (requests.RequestException, ValueError, RuntimeError, PermissionError):
                 return None  # transient/auth — no verdict, re-probe next call
+            if resp.status_code in _TRANSIENT_HTTP_STATUSES:
+                # In practice only 408 reaches here (``_http_get`` retries the
+                # rest and raises after the budget), but the membership test
+                # keeps the definitive/transient split in one place.
+                return None  # transient status — no verdict, re-probe next call
             if resp.status_code != 200:
                 return False
             applied = resp.headers.get("Preference-Applied", "")
@@ -7475,7 +7480,12 @@ def register_lakeflow_source(spark):
                 resp = self._http_get_once(self._get_session(), probe)
             except Exception:  # transport error, or auth failure (PermissionError)
                 return True  # not OR evidence — fail open this seek, record nothing
-            if resp.status_code in _RETRYABLE_HTTP_STATUSES:  # 429/5xx — transient
+            # 408/429/5xx — transient. ``_TRANSIENT_HTTP_STATUSES`` (which
+            # includes 408, unlike the retry set) so a request timeout isn't
+            # misread as "OR rejected" and durably persisted — ``or_filter_ok``
+            # has no reset path, the same discipline the _contained preflights
+            # follow.
+            if resp.status_code in _TRANSIENT_HTTP_STATUSES:
                 return True  # not OR evidence — fail open this seek, record nothing
             ok = not 400 <= resp.status_code < 500  # a non-transient 4xx = OR rejected
             self.__dict__["_or_filter_ok"] = ok
@@ -8826,13 +8836,13 @@ def register_lakeflow_source(spark):
             # Return the BARE ISO string (``...Z`` / ``...+10:00``), not a
             # datetime and NOT ``_odata_literal(...)``: the leaf-cursor walk
             # compares it client-side against the rows' own cursor strings
-            # (``rec_cursor <= chain_since``) — a datetime would raise on the
-            # str-vs-datetime mix, and a pre-escaped literal would compare
-            # escaped-vs-raw text AND get re-fed through ``_odata_literal`` at
-            # the ``_cursor_filter`` URL build, where a non-UTC ``%2B`` offset
-            # fails the ISO sniff and double-escapes into a quoted garbage
-            # string on the wire. Raw value space here; the single escape
-            # happens at literal generation.
+            # (``rec_cursor <= chain_since``) — a NAIVE datetime would still
+            # raise through ``_cursor_le``'s raw fallback, and a pre-escaped
+            # literal would compare escaped-vs-raw text AND get re-fed through
+            # ``_odata_literal`` at the ``_cursor_filter`` URL build, where a
+            # non-UTC ``%2B`` offset fails the ISO sniff and double-escapes
+            # into a quoted garbage string on the wire. Raw value space here;
+            # the single escape happens at literal generation.
             floored = (dt - timedelta(seconds=seconds)).isoformat()
             return floored.replace("+00:00", "Z")
 
