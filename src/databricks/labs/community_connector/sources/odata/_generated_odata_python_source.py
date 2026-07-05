@@ -6985,14 +6985,24 @@ def register_lakeflow_source(spark):
 
             A single-key ``$orderby`` never builds an OR, so this short-circuits to
             ``True`` for ``len(order_keys) < 2``. For a composite seek it issues ONE
-            ``$top=1`` probe carrying the OR filter, built from ``sample_row`` so the
-            literals are correctly typed. A definitive **4xx** ⇒ the server rejects
-            OR across columns (e.g. Hexagon Smart API: "on different columns, only
-            AND operators are supported") and the caller falls back to ``$skip``
-            (pagination mode B). A transport error or any non-4xx outcome is **not**
-            evidence of non-support, so it fails **open** (assume supported) — the
-            real seek then runs and surfaces any genuine error itself. The verdict
-            is cached per instance (the capability is server-wide)."""
+            auth-aware ``$top=1`` probe carrying the OR filter, built from
+            ``sample_row`` so the literals are correctly typed. Mirrors the
+            batch/expand preflight discipline — only a **definitive** outcome is
+            cached/persisted (instance + shared process/file cache):
+
+            * definitive pass — a **2xx**: the server accepts OR across columns;
+            * definitive fail — a **non-transient 4xx** (e.g. Hexagon Smart API's
+              400 "on different columns, only AND operators are supported"): the
+              caller falls back to ``$skip`` (pagination mode B).
+
+            A transient status (429/5xx) or a transport/auth failure is **not**
+            evidence about OR support, so it fails **open** for this seek (assume
+            supported — the real seek then surfaces any genuine error) and records
+            **nothing**, so the next seek re-probes instead of durably pinning the
+            slower ``$skip`` walk on a momentary blip. Going through
+            :meth:`_http_get_once` (not a raw ``session.get``) means an expired
+            OAuth token is refreshed rather than misread as a ``401`` = "OR
+            unsupported"."""
             if len(order_keys) < 2:
                 return True
             cached = self.__dict__.get("_or_filter_ok")
@@ -7002,23 +7012,24 @@ def register_lakeflow_source(spark):
             if cached is not None:
                 self.__dict__["_or_filter_ok"] = cached
                 return cached
-            ok = True
             seek = _pg_keyset_filter(order_keys, sample_row)
-            if seek is not None and " or " in seek:
-                probe = _pg_strip_query(
-                    _pg_set_query(
-                        _pg_keyset_seek_url(base_url, _pg_base_filter(base_url), seek),
-                        "$top",
-                        "1",
-                    ),
-                    "__pgbase",
-                )
-                try:
-                    resp = self._get_session().get(probe, timeout=self.timeout)
-                    if 400 <= resp.status_code < 500:
-                        ok = False  # server explicitly rejected the OR-across-columns filter
-                except Exception:  # transport error ≠ unsupported — defer to the real seek
-                    ok = True
+            if seek is None or " or " not in seek:
+                return True  # no OR-across-columns built for this key set — nothing to probe
+            probe = _pg_strip_query(
+                _pg_set_query(
+                    _pg_keyset_seek_url(base_url, _pg_base_filter(base_url), seek),
+                    "$top",
+                    "1",
+                ),
+                "__pgbase",
+            )
+            try:
+                resp = self._http_get_once(self._get_session(), probe)
+            except Exception:  # transport error, or auth failure (PermissionError)
+                return True  # not OR evidence — fail open this seek, record nothing
+            if resp.status_code in _RETRYABLE_HTTP_STATUSES:  # 429/5xx — transient
+                return True  # not OR evidence — fail open this seek, record nothing
+            ok = not (400 <= resp.status_code < 500)  # a non-transient 4xx = OR rejected
             self.__dict__["_or_filter_ok"] = ok
             self._store_capability("or_filter_ok", ok)
             return ok

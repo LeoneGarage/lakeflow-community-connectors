@@ -10814,6 +10814,56 @@ def test_or_filter_preflight_uses_keyset_when_supported():
 
 
 @responses.activate
+def test_or_filter_probe_transient_fails_open_without_persisting():
+    """A transient (429/5xx) on the OR-across-columns probe is NOT evidence
+    about OR support: fail OPEN (True) for this seek and record NOTHING (no
+    instance verdict, no shared-cache verdict), so the next seek re-probes
+    instead of durably pinning the slower $skip walk on a momentary throttle."""
+    calls = {"n": 0}
+
+    def _cb(_request):
+        calls["n"] += 1
+        return (429, {}, json.dumps({"error": "slow down"}))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Coll", callback=_cb)
+    c = _make()
+    assert c._verify_or_filter_support(f"{SERVICE_URL}Coll", ["a", "b"], {"a": 1, "b": 2}) is True
+    assert calls["n"] == 1  # probed once (single attempt, no retry storm)
+    assert "_or_filter_ok" not in c.__dict__  # nothing cached on the instance
+    assert c._cached_capability("or_filter_ok") is None  # nothing persisted
+
+
+@responses.activate
+def test_or_filter_probe_auth_401_not_mislabeled_as_unsupported():
+    """A 401 (expired token) on the OR probe must NOT be read as 'OR
+    unsupported'. Routed through the auth-aware _http_get_once, a 401 without an
+    OAuth refresh path raises PermissionError, which fails open (True) and
+    records nothing — rather than the pre-fix raw session.get that treated the
+    401 as a definitive 4xx rejection and pinned $skip."""
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Coll", callback=lambda _r: (401, {}, ""))
+    c = _make()  # bearer auth → no OAuth refresh path
+    assert c._verify_or_filter_support(f"{SERVICE_URL}Coll", ["a", "b"], {"a": 1, "b": 2}) is True
+    assert "_or_filter_ok" not in c.__dict__
+    assert c._cached_capability("or_filter_ok") is None
+
+
+@responses.activate
+def test_or_filter_probe_definitive_400_still_falls_back_and_persists():
+    """Regression: a genuine non-transient 4xx (the 'only AND operators are
+    supported' 400) is still a definitive rejection — cached False on the
+    instance AND persisted to the shared cache so later seeks skip the probe."""
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Coll",
+        callback=lambda _r: (400, {}, json.dumps({"error": "only AND operators are supported"})),
+    )
+    c = _make()
+    assert c._verify_or_filter_support(f"{SERVICE_URL}Coll", ["a", "b"], {"a": 1, "b": 2}) is False
+    assert c.__dict__["_or_filter_ok"] is False
+    assert c._cached_capability("or_filter_ok") is False
+
+
+@responses.activate
 def test_capability_verdicts_thread_through_offset():
     """The OR / $batch capability verdicts ride the resume offset so a reader
     the framework recreates each microbatch skips re-probing. Seed-from-offset,
