@@ -1317,25 +1317,35 @@ def register_lakeflow_source(spark):
     _NO_ANCESTOR_CURSOR = object()
 
 
-    def _chain_resume_key(chain: list[dict], ancestor_cursor: Any = _NO_ANCESTOR_CURSOR) -> list:
+    def _chain_resume_key(
+        chain: list[dict],
+        ancestor_cursor: Any = _NO_ANCESTOR_CURSOR,
+        cursor_level: int = 0,
+    ) -> list:
         """Client-side ordering key for one ancestor key chain, mirroring the
-        chain enumerations' server-side ``$orderby`` (PK asc per level; the
-        ancestor-cursor walk prefixes its ``cursor asc`` term). Values route
-        through :func:`cursor_sort_key` so ISO-rendered keys order
-        chronologically, consistent with every other comparison in the
-        connector. Used by the capped walks' key-based resume — see
-        :func:`_chain_strictly_before`."""
+        chain enumerations' server-side ordering. The enumeration is NESTED —
+        each level orders within its parent (PK asc; the cursor level prefixes
+        ``cursor asc`` WITHIN that level, see ``_iter_parent_chains_with_cursor``)
+        — so the ancestor-cursor walk's cursor term is inserted at its LEVEL's
+        position, never globally first: a globally-first cursor misorders every
+        ``cursor_level >= 1`` path (a chain under a later top-level parent with
+        a lower cursor would sort "before" the park and be skipped unwalked —
+        permanent subtree loss on a completely stable source). Values stay RAW
+        (the server's rendered text); all ordering happens in
+        :func:`_chain_strictly_before` via the chronological comparators."""
         key: list = []
-        if ancestor_cursor is not _NO_ANCESTOR_CURSOR:
-            key.append(None if ancestor_cursor is None else _cursor_sort_key(ancestor_cursor))
-        for level in chain:
-            key.extend(_cursor_sort_key(v) for v in level.values())
+        for idx, level_keys in enumerate(chain):
+            if ancestor_cursor is not _NO_ANCESTOR_CURSOR and idx == cursor_level:
+                key.append(ancestor_cursor)
+            key.extend(level_keys.values())
+        if ancestor_cursor is not _NO_ANCESTOR_CURSOR and cursor_level >= len(chain):
+            key.append(ancestor_cursor)
         return key
 
 
     def _chain_strictly_before(key_a: list, key_b: list) -> bool:
         """Whether enumeration position ``key_a`` sorts strictly before
-        ``key_b`` (both from :func:`_chain_resume_key`).
+        ``key_b`` (both from :func:`_chain_resume_key`, raw values).
 
         This drives the "already walked in a prior capped batch" skip. The
         positional (index-based) skip it replaces silently desynchronizes
@@ -1344,12 +1354,29 @@ def register_lakeflow_source(spark):
         parent forever; an insert shifts right, so a parked mid-collection
         continuation link gets applied to the WRONG parent (its rows then
         FK-tagged with that parent's keys). Comparing by the enumeration's
-        own ordering keys is churn-stable. Incomparable pairs (cross-type
-        values after a metadata change, or server collation the client
-        can't reproduce) return ``False`` — the chain is NOT skipped,
-        degrading to a duplicate-safe re-read instead of a silent skip."""
+        own ordering keys is churn-stable.
+
+        Elements compare via :func:`cursor_newer` — chronological for
+        ISO-rendered values INCLUDING the padded-fraction sub-microsecond
+        tie-break. A µs-truncating comparison here re-opens the round-18 tie
+        class one layer up: two 100ns-distinct cursors (SQL Server
+        ``datetime2(7)``) tie, the seek loop stops one chain early, the
+        parked continuation is silently dropped, and the walk re-parks a
+        byte-identical offset — a permanently failing (no-progress) or
+        silently starved stream. Incomparable pairs (cross-type values after
+        a metadata change, or server collation the client can't reproduce)
+        return ``False`` — the chain is NOT skipped, degrading to a
+        duplicate-safe re-read instead of a silent skip."""
         try:
-            return key_a < key_b
+            for a, b in zip(key_a, key_b):
+                if a == b:
+                    continue
+                # First differing element decides: a sorts before b iff b is
+                # strictly newer/greater. cursor_newer is a strict total order
+                # over comparable values, so this is well-defined; it raises
+                # TypeError only for genuinely incomparable pairs.
+                return _cursor_newer(b, a)
+            return len(key_a) < len(key_b)
         except TypeError:
             return False
 
@@ -3648,6 +3675,12 @@ def register_lakeflow_source(spark):
                 emitted,
                 ctx,
                 page_size,
+                # New-rows-only cap accounting: the committed watermark (never
+                # the lookback-floored read filter) is the counting floor.
+                count_floor=(start_offset or {}).get("cursor") if cursor_field else None,
+                leaf_pks=self._own_primary_keys_for_et(
+                    self._entity_type_for(CONTAINED_PATH_SEP.join(segments), namespace)
+                ),
             )
             drain_elapsed = time.monotonic() - drain_start
             end_offset = self._build_expand_end_offset(
@@ -3675,6 +3708,8 @@ def register_lakeflow_source(spark):
             emitted: list[dict],
             ctx: tuple | None,
             page_size: int | None,
+            count_floor: Any = None,
+            leaf_pks: list[str] | None = None,
         ) -> list[dict]:
             """Iterative work-queue processor.
 
@@ -3682,40 +3717,79 @@ def register_lakeflow_source(spark):
             process the rows it returns" task::
 
                 {
-                    "url":     str,              # HTTP URL to GET (one page)
-                    "level":   int,              # level the URL's rows live at
-                    "chain":   list[dict],       # ancestor PK chain (snapshot)
-                    "cur_val": Any | None,       # captured cursor value
-                    "skip":    int,              # top_row index to start at
+                    "url":      str,             # HTTP URL to GET (one page)
+                    "level":    int,             # level the URL's rows live at
+                    "chain":    list[dict],      # ancestor PK chain (snapshot)
+                    "cur_val":  Any | None,      # captured cursor value
+                    "skip":     int,             # legacy positional fallback
+                    "boundary": list | None,     # last processed row's order key
                 }
 
             Items are popped FIFO; each pop performs ONE HTTP fetch and
-            processes its top_rows starting from ``skip``. Inner-collection
-            ``@odata.nextLink`` values discovered during a row's inline
-            descent are APPENDED to the queue (via
-            ``_flatten_expand_response``'s ``pending_fetches`` arg) rather
-            than followed inline. After each fully-processed top_row the
-            ``max_records`` cap is checked: when exceeded, the current
-            item is re-queued at the front with ``skip`` advanced past the
-            rows just emitted, and the loop exits. The returned queue is
-            the work left to do — non-empty means "continuation pending",
-            empty means "chain drained".
+            processes its top_rows. Inner-collection ``@odata.nextLink``
+            values discovered during a row's inline descent are APPENDED to
+            the queue (via ``_flatten_expand_response``'s ``pending_fetches``
+            arg) rather than followed inline. After each fully-processed
+            top_row the ``max_records`` cap is checked: when exceeded, the
+            current item is re-queued at the front carrying the just-processed
+            row's ORDER KEY (its ``$orderby`` values — cursor + level PKs, or
+            PKs alone), and the loop exits. The resumed batch re-fetches the
+            URL and skips rows at-or-below that boundary by chronological
+            comparison — NOT by position: the page is re-fetched from a
+            mutating source, so a positional ``skip`` desynchronizes under
+            churn (an update to an already-emitted row on a cursor-ordered
+            page moves it to the tail and shifts an UNREAD row into the
+            skipped prefix — its subtree lost behind the watermark; a delete
+            on a PK-ordered page does the same). ``skip`` remains as the
+            legacy/downgrade fallback for parked offsets without a boundary.
+            Rows whose boundary comparison is incomparable are processed
+            (duplicate-safe), never skipped. The returned queue is the work
+            left to do — non-empty means "continuation pending", empty means
+            "chain drained".
 
-            Cap deviation per batch is bounded by ONE HTTP response's
-            worth of leaf rows (≤ ``page_size``), not by the size of a
-            single top_row's subtree as in the previous design.
+            ``count_floor`` — see ``_walk_contained_with_cursor``: only rows
+            strictly above the committed watermark count toward
+            ``max_records``, so a lookback overlap larger than the cap cannot
+            wedge the stream into an eternal park/complete cycle. Cap
+            deviation per batch is bounded by ONE HTTP response's worth of
+            leaf rows (≤ ``page_size``) plus the lookback overlap.
             """
             # Take ownership: mutated in-place by appends from
             # ``_flatten_expand_response`` and by our own front re-queues.
             queue: list[dict] = list(initial_queue)
             cur_field, cur_level, _ = ctx or (None, -1, None)
-            while queue and len(emitted) < max_records:
+            countable = 0
+
+            def _count_new(rows_slice: list[dict]) -> int:
+                if count_floor is None or cur_field is None:
+                    return len(rows_slice)
+                return sum(
+                    1
+                    for r in rows_slice
+                    if r.get(cur_field) is not None and _cursor_newer(r.get(cur_field), count_floor)
+                )
+
+            def _row_order_key(row: dict, level: int) -> list:
+                # The row's values for its page's own $orderby terms (see
+                # _expand_level_order_by: cursor-first at the cursor level,
+                # PK-only elsewhere) — the churn-stable within-page identity.
+                # ``pks_per_level`` covers ancestor levels only; leaf-level
+                # pages (inner continuations) use the leaf's own PKs.
+                key: list = []
+                if cur_field is not None and level == cur_level:
+                    key.append(row.get(cur_field))
+                pks = pks_per_level[level] if level < len(pks_per_level) else (leaf_pks or [])
+                key.extend(row.get(pk) for pk in pks)
+                return key
+
+            while queue and countable < max_records:
                 item = queue.pop(0)
                 url = item["url"]
                 level = item["level"]
                 chain = [dict(p) for p in item.get("chain") or []]
                 cur_val = item.get("cur_val")
                 skip = int(item.get("skip", 0) or 0)
+                boundary = item.get("boundary")
                 item_ctx = (cur_field, cur_level, cur_val) if cur_field else None
                 # Tops budgeted over only THIS request's collection levels
                 # (root == item level downward); ancestors above are fixed keys.
@@ -3739,10 +3813,19 @@ def register_lakeflow_source(spark):
                         )
                     continue
                 truncated = False
-                for row_idx in range(skip, len(page_rows)):
+                for row_idx in range(0 if boundary is not None else skip, len(page_rows)):
+                    row = page_rows[row_idx]
+                    if boundary is not None:
+                        row_key = _row_order_key(row, level)
+                        # Skip only rows PROVABLY at-or-below the parked
+                        # boundary; incomparable rows are processed
+                        # (duplicate-safe, never silent loss).
+                        if row_key == boundary or _chain_strictly_before(row_key, boundary):
+                            continue
+                    prev_len = len(emitted)
                     self._flatten_expand_response(
                         level,
-                        page_rows[row_idx],
+                        row,
                         segments,
                         pks_per_level,
                         chain,
@@ -3754,10 +3837,13 @@ def register_lakeflow_source(spark):
                         pending_fetches=queue,
                         page_size=page_size,
                     )
-                    if len(emitted) >= max_records and row_idx + 1 < len(page_rows):
+                    countable += _count_new(emitted[prev_len:])
+                    if countable >= max_records and row_idx + 1 < len(page_rows):
                         # Mid-page: re-queue the SAME URL at the front so
                         # the next batch resumes here without scrambling
-                        # depth ordering.
+                        # depth ordering — carrying the just-processed row's
+                        # order key (churn-stable), with the positional skip
+                        # only as a downgrade fallback.
                         queue.insert(
                             0,
                             {
@@ -3766,6 +3852,7 @@ def register_lakeflow_source(spark):
                                 "chain": [dict(p) for p in chain],
                                 "cur_val": cur_val,
                                 "skip": row_idx + 1,
+                                "boundary": _row_order_key(row, level),
                             },
                         )
                         truncated = True
@@ -4335,6 +4422,7 @@ def register_lakeflow_source(spark):
             effective=None,
             skip_null: bool = False,
             parked_chain: list | None = None,
+            count_floor: Any = None,
         ) -> tuple[list[dict], bool, int, list | None, str | None, Any]:
             """Drive the per-parent fetch loop (leaf-cursor mode).
 
@@ -4401,6 +4489,14 @@ def register_lakeflow_source(spark):
             truncated = False
             parent_idx = 0
             chain_start_idx = 0
+            # Only rows strictly above the COMMITTED watermark (``count_floor``,
+            # the true ``since`` — not the lookback-floored read filter) count
+            # toward ``max_records``: overlap re-reads ride on top, so a lookback
+            # window holding >= max_records rows can't wedge the stream into an
+            # eternal park/complete duplicate cycle — a pure-overlap walk always
+            # completes and hits the suppressed-idle rule. The cap may overshoot
+            # by the overlap size (bounded by the user's lookback window).
+            countable = 0
             parked_chain_out: list | None = None
             chain_next_link_out: str | None = None
             truncated_chain_cursor_out: Any = None
@@ -4489,7 +4585,11 @@ def register_lakeflow_source(spark):
                             continue
                         self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                         emitted.append(row)
-                        if len(emitted) >= max_records:
+                        if count_floor is None or (
+                            rec_cursor is not None and _cursor_newer(rec_cursor, count_floor)
+                        ):
+                            countable += 1
+                        if countable >= max_records:
                             cap_hit_in_page = True
                     if cap_hit_in_page:
                         # Finish the current page (above) so its nextLink is a
@@ -4558,6 +4658,7 @@ def register_lakeflow_source(spark):
             batch_size: int = _BATCH_MAX_OPS,
             parked_chain: list | None = None,
             resume_inclusive: bool = False,
+            count_floor: Any = None,
         ) -> tuple[list[dict], bool, int, list | None, None, None]:
             """OData ``$batch`` counterpart to :meth:`_walk_contained_with_cursor`.
 
@@ -4593,6 +4694,8 @@ def register_lakeflow_source(spark):
             emitted: list[dict] = []
             truncated = False
             parent_idx = 0
+            # New-rows-only cap accounting — see _walk_contained_with_cursor.
+            countable = 0
             group: list[list[dict[str, Any]]] = []
             # Drop ``page_size`` so the per-leaf-parent sub-requests carry NO ``$top``
             # — the server drives paging and emits ``@odata.nextLink`` for any
@@ -4601,6 +4704,7 @@ def register_lakeflow_source(spark):
             leaf_opts = {k: v for k, v in (table_options or {}).items() if k != "page_size"}
 
             def _drain_group(buffered: list[list[dict[str, Any]]]) -> None:
+                nonlocal countable
                 # idx-keyed initial URLs (no $top → server pages + emits nextLink).
                 pending: list[tuple[int, str]] = []
                 chain_by_key: dict[int, list[dict[str, Any]]] = {}
@@ -4645,6 +4749,10 @@ def register_lakeflow_source(spark):
                             clean = {k: v for k, v in row.items() if not k.startswith("@odata.")}
                             self._tag_with_ancestor_fks(clean, segments, chain, fk_columns)
                             emitted.append(clean)
+                            if count_floor is None or (
+                                rec_cursor is not None and _cursor_newer(rec_cursor, count_floor)
+                            ):
+                                countable += 1
                         raw_next = body.get("@odata.nextLink") if isinstance(body, dict) else None
                         if raw_next:
                             pending.append((key, self._resolve_next_link(req_url, raw_next)))
@@ -4675,7 +4783,7 @@ def register_lakeflow_source(spark):
                     last_drained = group[-1]
                     _drain_group(group)
                     group = []
-                    if len(emitted) >= max_records:
+                    if countable >= max_records:
                         truncated = True
                         parked_chain_out = last_drained
                         break
@@ -5080,6 +5188,7 @@ def register_lakeflow_source(spark):
                     resume_inclusive=(
                         chain_next_link_in is not None or truncated_chain_cursor_in is not None
                     ),
+                    count_floor=since,
                 )
             else:
                 (
@@ -5105,6 +5214,7 @@ def register_lakeflow_source(spark):
                     effective=effective,
                     skip_null=skip_null,
                     parked_chain=parked_chain_in,
+                    count_floor=since,
                 )
             walk_elapsed = time.monotonic() - walk_start
             if truncated:
@@ -5130,6 +5240,20 @@ def register_lakeflow_source(spark):
                         end_offset["truncated_chain_cursor"] = truncated_chain_cursor_out
                 if since is not None:
                     end_offset["cursor"] = since
+                # Accumulate the max cursor seen across the truncated cycle's
+                # batches (mirrors ``_ancestor_cursor_offset``): the committed
+                # ``cursor`` must stay at ``since`` while in flight, but WITHOUT
+                # this a resume that completes EMPTY would clear the checkpoint
+                # back to ``{"cursor": since}`` and lose every truncated batch's
+                # progress — a permanent period-2 duplicate loop on a static
+                # source whose new rows fit exactly in one capped batch.
+                batch_cursors = [effective(r) for r in emitted if effective(r) is not None]
+                running_max = _max_or(
+                    _cursor_max(batch_cursors) if batch_cursors else None,
+                    (start_offset or {}).get("running_max"),
+                )
+                if running_max is not None:
+                    end_offset["running_max"] = running_max
             else:
                 if not emitted:
                     empty = start_offset or {}
@@ -5150,9 +5274,17 @@ def register_lakeflow_source(spark):
                         "parent_keys",
                         "chain_next_link",
                         "truncated_chain_cursor",
+                        "running_max",
                     )
                     if any(k in empty for k in checkpoint_keys):
+                        # Fold the cycle's accumulated max into the committed
+                        # cursor BEFORE clearing — the truncated batches' rows
+                        # were emitted under it, and dropping it re-reads them
+                        # forever (period-2 duplicate loop).
+                        committed = _max_or(empty.get("running_max"), empty.get("cursor"))
                         empty = {k: v for k, v in empty.items() if k not in checkpoint_keys}
+                        if committed is not None:
+                            empty["cursor"] = committed
                     if persist_probe_ok:
                         empty = self._with_probe_ok(empty)
                     if persist_batch_ok:
@@ -5164,6 +5296,15 @@ def register_lakeflow_source(spark):
                 # batch and no prior ``since`` to carry, the offset is ``{}`` —
                 # not ``{"cursor": None}`` (see ``_cursor_max_end_offset``).
                 end_offset = self._cursor_max_end_offset(cursors, since)
+                # Completing a previously-truncated cycle: fold the accumulated
+                # ``running_max`` into the committed cursor (and drop the key —
+                # terminal offsets stay clean).
+                prior_running = (start_offset or {}).get("running_max")
+                if prior_running is not None:
+                    committed = _max_or(end_offset.get("cursor"), prior_running)
+                    end_offset = {k: v for k, v in end_offset.items() if k != "cursor"}
+                    if committed is not None:
+                        end_offset["cursor"] = committed
             records, out_offset = self._finalize_cursor_read(
                 start_offset, end_offset, emitted, table_name, cursor_field
             )
@@ -5223,6 +5364,8 @@ def register_lakeflow_source(spark):
                 leaf_segment_filter=segment_filters.get(len(segments) - 1),
                 parked_chain=(start_offset or {}).get("parent_keys"),
                 parked_cursor=(start_offset or {}).get("parent_cursor"),
+                cursor_level=cursor_level,
+                count_floor=since,
             )
             end_offset = self._ancestor_cursor_offset(walk_state, start_offset, since, cursor_field)
             return self._finalize_cursor_read(
@@ -5242,6 +5385,8 @@ def register_lakeflow_source(spark):
             leaf_segment_filter: str | None = None,
             parked_chain: list | None = None,
             parked_cursor: Any = None,
+            cursor_level: int = 0,
+            count_floor: Any = None,
         ) -> dict[str, Any]:
             """Walk ancestor chains, fetching each chain's leaf collection
             and stamping rows with the chain's cursor.
@@ -5257,25 +5402,32 @@ def register_lakeflow_source(spark):
             complete and the resume skips through it).
 
             Resume positioning is key-based (``parked_chain`` +
-            ``parked_cursor``, matching the enumeration's ``cursor asc, pks
-            asc`` ordering): this enumeration is ordered by a MUTABLE cursor
-            column and filtered by ``cursor gt since``, so positional resume
-            desynchronizes under any churn — updates included, not just
-            inserts/deletes (see :func:`_chain_strictly_before`). A parked
-            parent whose cursor advanced between batches re-enters at its
-            new position and is re-walked in full with a fresh stamp
-            (duplicate-safe; its old mid-page link is correctly dropped).
-            Legacy index-only offsets fall back to the positional skip."""
+            ``parked_cursor``, matching the enumeration's nested ordering with
+            the cursor term at ``cursor_level``'s position — see
+            :func:`_chain_resume_key`): this enumeration is ordered by a
+            MUTABLE cursor column and filtered by ``cursor gt since``, so
+            positional resume desynchronizes under any churn — updates
+            included, not just inserts/deletes (see
+            :func:`_chain_strictly_before`). A parked parent whose cursor
+            advanced between batches re-enters at its new position and is
+            re-walked in full with a fresh stamp (duplicate-safe; its old
+            mid-page link is correctly dropped). Legacy index-only offsets
+            fall back to the positional skip. ``count_floor`` — see
+            ``_walk_contained_with_cursor``: only rows stamped strictly above
+            the committed watermark count toward the cap."""
             namespace = (table_options or {}).get("namespace")
             leaf_order_by = self._leaf_pk_order_by(segments, namespace)
             parent_idx = 0
             emitted: list[dict] = []
             truncated = False
+            countable = 0
             chain_next_link_out: str | None = None
             parked_chain_out: list | None = None
             parked_cursor_out: Any = None
             parked_key = (
-                _chain_resume_key(parked_chain, parked_cursor) if parked_chain is not None else None
+                _chain_resume_key(parked_chain, parked_cursor, cursor_level)
+                if parked_chain is not None
+                else None
             )
             seeking = parked_key is not None
             for chain, ancestor_cursor in chains_iter:
@@ -5288,7 +5440,7 @@ def register_lakeflow_source(spark):
                     if seeking:
                         at_parked = chain == parked_chain
                         if not at_parked and _chain_strictly_before(
-                            _chain_resume_key(chain, ancestor_cursor), parked_key
+                            _chain_resume_key(chain, ancestor_cursor, cursor_level), parked_key
                         ):
                             parent_idx += 1
                             continue
@@ -5323,7 +5475,11 @@ def register_lakeflow_source(spark):
                         self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                         row[cursor_field] = ancestor_cursor
                         emitted.append(row)
-                    if len(emitted) >= max_records:
+                        if count_floor is None or (
+                            ancestor_cursor is not None and _cursor_newer(ancestor_cursor, count_floor)
+                        ):
+                            countable += 1
+                    if countable >= max_records:
                         truncated = True
                         break
                 if truncated:
@@ -9686,7 +9842,6 @@ def register_lakeflow_source(spark):
     _cursor_le = cursor_le
     _cursor_max = cursor_max
     _cursor_newer = cursor_newer
-    _cursor_sort_key = cursor_sort_key
     _max_or = max_or
     _trim_to_distinct_cursor_boundary = trim_to_distinct_cursor_boundary
     _cursor_le = cursor_le

@@ -6927,6 +6927,7 @@ def test_contained_incremental_truncation_trims_boundary_cohort():
         "parent_idx": 0,
         "parent_keys": [{"Id": 1}],
         "truncated_chain_cursor": "2024-01-01T00:00:00Z",
+        "running_max": "2024-01-01T00:00:00Z",
     }
 
 
@@ -7125,11 +7126,211 @@ def test_chain_resume_ordering_is_chronological_and_incomparable_safe():
     assert not _chain_strictly_before(
         _chain_resume_key([{"Id": "x"}]), _chain_resume_key([{"Id": 5}])
     )
-    # Ancestor-cursor walks prefix the stamped cursor term.
+    # Ancestor-cursor walks put the cursor term at ITS level's position
+    # (level 0 here → it is the major sort key).
     assert _chain_strictly_before(
         _chain_resume_key([{"Id": 9}], "2024-01-01T00:00:00Z"),
         _chain_resume_key([{"Id": 1}], "2024-06-01T00:00:00Z"),
     )
+    # Sub-microsecond-distinct cursors must NOT tie: a µs-truncating
+    # comparison stalls the seek loop and silently drops the parked
+    # continuation (round-18 tie class, one layer up).
+    assert _chain_strictly_before(
+        _chain_resume_key([{"K": "2024-01-01T00:00:00.4876545+00:00"}]),
+        _chain_resume_key([{"K": "2024-01-01T00:00:00.4876546Z"}]),
+    )
+    assert not _chain_strictly_before(
+        _chain_resume_key([{"K": "2024-01-01T00:00:00.4876546Z"}]),
+        _chain_resume_key([{"K": "2024-01-01T00:00:00.4876545+00:00"}]),
+    )
+    # Mid-level cursor (3-segment path, cursor on level 1): the enumeration
+    # is NESTED — level-0 PKs order BEFORE the level-1 cursor ever applies,
+    # so (A=2, cursor 2024-01) sorts AFTER (A=1, cursor 2024-06). A
+    # globally-first cursor key would invert this and skip unwalked
+    # subtrees under later top-level parents.
+    assert not _chain_strictly_before(
+        _chain_resume_key([{"A": 2}, {"B": 1}], "2024-01-01T00:00:00Z", cursor_level=1),
+        _chain_resume_key([{"A": 1}, {"B": 9}], "2024-06-01T00:00:00Z", cursor_level=1),
+    )
+    assert _chain_strictly_before(
+        _chain_resume_key([{"A": 1}, {"B": 9}], "2024-06-01T00:00:00Z", cursor_level=1),
+        _chain_resume_key([{"A": 2}, {"B": 1}], "2024-01-01T00:00:00Z", cursor_level=1),
+    )
+
+
+@responses.activate
+def test_ancestor_midlevel_cursor_resume_does_not_skip_later_parents():
+    """3-segment path with the cursor on level 1 (Children.ModifiedAt,
+    leaf = Notes): the enumeration orders by level-0 PK FIRST, cursor only
+    within each parent. A resume key that put the cursor globally first
+    skipped every (later parent, lower cursor) chain as "already walked" —
+    permanent subtree loss on a completely stable source, then locked out
+    by running_max."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}, {"Id": 2}]})
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={"value": [{"Id": 11, "ModifiedAt": "2024-06-01T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    responses.get(
+        f"{SERVICE_URL}Parents(2)/Children",
+        json={"value": [{"Id": 21, "ModifiedAt": "2024-01-01T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children(11)/Notes",
+        json={"value": [{"Id": 111, "Text": "a"}, {"Id": 112, "Text": "b"}]},
+        match_querystring=False,
+    )
+    responses.get(
+        f"{SERVICE_URL}Parents(2)/Children(21)/Notes",
+        json={"value": [{"Id": 211, "Text": "c"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    opts = {"cursor_field": "ModifiedAt", "max_records_per_batch": "2", "pagination": "nextlink"}
+    recs1, offset1 = c.read_table("Parents__Children__Notes", {}, opts)
+    # Batch 1: chain (P1, C11)@2024-06 emits its two notes and parks.
+    assert [r["Id"] for r in recs1] == [111, 112]
+    assert offset1["parent_keys"] == [{"Id": 1}, {"Id": 11}]
+    assert offset1["parent_cursor"] == "2024-06-01T00:00:00Z"
+    # Batch 2 (stable source): chain (P2, C21)@2024-01 sorts AFTER the park
+    # (level-0 PK majors) — it must be walked, not skipped.
+    recs2, offset2 = c.read_table("Parents__Children__Notes", offset1, opts)
+    assert [r["Id"] for r in recs2] == [211]
+    assert _drop_lb(offset2) == {"cursor": "2024-06-01T00:00:00Z"}
+
+
+@responses.activate
+def test_expand_midpage_park_resumes_by_row_key_not_position():
+    """The expand drainer's mid-page park must carry the last processed
+    row's ORDER KEY, not a positional skip: on a cursor-ordered top page,
+    updating an already-emitted row moves it to the tail of the re-fetched
+    page and shifts an UNREAD row into the skipped prefix — its whole
+    subtree lost behind the watermark under a positional resume."""
+    _mock_nested_metadata()
+    # Mutable source: parents with ISO ``Name`` as the level-0 cursor, one
+    # inline child each.
+    state = [
+        {"Id": 10, "Name": "2024-01-01T00:00:00Z", "kid": 101},
+        {"Id": 20, "Name": "2024-01-02T00:00:00Z", "kid": 201},
+        {"Id": 30, "Name": "2024-01-03T00:00:00Z", "kid": 301},
+        {"Id": 40, "Name": "2024-01-04T00:00:00Z", "kid": 401},
+    ]
+
+    def parents_cb(_req):
+        rows = [
+            {
+                "Id": p["Id"],
+                "Name": p["Name"],
+                "Children": [{"Id": p["kid"], "Label": "x", "ModifiedAt": p["Name"]}],
+            }
+            for p in sorted(state, key=lambda p: (p["Name"], p["Id"]))
+        ]
+        return (200, {}, json.dumps({"value": rows}))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=parents_cb)
+    c = _make()
+    opts = {
+        "expand_contained": "true",
+        "cursor_field": "Name",
+        "max_records_per_batch": "2",
+        "pagination": "nextlink",
+    }
+    recs1, offset1 = c.read_table("Parents__Children", {}, opts)
+    # Batch 1: children of parents 10 and 20 emitted; mid-page park.
+    assert sorted(r["Id"] for r in recs1) == [101, 201]
+    assert offset1["pending_fetches"][0]["boundary"] == ["2024-01-02T00:00:00Z", 20]
+    # Parent 10 is updated between batches → moves to the TAIL of the
+    # cursor-ordered page; parent 30 shifts into the old positional prefix.
+    state[0]["Name"] = "2024-01-05T00:00:00Z"
+    recs2, offset2 = c.read_table("Parents__Children", offset1, opts)
+    got = [r["Id"] for r in recs2]
+    if offset2.get("pending_fetches"):
+        recs3, _ = c.read_table("Parents__Children", offset2, opts)
+        got += [r["Id"] for r in recs3]
+    # Key-based resume: parents 30, 40, and the updated 10 all emit (across
+    # the remaining capped batches). The positional skip=2 resume lost
+    # parent 30's subtree entirely.
+    assert sorted(got) == [101, 301, 401]
+
+
+@responses.activate
+def test_capped_walk_watermark_survives_empty_resume_completion():
+    """A truncated batch's max cursor must survive a resume that completes
+    EMPTY: without running_max the checkpoint clear fell back to the old
+    watermark and the stream re-read the same rows forever (period-2
+    duplicate loop on a static source)."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}]})
+
+    def children_cb(req):
+        from urllib.parse import unquote
+
+        url = unquote(req.url)
+        rows = [
+            {"Id": 11, "ModifiedAt": "2024-02-01T00:00:00Z"},
+            {"Id": 12, "ModifiedAt": "2024-03-01T00:00:00Z"},
+            {"Id": 13, "ModifiedAt": "2024-04-01T00:00:00Z"},
+        ]
+        m = re.findall(r"ModifiedAt gt (\S+?)[)&]", url + "&")
+        if m:
+            floor = max(m)
+            rows = [r for r in rows if r["ModifiedAt"] > floor]
+        return (200, {}, json.dumps({"value": rows}))  # NO nextLink
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents(1)/Children", callback=children_cb)
+    c = _make()
+    # Default pagination=auto: the cap fires inside the one full-collection
+    # page and the synthesized keyset seek becomes the parked link.
+    opts = {"cursor_field": "ModifiedAt", "max_records_per_batch": "3"}
+    start = {"cursor": "2024-01-01T00:00:00Z"}
+    recs1, offset1 = c.read_table("Parents__Children", start, opts)
+    assert [r["Id"] for r in recs1] == [11, 12, 13]
+    assert offset1.get("running_max") == "2024-04-01T00:00:00Z"
+    # Resume: the parked seek returns nothing — the clear must FOLD the
+    # accumulated max into the committed cursor, not fall back to the old
+    # watermark (which replays the same three rows forever).
+    recs2, offset2 = c.read_table("Parents__Children", offset1, opts)
+    assert list(recs2) == []
+    assert _drop_lb(offset2) == {"cursor": "2024-04-01T00:00:00Z"}
+
+
+@responses.activate
+def test_lookback_overlap_larger_than_cap_completes_and_idles():
+    """Overlap re-reads (rows at-or-below the committed watermark) must not
+    count toward max_records_per_batch: a lookback window holding >= cap
+    rows otherwise wedges the stream into an eternal park/complete cycle
+    that re-emits the same duplicates on every trigger and never reaches
+    the end == start idle."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}]})
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children",
+        callback=_churn_children_cb(
+            [
+                {"Id": 11, "ModifiedAt": "2024-05-01T00:10:00Z"},
+                {"Id": 12, "ModifiedAt": "2024-05-01T00:20:00Z"},
+                {"Id": 13, "ModifiedAt": "2024-05-01T00:30:00Z"},
+            ]
+        ),
+    )
+    c = _make()
+    watermark = "2024-05-01T00:30:00Z"
+    opts = {
+        "cursor_field": "ModifiedAt",
+        "max_records_per_batch": "2",  # smaller than the 3-row overlap
+        "cursor_lookback_seconds": "3600",
+        "pagination": "nextlink",
+    }
+    records, offset = c.read_table("Parents__Children", {"cursor": watermark}, opts)
+    list(records)
+    # The pure-overlap walk completes (no park) and idles at the watermark.
+    assert _drop_lb(offset) == {"cursor": watermark}
+    for stale in ("parent_idx", "parent_keys", "chain_next_link", "truncated_chain_cursor"):
+        assert stale not in offset
 
 
 @responses.activate
@@ -7227,6 +7428,7 @@ def test_contained_incremental_continues_past_single_cursor_parent_then_checkpoi
         "parent_idx": 1,
         "parent_keys": [{"Id": 2}],
         "truncated_chain_cursor": "2024-02-01T00:00:00Z",
+        "running_max": "2024-02-01T00:00:00Z",
     }
 
 
@@ -7362,6 +7564,7 @@ def test_contained_incremental_truncation_uses_nextlink_at_page_boundary():
         "parent_idx": 0,
         "parent_keys": [{"Id": 1}],
         "chain_next_link": next_link,
+        "running_max": "2024-01-02T00:00:00Z",
     }
 
 
@@ -10935,7 +11138,9 @@ def test_batch_walk_cap_on_final_chunk_resume_clears_checkpoint():
     recs2, offset2 = c.read_table(PROBE_TABLE, offset, opts)
     assert list(recs2) == []
     assert "parent_idx" not in offset2
-    assert offset2["cursor"] == since
+    # The clear folds the truncated cycle's running_max into the committed
+    # cursor — batch 1's progress is never lost (no period-2 re-read loop).
+    assert offset2["cursor"] == "2020-06-02T00:00:00Z"
 
 
 @responses.activate
