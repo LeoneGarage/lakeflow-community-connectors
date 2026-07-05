@@ -616,6 +616,17 @@ def register_lakeflow_source(spark):
     _ISO_FRACTION_RE = re.compile(r"\.(\d+)")
 
 
+    def _fraction_digits(value: Any) -> str:
+        """The fractional-second digit run of an ISO-rendered string, or ``""``.
+        Used by :func:`cursor_newer`'s tie-break — see there for why the digits
+        are compared zero-padded rather than as raw text."""
+        if isinstance(value, str):
+            match = _ISO_FRACTION_RE.search(value)
+            if match:
+                return match.group(1)
+        return ""
+
+
     def parse_iso8601(value: str) -> datetime:
         """``datetime.fromisoformat`` with version-uniform fraction handling.
 
@@ -671,30 +682,59 @@ def register_lakeflow_source(spark):
         chronological where both render as ISO-8601 (see
         :func:`cursor_sort_key`), raw ordering otherwise. A shape-mixed column
         (one value parses, the other doesn't) falls back to comparing the raw
-        values, preserving the pre-helper behavior for such data."""
+        values, preserving the pre-helper behavior for such data.
+
+        Key TIES between different raw texts break on the FRACTION DIGITS,
+        zero-padded to a common width: Python datetimes hold microseconds, so
+        :func:`parse_iso8601` truncates sub-microsecond digits — two
+        chronologically DIFFERENT 100ns-precision cursors (SQL Server
+        ``datetime2(7)`` sources emit 7-digit fractions) would otherwise tie,
+        and a tie at the ``<= since`` re-filter drops a strictly-newer row the
+        server correctly returned. Padding before comparing matters: raw-text
+        comparison inverts when digit counts differ (the shorter fraction's
+        terminator ``Z``/``+`` sorts above any digit), whereas equal-width
+        digit strings compare numerically. Genuinely equal instants rendered
+        two ways (``…Z`` vs ``…+00:00``, trailing zeros) fall through to an
+        arbitrary-but-consistent raw order that errs only in the
+        duplicate-safe direction."""
         key_a, key_b = cursor_sort_key(a), cursor_sort_key(b)
         try:
-            return key_a > key_b
+            if key_a > key_b:
+                return True
+            if key_b > key_a:
+                return False
         except TypeError:
             return a > b
+        if a == b:
+            return False
+        # Exact-key tie with different texts: sub-microsecond digits (or two
+        # renderings of one instant). Compare fractions numerically first.
+        frac_a, frac_b = _fraction_digits(a), _fraction_digits(b)
+        width = max(len(frac_a), len(frac_b))
+        frac_a, frac_b = frac_a.ljust(width, "0"), frac_b.ljust(width, "0")
+        if frac_a != frac_b:
+            return frac_a > frac_b
+        try:
+            return a > b  # same instant — consistent arbitrary order
+        except TypeError:
+            return False
 
 
     def cursor_le(a: Any, b: Any) -> bool:
-        """Whether ``a <= b`` in cursor order (see :func:`cursor_newer`)."""
-        key_a, key_b = cursor_sort_key(a), cursor_sort_key(b)
-        try:
-            return key_a <= key_b
-        except TypeError:
-            return a <= b
+        """Whether ``a <= b`` in cursor order — the exact complement of
+        :func:`cursor_newer` under its strict total order (including the
+        raw-text tie-break), so the re-filter and the watermark max can never
+        disagree about a boundary row."""
+        return not cursor_newer(a, b)
 
 
     def cursor_max(values: Any) -> Any:
         """Max of an iterable of non-``None`` cursor values in cursor order.
         Pairwise via :func:`cursor_newer` (not ``max(key=…)``) so a shape-mixed
-        iterable degrades per-pair instead of raising, and the FIRST maximal
-        value wins ties — matching ``max``'s tie behavior, so an equal-instant
-        pair rendered two ways (``…Z`` vs ``…+00:00``) keeps the earlier-seen
-        text as the watermark."""
+        iterable degrades per-pair instead of raising. With the raw-text
+        tie-break in :func:`cursor_newer`, only IDENTICAL texts (or
+        incomparable pairs) still tie — for those the first-seen value wins,
+        matching ``max``'s tie behavior."""
         result = sentinel = object()
         for value in values:
             if result is sentinel or cursor_newer(value, result):

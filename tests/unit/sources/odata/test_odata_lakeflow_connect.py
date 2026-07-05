@@ -193,13 +193,33 @@ def test_cursor_comparisons_are_chronological_not_lexical():
         "2024-01-01T23:00:00.5Z"
     )
     assert max_or("2024-01-01T23:00:00Z", "2024-01-01T23:00:00.5Z") == ("2024-01-01T23:00:00.5Z")
-    # Equal instants rendered two ways tie (neither is newer); the max
-    # keeps the first-seen text as the watermark.
-    assert not cursor_newer("2024-01-01T23:00:00+00:00", "2024-01-01T23:00:00Z")
-    assert cursor_le("2024-01-01T23:00:00+00:00", "2024-01-01T23:00:00Z")
+    # Sub-microsecond precision (SQL Server datetime2(7) emits 7-digit
+    # fractions): Python datetimes truncate to µs, so the PARSED keys tie —
+    # the raw-text tie-break must still order chronologically, or the
+    # <= since re-filter drops a strictly-newer row the server correctly
+    # returned (the round-13 loss mechanism one scale down).
+    assert cursor_newer("2024-01-01T23:00:00.1234568Z", "2024-01-01T23:00:00.1234567Z")
+    assert not cursor_le("2024-01-01T23:00:00.1234568Z", "2024-01-01T23:00:00.1234567Z")
+    assert (
+        cursor_max(["2024-01-01T23:00:00.1234567Z", "2024-01-01T23:00:00.1234568Z"])
+        == "2024-01-01T23:00:00.1234568Z"
+    )  # true max regardless of order
+    # Differing digit counts below the µs boundary compare zero-padded
+    # (.12345675 > .1234567 == .12345670) — raw-text comparison would
+    # invert here because the shorter fraction's 'Z' sorts above digits.
+    assert cursor_newer("2024-01-01T23:00:00.12345675Z", "2024-01-01T23:00:00.1234567Z")
+    # Equal instants rendered two ways: the consistent raw tie-break errs
+    # only in the duplicate-safe direction at the re-filter — a same-instant
+    # re-read is either dropped (correct) or kept (MERGE-deduped duplicate),
+    # never a lost newer row.
+    assert cursor_le("2024-01-01T23:00:00+00:00", "2024-01-01T23:00:00Z")  # dropped: correct
+    assert not cursor_le("2024-01-01T23:00:00Z", "2024-01-01T23:00:00+00:00")  # kept: dup-safe
     assert cursor_max(["2024-01-01T23:00:00Z", "2024-01-01T23:00:00+00:00"]) == (
         "2024-01-01T23:00:00Z"
     )
+    # Identical texts still tie exactly.
+    assert not cursor_newer("2024-01-01T23:00:00Z", "2024-01-01T23:00:00Z")
+    assert cursor_le("2024-01-01T23:00:00Z", "2024-01-01T23:00:00Z")
     # Offsets order chronologically, not textually.
     assert cursor_newer("2024-01-01T23:00:00Z", "2024-01-02T08:59:00+10:00")
     # Non-ISO values keep their natural ordering; ints untouched.
