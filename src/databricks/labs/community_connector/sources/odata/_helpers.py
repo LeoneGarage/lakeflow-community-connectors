@@ -6,8 +6,35 @@ read code can share them without ``_contained`` having to import from
 ``ContainedNavMixin`` at class definition time).
 """
 
+import re
 from datetime import datetime, timezone
 from typing import Any
+
+_ISO_FRACTION_RE = re.compile(r"\.(\d+)")
+
+
+def parse_iso8601(value: str) -> datetime:
+    """``datetime.fromisoformat`` with version-uniform fraction handling.
+
+    The connector's floor is Python 3.10 (DBR 13.3 LTS), where
+    ``fromisoformat`` accepts fractional seconds of EXACTLY 3 or 6 digits —
+    while real servers render value-dependent digit counts (Olingo/SAP trim
+    trailing zeros → ``.5``; nanosecond servers emit 7+ digits, which even
+    3.10 rejects). Left unnormalized, a ``…00.5Z`` watermark on a 3.10
+    runtime fails the ISO sniff (→ ``odata_literal`` QUOTES it → wire 400
+    every batch) and falls out of the chronological comparisons (→ back to
+    the lexical silent-loss ordering those comparisons exist to prevent).
+    Normalizing the fraction to exactly 6 digits (pad short, truncate
+    long — sub-microsecond precision only affects ordering ties, which are
+    duplicate-safe) makes parsing identical on every supported version.
+    Also maps the ``Z`` designator 3.10 can't parse. Raises ``ValueError``
+    like ``fromisoformat`` for non-ISO input."""
+    s = value.replace("Z", "+00:00")
+    frac = _ISO_FRACTION_RE.search(s)
+    if frac:
+        digits = frac.group(1)
+        s = s[: frac.start(1)] + digits[:6].ljust(6, "0") + s[frac.end(1) :]
+    return datetime.fromisoformat(s)
 
 
 def cursor_sort_key(value: Any) -> Any:
@@ -27,7 +54,7 @@ def cursor_sort_key(value: Any) -> Any:
     server's raw text — this key is for COMPARISON only."""
     if isinstance(value, str):
         try:
-            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            dt = parse_iso8601(value)
         except (ValueError, TypeError):
             return value
         if dt.tzinfo is None:

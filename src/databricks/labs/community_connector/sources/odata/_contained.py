@@ -38,6 +38,7 @@ from databricks.labs.community_connector.sources.odata._helpers import (
     cursor_max as _cursor_max,
     cursor_newer as _cursor_newer,
     max_or as _max_or,
+    parse_iso8601,
     trim_to_distinct_cursor_boundary as _trim_to_distinct_cursor_boundary,
 )
 
@@ -268,11 +269,16 @@ def join_url(base: str, suffix: str) -> str:
 
 
 def looks_like_iso8601(s: str) -> bool:
-    """Cheap ISO-8601 sniff used by ``odata_literal`` to render bare timestamps."""
+    """Cheap ISO-8601 sniff used by ``odata_literal`` to render bare timestamps.
+
+    Routed through :func:`parse_iso8601` so the verdict is identical on
+    every supported Python — a bare ``fromisoformat`` on 3.10 rejects
+    ``…00.5Z`` (1/2/4/5/7+ fractional digits), which would QUOTE a
+    fractional watermark in ``$filter`` and 400 every incremental batch."""
     if len(s) < 10 or s[4] != "-" or s[7] != "-":
         return False
     try:
-        datetime.fromisoformat(s.replace("Z", "+00:00"))
+        parse_iso8601(s)
         return True
     except ValueError:
         return False

@@ -613,6 +613,33 @@ def register_lakeflow_source(spark):
     # src/databricks/labs/community_connector/sources/odata/_helpers.py
     ########################################################
 
+    _ISO_FRACTION_RE = re.compile(r"\.(\d+)")
+
+
+    def parse_iso8601(value: str) -> datetime:
+        """``datetime.fromisoformat`` with version-uniform fraction handling.
+
+        The connector's floor is Python 3.10 (DBR 13.3 LTS), where
+        ``fromisoformat`` accepts fractional seconds of EXACTLY 3 or 6 digits —
+        while real servers render value-dependent digit counts (Olingo/SAP trim
+        trailing zeros → ``.5``; nanosecond servers emit 7+ digits, which even
+        3.10 rejects). Left unnormalized, a ``…00.5Z`` watermark on a 3.10
+        runtime fails the ISO sniff (→ ``odata_literal`` QUOTES it → wire 400
+        every batch) and falls out of the chronological comparisons (→ back to
+        the lexical silent-loss ordering those comparisons exist to prevent).
+        Normalizing the fraction to exactly 6 digits (pad short, truncate
+        long — sub-microsecond precision only affects ordering ties, which are
+        duplicate-safe) makes parsing identical on every supported version.
+        Also maps the ``Z`` designator 3.10 can't parse. Raises ``ValueError``
+        like ``fromisoformat`` for non-ISO input."""
+        s = value.replace("Z", "+00:00")
+        frac = _ISO_FRACTION_RE.search(s)
+        if frac:
+            digits = frac.group(1)
+            s = s[: frac.start(1)] + digits[:6].ljust(6, "0") + s[frac.end(1) :]
+        return datetime.fromisoformat(s)
+
+
     def cursor_sort_key(value: Any) -> Any:
         """Chronological sort key for one cursor value.
 
@@ -630,7 +657,7 @@ def register_lakeflow_source(spark):
         server's raw text — this key is for COMPARISON only."""
         if isinstance(value, str):
             try:
-                dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                dt = parse_iso8601(value)
             except (ValueError, TypeError):
                 return value
             if dt.tzinfo is None:
@@ -952,11 +979,16 @@ def register_lakeflow_source(spark):
 
 
     def looks_like_iso8601(s: str) -> bool:
-        """Cheap ISO-8601 sniff used by ``odata_literal`` to render bare timestamps."""
+        """Cheap ISO-8601 sniff used by ``odata_literal`` to render bare timestamps.
+
+        Routed through :func:`parse_iso8601` so the verdict is identical on
+        every supported Python — a bare ``fromisoformat`` on 3.10 rejects
+        ``…00.5Z`` (1/2/4/5/7+ fractional digits), which would QUOTE a
+        fractional watermark in ``$filter`` and 400 every incremental batch."""
         if len(s) < 10 or s[4] != "-" or s[7] != "-":
             return False
         try:
-            datetime.fromisoformat(s.replace("Z", "+00:00"))
+            parse_iso8601(s)
             return True
         except ValueError:
             return False
@@ -8816,7 +8848,7 @@ def register_lakeflow_source(spark):
             dt = since
             if isinstance(since, str):
                 try:
-                    dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+                    dt = _parse_iso8601(since)
                 except ValueError as exc:
                     if getattr(self, "_cursor_lookback", "auto") == "auto":
                         return since
@@ -9140,6 +9172,7 @@ def register_lakeflow_source(spark):
     _trim_to_distinct_cursor_boundary = trim_to_distinct_cursor_boundary
     _cursor_le = cursor_le
     _cursor_max = cursor_max
+    _parse_iso8601 = parse_iso8601
     _trim_to_distinct_cursor_boundary = trim_to_distinct_cursor_boundary
     _CONTAINED_PATH_SEP = CONTAINED_PATH_SEP
     _DEFAULT_PAGE_SIZE = DEFAULT_PAGE_SIZE

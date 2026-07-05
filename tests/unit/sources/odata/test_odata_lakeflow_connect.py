@@ -138,6 +138,37 @@ def test_odata_literal_quotes_strings_and_escapes():
 
 def test_odata_literal_passes_iso_timestamps_bare():
     assert _odata_literal("2024-05-01T00:00:00Z") == "2024-05-01T00:00:00Z"
+    # Odd-digit fractions must stay bare too — on Python 3.10 (DBR 13.3 LTS)
+    # a bare fromisoformat rejects '.5', which would QUOTE the watermark in
+    # $filter and 400 every incremental batch. parse_iso8601 normalizes the
+    # digit count so the sniff verdict is version-uniform.
+    assert _odata_literal("2024-05-01T00:00:00.5Z") == "2024-05-01T00:00:00.5Z"
+    assert _odata_literal("2024-05-01T00:00:00.1234567Z") == "2024-05-01T00:00:00.1234567Z"
+
+
+def test_parse_iso8601_normalizes_fraction_digit_count():
+    """Version-uniform parsing: Python 3.10 (the declared floor, DBR 13.3
+    LTS) accepts only 3- or 6-digit fractional seconds, while servers render
+    value-dependent digit counts (Olingo/SAP trim trailing zeros) and
+    nanosecond servers emit 7+. The helper pads/truncates to 6 so parsing —
+    and everything built on it: the ISO sniff, the chronological
+    comparisons, the lookback floor — behaves identically everywhere."""
+    from datetime import datetime, timezone
+
+    from databricks.labs.community_connector.sources.odata._helpers import parse_iso8601
+
+    base = datetime(2024, 1, 1, 23, 0, 0, 500000, tzinfo=timezone.utc)
+    assert parse_iso8601("2024-01-01T23:00:00.5Z") == base  # 1 digit → padded
+    assert parse_iso8601("2024-01-01T23:00:00.50000Z") == base  # 5 digits → padded
+    assert parse_iso8601("2024-01-01T23:00:00.5000000Z") == base  # 7 digits → truncated
+    # Sub-microsecond digits truncate (ordering-tie territory, duplicate-safe).
+    assert parse_iso8601("2024-01-01T23:00:00.1234567Z") == parse_iso8601(
+        "2024-01-01T23:00:00.123456Z"
+    )
+    # Non-fractional and offset forms pass through untouched.
+    assert parse_iso8601("2024-01-01T23:00:00+10:00").utcoffset().total_seconds() == 36000
+    with pytest.raises(ValueError):
+        parse_iso8601("not-a-timestamp")
 
 
 def test_cursor_comparisons_are_chronological_not_lexical():

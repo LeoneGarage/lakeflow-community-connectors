@@ -87,6 +87,7 @@ from databricks.labs.community_connector.interface.supports_namespaces import (
 from databricks.labs.community_connector.sources.odata._helpers import (
     cursor_le as _cursor_le,
     cursor_max as _cursor_max,
+    parse_iso8601 as _parse_iso8601,
     trim_to_distinct_cursor_boundary as _trim_to_distinct_cursor_boundary,
 )
 
@@ -3489,7 +3490,7 @@ class ODataLakeflowConnect(
         dt = since
         if isinstance(since, str):
             try:
-                dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+                dt = _parse_iso8601(since)
             except ValueError as exc:
                 if getattr(self, "_cursor_lookback", "auto") == "auto":
                     return since
