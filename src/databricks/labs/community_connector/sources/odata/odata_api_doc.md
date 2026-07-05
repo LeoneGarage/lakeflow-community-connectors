@@ -215,7 +215,7 @@ A date-only cursor (`Edm.Date`) or a one-second-resolution timestamp on a busy t
 
 ### Snapshot mode
 
-When `cursor_field` is not set, the connector walks `@odata.nextLink` from the initial `$top=<page_size>` request until the server stops returning a next link, accumulates the full row set, and returns it in one batch. No cursor filter is applied. No primary keys are appended to `$orderby` (none is sent at all).
+When `cursor_field` is not set, the connector walks `@odata.nextLink` from the initial `$top=<page_size>` request until the server stops returning a next link, streaming rows lazily one page at a time (the full result set is never materialized in memory). No cursor filter is applied. A PK-only `$orderby` **is** sent whenever the entity declares keys — OData v4 §11.2.5.7 gives no stable default ordering across pages, so skiptoken pagination needs an explicit total order.
 
 The OData v4 spec allows `@odata.nextLink` to be either an absolute URL or a relative one resolved against the request URL. Some services (SAP NetWeaver Gateway, certain self-hosted Olingo deployments) return only `Customers?$skiptoken=...`. The connector resolves these via `urllib.parse.urljoin` against `resp.url`, so absolute links pass through unchanged and relative links are prepended with the service root.
 
@@ -236,7 +236,8 @@ OData v4 §11.3 ("Requesting Changes") defines a server-driven change-tracking p
 - 200 + `Preference-Applied: odata.track-changes` header → delta supported. Cached.
 - 200 + missing `Preference-Applied` header → server silently ignored the prefer. Falls back to whatever cursor/snapshot config is set. Cached.
 - non-200 status (400/405 commonly) → server rejected the prefer. Falls back. Cached.
-- Network error / non-JSON body → falls back. Cached `False`.
+- Hard, non-transient failure (definitive rejection) → falls back. Cached `False`.
+- Transient failure (transport error, retryable status incl. 408, non-JSON body) → falls back **for this batch only**; nothing is cached and the next call re-probes.
 
 `delta_tracking=enabled` skips the probe entirely. If the actual bootstrap response is missing `Preference-Applied`, the connector raises a `RuntimeError` pointing the operator at `delta_tracking=disabled` as the fallback.
 
@@ -285,7 +286,7 @@ Two columns are appended to the declared schema for delta-active tables:
 | Column | Type | Purpose |
 | --- | --- | --- |
 | `_deleted` | `BooleanType` (non-null) | In-band tombstone flag. `True` only for `@removed` entries; `False` for adds and changes. |
-| `_lc_sequence` | `StringType` (non-null) | `read_table_metadata` reports this as `cursor_field`. Format: `<iso_8601_with_microseconds>_<12-digit_counter>`. Strictly monotonic per emit per process, so `apply_changes` MERGE-by-PK picks deterministic winners when the same primary key appears multiple times in one batch. |
+| `_lc_sequence` | `StringType` (non-null) | `read_table_metadata` reports this as `cursor_field`. Format: `<20-digit zero-padded nanoseconds-since-epoch>_<12-digit counter>`. Strictly monotonic per emit per process, so `apply_changes` MERGE-by-PK picks deterministic winners when the same primary key appears multiple times in one batch. |
 
 ### Graph deltaLink-rotation guard
 
@@ -301,7 +302,7 @@ When the server returns 410 Gone on a stored `delta_link` or `next_link`, the co
 
 OData v4 §11.4 allows delta payloads to return only the *modified* properties on an updated entity. Applying that as-is would write NULLs over good destination values — silent corruption. The connector refuses such payloads.
 
-Detection runs once per call against the first non-tombstone entry. Expected key set:
+Detection runs on **every** non-tombstone entry (mixed payloads — full entities for creates, changed-properties-only for updates — are the norm, so first-entry sampling would wave sparse updates through). The expected key set is precomputed once per walk:
 
 - The full declared schema, minus the synthetic `_deleted` / `_lc_sequence` columns.
 - Filtered to the `$select` projection if set.
@@ -413,11 +414,11 @@ Most OData servers cap `$expand` depth at 1; deeper expands surface as HTTP 4xx 
 
 Set `cursor_field` to a column on the leaf entity. The connector walks every parent tuple per `read_table` call, applies `$filter=cursor gt since` and `$orderby=cursor asc, leaf_pk asc` to each per-parent fetch, and tracks the global max cursor across all parents in the offset's `cursor` key.
 
-Offset shape: `{"cursor": "<max_seen_value>"}` on natural completion, plus `"parent_idx": <int>` when truncated mid-walk by `max_records_per_batch`. The mid-walk resume re-walks from `parent_idx` with the advanced cursor, so rows already emitted within that parent are elided by the filter.
+Offset shape: `{"cursor": "<max_seen_value>"}` on natural completion. When truncated mid-walk by `max_records_per_batch` the offset parks the truncated parent's **key chain** (`parent_keys`, plus `parent_cursor` on the ancestor-cursor path) alongside a `running_max` accumulator and a legacy `parent_idx` (downgrade fallback only). The resume re-positions by the enumeration's own ordering keys — churn-stable under parent inserts/deletes between batches — and rows already emitted within the resumed parent are elided by the parked continuation filter.
 
 Termination: when an end_offset equal to the start_offset would be returned (no new rows anywhere), the connector emits zero rows and the same offset, satisfying the framework's "no progress" stop condition.
 
-Truncation handling: when `max_records_per_batch` caps the walk mid-parent, the connector trims the trailing same-cursor cohort *within the truncated parent only* (`_trim_to_distinct_cursor_boundary`), and the returned offset carries a `truncated_chain_cursor` alongside `cursor` and `parent_idx`. The resumed call uses `cursor gt truncated_chain_cursor` for the truncated parent (re-picks up its boundary cohort) and `cursor gt cursor` (the original `since`) for every subsequent parent — per-parent cursor distributions are independent, so a single boundary value can't safely cover them all. After the resumed walk completes naturally the offset collapses back to `{"cursor": <max_seen>}`; subsequent batches may re-emit earlier parents' rows whose cursors lie above `max_seen` from the resume, but `apply_changes` keyed on the composite PK dedupes them at the destination. If a parent's same-cursor cohort exceeds `max_records_per_batch` *and the server returned that parent's whole leaf collection in one page* (no `@odata.nextLink`), the cohort is complete but has no splittable boundary — the connector emits it in full and continues to the next parent (overshooting the cap for that one parent) rather than failing, advancing the watermark exactly as natural completion would.
+Truncation handling: when `max_records_per_batch` caps the walk mid-parent, the connector trims the trailing same-cursor cohort *within the truncated parent only* (`_trim_to_distinct_cursor_boundary`), and the returned offset carries a `truncated_chain_cursor` alongside `cursor`, `parent_keys` (the key-based resume position), `running_max`, and the legacy `parent_idx`. The resumed call uses `cursor gt truncated_chain_cursor` for the truncated parent (re-picks up its boundary cohort) and `cursor gt cursor` (the original `since`) for every subsequent parent — per-parent cursor distributions are independent, so a single boundary value can't safely cover them all. After the resumed walk completes naturally the offset collapses back to `{"cursor": <max_seen>}`; subsequent batches may re-emit earlier parents' rows whose cursors lie above `max_seen` from the resume, but `apply_changes` keyed on the composite PK dedupes them at the destination. If a parent's same-cursor cohort exceeds `max_records_per_batch` *and the server returned that parent's whole leaf collection in one page* (no `@odata.nextLink`), the cohort is complete but has no splittable boundary — the connector emits it in full and continues to the next parent (overshooting the cap for that one parent) rather than failing, advancing the watermark exactly as natural completion would.
 
 ### Ancestor-cursor fallback
 
@@ -461,7 +462,7 @@ EDM primitive types are mapped to Spark types as follows. Any unrecognized type 
 | `Edm.Guid` | `StringType` | |
 | `Edm.Binary` | `BinaryType` | Base64-encoded on the wire; downstream callers can use `_decode_binary` to materialize bytes. |
 
-Complex types, enum types, and navigation properties are not surfaced — only `<Property>` elements of the entity type are emitted as fields.
+Complex-typed, enum-typed, `Collection(...)`, and TypeDefinition-typed `<Property>` elements are surfaced as `StringType` columns, with structured (object/array) values rendered as **JSON text** at the emit boundary (parseable downstream with `from_json`). Only navigation properties are unsurfaced.
 
 ---
 
@@ -543,7 +544,7 @@ If `max_records_per_batch` were set to, say, `10`, the connector would raise `Ru
 ## Known limits
 
 - **Server-side `$top` caps.** Some services cap `$top` below the requested value (Microsoft Graph at 999 for most endpoints; certain SAP services at 5000). Under the default `pagination=auto` the connector follows the server's `@odata.nextLink` whenever one is emitted, and when a server page-limits *without* emitting a link it falls back to a keyset seek / `$skip` drain until an empty page — so a smaller effective page size costs throughput, never rows. See the README's `pagination` row for the full mode matrix.
-- **Opaque `$skiptoken` stability requires a unique total `$orderby`.** As described in *Incremental ingestion contract*, the connector unconditionally appends every primary-key column to `$orderby` in CDC mode. Snapshot reads under the default `pagination=auto` also send `$top=1000` plus a stable PK `$orderby` where one is needed for the client-driven drain; only `pagination=nextlink` sends a `$top`-free, `$orderby`-free snapshot scan that follows server pagination as-is.
+- **Opaque `$skiptoken` stability requires a unique total `$orderby`.** As described in *Incremental ingestion contract*, the connector unconditionally appends every primary-key column to `$orderby` in CDC mode. Snapshot reads under the default `pagination=auto` also send `$top=1000` plus a stable PK `$orderby` where one is needed for the client-driven drain; only `pagination=nextlink` sends a `$top`-free snapshot scan that follows server pagination as-is (a PK-only `$orderby` is still sent whenever the entity declares keys — skiptoken stability needs it).
 - **Relative `@odata.nextLink`.** Handled — resolved against the response URL via `urljoin`. Absolute links pass through unchanged.
 - **The `cdc_with_deletes` ingestion type is never reported.** Deletes **are** captured under `delta_tracking` (in-band `_deleted=True` tombstone rows — see [Delta tracking](#delta-tracking-contract)); cursor/snapshot reads cannot observe deletes, so there soft-deletes must be modeled as updates to a status column.
 - **Flat entity sets read single-partition.** Skiptokens are opaque, so one collection's page walk can't be split. Contained N+1 paths partition across top-level subtrees via `num_partitions` (`SupportsPartitionedStream`).

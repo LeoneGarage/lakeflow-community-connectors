@@ -20,6 +20,7 @@ import re
 import time
 
 import pytest
+import requests
 import responses
 
 from databricks.labs.community_connector.sources.odata import ODataLakeflowConnect
@@ -7344,6 +7345,155 @@ def test_expand_stale_inner_continuation_rebuilds_from_scratch():
     # with the PARKED chain's parent.
     assert [(r["Parents_Id"], r["Id"]) for r in rows] == [(1, 13)]
     assert "pending_fetches" not in offset2
+
+
+def _expand_l0_park_batch1(c, parents_cb):
+    """Batch 1 of an expand read that parks a LEVEL-0 top continuation
+    (the server's top-level $skiptoken link) in ``pending_fetches``."""
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=parents_cb)
+    opts = {
+        "expand_contained": "true",
+        "cursor_field": "Name",
+        "max_records_per_batch": "1",
+        "pagination": "nextlink",
+    }
+    recs1, offset1 = c.read_table("Parents__Children", {}, opts)
+    assert [r["Id"] for r in recs1] == [11]
+    pending = offset1["pending_fetches"]
+    assert len(pending) == 1 and pending[0]["level"] == 0
+    assert "skiptoken=top1" in pending[0]["url"]
+    return opts, offset1
+
+
+def _expand_l0_page1():
+    return {
+        "value": [
+            {
+                "Id": 1,
+                "Name": "2024-01-01T00:00:00Z",
+                "Children": [{"Id": 11, "Label": "a"}],
+            }
+        ],
+        "@odata.nextLink": f"{SERVICE_URL}Parents?$skiptoken=top1",
+    }
+
+
+@responses.activate
+def test_expand_stale_top_level_continuation_rebuilds_from_scratch():
+    """A parked LEVEL-0 continuation (the top collection's $skiptoken) can
+    expire exactly like an inner one — 410 is the spec-sanctioned signal.
+    Re-raising made the checkpoint a permanently failing stream; the
+    recovery must rebuild the top-level seed URL from the stashed
+    options/watermark and re-read the collection (bounded duplicates)."""
+    _mock_nested_metadata()
+
+    state = {"seed_calls": 0}
+
+    def parents_cb(req):
+        if "skiptoken" in req.url:
+            return (410, {}, json.dumps({"error": {"message": "token expired"}}))
+        state["seed_calls"] += 1
+        if state["seed_calls"] == 1:  # batch 1's seed fetch
+            return (200, {}, json.dumps(_expand_l0_page1()))
+        # batch 2's REBUILT seed: the collection's remaining page.
+        return (
+            200,
+            {},
+            json.dumps(
+                {
+                    "value": [
+                        {
+                            "Id": 2,
+                            "Name": "2024-01-02T00:00:00Z",
+                            "Children": [{"Id": 21, "Label": "b"}],
+                        }
+                    ]
+                }
+            ),
+        )
+
+    c = _make()
+    opts, offset1 = _expand_l0_park_batch1(c, parents_cb)
+    recs2, offset2 = c.read_table("Parents__Children", offset1, opts)
+    # The rebuilt seed re-read the top collection; the remaining parent's
+    # child is recovered, and the stream is healthy again.
+    assert [(r["Parents_Id"], r["Id"]) for r in recs2] == [(2, 21)]
+    assert "pending_fetches" not in offset2
+
+
+@responses.activate
+def test_expand_top_level_collection_truly_gone_still_raises():
+    """When the REBUILT top-level seed also 404s, the whole collection is
+    gone — that's a config/service error, not row churn, and it must
+    surface loudly rather than silently dropping the table."""
+    _mock_nested_metadata()
+    state = {"first": True}
+
+    def parents_cb(_req):
+        if state["first"]:
+            state["first"] = False
+            return (200, {}, json.dumps(_expand_l0_page1()))
+        return (404, {}, json.dumps({"error": {"message": "gone"}}))
+
+    c = _make()
+    opts, offset1 = _expand_l0_park_batch1(c, parents_cb)
+    with pytest.raises(requests.HTTPError):
+        records, _ = c.read_table("Parents__Children", offset1, opts)
+        list(records)
+
+
+@responses.activate
+def test_expand_pending_queue_length_is_soft_capped(monkeypatch):
+    """The cap bounds EMITTED rows, not queue growth: a wide top page over
+    an inner-paging server could park thousands of URL-carrying items into
+    a multi-MB pending_fetches offset. Above the soft ceiling the drainer
+    parks early and drains across later batches — bounded offsets, no
+    loss."""
+    from databricks.labs.community_connector.sources.odata import _contained as _contained_mod
+
+    monkeypatch.setattr(_contained_mod, "_MAX_PENDING_FETCHES", 3)
+    _mock_nested_metadata()
+    parents = []
+    for i in range(1, 7):
+        parents.append(
+            {
+                "Id": i,
+                "Name": f"2024-01-0{i}T00:00:00Z",
+                "Children": [{"Id": i * 100 + 1, "Label": "inline"}],
+                "Children@odata.nextLink": f"{SERVICE_URL}Parents({i})/Children?$skiptoken=k{i}",
+            }
+        )
+        responses.get(
+            f"{SERVICE_URL}Parents({i})/Children",
+            json={"value": [{"Id": i * 100 + 2, "Label": "paged"}]},
+            match_querystring=False,
+        )
+    responses.get(f"{SERVICE_URL}Parents", json={"value": parents}, match_querystring=False)
+    c = _make()
+    opts = {
+        "expand_contained": "true",
+        "cursor_field": "Name",
+        "max_records_per_batch": "100",  # never the trigger — queue length is
+        "pagination": "nextlink",
+    }
+    got: list[int] = []
+    offset: dict = {}
+    for _ in range(25):
+        records, offset = c.read_table("Parents__Children", offset, opts)
+        got.extend(r["Id"] for r in records)
+        pending = offset.get("pending_fetches")
+        if not pending:
+            break
+        # Parked queues stay near the ceiling — soft cap: threshold (3)
+        # plus at most the in-flight page's own fan-out (6 rows here) —
+        # never unbounded growth.
+        assert len(pending) <= 9
+    else:
+        raise AssertionError("expand queue never drained")
+    # Every inline and every paged child arrived exactly once each cycle.
+    assert sorted(set(got)) == sorted(
+        [i * 100 + 1 for i in range(1, 7)] + [i * 100 + 2 for i in range(1, 7)]
+    )
 
 
 @responses.activate

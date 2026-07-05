@@ -68,6 +68,17 @@ MAX_CONTAINED_DEPTH = 10
 # ``@odata.nextLink`` chase at every level.
 MIN_DYNAMIC_TOP = 5
 
+# Soft ceiling on the expand work queue's length at park time. The
+# ``max_records_per_batch`` cap bounds EMITTED rows, not queue growth: every
+# flattened top row can append one URL-carrying work item per truncated
+# inner collection (~0.3–2KB each), so a wide top page over an
+# inner-paging server can otherwise park thousands of items — a multi-MB
+# ``pending_fetches`` offset persisted every microbatch. Once the queue
+# reaches this length the drainer parks early (clean boundary item for the
+# current page, then stop dequeuing); the parked queue drains across later
+# batches. Soft: one in-flight page can still overshoot by its own fan-out.
+_MAX_PENDING_FETCHES = 500
+
 # Default ``page_size`` applied to **cursor-based** reads (cursor_field
 # or delta) when the user didn't set one, so a ``$top`` is still sent.
 # Snapshot reads deliberately omit ``$top`` entirely when ``page_size``
@@ -3078,7 +3089,9 @@ class ContainedNavMixin:
                     page_size=page_size,
                 )
                 countable += _count_new(emitted[prev_len:])
-                if countable >= max_records and row_idx + 1 < len(page_rows):
+                if (
+                    countable >= max_records or len(queue) >= _MAX_PENDING_FETCHES
+                ) and row_idx + 1 < len(page_rows):
                     # Mid-page: re-queue the SAME URL at the front so
                     # the next batch resumes here without scrambling
                     # depth ordering — carrying the just-processed row's
@@ -3107,6 +3120,12 @@ class ContainedNavMixin:
                         "skip": 0,
                     }
                 )
+            if len(queue) >= _MAX_PENDING_FETCHES:
+                # Park before the queue balloons further (offset-size
+                # ceiling — see _MAX_PENDING_FETCHES). Checked AFTER the
+                # item was processed, so every batch makes progress even
+                # when it resumes an already-oversized parked queue.
+                break
         return queue
 
     def _stream_expand_pages(
@@ -3214,27 +3233,31 @@ class ContainedNavMixin:
           ``$skiptoken``) while the parent still exists → dropping the
           item would silently lose the rest of that collection.
 
-        Disambiguate by REBUILDING the item's collection URL from scratch
-        from its parked chain (``_build_expand_continuation_url`` with
-        ``mode="skip"``, ``inline_count=0`` — the full child collection
-        with the read's cursor filter/order and grandchild expands
-        intact) and re-queueing it marked ``rebuilt``: if the parent is
-        gone, the rebuilt URL 404s too and the second recovery pass DROPS
-        the item (duplicate-safe — the subtree no longer exists
-        server-side; already-emitted rows stand); if the parent lives,
-        the fresh fetch re-reads the collection from scratch (bounded
-        duplicates, no loss).
+        Disambiguate by REBUILDING the item's URL from scratch and
+        re-queueing it marked ``rebuilt``: a level >= 1 item's child
+        collection via ``_build_expand_continuation_url`` (``mode="skip"``,
+        ``inline_count=0`` — the read's cursor filter/order and grandchild
+        expands intact); a level-0 item — a parked TOP-LEVEL server
+        continuation, whose ``$skiptoken`` can equally expire while the
+        collection lives — via the same seed-URL construction the read
+        entry uses (``_cursor_expand_clause`` + ``_build_expand_url`` from
+        the stashed options/watermark), re-reading the top collection from
+        ``since``. If the rebuilt URL fails too, the SECOND recovery pass
+        resolves by level: level >= 1 DROPS the item (the parent entity is
+        gone — duplicate-safe; already-emitted rows stand), while level 0
+        RE-RAISES (the whole collection vanishing is a config/service
+        error, not row churn). Non-404/410 statuses always re-raise.
 
-        Returns the replacement item, or ``None`` to drop. Level-0 URLs
-        and non-404/410 statuses re-raise: the top-level collection
-        vanishing is a config/service error, not row churn.
+        Returns the replacement item, or ``None`` to drop.
         """
         status = exc.response.status_code if exc.response is not None else None
         level = item.get("level", 0)
-        if status not in (404, 410) or level < 1:
+        if status not in (404, 410):
             raise exc
         chain = [dict(p) for p in item.get("chain") or []]
         if item.get("rebuilt"):
+            if level < 1:
+                raise exc  # collection itself is gone — config error
             _LOG.warning(
                 "expand resume: parent %s no longer exists (HTTP %s on the "
                 "rebuilt collection URL too) — dropping its parked subtree. "
@@ -3245,15 +3268,39 @@ class ContainedNavMixin:
             )
             return None
         _LOG.warning(
-            "expand resume: parked continuation for parent %s returned "
+            "expand resume: parked continuation (level %s, parent %s) returned "
             "HTTP %s (deleted parent, or a stale server continuation) — "
-            "rebuilding the collection URL from scratch and retrying once.",
+            "rebuilding the URL from scratch and retrying once.",
+            level,
             chain,
             status,
         )
-        fresh_url = self._build_expand_continuation_url(
-            segments, level - 1, chain, cursor_field, "skip", {}, 0
-        )
+        if level >= 1:
+            fresh_url = self._build_expand_continuation_url(
+                segments, level - 1, chain, cursor_field, "skip", {}, 0
+            )
+        else:
+            # Rebuild the top-level seed exactly as the read entry does.
+            table_options = getattr(self, "_expand_cont_opts", None) or {}
+            since = getattr(self, "_expand_cont_since", None)
+            namespace = table_options.get("namespace")
+            if cursor_field:
+                (
+                    cursor_level,
+                    cursor_filter,
+                    cursor_order,
+                    cursor_select,
+                ) = self._cursor_expand_clause(segments, namespace, cursor_field, since)
+            else:
+                cursor_level, cursor_filter, cursor_order, cursor_select = -1, None, None, None
+            fresh_url = self._build_expand_url(
+                segments,
+                table_options,
+                cursor_level=cursor_level if cursor_field else None,
+                cursor_filter=cursor_filter,
+                cursor_order=cursor_order,
+                cursor_select=cursor_select,
+            )
         return {
             "url": fresh_url,
             "level": level,

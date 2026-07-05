@@ -1,9 +1,10 @@
-"""Shared helpers used by both ``odata.py`` and ``_contained.py``.
+"""Shared helpers used by ``odata.py``, ``_contained.py``, and
+``_partition.py``.
 
-These functions live in a third module so the flat-path and contained-path
-read code can share them without ``_contained`` having to import from
-``odata`` (which would close a cycle — ``odata`` already mixes in
-``ContainedNavMixin`` at class definition time).
+These functions live in a separate module so the flat-path, contained-path,
+and partition read code can share them without ``_contained``/``_partition``
+having to import from ``odata`` (which would close a cycle — ``odata``
+already mixes both mixins in at class definition time).
 """
 
 import json
