@@ -157,6 +157,12 @@ class PartitionMixin(SupportsPartitionedStream):
         cursor_field = opts.get("cursor_field")
         if not cursor_field:
             return {"snapshot_id": _wall_clock_ns()}
+        # Honour the user's ``pagination=`` for the fence probe's page walk —
+        # get_partitions/read_partition set this at entry too, but this method
+        # can run first (or alone) on a freshly-recreated driver instance, and
+        # the probe walking under a stale/default mode can misread a
+        # link-omitting server's short page as the whole top set.
+        self._pagination = self._parse_pagination(opts)
         segments = parse_contained_path(table_name) or [table_name]
         namespace = opts.get("namespace")
         max_cursor = self._probe_top_level_max_cursor(segments, namespace, cursor_field, opts)
@@ -257,6 +263,28 @@ class PartitionMixin(SupportsPartitionedStream):
         top_rows = self._discover_top_parent_rows(
             segments, namespace, opts, cursor_field, cursor_lower
         )
+        if cursor_field and any(
+            f.name == cursor_field
+            for f in self._own_fields_for_et(self._entity_type_for(segments[0], namespace))
+        ):
+            # Null-cursor top parents are UNSUPPORTED on the partitioned path:
+            # this (unfenced) discovery still sees them, but once a fence is
+            # committed every later batch's ``cursor gt`` discovery filter
+            # excludes them SERVER-SIDE — their subtrees' future changes would
+            # be dropped silently, with no error and no log (the serial
+            # ancestor-cursor path raises on the same configuration). Refuse
+            # here, on the only batch that can still see them.
+            nulls = [r for r in top_rows if r.get(cursor_field) is None]
+            if nulls:
+                raise ValueError(
+                    f"Partitioned read of {table_name!r}: {len(nulls)} top-level "
+                    f"parent(s) have a null {cursor_field!r}. Null-cursor parents "
+                    f"are invisible to the partitioned fence filter after the "
+                    f"first batch, so their contained rows would be silently "
+                    f"dropped. Exclude them server-side (e.g. "
+                    f'filter_at_{segments[0]}="{cursor_field} ne null"), fix the '
+                    f"data, or read serially (num_partitions unset)."
+                )
         if not top_rows:
             return []
         return _bin_pack(top_rows, num_partitions, cursor_lower)
@@ -412,7 +440,7 @@ class PartitionMixin(SupportsPartitionedStream):
         if table_options.get("page_size"):
             opts["page_size"] = table_options["page_size"]
         url = self._build_url(top_set, opts, extra_filter=extra_filter, order_by=order_by)
-        return list(self._fetch_pages(url))
+        return list(self._fetch_pages(url, self._edm_types_for_et(ancestor_et)))
 
     def _iter_partition_rows(
         self,
@@ -434,6 +462,9 @@ class PartitionMixin(SupportsPartitionedStream):
         segment_filters = resolve_segment_filters(table_options, segments)
         leaf_seg_filter = segment_filters.get(len(segments) - 1)
         leaf_order_by = self._leaf_pk_order_by(segments, namespace)
+        # Leaf-collection types so keyset-seek boundaries render typed
+        # (guid bare / ISO-looking string quoted) — see odata_literal_typed.
+        leaf_types = self._edm_types_for_level(segments, len(segments) - 1, namespace)
         if not cursor_field:
             for chain in self._iter_parent_key_chains(
                 segments, namespace, table_options, top_parent_rows=top_parent_rows
@@ -445,7 +476,7 @@ class PartitionMixin(SupportsPartitionedStream):
                     extra_filter=leaf_seg_filter,
                     order_by=leaf_order_by,
                 )
-                for row in self._fetch_pages(url):
+                for row in self._fetch_pages(url, leaf_types):
                     self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                     yield row
             return
@@ -472,7 +503,7 @@ class PartitionMixin(SupportsPartitionedStream):
             url = self._build_contained_url(
                 segments, chain, table_options, extra_filter=leaf_seg_filter, order_by=leaf_order_by
             )
-            for row in self._fetch_pages(url):
+            for row in self._fetch_pages(url, leaf_types):
                 self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                 if cursor_level == len(segments) - 1:
                     # Leaf-cursor mode: filter per row by ``cursor gt

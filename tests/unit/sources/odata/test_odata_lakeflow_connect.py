@@ -13354,3 +13354,247 @@ def test_token_endpoint_403_raises_actionable_error():
     assert "403" in msg
     assert "forbidden_by_policy" in msg
     assert "s3cr3t-value" not in msg
+
+
+# ---------------------------------------------------------------------------
+# Round-28 fixes: typed seeks on every walk, $batch retry status, partition
+# fence pagination, null-cursor partition guard, failure memo
+# ---------------------------------------------------------------------------
+
+_GUID2 = "0a1b2c3d-4e5f-6789-abcd-ef0123456789"
+
+GUID_CURSOR_METADATA_XML = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="G" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Account">
+        <Key><PropertyRef Name="AccountId"/></Key>
+        <Property Name="AccountId" Type="Edm.Guid" Nullable="false"/>
+        <Property Name="Name" Type="Edm.String"/>
+        <NavigationProperty Name="Contacts" Type="Collection(G.Contact)" ContainsTarget="true"/>
+      </EntityType>
+      <EntityType Name="Contact">
+        <Key><PropertyRef Name="ContactId"/></Key>
+        <Property Name="ContactId" Type="Edm.Guid" Nullable="false"/>
+        <Property Name="ModifiedAt" Type="Edm.DateTimeOffset"/>
+      </EntityType>
+      <EntityContainer Name="C">
+        <EntitySet Name="Accounts" EntityType="G.Account"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+
+@responses.activate
+def test_leaf_cursor_walk_keyset_seek_guid_boundary_bare():
+    """Round-28: the leaf-cursor N+1 cap walk's compound keyset seek (ALSO its
+    cap-resume checkpoint) must render a guid PK boundary BARE. Round 27 only
+    typed the flat walks; with a pre-recorded ``or_filter_ok=True`` (a typed
+    walk probed first) the untyped seek went to the wire unprobed and 400d on
+    strict servers."""
+    from urllib.parse import unquote
+
+    responses.get(f"{SERVICE_URL}$metadata", body=GUID_CURSOR_METADATA_XML, status=200)
+    responses.get(
+        f"{SERVICE_URL}Accounts", json={"value": [{"AccountId": _GUID}]}, match_querystring=False
+    )
+
+    def _contacts_cb(request):
+        url = unquote(request.url)
+        if f"ContactId gt {_GUID2}" in url:  # correctly-typed bare seek
+            return (200, {}, json.dumps({"value": []}))
+        if "ContactId gt" in url:  # quoted seek — server would 400; loop the page
+            return (200, {}, json.dumps({"value": [{"ContactId": _GUID2, "ModifiedAt": "2020-06-01T00:00:00Z"}]}))
+        return (200, {}, json.dumps({"value": [{"ContactId": _GUID2, "ModifiedAt": "2020-06-01T00:00:00Z"}]}))
+
+    responses.add_callback(
+        responses.GET, f"{SERVICE_URL}Accounts({_GUID})/Contacts", callback=_contacts_cb
+    )
+    c = _make()
+    c.__dict__["_or_filter_ok"] = True  # typed-first poisoning scenario: no probe shield
+    recs, offset = c.read_table(
+        "Accounts__Contacts",
+        {"cursor": "2020-01-01T00:00:00Z"},
+        {
+            "cursor_field": "ModifiedAt",
+            "expand_contained": "false",
+            "cursor_probe": "false",
+            "contained_fetch": "single",
+            "pagination": "keyset",
+            "cursor_lookback_seconds": "off",
+        },
+    )
+    assert [r["ContactId"] for r in recs] == [_GUID2]
+    assert offset["cursor"] == "2020-06-01T00:00:00Z"
+    seek_urls = [
+        unquote(call.request.url)
+        for call in responses.calls
+        if "ContactId gt" in unquote(call.request.url)
+    ]
+    assert seek_urls, "leaf walk never issued a keyset seek"
+    assert all(f"ContactId gt {_GUID2}" in u for u in seek_urls)
+    assert not any(f"gt '{_GUID2}'" in u for u in seek_urls)
+
+
+@responses.activate
+def test_partition_walks_keyset_seek_guid_boundaries_bare():
+    """Round-28: the partition path's discovery AND per-partition leaf fetches
+    build keyset seeks too — both must render guid PK boundaries bare."""
+    from urllib.parse import unquote
+
+    responses.get(f"{SERVICE_URL}$metadata", body=GUID_CURSOR_METADATA_XML, status=200)
+
+    def _accounts_cb(request):
+        url = unquote(request.url)
+        if f"AccountId gt {_GUID}" in url:
+            return (200, {}, json.dumps({"value": []}))
+        if "AccountId gt" in url:  # quoted — keep returning the page
+            return (200, {}, json.dumps({"value": [{"AccountId": _GUID}]}))
+        return (200, {}, json.dumps({"value": [{"AccountId": _GUID}]}))
+
+    def _contacts_cb(request):
+        url = unquote(request.url)
+        if f"ContactId gt {_GUID2}" in url:
+            return (200, {}, json.dumps({"value": []}))
+        return (
+            200,
+            {},
+            json.dumps({"value": [{"ContactId": _GUID2, "ModifiedAt": "2020-06-01T00:00:00Z"}]}),
+        )
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Accounts", callback=_accounts_cb)
+    responses.add_callback(
+        responses.GET, f"{SERVICE_URL}Accounts({_GUID})/Contacts", callback=_contacts_cb
+    )
+    c = _make()
+    opts = {
+        "expand_contained": "false",
+        "pagination": "keyset",
+        "num_partitions": "2",
+    }
+    parts = c.get_partitions("Accounts__Contacts", opts)
+    rows = []
+    for part in parts:
+        rows.extend(c.read_partition("Accounts__Contacts", part, opts))
+    assert [r["ContactId"] for r in rows] == [_GUID2]
+    urls = [unquote(call.request.url) for call in responses.calls]
+    assert any(f"AccountId gt {_GUID}" in u for u in urls), "discovery never seeked"
+    assert any(f"ContactId gt {_GUID2}" in u for u in urls), "leaf fetch never seeked"
+    assert not any(f"gt '{_GUID}'" in u or f"gt '{_GUID2}'" in u for u in urls)
+
+
+def test_expand_level_types_stash_bounds():
+    """The per-level type stash used by the expand queue drains: in-range
+    levels return their map, out-of-range/absent stash returns None (sniff
+    fallback), never raises."""
+    c = _make()
+    assert c._expand_level_types(0) is None  # no expand read yet
+    c._expand_types_per_level = [{"a": "Edm.Guid"}, {}]
+    assert c._expand_level_types(0) == {"a": "Edm.Guid"}
+    assert c._expand_level_types(1) == {}
+    assert c._expand_level_types(2) is None
+    assert c._expand_level_types(-1) is None
+
+
+@responses.activate
+def test_post_batch_corrupt_200_then_error_surfaces_status():
+    """Round-28: when the corrupt-200 re-POST comes back a real 4xx, the
+    status handling must repeat — a plain 400 carries its status/body (not a
+    misleading "missing sub-response id"), and a "too many parts" 400 still
+    raises the adaptive-shrink trigger."""
+    from databricks.labs.community_connector.sources.odata._contained import _BatchTooManyParts
+
+    state = {"n": 0}
+
+    def _cb_plain_400(request):
+        state["n"] += 1
+        if state["n"] == 1:
+            return (200, {"Content-Type": "application/json"}, "{trunc")
+        return (400, {}, json.dumps({"error": {"message": "bad request"}}))
+
+    responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=_cb_plain_400)
+    c = _make()
+    with pytest.raises(RuntimeError, match="failed: 400"):
+        c._post_batch([f"{SERVICE_URL}Roots"])
+
+    responses.reset()
+    state["n"] = 0
+
+    def _cb_too_many(request):
+        state["n"] += 1
+        if state["n"] == 1:
+            return (200, {"Content-Type": "application/json"}, "{trunc")
+        return (400, {}, json.dumps({"error": {"message": "contains too many parts"}}))
+
+    responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=_cb_too_many)
+    with pytest.raises(_BatchTooManyParts):
+        c._post_batch([f"{SERVICE_URL}Roots"])
+
+
+@responses.activate
+def test_latest_offset_honours_pagination_option():
+    """Round-28: ``latest_offset`` parses/applies ``pagination=`` like
+    ``get_partitions``/``read_partition`` do — the fence probe must not walk
+    under a stale or default mode (and an invalid value must raise the same
+    curated error)."""
+    responses.get(f"{SERVICE_URL}$metadata", body=GUID_CURSOR_METADATA_XML, status=200)
+    responses.get(
+        f"{SERVICE_URL}Accounts",
+        json={"value": [{"Name": "2020-06-01T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    with pytest.raises(ValueError, match="pagination"):
+        c.latest_offset("Accounts__Contacts", {"cursor_field": "Name", "pagination": "bogus"})
+    off = c.latest_offset(
+        "Accounts__Contacts", {"cursor_field": "Name", "pagination": "nextlink"}
+    )
+    assert off == {"cursor": "2020-06-01T00:00:00Z"}
+    assert c._pagination == "nextlink"
+
+
+@responses.activate
+def test_partition_discovery_rejects_null_cursor_parents():
+    """Round-28: null-cursor top parents are visible only to the UNFENCED
+    first discovery — every fenced batch's ``cursor gt`` filter hides them
+    server-side and their subtrees' changes drop silently. Discovery must
+    refuse loudly instead (the serial ancestor path raises on the same
+    configuration)."""
+    responses.get(f"{SERVICE_URL}$metadata", body=GUID_CURSOR_METADATA_XML, status=200)
+    responses.get(
+        f"{SERVICE_URL}Accounts",
+        json={"value": [{"AccountId": _GUID, "Name": "2020-06-01T00:00:00Z"}, {"AccountId": _GUID2, "Name": None}]},
+        match_querystring=False,
+    )
+    c = _make()
+    with pytest.raises(ValueError, match="null"):
+        c.get_partitions(
+            "Accounts__Contacts",
+            {"cursor_field": "Name", "expand_contained": "false", "num_partitions": "2"},
+            {},
+            {"cursor": "2020-06-01T00:00:00Z"},
+        )
+
+
+@responses.activate
+def test_edm_types_for_level_memoizes_failure():
+    """Round-28: an unresolvable path must not re-run entity-type resolution
+    (and re-format its "Available: ..." error) on every URL build — the
+    failure is memoized per (path, namespace)."""
+    _mock_metadata()
+    c = _make()
+    calls = {"n": 0}
+    orig = c._entity_type_for
+
+    def _counting(name, namespace=None):
+        calls["n"] += 1
+        return orig(name, namespace)
+
+    c._entity_type_for = _counting
+    assert c._edm_types_for_level(["NoSuchSet"], 0, None) == {}
+    assert calls["n"] == 1
+    assert c._edm_types_for_level(["NoSuchSet"], 0, None) == {}
+    assert calls["n"] == 1  # second call short-circuits on the failure memo
+    del c._entity_type_for

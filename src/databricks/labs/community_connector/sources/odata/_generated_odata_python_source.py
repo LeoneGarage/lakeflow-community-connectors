@@ -1913,11 +1913,20 @@ def register_lakeflow_source(spark):
             ``segments[level]``. Resolution failure (e.g. an entity-set name
             ambiguous across namespaces when the caller has no ``namespace`` in
             scope) degrades to ``{}`` — sniff-based literal rendering — rather
-            than failing a URL build that worked untyped for years."""
+            than failing a URL build that worked untyped for years. The failure
+            outcome is memoized per (path, namespace): this runs once per URL
+            build (per parent chain on an N+1 walk), and re-raising +
+            re-formatting ``_entity_type_for``'s sorted "Available: …" error
+            100k times per cycle is pure waste (success is already memoized
+            inside ``_entity_type_for``/``_edm_types_for_et``)."""
+            path = CONTAINED_PATH_SEP.join(segments[: level + 1])
+            failed = self.__dict__.setdefault("_edm_types_unresolvable", set())
+            if (path, namespace) in failed:
+                return {}
             try:
-                et = self._entity_type_for(CONTAINED_PATH_SEP.join(segments[: level + 1]), namespace)
-                return self._edm_types_for_et(et)
+                return self._edm_types_for_et(self._entity_type_for(path, namespace))
             except Exception:  # noqa: BLE001 — metadata gaps must not break URL builds
+                failed.add((path, namespace))
                 return {}
 
         def _build_contained_path(
@@ -2364,7 +2373,7 @@ def register_lakeflow_source(spark):
                             order_by=order_by,
                         )
                     )
-                    row_source = self._fetch_pages(url)
+                    row_source = self._fetch_pages(url, self._edm_types_for_et(ancestor_et))
                 for row in row_source:
                     next_cur = row.get(cursor_field) if level == cursor_level else cur_val
                     chain.append({pk: row.get(pk) for pk in ancestor_pks})
@@ -2429,7 +2438,7 @@ def register_lakeflow_source(spark):
                         if level == 0
                         else self._build_contained_url(sub_segments, chain, opts, order_by=order_by)
                     )
-                    row_source = self._fetch_pages(url)
+                    row_source = self._fetch_pages(url, self._edm_types_for_et(ancestor_et))
                 for row in row_source:
                     chain.append({pk: row.get(pk) for pk in ancestor_pks})
                     yield from _walk(level + 1, chain)
@@ -2533,12 +2542,12 @@ def register_lakeflow_source(spark):
             standard full walk (correct, no speed-up until a watermark exists)."""
             parent_segments = segments[:-1]
             leaf_nav = segments[-1]
-            lp_pks = self._own_primary_keys_for_et(
-                self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
-            )
+            lp_et = self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
+            lp_pks = self._own_primary_keys_for_et(lp_et)
+            lp_types = self._edm_types_for_et(lp_et)
             for pchain in self._iter_parent_key_chains(parent_segments, namespace, table_options):
                 url = self._build_probe_url(segments, pchain, table_options, cursor_field)
-                for row in self._fetch_pages(url):
+                for row in self._fetch_pages(url, lp_types):
                     # The probe returns the newest leaf (``$orderby cursor desc;
                     # $top=1``). Max over the returned rows so we're still correct
                     # if a server ignores ``$top`` and hands back several. Dirty
@@ -2739,11 +2748,11 @@ def register_lakeflow_source(spark):
             ordering can't cause a miss."""
             parent_segments = segments[:-1]
             leaf_nav = segments[-1]
-            lp_pks = self._own_primary_keys_for_et(
-                self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
-            )
+            lp_et = self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
+            lp_pks = self._own_primary_keys_for_et(lp_et)
             if not lp_pks:
                 return (None, False)
+            lp_types = self._edm_types_for_et(lp_et)
             page_size = (table_options or {}).get("page_size") or DEFAULT_PAGE_SIZE
             lp_order = _ancestor_pk_order_by(lp_pks)
             scanned = 0
@@ -2756,7 +2765,7 @@ def register_lakeflow_source(spark):
                     next_url += f"&$orderby={lp_order}"
                 while next_url:
                     try:
-                        lp_rows, next_url = self._fetch_one_expand_page(next_url)
+                        lp_rows, next_url = self._fetch_one_expand_page(next_url, lp_types)
                     except Exception as exc:  # enumeration fetch failed — no verdict
                         raise _CursorProbePreflightUnavailable(str(exc)) from exc
                     for lp_row in lp_rows:
@@ -2949,8 +2958,10 @@ def register_lakeflow_source(spark):
                 ]
             }
             batch_url = join_url(self.service_url, "$batch")
-            resp = self._http_get(session, batch_url, method="POST", json=payload)
-            if resp.status_code >= 400:
+
+            def _raise_for_batch_status(resp):
+                if resp.status_code < 400:
+                    return
                 body = resp.text or ""
                 if _is_batch_too_large(body):
                     raise _BatchTooManyParts(
@@ -2960,6 +2971,9 @@ def register_lakeflow_source(spark):
                 raise RuntimeError(
                     f"OData $batch POST to {batch_url!r} failed: " f"{resp.status_code} {body[:300]}"
                 )
+
+            resp = self._http_get(session, batch_url, method="POST", json=payload)
+            _raise_for_batch_status(resp)
             try:
                 data = resp.json()
             except ValueError:
@@ -2968,6 +2982,13 @@ def register_lakeflow_source(spark):
                 # and the $batch envelope is the largest response the connector
                 # ever receives. One re-POST is safe (GET-only sub-requests).
                 resp = self._http_get(session, batch_url, method="POST", json=payload)
+                # The retry can come back non-2xx (the corrupt 200 was a blip, the
+                # real answer is an error): route it through the SAME status
+                # handling — a "too many parts" 400 must still trigger the
+                # adaptive shrink, and a plain 4xx must carry its status/body
+                # instead of decoding as a responses-less envelope ("missing
+                # sub-response id 0").
+                _raise_for_batch_status(resp)
                 try:
                     data = resp.json()
                 except ValueError:
@@ -3025,7 +3046,7 @@ def register_lakeflow_source(spark):
             )
             return True
 
-        def _get_as_batch_response(self, url: str) -> dict:
+        def _get_as_batch_response(self, url: str, edm_types: dict[str, str] | None = None) -> dict:
             """Plain GET fall-back for one leaf-parent, shaped like a ``$batch``
             sub-response (``{"status", "body": {"value": [...]}}``) so the drain loops
             parse it identically. All pages are drained here (no ``@odata.nextLink``
@@ -3054,10 +3075,12 @@ def register_lakeflow_source(spark):
                 and not _pg_is_continuation(url)
             ):
                 url = _pg_set_query(url, "$top", DEFAULT_PAGE_SIZE)
-            rows = list(self._fetch_pages(url))
+            rows = list(self._fetch_pages(url, edm_types))
             return {"status": 200, "body": {"value": rows}}
 
-        def _checked_batch_subresponse(self, resp: dict, req_url: str) -> dict:
+        def _checked_batch_subresponse(
+            self, resp: dict, req_url: str, edm_types: dict[str, str] | None = None
+        ) -> dict:
             """Validate one ``$batch`` sub-response before the drain loops parse it.
 
             :meth:`_post_batch` deliberately carries per-sub-request HTTP errors
@@ -3088,9 +3111,11 @@ def register_lakeflow_source(spark):
                 req_url,
                 status,
             )
-            return self._get_as_batch_response(req_url)
+            return self._get_as_batch_response(req_url, edm_types)
 
-        def _post_batch_adaptive(self, urls: list[str]) -> list[dict]:
+        def _post_batch_adaptive(
+            self, urls: list[str], edm_types: dict[str, str] | None = None
+        ) -> list[dict]:
             """:meth:`_post_batch` with adaptive sizing: post ``urls`` in chunks no
             larger than the working cap, and on a "too many parts" rejection shrink
             the cap by 25% and retry the offending chunk re-split at the new cap — up
@@ -3102,13 +3127,13 @@ def register_lakeflow_source(spark):
             plus every later round — fall back to a plain per-leaf-parent GET.
             Returns responses aligned with ``urls`` (``$batch`` sub-response shape)."""
             if self.__dict__.get("_batch_size_cap") == 1:  # give-up sentinel → plain GET
-                return [self._get_as_batch_response(u) for u in urls]
+                return [self._get_as_batch_response(u, edm_types) for u in urls]
             out: list[dict] = []
             pending = list(urls)
             while pending:
                 cap = self.__dict__.get("_batch_size_cap")
                 if cap == 1:  # gave up mid-walk → plain GET the rest
-                    out.extend(self._get_as_batch_response(u) for u in pending)
+                    out.extend(self._get_as_batch_response(u, edm_types) for u in pending)
                     break
                 # Always slice the front at the CURRENT cap, so a shrink applies to
                 # every remaining chunk — no stale oversized chunk wastes a retry.
@@ -3122,7 +3147,7 @@ def register_lakeflow_source(spark):
                         # $batch and plain-GET everything still pending.
                         self.__dict__["_batch_size_cap"] = 1
                         self._store_capability("batch_size_ok", 1)
-                        out.extend(self._get_as_batch_response(u) for u in pending)
+                        out.extend(self._get_as_batch_response(u, edm_types) for u in pending)
                         break
                     # cap shrank; retry the (now smaller) front of pending.
             return out
@@ -3619,12 +3644,15 @@ def register_lakeflow_source(spark):
             ``$top`` stripped so the server drives paging, and any sub-response
             ``@odata.nextLink`` is re-batched until drained. Lazy at group
             granularity (≤ one chunk of collections buffered at a time)."""
+            leaf_types = self._edm_types_for_level(
+                segments, len(segments) - 1, (table_options or {}).get("namespace")
+            )
             if batch_size <= 1:
                 for chain, meta in chain_meta_iter:
                     url = self._build_contained_url(
                         segments, chain, table_options, extra_filter=extra_filter, order_by=order_by
                     )
-                    for row in self._fetch_pages(url):
+                    for row in self._fetch_pages(url, leaf_types):
                         yield meta, row
                 return
             # ``$batch``: drop ``page_size`` so sub-requests carry no ``$top`` and
@@ -3636,12 +3664,12 @@ def register_lakeflow_source(spark):
                 group.append((chain, meta))
                 if len(group) >= batch_size:
                     yield from self._drain_contained_group(
-                        segments, group, leaf_opts, extra_filter, order_by, batch_size
+                        segments, group, leaf_opts, extra_filter, order_by, batch_size, leaf_types
                     )
                     group = []
             if group:
                 yield from self._drain_contained_group(
-                    segments, group, leaf_opts, extra_filter, order_by, batch_size
+                    segments, group, leaf_opts, extra_filter, order_by, batch_size, leaf_types
                 )
 
         def _drain_contained_group(
@@ -3652,6 +3680,7 @@ def register_lakeflow_source(spark):
             extra_filter: str | None,
             order_by: str | None,
             batch_size: int,
+            edm_types: dict[str, str] | None = None,
         ) -> Iterator[tuple[Any, dict]]:
             """Hydrate one group of leaf-parent chains via ``$batch`` (+ nextLink
             continuations), yielding ``(meta, raw_row)`` with ``@odata.*`` stripped.
@@ -3673,9 +3702,9 @@ def register_lakeflow_source(spark):
                 eff = self._effective_batch_size(batch_size)
                 round_ = pending[:eff]
                 pending = pending[eff:]
-                responses = self._post_batch_adaptive([u for _, u in round_])
+                responses = self._post_batch_adaptive([u for _, u in round_], edm_types)
                 for (key, req_url), resp in zip(round_, responses):
-                    resp = self._checked_batch_subresponse(resp, req_url)
+                    resp = self._checked_batch_subresponse(resp, req_url, edm_types)
                     body = resp.get("body") if isinstance(resp, dict) else None
                     rows = body.get("value", []) if isinstance(body, dict) else []
                     for row in rows:
@@ -3796,6 +3825,13 @@ def register_lakeflow_source(spark):
             # generator without threading through every flatten call site.
             self._expand_cont_opts = table_options
             self._expand_cont_since = (start_offset or {}).get("cursor")
+            # Per-level property→Edm-type maps for the same recursion (and the
+            # queue drains), so keyset-seek boundaries built while paging a
+            # collection at any depth render TYPED (guid bare / ISO-looking
+            # string quoted) — same stash-on-self pattern as above.
+            self._expand_types_per_level = [
+                self._edm_types_for_level(segments, i, namespace) for i in range(len(segments))
+            ]
             if cursor_field and cursor_level == -1:
                 raise ValueError(
                     f"cursor_field={cursor_field!r} is not a property of any "
@@ -4006,7 +4042,9 @@ def register_lakeflow_source(spark):
                 # collection waits until the next dequeue so we can check
                 # the cap between them.
                 try:
-                    page_rows, page_next_url = self._fetch_one_expand_page(url)
+                    page_rows, page_next_url = self._fetch_one_expand_page(
+                        url, self._expand_level_types(level)
+                    )
                 except requests.HTTPError as exc:
                     replacement = self._recover_expand_item(exc, item, segments, cur_field)
                     if replacement is not None:
@@ -4126,7 +4164,9 @@ def register_lakeflow_source(spark):
                 # drainer: inner continuations queued earlier in THIS walk can
                 # 404 when the parent vanishes mid-walk.
                 try:
-                    page_rows, page_next_url = self._fetch_one_expand_page(url)
+                    page_rows, page_next_url = self._fetch_one_expand_page(
+                        url, self._expand_level_types(level)
+                    )
                 except requests.HTTPError as exc:
                     replacement = self._recover_expand_item(exc, item, segments, cur_field)
                     if replacement is not None:
@@ -4271,10 +4311,24 @@ def register_lakeflow_source(spark):
                 "rebuilt": True,
             }
 
-        def _fetch_one_expand_page(self, url: str) -> tuple[list[dict], str | None]:
+        def _expand_level_types(self, level: int) -> dict[str, str] | None:
+            """The stashed property→Edm-type map for the collection at ``level``
+            of the current expand read (see the stash in
+            ``_read_contained_expand``), or ``None`` outside one / past the
+            stash's depth — the seek builder then falls back to value sniffing."""
+            stash = getattr(self, "_expand_types_per_level", None)
+            if stash and 0 <= level < len(stash):
+                return stash[level]
+            return None
+
+        def _fetch_one_expand_page(
+            self, url: str, edm_types: dict[str, str] | None = None
+        ) -> tuple[list[dict], str | None]:
             """One HTTP GET; returns ``(page_rows, next_url)``. Thin wrapper
             over :meth:`_fetch_pages_with_links` that consumes a single
             iteration so the caller can check the cap between fetches.
+            ``edm_types`` (the fetched collection's declared property types)
+            types any keyset-seek boundary built for the returned ``next_url``.
 
             No-progress guard for the work-queue drainers: those slice pagination
             one page per call, so the in-generator guard in
@@ -4300,7 +4354,7 @@ def register_lakeflow_source(spark):
             — and a repeated row is deduped at the destination by ``apply_changes``'
             MERGE on the primary key (a harmless duplicate, vs. the data loss a
             short-page stop causes)."""
-            for page_rows, page_next_url in self._fetch_pages_with_links(url):
+            for page_rows, page_next_url in self._fetch_pages_with_links(url, edm_types):
                 return page_rows, (None if page_next_url == url else page_next_url)
             return [], None
 
@@ -4563,7 +4617,9 @@ def register_lakeflow_source(spark):
                 # continuation via ``_client_paginate_pages`` (the synthesized
                 # URL carries the seek/skip), draining the whole collection.
                 inner_current = resolved
-                for page_rows, page_next in self._fetch_pages_with_links(resolved):
+                for page_rows, page_next in self._fetch_pages_with_links(
+                    resolved, self._expand_level_types(level + 1)
+                ):
                     for child in page_rows:
                         self._flatten_expand_response(
                             level + 1,
@@ -4848,6 +4904,12 @@ def register_lakeflow_source(spark):
             # chain was fully drained.
             resume_inclusive = chain_next_link is not None or truncated_chain_cursor is not None
             seeking = parked_key is not None
+            # Leaf-collection property types: the compound keyset seek built while
+            # paging a leaf collection (ALSO the cap-hit resume checkpoint) must
+            # render its boundaries typed (guid bare / ISO-looking string quoted).
+            leaf_types = self._edm_types_for_level(
+                segments, len(segments) - 1, (table_options or {}).get("namespace")
+            )
             for chain in chains_iter:
                 # Skip the chains we already emitted in prior batches — by the
                 # enumeration's own ordering keys when the offset parked them
@@ -4912,7 +4974,7 @@ def register_lakeflow_source(spark):
                 # cohort that spans the cap (better than the cursor-only trim below,
                 # which is kept for nextlink mode / whole-leaf-in-one-response
                 # servers where ``page_next_url`` is None).
-                for page_rows, page_next_url in self._fetch_pages_with_links(initial_url):
+                for page_rows, page_next_url in self._fetch_pages_with_links(initial_url, leaf_types):
                     for row in page_rows:
                         if skip_null and row.get(cursor_field) is None:
                             continue
@@ -5044,6 +5106,9 @@ def register_lakeflow_source(spark):
             # overflow (the keyset/$skip drain the plain ``auto`` walk would use to
             # continue a short link-less page can't run inside a batch sub-request).
             leaf_opts = {k: v for k, v in (table_options or {}).items() if k != "page_size"}
+            leaf_types = self._edm_types_for_level(
+                segments, len(segments) - 1, (table_options or {}).get("namespace")
+            )
 
             def _drain_group(buffered: list[list[dict[str, Any]]]) -> None:
                 nonlocal countable
@@ -5070,9 +5135,9 @@ def register_lakeflow_source(spark):
                     eff = self._effective_batch_size(batch_size)
                     round_ = pending[:eff]
                     pending = pending[eff:]
-                    responses = self._post_batch_adaptive([u for _, u in round_])
+                    responses = self._post_batch_adaptive([u for _, u in round_], leaf_types)
                     for (key, req_url), resp in zip(round_, responses):
-                        resp = self._checked_batch_subresponse(resp, req_url)
+                        resp = self._checked_batch_subresponse(resp, req_url, leaf_types)
                         body = resp.get("body") if isinstance(resp, dict) else None
                         rows = body.get("value", []) if isinstance(body, dict) else []
                         chain = chain_by_key[key]
@@ -5797,6 +5862,10 @@ def register_lakeflow_source(spark):
                 else None
             )
             seeking = parked_key is not None
+            # Same typed-seek requirement as the leaf-cursor walk below.
+            leaf_types = self._edm_types_for_level(
+                segments, len(segments) - 1, (table_options or {}).get("namespace")
+            )
             for chain, ancestor_cursor in chains_iter:
                 # Skip already-emitted chains — key-based when parked
                 # (churn-stable), positional for legacy offsets. Ancestor-page
@@ -5837,7 +5906,7 @@ def register_lakeflow_source(spark):
                 # default auto drains a link-omitting, sub-$top-capped leaf via the
                 # keyset seek, and the synthesized seek doubles as the cap-hit resume
                 # checkpoint.
-                for page_rows, page_next_url in self._fetch_pages_with_links(initial_url):
+                for page_rows, page_next_url in self._fetch_pages_with_links(initial_url, leaf_types):
                     for row in page_rows:
                         self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                         row[cursor_field] = ancestor_cursor
@@ -6006,6 +6075,12 @@ def register_lakeflow_source(spark):
             cursor_field = opts.get("cursor_field")
             if not cursor_field:
                 return {"snapshot_id": _wall_clock_ns()}
+            # Honour the user's ``pagination=`` for the fence probe's page walk —
+            # get_partitions/read_partition set this at entry too, but this method
+            # can run first (or alone) on a freshly-recreated driver instance, and
+            # the probe walking under a stale/default mode can misread a
+            # link-omitting server's short page as the whole top set.
+            self._pagination = self._parse_pagination(opts)
             segments = parse_contained_path(table_name) or [table_name]
             namespace = opts.get("namespace")
             max_cursor = self._probe_top_level_max_cursor(segments, namespace, cursor_field, opts)
@@ -6106,6 +6181,28 @@ def register_lakeflow_source(spark):
             top_rows = self._discover_top_parent_rows(
                 segments, namespace, opts, cursor_field, cursor_lower
             )
+            if cursor_field and any(
+                f.name == cursor_field
+                for f in self._own_fields_for_et(self._entity_type_for(segments[0], namespace))
+            ):
+                # Null-cursor top parents are UNSUPPORTED on the partitioned path:
+                # this (unfenced) discovery still sees them, but once a fence is
+                # committed every later batch's ``cursor gt`` discovery filter
+                # excludes them SERVER-SIDE — their subtrees' future changes would
+                # be dropped silently, with no error and no log (the serial
+                # ancestor-cursor path raises on the same configuration). Refuse
+                # here, on the only batch that can still see them.
+                nulls = [r for r in top_rows if r.get(cursor_field) is None]
+                if nulls:
+                    raise ValueError(
+                        f"Partitioned read of {table_name!r}: {len(nulls)} top-level "
+                        f"parent(s) have a null {cursor_field!r}. Null-cursor parents "
+                        f"are invisible to the partitioned fence filter after the "
+                        f"first batch, so their contained rows would be silently "
+                        f"dropped. Exclude them server-side (e.g. "
+                        f'filter_at_{segments[0]}="{cursor_field} ne null"), fix the '
+                        f"data, or read serially (num_partitions unset)."
+                    )
             if not top_rows:
                 return []
             return _bin_pack(top_rows, num_partitions, cursor_lower)
@@ -6261,7 +6358,7 @@ def register_lakeflow_source(spark):
             if table_options.get("page_size"):
                 opts["page_size"] = table_options["page_size"]
             url = self._build_url(top_set, opts, extra_filter=extra_filter, order_by=order_by)
-            return list(self._fetch_pages(url))
+            return list(self._fetch_pages(url, self._edm_types_for_et(ancestor_et)))
 
         def _iter_partition_rows(
             self,
@@ -6283,6 +6380,9 @@ def register_lakeflow_source(spark):
             segment_filters = resolve_segment_filters(table_options, segments)
             leaf_seg_filter = segment_filters.get(len(segments) - 1)
             leaf_order_by = self._leaf_pk_order_by(segments, namespace)
+            # Leaf-collection types so keyset-seek boundaries render typed
+            # (guid bare / ISO-looking string quoted) — see odata_literal_typed.
+            leaf_types = self._edm_types_for_level(segments, len(segments) - 1, namespace)
             if not cursor_field:
                 for chain in self._iter_parent_key_chains(
                     segments, namespace, table_options, top_parent_rows=top_parent_rows
@@ -6294,7 +6394,7 @@ def register_lakeflow_source(spark):
                         extra_filter=leaf_seg_filter,
                         order_by=leaf_order_by,
                     )
-                    for row in self._fetch_pages(url):
+                    for row in self._fetch_pages(url, leaf_types):
                         self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                         yield row
                 return
@@ -6321,7 +6421,7 @@ def register_lakeflow_source(spark):
                 url = self._build_contained_url(
                     segments, chain, table_options, extra_filter=leaf_seg_filter, order_by=leaf_order_by
                 )
-                for row in self._fetch_pages(url):
+                for row in self._fetch_pages(url, leaf_types):
                     self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                     if cursor_level == len(segments) - 1:
                         # Leaf-cursor mode: filter per row by ``cursor gt
