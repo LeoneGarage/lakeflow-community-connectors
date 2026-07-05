@@ -49,6 +49,7 @@ import json
 import logging
 import os
 import pickle
+import random
 import re
 import tempfile
 import threading
@@ -350,8 +351,14 @@ _SEQUENCE_COUNTER = _SequenceCounter()
 # ``LakeflowSource`` (and ``ODataLakeflowConnect``) for every
 # ``spark.readStream.format("lakeflow_connect").load()`` call; within
 # a single Python process this cache makes all instances share one
-# parse.
-_METADATA_CACHE: dict[str, tuple[str, ET.Element, "_CsdlIndex"]] = {}
+# parse. Entries carry the wall-clock time the document was FETCHED
+# (for file-cache hits, the file's mtime — the fetch time of the
+# process that wrote it) so ``metadata_cache_ttl_seconds`` governs this
+# layer exactly like the on-disk one: entries expire after the TTL and
+# a TTL of 0 disables the layer entirely. Without the stamp a
+# long-running driver would serve the same parsed ``$metadata`` forever
+# regardless of the configured TTL.
+_METADATA_CACHE: dict[str, tuple[str, ET.Element, "_CsdlIndex", float]] = {}
 
 # On-disk CSDL cache. PySpark's Python Data Source forks a fresh
 # ``pyspark.daemon`` worker for schema inference on every ``.load()``
@@ -377,6 +384,11 @@ _TRANSIENT_NETWORK_ERRORS = (
 )
 
 # HTTP status codes treated as transient by ``_http_get``'s retry loop:
+# * 408 — Request Timeout. The server (or a proxy) gave up waiting for
+#   the request; same transient shape as a read timeout, which IS
+#   retried as a network error. Keeps this set aligned with
+#   ``_TRANSIENT_HTTP_STATUSES`` in ``_contained.py`` so a flaky
+#   408-emitting proxy doesn't kill a read a 503-emitting one survives.
 # * 429 — Too Many Requests (throttling).
 # * 500 — Internal Server Error. Frequently transient (the "contact
 #   support" templated body that Hexagon SCApi returns under load is
@@ -389,7 +401,7 @@ _TRANSIENT_NETWORK_ERRORS = (
 # 429 and 503 honour the server's ``Retry-After`` header when present;
 # 500/502/504 fall back to pure exponential backoff (Retry-After is
 # rarely emitted on those, and we shouldn't trust it if it is).
-_RETRYABLE_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
+_RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 
 # Module logger. Always-on:
 #   * WARNING — every retry (network/429/503/JSON decode), so an
@@ -420,19 +432,53 @@ def _cache_owner_tag() -> str:
         import getpass
 
         try:
-            return getpass.getuser()
+            # Windows account names can't contain path separators, but the
+            # value can come from the USERNAME env var — sanitize so the
+            # tag can never smuggle path syntax into the cache filename.
+            return re.sub(r"[^A-Za-z0-9._-]", "_", getpass.getuser())
         except Exception:  # noqa: BLE001 — cache tag must never fail
             return "user"
 
 
 def _cache_file_owned_by_us(path: str) -> bool:
-    """Whether ``path`` is owned by the current uid (POSIX). On platforms
-    without ``os.getuid`` the per-user filename is the only guard."""
+    """Whether ``path`` itself is owned by the current uid (POSIX). Uses
+    ``lstat`` so a foreign-owned symlink planted at the (predictable) cache
+    path fails the check outright — with following ``stat`` a symlink
+    pointing at some victim-owned file would pass, diverging from what the
+    subsequent ``open`` actually reads. On platforms without ``os.getuid``
+    the per-user filename is the only guard."""
     try:
-        return os.stat(path).st_uid == os.getuid()
+        return os.lstat(path).st_uid == os.getuid()
     except AttributeError:
         return True
     except OSError:
+        return False
+
+
+def _replace_with_private_tmp(path: str, data: bytes) -> bool:
+    """Atomically publish ``data`` at ``path`` via a private temp file in
+    the same directory. The temp name embeds ``os.urandom`` so it can't be
+    predicted, and it is opened ``O_CREAT | O_EXCL | O_NOFOLLOW`` with mode
+    ``0o600`` — a pre-planted file or symlink at the name makes the open
+    fail instead of following the link and clobbering whatever it points
+    at (the tempdir is world-writable on multi-user hosts). Best-effort:
+    returns ``False`` on any OSError, ``True`` once ``os.replace`` lands."""
+    tmp = f"{path}.{os.getpid()}.{os.urandom(4).hex()}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(tmp, flags, 0o600)
+    except OSError:
+        return False
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
         return False
 
 
@@ -547,27 +593,19 @@ def _capability_cache_path(service_url: str) -> str:
 
 
 def _capability_cache_flush(service_url: str, payload: str) -> None:
-    """Write an already-serialized ``payload`` string to the on-disk mirror:
-    temp file (unique per process AND per thread) then ``os.replace``, so a
-    concurrent worker never observes a half-written file. Takes a **string**, not
-    the live dict, so the caller serializes under :data:`_CAPABILITY_LOCK` and
-    the blocking disk I/O here runs lock-free — concurrent cache ops don't
-    serialize on each other's I/O. Best-effort: like the cross-process case, a
-    concurrent writer's swap can win (last-writer-wins on the mirror); the
-    in-memory cache stays authoritative and a re-probe/TTL recovers any lag.
-    The temp file is cleaned up on failure; the mtime memo is refreshed so the
+    """Write an already-serialized ``payload`` string to the on-disk mirror
+    via :func:`_replace_with_private_tmp` (unpredictable ``O_EXCL`` temp name
+    + ``os.replace``), so a concurrent worker never observes a half-written
+    file and a pre-planted symlink can't redirect the write. Takes a
+    **string**, not the live dict, so the caller serializes under
+    :data:`_CAPABILITY_LOCK` and the blocking disk I/O here runs lock-free —
+    concurrent cache ops don't serialize on each other's I/O. Best-effort:
+    like the cross-process case, a concurrent writer's swap can win
+    (last-writer-wins on the mirror); the in-memory cache stays authoritative
+    and a re-probe/TTL recovers any lag. The mtime memo is refreshed so the
     writing process doesn't immediately re-read its own write."""
     path = _capability_cache_path(service_url)
-    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(payload)
-        os.replace(tmp, path)
-    except OSError:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
+    if not _replace_with_private_tmp(path, payload.encode("utf-8")):
         return
     try:
         _CAPABILITY_DISK_MTIME[path] = os.path.getmtime(path)
@@ -749,6 +787,13 @@ class _CsdlIndex:
     # All namespaces that declare at least one entity set. Used for
     # error hints when the requested namespace declares only types.
     namespaces_with_sets: list[str]
+    # Fully-qualified ``<TypeDefinition>`` name (canonical namespace) →
+    # its ``UnderlyingType`` (an ``Edm.*`` primitive). Properties typed
+    # via a TypeDefinition quote their literals per the underlying
+    # primitive — without this map an ``Edm.String``-backed definition
+    # would fall out of typed rendering and an ISO-looking value would
+    # render bare (invalid predicate).
+    typedef_underlying: dict[str, str]
 
 
 def _build_csdl_index(root: ET.Element) -> _CsdlIndex:
@@ -768,6 +813,7 @@ def _build_csdl_index(root: ET.Element) -> _CsdlIndex:
     alias_to_namespace: dict[str, str] = {}
     entity_type_by_qname: dict[str, ET.Element] = {}
     namespaces_with_sets: list[str] = []
+    typedef_underlying: dict[str, str] = {}
 
     for schema in root.iter(f"{_NS_EDM}Schema"):
         ns = schema.get("Namespace") or ""
@@ -775,12 +821,20 @@ def _build_csdl_index(root: ET.Element) -> _CsdlIndex:
             alias_to_namespace[ns] = ns
         alias = schema.get("Alias")
         if alias:
+            # Duplicate aliases across schemas (spec-malformed) resolve
+            # last-writer-wins — same policy as duplicate namespaces.
             alias_to_namespace[alias] = ns
 
         for entity_type in schema.findall(f"{_NS_EDM}EntityType"):
             type_name = entity_type.get("Name")
             if type_name:
                 entity_type_by_qname[f"{ns}.{type_name}"] = entity_type
+
+        for typedef in schema.findall(f"{_NS_EDM}TypeDefinition"):
+            td_name = typedef.get("Name")
+            underlying = typedef.get("UnderlyingType")
+            if td_name and underlying:
+                typedef_underlying[f"{ns}.{td_name}"] = underlying
 
         had_set = False
         for container in schema.iter(f"{_NS_EDM}EntityContainer"):
@@ -803,6 +857,7 @@ def _build_csdl_index(root: ET.Element) -> _CsdlIndex:
         alias_to_namespace=alias_to_namespace,
         entity_type_by_qname=entity_type_by_qname,
         namespaces_with_sets=namespaces_with_sets,
+        typedef_underlying=typedef_underlying,
     )
 
 
@@ -1001,9 +1056,12 @@ class ODataLakeflowConnect(
 
     def list_tables_in_namespace(self, namespace: list[str]) -> list[str]:
         index = self._entity_set_index()
-        if not namespace:
+        if len(namespace) != 1:
             # Entity sets always live inside a Schema with a Namespace
-            # attribute; root-level tables don't exist in OData v4.
+            # attribute; root-level tables don't exist in OData v4, and
+            # namespaces are single-level — a multi-segment path names
+            # nothing (returning segment[0]'s tables would fabricate
+            # rows under a nonexistent namespace path).
             return []
         target = namespace[0]
         flat = sorted({es for ns, es in index if ns == target})
@@ -1023,8 +1081,8 @@ class ODataLakeflowConnect(
         # place. Validate against the path's real FK columns, but only for
         # contained paths: a flat table has none, so a connection-wide
         # default applied to it is a silent no-op rather than warning noise.
-        if excluded and "*" not in excluded and _parse_contained_path(table_name) is not None:
-            segments = _parse_contained_path(table_name)
+        if excluded and "*" not in excluded and self._table_segments(table_name) is not None:
+            segments = self._table_segments(table_name)
             all_fk = self._all_fk_column_names(segments, namespace)
             non_fk = excluded - all_fk
             if non_fk:
@@ -1055,7 +1113,7 @@ class ODataLakeflowConnect(
         if select:
             wanted = {c.strip() for c in select.split(",")}
             # ``select`` filters leaf columns only; FK columns survive.
-            segments = _parse_contained_path(table_name) or [table_name]
+            segments = self._table_segments(table_name) or [table_name]
             fk_names = set(self._resolve_fk_columns(segments, namespace).values())
             fields = [f for f in fields if f.name in fk_names or f.name in wanted]
         # Contained path + cursor_field lives on an ancestor → propagate
@@ -1082,7 +1140,7 @@ class ODataLakeflowConnect(
         # ``delta_tracking=auto`` whose server 200-acknowledges the Prefer
         # header on the contained URL would declare two NON-NULLABLE columns
         # no emitted row carries.
-        if _parse_contained_path(table_name) is None and self._delta_active_for(
+        if self._table_segments(table_name) is None and self._delta_active_for(
             table_name, table_options
         ):
             fields = list(fields) + [
@@ -1098,7 +1156,7 @@ class ODataLakeflowConnect(
         user_cursor = (table_options or {}).get("cursor_field")
         # Contained paths skip the delta probe (server delta is for
         # top-level sets only; mutex enforced in dispatch below).
-        if _parse_contained_path(table_name) is None and self._delta_active_for(
+        if self._table_segments(table_name) is None and self._delta_active_for(
             table_name, table_options
         ):
             return {
@@ -1184,7 +1242,7 @@ class ODataLakeflowConnect(
         if (
             isinstance(self._cursor_lookback, int)
             and self._cursor_lookback > 0
-            and not (_parse_contained_path(table_name) is not None and opts.get("cursor_field"))
+            and not (self._table_segments(table_name) is not None and opts.get("cursor_field"))
         ):
             raise ValueError(
                 "cursor_lookback_seconds (an explicit value) is supported "
@@ -1237,7 +1295,7 @@ class ODataLakeflowConnect(
         # every flat / snapshot / expand_contained read would trip them.
         cursor_probe_raw = (opts.get("cursor_probe") or "").strip().lower()
         if "cursor_probe" in opts and self._cursor_probe_mode(opts) in ("probe", "batch"):
-            if _parse_contained_path(table_name) is None:
+            if self._table_segments(table_name) is None:
                 raise ValueError(
                     f"cursor_probe={cursor_probe_raw} is supported only on "
                     f"contained-collection paths; {table_name!r} is a flat entity "
@@ -1282,7 +1340,7 @@ class ODataLakeflowConnect(
         # Seed per-instance capability verdicts from the resume offset so a
         # reader the framework recreates each microbatch skips re-probing.
         self._seed_capability_caches(table_name, opts, start_offset)
-        if _parse_contained_path(table_name) is not None:
+        if self._table_segments(table_name) is not None:
             if self._delta_setting(opts) == "enabled":
                 raise ValueError(
                     "delta_tracking=enabled is not supported on contained-"
@@ -1543,7 +1601,7 @@ class ODataLakeflowConnect(
                 table_name=self._expand_shared_key(table_name, table_options),
             )
         if self._cursor_probe_mode(table_options) != "auto":
-            segments = _parse_contained_path(table_name)
+            segments = self._table_segments(table_name)
             if segments is not None:
                 key = self._cursor_probe_shared_key(
                     segments, (table_options or {}).get("namespace")
@@ -2389,9 +2447,10 @@ class ODataLakeflowConnect(
         except (requests.RequestException, ValueError, RuntimeError, PermissionError):
             return None  # transient/auth — no verdict, re-probe next call
         if resp.status_code in _TRANSIENT_HTTP_STATUSES:
-            # In practice only 408 reaches here (``_http_get`` retries the
-            # rest and raises after the budget), but the membership test
-            # keeps the definitive/transient split in one place.
+            # Defensive: ``_http_get`` retries every transient status and
+            # raises after the budget (caught above), so nothing should
+            # reach here in practice — the membership test keeps the
+            # definitive/transient split in one place regardless.
             return None  # transient status — no verdict, re-probe next call
         if resp.status_code != 200:
             return False
@@ -2605,11 +2664,11 @@ class ODataLakeflowConnect(
             resp = self._http_get_once(self._get_session(), probe)
         except Exception:  # transport error, or auth failure (PermissionError)
             return True  # not OR evidence — fail open this seek, record nothing
-        # 408/429/5xx — transient. ``_TRANSIENT_HTTP_STATUSES`` (which
-        # includes 408, unlike the retry set) so a request timeout isn't
-        # misread as "OR rejected" and durably persisted — ``or_filter_ok``
-        # has no reset path, the same discipline the _contained preflights
-        # follow.
+        # 408/429/5xx — transient, so a request timeout isn't misread as
+        # "OR rejected" and durably persisted. The verdict outlives the
+        # instance and its only reset is the explicit ``pagination=
+        # skip/nextlink`` scrub (``_scrub_nonauto_verdicts``) — the same
+        # discipline the _contained preflights follow.
         if resp.status_code in _TRANSIENT_HTTP_STATUSES:
             return True  # not OR evidence — fail open this seek, record nothing
         ok = not 400 <= resp.status_code < 500  # a non-transient 4xx = OR rejected
@@ -3020,14 +3079,19 @@ class ODataLakeflowConnect(
         )
 
     def _backoff_delay(self, attempt: int) -> float:
-        """Exponential backoff capped at ``retry_max_delay_seconds``.
+        """Exponential backoff capped at ``retry_max_delay_seconds``,
+        jittered to 50–100 % of the capped value.
 
         Used for transient network failures where the server never
         sent a response, so there's no ``Retry-After`` to honour (the
         429/503 path prefers the server hint via
-        ``_retry_after_delay``).
+        ``_retry_after_delay``). The jitter de-synchronizes the
+        ``num_partitions`` executor tasks a throttling source knocked
+        back in the same instant — without it they all retry in
+        lockstep at 1, 2, 4 … s and re-trigger the throttle together.
         """
-        return min(float(2**attempt), float(self.retry_max_delay_seconds))
+        capped = min(float(2**attempt), float(self.retry_max_delay_seconds))
+        return capped * random.uniform(0.5, 1.0)
 
     def _http_get_once(
         self, session: requests.Session, url: str, method: str = "GET", **kwargs: Any
@@ -3071,8 +3135,9 @@ class ODataLakeflowConnect(
 
         Priority:
           1. ``Retry-After`` header — integer seconds or HTTP-date.
-          2. Exponential backoff: ``2**attempt`` seconds (1, 2, 4, 8,
-             16 …).
+             Honoured as-is (capped): the server picked the moment, so
+             jittering it would retry too early.
+          2. Jittered exponential backoff via ``_backoff_delay``.
 
         Either way the value is capped at ``retry_max_delay_seconds``.
         """
@@ -3082,7 +3147,7 @@ class ODataLakeflowConnect(
             parsed = _parse_retry_after(header)
             if parsed is not None:
                 return min(parsed, cap)
-        return min(float(2**attempt), cap)
+        return self._backoff_delay(attempt)
 
     def _transient_status_exhausted_error(
         self, resp: requests.Response, url: str, attempts: int
@@ -3094,6 +3159,11 @@ class ODataLakeflowConnect(
         retry_after = resp.headers.get("Retry-After", "<none>")
         if status in (429, 503):
             symptom = "server is throttling or temporarily unavailable"
+        elif status == 408:
+            symptom = (
+                "server (or a proxy) timed out waiting on every attempt — "
+                "consider raising 'timeout_seconds' or lowering 'page_size'"
+            )
         elif status == 500:
             symptom = (
                 "server returned an internal error on every attempt — likely a "
@@ -3215,15 +3285,24 @@ class ODataLakeflowConnect(
         """True iff a known-expiry token has hit its 60 s safety window."""
         if self._access_token_expires_at is None:
             return False
-        return time.monotonic() >= self._access_token_expires_at
+        return time.time() >= self._access_token_expires_at
 
     def _has_oauth_refresh_path(self) -> bool:
-        """True iff `_oauth2_token()` can mint a fresh access token.
+        """True iff a 401 should be answered by minting a fresh OAuth2
+        access token: the session actually authenticates with our minted
+        bearer header (``auth_type=oauth2`` — the only branch that does),
+        AND `_oauth2_token()` has a grant to run (a refresh token for the
+        user flow, or client id + secret for client-credentials).
 
-        Either a refresh token is on hand (user flow) or
-        ``oauth2_client_id`` + ``oauth2_client_secret`` are present
-        for the client-credentials grant.
+        The ``auth_type`` gate matters: with ``auth_type=basic`` plus
+        leftover oauth2 options, minting a token sets an Authorization
+        header that ``session.auth`` overwrites at request-prepare time —
+        the retry re-sends the same rejected basic credentials and the
+        second 401 would blame "the refreshed OAuth2 token" for a basic
+        auth failure.
         """
+        if (self.options.get("auth_type") or "").lower().strip() != "oauth2":
+            return False
         if self.options.get("oauth2_refresh_token"):
             return True
         return bool(
@@ -3409,7 +3488,12 @@ class ODataLakeflowConnect(
         expires_in = payload.get("expires_in")
         if expires_in is not None:
             try:
-                self._access_token_expires_at = time.monotonic() + int(expires_in) - 60
+                # Wall clock, NOT ``time.monotonic()`` — the deadline
+                # rides the pickled connector to executors, where the
+                # monotonic epoch is a different arbitrary origin on a
+                # different host; wall clocks are comparable across
+                # hosts (the 60 s margin absorbs ordinary skew).
+                self._access_token_expires_at = time.time() + int(expires_in) - 60
             except (TypeError, ValueError):
                 self._access_token_expires_at = None
         else:
@@ -3437,8 +3521,12 @@ class ODataLakeflowConnect(
            the lookup methods see the same cached root + index.
         2. Module ``_METADATA_CACHE`` keyed by ``service_url`` — shared
            across all connector instances in the same Python process.
-           Stores ``(xml_text, root, index)`` so the index isn't
-           rebuilt per instance either.
+           Stores ``(xml_text, root, index, fetched_at)`` so the index
+           isn't rebuilt per instance either. Honours
+           ``metadata_cache_ttl_seconds`` exactly like layer 3: entries
+           past the TTL are refreshed, and a TTL of 0 skips the layer
+           entirely (read AND write) so ``$metadata`` is re-fetched per
+           instance as documented.
         3. On-disk pickle at ``_metadata_cache_path(service_url)`` —
            shared across forked ``pyspark.daemon`` workers (PySpark
            forks one per ``.load()`` schema inference). The pickle
@@ -3449,20 +3537,28 @@ class ODataLakeflowConnect(
         """
         if self._metadata is not None:
             return self._metadata
-        cached = _METADATA_CACHE.get(self.service_url)
+        ttl = self.metadata_cache_ttl_seconds
+        cached = _METADATA_CACHE.get(self.service_url) if ttl > 0 else None
         if cached is not None:
-            xml_text, root, index = cached
-            self._metadata = _MetadataState(root=root, index=index)
-            # ``xml_text`` is only needed for the write path; once
-            # cached, we don't carry it on the bundle.
-            del xml_text
-            return self._metadata
+            xml_text, root, index, fetched_at = cached
+            if time.time() - fetched_at <= ttl:
+                self._metadata = _MetadataState(root=root, index=index)
+                # ``xml_text`` is only needed for the write path; once
+                # cached, we don't carry it on the bundle.
+                del xml_text
+                return self._metadata
+            # Expired — drop it so a concurrent reader doesn't race the
+            # refresh below against the stale entry.
+            _METADATA_CACHE.pop(self.service_url, None)
         file_cached = self._read_metadata_file_cache()
         if file_cached is not None:
-            xml_text, root = file_cached
+            xml_text, root, fetched_at = file_cached
             index = _build_csdl_index(root)
             self._metadata = _MetadataState(root=root, index=index)
-            _METADATA_CACHE[self.service_url] = (xml_text, root, index)
+            # Stamp with the FILE's fetch time (its mtime), not now() —
+            # the process entry must expire when the on-disk one would,
+            # or an old document gains a second TTL lease per process.
+            _METADATA_CACHE[self.service_url] = (xml_text, root, index, fetched_at)
             return self._metadata
         session = self._get_session()
         url = _join_url(self.service_url, "$metadata")
@@ -3472,16 +3568,18 @@ class ODataLakeflowConnect(
         root = ET.fromstring(xml_text)
         index = _build_csdl_index(root)
         self._metadata = _MetadataState(root=root, index=index)
-        _METADATA_CACHE[self.service_url] = (xml_text, root, index)
+        if ttl > 0:
+            _METADATA_CACHE[self.service_url] = (xml_text, root, index, time.time())
         self._write_metadata_file_cache(xml_text, root)
         return self._metadata
 
-    def _read_metadata_file_cache(self) -> tuple[str, ET.Element] | None:
-        """Return the cached ``(xml_text, parsed_root)`` from the
-        on-disk pickle if it exists and is within the TTL. Returns
-        ``None`` for any miss (missing, expired, unreadable,
-        unpicklable). All failures are silent — the caller falls
-        through to the network."""
+    def _read_metadata_file_cache(self) -> tuple[str, ET.Element, float] | None:
+        """Return the cached ``(xml_text, parsed_root, fetched_at)`` from
+        the on-disk pickle if it exists and is within the TTL —
+        ``fetched_at`` is the file's mtime, i.e. when the writing process
+        fetched the document. Returns ``None`` for any miss (missing,
+        expired, unreadable, unpicklable). All failures are silent — the
+        caller falls through to the network."""
         if self.metadata_cache_ttl_seconds <= 0:
             return None
         path = _metadata_cache_path(self.service_url)
@@ -3512,33 +3610,45 @@ class ODataLakeflowConnect(
             or not isinstance(payload[1], ET.Element)
         ):
             return None
-        return payload
+        return payload[0], payload[1], mtime
 
     def _write_metadata_file_cache(self, xml_text: str, root: ET.Element) -> None:
         """Best-effort write of ``(xml_text, parsed_root)`` to the
-        on-disk pickle. Uses atomic rename so a concurrent reader
-        either sees the old file or the fully-written new one, never
-        a torn write."""
+        on-disk pickle via :func:`_replace_with_private_tmp` — atomic
+        rename (a concurrent reader sees the old file or the new one,
+        never a torn write) through an unpredictable ``O_EXCL`` temp
+        name, so a pre-planted symlink can't redirect the write. File
+        cache is purely an optimization: if anything goes wrong
+        (read-only tempdir, disk full, pickling failure) the connector
+        still works — just slower."""
         if self.metadata_cache_ttl_seconds <= 0:
             return
-        path = _metadata_cache_path(self.service_url)
-        tmp_path = f"{path}.{os.getpid()}.tmp"
         try:
-            with open(tmp_path, "wb") as fh:
-                pickle.dump((xml_text, root), fh, protocol=pickle.HIGHEST_PROTOCOL)
-            os.replace(tmp_path, path)
-        except (OSError, pickle.PicklingError):
-            # File cache is purely an optimization. If anything goes
-            # wrong (read-only tempdir, disk full, pickling failure)
-            # the connector still works — just slower.
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+            data = pickle.dumps((xml_text, root), protocol=pickle.HIGHEST_PROTOCOL)
+        except pickle.PicklingError:
+            return
+        _replace_with_private_tmp(_metadata_cache_path(self.service_url), data)
 
     def _entity_set_index(self) -> list[tuple[str, str]]:
         """All (schema_namespace, entity_set_name) pairs declared in $metadata."""
         return self._metadata_state().index.entity_set_pairs
+
+    def _table_segments(self, table_name: str) -> list[str] | None:
+        """:func:`parse_contained_path` with the declared-flat-set override:
+        a name declared VERBATIM as a top-level entity set is always read
+        flat, even when it contains ``__``. CSDL SimpleIdentifiers legally
+        allow consecutive underscores, so ``My__Set`` can be a real entity
+        set — without the override ``list_tables`` emits a name the read
+        path then splits into a nonexistent containment path and can never
+        resolve. Every table-name split in the connector goes through here;
+        the raw parser is only for contexts with no metadata access."""
+        if _CONTAINED_PATH_SEP in table_name:
+            try:
+                if table_name in self._metadata_state().index.entity_set_by_name:
+                    return None
+            except Exception:  # noqa: BLE001 — let the parse/resolve error surface instead
+                pass
+        return _parse_contained_path(table_name)
 
     def _entity_type_for(self, table_name: str, namespace: str | None = None) -> ET.Element:
         """Resolve flat names or contained paths (segment-by-segment via
@@ -3548,7 +3658,7 @@ class ODataLakeflowConnect(
         cached = state.entity_type.get(cache_key)
         if cached is not None:
             return cached
-        segments = _parse_contained_path(table_name) or [table_name]
+        segments = self._table_segments(table_name) or [table_name]
         et = self._flat_entity_type_for(segments[0], namespace)
         for idx, child_segment in enumerate(segments[1:], start=1):
             nav_props = self._all_contained_nav_props(et)
@@ -3575,6 +3685,10 @@ class ODataLakeflowConnect(
         index = self._metadata_state().index
         candidates = index.entity_set_by_name.get(table_name) or []
         if namespace is not None:
+            # Accept the schema's ``Alias`` as well as its canonical
+            # ``Namespace`` — CSDL lets type references use either, so
+            # the table option should too.
+            namespace = index.alias_to_namespace.get(namespace, namespace)
             matches = [(ns, ref) for ns, ref in candidates if ns == namespace]
         else:
             matches = list(candidates)
@@ -3602,6 +3716,16 @@ class ODataLakeflowConnect(
             )
         if len(matches) > 1:
             namespaces = sorted({m[0] for m in matches})
+            if len(namespaces) == 1:
+                # Same name twice in ONE namespace (multiple containers in
+                # one schema — malformed CSDL): 'namespace' can't
+                # disambiguate, so don't suggest it.
+                raise ValueError(
+                    f"Entity set {table_name!r} is declared more than once in "
+                    f"namespace {namespaces[0]!r} (malformed $metadata — "
+                    f"duplicate EntitySet declarations). The connector cannot "
+                    f"tell the declarations apart; fix the service metadata."
+                )
             raise ValueError(
                 f"Entity set {table_name!r} is declared in multiple namespaces: "
                 f"{namespaces}. Set 'namespace' in table_options to disambiguate."
@@ -3688,7 +3812,7 @@ class ODataLakeflowConnect(
         cached = state.fields.get(cache_key)
         if cached is not None:
             return cached
-        segments = _parse_contained_path(table_name) or [table_name]
+        segments = self._table_segments(table_name) or [table_name]
         own_fields = self._own_fields_for_et(self._entity_type_for(table_name, namespace))
         if len(segments) == 1:
             state.fields[cache_key] = own_fields
@@ -3749,7 +3873,7 @@ class ODataLakeflowConnect(
         cached = state.primary_keys.get(cache_key)
         if cached is not None:
             return cached
-        segments = _parse_contained_path(table_name) or [table_name]
+        segments = self._table_segments(table_name) or [table_name]
         leaf_pks = self._own_primary_keys_for_et(self._entity_type_for(table_name, namespace))
         if len(segments) == 1:
             state.primary_keys[cache_key] = leaf_pks
@@ -3812,9 +3936,26 @@ class ODataLakeflowConnect(
             for prop in type_el.findall(f"{_NS_EDM}Property"):
                 name = prop.get("Name")
                 if name and name not in result:
-                    result[name] = prop.get("Type", "Edm.String")
+                    result[name] = self._resolve_underlying_type(prop.get("Type", "Edm.String"))
         state.edm_types[cache_key] = result
         return result
+
+    def _resolve_underlying_type(self, type_ref: str) -> str:
+        """Resolve a ``<TypeDefinition>``-typed property reference to its
+        underlying ``Edm.*`` primitive; anything else passes through
+        verbatim. A definition backed by ``Edm.String`` must quote its
+        literals like any string — recording the definition name instead
+        would drop the property out of typed rendering and an ISO-looking
+        value would render bare (the exact misfire typed rendering
+        exists to prevent). Accepts alias- or namespace-qualified refs."""
+        if type_ref.startswith("Edm.") or "." not in type_ref:
+            return type_ref
+        index = self._metadata_state().index
+        prefix, type_name = type_ref.rsplit(".", 1)
+        target_ns = index.alias_to_namespace.get(prefix)
+        if target_ns is None:
+            return type_ref
+        return index.typedef_underlying.get(f"{target_ns}.{type_name}", type_ref)
 
     def _edm_types_for_table(self, table_name: str, namespace: str | None) -> dict[str, str]:
         """Best-effort :meth:`_edm_types_for_et` by table name / contained

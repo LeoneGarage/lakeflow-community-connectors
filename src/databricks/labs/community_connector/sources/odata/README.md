@@ -55,7 +55,7 @@ For other auth methods, swap `token` for the relevant fields:
 | `bearer` | `token` | |
 | `basic` | `username`, `password` | |
 | `api_key` | `api_key` (optionally `api_key_header`) | |
-| `oauth2` (client credentials) | `oauth2_token_url`, `oauth2_client_id`, `oauth2_client_secret` (optionally `oauth2_scope`) | Server-to-server. Mints a fresh access token at session start; re-mints pre-emptively when `expires_in` is exhausted (60 s safety buffer). |
+| `oauth2` (client credentials) | `oauth2_token_url`, `oauth2_client_id`, `oauth2_client_secret` (optionally `oauth2_scope`) | Server-to-server. Mints a fresh access token at session start; re-mints pre-emptively when `expires_in` is exhausted (60 s safety buffer). Client credentials are sent in the POST body (`client_secret_post`); providers that require HTTP-Basic on the token endpoint (`client_secret_basic` — e.g. Okta's default) are not supported. |
 | `oauth2` (authorization code) | Same as above **plus** `oauth2_refresh_token` (and optionally `oauth2_access_token`) | User-delegated. The pre-issued access token is used directly, then refreshed via `grant_type=refresh_token` either pre-emptively when the deadline approaches or reactively on a 401 from the source. Rotated refresh tokens are tracked automatically. |
 
 #### OAuth2 — client credentials (server-to-server)
@@ -251,8 +251,8 @@ The no-refresh-path row's remediation depends on the configured auth mode:
 | Option                        | Default | Description |
 | ----------------------------- | ------- | ----------- |
 | `timeout_seconds`             | 180     | Per-request HTTP timeout (seconds) applied to every call to the OData service (`$metadata` fetch and all entity reads). Raise it for slow services or large `$metadata`; lower it to fail fast. |
-| `metadata_cache_ttl_seconds`  | 60      | TTL (seconds) for the on-disk cache of the parsed `$metadata` document, shared across forked workers so the fetch + parse cost is paid once per pipeline init. Set to `0` to disable. |
-| `max_retries`                 | 5       | Retry budget for transient failures. Two classes covered: (1) **HTTP 429 / 500 / 502 / 503 / 504** — throttling, service unavailable, and transient gateway/server errors; honours the server's `Retry-After` header when present (integer seconds or HTTP-date), otherwise exponential backoff (1, 2, 4, 8, 16 s …). (2) **Connection-level exceptions** — TCP reset / remote disconnect, read or connect timeout, mid-body chunked-encoding error (the server returned no HTTP response at all); always exponential backoff. After `max_retries` consecutive failures the batch raises — `RuntimeError` for the retryable HTTP statuses, the original exception type (`ConnectionError`/`Timeout`/`ChunkedEncodingError`) for network failures. Set to `0` to opt out. |
+| `metadata_cache_ttl_seconds`  | 60      | TTL (seconds) for the cached parsed `$metadata` document — governs **both** the in-process cache (shared by all connector instances in one driver/worker process) and the on-disk pickle (shared across forked workers), so the fetch + parse cost is paid once per pipeline init and a long-running process still picks up upstream schema changes after the TTL. Set to `0` to disable both layers (every instance re-fetches). |
+| `max_retries`                 | 5       | Retry budget for transient failures. Two classes covered: (1) **HTTP 408 / 429 / 500 / 502 / 503 / 504** — request timeout, throttling, service unavailable, and transient gateway/server errors; honours the server's `Retry-After` header when present (integer seconds or HTTP-date), otherwise exponential backoff (1, 2, 4, 8, 16 s …, jittered to 50–100 % so parallel partition tasks knocked back together don't retry in lockstep). (2) **Connection-level exceptions** — TCP reset / remote disconnect, read or connect timeout, mid-body chunked-encoding error (the server returned no HTTP response at all); always (jittered) exponential backoff. After `max_retries` consecutive failures the batch raises — `RuntimeError` for the retryable HTTP statuses, the original exception type (`ConnectionError`/`Timeout`/`ChunkedEncodingError`) for network failures. Set to `0` to opt out. |
 | `retry_max_delay_seconds`     | 60      | Per-retry sleep cap (seconds). Applied to both server-supplied `Retry-After` values and the exponential-backoff fallback, so a misbehaving source emitting an hour-long `Retry-After` can't pin a Spark task. |
 | `verbose_http_logging`        | false   | When `true`, logs each HTTP request/response (method, URL, status, timing) at INFO for troubleshooting. Off by default to keep logs quiet and avoid leaking URL query values. |
 | `verbose_http_log_body_chars` | 500     | When `verbose_http_logging` is on, the maximum number of response-body characters logged per request (truncated beyond this). Only consulted when verbose logging is enabled. |
@@ -308,7 +308,7 @@ build_pipeline(
 
 | Option                  | Default | Description |
 | ----------------------- | ------- | ----------- |
-| `namespace`             |         | OData schema namespace (e.g. `Sales`, `HR`). Required only when two schemas declare an entity set with the same name. |
+| `namespace`             |         | OData schema namespace (e.g. `Sales`, `HR`) — the schema's `Alias` is accepted interchangeably. Required only when two schemas declare an entity set with the same name. |
 | `cursor_field`          |         | Drives incremental reads. Omit for snapshot. |
 | `select`                | all     | Comma-separated `$select` projection. |
 | `filter`                |         | Extra OData `$filter` expression. Applied to the **leaf segment** in both modes — leaf URL in N+1 mode (`expand_contained=false`), innermost `$expand(...)` clause in expand mode. Equivalent to `filter_at_<leaf-segment>`; AND-composes with it if both are set. For per-segment placement on intermediate ancestors of contained paths, use `filter_at_<segment>` below. |
@@ -467,6 +467,13 @@ Parents__Children
 Parents__Children__Notes
 Parents__Tags
 ```
+
+A top-level entity set whose *own* name legally contains `__` (CSDL
+identifiers allow consecutive underscores, e.g. `My__Set`) always wins over
+the containment-path interpretation: a name declared verbatim in
+`$metadata` is read flat. In the pathological service that declares both
+`My__Set` *and* a `My` set with a contained `Set` collection, the flat set
+shadows the contained path.
 
 ### Structured property values
 

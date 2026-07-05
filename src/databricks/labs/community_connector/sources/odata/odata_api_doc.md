@@ -99,7 +99,7 @@ Notes:
 - **Bearer.** Sent as `Authorization: Bearer <token>`. Works for most modern OData APIs (Microsoft Graph, Dynamics 365, SAP S/4HANA Cloud).
 - **Basic.** Sent as `Authorization: Basic <base64(user:pass)>` via `requests.auth.HTTPBasicAuth`. Common for on-prem SAP NetWeaver / Gateway.
 - **API key.** Sent as `<header-name>: <key>`. The header name defaults to `x-api-key` and is configurable per service via `api_key_header`.
-- **OAuth2 (client credentials).** At session-construction time the connector POSTs `grant_type=client_credentials` to `oauth2_token_url` and caches the access token on the session for the run.
+- **OAuth2 (client credentials).** At session-construction time the connector POSTs `grant_type=client_credentials` to `oauth2_token_url` and caches the access token on the session for the run. Client authentication is `client_secret_post` (id + secret in the form body) only; token endpoints that mandate `client_secret_basic` (HTTP Basic on the token endpoint — e.g. Okta's default posture) are not supported. The 401-triggered refresh applies only under `auth_type=oauth2` — with any other auth type, leftover `oauth2_*` options are ignored and a 401 raises the standard actionable error for that auth type.
 - **OAuth2 (authorization code / user-delegated).** The user runs the authorization-code flow once (externally — e.g. via the SDK's OAuth helpers) and supplies the resulting `oauth2_access_token` and `oauth2_refresh_token` on the connection. The connector uses the pre-supplied access token directly; on HTTP 401 from the source it POSTs `grant_type=refresh_token` to `oauth2_token_url` (with `client_id` + `client_secret` for client authentication) and retries the request once. Providers that rotate refresh tokens have the new value tracked in-process for the rest of the run.
 
 Tokens, passwords, API keys, and OAuth client secrets are all declared `secret: true` in `connector_spec.yaml` and are masked by the Unity Catalog connection store.
@@ -114,9 +114,9 @@ These are set on the UC connection (alongside the auth fields above).
 | --- | --- | --- | --- | --- |
 | `service_url` | string | Yes | — | OData v4 service root URL. Must end at the service segment; the connector appends entity-set names and `$metadata` directly. Example: `https://services.odata.org/V4/Northwind/Northwind.svc/`. Must **not** embed credentials (`user:pass@host` userinfo — rejected at init, since the URL is echoed in logs and error messages); use the auth options instead. |
 | `timeout_seconds` | string | No | `180` | HTTP timeout per request, in seconds. |
-| `extra_headers` | string | No | — | Extra request headers as `Key:Value,Key2:Value2`. Useful for tenant IDs, CSRF tokens, or non-standard server discriminators. |
-| `metadata_cache_ttl_seconds` | string | No | `60` | TTL of the shared `$metadata` cache (process dict + on-disk pickle). |
-| `max_retries` | string | No | `5` | Retry budget for transient failures (429/5xx, network errors) — applies to source requests and the OAuth2 token endpoint alike. |
+| `extra_headers` | string | No | — | Extra request headers as `Key:Value,Key2:Value2`. Useful for tenant IDs, CSRF tokens, or non-standard server discriminators. The list splits on `,`, so header values containing commas (e.g. HTTP-dates) can't be expressed. |
+| `metadata_cache_ttl_seconds` | string | No | `60` | TTL of the shared `$metadata` cache — both the process dict and the on-disk pickle honour it; `0` disables both. |
+| `max_retries` | string | No | `5` | Retry budget for transient failures (408/429/5xx, network errors) — applies to source requests and the OAuth2 token endpoint alike. Backoff is exponential with 50–100 % jitter; server `Retry-After` hints are honoured un-jittered. |
 | `retry_max_delay_seconds` | string | No | `60` | Cap on any single retry sleep (exponential backoff / `Retry-After`). |
 | `verbose_http_logging` | string | No | `false` | Log every request and response line at INFO. Source data lands in the log stream — debugging only. |
 | `verbose_http_log_body_chars` | string | No | `500` | Response-body prefix length included in verbose logs. |
@@ -139,7 +139,7 @@ These are passed to the connector via the pipeline's `table_configuration` block
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `namespace` | — | Selects the `<Schema Namespace="...">` block that declares this entity set. Required only when the same entity-set name appears in multiple schemas. |
+| `namespace` | — | Selects the `<Schema Namespace="...">` block that declares this entity set; the schema's `Alias` is accepted interchangeably. Required only when the same entity-set name appears in multiple schemas. |
 | `cursor_field` | — | Column to drive incremental reads. Absent → snapshot. Must be naturally ordered by OData `$orderby` (timestamps and monotonic IDs are typical). On flat tables, the column must be a property of the entity. On contained paths, the connector first checks the leaf entity for the column; if missing, it walks leaf→root to find the **closest ancestor** that has it, filters at that ancestor level, and propagates the ancestor's cursor value onto every emitted leaf row. |
 | `select` | all properties | Comma-separated `$select` projection. Both the on-wire OData query and the derived Spark schema are filtered to these columns. On contained paths, synthetic ancestor-FK columns (default form `<seg>_<pk>`) are always preserved regardless of `select`. |
 | `filter` | — | Additional OData `$filter` expression, AND-ed with any cursor filter the connector generates. Applies to the leaf collection only on contained paths. |
@@ -359,7 +359,7 @@ Emitted: zero rows. Offset: `{"delta_link": "https://...users?$deltatoken=B"}` �
 
 OData v4 §13.4.3 defines `<NavigationProperty ContainsTarget="true">` on an EntityType: a collection that is *owned by* the parent entity rather than declared as a top-level EntitySet. The contained collection is addressed by traversing the parent's key — `GET Parent(<key>)/ContainedNavProp` — and each parent has its own independent contained collection. The protocol allows recursive containment, so a service can declare `Parent → Child → Grandchild → ...` chains.
 
-The connector surfaces these as double-underscore-pathed tables (`__` between segments — slash isn't valid in Spark SQL identifiers, which the framework uses for view names) alongside top-level entity sets, e.g. `Parents__Children__Notes`, up to **10 segments deep** (the depth cap prevents pathological discovery walks on services that declare circular containment; cycles within the cap are also detected and broken). Path parsing rejects empty segments and over-depth paths at `read_table_metadata` / `get_table_schema` time.
+The connector surfaces these as double-underscore-pathed tables (`__` between segments — slash isn't valid in Spark SQL identifiers, which the framework uses for view names) alongside top-level entity sets, e.g. `Parents__Children__Notes`, up to **10 segments deep** (the depth cap prevents pathological discovery walks on services that declare circular containment; cycles within the cap are also detected and broken). Path parsing rejects empty segments and over-depth paths at `read_table_metadata` / `get_table_schema` time. A top-level entity set whose own name contains `__` (legal in CSDL identifiers) is recognized verbatim and always read flat — the declared flat set wins over the containment-path interpretation of the same spelling.
 
 ### Discovery
 
@@ -400,7 +400,7 @@ Selected via `expand_contained`:
 
 Pagination (`@odata.nextLink`) walks happen *within* each per-parent fetch. Cost is O(product of parent fanouts) HTTP round trips; bandwidth is proportional to leaf row count plus a small overhead for the PK-only enumerations.
 
-Key predicate quoting: single-key parents use the bare form `(value)`; composite-key parents use the named form `(K1=v1,K2=v2)`. Quoting is decided by the property's **declared Edm type** from `$metadata` (`odata_literal_typed`): `Edm.Guid` (and numeric/date types the server may render as JSON strings) emit **bare** per the OData v4 ABNF — strict stacks (Olingo, SAP) 400 on a quoted guid predicate — while `Edm.String` keys are **always** single-quote-escaped and quoted, even when the value happens to look like a timestamp (`'2024-01-01'`). The same typed rendering covers the per-leaf-parent PK `$filter` and keyset-seek boundaries; only where the type can't be resolved does the older value-sniff (quote anything non-ISO-looking) apply.
+Key predicate quoting: single-key parents use the bare form `(value)`; composite-key parents use the named form `(K1=v1,K2=v2)`. Quoting is decided by the property's **declared Edm type** from `$metadata` (`odata_literal_typed`): `Edm.Guid` (and numeric/date types the server may render as JSON strings) emit **bare** per the OData v4 ABNF — strict stacks (Olingo, SAP) 400 on a quoted guid predicate — while `Edm.String` keys are **always** single-quote-escaped and quoted, even when the value happens to look like a timestamp (`'2024-01-01'`). The same typed rendering covers the per-leaf-parent PK `$filter` and keyset-seek boundaries; only where the type can't be resolved does the older value-sniff (quote anything non-ISO-looking) apply. Properties typed via a `<TypeDefinition>` resolve to their `UnderlyingType` first, so an `Edm.String`-backed definition quotes like any string.
 
 **Single `$expand` chain (`expand_contained=true`; `auto` — the default — on a preflight-verified server).** One HTTP request per pipeline trigger:
 

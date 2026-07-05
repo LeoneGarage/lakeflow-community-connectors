@@ -16,6 +16,7 @@ Two layers:
 
 import json
 import logging
+import os
 import re
 import time
 
@@ -1537,8 +1538,11 @@ def test_oauth2_user_flow_tracks_rotated_refresh_token():
 
 @responses.activate
 def test_oauth2_captures_expires_in_from_token_response():
-    """`expires_in` from the token endpoint is stored as a monotonic
-    deadline so the next request can pre-emptively refresh."""
+    """`expires_in` from the token endpoint is stored as a WALL-CLOCK
+    deadline so the next request can pre-emptively refresh. Wall clock,
+    not monotonic: the deadline rides the pickled connector to executors,
+    where the monotonic epoch is a different arbitrary origin — only
+    ``time.time()`` compares meaningfully across hosts."""
     _mock_metadata()
     responses.post(
         "https://idp.example.com/token",
@@ -1552,9 +1556,9 @@ def test_oauth2_captures_expires_in_from_token_response():
             "oauth2_client_secret": "secret",
         }
     )
-    before = time.monotonic()
+    before = time.time()
     c.list_tables()  # triggers session creation which mints the token
-    after = time.monotonic()
+    after = time.time()
     # Expires_at should be ~ now + 3600 - 60s buffer, accounting for test time.
     assert c._access_token_expires_at is not None
     assert before + 3600 - 60 - 1 <= c._access_token_expires_at <= after + 3600 - 60
@@ -1600,7 +1604,7 @@ def test_oauth2_preemptively_refreshes_when_token_near_expiry():
     # into the past to simulate post-expiry on the next request.
     session = c._get_session()
     assert session.headers["Authorization"] == "Bearer first"
-    c._access_token_expires_at = time.monotonic() - 1.0
+    c._access_token_expires_at = time.time() - 1.0
 
     list(c.read_table("Customers", None, {})[0])
     # No 401 in this scenario — pre-emptive refresh happened before send,
@@ -8716,12 +8720,19 @@ def _patch_sleep(monkeypatch):
 
     Returns the list the sleeps are appended into — tests assert on
     durations directly. The lambda short-circuits the real sleep so the
-    suite stays sub-second.
+    suite stays sub-second. Backoff jitter is pinned to its upper bound
+    (``random.uniform → 1.0``) so the captured durations are the
+    deterministic exponential sequence (1, 2, 4 …); jitter itself is
+    covered by ``test_backoff_delay_is_jittered``.
     """
     sleeps: list[float] = []
     monkeypatch.setattr(
         "databricks.labs.community_connector.sources.odata.odata.time.sleep",
         lambda s: sleeps.append(s),
+    )
+    monkeypatch.setattr(
+        "databricks.labs.community_connector.sources.odata.odata.random.uniform",
+        lambda a, b: b,
     )
     return sleeps
 
@@ -13903,7 +13914,7 @@ def test_connection_int_options_curated_validation():
 # ---------------------------------------------------------------------------
 
 
-def test_cache_paths_are_per_user_and_reader_checks_ownership(monkeypatch, tmp_path):
+def test_cache_paths_are_per_user_and_reader_checks_ownership(monkeypatch):
     """Both tempdir caches previously sat at predictable world-writable paths
     keyed only by service_url — the pickle one feeds pickle.load (arbitrary
     code execution if pre-planted by another local user), the JSON one could
@@ -13965,9 +13976,7 @@ def test_expand_ok_offset_carries_pass_only():
     assert c._merge_capability_caches({"cursor": "y"}, key)["expand_ok"] is True
     # Seed side: a false from an old (pre-fix) checkpoint is ignored.
     c2 = _make()
-    c2._seed_capability_caches(
-        "Roots__Mids__Leaves", None, {"cursor": "x", "expand_ok": False}
-    )
+    c2._seed_capability_caches("Roots__Mids__Leaves", None, {"cursor": "x", "expand_ok": False})
     assert not c2.__dict__.get("_expand_supported")
     c2._seed_capability_caches("Roots__Mids__Leaves", None, {"cursor": "x", "expand_ok": True})
     assert c2.__dict__["_expand_supported"] == {key: True}
@@ -14058,6 +14067,325 @@ def test_delta_stream_property_not_expected_in_payload():
     )
     with pytest.raises(RuntimeError, match="missing"):
         records, _ = c.read_table(
-            "Docs", {"delta_link": f"{SERVICE_URL}Docs?$deltatoken=t2"}, {"delta_tracking": "enabled"}
+            "Docs",
+            {"delta_link": f"{SERVICE_URL}Docs?$deltatoken=t2"},
+            {"delta_tracking": "enabled"},
         )
         list(records)
+
+
+# ---------------------------------------------------------------------------
+# Round-31 fixes: metadata process-cache TTL, symlink-safe cache writes,
+# TypeDefinition typing, __-named flat sets, 408 retry, auth_type-gated
+# refresh, wall-clock token deadline, jittered backoff, Decimal literals
+# ---------------------------------------------------------------------------
+
+
+METADATA_XML_V2 = METADATA_XML.replace('Name="Customers"', 'Name="CustomersV2"')
+
+
+@responses.activate
+def test_metadata_process_cache_honors_ttl(monkeypatch):
+    """The process-wide _METADATA_CACHE previously had NO TTL check — in a
+    long-running driver $metadata never refreshed regardless of the setting.
+    Entries are now stamped and expire after metadata_cache_ttl_seconds."""
+    from databricks.labs.community_connector.sources.odata import odata as odata_mod
+
+    responses.get(f"{SERVICE_URL}$metadata", body=METADATA_XML, status=200)
+    a = _make({"metadata_cache_ttl_seconds": "60"})
+    assert "Customers" in a.list_tables()
+
+    # Serve a changed document and jump past the TTL (both the process
+    # stamp and the on-disk mtime check read the same clock).
+    responses.replace(responses.GET, f"{SERVICE_URL}$metadata", body=METADATA_XML_V2, status=200)
+    real_time = odata_mod.time.time
+    monkeypatch.setattr(odata_mod.time, "time", lambda: real_time() + 61)
+    b = _make({"metadata_cache_ttl_seconds": "60"})
+    tables = b.list_tables()
+    assert "CustomersV2" in tables and "Customers" not in tables
+
+
+@responses.activate
+def test_metadata_cache_ttl_zero_disables_process_cache():
+    """metadata_cache_ttl_seconds=0 is documented as 'disable' but previously
+    only skipped the on-disk pickle — the process dict still served (and was
+    fed) stale documents. TTL 0 now bypasses the process layer entirely."""
+    responses.get(f"{SERVICE_URL}$metadata", body=METADATA_XML, status=200)
+    a = _make({"metadata_cache_ttl_seconds": "0"})
+    assert "Customers" in a.list_tables()
+
+    responses.replace(responses.GET, f"{SERVICE_URL}$metadata", body=METADATA_XML_V2, status=200)
+    b = _make({"metadata_cache_ttl_seconds": "0"})
+    tables = b.list_tables()
+    assert "CustomersV2" in tables and "Customers" not in tables
+
+
+def test_private_tmp_write_refuses_preplanted_symlink(tmp_path, monkeypatch):
+    """Cache writers previously opened a PREDICTABLE `{path}.{pid}.tmp` name
+    with plain open() — a pre-planted symlink there redirected the write onto
+    any victim-writable file (and os.replace then hid the evidence). The tmp
+    name now embeds os.urandom and opens O_CREAT|O_EXCL|O_NOFOLLOW, so a
+    planted name makes the write fail instead of following the link."""
+    from databricks.labs.community_connector.sources.odata import odata as odata_mod
+
+    victim = tmp_path / "victim.txt"
+    victim.write_bytes(b"precious")
+    target = tmp_path / "cache.json"
+    real_urandom = os.urandom
+    # Deterministic tmp name so the attacker (this test) can pre-plant it.
+    monkeypatch.setattr(odata_mod.os, "urandom", lambda n: b"\x00" * n)
+    planted = f"{target}.{odata_mod.os.getpid()}.{'00000000'}.tmp"
+    odata_mod.os.symlink(victim, planted)
+    try:
+        assert odata_mod._replace_with_private_tmp(str(target), b"attacker-view") is False
+        assert victim.read_bytes() == b"precious"  # not clobbered
+        assert not target.exists()
+    finally:
+        if odata_mod.os.path.lexists(planted):
+            odata_mod.os.remove(planted)
+
+    # Clean path: write lands atomically with owner-only permissions.
+    monkeypatch.setattr(odata_mod.os, "urandom", real_urandom)
+    assert odata_mod._replace_with_private_tmp(str(target), b"payload") is True
+    assert target.read_bytes() == b"payload"
+    assert (target.stat().st_mode & 0o777) == 0o600
+
+
+def test_capability_flush_writes_private_file():
+    """Wiring: the capability mirror goes through the hardened writer, so the
+    published file carries owner-only permissions (pre-fix: umask default)."""
+    from databricks.labs.community_connector.sources.odata import odata as odata_mod
+
+    path = odata_mod._capability_cache_path(SERVICE_URL)
+    odata_mod._capability_cache_flush(SERVICE_URL, "{}")
+    try:
+        assert (os.stat(path).st_mode & 0o777) == 0o600
+    finally:
+        os.remove(path)
+
+
+def test_cache_ownership_check_uses_lstat(tmp_path):
+    """The ownership check previously followed symlinks (os.stat): a foreign
+    symlink pointing at a victim-owned file passed. lstat judges the link
+    itself — pinned via a dangling symlink, where stat raises (False) but
+    lstat sees our own link (True; the subsequent open just misses)."""
+    from databricks.labs.community_connector.sources.odata import odata as odata_mod
+
+    dangling = tmp_path / "dangling"
+    dangling.symlink_to(tmp_path / "nonexistent-target")
+    assert odata_mod._cache_file_owned_by_us(str(dangling)) is True
+
+
+TYPEDEF_METADATA_XML = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="T" Alias="ta" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <TypeDefinition Name="Code" UnderlyingType="Edm.String"/>
+      <TypeDefinition Name="Qty" UnderlyingType="Edm.Int64"/>
+      <EntityType Name="Item">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="Code" Type="T.Code"/>
+        <Property Name="Qty" Type="ta.Qty"/>
+      </EntityType>
+      <EntityContainer Name="C">
+        <EntitySet Name="Items" EntityType="T.Item"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+
+@responses.activate
+def test_typedef_properties_resolve_to_underlying_edm_type():
+    """A property typed via <TypeDefinition> previously recorded the
+    definition name verbatim, falling out of typed literal rendering — an
+    ISO-looking string on an Edm.String-backed definition rendered BARE
+    (invalid predicate), the exact misfire typed rendering exists to stop.
+    The index now resolves definitions to their underlying primitive,
+    accepting both namespace- and alias-qualified references."""
+    from databricks.labs.community_connector.sources.odata._contained import (
+        odata_literal_typed,
+    )
+
+    responses.get(f"{SERVICE_URL}$metadata", body=TYPEDEF_METADATA_XML, status=200)
+    c = _make()
+    types = c._edm_types_for_table("Items", None)
+    assert types["Code"] == "Edm.String"
+    assert types["Qty"] == "Edm.Int64"
+    assert odata_literal_typed("2024-01-01", types["Code"]) == "'2024-01-01'"
+    assert odata_literal_typed("42", types["Qty"]) == "42"
+
+
+@responses.activate
+def test_namespace_option_accepts_schema_alias():
+    """CSDL lets type references use the schema Alias interchangeably with
+    its Namespace; the `namespace` table option now does too (previously an
+    alias failed with the type-only-schema error)."""
+    responses.get(f"{SERVICE_URL}$metadata", body=TYPEDEF_METADATA_XML, status=200)
+    c = _make()
+    schema = c.get_table_schema("Items", {"namespace": "ta"})
+    assert {f.name for f in schema.fields} >= {"Id", "Code", "Qty"}
+
+
+@responses.activate
+def test_list_tables_in_namespace_rejects_multi_segment():
+    """OData namespaces are single-level; a multi-segment path names nothing.
+    Previously segment[0]'s tables were returned, fabricating rows under a
+    nonexistent namespace path."""
+    _mock_metadata()
+    c = _make()
+    assert c.list_tables_in_namespace(["Demo"]) == ["Customers", "Orders"]
+    assert c.list_tables_in_namespace(["Demo", "bogus"]) == []
+    assert c.list_tables_in_namespace([]) == []
+
+
+DUNDER_SET_METADATA_XML = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="D" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Thing">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="Name" Type="Edm.String"/>
+      </EntityType>
+      <EntityContainer Name="C">
+        <EntitySet Name="My__Set" EntityType="D.Thing"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+
+@responses.activate
+def test_flat_entity_set_with_double_underscore_is_readable():
+    """CSDL SimpleIdentifiers legally allow consecutive underscores, so
+    list_tables can emit `My__Set` — but the read path previously split it
+    into a nonexistent containment path and failed with a misleading
+    "Entity set 'My' not found". A verbatim flat declaration now wins over
+    the containment-path interpretation everywhere."""
+    responses.get(f"{SERVICE_URL}$metadata", body=DUNDER_SET_METADATA_XML, status=200)
+    responses.get(
+        f"{SERVICE_URL}My__Set",
+        json={"value": [{"Id": 1, "Name": "x"}]},
+    )
+    c = _make()
+    assert "My__Set" in c.list_tables()
+    assert {f.name for f in c.get_table_schema("My__Set", {}).fields} == {"Id", "Name"}
+    rows, _ = c.read_table("My__Set", None, {"pagination": "nextlink"})
+    assert [r["Id"] for r in rows] == [1]
+
+
+@responses.activate
+def test_retry_408_treated_as_transient(monkeypatch):
+    """408 was in the probes' transient set but NOT the retry set — a flaky
+    proxy emitting 408s killed a read that a 503-emitting one survived. It
+    now retries like every other transient status."""
+    _mock_metadata()
+    sleeps = _patch_sleep(monkeypatch)
+    call_count = {"n": 0}
+
+    def _customers(request):  # pylint: disable=unused-argument
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return (408, {}, '{"error": "request timeout"}')
+        return (200, {}, '{"value": [{"Id": 1, "Name": "A"}]}')
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Customers", callback=_customers)
+    c = _make({"token": "t"})
+    rows, _ = c.read_table("Customers", None, {"pagination": "nextlink"})
+    assert [r["Id"] for r in rows] == [1]
+    assert call_count["n"] == 2
+    assert sleeps == [1.0]
+
+
+@responses.activate
+def test_basic_auth_401_with_leftover_oauth_options_stays_actionable():
+    """With auth_type=basic plus leftover oauth2 options, a 401 previously
+    minted a useless token (session.auth overwrites the header at prepare
+    time) and blamed 'the refreshed OAuth2 access token'. The refresh path
+    is now gated on auth_type=oauth2: no token mint, and the error points
+    at the basic credentials."""
+    _mock_metadata()
+    responses.get(f"{SERVICE_URL}Customers", json={"error": "denied"}, status=401)
+    token_calls = {"n": 0}
+
+    def _token(request):  # pylint: disable=unused-argument
+        token_calls["n"] += 1
+        return (200, {}, '{"access_token": "minted"}')
+
+    responses.add_callback(responses.POST, "https://idp.example.com/token", callback=_token)
+    c = _make(
+        {
+            "auth_type": "basic",
+            "username": "u",
+            "password": "p",
+            "oauth2_token_url": "https://idp.example.com/token",
+            "oauth2_client_id": "id",
+            "oauth2_client_secret": "secret",
+        }
+    )
+    with pytest.raises(PermissionError) as exc_info:
+        rows, _ = c.read_table("Customers", None, {"pagination": "nextlink"})
+        list(rows)
+    assert "refreshing the OAuth2 access token" not in str(exc_info.value)
+    assert token_calls["n"] == 0
+
+
+def test_backoff_delay_is_jittered(monkeypatch):
+    """Backoff multiplies by uniform(0.5, 1.0) so `num_partitions` tasks a
+    throttling source knocked back together don't retry in lockstep."""
+    c = _make()
+    monkeypatch.setattr(
+        "databricks.labs.community_connector.sources.odata.odata.random.uniform",
+        lambda a, b: a,
+    )
+    assert c._backoff_delay(1) == 1.0  # 2**1 = 2, floor of the jitter band
+    monkeypatch.setattr(
+        "databricks.labs.community_connector.sources.odata.odata.random.uniform",
+        lambda a, b: b,
+    )
+    assert c._backoff_delay(1) == 2.0  # ceiling: the pre-jitter value
+
+
+def test_decimal_nonfinite_renders_odata_wire_literals():
+    """Decimal('Infinity')/NaN previously fell through the float-only guard
+    and rendered Python's spellings (invalid on the wire)."""
+    from decimal import Decimal as _D
+
+    assert _odata_literal(_D("Infinity")) == "INF"
+    assert _odata_literal(_D("-Infinity")) == "-INF"
+    assert _odata_literal(_D("NaN")) == "NaN"
+    assert _odata_literal(_D("1.5")) == "1.5"
+
+
+DUPSET_METADATA_XML = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="D" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Thing">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+      </EntityType>
+      <EntityContainer Name="C1">
+        <EntitySet Name="Things" EntityType="D.Thing"/>
+      </EntityContainer>
+      <EntityContainer Name="C2">
+        <EntitySet Name="Things" EntityType="D.Thing"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+
+@responses.activate
+def test_duplicate_set_in_single_namespace_gets_precise_error():
+    """Same set name twice in ONE namespace (malformed CSDL): the old message
+    suggested the `namespace` option, which cannot disambiguate here."""
+    responses.get(f"{SERVICE_URL}$metadata", body=DUPSET_METADATA_XML, status=200)
+    c = _make()
+    with pytest.raises(ValueError, match="more than once in namespace"):
+        c.get_table_schema("Things", {})

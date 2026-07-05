@@ -57,7 +57,6 @@ from databricks.labs.community_connector.sources.odata._contained import (
     DEFAULT_PAGE_SIZE,
     _ancestor_pk_order_by,
     combine_filters,
-    parse_contained_path,
     resolve_segment_filters,
     validate_page_size,
 )
@@ -100,7 +99,7 @@ class PartitionMixin(SupportsPartitionedStream):
         them from ``self.options`` — safe because each
         ``LakeflowSource`` instance carries one table's options.
         """
-        if parse_contained_path(table_name) is None:
+        if self._table_segments(table_name) is None:
             return False
         opts = getattr(self, "options", {}) or {}
         # Fail fast at stream setup: a partitionable table never routes
@@ -123,7 +122,7 @@ class PartitionMixin(SupportsPartitionedStream):
         # cursor_field) clear this trivially.
         cursor_field = opts.get("cursor_field")
         if cursor_field:
-            segments = parse_contained_path(table_name) or [table_name]
+            segments = self._table_segments(table_name) or [table_name]
             namespace = opts.get("namespace")
             if self._find_cursor_level(segments, namespace, cursor_field) != 0:
                 return False
@@ -163,7 +162,7 @@ class PartitionMixin(SupportsPartitionedStream):
         # the probe walking under a stale/default mode can misread a
         # link-omitting server's short page as the whole top set.
         self._pagination = self._parse_pagination(opts)
-        segments = parse_contained_path(table_name) or [table_name]
+        segments = self._table_segments(table_name) or [table_name]
         namespace = opts.get("namespace")
         max_cursor = self._probe_top_level_max_cursor(segments, namespace, cursor_field, opts)
         prior = (start_offset or {}).get("cursor")
@@ -199,7 +198,7 @@ class PartitionMixin(SupportsPartitionedStream):
         single empty descriptor so ``read_partition`` falls through
         to the existing serial ``read_table`` semantics.
         """
-        if parse_contained_path(table_name) is None:
+        if self._table_segments(table_name) is None:
             # Flat table — let the existing serial path handle it.
             return [{}]
         opts = table_options or {}
@@ -231,7 +230,7 @@ class PartitionMixin(SupportsPartitionedStream):
             and self._expand_read_active(table_name, opts)
         ):
             return [{}]
-        segments = parse_contained_path(table_name) or [table_name]
+        segments = self._table_segments(table_name) or [table_name]
         namespace = opts.get("namespace")
         cursor_field = opts.get("cursor_field")
         self._pagination = self._parse_pagination(opts)
@@ -318,7 +317,7 @@ class PartitionMixin(SupportsPartitionedStream):
             # mode commits offsets via latest_offset, not per-read.
             records, _ = self.read_table(table_name, None, opts)
             return records
-        segments = parse_contained_path(table_name) or [table_name]
+        segments = self._table_segments(table_name) or [table_name]
         cursor_field = opts.get("cursor_field")
         self._pagination = self._parse_pagination(opts)
         # Parse THIS table's exclusion list before tagging rows — this entry

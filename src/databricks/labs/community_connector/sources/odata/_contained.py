@@ -350,10 +350,18 @@ def odata_literal(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, int | float | Decimal):
-        if isinstance(value, float) and not math.isfinite(value):
+        finite = (
+            value.is_finite()
+            if isinstance(value, Decimal)
+            else (isinstance(value, int) or math.isfinite(value))
+        )
+        if not finite:
             # OData ABNF spells these ``NaN`` / ``INF`` / ``-INF``;
-            # Python's ``nan`` / ``inf`` are not valid wire literals.
-            return "NaN" if math.isnan(value) else ("INF" if value > 0 else "-INF")
+            # Python's ``nan`` / ``inf`` / ``Decimal("Infinity")`` are
+            # not valid wire literals. (NaN check first — comparing a
+            # Decimal NaN with ``>`` raises InvalidOperation.)
+            nan = value.is_nan() if isinstance(value, Decimal) else math.isnan(value)
+            return "NaN" if nan else ("INF" if value > 0 else "-INF")
         # ``str(1e20)`` renders ``1e+20`` — the exponent's ``+`` must be
         # escaped like any literal ``+`` (form-decoding servers read a raw
         # query-string ``+`` as a space → malformed number → 400).
@@ -1492,7 +1500,7 @@ class ContainedNavMixin:
         ancestor of a contained path; ``None`` when the leaf owns it or
         the path is flat. Used by ``get_table_schema`` to add the column
         to the leaf schema."""
-        segments = parse_contained_path(table_name) or [table_name]
+        segments = self._table_segments(table_name) or [table_name]
         if len(segments) < 2:
             return None
         cursor_level = self._find_cursor_level(segments, namespace, cursor_field)
@@ -2059,7 +2067,7 @@ class ContainedNavMixin:
                 "error",
                 "cursor_probe=nested-expand needs the source to accept "
                 "$orderby/$top/$select inside $expand, but "
-                f"{self._build_contained_path(segments, full_chain)!r} rejected the probe "
+                f"{self._build_contained_path(segments, full_chain, namespace)!r} rejected the probe "
                 "query with an error (the server does not support these inner-$expand "
                 "options). Use cursor_probe=batch or cursor_probe=auto (which falls back "
                 "to $batch / the plain N+1 walk), or cursor_probe=false for the plain walk.",
@@ -2090,7 +2098,7 @@ class ContainedNavMixin:
         return (
             "error",
             "cursor_probe=nested-expand requires the source to honour $orderby/$top "
-            f"inside $expand, but {self._build_contained_path(segments, full_chain)!r} "
+            f"inside $expand, but {self._build_contained_path(segments, full_chain, namespace)!r} "
             f"returned {inner_max!r} as its newest {leaf_nav} via $expand when the "
             f"true newest is {direct_max!r} (direct navigation). This server "
             "silently mis-orders inner $expand, so cursor_probe would drop changed "
@@ -2467,7 +2475,7 @@ class ContainedNavMixin:
         mode = self._expand_contained_mode(table_options)
         if mode != "auto":
             return mode == "true"
-        segments = parse_contained_path(table_name)
+        segments = self._table_segments(table_name)
         if segments is None:
             return False  # flat table — nothing to expand
         return self._verify_expand_support(table_name, segments, table_options, start_offset)
@@ -2934,7 +2942,7 @@ class ContainedNavMixin:
         per parent) this keeps peak memory bounded by one page worth
         of rows rather than the whole result set.
         """
-        segments = parse_contained_path(table_name) or [table_name]
+        segments = self._table_segments(table_name) or [table_name]
         namespace = (table_options or {}).get("namespace")
         fk_columns = self._resolve_fk_columns(segments, namespace)
         segment_filters = resolve_segment_filters(table_options, segments)
@@ -3014,7 +3022,7 @@ class ContainedNavMixin:
         ``running_max_cursor`` in the offset; on chain completion it
         becomes the new ``cursor`` value.
         """
-        segments = parse_contained_path(table_name) or [table_name]
+        segments = self._table_segments(table_name) or [table_name]
         if len(segments) < 2:
             raise ValueError(f"expand_contained requires a contained path; {table_name!r} is flat.")
         namespace = (table_options or {}).get("namespace")
@@ -4501,7 +4509,7 @@ class ContainedNavMixin:
         for next-call resume. When the leaf entity doesn't declare
         ``cursor_field``, the closest ancestor that does owns the filter
         and its cursor value is propagated onto each leaf row."""
-        segments = parse_contained_path(table_name) or [table_name]
+        segments = self._table_segments(table_name) or [table_name]
         namespace = (table_options or {}).get("namespace")
         cursor_level = self._find_cursor_level(segments, namespace, cursor_field)
         if cursor_level == -1:
