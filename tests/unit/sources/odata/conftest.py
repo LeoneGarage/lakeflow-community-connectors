@@ -11,6 +11,7 @@ parsed tree into the next.
 import pytest
 
 from databricks.labs.community_connector.sources.odata.odata import (
+    _clear_capability_cache,
     _clear_metadata_cache,
 )
 
@@ -18,5 +19,10 @@ from databricks.labs.community_connector.sources.odata.odata import (
 @pytest.fixture(autouse=True)
 def _reset_odata_metadata_cache():
     _clear_metadata_cache()
+    # Same reuse problem for the process/file capability cache: tests share
+    # SERVICE_URL across cases whose mocked servers have different $batch /
+    # $expand behaviours, so one case's verdict must not leak into the next.
+    _clear_capability_cache()
     yield
     _clear_metadata_cache()
+    _clear_capability_cache()

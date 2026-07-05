@@ -114,7 +114,14 @@ def _drop_lb(offset):
     ``batch_ok`` / ``batch_size_ok`` / ``or_filter_ok``, one-time-set markers
     threaded across microbatches). Tests assert the cursor/resume state, not this
     bookkeeping — mirrors the no-progress comparison in ``_finalize_cursor_read``."""
-    _bookkeeping = {"lb_history", "cursor_probe_ok", "batch_ok", "batch_size_ok", "or_filter_ok"}
+    _bookkeeping = {
+        "lb_history",
+        "cursor_probe_ok",
+        "batch_ok",
+        "batch_size_ok",
+        "or_filter_ok",
+        "expand_ok",
+    }
     return {k: v for k, v in (offset or {}).items() if k not in _bookkeeping}
 
 
@@ -4027,7 +4034,7 @@ def test_pagination_auto_drains_snapshot_server_pages_below_top():
     rows, _ = c.read_table(
         "Parents__Children",
         None,
-        {"pagination": "auto", "page_size": "1000"},
+        {"pagination": "auto", "page_size": "1000", "expand_contained": "false"},
     )
     # auto drains every capped page — all 7 leaf rows, not just the first 3.
     assert [r["Id"] for r in rows] == [10, 11, 12, 13, 14, 15, 16]
@@ -5341,7 +5348,7 @@ def test_contained_ancestor_walks_force_pk_orderby_for_stable_skiptoken():
         responses.GET, f"{SERVICE_URL}Parents(1)/Children(10)/Notes", callback=_callback
     )
     c = _make()
-    records, _ = c.read_table("Parents__Children__Notes", None, {})
+    records, _ = c.read_table("Parents__Children__Notes", None, {"expand_contained": "false"})
     list(records)
     # Top-level + intermediate ancestor fetches both carry
     # ``$orderby=Id asc``. The leaf collection (Notes) doesn't need
@@ -5974,7 +5981,9 @@ def test_contained_incremental_first_call_no_filter():
         match_querystring=False,
     )
     c = _make()
-    records, offset = c.read_table("Parents__Children", {}, {"cursor_field": "ModifiedAt"})
+    records, offset = c.read_table(
+        "Parents__Children", {}, {"cursor_field": "ModifiedAt", "expand_contained": "false"}
+    )
     rows = list(records)
     assert len(rows) == 2
     assert _drop_lb(offset) == {"cursor": "2024-01-02T00:00:00Z"}
@@ -6346,7 +6355,9 @@ def test_contained_incremental_auto_drains_capped_leaf():
     seen, offset, batches = [], {}, 0
     while batches < 20:
         batches += 1
-        recs, new = c.read_table("Parents__Children", offset, {"cursor_field": "ModifiedAt"})
+        recs, new = c.read_table(
+            "Parents__Children", offset, {"cursor_field": "ModifiedAt", "expand_contained": "false"}
+        )
         got = [r["Id"] for r in recs]
         seen.extend(got)
         if not got or new == offset:
@@ -6381,7 +6392,7 @@ def test_contained_incremental_truncation_resume_uses_chain_cursor():
     records, offset = c.read_table(
         "Parents__Children",
         {"parent_idx": 0, "truncated_chain_cursor": "2024-01-01T00:00:00Z"},
-        {"cursor_field": "ModifiedAt"},
+        {"cursor_field": "ModifiedAt", "expand_contained": "false"},
     )
     rows = list(records)
     # Both chains' rows come through; offset is back to natural-completion shape.
@@ -6618,7 +6629,9 @@ def test_ancestor_cursor_incremental_filters_at_ancestor_level():
         json={"value": [{"Id": 200, "Text": "c"}]},
     )
     c = _make()
-    records, offset = c.read_table("Parents__Children__Notes", {}, {"cursor_field": "ModifiedAt"})
+    records, offset = c.read_table(
+        "Parents__Children__Notes", {}, {"cursor_field": "ModifiedAt", "expand_contained": "false"}
+    )
     rows = list(records)
     # All 3 leaf rows emitted; cursor value propagated from ancestor.
     assert len(rows) == 3
@@ -7788,6 +7801,7 @@ def test_cursor_probe_hydrates_only_dirty_parents():
             "cursor_field": "RecordLastModified",
             "cursor_probe": "nested-expand",
             "pagination": "nextlink",
+            "expand_contained": "false",
         },
     )
     rows = list(recs)
@@ -8209,6 +8223,241 @@ def test_cursor_probe_preflight_passes_when_inner_orderby_honored():
 
 
 @responses.activate
+def test_cursor_probe_misorder_verdict_shared_across_instances():
+    """Under the ``auto`` cascade a mis-order FAIL rides the process cache —
+    the offset only ever carries the pass, so without this a mis-ordering
+    server would re-pay the preflight GETs on every recreated reader."""
+    _mock_probe_metadata()
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Roots(1)/Mids",
+        callback=_probe_mids_callback("2020-02-01T00:00:00Z"),  # NOT the true max
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={
+            "value": [
+                {"RecordLastModified": "2020-09-01T00:00:00Z"},
+                {"RecordLastModified": "2020-05-01T00:00:00Z"},
+            ]
+        },
+    )
+    c1 = _make()
+    assert c1._verify_cursor_probe_support(
+        ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified", strict=False
+    ) == (False, False)
+    assert c1._cached_capability("cursor_probe_ok", table_name="Roots__Mids__Leaves") is False
+    n_before = len(responses.calls)
+    c2 = _make()
+    assert c2._verify_cursor_probe_support(
+        ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified", strict=False
+    ) == (False, False)
+    assert len(responses.calls) == n_before  # no preflight re-run
+
+
+@responses.activate
+def test_cursor_probe_conclusive_pass_shared_across_instances():
+    """A conclusive pass reaches a fresh instance through the process cache
+    even with no offset to carry ``cursor_probe_ok``."""
+    _mock_probe_metadata()
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Roots(1)/Mids",
+        callback=_probe_mids_callback("2020-09-01T00:00:00Z"),  # matches direct max
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={
+            "value": [
+                {"RecordLastModified": "2020-09-01T00:00:00Z"},
+                {"RecordLastModified": "2020-05-01T00:00:00Z"},
+            ]
+        },
+    )
+    c1 = _make()
+    assert c1._verify_cursor_probe_support(
+        ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified", strict=False
+    ) == (True, True)
+    n_before = len(responses.calls)
+    c2 = _make()
+    assert c2._verify_cursor_probe_support(
+        ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified", strict=False
+    ) == (True, True)
+    assert len(responses.calls) == n_before
+
+
+@responses.activate
+def test_cursor_probe_strict_ignores_shared_cache():
+    """Strict mode (explicit ``cursor_probe=nested-expand``) neither trusts nor
+    writes the shared cache: a cached False doesn't spare the probe (it runs
+    and passes on this healthy server), and the strict pass doesn't overwrite
+    the recorded verdict — explicit modes keep no recorded state."""
+    _mock_probe_metadata()
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Roots(1)/Mids",
+        callback=_probe_mids_callback("2020-09-01T00:00:00Z"),
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={
+            "value": [
+                {"RecordLastModified": "2020-09-01T00:00:00Z"},
+                {"RecordLastModified": "2020-05-01T00:00:00Z"},
+            ]
+        },
+    )
+    c = _make()
+    c._store_capability("cursor_probe_ok", False, table_name="Roots__Mids__Leaves")
+    n_before = len(responses.calls)
+    assert c._verify_cursor_probe_support(
+        ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified", strict=True
+    ) == (True, True)
+    assert len(responses.calls) > n_before  # the probe really ran
+    assert c._cached_capability("cursor_probe_ok", table_name="Roots__Mids__Leaves") is False
+
+
+@responses.activate
+def test_cursor_probe_strict_raises_despite_cached_pass():
+    """The inverse: a cached True must not let strict mode skip the probe — a
+    genuinely mis-ordering server still raises with fresh evidence."""
+    _mock_probe_metadata()
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Roots(1)/Mids",
+        callback=_probe_mids_callback("2020-02-01T00:00:00Z"),  # NOT the true max
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={
+            "value": [
+                {"RecordLastModified": "2020-09-01T00:00:00Z"},
+                {"RecordLastModified": "2020-05-01T00:00:00Z"},
+            ]
+        },
+    )
+    c = _make()
+    c._store_capability("cursor_probe_ok", True, table_name="Roots__Mids__Leaves")
+    with pytest.raises(ValueError, match=r"honour \$orderby/\$top inside \$expand"):
+        c._verify_cursor_probe_support(
+            ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified", strict=True
+        )
+
+
+@responses.activate
+def test_cursor_probe_race_newer_leaf_is_skipped_not_failed():
+    """A probe-shaped ``$expand`` newest NEWER than the direct-nav reference is
+    a concurrent-write race (the two fetches aren't atomic), not mis-ordering
+    evidence — a genuinely mis-ordering server returns an OLDER leaf. So the
+    sample is skipped like a non-discriminating one: the scan finds nothing
+    conclusive → inconclusive ``(True, False)`` (probe engages this batch, the
+    established safe default), and NOTHING is persisted (no false fail can be
+    pinned). One unlucky write must never abort the whole preflight or raise."""
+    _mock_probe_metadata()
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Roots(1)/Mids",
+        callback=_probe_mids_callback("2020-12-01T00:00:00Z"),  # NEWER than reference
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={
+            "value": [
+                {"RecordLastModified": "2020-09-01T00:00:00Z"},
+                {"RecordLastModified": "2020-05-01T00:00:00Z"},
+            ]
+        },
+    )
+    c = _make()
+    # Inconclusive, not a fail: supported (engage), non-conclusive (re-check).
+    assert c._verify_cursor_probe_support(
+        ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified", strict=False
+    ) == (True, False)
+    assert c._cached_capability("cursor_probe_ok", table_name="Roots__Mids__Leaves") is None
+    assert c.__dict__["_cursor_probe_verified"][(("Roots", "Mids", "Leaves"), None)] == (
+        None,
+        False,
+    )
+
+
+@responses.activate
+def test_cursor_probe_race_does_not_abort_scan_to_clean_sample():
+    """A racing sample must not abort the scan: with the first leaf-parent
+    racing (newer) and a second cleanly discriminating (probe returns the true
+    newest), the preflight skips the racer, reaches the clean parent, and
+    records a conclusive PASS — rather than being derailed by the race."""
+    _mock_probe_metadata()
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}, {"Id": 2}]})
+    # Parent 1: probe-shaped $expand newest is NEWER than reference → race/skip.
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Roots(1)/Mids",
+        callback=_probe_mids_callback("2020-12-01T00:00:00Z"),
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={
+            "value": [
+                {"RecordLastModified": "2020-09-01T00:00:00Z"},
+                {"RecordLastModified": "2020-05-01T00:00:00Z"},
+            ]
+        },
+    )
+    # Parent 2: probe newest MATCHES the reference max → clean conclusive pass.
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Roots(2)/Mids",
+        callback=_probe_mids_callback("2020-09-01T00:00:00Z"),
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(2)/Mids(10)/Leaves",
+        json={
+            "value": [
+                {"RecordLastModified": "2020-09-01T00:00:00Z"},
+                {"RecordLastModified": "2020-05-01T00:00:00Z"},
+            ]
+        },
+    )
+    c = _make()
+    assert c._verify_cursor_probe_support(
+        ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified", strict=False
+    ) == (True, True)
+    assert c._cached_capability("cursor_probe_ok", table_name="Roots__Mids__Leaves") is True
+
+
+@responses.activate
+def test_cursor_probe_strict_does_not_raise_on_race():
+    """Strict mode must not raise the pipeline on a transient concurrent-write
+    race: a newer-than-reference sample is skipped, and with no other sample the
+    scan is inconclusive → ``(True, False)``, not a raise."""
+    _mock_probe_metadata()
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Roots(1)/Mids",
+        callback=_probe_mids_callback("2020-12-01T00:00:00Z"),  # NEWER → race/skip
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={
+            "value": [
+                {"RecordLastModified": "2020-09-01T00:00:00Z"},
+                {"RecordLastModified": "2020-05-01T00:00:00Z"},
+            ]
+        },
+    )
+    c = _make()
+    assert c._verify_cursor_probe_support(
+        ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified", strict=True
+    ) == (True, False)
+
+
+@responses.activate
 def test_cursor_probe_read_table_raises_when_server_misorders_inner_expand():
     """Fail fast: when the inner ``$expand($orderby desc;$top=1)`` returns a
     non-newest leaf (server ignores inner ordering), read_table raises during
@@ -8417,6 +8666,7 @@ def test_leaf_cursor_plain_walk_lookback_keeps_overlap_rows():
             "cursor_probe": "false",  # plain N+1
             "pagination": "nextlink",
             "cursor_lookback_seconds": "86400",
+            "expand_contained": "false",
         },
     )
     rows = list(recs)
@@ -8519,7 +8769,12 @@ def test_cursor_probe_batch_hydrates_via_batch_endpoint():
     recs, offset = c.read_table(
         PROBE_TABLE,
         {"cursor": since},
-        {"cursor_field": "RecordLastModified", "cursor_probe": "batch", "pagination": "nextlink"},
+        {
+            "cursor_field": "RecordLastModified",
+            "cursor_probe": "batch",
+            "pagination": "nextlink",
+            "expand_contained": "false",
+        },
     )
     rows = list(recs)
     assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in rows] == [(1, 10, 1001)]
@@ -8747,7 +9002,9 @@ def test_contained_fetch_batch_snapshot_hydrates_via_batch():
     responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=responder)
 
     c = _make()
-    recs, offset = c.read_table("Parents__Children", {}, {})  # no cursor → snapshot
+    recs, offset = c.read_table(
+        "Parents__Children", {}, {"expand_contained": "false"}
+    )  # no cursor → snapshot
     rows = sorted((r["Parents_Id"], r["Id"]) for r in recs)
     assert rows == [(1, 11), (2, 21)]
     # The snapshot's terminal offset stays a bare {} — capability flags are NOT
@@ -8842,7 +9099,9 @@ def test_contained_fetch_batch_reader_stream_hydrates_via_batch():
 
     c = _make()
     # start_offset=None → LakeflowBatchReader path → _stream_contained_incremental
-    recs, offset = c.read_table("Parents__Children", None, {"cursor_field": "ModifiedAt"})
+    recs, offset = c.read_table(
+        "Parents__Children", None, {"cursor_field": "ModifiedAt", "expand_contained": "false"}
+    )
     assert [(r["Parents_Id"], r["Id"]) for r in recs] == [(1, 11)]
     assert _drop_lb(offset) == {}  # batch reader discards the offset
     assert any("Parents(1)/Children" in u for u in responder.seen)
@@ -8889,7 +9148,9 @@ def test_contained_fetch_numeric_chunks_batch_by_size():
     responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=responder)
 
     c = _make()
-    recs, _ = c.read_table("Parents__Children", {}, {"contained_fetch": "2"})
+    recs, _ = c.read_table(
+        "Parents__Children", {}, {"contained_fetch": "2", "expand_contained": "false"}
+    )
     assert sorted((r["Parents_Id"], r["Id"]) for r in recs) == [(1, 11), (2, 21), (3, 31)]
     # No per-parent GET to /Children — all hydration went through $batch.
     assert not any(
@@ -9287,6 +9548,780 @@ def test_contained_fetch_single_suppresses_auto_batch_cascade():
     )
     assert [(r["Roots_Id"], r["Plains_Id"], r["Id"]) for r in recs] == [(1, 5, 501)]
     assert not any(call.request.method == "POST" for call in responses.calls)
+
+
+# ---------------------------------------------------------------------------
+# expand_contained=auto — preflighted nested-$expand with N+1 fallback
+# ---------------------------------------------------------------------------
+
+_EXPAND_AUTO_OPTS = {
+    "cursor_field": "RecordLastModified",
+    "expand_contained": "auto",
+    "cursor_probe": "false",  # keep the N+1 fallback a plain walk (no $batch)
+    "pagination": "nextlink",
+}
+
+
+def _expand_auto_roots_callback(expand_body=None, expand_status=200):
+    """GET Roots callback: requests carrying ``$expand`` get ``expand_body`` /
+    ``expand_status``; plain requests (N+1 ancestor enumeration) get bare Ids."""
+    from urllib.parse import unquote
+
+    def _cb(request):
+        if "$expand" in unquote(request.url):
+            body = expand_body if expand_body is not None else {"value": [{"Id": 1}]}
+            return (expand_status, {}, json.dumps(body))
+        return (200, {}, json.dumps({"value": [{"Id": 1}]}))
+
+    return _cb
+
+
+@responses.activate
+def test_expand_contained_auto_uses_expand_when_supported():
+    """``auto`` preflights the real nested-$expand URL; a conclusive pass
+    (inline children at every level) runs the expand read and persists
+    ``expand_ok``, which a recreated reader uses to skip the preflight."""
+    from urllib.parse import unquote
+
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+    tree = {
+        "value": [
+            {
+                "Id": 1,
+                "Mids": [
+                    {
+                        "Id": 10,
+                        "Leaves": [{"Id": 1001, "RecordLastModified": "2020-06-01T00:00:00Z"}],
+                    }
+                ],
+            }
+        ]
+    }
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Roots",
+        callback=lambda request: (200, {}, json.dumps(tree)),
+    )
+    c = _make()
+    recs, offset = c.read_table(PROBE_TABLE, {"cursor": since}, dict(_EXPAND_AUTO_OPTS))
+    assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs] == [(1, 10, 1001)]
+    assert offset["cursor"] == "2020-06-01T00:00:00Z"
+    assert offset.get("expand_ok") is True
+    # Expand read: never a per-parent keyed GET (no N+1 ancestor walk).
+    assert not any("Roots(" in call.request.url for call in responses.calls)
+    # Exactly two $expand GETs: the preflight probe + the actual read.
+    n_expand = sum(1 for call in responses.calls if "$expand" in unquote(call.request.url))
+    assert n_expand == 2
+    # The preflight probe pins the top-level $top to 1 (small subtree).
+    probe_urls = [
+        unquote(c_.request.url) for c_ in responses.calls if "$top=1&" in unquote(c_.request.url)
+    ]
+    assert probe_urls  # probe present
+
+    # A RECREATED reader seeded from the offset skips the preflight entirely.
+    n_before = len(responses.calls)
+    c2 = _make()
+    recs2, _ = c2.read_table(PROBE_TABLE, offset, dict(_EXPAND_AUTO_OPTS))
+    list(recs2)
+    new_roots = [call for call in responses.calls[n_before:] if "/Roots?" in call.request.url]
+    assert len(new_roots) == 1  # just the read — no second probe
+
+
+@responses.activate
+def test_expand_contained_auto_falls_back_when_expand_ignored():
+    """A server that accepts the $expand URL but returns rows WITHOUT the
+    inline child collections would silently drop every deep row. The preflight
+    cross-checks direct navigation, sees the children exist, records the
+    definitive fail (``expand_ok=false``) and falls back to the N+1 walk."""
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+    responses.add_callback(
+        responses.GET, f"{SERVICE_URL}Roots", callback=_expand_auto_roots_callback()
+    )
+    # Serves both the preflight's direct-nav cross-check and the N+1 walk.
+    responses.get(f"{SERVICE_URL}Roots(1)/Mids", json={"value": [{"Id": 10}]})
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={"value": [{"Id": 1001, "RecordLastModified": "2020-06-01T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    recs, offset = c.read_table(PROBE_TABLE, {"cursor": since}, dict(_EXPAND_AUTO_OPTS))
+    assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs] == [(1, 10, 1001)]
+    assert offset.get("expand_ok") is False
+    # Fallback hydrated via per-parent GETs.
+    assert any(
+        call.request.method == "GET" and "Mids(10)/Leaves" in call.request.url
+        for call in responses.calls
+    )
+
+
+@responses.activate
+def test_expand_contained_auto_definitive_4xx_falls_back_and_persists():
+    """A hard 4xx on the expand URL is a definitive verdict: fall back to N+1
+    and persist ``expand_ok=false`` so the next microbatch skips the probe."""
+    from urllib.parse import unquote
+
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Roots",
+        callback=_expand_auto_roots_callback(
+            expand_body={"error": "expand not supported"}, expand_status=400
+        ),
+    )
+    responses.get(f"{SERVICE_URL}Roots(1)/Mids", json={"value": [{"Id": 10}]})
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={"value": [{"Id": 1001, "RecordLastModified": "2020-06-01T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    recs, offset = c.read_table(PROBE_TABLE, {"cursor": since}, dict(_EXPAND_AUTO_OPTS))
+    assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs] == [(1, 10, 1001)]
+    assert offset.get("expand_ok") is False
+    # A recreated reader seeded with the False verdict never retries $expand.
+    n_before = len(responses.calls)
+    c2 = _make()
+    list(c2.read_table(PROBE_TABLE, offset, dict(_EXPAND_AUTO_OPTS))[0])
+    assert not any("$expand" in unquote(call.request.url) for call in responses.calls[n_before:])
+
+
+@responses.activate
+def test_expand_contained_auto_transient_failure_not_persisted():
+    """A transient failure (503) on the expand preflight degrades THIS batch to
+    the N+1 walk but records NO verdict — the next batch re-probes instead of
+    pinning the stream to the fallback."""
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Roots",
+        callback=_expand_auto_roots_callback(expand_body={"detail": "busy"}, expand_status=503),
+    )
+    responses.get(f"{SERVICE_URL}Roots(1)/Mids", json={"value": [{"Id": 10}]})
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={"value": [{"Id": 1001, "RecordLastModified": "2020-06-01T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    recs, offset = c.read_table(PROBE_TABLE, {"cursor": since}, dict(_EXPAND_AUTO_OPTS))
+    assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs] == [(1, 10, 1001)]
+    assert "expand_ok" not in offset
+    assert "_expand_supported" not in c.__dict__
+    assert c._cached_capability("expand_ok", table_name=PROBE_TABLE) is None
+
+
+@responses.activate
+def test_expand_contained_default_is_auto():
+    """With ``expand_contained`` UNSET, contained reads default to ``auto``:
+    the preflight runs and a verified server is read via nested-$expand."""
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+    tree = {
+        "value": [
+            {
+                "Id": 1,
+                "Mids": [
+                    {
+                        "Id": 10,
+                        "Leaves": [{"Id": 1001, "RecordLastModified": "2020-06-01T00:00:00Z"}],
+                    }
+                ],
+            }
+        ]
+    }
+    responses.add_callback(
+        responses.GET, f"{SERVICE_URL}Roots", callback=lambda request: (200, {}, json.dumps(tree))
+    )
+    c = _make()
+    recs, offset = c.read_table(
+        PROBE_TABLE,
+        {"cursor": since},
+        {"cursor_field": "RecordLastModified", "pagination": "nextlink"},  # no expand_contained
+    )
+    assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs] == [(1, 10, 1001)]
+    assert offset.get("expand_ok") is True
+    assert not any("Roots(" in call.request.url for call in responses.calls)  # no N+1 walk
+
+
+@responses.activate
+def test_expand_contained_auto_inconclusive_falls_back_to_n1():
+    """An INCONCLUSIVE preflight must resolve to the N+1 shape, not expand.
+
+    The trap: a server that silently ignores ``$expand`` whose first sampled
+    branch is genuinely childless reads as inconclusive forever — assuming the
+    expand shape there would silently drop every OTHER branch's rows on every
+    batch. The safe resolution is N+1 for this batch (always correct), record
+    nothing, re-probe next batch."""
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+
+    def _roots_cb(request):
+        from urllib.parse import unquote
+
+        # $expand ignored by the server: rows come back with NO inline Mids —
+        # for the probe AND for any read. Two parents; the first is childless.
+        _ = unquote(request.url)
+        return (200, {}, json.dumps({"value": [{"Id": 1}, {"Id": 2}]}))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Roots", callback=_roots_cb)
+    # Preflight cross-check on the FIRST parent: genuinely childless → the
+    # probe cannot tell "ignored $expand" from "no children" → inconclusive.
+    responses.get(f"{SERVICE_URL}Roots(1)/Mids", json={"value": []})
+    # The second parent HAS children — only the N+1 walk can see them.
+    responses.get(f"{SERVICE_URL}Roots(2)/Mids", json={"value": [{"Id": 20}]})
+    responses.get(
+        f"{SERVICE_URL}Roots(2)/Mids(20)/Leaves",
+        json={"value": [{"Id": 2001, "RecordLastModified": "2020-06-01T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    recs, offset = c.read_table(PROBE_TABLE, {"cursor": since}, dict(_EXPAND_AUTO_OPTS))
+    # N+1 fallback found the second parent's leaf — the expand shape would
+    # have silently emitted nothing.
+    assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs] == [(2, 20, 2001)]
+    # Inconclusive: nothing recorded, nothing persisted — re-probed next batch.
+    assert "expand_ok" not in offset
+    assert "_expand_supported" not in c.__dict__
+    assert c._cached_capability("expand_ok", table_name=PROBE_TABLE) is None
+
+
+@responses.activate
+def test_snapshot_contained_stream_preflight_cached_across_microbatches():
+    """The user-visible fix the capability cache exists for: a contained
+    SNAPSHOT stream keeps its offsets bare (``{}``), so the ``expand_contained
+    =auto`` preflight can't ride the checkpoint — and the framework recreates
+    the connector instance each microbatch. The process-wide cache must make
+    microbatch 2 (fresh instance, bare offset) skip the probe entirely."""
+    from urllib.parse import unquote
+
+    _mock_probe_metadata()
+    tree = {
+        "value": [
+            {"Id": 1, "Mids": [{"Id": 10, "Leaves": [{"Id": 1001}]}]},
+        ]
+    }
+    responses.add_callback(
+        responses.GET, f"{SERVICE_URL}Roots", callback=lambda request: (200, {}, json.dumps(tree))
+    )
+    opts = {"pagination": "nextlink"}  # no cursor_field → snapshot; expand auto by default
+
+    # Microbatch 1: preflight probe + expand read = 2 $expand GETs; the
+    # terminal snapshot offset stays bare so the stream can quiesce.
+    c1 = _make()
+    recs1, offset1 = c1.read_table(PROBE_TABLE, {}, dict(opts))
+    assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs1] == [(1, 10, 1001)]
+    assert offset1 == {}
+    n_expand_1 = sum(1 for call in responses.calls if "$expand" in unquote(call.request.url))
+    assert n_expand_1 == 2
+
+    # Microbatch 2: FRESH instance, bare offset — the process cache serves the
+    # verdict, so exactly ONE more $expand GET (the read), no probe.
+    c2 = _make()
+    recs2, offset2 = c2.read_table(PROBE_TABLE, {}, dict(opts))
+    assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs2] == [(1, 10, 1001)]
+    assert offset2 == {}
+    n_expand_2 = sum(1 for call in responses.calls if "$expand" in unquote(call.request.url))
+    assert n_expand_2 == n_expand_1 + 1
+
+
+@responses.activate
+def test_snapshot_contained_stream_pin_false_purges_cache_then_auto_reprobes():
+    """The reset contract must hold for the SNAPSHOT path too (bare offsets that
+    the offset scrub never sees): auto records ``expand_ok`` → pinning ``false``
+    purges the shared cache on the very next read (not just an offset-carrying
+    transition) → re-selecting ``auto`` re-runs the preflight instead of reusing
+    the stale verdict."""
+    from urllib.parse import unquote
+
+    _mock_probe_metadata()
+    tree = {"value": [{"Id": 1, "Mids": [{"Id": 10, "Leaves": [{"Id": 1001}]}]}]}
+    responses.add_callback(
+        responses.GET, f"{SERVICE_URL}Roots", callback=_expand_auto_roots_callback(expand_body=tree)
+    )
+    responses.get(f"{SERVICE_URL}Roots(1)/Mids", json={"value": [{"Id": 10}]})
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={"value": [{"Id": 1001}]},
+        match_querystring=False,
+    )
+
+    def n_expand():
+        return sum(1 for c in responses.calls if "$expand" in unquote(c.request.url))
+
+    # Microbatch 1 — auto: preflight + read, verdict recorded in the cache.
+    c1 = _make()
+    list(c1.read_table(PROBE_TABLE, {}, {"pagination": "nextlink"})[0])
+    assert c1._cached_capability("expand_ok", table_name=PROBE_TABLE) is True
+
+    # Microbatch 2 — pinned false (still a bare-offset snapshot): the read
+    # purges the per-table verdict from the shared cache even though no offset
+    # carried it, and issues no $expand.
+    n_before = n_expand()
+    c2 = _make()
+    list(c2.read_table(PROBE_TABLE, {}, {"pagination": "nextlink", "expand_contained": "false"})[0])
+    assert n_expand() == n_before  # pinned false never expands
+    assert c2._cached_capability("expand_ok", table_name=PROBE_TABLE) is None  # purged
+
+    # Microbatch 3 — back to auto: nothing cached → the preflight RE-RUNS.
+    n_before = n_expand()
+    c3 = _make()
+    list(c3.read_table(PROBE_TABLE, {}, {"pagination": "nextlink"})[0])
+    assert n_expand() == n_before + 2  # probe + read, freshly re-verified
+
+
+@responses.activate
+def test_pin_false_on_one_table_leaves_sibling_table_verdict_intact():
+    """The snapshot purge is table-scoped: pinning ``expand_contained=false`` on
+    one contained table must not evict a SIBLING table's cached ``expand_ok``
+    (the drop of a per-table verdict touches only its own key)."""
+    _mock_probe_metadata()
+    c = _make()
+    c._store_capability("expand_ok", True, table_name="Roots__Mids__Leaves")
+    c._store_capability("expand_ok", True, table_name="Roots__Mids")
+    # Read the two-segment sibling pinned false → purges only its own entry.
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.get(f"{SERVICE_URL}Roots(1)/Mids", json={"value": [{"Id": 10}]})
+    list(
+        c.read_table("Roots__Mids", {}, {"pagination": "nextlink", "expand_contained": "false"})[0]
+    )
+    assert c._cached_capability("expand_ok", table_name="Roots__Mids") is None
+    assert c._cached_capability("expand_ok", table_name="Roots__Mids__Leaves") is True
+
+
+@responses.activate
+def test_capability_cache_shares_batch_verdict_across_instances():
+    """``batch_ok`` (and the discovered ``batch_size_ok`` cap) reach a fresh
+    instance through the process cache — the capability POST runs once per
+    process, not once per framework-recreated reader."""
+    responses.post(
+        f"{SERVICE_URL}$batch",
+        json={"responses": [{"id": "0", "status": 200, "body": {"value": []}}]},
+    )
+    c1 = _make()
+    assert c1._verify_batch_support(["Roots"], {}) is True
+    c1._shrink_batch_cap(100)  # discovered cap must travel with the verdict
+    discovered_cap = c1.__dict__["_batch_size_cap"]
+    n_posts = sum(1 for call in responses.calls if call.request.method == "POST")
+    assert n_posts == 1
+
+    c2 = _make()
+    assert c2._verify_batch_support(["Roots"], {}) is True
+    assert c2.__dict__["_batch_size_cap"] == discovered_cap
+    assert sum(1 for call in responses.calls if call.request.method == "POST") == n_posts
+
+
+@responses.activate
+def test_capability_cache_definitive_false_survives_process_cache_clear():
+    """A definitive fail is shared too, and the on-disk JSON mirror covers a
+    fresh process (simulated by clearing BOTH process-memory dicts — the verdict
+    cache and its mtime memo — while leaving the disk file intact): the fresh
+    'process' loads the verdict from the file instead of re-probing."""
+    from databricks.labs.community_connector.sources.odata.odata import (
+        _CAPABILITY_CACHE,
+        _CAPABILITY_DISK_MTIME,
+    )
+
+    responses.post(f"{SERVICE_URL}$batch", json={"error": "no batch"}, status=405)
+    c1 = _make()
+    assert c1._verify_batch_support(["Roots"], {}) is False
+    assert sum(1 for call in responses.calls if call.request.method == "POST") == 1
+
+    # Fresh process = empty verdict cache AND empty mtime memo (a real fork
+    # inherits both via copy-on-write; a brand-new process has neither). The
+    # disk file is untouched, so the reload rehydrates the verdict from it.
+    _CAPABILITY_CACHE.clear()
+    _CAPABILITY_DISK_MTIME.clear()
+    c2 = _make()
+    assert c2._verify_batch_support(["Roots"], {}) is False
+    assert sum(1 for call in responses.calls if call.request.method == "POST") == 1
+
+
+def test_scrub_nonauto_strips_offset_and_purges_server_wide_batch_cache():
+    """The offset scrub owns two things: (1) strip every non-``auto`` verdict
+    from the outgoing offset; (2) purge the SERVER-WIDE ``$batch`` verdicts from
+    the shared cache, but only on the transition (the offset still carries them)
+    — conservative, since they aren't table-scoped and a sibling table may have
+    a live ``auto`` consumer. The per-table verdicts are purged elsewhere (see
+    ``_purge_nonauto_table_verdicts``), so scrub must leave them in the cache."""
+    c = _make()
+    c._store_capability("expand_ok", True, table_name=PROBE_TABLE)
+    c._store_capability("batch_ok", True)
+    pinned = {"expand_contained": "false", "contained_fetch": "single", "cursor_probe": "false"}
+
+    # Offset always stripped of the pinned keys.
+    assert c._scrub_nonauto_verdicts({"cursor": "x", "expand_ok": True}, pinned) == {"cursor": "x"}
+    # Per-table ``expand_ok`` is NOT the offset scrub's job → left in the cache.
+    assert c._cached_capability("expand_ok", table_name=PROBE_TABLE) is True
+
+    # Steady state (no batch verdict in the offset) → server-wide cache kept.
+    assert c._scrub_nonauto_verdicts({"cursor": "x"}, pinned) == {"cursor": "x"}
+    assert c._cached_capability("batch_ok") is True
+
+    # Transition (offset carries batch_ok) → server-wide cache purged.
+    assert c._scrub_nonauto_verdicts({"cursor": "x", "batch_ok": True}, pinned) == {"cursor": "x"}
+    assert c._cached_capability("batch_ok") is None
+
+
+def test_purge_nonauto_table_verdicts_is_table_scoped_and_mode_gated():
+    """``_purge_nonauto_table_verdicts`` drops the per-table ``expand_ok`` /
+    ``cursor_probe_ok`` only when the governing option is non-``auto``, and only
+    for the named table."""
+    c = _make()
+    c._store_capability("expand_ok", True, table_name="Roots__Mids__Leaves")
+    c._store_capability("expand_ok", True, table_name="Roots__Mids")
+
+    # auto (unset) → no purge.
+    c._purge_nonauto_table_verdicts("Roots__Mids__Leaves", {"cursor_probe": "false"})
+    assert c._cached_capability("expand_ok", table_name="Roots__Mids__Leaves") is True
+
+    # pinned false → drops only this table's entry.
+    c._purge_nonauto_table_verdicts("Roots__Mids__Leaves", {"expand_contained": "false"})
+    assert c._cached_capability("expand_ok", table_name="Roots__Mids__Leaves") is None
+    assert c._cached_capability("expand_ok", table_name="Roots__Mids") is True
+
+
+# ---------------------------------------------------------------------------
+# expand_contained mode switches — streaming resume across false/true/auto
+# ---------------------------------------------------------------------------
+
+
+def _switch_opts(mode):
+    """Table options for the mode-switch tests: leaf cursor on PROBE_TABLE,
+    N+1 fallback kept a plain walk (no $batch), server-driven paging. The
+    ``auto`` cursor-lookback is disabled so the read filter equals the
+    committed watermark exactly — these tests assert the ``gt <watermark>``
+    literal to prove the switched mode resumed from the shared cursor key."""
+    return {
+        "cursor_field": "RecordLastModified",
+        "expand_contained": mode,
+        "cursor_probe": "false",
+        "pagination": "nextlink",
+        "cursor_lookback_seconds": "off",
+    }
+
+
+def _switch_tree(leaf_id, ts):
+    """One-root/one-mid $expand response whose single leaf is ``leaf_id``."""
+    return {
+        "value": [
+            {"Id": 1, "Mids": [{"Id": 10, "Leaves": [{"Id": leaf_id, "RecordLastModified": ts}]}]}
+        ]
+    }
+
+
+def _expand_urls():
+    from urllib.parse import unquote
+
+    return [unquote(c.request.url) for c in responses.calls if "$expand" in unquote(c.request.url)]
+
+
+@responses.activate
+@pytest.mark.parametrize("second_mode", ["true", "auto"])
+def test_expand_contained_switch_false_to_expand_resumes_from_watermark(second_mode):
+    """Batch 1 reads N+1 (``expand_contained=false``) and commits a watermark;
+    switching to ``true`` (or ``auto``) resumes from that same ``cursor`` key —
+    the expand read filters ``gt <watermark>`` and picks up exactly the new
+    rows, no re-ingest of batch 1's rows, no error."""
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Roots",
+        callback=_expand_auto_roots_callback(
+            expand_body=_switch_tree(1002, "2020-07-01T00:00:00Z")
+        ),
+    )
+    responses.get(f"{SERVICE_URL}Roots(1)/Mids", json={"value": [{"Id": 10}]})
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={"value": [{"Id": 1001, "RecordLastModified": "2020-06-01T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    # Batch 1: N+1 walk.
+    c1 = _make()
+    recs1, offset1 = c1.read_table(PROBE_TABLE, {"cursor": since}, _switch_opts("false"))
+    assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs1] == [(1, 10, 1001)]
+    assert offset1["cursor"] == "2020-06-01T00:00:00Z"
+    assert not _expand_urls()  # pure N+1 so far
+
+    # Batch 2: switched mode, resumed from batch 1's checkpoint.
+    c2 = _make()
+    recs2, offset2 = c2.read_table(PROBE_TABLE, offset1, _switch_opts(second_mode))
+    assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs2] == [(1, 10, 1002)]
+    assert offset2["cursor"] == "2020-07-01T00:00:00Z"
+    # The expand read resumed from the SHARED watermark, not from scratch.
+    assert any("gt 2020-06-01T00:00:00Z" in u for u in _expand_urls())
+    # No stale N+1 resume state rides forward.
+    for stale in ("parent_idx", "chain_next_link", "truncated_chain_cursor"):
+        assert stale not in offset2
+
+
+@responses.activate
+def test_expand_contained_switch_true_to_false_resumes_from_watermark():
+    """The reverse switch: batch 1 reads via $expand and commits a watermark;
+    ``expand_contained=false`` resumes from it — the N+1 leaf walk filters
+    ``gt <watermark>`` and no $expand request is ever issued again."""
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Roots",
+        callback=_expand_auto_roots_callback(
+            expand_body=_switch_tree(1001, "2020-06-01T00:00:00Z")
+        ),
+    )
+    responses.get(f"{SERVICE_URL}Roots(1)/Mids", json={"value": [{"Id": 10}]})
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={"value": [{"Id": 1002, "RecordLastModified": "2020-07-01T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    # Batch 1: explicit expand read.
+    c1 = _make()
+    recs1, offset1 = c1.read_table(PROBE_TABLE, {"cursor": since}, _switch_opts("true"))
+    assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs1] == [(1, 10, 1001)]
+    assert offset1["cursor"] == "2020-06-01T00:00:00Z"
+    n_expand_batch1 = len(_expand_urls())
+    assert n_expand_batch1 >= 1
+
+    # Batch 2: N+1, resumed from the expand checkpoint.
+    c2 = _make()
+    recs2, offset2 = c2.read_table(PROBE_TABLE, offset1, _switch_opts("false"))
+    assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs2] == [(1, 10, 1002)]
+    assert offset2["cursor"] == "2020-07-01T00:00:00Z"
+    assert len(_expand_urls()) == n_expand_batch1  # no $expand after the switch
+    # The leaf walk filtered from the shared watermark.
+    from urllib.parse import unquote
+
+    leaf_urls = [
+        unquote(c.request.url) for c in responses.calls if "Mids(10)/Leaves" in c.request.url
+    ]
+    assert any("gt 2020-06-01T00:00:00Z" in u for u in leaf_urls)
+
+
+@responses.activate
+def test_expand_truncation_offset_switch_to_false_ignores_pending_fetches():
+    """MID-FLIGHT switch: the expand read truncated (parked ``pending_fetches``
+    + ``running_max_cursor``, watermark held). Switching to ``false`` must
+    ignore the parked expand state, re-read from the HELD watermark (re-emitted
+    rows are MERGE-deduped downstream — never loss), and drop the stale expand
+    keys from the outgoing offset so they can't resurrect on a later switch
+    back."""
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.get(f"{SERVICE_URL}Roots(1)/Mids", json={"value": [{"Id": 10}]})
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={"value": [{"Id": 1001, "RecordLastModified": "2020-06-01T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    truncated = {
+        "cursor": since,  # watermark held while the chain was in flight
+        "running_max_cursor": "2020-06-05T00:00:00Z",
+        "pending_fetches": [
+            {
+                "url": f"{SERVICE_URL}Roots?$marker=stale",
+                "level": 0,
+                "chain": [],
+                "cur_val": None,
+                "skip": 0,
+            }
+        ],
+    }
+    c = _make()
+    recs, offset = c.read_table(PROBE_TABLE, dict(truncated), _switch_opts("false"))
+    assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs] == [(1, 10, 1001)]
+    assert offset["cursor"] == "2020-06-01T00:00:00Z"
+    # The parked expand work queue was never resumed...
+    assert not any("marker=stale" in c_.request.url for c_ in responses.calls)
+    # ...and neither expand key leaks into the N+1 checkpoint.
+    assert "pending_fetches" not in offset
+    assert "running_max_cursor" not in offset
+    # Read floor came from the held watermark, not the in-flight running max.
+    from urllib.parse import unquote
+
+    leaf_urls = [unquote(c_.request.url) for c_ in responses.calls if "Leaves" in c_.request.url]
+    assert any(f"gt {since}" in u for u in leaf_urls)
+
+
+@responses.activate
+def test_n1_truncation_offset_switch_to_true_ignores_parent_idx():
+    """MID-FLIGHT switch, other direction: the N+1 walk truncated (parked
+    ``parent_idx``, watermark held). Switching to ``true`` must ignore the N+1
+    resume state, read the full $expand from the HELD watermark (parent 0's
+    unread rows are re-covered — never skipped), and drop ``parent_idx`` from
+    the outgoing offset."""
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Roots",
+        callback=_expand_auto_roots_callback(
+            expand_body=_switch_tree(1001, "2020-06-01T00:00:00Z")
+        ),
+    )
+    truncated = {"cursor": since, "parent_idx": 1}  # watermark held at truncation
+    c = _make()
+    recs, offset = c.read_table(PROBE_TABLE, dict(truncated), _switch_opts("true"))
+    # parent_idx=1 would have SKIPPED Root 1 — the expand read must not honour it.
+    assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs] == [(1, 10, 1001)]
+    assert offset["cursor"] == "2020-06-01T00:00:00Z"
+    assert "parent_idx" not in offset
+    assert any(f"gt {since}" in u for u in _expand_urls())
+
+
+@responses.activate
+def test_expand_contained_auto_pin_unpin_lifecycle_across_stream():
+    """Full verdict lifecycle over three microbatches of one stream:
+    ``auto`` records ``expand_ok`` (offset + shared cache) → pinning ``false``
+    reads N+1, scrubs the flag from the checkpoint AND purges the shared cache
+    → re-selecting ``auto`` re-runs the preflight from scratch. Rows flow
+    correctly at every step."""
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Roots",
+        callback=_expand_auto_roots_callback(
+            expand_body=_switch_tree(1001, "2020-06-01T00:00:00Z")
+        ),
+    )
+    responses.get(f"{SERVICE_URL}Roots(1)/Mids", json={"value": [{"Id": 10}]})
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={"value": [{"Id": 1002, "RecordLastModified": "2020-07-01T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    # Microbatch 1 — auto: preflight + expand read, verdict recorded twice.
+    c1 = _make()
+    recs1, off1 = c1.read_table(PROBE_TABLE, {"cursor": since}, _switch_opts("auto"))
+    assert [(r["Id"]) for r in recs1] == [1001]
+    assert off1.get("expand_ok") is True
+    assert c1._cached_capability("expand_ok", table_name=PROBE_TABLE) is True
+
+    # Microbatch 2 — pinned false: N+1 read; the switch scrubs the checkpoint
+    # flag and purges the shared cache entry.
+    c2 = _make()
+    n_expand_before = len(_expand_urls())
+    recs2, off2 = c2.read_table(PROBE_TABLE, off1, _switch_opts("false"))
+    assert [(r["Id"]) for r in recs2] == [1002]
+    assert off2["cursor"] == "2020-07-01T00:00:00Z"
+    assert "expand_ok" not in off2
+    assert len(_expand_urls()) == n_expand_before  # pinned false never expands
+    assert c2._cached_capability("expand_ok", table_name=PROBE_TABLE) is None
+
+    # Microbatch 3 — back to auto: nothing recorded anywhere → the preflight
+    # RE-RUNS (probe + read = two more $expand GETs), then re-records.
+    c3 = _make()
+    recs3, off3 = c3.read_table(PROBE_TABLE, off2, _switch_opts("auto"))
+    list(recs3)
+    assert len(_expand_urls()) == n_expand_before + 2
+    assert off3.get("expand_ok") is True
+
+
+def test_expand_contained_nonauto_scrubs_expand_ok():
+    """An explicit non-``auto`` ``expand_contained`` scrubs the recorded
+    ``expand_ok`` verdict, so re-selecting ``auto`` re-runs the preflight;
+    ``auto`` — explicit or the unset default — keeps it."""
+    c = _make()
+    off = {"cursor": "x", "expand_ok": True}
+    assert c._scrub_nonauto_verdicts(off, {"expand_contained": "false"}) == {"cursor": "x"}
+    assert c._scrub_nonauto_verdicts(off, {"expand_contained": "true"}) == {"cursor": "x"}
+    assert c._scrub_nonauto_verdicts(off, {}) == off  # unset default is auto → kept
+    assert c._scrub_nonauto_verdicts(off, {"expand_contained": "auto"}) == off
+
+
+@responses.activate
+def test_is_partitioned_expand_auto_follows_preflight_verdict():
+    """``expand_contained=auto`` partition activation follows the RESOLVED
+    shape: a verified server (expand read, no fan-out) is not partitioned;
+    explicit ``true`` never is; explicit ``false``/unset always may be."""
+    _mock_probe_metadata()
+    tree = {
+        "value": [
+            {
+                "Id": 1,
+                "Mids": [
+                    {
+                        "Id": 10,
+                        "Leaves": [{"Id": 1001, "RecordLastModified": "2020-06-01T00:00:00Z"}],
+                    }
+                ],
+            }
+        ]
+    }
+    responses.add_callback(
+        responses.GET, f"{SERVICE_URL}Roots", callback=lambda request: (200, {}, json.dumps(tree))
+    )
+    c = _make({"expand_contained": "auto"})
+    assert c.is_partitioned(PROBE_TABLE) is False  # preflight verified → expand shape
+    # The batch get_partitions reuses the cached verdict → serial deferral.
+    assert c.get_partitions(PROBE_TABLE, {"expand_contained": "auto"}) == [{}]
+    assert _make({"expand_contained": "true"}).is_partitioned(PROBE_TABLE) is False
+    assert _make().is_partitioned(PROBE_TABLE) is False  # unset default = auto → verified
+    assert _make({"expand_contained": "false"}).is_partitioned(PROBE_TABLE) is True
+
+
+@responses.activate
+def test_is_partitioned_expand_auto_fallback_stays_partitionable():
+    """When the ``auto`` preflight fails (server ignores ``$expand``), the
+    table resolves to the N+1 shape and KEEPS its partitioned parallelism —
+    both activation and the batch ``get_partitions`` fan-out."""
+    _mock_probe_metadata()
+    responses.add_callback(
+        responses.GET, f"{SERVICE_URL}Roots", callback=_expand_auto_roots_callback()
+    )
+    # Preflight cross-check finds real children → definitive ignored-$expand.
+    responses.get(f"{SERVICE_URL}Roots(1)/Mids", json={"value": [{"Id": 10}]})
+    c = _make({"expand_contained": "auto"})
+    assert c.is_partitioned(PROBE_TABLE) is True
+    parts = c.get_partitions(PROBE_TABLE, {"expand_contained": "auto"})
+    assert parts and "top_parent_rows" in parts[0]  # real partition fan-out
+
+
+@responses.activate
+def test_partitioned_pin_false_resets_shared_verdict_via_partition_path():
+    """The reset contract must hold on the PARTITION path too. A partitionable
+    contained snapshot pinned ``expand_contained=false`` streams through
+    ``is_partitioned`` / ``get_partitions`` (never ``read_table``), so those
+    must purge the per-table shared-cache verdict — otherwise a later switch
+    back to ``auto`` would reuse a stale verdict without re-probing."""
+    from urllib.parse import unquote
+
+    _mock_probe_metadata()
+    tree = {"value": [{"Id": 1, "Mids": [{"Id": 10, "Leaves": [{"Id": 1001}]}]}]}
+    responses.add_callback(
+        responses.GET, f"{SERVICE_URL}Roots", callback=lambda r: (200, {}, json.dumps(tree))
+    )
+
+    # auto snapshot: the preflight records expand_ok=True in the shared cache.
+    c_auto = _make({"expand_contained": "auto"})
+    assert c_auto._expand_read_active(PROBE_TABLE, {"expand_contained": "auto"}) is True
+    assert c_auto._cached_capability("expand_ok", table_name=PROBE_TABLE) is True
+
+    # Pinned false, partitionable snapshot: is_partitioned purges the verdict
+    # (it would otherwise never be reset — this path skips read_table).
+    c_false = _make({"expand_contained": "false"})
+    assert c_false.is_partitioned(PROBE_TABLE) is True
+    assert c_false._cached_capability("expand_ok", table_name=PROBE_TABLE) is None
+
+    # And get_partitions on the pinned-false path resets it too (idempotent).
+    c_auto._store_capability("expand_ok", True, table_name=PROBE_TABLE)  # re-seed
+    c_false2 = _make({"expand_contained": "false"})
+    c_false2.get_partitions(PROBE_TABLE, {"expand_contained": "false"})
+    assert c_false2._cached_capability("expand_ok", table_name=PROBE_TABLE) is None
+
+    # Switching back to auto now genuinely re-probes (nothing cached).
+    n_before = sum(1 for c in responses.calls if "$expand" in unquote(c.request.url))
+    c_reauto = _make({"expand_contained": "auto"})
+    assert c_reauto.is_partitioned(PROBE_TABLE) is False  # verified → expand shape
+    assert sum(1 for c in responses.calls if "$expand" in unquote(c.request.url)) > n_before
 
 
 # ---------------------------------------------------------------------------

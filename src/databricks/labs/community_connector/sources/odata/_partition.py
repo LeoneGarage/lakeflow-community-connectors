@@ -11,9 +11,11 @@ Activation policy (``is_partitioned``):
 
 * Contained paths only (depth >= 2). Flat tables aren't usefully
   partitionable without prior knowledge of the keyspace distribution.
-* ``expand_contained=false`` (the N+1 model). With
-  ``expand_contained=true`` the whole table is one HTTP — no fan-out
-  to parallelise.
+* ``expand_contained`` resolves to the N+1 model — explicit ``false``,
+  or ``auto`` (the default) whose behavioural preflight fell back to
+  N+1. With ``expand_contained=true`` (or an ``auto`` preflight that
+  verified ``$expand``) the whole table is one HTTP — no fan-out to
+  parallelise, so it is not partitioned.
 * Delta-tracking is off. The server-driven delta link is stateful
   and can't be split across executors.
 * For *streaming* reads (``latest_offset`` path), additionally the
@@ -89,7 +91,14 @@ class PartitionMixin(SupportsPartitionedStream):
         if parse_contained_path(table_name) is None:
             return False
         opts = getattr(self, "options", {}) or {}
-        if opts.get("expand_contained", "false").strip().lower() == "true":
+        # Reset any per-table shared-cache verdict pinned non-``auto`` here too:
+        # a partitionable table streams through the partition path (this →
+        # get_partitions → read_partition), never read_table, so without this
+        # the reset would never fire for it and a later switch back to ``auto``
+        # would reuse a stale verdict. Table-scoped + idempotent (see
+        # ``_purge_nonauto_table_verdicts``); a no-op under ``auto``.
+        self._purge_nonauto_table_verdicts(table_name, opts)
+        if self._expand_contained_mode(opts) == "true":
             return False
         if self._delta_setting(opts) != "disabled":
             return False
@@ -102,7 +111,14 @@ class PartitionMixin(SupportsPartitionedStream):
             namespace = opts.get("namespace")
             if self._find_cursor_level(segments, namespace, cursor_field) != 0:
                 return False
-        return True
+        # ``expand_contained=auto`` follows its RESOLVED shape: the preflight
+        # verdict decides (single-$expand read → no fan-out to parallelise →
+        # not partitioned; N+1 fallback → partitionable). Checked LAST so the
+        # probe only runs for tables every cheap gate above already admitted;
+        # the instance cache dedupes it across is_partitioned/get_partitions
+        # within one setup. A transient preflight failure resolves to the N+1
+        # (partitioned) shape for this stream — correct, just parallel.
+        return not self._expand_read_active(table_name, opts)
 
     def latest_offset(
         self,
@@ -162,13 +178,32 @@ class PartitionMixin(SupportsPartitionedStream):
             # Flat table — let the existing serial path handle it.
             return [{}]
         opts = table_options or {}
-        if opts.get("expand_contained", "false").strip().lower() == "true":
+        # Reset any per-table shared-cache verdict pinned non-``auto`` on the
+        # partition path too (called every microbatch for a partitioned stream,
+        # which never reaches read_table's reset). Table-scoped + idempotent;
+        # a no-op under ``auto``.
+        self._purge_nonauto_table_verdicts(table_name, opts)
+        if self._expand_contained_mode(opts) == "true":
             return [{}]
         if self._delta_setting(opts) != "disabled":
             return [{}]
         if start_offset == end_offset and start_offset is not None:
             # Streaming: no new data — no work to partition.
             return []
+        # ``expand_contained=auto`` on the BATCH invocation (no offsets)
+        # follows its resolved shape: expand verified → a single empty
+        # descriptor defers to the serial ``read_table`` (which re-uses the
+        # cached verdict); preflight fail → partitionable N+1 below. The
+        # STREAMING invocation never re-probes: ``is_partitioned`` already
+        # resolved the shape at stream setup, and a divergent verdict here
+        # (e.g. a transient flip) would pair the partitioned reader with a
+        # ``[{}]`` descriptor — an uncapped serial read per microbatch.
+        if (
+            start_offset is None
+            and end_offset is None
+            and self._expand_read_active(table_name, opts)
+        ):
+            return [{}]
         segments = parse_contained_path(table_name) or [table_name]
         namespace = opts.get("namespace")
         cursor_field = opts.get("cursor_field")

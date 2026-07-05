@@ -141,7 +141,7 @@ These are passed to the connector via the pipeline's `table_configuration` block
 | `page_size` | `1000` | Value of `$top` sent on each HTTP request. Sets the maximum rows per OData page. Some servers cap this server-side (see *Known limits*). |
 | `max_records_per_batch` | `10000` | Client-side cap on records returned per `read_table` call. The connector truncates and returns control to the framework once this limit is hit. Independent of `page_size`. |
 | `delta_tracking` | `disabled` | Opt-in OData v4 delta queries. `disabled` keeps the existing snapshot / cursor behavior; `auto` probes the server's `Prefer: odata.track-changes` support once per table and falls back if missing; `enabled` requires support and errors on the first read if the server doesn't acknowledge. See [Delta tracking](#delta-tracking-contract). Mutually exclusive with contained-path tables. |
-| `expand_contained` | `false` | For contained-collection paths (`Parent__Child__...`). When `true`, a single `GET Parent?$expand=Child(...)` replaces the default N+1 per-parent traversal. See [Contained navigation properties](#contained-navigation-properties). |
+| `expand_contained` | `auto` | For contained-collection paths (`Parent__Child__...`). `auto` (default) preflights the server's nested-`$expand` support and uses a single `GET Parent?$expand=Child(...)` when verified, else the N+1 per-parent traversal; `true` forces the `$expand` read, `false` forces N+1. See [Contained navigation properties](#contained-navigation-properties). |
 
 `namespace` is consumed by the connector before the request is built; the rest all influence the URL, the per-batch loop, or the request semantics.
 
@@ -376,7 +376,7 @@ When an ancestor has a composite primary key, every key column gets its own `<se
 
 Selected via `expand_contained`:
 
-**Default — N+1 traversal (`expand_contained=false`).** For a path `A/B/C/D`:
+**N+1 traversal (`expand_contained=false`; `auto`'s fallback).** For a path `A/B/C/D`:
 
 1. `GET A?$select=<A_pks>&$top=<page_size>` — enumerate top-level parent keys.
 2. For each `A_key`: `GET A(<A_key>)/B?$select=<B_pks>` — enumerate level-2 parents.
@@ -387,7 +387,7 @@ Pagination (`@odata.nextLink`) walks happen *within* each per-parent fetch. Cost
 
 Key predicate quoting: single-key parents use the bare form `(value)`; composite-key parents use the named form `(K1=v1,K2=v2)`. String values pass through `_odata_literal` for single-quote escaping; timestamps pass through bare per OData v4 §5.1.1.6.1.
 
-**Opt-in — single `$expand` chain (`expand_contained=true`).** One HTTP request per pipeline trigger:
+**Single `$expand` chain (`expand_contained=true`; `auto` — the default — on a preflight-verified server).** One HTTP request per pipeline trigger:
 
 ```
 GET A?$select=...&$top=...&$expand=B($expand=C($expand=D))

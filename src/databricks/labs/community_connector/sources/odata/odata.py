@@ -47,6 +47,7 @@ import logging
 import os
 import pickle
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -280,6 +281,174 @@ def _clear_metadata_cache() -> None:
     try:
         for entry in os.listdir(tmpdir):
             if entry.startswith("odata_csdl_") and entry.endswith(".pickle"):
+                try:
+                    os.remove(os.path.join(tmpdir, entry))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+# Process-wide capability-verdict cache, keyed by service_url — same
+# lifecycle problem as ``_METADATA_CACHE``: SDP recreates the connector
+# instance per microbatch / ``.load()``, so instance caches don't survive,
+# and the paths that keep their offsets bare (contained snapshot streams)
+# or have no offset at all (the batch reader behind pipeline snapshot
+# refreshes) would otherwise re-run their preflight probes on every read.
+# Entry shape: ``{"batch_ok": bool, "batch_size_ok": int,
+# "or_filter_ok": bool, "expand_ok": {table_name: bool}}`` — the
+# server-wide verdicts flat, the per-table nested-$expand verdict keyed by
+# contained path (different nesting depths can verify differently).
+_CAPABILITY_CACHE: dict[str, dict] = {}
+
+# On-disk mirror of the capability cache (JSON, not pickle — plain data
+# only). Covers the forked-worker gap the process dict can't (PySpark may
+# fork a fresh daemon worker per ``.load()``), so a pipeline refresh with N
+# contained snapshot tables pays each probe once, not N times. The TTL is
+# much longer than the CSDL cache's (a capability verdict is a couple of
+# booleans that only change when the SERVER is upgraded, and the
+# offset-persisted copies of these same verdicts never expire at all);
+# an explicit non-``auto`` mode switch purges the entry immediately (see
+# ``_scrub_nonauto_verdicts``), so re-selecting ``auto`` still re-probes.
+_CAPABILITY_FILE_CACHE_TTL_SECONDS = 900
+
+# Per-service mtime of the on-disk mirror the last time this process merged it
+# into ``_CAPABILITY_CACHE``. Lets ``_capability_cache_load`` skip the re-read +
+# re-parse when the file hasn't changed since — so the hot lookup on the
+# offset-less paths (snapshot / batch reader, once per table per microbatch) is
+# a single ``stat`` rather than a full JSON parse. A sibling worker's write
+# bumps the mtime and is picked up on the next load.
+_CAPABILITY_DISK_MTIME: dict[str, float] = {}
+
+
+def _capability_cache_path(service_url: str) -> str:
+    """Tempdir path for the capability-verdict JSON of ``service_url``."""
+    digest = hashlib.sha256(service_url.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(tempfile.gettempdir(), f"odata_caps_{digest}.json")
+
+
+def _capability_cache_write(path: str, data: dict) -> None:
+    """Atomically rewrite the on-disk mirror: write a temp file then
+    ``os.replace`` it into place, so a concurrent worker never observes a
+    half-written file (the naive truncate-in-place did). The temp name is unique
+    per process AND per thread, so two concurrent streaming queries on one driver
+    don't clobber each other's temp mid-write. Best-effort — a read-only tempdir
+    just leaves the process cache authoritative — and the temp file is cleaned up
+    on failure. Updates the mtime memo so the writing process doesn't immediately
+    re-read its own write."""
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return
+    try:
+        _CAPABILITY_DISK_MTIME[path] = os.path.getmtime(path)
+    except OSError:
+        pass
+
+
+def _capability_cache_load(service_url: str) -> dict:
+    """The cached capability verdicts for ``service_url``: the process-wide
+    entry, hydrated from the on-disk JSON (when fresh) for keys the process
+    hasn't determined itself. Returns the live process entry (mutable). The
+    disk file is re-parsed only when its mtime changed since the last merge
+    (see :data:`_CAPABILITY_DISK_MTIME`); otherwise this is just a ``stat``."""
+    entry = _CAPABILITY_CACHE.setdefault(service_url, {})
+    path = _capability_cache_path(service_url)
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return entry  # no file yet — process entry stands alone
+    if mtime < time.time() - _CAPABILITY_FILE_CACHE_TTL_SECONDS:
+        return entry  # stale on disk — ignore it (process entry stands)
+    if _CAPABILITY_DISK_MTIME.get(path) == mtime:
+        return entry  # already merged this exact disk state
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            disk = json.load(fh)
+    except (OSError, ValueError):
+        return entry  # missing/corrupt file — the process entry stands alone
+    if isinstance(disk, dict):
+        for key, value in disk.items():
+            if key == "expand_ok" and isinstance(value, dict):
+                entry["expand_ok"] = {**value, **entry.get("expand_ok", {})}
+            else:
+                entry.setdefault(key, value)
+    _CAPABILITY_DISK_MTIME[path] = mtime
+    return entry
+
+
+def _capability_cache_store(service_url: str, key: str, value, table_name: str | None = None):
+    """Record one capability verdict in the process cache and atomically
+    rewrite the on-disk mirror. ``expand_ok`` verdicts are per-table
+    (``table_name`` required); everything else is server-wide."""
+    entry = _capability_cache_load(service_url)
+    if table_name is not None:
+        entry.setdefault(key, {})[table_name] = value
+    else:
+        entry[key] = value
+    _capability_cache_write(_capability_cache_path(service_url), entry)
+
+
+def _cap_dict_has(container: dict, key: str, table_name: str | None) -> bool:
+    """Whether ``container`` holds the verdict identified by ``key`` (+ optional
+    ``table_name`` for a per-table map) — the guard that keeps a purge from
+    rewriting the file when there is nothing to remove."""
+    if key not in container:
+        return False
+    if table_name is None:
+        return True
+    value = container[key]
+    return isinstance(value, dict) and table_name in value
+
+
+def _cap_dict_drop(container: dict, key: str, table_name: str | None) -> None:
+    """Remove one verdict from a cache dict in place. With ``table_name`` and a
+    per-table map, drop only that table's entry (leaving sibling tables intact);
+    otherwise drop the whole key."""
+    if table_name is not None and isinstance(container.get(key), dict):
+        container[key].pop(table_name, None)
+    else:
+        container.pop(key, None)
+
+
+def _capability_cache_drop(service_url: str, keys: set[str], table_name: str | None = None) -> None:
+    """Purge ``keys`` from the cached verdicts of ``service_url`` (process AND
+    disk) — called when an explicit non-``auto`` mode leaves a recorded verdict
+    the user asked to forget, so the shared cache can't resurrect it. With
+    ``table_name`` the per-table verdicts (``expand_ok`` / ``cursor_probe_ok``)
+    drop only that table's entry, leaving sibling tables' verdicts intact;
+    without it the whole key is dropped (server-wide verdicts, or a
+    table-agnostic reset).
+
+    Goes through :func:`_capability_cache_load` for the authoritative merged
+    view, so when nothing matches it returns without touching the file — and
+    that check is a bare ``stat`` while the mtime is unchanged (the common
+    steady-state pinned read every microbatch), not a full JSON parse."""
+    entry = _capability_cache_load(service_url)
+    if not any(_cap_dict_has(entry, k, table_name) for k in keys):
+        return  # nothing recorded anywhere — no rewrite
+    for key in keys:
+        _cap_dict_drop(entry, key, table_name)
+    _capability_cache_write(_capability_cache_path(service_url), entry)
+
+
+def _clear_capability_cache() -> None:
+    """Clear the in-process capability cache and remove any on-disk JSON
+    files. Tests use this between cases that reuse a ``service_url`` with
+    different mocked server behaviours."""
+    _CAPABILITY_CACHE.clear()
+    _CAPABILITY_DISK_MTIME.clear()
+    tmpdir = tempfile.gettempdir()
+    try:
+        for entry in os.listdir(tmpdir):
+            if entry.startswith("odata_caps_") and entry.endswith(".json"):
                 try:
                     os.remove(os.path.join(tmpdir, entry))
                 except OSError:
@@ -758,14 +927,31 @@ class ODataLakeflowConnect(
                     "to top-level entity sets). Set delta_tracking=disabled "
                     "or ingest the parent set directly."
                 )
-            if self._expand_contained_active(opts):
+            # Reset any per-table shared-cache verdict whose option is pinned
+            # non-``auto`` before resolving the read, so a switch back to
+            # ``auto`` re-probes even on the bare-offset snapshot / batch-reader
+            # paths (the offset scrub only sees offset-carrying reads).
+            self._purge_nonauto_table_verdicts(table_name, opts)
+            # ``expand_contained``: ``true`` forces the nested-$expand read;
+            # ``auto`` attempts it behind a one-shot behavioural preflight
+            # (real expand URL + inline-containment cross-check; verdict
+            # persisted as ``expand_ok``) and falls back to the N+1 branches
+            # below when the server can't be trusted with $expand. The same
+            # resolver drives partition activation, so an ``auto`` table that
+            # falls back to N+1 stays partitionable.
+            if self._expand_read_active(table_name, opts, start_offset):
                 # Cursor-based expand keeps a default $top (page_size);
                 # snapshot expand omits $top when page_size is unset.
                 if opts.get("cursor_field"):
                     opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
-                return self._with_capabilities(
-                    self._read_contained_expand(table_name, start_offset, opts), opts
-                )
+                    return self._with_capabilities(
+                        self._read_contained_expand(table_name, start_offset, opts), opts
+                    )
+                # Snapshot expand: same bare-``{}`` terminal-offset rule as
+                # the N+1 snapshot below (quiesce on ``end == start``); the
+                # preflight verdict rides the process/file capability cache
+                # instead of the offset.
+                return self._read_contained_expand(table_name, start_offset, opts)
             if opts.get("cursor_field"):
                 # Cursor-based read: default page_size so a $top is sent.
                 # Snapshot (the branch below) leaves it unset → no $top.
@@ -781,8 +967,9 @@ class ODataLakeflowConnect(
             # quiesces on ``end == start``; merging flags would turn the first
             # trigger's ``{}`` into ``{"batch_ok": …}`` and buy one extra full
             # snapshot re-read before settling. The batch reader discards the
-            # offset anyway, and the per-read preflight POST is noise next to
-            # a full snapshot walk.
+            # offset anyway. Preflight dedup across framework-recreated
+            # instances comes from the process/file capability cache instead
+            # (see ``_CAPABILITY_CACHE``), which needs no offset channel.
             return self._read_contained_snapshot(table_name, opts)
         # Offset-shape check ahead of the delta predicate so a resumed
         # delta stream (offset carries delta_link / next_link) takes the
@@ -823,6 +1010,8 @@ class ODataLakeflowConnect(
             self.__dict__["_batch_supported"] = bool(off["batch_ok"])
         if "batch_size_ok" in off:
             self.__dict__["_batch_size_cap"] = int(off["batch_size_ok"])
+        if "expand_ok" in off:
+            self.__dict__["_expand_supported"] = bool(off["expand_ok"])
 
     def _merge_capability_caches(self, offset: dict) -> dict:
         """Thread the per-instance OR / $batch / batch-size verdicts into the
@@ -841,13 +1030,37 @@ class ODataLakeflowConnect(
             add["batch_ok"] = self.__dict__["_batch_supported"]
         if "_batch_size_cap" in self.__dict__ and "batch_size_ok" not in offset:
             add["batch_size_ok"] = self.__dict__["_batch_size_cap"]
+        if "_expand_supported" in self.__dict__ and "expand_ok" not in offset:
+            add["expand_ok"] = self.__dict__["_expand_supported"]
         return {**offset, **add} if add else offset
+
+    def _cached_capability(self, key: str, table_name: str | None = None):
+        """The process/file-cached verdict for ``key`` (``None`` when
+        undetermined). Consulted by the ``_verify_*`` preflights AFTER the
+        offset flag and the instance cache, BEFORE probing — so a connector
+        instance the framework recreates each microbatch (or a forked batch
+        worker within the file-cache TTL) skips the probe even on paths
+        that carry no offset (contained snapshot streams, the batch
+        reader)."""
+        entry = _capability_cache_load(self.service_url)
+        value = entry.get(key)
+        if table_name is not None:
+            return value.get(table_name) if isinstance(value, dict) else None
+        return value
+
+    def _store_capability(self, key: str, value, table_name: str | None = None) -> None:
+        """Mirror a freshly determined DEFINITIVE verdict into the
+        process/file capability cache (see :data:`_CAPABILITY_CACHE`).
+        Callers keep the transient-vs-definitive discipline — a transient
+        outcome must record nothing anywhere, so it never reaches here."""
+        _capability_cache_store(self.service_url, key, value, table_name)
 
     def _scrub_nonauto_verdicts(self, offset: dict, table_options: dict | None) -> dict:
         """Drop persisted preflight verdicts whose governing option is **not**
         ``auto``, so re-selecting ``auto`` later re-runs the preflight instead of
         reusing a stale verdict. ``cursor_probe`` owns its nested-``$expand``
-        probe verdict (``cursor_probe_ok``). The ``$batch`` verdicts
+        probe verdict (``cursor_probe_ok``); ``expand_contained`` owns the
+        expand-read capability verdict (``expand_ok``). The ``$batch`` verdicts
         (``batch_ok`` / ``batch_size_ok``) are **shared**: ``contained_fetch``'s
         full walks AND the ``cursor_probe`` ``auto`` cascade's hydrate both read
         and refresh them — so they're kept while ANY auto-mode consumer is live
@@ -865,6 +1078,11 @@ class ODataLakeflowConnect(
         cp_mode = self._cursor_probe_mode(table_options)
         if cp_mode != "auto":
             drop.add("cursor_probe_ok")
+        # ``expand_contained`` owns the nested-$expand verdict (``expand_ok``):
+        # an explicit ``true``/``false`` (or the unset ``false`` default)
+        # scrubs it so a later switch to ``auto`` re-runs the preflight.
+        if self._expand_contained_mode(table_options) != "auto":
+            drop.add("expand_ok")
         batch_live = self._contained_fetch_is_auto(table_options) or (
             cp_mode == "auto" and not self._contained_fetch_forces_single(table_options)
         )
@@ -872,7 +1090,39 @@ class ODataLakeflowConnect(
             drop |= {"batch_ok", "batch_size_ok"}
         if not drop:
             return offset
+        # Shared-cache reset for the SERVER-WIDE ``$batch`` verdicts only:
+        # a value actually present in the offset means the user just switched
+        # this option away from ``auto`` (the transition batch). These keys
+        # aren't table-scoped, so purge conservatively — transition-driven —
+        # to avoid churning a sibling table's live ``auto`` consumer. The
+        # per-table verdicts (``expand_ok`` / ``cursor_probe_ok``) are reset
+        # separately and unconditionally by ``_purge_nonauto_table_verdicts``
+        # (table-scoped, so it also safely covers the bare-offset snapshot /
+        # batch-reader paths this offset scrub can't see).
+        recorded_batch = drop & {"batch_ok", "batch_size_ok"} & offset.keys()
+        if recorded_batch:
+            _capability_cache_drop(self.service_url, recorded_batch)
         return {k: v for k, v in offset.items() if k not in drop}
+
+    def _purge_nonauto_table_verdicts(self, table_name: str, table_options: dict | None) -> None:
+        """Reset the per-table shared-cache verdicts (``expand_ok`` /
+        ``cursor_probe_ok``) whose governing option is pinned non-``auto``, so a
+        later switch back to ``auto`` re-runs the preflight rather than reusing
+        the cached verdict. Unlike the offset scrub, this runs on **every**
+        contained read — not just an offset-carrying transition — so it also
+        covers the contained snapshot stream and the batch reader, whose bare /
+        absent offsets can't trigger the scrub. Table-scoped (pinning one table
+        never disturbs a sibling's verdict) and idempotent (a no-op, no file
+        rewrite, once the entry is gone)."""
+        if self._expand_contained_mode(table_options) != "auto":
+            _capability_cache_drop(self.service_url, {"expand_ok"}, table_name=table_name)
+        if self._cursor_probe_mode(table_options) != "auto":
+            segments = _parse_contained_path(table_name)
+            if segments is not None:
+                key = self._cursor_probe_shared_key(
+                    segments, (table_options or {}).get("namespace")
+                )
+                _capability_cache_drop(self.service_url, {"cursor_probe_ok"}, table_name=key)
 
     def _with_capabilities(self, result: tuple, table_options: dict | None = None) -> tuple:
         """Wrap a ``(records, offset)`` read result, threading capability verdicts
@@ -1670,6 +1920,10 @@ class ODataLakeflowConnect(
         cached = self.__dict__.get("_or_filter_ok")
         if cached is not None:
             return cached
+        cached = self._cached_capability("or_filter_ok")
+        if cached is not None:
+            self.__dict__["_or_filter_ok"] = cached
+            return cached
         ok = True
         seek = _pg_keyset_filter(order_keys, sample_row)
         if seek is not None and " or " in seek:
@@ -1688,6 +1942,7 @@ class ODataLakeflowConnect(
             except Exception:  # transport error ≠ unsupported — defer to the real seek
                 ok = True
         self.__dict__["_or_filter_ok"] = ok
+        self._store_capability("or_filter_ok", ok)
         return ok
 
     def _client_paginate_pages(

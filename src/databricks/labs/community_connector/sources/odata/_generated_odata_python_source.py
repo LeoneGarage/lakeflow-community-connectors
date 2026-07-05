@@ -60,6 +60,7 @@ import logging
 import math
 import requests
 import tempfile
+import threading
 
 
 def register_lakeflow_source(spark):
@@ -699,6 +700,15 @@ def register_lakeflow_source(spark):
     # allowing the read (inconclusive). Bounds the preflight's request cost.
     _CURSOR_PROBE_PREFLIGHT_SCAN = 50
 
+    # Instance-cache ``problem`` message stamped when a per-instance cursor_probe
+    # verdict is rehydrated from the shared process/file cache as a definitive fail
+    # (the original preflight message isn't cached across instances). Only surfaced
+    # if a same-instance strict call reuses it — non-strict callers just fall back.
+    _CURSOR_PROBE_SHARED_FAIL = (
+        "cursor_probe nested-$expand support was previously found unreliable on this "
+        "server (cached verdict); using the $batch / plain N+1 fallback."
+    )
+
     # Max GET sub-requests packed into one OData ``$batch`` request by the
     # ``cursor_probe=batch`` / ``auto``-fallback hydrate. A hard cap — some Smart
     # Default ``$batch`` chunk size: the batched walk packs leaf-parent reads (and
@@ -715,6 +725,12 @@ def register_lakeflow_source(spark):
     # headroom for servers (e.g. Hexagon Smart API) that cap a batch around 100 parts.
     _BATCH_SHRINK_FACTOR = 0.75
     _BATCH_OVERFLOW_RETRIES = 10
+
+    # Page budget for the ``expand_contained=auto`` preflight GET. Small on
+    # purpose: ``compute_dynamic_tops`` floors every inner ``$expand`` level at
+    # ``MIN_DYNAMIC_TOP`` (5) and the top-level ``$top`` is rewritten to 1, so the
+    # probe response is one shallow subtree, not a real page.
+    _EXPAND_PREFLIGHT_PAGE = "25"
 
     # HTTP statuses that say nothing definitive about a server's capabilities —
     # throttling and transient server-side failures. A capability preflight that
@@ -1237,12 +1253,37 @@ def register_lakeflow_source(spark):
 
         # --- option parsing ----------------------------------------------------
 
+        def _expand_contained_mode(self, table_options: dict[str, str] | None) -> str:
+            """Parse the ``expand_contained`` table option: ``true``, ``false``,
+            or ``auto`` (**default** when unset).
+
+            ``auto`` attempts the nested-``$expand`` read first: a one-shot
+            behavioural preflight (:meth:`_verify_expand_support`) issues the real
+            expand URL — with the same inner ``$top``/``$orderby``/``$filter``
+            constructs the read would send — and verifies the server actually
+            returns inline child collections (cross-checked against direct
+            navigation, so a server that accepts the URL but silently ignores
+            ``$expand`` is caught). ONLY a conclusive pass runs the expand read;
+            anything else — a definitive failure, a transient blip, or an
+            inconclusive sample — **falls back** to the N+1 walks
+            (``expand_contained=false``) for that batch, never raising on a
+            capability shortfall and never assuming ``$expand`` works before the
+            verdict is in. The verdict persists in the resume offset as
+            ``expand_ok`` (mirrors ``batch_ok``); any non-``auto`` value scrubs
+            it so re-selecting ``auto`` re-runs the preflight."""
+            raw = ((table_options or {}).get("expand_contained") or "auto").strip().lower()
+            if raw not in {"true", "false", "auto"}:
+                raise ValueError(
+                    f"Invalid expand_contained={raw!r}. Expected one of: true, false, auto."
+                )
+            return raw
+
         def _expand_contained_active(self, table_options: dict[str, str] | None) -> bool:
-            """Parse the boolean ``expand_contained`` table option."""
-            raw = ((table_options or {}).get("expand_contained") or "false").strip().lower()
-            if raw not in {"true", "false"}:
-                raise ValueError(f"Invalid expand_contained={raw!r}. Expected one of: true, false.")
-            return raw == "true"
+            """``True`` only for an explicit ``expand_contained=true`` (the strict
+            opt-in). ``auto`` returns ``False`` here — validation gates that key on
+            this (e.g. the ``cursor_probe`` conflict check) must not fire for
+            ``auto``, whose expand attempt silently degrades instead."""
+            return self._expand_contained_mode(table_options) == "true"
 
         def _cursor_probe_mode(self, table_options: dict[str, str] | None) -> str:
             """Parse the ``cursor_probe`` table option into a leaf-cursor read
@@ -2005,10 +2046,18 @@ def register_lakeflow_source(spark):
             *conclusive* pass is also persisted in the resume offset as
             ``cursor_probe_ok``; when a prior batch's offset carries it, the
             preflight requests are skipped entirely. Only a conclusive pass is
-            trusted this way. An *inconclusive* result — no leaf-parent yet has
-            ``>= 2`` distinct leaf cursors, so ordering can't cause a miss — is
-            re-checked every batch, so a server that begins to mis-order once its
-            data grows discriminating is still caught.
+            trusted this way. Under the non-strict ``auto`` cascade BOTH
+            definitive outcomes additionally ride the process/file capability
+            cache (per contained path) — the offset never carries a fail, so
+            without it a mis-ordering server would re-pay the preflight GETs on
+            every framework-recreated reader. Strict mode neither consults nor
+            records the shared cache (an explicit mode keeps no recorded
+            verdicts, and its error must carry fresh evidence). An *inconclusive*
+            result — no leaf-parent yet has ``>= 2`` distinct leaf cursors, so
+            ordering can't cause a miss — is re-checked every batch, so a server
+            that begins to mis-order once its data grows discriminating is still
+            caught; a race-contaminated sample (see
+            :meth:`_cursor_probe_check_sample`) likewise records nothing.
 
             ``(supported, conclusive)``: ``supported`` is ``True`` via the persisted
             offset flag or any non-mis-ordering preflight verdict; ``conclusive`` is
@@ -2021,15 +2070,55 @@ def register_lakeflow_source(spark):
             cache = self.__dict__.setdefault("_cursor_probe_verified", {})
             cache_key = (tuple(segments), namespace)
             if cache_key not in cache:
-                cache[cache_key] = self._run_cursor_probe_preflight(
-                    segments, namespace, table_options, cursor_field
+                # Process/file capability cache — ``auto`` cascade only. The
+                # strict mode (``cursor_probe=nested-expand``) is an explicit
+                # non-``auto`` selection: it neither consults nor records the
+                # shared verdict (same rule as the offset scrub) and re-probes
+                # so its error carries fresh, actionable evidence. Both
+                # definitive outcomes are shared: a conclusive pass AND a
+                # mis-ordering fail (otherwise ``auto`` against a mis-ordering
+                # server would re-pay the preflight GETs on every framework-
+                # recreated reader — the offset only ever carries the pass). A
+                # shared hit fills the per-instance cache (like the other
+                # verifiers) so repeat calls this instance skip the file read.
+                shared_key = self._cursor_probe_shared_key(segments, namespace)
+                shared = (
+                    None
+                    if strict
+                    else self._cached_capability("cursor_probe_ok", table_name=shared_key)
                 )
+                if shared is True:
+                    cache[cache_key] = (None, True)
+                elif shared is False:
+                    cache[cache_key] = (_CURSOR_PROBE_SHARED_FAIL, False)
+                else:
+                    cache[cache_key] = self._run_cursor_probe_preflight(
+                        segments, namespace, table_options, cursor_field
+                    )
+                    problem, conclusive = cache[cache_key]
+                    if not strict:
+                        if problem:  # clean mis-ordering evidence — a definitive fail
+                            self._store_capability("cursor_probe_ok", False, table_name=shared_key)
+                        elif conclusive:
+                            self._store_capability("cursor_probe_ok", True, table_name=shared_key)
+                        # Inconclusive scans (no discriminating sample, or only
+                        # concurrent-write races) record nothing and re-check next
+                        # batch, so a server that starts mis-ordering once its data
+                        # grows discriminating is still caught.
             problem, conclusive = cache[cache_key]
             if problem:
                 if strict:
                     raise ValueError(problem)
                 return (False, False)
             return (True, conclusive)
+
+        @staticmethod
+        def _cursor_probe_shared_key(segments: list[str], namespace: str | None) -> str:
+            """Per-path key for the shared ``cursor_probe_ok`` verdict — the
+            contained path (the probe shape depends on it), namespace-qualified
+            for multi-schema services."""
+            path = CONTAINED_PATH_SEP.join(segments)
+            return f"{namespace}:{path}" if namespace else path
 
         def _run_cursor_probe_preflight(
             self,
@@ -2041,22 +2130,27 @@ def register_lakeflow_source(spark):
             """Behavioural capability check for :meth:`_iter_dirty_leaf_parent_chains`.
 
             Returns ``(problem, conclusive)``: ``problem`` is an actionable error
-            message when the server mishandles inner ``$expand`` ordering (the probe
-            would under-report dirty leaf-parents and drop rows), else ``None``.
-            ``conclusive`` is ``True`` only when a discriminating sample was found
-            AND the probe shape returned the true newest leaf — the verdict the
-            caller may persist across batches (see
-            :meth:`_verify_cursor_probe_support`); ``False`` on an inconclusive
-            scan, which must be re-checked rather than trusted.
+            message on clean mis-ordering evidence (inner leaf OLDER than / missing
+            from the trusted reference — the direction a genuinely mis-ordering
+            server produces), else ``None``. A ``problem`` is always a *definitive*
+            fail the caller may persist as ``cursor_probe_ok=false`` (and, in strict
+            mode, raise on). ``conclusive`` is ``True`` only when a discriminating
+            sample was found AND the probe shape returned the true newest leaf — the
+            verdict the caller may persist as ``cursor_probe_ok=true``; ``False`` on
+            an inconclusive scan (``problem`` ``None``), which must be re-checked
+            rather than trusted.
 
             Finds a sample leaf-parent with ≥2 distinct leaf cursors and verifies
             that the probe's own ``$expand($orderby cursor desc;$top=1)`` returns
             the true newest leaf — cross-checked against a trusted direct-navigation
             ``$orderby`` query (basic collection ordering, far more universally
-            honoured than inner-``$expand`` ordering). Inconclusive (no
-            discriminating sample within :data:`_CURSOR_PROBE_PREFLIGHT_SCAN`) →
-            ``(None, False)``: with ≤1 leaf per parent, ordering can't cause a
-            miss."""
+            honoured than inner-``$expand`` ordering). A sample that can't
+            discriminate (≤1 distinct leaf cursor) or that races a concurrent write
+            (inner leaf NEWER than the reference — see
+            :meth:`_cursor_probe_check_sample`) is skipped and the scan moves on;
+            an all-skip scan within :data:`_CURSOR_PROBE_PREFLIGHT_SCAN` returns
+            ``(None, False)`` (inconclusive), since with no discriminating sample
+            ordering can't cause a miss."""
             parent_segments = segments[:-1]
             leaf_nav = segments[-1]
             lp_pks = self._own_primary_keys_for_et(
@@ -2103,10 +2197,15 @@ def register_lakeflow_source(spark):
         ) -> tuple[str, str | None]:
             """Verify the probe shape against trusted ordering for one leaf-parent.
 
-            Returns ``("skip", None)`` when the sample can't discriminate (< 2
-            distinct leaf cursors), ``("ok", None)`` when the probe's inner
-            ``$expand`` ordering returns the true newest leaf, or
-            ``("error", msg)`` when it does not."""
+            Returns ``("skip", None)`` when the sample can't be trusted as
+            evidence — either it can't discriminate (< 2 distinct leaf cursors)
+            or the probe returned a leaf NEWER than the reference (a concurrent
+            write between the two non-atomic fetches, not ordering evidence) — so
+            the scan should move on to another sample; ``("ok", None)`` when the
+            probe's inner ``$expand`` ordering returns the true newest leaf; or
+            ``("error", msg)`` when it returns an OLDER/missing leaf (the
+            direction a genuinely mis-ordering server produces — clean
+            evidence)."""
             full_chain = pchain + [lp_key]
             leaf_base = join_url(self.service_url, self._build_contained_path(segments, full_chain))
             # Trusted reference: direct-navigation ordering on the leaf collection.
@@ -2136,6 +2235,20 @@ def register_lakeflow_source(spark):
             )
             if inner_max == direct_max:
                 return ("ok", None)
+            # Direction matters, because a fail verdict now outlives the instance
+            # (shared capability cache) and can raise in strict mode. A newest-leaf
+            # NEWER than the trusted reference is NOT ordering evidence: the two
+            # fetches aren't atomic, so a leaf inserted between them makes an honest
+            # server look mismatched. A genuinely mis-ordering server returns an
+            # OLDER leaf, never a newer one — so the newer direction is skipped like
+            # a non-discriminating sample (keep scanning for a clean one) rather
+            # than treated as a failure. This keeps one concurrent write from
+            # aborting the whole preflight or spuriously raising strict mode.
+            try:
+                if inner_max is not None and inner_max > direct_max:
+                    return ("skip", None)
+            except TypeError:
+                pass  # incomparable cursor values — keep the mismatch as evidence
             return (
                 "error",
                 "cursor_probe=nested-expand requires the source to honour $orderby/$top "
@@ -2254,6 +2367,7 @@ def register_lakeflow_source(spark):
             if new_cap >= cap:  # ensure forward progress when the factor rounds up
                 new_cap = max(1, cap - 1)
             self.__dict__["_batch_size_cap"] = new_cap
+            self._store_capability("batch_size_ok", new_cap)
             self.__dict__["_batch_shrinks"] = shrinks + 1
             _LOG.warning(
                 "OData $batch rejected %d parts (too many); reducing batch size to "
@@ -2315,6 +2429,7 @@ def register_lakeflow_source(spark):
                         # Budget spent or batch collapsed to one part → give up on
                         # $batch and plain-GET everything still pending.
                         self.__dict__["_batch_size_cap"] = 1
+                        self._store_capability("batch_size_ok", 1)
                         out.extend(self._get_as_batch_response(u) for u in pending)
                         break
                     # cap shrank; retry the (now smaller) front of pending.
@@ -2355,6 +2470,18 @@ def register_lakeflow_source(spark):
             cached = self.__dict__.get("_batch_supported")
             if cached is not None:
                 return cached
+            # Process/file cache: paths whose offsets can't carry the verdict
+            # (contained snapshot streams — bare ``{}`` offsets — and the batch
+            # reader) would otherwise re-pay this POST on every framework-
+            # recreated instance. Pull the discovered chunk cap along with the
+            # verdict so the adaptive shrink doesn't re-discover it either.
+            cached = self._cached_capability("batch_ok")
+            if cached is not None:
+                self.__dict__["_batch_supported"] = cached
+                cap = self._cached_capability("batch_size_ok")
+                if cap is not None and "_batch_size_cap" not in self.__dict__:
+                    self.__dict__["_batch_size_cap"] = int(cap)
+                return cached
             probe_url = join_url(self.service_url, segments[0]) + "?$top=1"
             payload = {
                 "requests": [{"id": "0", "method": "GET", "url": self._batch_relative(probe_url)}]
@@ -2387,7 +2514,251 @@ def register_lakeflow_source(spark):
                     definitive = True  # e.g. 404/405 — no $batch endpoint
             if definitive:
                 self.__dict__["_batch_supported"] = ok
+                self._store_capability("batch_ok", ok)
             return ok
+
+        def _expand_read_active(
+            self,
+            table_name: str,
+            table_options: dict[str, str] | None,
+            start_offset: dict | None = None,
+        ) -> bool:
+            """The RESOLVED expand decision for this table: an explicit
+            ``expand_contained=true``, or ``auto`` whose preflight verifies the
+            server (see :meth:`_verify_expand_support`). ``false`` (incl. unset)
+            and ``auto``-with-a-failed-preflight return ``False`` — the N+1 shape.
+
+            Shared by ``read_table`` (which passes ``start_offset`` so a persisted
+            ``expand_ok`` skips the probe) and the partition activation
+            (``is_partitioned`` / batch ``get_partitions``, no offset available —
+            the instance cache dedupes the probe within one setup)."""
+            mode = self._expand_contained_mode(table_options)
+            if mode != "auto":
+                return mode == "true"
+            segments = parse_contained_path(table_name)
+            if segments is None:
+                return False  # flat table — nothing to expand
+            return self._verify_expand_support(table_name, segments, table_options, start_offset)
+
+        def _verify_expand_support(
+            self,
+            table_name: str,
+            segments: list[str],
+            table_options: dict[str, str] | None,
+            start_offset: dict | None = None,
+        ) -> bool:
+            """Whether the server supports the nested-``$expand`` read for this
+            path (the ``expand_contained=auto`` preflight; never raises).
+
+            Mirrors :meth:`_verify_batch_support`'s verdict discipline: a pass is
+            persisted in the resume offset as ``expand_ok`` and cached per
+            instance, but only a **definitive** outcome is recorded —
+
+            * definitive pass — the real expand URL returns 2xx AND inline child
+              collections are present at every level down to the leaf;
+            * definitive fail — a hard 4xx on the expand URL, a non-collection
+              2xx body, or a level whose inline children are missing/empty while
+              direct navigation shows children exist (the server accepted the URL
+              but silently ignored ``$expand`` — using it would drop rows);
+            * transient / inconclusive — transport errors, retryable statuses, or
+              a sample too empty to discriminate (empty top set, or a genuinely
+              childless probed branch): **fall back to the N+1 shape for THIS
+              batch** and re-run the preflight next batch, recording nothing.
+
+            Expand behaviour engages ONLY on a conclusive pass — ``auto`` never
+            assumes the server can ``$expand`` before the verdict is in. The
+            N+1 walk is always correct, so an unresolved verdict costs request
+            shape, never rows; the risky direction (expand on an unverified
+            server) is what silently drops every deep row. A childless-first-
+            branch server that ignores ``$expand`` would otherwise read as
+            inconclusive forever while losing data on every other branch."""
+            if (start_offset or {}).get("expand_ok"):
+                return True
+            cached = self.__dict__.get("_expand_supported")
+            if cached is not None:
+                return cached
+            # Process/file cache (per-table — different nesting depths can
+            # verify differently): covers the contained snapshot stream (bare
+            # ``{}`` offsets) and the batch reader, where the offset channel
+            # can't carry ``expand_ok`` across framework-recreated instances.
+            cached = self._cached_capability("expand_ok", table_name=table_name)
+            if cached is not None:
+                self.__dict__["_expand_supported"] = cached
+                return cached
+            ok, definitive = self._run_expand_preflight(
+                table_name, segments, table_options, start_offset
+            )
+            if definitive:
+                self.__dict__["_expand_supported"] = ok
+                self._store_capability("expand_ok", ok, table_name=table_name)
+            return ok
+
+        def _expand_preflight_url(
+            self,
+            table_name: str,
+            segments: list[str],
+            table_options: dict[str, str] | None,
+            start_offset: dict | None,
+        ) -> tuple[str, int, str | None]:
+            """Build the preflight GET: the REAL expand URL for this table (same
+            inner ``$top``/``$orderby``/``$filter`` construction as the read),
+            with a small page budget and the top-level ``$top`` pinned to 1 so the
+            probe response stays a single subtree. When a cursor is configured but
+            no watermark exists yet, a synthetic floor value stands in so the
+            inner ``cursor gt`` ``$filter`` construct is still exercised (later
+            batches will send one; a server that rejects it must fail the
+            preflight now, not the first filtered read). Returns
+            ``(url, cursor_level, cursor_filter)`` — the filter pieces feed the
+            direct-navigation cross-check."""
+            namespace = (table_options or {}).get("namespace")
+            cursor_field = (table_options or {}).get("cursor_field")
+            since = (start_offset or {}).get("cursor")
+            if cursor_field and since is None:
+                try:
+                    since, _kind = self._cursor_floor(table_name, namespace, cursor_field)
+                except ValueError:
+                    since = None  # no synthesisable floor — probe unfiltered
+            if cursor_field:
+                cursor_level, cursor_filter, cursor_order, cursor_select = self._cursor_expand_clause(
+                    segments, namespace, cursor_field, since
+                )
+            else:
+                cursor_level, cursor_filter, cursor_order, cursor_select = -1, None, None, None
+            probe_opts = {**(table_options or {}), "page_size": _EXPAND_PREFLIGHT_PAGE}
+            url = self._build_expand_url(
+                segments,
+                probe_opts,
+                cursor_level=cursor_level if cursor_field else None,
+                cursor_filter=cursor_filter,
+                cursor_order=cursor_order,
+                cursor_select=cursor_select,
+            )
+            # Only the top-level ``$top`` follows ``?``/``&``; the inner expand
+            # tops (after ``(``/``;``) are left at their per-level floor.
+            return rewrite_top_in_url(url, 1), cursor_level, cursor_filter
+
+        def _run_expand_preflight(
+            self,
+            table_name: str,
+            segments: list[str],
+            table_options: dict[str, str] | None,
+            start_offset: dict | None,
+        ) -> tuple[bool, bool]:
+            """One-shot behavioural probe for ``expand_contained=auto``. Returns
+            ``(ok, definitive)`` — see :meth:`_verify_expand_support` for the
+            verdict semantics. SINGLE auth-aware attempt (``_http_get_once``):
+            a capability probe must fail fast, and a transient blip only degrades
+            this batch."""
+            url, cursor_level, cursor_filter = self._expand_preflight_url(
+                table_name, segments, table_options, start_offset
+            )
+            try:
+                resp = self._http_get_once(self._get_session(), url)
+            except Exception:  # transport/auth failure — no verdict on $expand itself
+                return (False, False)
+            if resp.status_code >= 400:
+                return (False, resp.status_code not in _TRANSIENT_HTTP_STATUSES)
+            try:
+                top_rows = resp.json().get("value")
+            except Exception:
+                return (False, False)
+            if not isinstance(top_rows, list):
+                return (False, True)  # 2xx, but not an OData collection payload
+            if not top_rows:
+                # Empty top set — nothing to discriminate. N+1 this batch (it
+                # emits the same nothing), re-probe next batch.
+                return (False, False)
+            return self._expand_preflight_walk(
+                segments, top_rows, table_options, cursor_level, cursor_filter
+            )
+
+        # pylint: disable=too-many-arguments,too-many-positional-arguments
+        def _expand_preflight_walk(
+            self,
+            segments: list[str],
+            top_rows: list[dict],
+            table_options: dict[str, str] | None,
+            cursor_level: int,
+            cursor_filter: str | None,
+        ) -> tuple[bool, bool]:
+            """Walk the probe response level by level verifying inline containment.
+
+            At each level, descend through every row whose child nav property is a
+            non-empty inline list. The first level with NO inline children anywhere
+            is ambiguous — either the server ignored ``$expand`` (rows dropped!) or
+            this branch is genuinely childless — so it is resolved with ONE direct-
+            navigation ``$top=1`` GET on the first parent's child collection
+            (carrying the same level ``$filter`` the expand sent, so a filtered-
+            empty level isn't misread as ignored-``$expand``): children found ⇒
+            definitive fail; none (or the check itself fails) ⇒ **inconclusive —
+            fall back to N+1 for this batch** and re-probe next batch. Expand only
+            ever runs on the one conclusive-pass outcome: inline rows present at
+            every level down to the leaf."""
+            namespace = (table_options or {}).get("namespace")
+            pending: list[tuple[dict, list[dict[str, Any]]]] = [(r, []) for r in top_rows]
+            for lvl in range(len(segments) - 1):
+                try:
+                    pks = self._own_primary_keys_for_et(
+                        self._entity_type_for(CONTAINED_PATH_SEP.join(segments[: lvl + 1]), namespace)
+                    )
+                except ValueError:
+                    return (False, False)
+                if not pks:
+                    return (False, False)  # can't address a child collection to verify
+                child_key = segments[lvl + 1]
+                nxt: list[tuple[dict, list[dict[str, Any]]]] = []
+                for row, chain in pending:
+                    kids = row.get(child_key)
+                    if isinstance(kids, list) and kids:
+                        parent_keys = {pk: row.get(pk) for pk in pks}
+                        nxt.extend((k, chain + [parent_keys]) for k in kids)
+                if nxt:
+                    pending = nxt
+                    continue
+                row, chain = pending[0]
+                full_chain = chain + [{pk: row.get(pk) for pk in pks}]
+                check_url = self._expand_preflight_child_check_url(
+                    segments, lvl, full_chain, table_options, cursor_level, cursor_filter
+                )
+                try:
+                    r2 = self._http_get_once(self._get_session(), check_url)
+                    direct = (r2.json().get("value") or []) if r2.status_code < 400 else None
+                except Exception:
+                    direct = None
+                if direct is None:
+                    return (False, False)  # couldn't verify — N+1, re-probe next batch
+                if direct:
+                    return (False, True)  # children exist but $expand omitted them
+                return (False, False)  # sampled branch genuinely childless — N+1, re-probe
+            return (True, True)
+
+        # pylint: disable=too-many-arguments,too-many-positional-arguments
+        def _expand_preflight_child_check_url(
+            self,
+            segments: list[str],
+            lvl: int,
+            chain: list[dict[str, Any]],
+            table_options: dict[str, str] | None,
+            cursor_level: int,
+            cursor_filter: str | None,
+        ) -> str:
+            """Direct-navigation URL for the cross-check: the child collection at
+            ``lvl + 1`` under ``chain``, ``$top=1``, carrying the SAME ``$filter``
+            the expand's inner clause applied at that level (cursor filter /
+            ``filter_at_<segment>`` / the leaf ``filter``) so a legitimately
+            filtered-empty level isn't misread as the server ignoring ``$expand``."""
+            segment_filters = resolve_segment_filters(table_options, segments)
+            is_leaf = (lvl + 1) == len(segments) - 1
+            level_filter = combine_filters(
+                cursor_filter if cursor_level == lvl + 1 else None,
+                segment_filters.get(lvl + 1),
+                (table_options or {}).get("filter") if is_leaf else None,
+            )
+            base = join_url(self.service_url, self._build_contained_path(segments[: lvl + 2], chain))
+            url = f"{base}?$top=1"
+            if level_filter:
+                url += f"&$filter={level_filter}"
+            return url
 
         def _contained_fetch_batch_size(self, table_options: dict[str, str] | None) -> int:
             """Parse the ``contained_fetch`` table option into a requested ``$batch``
@@ -3802,7 +4173,8 @@ def register_lakeflow_source(spark):
                     k: v
                     for k, v in (off or {}).items()
                     if not k.startswith("lb_")
-                    and k not in ("cursor_probe_ok", "batch_ok", "batch_size_ok", "or_filter_ok")
+                    and k
+                    not in ("cursor_probe_ok", "batch_ok", "batch_size_ok", "or_filter_ok", "expand_ok")
                 }
 
             if _progress_view(start_offset) == _progress_view(end_offset):
@@ -4415,7 +4787,14 @@ def register_lakeflow_source(spark):
             if parse_contained_path(table_name) is None:
                 return False
             opts = getattr(self, "options", {}) or {}
-            if opts.get("expand_contained", "false").strip().lower() == "true":
+            # Reset any per-table shared-cache verdict pinned non-``auto`` here too:
+            # a partitionable table streams through the partition path (this →
+            # get_partitions → read_partition), never read_table, so without this
+            # the reset would never fire for it and a later switch back to ``auto``
+            # would reuse a stale verdict. Table-scoped + idempotent (see
+            # ``_purge_nonauto_table_verdicts``); a no-op under ``auto``.
+            self._purge_nonauto_table_verdicts(table_name, opts)
+            if self._expand_contained_mode(opts) == "true":
                 return False
             if self._delta_setting(opts) != "disabled":
                 return False
@@ -4428,7 +4807,14 @@ def register_lakeflow_source(spark):
                 namespace = opts.get("namespace")
                 if self._find_cursor_level(segments, namespace, cursor_field) != 0:
                     return False
-            return True
+            # ``expand_contained=auto`` follows its RESOLVED shape: the preflight
+            # verdict decides (single-$expand read → no fan-out to parallelise →
+            # not partitioned; N+1 fallback → partitionable). Checked LAST so the
+            # probe only runs for tables every cheap gate above already admitted;
+            # the instance cache dedupes it across is_partitioned/get_partitions
+            # within one setup. A transient preflight failure resolves to the N+1
+            # (partitioned) shape for this stream — correct, just parallel.
+            return not self._expand_read_active(table_name, opts)
 
         def latest_offset(
             self,
@@ -4488,13 +4874,32 @@ def register_lakeflow_source(spark):
                 # Flat table — let the existing serial path handle it.
                 return [{}]
             opts = table_options or {}
-            if opts.get("expand_contained", "false").strip().lower() == "true":
+            # Reset any per-table shared-cache verdict pinned non-``auto`` on the
+            # partition path too (called every microbatch for a partitioned stream,
+            # which never reaches read_table's reset). Table-scoped + idempotent;
+            # a no-op under ``auto``.
+            self._purge_nonauto_table_verdicts(table_name, opts)
+            if self._expand_contained_mode(opts) == "true":
                 return [{}]
             if self._delta_setting(opts) != "disabled":
                 return [{}]
             if start_offset == end_offset and start_offset is not None:
                 # Streaming: no new data — no work to partition.
                 return []
+            # ``expand_contained=auto`` on the BATCH invocation (no offsets)
+            # follows its resolved shape: expand verified → a single empty
+            # descriptor defers to the serial ``read_table`` (which re-uses the
+            # cached verdict); preflight fail → partitionable N+1 below. The
+            # STREAMING invocation never re-probes: ``is_partitioned`` already
+            # resolved the shape at stream setup, and a divergent verdict here
+            # (e.g. a transient flip) would pair the partitioned reader with a
+            # ``[{}]`` descriptor — an uncapped serial read per microbatch.
+            if (
+                start_offset is None
+                and end_offset is None
+                and self._expand_read_active(table_name, opts)
+            ):
+                return [{}]
             segments = parse_contained_path(table_name) or [table_name]
             namespace = opts.get("namespace")
             cursor_field = opts.get("cursor_field")
@@ -4908,6 +5313,174 @@ def register_lakeflow_source(spark):
         try:
             for entry in os.listdir(tmpdir):
                 if entry.startswith("odata_csdl_") and entry.endswith(".pickle"):
+                    try:
+                        os.remove(os.path.join(tmpdir, entry))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+
+    # Process-wide capability-verdict cache, keyed by service_url — same
+    # lifecycle problem as ``_METADATA_CACHE``: SDP recreates the connector
+    # instance per microbatch / ``.load()``, so instance caches don't survive,
+    # and the paths that keep their offsets bare (contained snapshot streams)
+    # or have no offset at all (the batch reader behind pipeline snapshot
+    # refreshes) would otherwise re-run their preflight probes on every read.
+    # Entry shape: ``{"batch_ok": bool, "batch_size_ok": int,
+    # "or_filter_ok": bool, "expand_ok": {table_name: bool}}`` — the
+    # server-wide verdicts flat, the per-table nested-$expand verdict keyed by
+    # contained path (different nesting depths can verify differently).
+    _CAPABILITY_CACHE: dict[str, dict] = {}
+
+    # On-disk mirror of the capability cache (JSON, not pickle — plain data
+    # only). Covers the forked-worker gap the process dict can't (PySpark may
+    # fork a fresh daemon worker per ``.load()``), so a pipeline refresh with N
+    # contained snapshot tables pays each probe once, not N times. The TTL is
+    # much longer than the CSDL cache's (a capability verdict is a couple of
+    # booleans that only change when the SERVER is upgraded, and the
+    # offset-persisted copies of these same verdicts never expire at all);
+    # an explicit non-``auto`` mode switch purges the entry immediately (see
+    # ``_scrub_nonauto_verdicts``), so re-selecting ``auto`` still re-probes.
+    _CAPABILITY_FILE_CACHE_TTL_SECONDS = 900
+
+    # Per-service mtime of the on-disk mirror the last time this process merged it
+    # into ``_CAPABILITY_CACHE``. Lets ``_capability_cache_load`` skip the re-read +
+    # re-parse when the file hasn't changed since — so the hot lookup on the
+    # offset-less paths (snapshot / batch reader, once per table per microbatch) is
+    # a single ``stat`` rather than a full JSON parse. A sibling worker's write
+    # bumps the mtime and is picked up on the next load.
+    _CAPABILITY_DISK_MTIME: dict[str, float] = {}
+
+
+    def _capability_cache_path(service_url: str) -> str:
+        """Tempdir path for the capability-verdict JSON of ``service_url``."""
+        digest = hashlib.sha256(service_url.encode("utf-8")).hexdigest()[:16]
+        return os.path.join(tempfile.gettempdir(), f"odata_caps_{digest}.json")
+
+
+    def _capability_cache_write(path: str, data: dict) -> None:
+        """Atomically rewrite the on-disk mirror: write a temp file then
+        ``os.replace`` it into place, so a concurrent worker never observes a
+        half-written file (the naive truncate-in-place did). The temp name is unique
+        per process AND per thread, so two concurrent streaming queries on one driver
+        don't clobber each other's temp mid-write. Best-effort — a read-only tempdir
+        just leaves the process cache authoritative — and the temp file is cleaned up
+        on failure. Updates the mtime memo so the writing process doesn't immediately
+        re-read its own write."""
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return
+        try:
+            _CAPABILITY_DISK_MTIME[path] = os.path.getmtime(path)
+        except OSError:
+            pass
+
+
+    def _capability_cache_load(service_url: str) -> dict:
+        """The cached capability verdicts for ``service_url``: the process-wide
+        entry, hydrated from the on-disk JSON (when fresh) for keys the process
+        hasn't determined itself. Returns the live process entry (mutable). The
+        disk file is re-parsed only when its mtime changed since the last merge
+        (see :data:`_CAPABILITY_DISK_MTIME`); otherwise this is just a ``stat``."""
+        entry = _CAPABILITY_CACHE.setdefault(service_url, {})
+        path = _capability_cache_path(service_url)
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return entry  # no file yet — process entry stands alone
+        if mtime < time.time() - _CAPABILITY_FILE_CACHE_TTL_SECONDS:
+            return entry  # stale on disk — ignore it (process entry stands)
+        if _CAPABILITY_DISK_MTIME.get(path) == mtime:
+            return entry  # already merged this exact disk state
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                disk = json.load(fh)
+        except (OSError, ValueError):
+            return entry  # missing/corrupt file — the process entry stands alone
+        if isinstance(disk, dict):
+            for key, value in disk.items():
+                if key == "expand_ok" and isinstance(value, dict):
+                    entry["expand_ok"] = {**value, **entry.get("expand_ok", {})}
+                else:
+                    entry.setdefault(key, value)
+        _CAPABILITY_DISK_MTIME[path] = mtime
+        return entry
+
+
+    def _capability_cache_store(service_url: str, key: str, value, table_name: str | None = None):
+        """Record one capability verdict in the process cache and atomically
+        rewrite the on-disk mirror. ``expand_ok`` verdicts are per-table
+        (``table_name`` required); everything else is server-wide."""
+        entry = _capability_cache_load(service_url)
+        if table_name is not None:
+            entry.setdefault(key, {})[table_name] = value
+        else:
+            entry[key] = value
+        _capability_cache_write(_capability_cache_path(service_url), entry)
+
+
+    def _cap_dict_has(container: dict, key: str, table_name: str | None) -> bool:
+        """Whether ``container`` holds the verdict identified by ``key`` (+ optional
+        ``table_name`` for a per-table map) — the guard that keeps a purge from
+        rewriting the file when there is nothing to remove."""
+        if key not in container:
+            return False
+        if table_name is None:
+            return True
+        value = container[key]
+        return isinstance(value, dict) and table_name in value
+
+
+    def _cap_dict_drop(container: dict, key: str, table_name: str | None) -> None:
+        """Remove one verdict from a cache dict in place. With ``table_name`` and a
+        per-table map, drop only that table's entry (leaving sibling tables intact);
+        otherwise drop the whole key."""
+        if table_name is not None and isinstance(container.get(key), dict):
+            container[key].pop(table_name, None)
+        else:
+            container.pop(key, None)
+
+
+    def _capability_cache_drop(service_url: str, keys: set[str], table_name: str | None = None) -> None:
+        """Purge ``keys`` from the cached verdicts of ``service_url`` (process AND
+        disk) — called when an explicit non-``auto`` mode leaves a recorded verdict
+        the user asked to forget, so the shared cache can't resurrect it. With
+        ``table_name`` the per-table verdicts (``expand_ok`` / ``cursor_probe_ok``)
+        drop only that table's entry, leaving sibling tables' verdicts intact;
+        without it the whole key is dropped (server-wide verdicts, or a
+        table-agnostic reset).
+
+        Goes through :func:`_capability_cache_load` for the authoritative merged
+        view, so when nothing matches it returns without touching the file — and
+        that check is a bare ``stat`` while the mtime is unchanged (the common
+        steady-state pinned read every microbatch), not a full JSON parse."""
+        entry = _capability_cache_load(service_url)
+        if not any(_cap_dict_has(entry, k, table_name) for k in keys):
+            return  # nothing recorded anywhere — no rewrite
+        for key in keys:
+            _cap_dict_drop(entry, key, table_name)
+        _capability_cache_write(_capability_cache_path(service_url), entry)
+
+
+    def _clear_capability_cache() -> None:
+        """Clear the in-process capability cache and remove any on-disk JSON
+        files. Tests use this between cases that reuse a ``service_url`` with
+        different mocked server behaviours."""
+        _CAPABILITY_CACHE.clear()
+        _CAPABILITY_DISK_MTIME.clear()
+        tmpdir = tempfile.gettempdir()
+        try:
+            for entry in os.listdir(tmpdir):
+                if entry.startswith("odata_caps_") and entry.endswith(".json"):
                     try:
                         os.remove(os.path.join(tmpdir, entry))
                     except OSError:
@@ -5386,14 +5959,31 @@ def register_lakeflow_source(spark):
                         "to top-level entity sets). Set delta_tracking=disabled "
                         "or ingest the parent set directly."
                     )
-                if self._expand_contained_active(opts):
+                # Reset any per-table shared-cache verdict whose option is pinned
+                # non-``auto`` before resolving the read, so a switch back to
+                # ``auto`` re-probes even on the bare-offset snapshot / batch-reader
+                # paths (the offset scrub only sees offset-carrying reads).
+                self._purge_nonauto_table_verdicts(table_name, opts)
+                # ``expand_contained``: ``true`` forces the nested-$expand read;
+                # ``auto`` attempts it behind a one-shot behavioural preflight
+                # (real expand URL + inline-containment cross-check; verdict
+                # persisted as ``expand_ok``) and falls back to the N+1 branches
+                # below when the server can't be trusted with $expand. The same
+                # resolver drives partition activation, so an ``auto`` table that
+                # falls back to N+1 stays partitionable.
+                if self._expand_read_active(table_name, opts, start_offset):
                     # Cursor-based expand keeps a default $top (page_size);
                     # snapshot expand omits $top when page_size is unset.
                     if opts.get("cursor_field"):
                         opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
-                    return self._with_capabilities(
-                        self._read_contained_expand(table_name, start_offset, opts), opts
-                    )
+                        return self._with_capabilities(
+                            self._read_contained_expand(table_name, start_offset, opts), opts
+                        )
+                    # Snapshot expand: same bare-``{}`` terminal-offset rule as
+                    # the N+1 snapshot below (quiesce on ``end == start``); the
+                    # preflight verdict rides the process/file capability cache
+                    # instead of the offset.
+                    return self._read_contained_expand(table_name, start_offset, opts)
                 if opts.get("cursor_field"):
                     # Cursor-based read: default page_size so a $top is sent.
                     # Snapshot (the branch below) leaves it unset → no $top.
@@ -5409,8 +5999,9 @@ def register_lakeflow_source(spark):
                 # quiesces on ``end == start``; merging flags would turn the first
                 # trigger's ``{}`` into ``{"batch_ok": …}`` and buy one extra full
                 # snapshot re-read before settling. The batch reader discards the
-                # offset anyway, and the per-read preflight POST is noise next to
-                # a full snapshot walk.
+                # offset anyway. Preflight dedup across framework-recreated
+                # instances comes from the process/file capability cache instead
+                # (see ``_CAPABILITY_CACHE``), which needs no offset channel.
                 return self._read_contained_snapshot(table_name, opts)
             # Offset-shape check ahead of the delta predicate so a resumed
             # delta stream (offset carries delta_link / next_link) takes the
@@ -5451,6 +6042,8 @@ def register_lakeflow_source(spark):
                 self.__dict__["_batch_supported"] = bool(off["batch_ok"])
             if "batch_size_ok" in off:
                 self.__dict__["_batch_size_cap"] = int(off["batch_size_ok"])
+            if "expand_ok" in off:
+                self.__dict__["_expand_supported"] = bool(off["expand_ok"])
 
         def _merge_capability_caches(self, offset: dict) -> dict:
             """Thread the per-instance OR / $batch / batch-size verdicts into the
@@ -5469,13 +6062,37 @@ def register_lakeflow_source(spark):
                 add["batch_ok"] = self.__dict__["_batch_supported"]
             if "_batch_size_cap" in self.__dict__ and "batch_size_ok" not in offset:
                 add["batch_size_ok"] = self.__dict__["_batch_size_cap"]
+            if "_expand_supported" in self.__dict__ and "expand_ok" not in offset:
+                add["expand_ok"] = self.__dict__["_expand_supported"]
             return {**offset, **add} if add else offset
+
+        def _cached_capability(self, key: str, table_name: str | None = None):
+            """The process/file-cached verdict for ``key`` (``None`` when
+            undetermined). Consulted by the ``_verify_*`` preflights AFTER the
+            offset flag and the instance cache, BEFORE probing — so a connector
+            instance the framework recreates each microbatch (or a forked batch
+            worker within the file-cache TTL) skips the probe even on paths
+            that carry no offset (contained snapshot streams, the batch
+            reader)."""
+            entry = _capability_cache_load(self.service_url)
+            value = entry.get(key)
+            if table_name is not None:
+                return value.get(table_name) if isinstance(value, dict) else None
+            return value
+
+        def _store_capability(self, key: str, value, table_name: str | None = None) -> None:
+            """Mirror a freshly determined DEFINITIVE verdict into the
+            process/file capability cache (see :data:`_CAPABILITY_CACHE`).
+            Callers keep the transient-vs-definitive discipline — a transient
+            outcome must record nothing anywhere, so it never reaches here."""
+            _capability_cache_store(self.service_url, key, value, table_name)
 
         def _scrub_nonauto_verdicts(self, offset: dict, table_options: dict | None) -> dict:
             """Drop persisted preflight verdicts whose governing option is **not**
             ``auto``, so re-selecting ``auto`` later re-runs the preflight instead of
             reusing a stale verdict. ``cursor_probe`` owns its nested-``$expand``
-            probe verdict (``cursor_probe_ok``). The ``$batch`` verdicts
+            probe verdict (``cursor_probe_ok``); ``expand_contained`` owns the
+            expand-read capability verdict (``expand_ok``). The ``$batch`` verdicts
             (``batch_ok`` / ``batch_size_ok``) are **shared**: ``contained_fetch``'s
             full walks AND the ``cursor_probe`` ``auto`` cascade's hydrate both read
             and refresh them — so they're kept while ANY auto-mode consumer is live
@@ -5493,6 +6110,11 @@ def register_lakeflow_source(spark):
             cp_mode = self._cursor_probe_mode(table_options)
             if cp_mode != "auto":
                 drop.add("cursor_probe_ok")
+            # ``expand_contained`` owns the nested-$expand verdict (``expand_ok``):
+            # an explicit ``true``/``false`` (or the unset ``false`` default)
+            # scrubs it so a later switch to ``auto`` re-runs the preflight.
+            if self._expand_contained_mode(table_options) != "auto":
+                drop.add("expand_ok")
             batch_live = self._contained_fetch_is_auto(table_options) or (
                 cp_mode == "auto" and not self._contained_fetch_forces_single(table_options)
             )
@@ -5500,7 +6122,39 @@ def register_lakeflow_source(spark):
                 drop |= {"batch_ok", "batch_size_ok"}
             if not drop:
                 return offset
+            # Shared-cache reset for the SERVER-WIDE ``$batch`` verdicts only:
+            # a value actually present in the offset means the user just switched
+            # this option away from ``auto`` (the transition batch). These keys
+            # aren't table-scoped, so purge conservatively — transition-driven —
+            # to avoid churning a sibling table's live ``auto`` consumer. The
+            # per-table verdicts (``expand_ok`` / ``cursor_probe_ok``) are reset
+            # separately and unconditionally by ``_purge_nonauto_table_verdicts``
+            # (table-scoped, so it also safely covers the bare-offset snapshot /
+            # batch-reader paths this offset scrub can't see).
+            recorded_batch = drop & {"batch_ok", "batch_size_ok"} & offset.keys()
+            if recorded_batch:
+                _capability_cache_drop(self.service_url, recorded_batch)
             return {k: v for k, v in offset.items() if k not in drop}
+
+        def _purge_nonauto_table_verdicts(self, table_name: str, table_options: dict | None) -> None:
+            """Reset the per-table shared-cache verdicts (``expand_ok`` /
+            ``cursor_probe_ok``) whose governing option is pinned non-``auto``, so a
+            later switch back to ``auto`` re-runs the preflight rather than reusing
+            the cached verdict. Unlike the offset scrub, this runs on **every**
+            contained read — not just an offset-carrying transition — so it also
+            covers the contained snapshot stream and the batch reader, whose bare /
+            absent offsets can't trigger the scrub. Table-scoped (pinning one table
+            never disturbs a sibling's verdict) and idempotent (a no-op, no file
+            rewrite, once the entry is gone)."""
+            if self._expand_contained_mode(table_options) != "auto":
+                _capability_cache_drop(self.service_url, {"expand_ok"}, table_name=table_name)
+            if self._cursor_probe_mode(table_options) != "auto":
+                segments = _parse_contained_path(table_name)
+                if segments is not None:
+                    key = self._cursor_probe_shared_key(
+                        segments, (table_options or {}).get("namespace")
+                    )
+                    _capability_cache_drop(self.service_url, {"cursor_probe_ok"}, table_name=key)
 
         def _with_capabilities(self, result: tuple, table_options: dict | None = None) -> tuple:
             """Wrap a ``(records, offset)`` read result, threading capability verdicts
@@ -6298,6 +6952,10 @@ def register_lakeflow_source(spark):
             cached = self.__dict__.get("_or_filter_ok")
             if cached is not None:
                 return cached
+            cached = self._cached_capability("or_filter_ok")
+            if cached is not None:
+                self.__dict__["_or_filter_ok"] = cached
+                return cached
             ok = True
             seek = _pg_keyset_filter(order_keys, sample_row)
             if seek is not None and " or " in seek:
@@ -6316,6 +6974,7 @@ def register_lakeflow_source(spark):
                 except Exception:  # transport error ≠ unsupported — defer to the real seek
                     ok = True
             self.__dict__["_or_filter_ok"] = ok
+            self._store_capability("or_filter_ok", ok)
             return ok
 
         def _client_paginate_pages(
