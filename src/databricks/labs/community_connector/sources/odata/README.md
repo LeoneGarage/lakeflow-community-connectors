@@ -392,7 +392,14 @@ detects this and falls back to whatever cursor/snapshot config is set.
   it drops `_deleted`/`_lc_sequence` the moment the option is
   non-active, so tombstones from the still-CDC read would parse as
   PK-only upserts. Changing `delta_tracking` on an existing table
-  needs a full refresh of that flow.
+  needs a full refresh of that flow. The same rule applies generally:
+  **changing any option that re-shapes the read** (`cursor_field` or
+  its level, `filter_at_<segment>`, `namespace`,
+  `expand_contained`) **over an existing streaming checkpoint needs a
+  full refresh** — the parked resume state (cursor watermarks,
+  mid-walk checkpoints, continuation links) was written under the old
+  shape, and while most mismatches degrade to duplicate-safe re-reads,
+  a repositioned checkpoint can also skip rows.
 
 ### Configuration example
 

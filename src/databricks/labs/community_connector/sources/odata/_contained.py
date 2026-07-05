@@ -37,6 +37,7 @@ from databricks.labs.community_connector.sources.odata._helpers import (
     cursor_le as _cursor_le,
     cursor_max as _cursor_max,
     cursor_newer as _cursor_newer,
+    cursor_sort_key as _cursor_sort_key,
     max_or as _max_or,
     parse_iso8601,
     trim_to_distinct_cursor_boundary as _trim_to_distinct_cursor_boundary,
@@ -537,6 +538,49 @@ def _pg_page_fingerprint(page_rows: list[dict]) -> int:
     identical after the annotation strip, and per-entity annotations
     (id/etag) are what disambiguate them."""
     return hash(repr(page_rows))
+
+
+# Sentinel distinguishing "walk has no ancestor cursor" (leaf-cursor / $batch
+# walks) from "ancestor cursor is None" (the ancestor-cursor walk, where a
+# null stamped cursor is a real value the ordering must carry).
+_NO_ANCESTOR_CURSOR = object()
+
+
+def _chain_resume_key(chain: list[dict], ancestor_cursor: Any = _NO_ANCESTOR_CURSOR) -> list:
+    """Client-side ordering key for one ancestor key chain, mirroring the
+    chain enumerations' server-side ``$orderby`` (PK asc per level; the
+    ancestor-cursor walk prefixes its ``cursor asc`` term). Values route
+    through :func:`cursor_sort_key` so ISO-rendered keys order
+    chronologically, consistent with every other comparison in the
+    connector. Used by the capped walks' key-based resume — see
+    :func:`_chain_strictly_before`."""
+    key: list = []
+    if ancestor_cursor is not _NO_ANCESTOR_CURSOR:
+        key.append(None if ancestor_cursor is None else _cursor_sort_key(ancestor_cursor))
+    for level in chain:
+        key.extend(_cursor_sort_key(v) for v in level.values())
+    return key
+
+
+def _chain_strictly_before(key_a: list, key_b: list) -> bool:
+    """Whether enumeration position ``key_a`` sorts strictly before
+    ``key_b`` (both from :func:`_chain_resume_key`).
+
+    This drives the "already walked in a prior capped batch" skip. The
+    positional (index-based) skip it replaces silently desynchronizes
+    under parent-set churn between batches — a deleted parent shifts
+    every successor left one slot, so the resume skips an unwalked
+    parent forever; an insert shifts right, so a parked mid-collection
+    continuation link gets applied to the WRONG parent (its rows then
+    FK-tagged with that parent's keys). Comparing by the enumeration's
+    own ordering keys is churn-stable. Incomparable pairs (cross-type
+    values after a metadata change, or server collation the client
+    can't reproduce) return ``False`` — the chain is NOT skipped,
+    degrading to a duplicate-safe re-read instead of a silent skip."""
+    try:
+        return key_a < key_b
+    except TypeError:
+        return False
 
 
 # Re-export of the EDM namespace prefix used by the main module.
@@ -3519,7 +3563,8 @@ class ContainedNavMixin:
         leaf_segment_filter: str | None = None,
         effective=None,
         skip_null: bool = False,
-    ) -> tuple[list[dict], bool, int, str | None, Any]:
+        parked_chain: list | None = None,
+    ) -> tuple[list[dict], bool, int, list | None, str | None, Any]:
         """Drive the per-parent fetch loop (leaf-cursor mode).
 
         ``chains_iter`` is consumed lazily and the walk stops at the
@@ -3530,7 +3575,20 @@ class ContainedNavMixin:
         is emitted in full and absorbed into the walk rather than
         checkpointed.
 
-        Resume preference, applied to the chain at ``parent_idx_start``:
+        Resume positioning: ``parked_chain`` (the truncated parent's key
+        chain, parked by the previous batch) is matched by the
+        enumeration's own ordering keys — churn-stable, unlike the
+        positional ``parent_idx_start`` skip it supersedes (see
+        :func:`_chain_strictly_before` for the loss/mis-tagging modes a
+        positional resume has under inserts/deletes between batches).
+        Offsets written before ``parent_keys`` existed carry only
+        ``parent_idx``, and fall back to the positional skip. A parked
+        chain that vanished (parent deleted) resumes at the first chain
+        past its position with the global ``since``. A park written by
+        the ``$batch`` walk (no continuation keys) is EXCLUSIVE — the
+        parked chain itself was fully drained and is skipped.
+
+        Resume preference, applied to the resume-target chain:
 
         1. ``chain_next_link`` (server skiptoken) — fetched directly,
            bypassing URL rebuild. Used when the previous batch parked
@@ -3553,8 +3611,10 @@ class ContainedNavMixin:
           the walk continues to the next parent. The cap is overshot
           for that one parent (bounded by one server response).
 
-        Returns ``(rows, truncated, parent_idx, chain_next_link_out,
-        truncated_chain_cursor_out)``.
+        Returns ``(rows, truncated, parent_idx, parked_chain_out,
+        chain_next_link_out, truncated_chain_cursor_out)`` —
+        ``parked_chain_out`` is the truncated parent's key chain (for the
+        next batch's key-based resume), ``None`` when not truncated.
 
         ``effective(row)`` supplies the cursor value used for filtering,
         the boundary trim and (via the caller) the watermark — the
@@ -3570,26 +3630,53 @@ class ContainedNavMixin:
         truncated = False
         parent_idx = 0
         chain_start_idx = 0
+        parked_chain_out: list | None = None
         chain_next_link_out: str | None = None
         truncated_chain_cursor_out: Any = None
+        parked_key = _chain_resume_key(parked_chain) if parked_chain is not None else None
+        # A park with a continuation key resumes AT the parked chain; a park
+        # without one (written by the $batch walk) is exclusive — the parked
+        # chain was fully drained.
+        resume_inclusive = chain_next_link is not None or truncated_chain_cursor is not None
+        seeking = parked_key is not None
         for chain in chains_iter:
-            # Skip the chains we already emitted in prior batches. The
-            # iterator still pays for the ancestor pages that produce
-            # those chains (no way to skip without knowing the keys),
-            # but no leaf fetches happen here.
-            if parent_idx < parent_idx_start:
-                parent_idx += 1
-                continue
+            # Skip the chains we already emitted in prior batches — by the
+            # enumeration's own ordering keys when the offset parked them
+            # (churn-stable), positionally for legacy index-only offsets.
+            # The iterator still pays for the ancestor pages that produce
+            # those chains (no way to skip without fetching the keys),
+            # but no leaf fetches happen during the skip.
+            if parked_key is not None:
+                if seeking:
+                    at_parked = chain == parked_chain
+                    if not at_parked and _chain_strictly_before(
+                        _chain_resume_key(chain), parked_key
+                    ):
+                        parent_idx += 1
+                        continue
+                    seeking = False
+                    if at_parked and not resume_inclusive:
+                        # Exclusive park: the parked chain itself is done.
+                        parent_idx += 1
+                        continue
+                    is_resume_target = at_parked
+                else:
+                    is_resume_target = False
+            else:
+                if parent_idx < parent_idx_start:
+                    parent_idx += 1
+                    continue
+                is_resume_target = parent_idx == parent_idx_start
             chain_start_idx = len(emitted)
             chain_since: Any
             initial_url: str
-            if parent_idx == parent_idx_start and chain_next_link is not None:
+            if is_resume_target and chain_next_link is not None:
                 # Resume from the server's own skiptoken; no client-side
                 # filter — the link already encodes filter/order state.
                 chain_since = None
                 initial_url = chain_next_link
             else:
-                if parent_idx == parent_idx_start and truncated_chain_cursor is not None:
+                if is_resume_target and truncated_chain_cursor is not None:
                     chain_since = truncated_chain_cursor
                 else:
                     chain_since = since
@@ -3641,9 +3728,11 @@ class ContainedNavMixin:
             if cap_hit_in_page:
                 if page_next_url is not None:
                     # Page boundary mid-collection: the server skiptoken is
-                    # a clean resume point — park it and re-enter this
-                    # parent next batch.
+                    # a clean resume point — park it (with this chain's keys
+                    # so the resume re-finds THIS parent under churn) and
+                    # re-enter this parent next batch.
                     truncated = True
+                    parked_chain_out = chain
                     chain_next_link_out = page_next_url
                     break
                 # No nextLink ⇒ the server returned this parent's ENTIRE
@@ -3655,6 +3744,7 @@ class ContainedNavMixin:
                 if trimmed:
                     del emitted[chain_start_idx + len(trimmed) :]
                     truncated = True
+                    parked_chain_out = chain
                     # Effective value (synthetic floor for a null under
                     # coalesce) so the resumed ``cursor gt`` is a real,
                     # comparable boundary — never the restored-null column.
@@ -3674,6 +3764,7 @@ class ContainedNavMixin:
             emitted,
             truncated,
             parent_idx,
+            parked_chain_out,
             chain_next_link_out,
             truncated_chain_cursor_out,
         )
@@ -3694,7 +3785,9 @@ class ContainedNavMixin:
         effective=None,
         skip_null: bool = False,
         batch_size: int = _BATCH_MAX_OPS,
-    ) -> tuple[list[dict], bool, int, None, None]:
+        parked_chain: list | None = None,
+        resume_inclusive: bool = False,
+    ) -> tuple[list[dict], bool, int, list | None, None, None]:
         """OData ``$batch`` counterpart to :meth:`_walk_contained_with_cursor`.
 
         Hydrates leaf collections via ``$batch`` instead of one GET per
@@ -3708,14 +3801,19 @@ class ContainedNavMixin:
         is identical — only the request shape differs.
 
         Resume + cap are **chunk-aligned**: the cap is checked after each
-        fully-drained group, so truncation parks ``parent_idx`` at the next group
-        boundary. ``chain_next_link`` / ``truncated_chain_cursor`` are unused
-        (returned ``None``) — a resumed batch re-enumerates ancestors and skips
-        ``parent_idx`` chains exactly like the plain walk. The cap is overshot by
-        at most one group's worth of changed rows (the same bounded-overshoot
-        tolerance the plain walk applies to a single complete parent).
+        fully-drained group, so truncation parks the LAST DRAINED chain's keys
+        (an EXCLUSIVE park — that chain is complete; the resume skips through
+        it by the enumeration's ordering keys, churn-stable). Legacy
+        index-only offsets fall back to the positional ``parent_idx`` skip.
+        ``chain_next_link`` / ``truncated_chain_cursor`` are unused (returned
+        ``None``); a serial-walk park resumed here (``resume_inclusive``)
+        re-drains the parked chain in full — duplicates, never loss. The cap
+        is overshot by at most one group's worth of changed rows (the same
+        bounded-overshoot tolerance the plain walk applies to a single
+        complete parent).
 
-        Returns the 5-tuple ``(emitted, truncated, parent_idx, None, None)``."""
+        Returns the 6-tuple
+        ``(emitted, truncated, parent_idx, parked_chain_out, None, None)``."""
         if effective is None:
 
             def effective(row):
@@ -3780,22 +3878,40 @@ class ContainedNavMixin:
                     if raw_next:
                         pending.append((key, self._resolve_next_link(req_url, raw_next)))
 
+        parked_key = _chain_resume_key(parked_chain) if parked_chain is not None else None
+        seeking = parked_key is not None
+        parked_chain_out: list | None = None
         for chain in chains_iter:
-            if parent_idx < parent_idx_start:
-                parent_idx += 1
-                continue
+            if parked_key is not None:
+                if seeking:
+                    at_parked = chain == parked_chain
+                    if not at_parked and _chain_strictly_before(
+                        _chain_resume_key(chain), parked_key
+                    ):
+                        parent_idx += 1
+                        continue
+                    seeking = False
+                    if at_parked and not resume_inclusive:
+                        parent_idx += 1
+                        continue
+            else:
+                if parent_idx < parent_idx_start:
+                    parent_idx += 1
+                    continue
             group.append(chain)
             parent_idx += 1
             if len(group) >= batch_size:
+                last_drained = group[-1]
                 _drain_group(group)
                 group = []
                 if len(emitted) >= max_records:
                     truncated = True
+                    parked_chain_out = last_drained
                     break
         else:
             if group:
                 _drain_group(group)
-        return (emitted, truncated, parent_idx, None, None)
+        return (emitted, truncated, parent_idx, parked_chain_out, None, None)
 
     def _no_progress_cursor_error(
         self, table_name: str, cursor_field: str, n_emitted: int
@@ -4148,6 +4264,9 @@ class ContainedNavMixin:
         read_since = self._apply_cursor_lookback(since)
         truncated_chain_cursor_in = (start_offset or {}).get("truncated_chain_cursor")
         chain_next_link_in = (start_offset or {}).get("chain_next_link")
+        # Key-based resume position (churn-stable); legacy offsets carry only
+        # ``parent_idx`` and fall back to the positional skip inside the walks.
+        parked_chain_in = (start_offset or {}).get("parent_keys")
         max_records = int((table_options or {}).get("max_records_per_batch", "10000"))
         order_by = self._leaf_cursor_order_by(table_name, namespace, cursor_field)
         if chains_iter is None:
@@ -4167,6 +4286,7 @@ class ContainedNavMixin:
                 emitted,
                 truncated,
                 parent_idx,
+                parent_keys_out,
                 chain_next_link_out,
                 truncated_chain_cursor_out,
             ) = self._batch_walk_contained_with_cursor(
@@ -4183,12 +4303,19 @@ class ContainedNavMixin:
                 effective=effective,
                 skip_null=skip_null,
                 batch_size=self._cursor_probe_batch_size(table_options),
+                parked_chain=parked_chain_in,
+                # A serial-walk park (continuation keys present) resumes AT
+                # the parked chain; the batch walk re-drains it in full.
+                resume_inclusive=(
+                    chain_next_link_in is not None or truncated_chain_cursor_in is not None
+                ),
             )
         else:
             (
                 emitted,
                 truncated,
                 parent_idx,
+                parent_keys_out,
                 chain_next_link_out,
                 truncated_chain_cursor_out,
             ) = self._walk_contained_with_cursor(
@@ -4206,6 +4333,7 @@ class ContainedNavMixin:
                 leaf_segment_filter=segment_filters.get(len(segments) - 1),
                 effective=effective,
                 skip_null=skip_null,
+                parked_chain=parked_chain_in,
             )
         walk_elapsed = time.monotonic() - walk_start
         if truncated:
@@ -4215,10 +4343,15 @@ class ContainedNavMixin:
             # parent with a distinct-cursor boundary. (A complete parent
             # with a single cursor value never truncates — the walk emits
             # it in full and continues — so there's no failure case here.)
+            # ``parent_idx`` rides along for downgrade compatibility; the
+            # resume itself positions on ``parent_keys`` (churn-stable).
             end_offset: dict = {"parent_idx": parent_idx}
-            # The ``$batch`` walk resumes purely on ``parent_idx`` (chunk-aligned)
-            # — it never parks a mid-collection checkpoint — so its truncation
-            # offset carries neither continuation key.
+            if parent_keys_out is not None:
+                end_offset["parent_keys"] = parent_keys_out
+            # The ``$batch`` walk's park is chunk-aligned and EXCLUSIVE (the
+            # parked chain is fully drained) — it never parks a
+            # mid-collection checkpoint, so its truncation offset carries
+            # neither continuation key.
             if not use_batch:
                 if chain_next_link_out is not None:
                     end_offset["chain_next_link"] = chain_next_link_out
@@ -4241,7 +4374,12 @@ class ContainedNavMixin:
                 # checkpointed rows vanish between batches. Dropping the
                 # checkpoint (keeping ``cursor`` and the bookkeeping keys)
                 # marks the walk complete so the next batch starts fresh.
-                checkpoint_keys = ("parent_idx", "chain_next_link", "truncated_chain_cursor")
+                checkpoint_keys = (
+                    "parent_idx",
+                    "parent_keys",
+                    "chain_next_link",
+                    "truncated_chain_cursor",
+                )
                 if any(k in empty for k in checkpoint_keys):
                     empty = {k: v for k, v in empty.items() if k not in checkpoint_keys}
                 if persist_probe_ok:
@@ -4312,6 +4450,8 @@ class ContainedNavMixin:
             int((table_options or {}).get("max_records_per_batch", "10000")),
             self._resolve_fk_columns(segments, namespace),
             leaf_segment_filter=segment_filters.get(len(segments) - 1),
+            parked_chain=(start_offset or {}).get("parent_keys"),
+            parked_cursor=(start_offset or {}).get("parent_cursor"),
         )
         end_offset = self._ancestor_cursor_offset(walk_state, start_offset, since, cursor_field)
         return self._finalize_cursor_read(
@@ -4329,6 +4469,8 @@ class ContainedNavMixin:
         max_records: int,
         fk_columns: dict[tuple[int, str], str],
         leaf_segment_filter: str | None = None,
+        parked_chain: list | None = None,
+        parked_cursor: Any = None,
     ) -> dict[str, Any]:
         """Walk ancestor chains, fetching each chain's leaf collection
         and stamping rows with the chain's cursor.
@@ -4340,21 +4482,57 @@ class ContainedNavMixin:
 
         Page-aware: a truncation at a page boundary parks the chain's
         ``@odata.nextLink``; when the chain happens to end on the
-        truncating page, ``parent_idx`` simply advances past it."""
+        truncating page the park is EXCLUSIVE (no link — the chain is
+        complete and the resume skips through it).
+
+        Resume positioning is key-based (``parked_chain`` +
+        ``parked_cursor``, matching the enumeration's ``cursor asc, pks
+        asc`` ordering): this enumeration is ordered by a MUTABLE cursor
+        column and filtered by ``cursor gt since``, so positional resume
+        desynchronizes under any churn — updates included, not just
+        inserts/deletes (see :func:`_chain_strictly_before`). A parked
+        parent whose cursor advanced between batches re-enters at its
+        new position and is re-walked in full with a fresh stamp
+        (duplicate-safe; its old mid-page link is correctly dropped).
+        Legacy index-only offsets fall back to the positional skip."""
         namespace = (table_options or {}).get("namespace")
         leaf_order_by = self._leaf_pk_order_by(segments, namespace)
         parent_idx = 0
         emitted: list[dict] = []
         truncated = False
         chain_next_link_out: str | None = None
+        parked_chain_out: list | None = None
+        parked_cursor_out: Any = None
+        parked_key = (
+            _chain_resume_key(parked_chain, parked_cursor) if parked_chain is not None else None
+        )
+        seeking = parked_key is not None
         for chain, ancestor_cursor in chains_iter:
-            # Skip already-emitted chains. Ancestor-page HTTP cost is
-            # unavoidable (we need the keys to identify the chain), but
-            # no leaf fetches happen during the skip.
-            if parent_idx < parent_idx_start:
-                parent_idx += 1
-                continue
-            if parent_idx == parent_idx_start and chain_next_link_in is not None:
+            # Skip already-emitted chains — key-based when parked
+            # (churn-stable), positional for legacy offsets. Ancestor-page
+            # HTTP cost is unavoidable (we need the keys to identify the
+            # chain), but no leaf fetches happen during the skip.
+            use_link = False
+            if parked_key is not None:
+                if seeking:
+                    at_parked = chain == parked_chain
+                    if not at_parked and _chain_strictly_before(
+                        _chain_resume_key(chain, ancestor_cursor), parked_key
+                    ):
+                        parent_idx += 1
+                        continue
+                    seeking = False
+                    if at_parked and chain_next_link_in is None:
+                        # Exclusive park: chain completed exactly at the cap.
+                        parent_idx += 1
+                        continue
+                    use_link = at_parked and chain_next_link_in is not None
+            else:
+                if parent_idx < parent_idx_start:
+                    parent_idx += 1
+                    continue
+                use_link = parent_idx == parent_idx_start and chain_next_link_in is not None
+            if use_link:
                 initial_url = chain_next_link_in
             else:
                 initial_url = self._build_contained_url(
@@ -4382,12 +4560,16 @@ class ContainedNavMixin:
                     chain_next_link_out = page_next_url
                 else:
                     parent_idx += 1
+                parked_chain_out = chain
+                parked_cursor_out = ancestor_cursor
                 break
             parent_idx += 1
         return {
             "emitted": emitted,
             "truncated": truncated,
             "parent_idx": parent_idx,
+            "parent_keys": parked_chain_out,
+            "parent_cursor": parked_cursor_out,
             "chain_next_link": chain_next_link_out,
         }
 
@@ -4415,7 +4597,14 @@ class ContainedNavMixin:
         prev_running_max = (start_offset or {}).get("running_max")
         new_running_max = _max_or(this_batch_max, prev_running_max)
         if walk_state["truncated"]:
+            # ``parent_idx`` rides along for downgrade compatibility; the
+            # resume positions on ``parent_keys``/``parent_cursor``
+            # (churn-stable — this enumeration is ordered by a mutable
+            # cursor column, see ``_walk_ancestor_chains``).
             offset: dict = {"parent_idx": walk_state["parent_idx"]}
+            if walk_state["parent_keys"] is not None:
+                offset["parent_keys"] = walk_state["parent_keys"]
+                offset["parent_cursor"] = walk_state["parent_cursor"]
             if since is not None:
                 offset["cursor"] = since
             if walk_state["chain_next_link"] is not None:

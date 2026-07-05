@@ -948,8 +948,16 @@ class ODataLakeflowConnect(
         # two synthetic columns alongside the entity's own properties:
         # ``_deleted`` (in-band tombstone flag) and ``_lc_sequence`` (the
         # cursor column apply_changes uses to order updates). Both must be
-        # in the declared schema so Spark accepts the records.
-        if self._delta_active_for(table_name, table_options):
+        # in the declared schema so Spark accepts the records. Contained
+        # paths never take the delta read path (``read_table`` rejects
+        # ``enabled`` there and ``read_table_metadata`` skips the probe with
+        # the same guard) — without it, a contained table under
+        # ``delta_tracking=auto`` whose server 200-acknowledges the Prefer
+        # header on the contained URL would declare two NON-NULLABLE columns
+        # no emitted row carries.
+        if _parse_contained_path(table_name) is None and self._delta_active_for(
+            table_name, table_options
+        ):
             fields = list(fields) + [
                 StructField(_DELETED_COL, BooleanType(), False),
                 StructField(_SEQUENCE_COL, StringType(), False),

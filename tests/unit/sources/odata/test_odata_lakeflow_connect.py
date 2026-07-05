@@ -6925,8 +6925,223 @@ def test_contained_incremental_truncation_trims_boundary_cohort():
     # Resume re-fetches parent 0 from cursor gt c1, picking up c2 + beyond.
     assert _drop_lb(offset) == {
         "parent_idx": 0,
+        "parent_keys": [{"Id": 1}],
         "truncated_chain_cursor": "2024-01-01T00:00:00Z",
     }
+
+
+def _churn_walk_opts():
+    return {
+        "cursor_field": "ModifiedAt",
+        "max_records_per_batch": "3",
+        "pagination": "nextlink",
+    }
+
+
+def _churn_children_cb(rows):
+    """Children endpoint callback honoring the walk's ``cursor gt`` filter."""
+
+    def cb(req):
+        from urllib.parse import parse_qs, unquote, urlparse
+
+        flt = unquote(parse_qs(urlparse(req.url).query).get("$filter", [""])[0])
+        out = rows
+        m = re.search(r"ModifiedAt gt (\S+)", flt)
+        if m:
+            out = [r for r in rows if r["ModifiedAt"] > m.group(1)]
+        return (200, {}, json.dumps({"value": out}))
+
+    return cb
+
+
+@responses.activate
+def test_capped_walk_resume_survives_parent_delete():
+    """The truncation checkpoint parks the truncated parent's KEY CHAIN, not
+    just its position: a parent deleted below the park shifts every
+    successor left one slot, and a positional resume then skips the parked
+    parent forever — its unread tail excluded by ``cursor gt <watermark>``
+    on every later batch (permanent loss; beyond lookback during a capped
+    bootstrap). The key-based resume re-finds the parked parent."""
+    _mock_nested_metadata()
+    parents_state = [{"Id": 10}, {"Id": 20}, {"Id": 30}]
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents",
+        callback=lambda _r: (200, {}, json.dumps({"value": parents_state})),
+    )
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(10)/Children",
+        callback=_churn_children_cb([{"Id": 101, "ModifiedAt": "2024-01-01T00:00:00Z"}]),
+    )
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(20)/Children",
+        callback=_churn_children_cb(
+            [
+                {"Id": 201, "ModifiedAt": "2024-01-01T00:00:00Z"},
+                {"Id": 202, "ModifiedAt": "2024-01-02T00:00:00Z"},
+                {"Id": 203, "ModifiedAt": "2024-01-03T00:00:00Z"},
+            ]
+        ),
+    )
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(30)/Children",
+        callback=_churn_children_cb([{"Id": 301, "ModifiedAt": "2024-02-01T00:00:00Z"}]),
+    )
+    c = _make()
+    recs1, offset1 = c.read_table("Parents__Children", {}, _churn_walk_opts())
+    # Batch 1: parent 10 in full + parent 20 trimmed at the c2 boundary.
+    assert [r["Id"] for r in recs1] == [101, 201, 202]
+    assert offset1["parent_keys"] == [{"Id": 20}]
+    # Parent 10 is deleted between batches — every survivor shifts left.
+    parents_state[:] = [{"Id": 20}, {"Id": 30}]
+    recs2, offset2 = c.read_table("Parents__Children", offset1, _churn_walk_opts())
+    # Batch 2 must resume AT parent 20 (its unread tail), then walk 30.
+    # The positional resume skipped 20 entirely and lost row 203.
+    assert [r["Id"] for r in recs2] == [203, 301]
+    assert _drop_lb(offset2) == {"cursor": "2024-02-01T00:00:00Z"}
+
+
+@responses.activate
+def test_capped_walk_parked_link_follows_parent_keys_not_position():
+    """A parent inserted below the park shifts the enumeration right; a
+    positional resume then applies the parked mid-collection continuation
+    link to the WRONG parent — its rows FK-tagged with that parent's keys
+    (corrupt ancestor attribution). The key-based resume applies the link
+    only to the parent that parked it. (The inserted parent's own rows are
+    the documented mid-walk-arrival class — recovered via
+    ``cursor_lookback`` on a later cycle, never mis-tagged.)"""
+    _mock_nested_metadata()
+    parents_state = [{"Id": 10}, {"Id": 20}, {"Id": 30}]
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents",
+        callback=lambda _r: (200, {}, json.dumps({"value": parents_state})),
+    )
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(10)/Children",
+        callback=_churn_children_cb([{"Id": 101, "ModifiedAt": "2024-01-01T00:00:00Z"}]),
+    )
+    token_page = {"value": [{"Id": 203, "ModifiedAt": "2024-01-03T00:00:00Z"}]}
+
+    def p20_cb(req):
+        if "$skiptoken=t1" in req.url:
+            return (200, {}, json.dumps(token_page))
+        return (
+            200,
+            {},
+            json.dumps(
+                {
+                    "value": [
+                        {"Id": 201, "ModifiedAt": "2024-01-01T00:00:00Z"},
+                        {"Id": 202, "ModifiedAt": "2024-01-02T00:00:00Z"},
+                    ],
+                    "@odata.nextLink": f"{SERVICE_URL}Parents(20)/Children?$skiptoken=t1",
+                }
+            ),
+        )
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents(20)/Children", callback=p20_cb)
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(30)/Children",
+        callback=_churn_children_cb([{"Id": 301, "ModifiedAt": "2024-02-01T00:00:00Z"}]),
+    )
+    # Parents(15)/Children deliberately unregistered: any fetch of the
+    # inserted parent (e.g. the parked link misapplied to it under the old
+    # positional resume) fails the test via ConnectionError.
+    c = _make()
+    recs1, offset1 = c.read_table("Parents__Children", {}, _churn_walk_opts())
+    # Batch 1: parent 10 (1 row) + parent 20 page 1 (2 rows) = cap; the
+    # page's nextLink is the checkpoint.
+    assert [r["Id"] for r in recs1] == [101, 201, 202]
+    assert offset1["parent_keys"] == [{"Id": 20}]
+    assert offset1["chain_next_link"].endswith("$skiptoken=t1")
+    # Parent 15 is inserted below the park between batches.
+    parents_state[:] = [{"Id": 10}, {"Id": 15}, {"Id": 20}, {"Id": 30}]
+    recs2, _ = c.read_table("Parents__Children", offset1, _churn_walk_opts())
+    # The link's rows must be tagged with parent 20 — the parent that
+    # parked it — never with the inserted parent occupying its old slot.
+    assert [(r["Parents_Id"], r["Id"]) for r in recs2] == [(20, 203), (30, 301)]
+
+
+@responses.activate
+def test_capped_walk_legacy_positional_offset_still_resumes():
+    """Offsets written before ``parent_keys`` existed carry only
+    ``parent_idx`` — they must keep resuming positionally (stable parent
+    set), so an upgrade mid-stream doesn't strand a parked checkpoint."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 10}, {"Id": 20}]})
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(10)/Children",
+        callback=_churn_children_cb(
+            [
+                {"Id": 101, "ModifiedAt": "2024-01-01T00:00:00Z"},
+                {"Id": 102, "ModifiedAt": "2024-01-02T00:00:00Z"},
+            ]
+        ),
+    )
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(20)/Children",
+        callback=_churn_children_cb([{"Id": 201, "ModifiedAt": "2024-02-01T00:00:00Z"}]),
+    )
+    c = _make()
+    legacy = {"parent_idx": 0, "truncated_chain_cursor": "2024-01-01T00:00:00Z"}
+    recs, offset = c.read_table("Parents__Children", legacy, _churn_walk_opts())
+    # Positional resume: parent at index 0 re-read from cursor gt c1.
+    assert [r["Id"] for r in recs] == [102, 201]
+    assert _drop_lb(offset) == {"cursor": "2024-02-01T00:00:00Z"}
+
+
+def test_chain_resume_ordering_is_chronological_and_incomparable_safe():
+    """The key-based resume orders chains like the server enumeration:
+    ints numerically, ISO-rendered keys chronologically (``…00.5Z`` is
+    NEWER than ``…00Z`` despite sorting lexically smaller). Incomparable
+    pairs (cross-type after a metadata change) are never skipped —
+    duplicate-safe, not silent loss."""
+    from databricks.labs.community_connector.sources.odata._contained import (
+        _chain_resume_key,
+        _chain_strictly_before,
+    )
+
+    assert _chain_strictly_before(_chain_resume_key([{"Id": 5}]), _chain_resume_key([{"Id": 20}]))
+    assert _chain_strictly_before(
+        _chain_resume_key([{"K": "2024-01-01T00:00:00Z"}]),
+        _chain_resume_key([{"K": "2024-01-01T00:00:00.5Z"}]),
+    )
+    assert not _chain_strictly_before(
+        _chain_resume_key([{"K": "2024-01-01T00:00:00.5Z"}]),
+        _chain_resume_key([{"K": "2024-01-01T00:00:00Z"}]),
+    )
+    # Cross-type: incomparable → False both ways (re-read, never skip).
+    assert not _chain_strictly_before(
+        _chain_resume_key([{"Id": 5}]), _chain_resume_key([{"Id": "x"}])
+    )
+    assert not _chain_strictly_before(
+        _chain_resume_key([{"Id": "x"}]), _chain_resume_key([{"Id": 5}])
+    )
+    # Ancestor-cursor walks prefix the stamped cursor term.
+    assert _chain_strictly_before(
+        _chain_resume_key([{"Id": 9}], "2024-01-01T00:00:00Z"),
+        _chain_resume_key([{"Id": 1}], "2024-06-01T00:00:00Z"),
+    )
+
+
+@responses.activate
+def test_contained_schema_never_gains_delta_columns():
+    """Contained paths never take the delta read path (dispatch rejects
+    ``enabled``; metadata skips the probe), so their declared schema must
+    not gain the non-nullable ``_deleted``/``_lc_sequence`` columns no
+    emitted row would carry. Flat tables keep them."""
+    _mock_nested_metadata()
+    c = _make()
+    names = [f.name for f in c.get_table_schema("Parents__Children", {"delta_tracking": "enabled"})]
+    assert "_deleted" not in names and "_lc_sequence" not in names
 
 
 @responses.activate
@@ -7010,6 +7225,7 @@ def test_contained_incremental_continues_past_single_cursor_parent_then_checkpoi
     # Checkpoint lands on parent 2 (index 1) at its last distinct cursor.
     assert _drop_lb(offset) == {
         "parent_idx": 1,
+        "parent_keys": [{"Id": 2}],
         "truncated_chain_cursor": "2024-02-01T00:00:00Z",
     }
 
@@ -7144,6 +7360,7 @@ def test_contained_incremental_truncation_uses_nextlink_at_page_boundary():
     assert len(rows) == 2
     assert _drop_lb(offset) == {
         "parent_idx": 0,
+        "parent_keys": [{"Id": 1}],
         "chain_next_link": next_link,
     }
 
@@ -11504,7 +11721,7 @@ def test_expand_contained_switch_false_to_expand_resumes_from_watermark(second_m
     # The expand read resumed from the SHARED watermark, not from scratch.
     assert any("gt 2020-06-01T00:00:00Z" in u for u in _expand_urls())
     # No stale N+1 resume state rides forward.
-    for stale in ("parent_idx", "chain_next_link", "truncated_chain_cursor"):
+    for stale in ("parent_idx", "parent_keys", "chain_next_link", "truncated_chain_cursor"):
         assert stale not in offset2
 
 
