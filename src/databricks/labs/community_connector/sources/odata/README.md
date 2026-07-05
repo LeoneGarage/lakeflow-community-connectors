@@ -422,7 +422,11 @@ OData v4 §13.4.3 makes contained-entity keys unique only within their
 immediate parent, so collapsing on the leaf's own PK collides across
 sibling parent branches. Default name is ``<segment>_<pkname>``;
 leading ``_`` characters are prepended (one or more, until unique) if it
-would collide with a leaf property **or** with another ancestor-FK column.
+would collide with a leaf property **or** with another ancestor-FK column —
+including when a recursive containment path repeats the same nav-prop name
+at two levels (``Nodes__Children__Children__Children`` → ``Nodes_Id``,
+``Children_Id``, ``_Children_Id``): each level keeps its own distinct
+column and composite-key component.
 For ``Parents__Children__Notes``:
 
 ```

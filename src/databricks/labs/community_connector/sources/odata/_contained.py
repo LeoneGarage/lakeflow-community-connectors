@@ -87,6 +87,19 @@ _CURSOR_PROBE_SHARED_FAIL = (
     "server (cached verdict); using the $batch / plain N+1 fallback."
 )
 
+
+class _CursorProbePreflightUnavailable(Exception):
+    """The cursor-probe preflight's enumeration or trusted-reference fetch
+    failed before reaching a verdict — indistinguishable from a transient,
+    so it must degrade a ``cursor_probe=auto`` read to the ``$batch``/plain
+    cascade (recording nothing) rather than escape as a raw HTTP error.
+
+    Raised ONLY around the preflight's HTTP fetches, so
+    ``_verify_cursor_probe_support`` can catch exactly this — a programming
+    error in the preflight's own logic still propagates instead of being
+    silently converted into permanent degradation."""
+
+
 # Max GET sub-requests packed into one OData ``$batch`` request by the
 # ``cursor_probe=batch`` / ``auto``-fallback hydrate. A hard cap — some Smart
 # Default ``$batch`` chunk size: the batched walk packs leaf-parent reads (and
@@ -1044,8 +1057,8 @@ class ContainedNavMixin:
 
     def _resolve_fk_columns(
         self, segments: list[str], namespace: str | None
-    ) -> dict[tuple[str, str], str]:
-        """Map ``(segment, pk_name) → unique FK column name`` for every
+    ) -> dict[tuple[int, str], str]:
+        """Map ``(level_index, pk_name) → unique FK column name`` for every
         non-leaf ancestor.
 
         OData v4 §13.4.3 makes contained-entity keys unique only within
@@ -1053,6 +1066,13 @@ class ContainedNavMixin:
         the full ancestor chain to be globally unique. Default name is
         ``<segment>_<pk>``; collisions get a leading ``_`` until unique.
         Empty mapping for flat tables.
+
+        Keyed by the segment's **index**, not its name: a recursive
+        containment path can repeat a nav-prop name at two non-leaf
+        levels (``Folders__Children__Children__Files``), and a
+        name-keyed map would collapse both levels into one entry —
+        losing a composite-key component (silent MERGE collisions) and
+        duplicating the surviving column in the schema.
 
         FK columns named in the ``exclude_ancestor_columns`` table option
         (parsed onto ``self._excluded_ancestor_columns`` at each entry
@@ -1086,7 +1106,7 @@ class ContainedNavMixin:
                     candidate = fk_column_name(seg, pk)
                     while candidate in used:
                         candidate = "_" + candidate
-                    resolved[(seg, pk)] = candidate
+                    resolved[(idx, pk)] = candidate
                     used.add(candidate)
             state.fk_columns[cache_key] = resolved
         excluded = getattr(self, "_excluded_ancestor_columns", frozenset())
@@ -1101,14 +1121,15 @@ class ContainedNavMixin:
         row: dict,
         segments: list[str],
         chain: list[dict[str, Any]],
-        fk_columns: dict[tuple[str, str], str],
+        fk_columns: dict[tuple[int, str], str],
     ) -> None:
         """Write every ancestor's primary-key values onto ``row`` under
-        the resolved FK column names from ``fk_columns``."""
+        the resolved FK column names from ``fk_columns`` (keyed by level
+        index, so repeated nav-prop names at different depths stay
+        distinct columns)."""
         for idx, ancestor_keys in enumerate(chain):
-            seg = segments[idx]
             for pk_name, pk_val in ancestor_keys.items():
-                col = fk_columns.get((seg, pk_name))
+                col = fk_columns.get((idx, pk_name))
                 if col is not None:
                     row[col] = pk_val
 
@@ -1491,18 +1512,21 @@ class ContainedNavMixin:
                     cache[cache_key] = self._run_cursor_probe_preflight(
                         segments, namespace, table_options, cursor_field
                     )
-                except Exception as exc:
+                except _CursorProbePreflightUnavailable as exc:
                     # The preflight's enumeration or trusted-reference fetch
-                    # failed before reaching a verdict. Unlike the probe-shape
-                    # rejection handled inside ``_cursor_probe_check_sample``
-                    # (whose sibling fetches just succeeded, making it
-                    # definitive), there is no evidence here to distinguish a
-                    # capability shortfall ($orderby desc / $select rejected
-                    # on direct navigation) from a transient blip — so treat
-                    # it like the other verifiers treat transients: degrade
-                    # THIS read to the $batch/plain cascade, cache and record
-                    # NOTHING (the next batch re-probes), and never let the
-                    # raw HTTP error escape a ``cursor_probe=auto`` read.
+                    # failed before reaching a verdict (only those two fetch
+                    # sites raise this type — a programming error in the
+                    # preflight's own logic still propagates). Unlike the
+                    # probe-shape rejection handled inside
+                    # ``_cursor_probe_check_sample`` (whose sibling fetches
+                    # just succeeded, making it definitive), there is no
+                    # evidence here to distinguish a capability shortfall
+                    # ($orderby desc / $select rejected on direct navigation)
+                    # from a transient blip — so treat it like the other
+                    # verifiers treat transients: degrade THIS read to the
+                    # $batch/plain cascade, cache and record NOTHING (the
+                    # next batch re-probes), and never let the raw HTTP
+                    # error escape a ``cursor_probe=auto`` read.
                     msg = (
                         f"cursor_probe preflight against "
                         f"{CONTAINED_PATH_SEP.join(segments)!r} failed before reaching "
@@ -1588,7 +1612,10 @@ class ContainedNavMixin:
             if lp_order:
                 next_url += f"&$orderby={lp_order}"
             while next_url:
-                lp_rows, next_url = self._fetch_one_expand_page(next_url)
+                try:
+                    lp_rows, next_url = self._fetch_one_expand_page(next_url)
+                except Exception as exc:  # enumeration fetch failed — no verdict
+                    raise _CursorProbePreflightUnavailable(str(exc)) from exc
                 for lp_row in lp_rows:
                     scanned += 1
                     lp_key = {pk: lp_row.get(pk) for pk in lp_pks}
@@ -1628,9 +1655,12 @@ class ContainedNavMixin:
         full_chain = pchain + [lp_key]
         leaf_base = join_url(self.service_url, self._build_contained_path(segments, full_chain))
         # Trusted reference: direct-navigation ordering on the leaf collection.
-        direct_rows, _ = self._fetch_one_expand_page(
-            f"{leaf_base}?$orderby={cursor_field} desc&$top=2&$select={cursor_field}"
-        )
+        try:
+            direct_rows, _ = self._fetch_one_expand_page(
+                f"{leaf_base}?$orderby={cursor_field} desc&$top=2&$select={cursor_field}"
+            )
+        except Exception as exc:  # reference fetch failed — no verdict either way
+            raise _CursorProbePreflightUnavailable(str(exc)) from exc
         vals = [r.get(cursor_field) for r in direct_rows if r.get(cursor_field) is not None]
         if len(vals) < 2 or vals[0] == vals[1]:
             return ("skip", None)
@@ -2678,7 +2708,7 @@ class ContainedNavMixin:
         max_records: int,
         segments: list[str],
         pks_per_level: list[list[str]],
-        fk_columns: dict[str, str],
+        fk_columns: dict[tuple[int, str], str],
         emitted: list[dict],
         ctx: tuple | None,
         page_size: int | None,
@@ -2794,7 +2824,7 @@ class ContainedNavMixin:
         initial_queue: list[dict],
         segments: list[str],
         pks_per_level: list[list[str]],
-        fk_columns: dict[tuple[str, str], str],
+        fk_columns: dict[tuple[int, str], str],
         ctx: tuple | None,
         page_size: int | None,
     ) -> Iterator[dict]:
@@ -3005,7 +3035,7 @@ class ContainedNavMixin:
         segments: list[str],
         pks_per_level: list[list[str]],
         chain: list[dict[str, Any]],
-        fk_columns: dict[tuple[str, str], str],
+        fk_columns: dict[tuple[int, str], str],
         out: list[dict],
         cursor_ctx: tuple[str | None, int, Any] | None = None,
         per_level_tops: list[int] | None = None,
@@ -3334,7 +3364,7 @@ class ContainedNavMixin:
         truncated_chain_cursor: Any,
         chain_next_link: str | None,
         max_records: int,
-        fk_columns: dict[tuple[str, str], str],
+        fk_columns: dict[tuple[int, str], str],
         leaf_segment_filter: str | None = None,
         effective=None,
         skip_null: bool = False,
@@ -3506,7 +3536,7 @@ class ContainedNavMixin:
         cursor_field: str,
         since: Any,
         max_records: int,
-        fk_columns: dict[tuple[str, str], str],
+        fk_columns: dict[tuple[int, str], str],
         leaf_segment_filter: str | None = None,
         effective=None,
         skip_null: bool = False,
@@ -4138,7 +4168,7 @@ class ContainedNavMixin:
         parent_idx_start: int,
         chain_next_link_in: str | None,
         max_records: int,
-        fk_columns: dict[tuple[str, str], str],
+        fk_columns: dict[tuple[int, str], str],
         leaf_segment_filter: str | None = None,
     ) -> dict[str, Any]:
         """Walk ancestor chains, fetching each chain's leaf collection

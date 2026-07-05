@@ -709,6 +709,19 @@ def register_lakeflow_source(spark):
         "server (cached verdict); using the $batch / plain N+1 fallback."
     )
 
+
+    class _CursorProbePreflightUnavailable(Exception):
+        """The cursor-probe preflight's enumeration or trusted-reference fetch
+        failed before reaching a verdict — indistinguishable from a transient,
+        so it must degrade a ``cursor_probe=auto`` read to the ``$batch``/plain
+        cascade (recording nothing) rather than escape as a raw HTTP error.
+
+        Raised ONLY around the preflight's HTTP fetches, so
+        ``_verify_cursor_probe_support`` can catch exactly this — a programming
+        error in the preflight's own logic still propagates instead of being
+        silently converted into permanent degradation."""
+
+
     # Max GET sub-requests packed into one OData ``$batch`` request by the
     # ``cursor_probe=batch`` / ``auto``-fallback hydrate. A hard cap — some Smart
     # Default ``$batch`` chunk size: the batched walk packs leaf-parent reads (and
@@ -1666,8 +1679,8 @@ def register_lakeflow_source(spark):
 
         def _resolve_fk_columns(
             self, segments: list[str], namespace: str | None
-        ) -> dict[tuple[str, str], str]:
-            """Map ``(segment, pk_name) → unique FK column name`` for every
+        ) -> dict[tuple[int, str], str]:
+            """Map ``(level_index, pk_name) → unique FK column name`` for every
             non-leaf ancestor.
 
             OData v4 §13.4.3 makes contained-entity keys unique only within
@@ -1675,6 +1688,13 @@ def register_lakeflow_source(spark):
             the full ancestor chain to be globally unique. Default name is
             ``<segment>_<pk>``; collisions get a leading ``_`` until unique.
             Empty mapping for flat tables.
+
+            Keyed by the segment's **index**, not its name: a recursive
+            containment path can repeat a nav-prop name at two non-leaf
+            levels (``Folders__Children__Children__Files``), and a
+            name-keyed map would collapse both levels into one entry —
+            losing a composite-key component (silent MERGE collisions) and
+            duplicating the surviving column in the schema.
 
             FK columns named in the ``exclude_ancestor_columns`` table option
             (parsed onto ``self._excluded_ancestor_columns`` at each entry
@@ -1708,7 +1728,7 @@ def register_lakeflow_source(spark):
                         candidate = fk_column_name(seg, pk)
                         while candidate in used:
                             candidate = "_" + candidate
-                        resolved[(seg, pk)] = candidate
+                        resolved[(idx, pk)] = candidate
                         used.add(candidate)
                 state.fk_columns[cache_key] = resolved
             excluded = getattr(self, "_excluded_ancestor_columns", frozenset())
@@ -1723,14 +1743,15 @@ def register_lakeflow_source(spark):
             row: dict,
             segments: list[str],
             chain: list[dict[str, Any]],
-            fk_columns: dict[tuple[str, str], str],
+            fk_columns: dict[tuple[int, str], str],
         ) -> None:
             """Write every ancestor's primary-key values onto ``row`` under
-            the resolved FK column names from ``fk_columns``."""
+            the resolved FK column names from ``fk_columns`` (keyed by level
+            index, so repeated nav-prop names at different depths stay
+            distinct columns)."""
             for idx, ancestor_keys in enumerate(chain):
-                seg = segments[idx]
                 for pk_name, pk_val in ancestor_keys.items():
-                    col = fk_columns.get((seg, pk_name))
+                    col = fk_columns.get((idx, pk_name))
                     if col is not None:
                         row[col] = pk_val
 
@@ -2113,18 +2134,21 @@ def register_lakeflow_source(spark):
                         cache[cache_key] = self._run_cursor_probe_preflight(
                             segments, namespace, table_options, cursor_field
                         )
-                    except Exception as exc:
+                    except _CursorProbePreflightUnavailable as exc:
                         # The preflight's enumeration or trusted-reference fetch
-                        # failed before reaching a verdict. Unlike the probe-shape
-                        # rejection handled inside ``_cursor_probe_check_sample``
-                        # (whose sibling fetches just succeeded, making it
-                        # definitive), there is no evidence here to distinguish a
-                        # capability shortfall ($orderby desc / $select rejected
-                        # on direct navigation) from a transient blip — so treat
-                        # it like the other verifiers treat transients: degrade
-                        # THIS read to the $batch/plain cascade, cache and record
-                        # NOTHING (the next batch re-probes), and never let the
-                        # raw HTTP error escape a ``cursor_probe=auto`` read.
+                        # failed before reaching a verdict (only those two fetch
+                        # sites raise this type — a programming error in the
+                        # preflight's own logic still propagates). Unlike the
+                        # probe-shape rejection handled inside
+                        # ``_cursor_probe_check_sample`` (whose sibling fetches
+                        # just succeeded, making it definitive), there is no
+                        # evidence here to distinguish a capability shortfall
+                        # ($orderby desc / $select rejected on direct navigation)
+                        # from a transient blip — so treat it like the other
+                        # verifiers treat transients: degrade THIS read to the
+                        # $batch/plain cascade, cache and record NOTHING (the
+                        # next batch re-probes), and never let the raw HTTP
+                        # error escape a ``cursor_probe=auto`` read.
                         msg = (
                             f"cursor_probe preflight against "
                             f"{CONTAINED_PATH_SEP.join(segments)!r} failed before reaching "
@@ -2210,7 +2234,10 @@ def register_lakeflow_source(spark):
                 if lp_order:
                     next_url += f"&$orderby={lp_order}"
                 while next_url:
-                    lp_rows, next_url = self._fetch_one_expand_page(next_url)
+                    try:
+                        lp_rows, next_url = self._fetch_one_expand_page(next_url)
+                    except Exception as exc:  # enumeration fetch failed — no verdict
+                        raise _CursorProbePreflightUnavailable(str(exc)) from exc
                     for lp_row in lp_rows:
                         scanned += 1
                         lp_key = {pk: lp_row.get(pk) for pk in lp_pks}
@@ -2250,9 +2277,12 @@ def register_lakeflow_source(spark):
             full_chain = pchain + [lp_key]
             leaf_base = join_url(self.service_url, self._build_contained_path(segments, full_chain))
             # Trusted reference: direct-navigation ordering on the leaf collection.
-            direct_rows, _ = self._fetch_one_expand_page(
-                f"{leaf_base}?$orderby={cursor_field} desc&$top=2&$select={cursor_field}"
-            )
+            try:
+                direct_rows, _ = self._fetch_one_expand_page(
+                    f"{leaf_base}?$orderby={cursor_field} desc&$top=2&$select={cursor_field}"
+                )
+            except Exception as exc:  # reference fetch failed — no verdict either way
+                raise _CursorProbePreflightUnavailable(str(exc)) from exc
             vals = [r.get(cursor_field) for r in direct_rows if r.get(cursor_field) is not None]
             if len(vals) < 2 or vals[0] == vals[1]:
                 return ("skip", None)
@@ -3300,7 +3330,7 @@ def register_lakeflow_source(spark):
             max_records: int,
             segments: list[str],
             pks_per_level: list[list[str]],
-            fk_columns: dict[str, str],
+            fk_columns: dict[tuple[int, str], str],
             emitted: list[dict],
             ctx: tuple | None,
             page_size: int | None,
@@ -3416,7 +3446,7 @@ def register_lakeflow_source(spark):
             initial_queue: list[dict],
             segments: list[str],
             pks_per_level: list[list[str]],
-            fk_columns: dict[tuple[str, str], str],
+            fk_columns: dict[tuple[int, str], str],
             ctx: tuple | None,
             page_size: int | None,
         ) -> Iterator[dict]:
@@ -3627,7 +3657,7 @@ def register_lakeflow_source(spark):
             segments: list[str],
             pks_per_level: list[list[str]],
             chain: list[dict[str, Any]],
-            fk_columns: dict[tuple[str, str], str],
+            fk_columns: dict[tuple[int, str], str],
             out: list[dict],
             cursor_ctx: tuple[str | None, int, Any] | None = None,
             per_level_tops: list[int] | None = None,
@@ -3956,7 +3986,7 @@ def register_lakeflow_source(spark):
             truncated_chain_cursor: Any,
             chain_next_link: str | None,
             max_records: int,
-            fk_columns: dict[tuple[str, str], str],
+            fk_columns: dict[tuple[int, str], str],
             leaf_segment_filter: str | None = None,
             effective=None,
             skip_null: bool = False,
@@ -4128,7 +4158,7 @@ def register_lakeflow_source(spark):
             cursor_field: str,
             since: Any,
             max_records: int,
-            fk_columns: dict[tuple[str, str], str],
+            fk_columns: dict[tuple[int, str], str],
             leaf_segment_filter: str | None = None,
             effective=None,
             skip_null: bool = False,
@@ -4760,7 +4790,7 @@ def register_lakeflow_source(spark):
             parent_idx_start: int,
             chain_next_link_in: str | None,
             max_records: int,
-            fk_columns: dict[tuple[str, str], str],
+            fk_columns: dict[tuple[int, str], str],
             leaf_segment_filter: str | None = None,
         ) -> dict[str, Any]:
             """Walk ancestor chains, fetching each chain's leaf collection
@@ -5295,6 +5325,40 @@ def register_lakeflow_source(spark):
 
     _NS_EDMX = "{http://docs.oasis-open.org/odata/ns/edmx}"
     _NS_EDM = "{http://docs.oasis-open.org/odata/ns/edm}"
+
+
+    def _spark_type_for_property(prop):
+        """Spark type for one CSDL ``<Property>`` element: the static EDM map,
+        except ``Edm.Decimal``, which honours the declared ``Precision`` /
+        ``Scale`` facets (a hardcoded ``DecimalType(38, 18)`` leaves only 20
+        digits left of the point — it can't hold a ``Decimal(38, 0)`` ID
+        column's large values). Facet handling:
+
+        * both facets absent — the historical wide ``DecimalType(38, 18)``,
+          so existing destinations don't shift types;
+        * ``Scale="variable"``/``"floating"`` — also ``(38, 18)`` (Spark's
+          fixed-scale decimal can't express a varying scale);
+        * ``Scale`` absent with ``Precision`` declared — scale 0 (the CSDL
+          default);
+        * values clamped to Spark's 38-digit maximum with
+          ``scale <= precision``."""
+        edm_type = prop.get("Type", "Edm.String")
+        if edm_type != "Edm.Decimal":
+            return _EDM_TO_SPARK.get(edm_type, StringType())
+        raw_precision = prop.get("Precision")
+        raw_scale = prop.get("Scale")
+        if raw_precision is None and raw_scale is None:
+            return DecimalType(38, 18)
+        if raw_scale is None:
+            scale = 0
+        elif raw_scale.isdigit():
+            scale = int(raw_scale)
+        else:  # "variable" / "floating"
+            return DecimalType(38, 18)
+        precision = int(raw_precision) if raw_precision and raw_precision.isdigit() else 38
+        precision = min(max(precision, 1), 38)
+        return DecimalType(precision, min(scale, precision))
+
 
     # Delta tracking constants.
     #
@@ -7650,12 +7714,36 @@ def register_lakeflow_source(spark):
             triage from a pipeline log nearly impossible. This method picks
             the relevant remediation hints based on which auth mode is
             active on the connection.
+
+            403 gets its own message ahead of the per-mode 401 branches:
+            it is an *authorization* failure (the token/credentials were
+            accepted), so the token-expiry/refresh hints — and the "no
+            refresh path is configured" framing — don't apply.
             """
             status = resp.status_code
             body = _truncate(resp.text, 300) or "(empty body)"
             auth = (self.options.get("auth_type") or "").lower().strip()
             if not auth and self.options.get("token"):
                 auth = "bearer"
+            if status == 403:
+                # 403 means the request WAS authenticated but the principal is
+                # not authorized for this resource — a token refresh can't fix
+                # it (which is why the 401-refresh branch deliberately skips
+                # 403), and the "no refresh path is configured" prefix below
+                # would be false and misleading on a fully-configured oauth2
+                # connection. Say what actually needs fixing: permissions.
+                return (
+                    f"OData service returned 403 (Forbidden) for {url!r}. The "
+                    f"request was authenticated but the principal is not "
+                    f"authorized for this resource, so an automatic token "
+                    f"refresh cannot fix it. Grant the principal read access "
+                    f"to this entity set at the source (role/permission "
+                    f"assignment), or supply credentials whose scope covers it "
+                    f"(check 'oauth2_scope' and any required admin consent), "
+                    f"and confirm tenant/instance identifiers in 'service_url' "
+                    f"or 'extra_headers' match the credentials. "
+                    f"Server response: {body}"
+                )
             prefix = (
                 f"OData service returned {status} for {url!r} and no "
                 f"automatic token-refresh path is configured. "
@@ -7822,11 +7910,29 @@ def register_lakeflow_source(spark):
             if scope:
                 data["scope"] = scope
             token_url = _require(self.options, "oauth2_token_url")
-            resp = requests.post(
-                token_url,
-                data=data,
-                timeout=self.timeout,
-            )
+            # The token endpoint gets the same transient tolerance as the
+            # source itself: a 429/5xx or a network blip here would otherwise
+            # kill the whole read (including mid-read, via the 401-refresh and
+            # pre-emptive-refresh paths in `_http_get_once`) while the source
+            # requests around it enjoy the full retry budget.
+            for attempt in range(self.max_retries + 1):
+                try:
+                    resp = requests.post(
+                        token_url,
+                        data=data,
+                        timeout=self.timeout,
+                    )
+                except _TRANSIENT_NETWORK_ERRORS as exc:
+                    if attempt >= self.max_retries:
+                        raise type(exc)(
+                            f"{exc} (token endpoint {token_url!r}, after " f"{attempt + 1} attempts)"
+                        ) from exc
+                    time.sleep(self._backoff_delay(attempt))
+                    continue
+                if resp.status_code in _RETRYABLE_HTTP_STATUSES and attempt < self.max_retries:
+                    time.sleep(self._retry_after_delay(resp, attempt))
+                    continue
+                break
             # Surface a precise, actionable error when the token endpoint
             # itself rejects the request. raise_for_status() would otherwise
             # produce a terse "401 Client Error: Unauthorized for url ..."
@@ -8148,8 +8254,7 @@ def register_lakeflow_source(spark):
             fk_columns = self._resolve_fk_columns(segments, namespace)
             fk_fields: list[StructField] = []
             for idx in range(len(segments) - 1):
-                seg = segments[idx]
-                if not any(k[0] == seg for k in fk_columns):
+                if not any(k[0] == idx for k in fk_columns):
                     continue
                 ancestor_et = self._entity_type_for(
                     _CONTAINED_PATH_SEP.join(segments[: idx + 1]), namespace
@@ -8158,7 +8263,7 @@ def register_lakeflow_source(spark):
                 for pk in self._own_primary_keys_for_et(ancestor_et):
                     fk_fields.append(
                         StructField(
-                            fk_columns[(seg, pk)],
+                            fk_columns[(idx, pk)],
                             own.get(pk, StringType()),
                             False,
                         )
@@ -8187,7 +8292,7 @@ def register_lakeflow_source(spark):
                     fields.append(
                         StructField(
                             name,
-                            _EDM_TO_SPARK.get(prop.get("Type", "Edm.String"), StringType()),
+                            _spark_type_for_property(prop),
                             prop.get("Nullable", "true").lower() != "false",
                         )
                     )
@@ -8209,14 +8314,13 @@ def register_lakeflow_source(spark):
             fk_columns = self._resolve_fk_columns(segments, namespace)
             composite: list[str] = []
             for idx in range(len(segments) - 1):
-                seg = segments[idx]
-                if not any(k[0] == seg for k in fk_columns):
+                if not any(k[0] == idx for k in fk_columns):
                     continue
                 ancestor_et = self._entity_type_for(
                     _CONTAINED_PATH_SEP.join(segments[: idx + 1]), namespace
                 )
                 for pk in self._own_primary_keys_for_et(ancestor_et):
-                    composite.append(fk_columns[(seg, pk)])
+                    composite.append(fk_columns[(idx, pk)])
             composite.extend(leaf_pks)
             state.primary_keys[cache_key] = composite
             return composite

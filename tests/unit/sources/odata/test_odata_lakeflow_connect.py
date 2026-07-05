@@ -24,7 +24,7 @@ import responses
 
 from databricks.labs.community_connector.sources.odata import ODataLakeflowConnect
 from databricks.labs.community_connector.sources.odata.odata import _odata_literal
-from pyspark.sql.types import IntegerType, StringType, TimestampType
+from pyspark.sql.types import DecimalType, IntegerType, StringType, TimestampType
 from tests.unit.sources.test_suite import LakeflowConnectTests
 from tests.unit.sources.test_partition_suite import SupportsPartitionedStreamTests
 
@@ -1155,6 +1155,53 @@ def test_oauth2_client_credentials_uses_client_credentials_grant():
 
 
 @responses.activate
+def test_oauth2_token_endpoint_retries_transient_errors():
+    """The token endpoint gets the same transient tolerance as the source: a
+    momentary 503 there (including mid-read via the 401-refresh path) must be
+    retried, not kill the whole read while source requests enjoy the full
+    retry budget."""
+    responses.post("https://idp.example.com/token", json={"error": "busy"}, status=503)
+    responses.post(
+        "https://idp.example.com/token",
+        json={"access_token": "after-retry", "token_type": "Bearer", "expires_in": 3600},
+    )
+    c = _make(
+        {
+            "auth_type": "oauth2",
+            "oauth2_token_url": "https://idp.example.com/token",
+            "oauth2_client_id": "id",
+            "oauth2_client_secret": "secret",
+            "retry_max_delay_seconds": "0",  # keep the backoff sleep at 0s
+        }
+    )
+    assert c._oauth2_token() == "after-retry"
+    assert sum(1 for call in responses.calls if call.request.method == "POST") == 2
+
+
+@responses.activate
+def test_oauth2_token_endpoint_hard_error_still_raises_actionable():
+    """A non-transient token-endpoint rejection (401) must NOT be retried —
+    it raises the same actionable credential message immediately."""
+    responses.post(
+        "https://idp.example.com/token",
+        json={"error": "invalid_client"},
+        status=401,
+    )
+    c = _make(
+        {
+            "auth_type": "oauth2",
+            "oauth2_token_url": "https://idp.example.com/token",
+            "oauth2_client_id": "id",
+            "oauth2_client_secret": "wrong",
+            "retry_max_delay_seconds": "0",
+        }
+    )
+    with pytest.raises(ValueError, match="client_credentials grant"):
+        c._oauth2_token()
+    assert sum(1 for call in responses.calls if call.request.method == "POST") == 1
+
+
+@responses.activate
 def test_oauth2_user_flow_uses_pre_supplied_access_token():
     """When `oauth2_access_token` is provided, the connector uses it
     directly and does NOT hit the token endpoint at startup."""
@@ -1563,8 +1610,11 @@ def test_no_auth_configured_401_raises_actionable_permission_error():
 
 @responses.activate
 def test_403_on_bearer_raises_permission_error():
-    """403 means authenticated-but-not-authorized — different from 401
-    but equally a permission issue. Same error UX."""
+    """403 means authenticated-but-not-authorized — an *authorization*
+    failure, so the message must point at permissions/scope, not at the
+    per-mode token-expiry hints, and must NOT claim "no automatic
+    token-refresh path is configured" (false on a fully-configured
+    oauth2 connection whose principal is simply forbidden)."""
     _mock_metadata()
     responses.add(
         responses.GET,
@@ -1576,8 +1626,9 @@ def test_403_on_bearer_raises_permission_error():
     with pytest.raises(PermissionError) as ei:
         list(c.read_table("Customers", None, {})[0])
     msg = str(ei.value)
-    assert "auth_type=bearer" in msg
     assert "403" in msg
+    assert "not authorized" in msg
+    assert "no automatic token-refresh path" not in msg
 
 
 @responses.activate
@@ -2461,6 +2512,114 @@ NESTED_METADATA_XML = """<?xml version="1.0" encoding="utf-8"?>
 
 def _mock_nested_metadata():
     responses.get(f"{SERVICE_URL}$metadata", body=NESTED_METADATA_XML, status=200)
+
+
+RECURSIVE_METADATA_XML = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="Rec" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Node">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="Label" Type="Edm.String"/>
+        <NavigationProperty Name="Children" Type="Collection(Rec.Node)" ContainsTarget="true"/>
+      </EntityType>
+      <EntityContainer Name="C">
+        <EntitySet Name="Nodes" EntityType="Rec.Node"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+
+def _mock_recursive_metadata():
+    responses.get(f"{SERVICE_URL}$metadata", body=RECURSIVE_METADATA_XML, status=200)
+
+
+@responses.activate
+def test_recursive_containment_fk_columns_stay_distinct_per_level():
+    """A hand-written recursive containment path repeats the same nav-prop
+    name at two non-leaf levels. The FK mapping is keyed by level INDEX —
+    a name-keyed map would collapse both levels into one entry, duplicating
+    the surviving column in the schema and dropping a composite-key
+    component (silent MERGE collisions between leaves under different
+    level-1 parents)."""
+    _mock_recursive_metadata()
+    c = _make()
+    table = "Nodes__Children__Children__Children"
+    schema = c.get_table_schema(table, {})
+    names = [f.name for f in schema.fields]
+    assert len(names) == len(set(names)), f"duplicate columns in schema: {names}"
+    # One distinct FK column per non-leaf level, collision-suffixed.
+    assert names[:3] == ["Nodes_Id", "Children_Id", "_Children_Id"]
+    # The composite key carries every level's component plus the leaf PK.
+    assert c._primary_keys_for(table) == ["Nodes_Id", "Children_Id", "_Children_Id", "Id"]
+
+
+@responses.activate
+def test_recursive_containment_rows_tagged_with_each_levels_fk():
+    """The N+1 walk stamps each ancestor level's PK into its OWN column —
+    the deeper repeated level must not overwrite the shallower one."""
+    _mock_recursive_metadata()
+    responses.get(f"{SERVICE_URL}Nodes", json={"value": [{"Id": 1, "Label": "root"}]})
+    responses.get(f"{SERVICE_URL}Nodes(1)/Children", json={"value": [{"Id": 10, "Label": "l1"}]})
+    responses.get(
+        f"{SERVICE_URL}Nodes(1)/Children(10)/Children",
+        json={"value": [{"Id": 100, "Label": "l2"}]},
+    )
+    responses.get(
+        f"{SERVICE_URL}Nodes(1)/Children(10)/Children(100)/Children",
+        json={"value": [{"Id": 1000, "Label": "leaf"}]},
+    )
+    c = _make()
+    recs, _ = c.read_table(
+        "Nodes__Children__Children__Children",
+        {},
+        {"expand_contained": "false", "contained_fetch": "single", "pagination": "nextlink"},
+    )
+    rows = list(recs)
+    assert rows == [
+        {"Nodes_Id": 1, "Children_Id": 10, "_Children_Id": 100, "Id": 1000, "Label": "leaf"}
+    ]
+
+
+DECIMAL_METADATA_XML = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="Dec" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Money">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="Exact" Type="Edm.Decimal" Precision="10" Scale="2"/>
+        <Property Name="Wide" Type="Edm.Decimal"/>
+        <Property Name="Varying" Type="Edm.Decimal" Precision="20" Scale="variable"/>
+        <Property Name="BigId" Type="Edm.Decimal" Precision="38"/>
+      </EntityType>
+      <EntityContainer Name="C">
+        <EntitySet Name="Moneys" EntityType="Dec.Money"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+
+@responses.activate
+def test_decimal_precision_scale_facets_honoured():
+    """``Edm.Decimal`` honours declared CSDL ``Precision``/``Scale`` facets.
+    A hardcoded ``DecimalType(38, 18)`` leaves only 20 digits left of the
+    point — it can't hold a ``Decimal(38, 0)`` ID column's large values.
+    Absent facets (and ``Scale="variable"``) keep the historical wide
+    default so existing destinations don't shift types; ``Scale`` absent
+    with ``Precision`` declared is scale 0 (the CSDL default)."""
+    responses.get(f"{SERVICE_URL}$metadata", body=DECIMAL_METADATA_XML, status=200)
+    c = _make()
+    types = {f.name: f.dataType for f in c.get_table_schema("Moneys", {}).fields}
+    assert types["Exact"] == DecimalType(10, 2)
+    assert types["Wide"] == DecimalType(38, 18)
+    assert types["Varying"] == DecimalType(38, 18)
+    assert types["BigId"] == DecimalType(38, 0)
 
 
 # --- Path parsing / discovery ---
@@ -8598,6 +8757,27 @@ def test_cursor_probe_preflight_fetch_error_degrades_instead_of_raising():
     with pytest.raises(ValueError, match="failed before reaching a verdict"):
         c2._verify_cursor_probe_support(
             ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified", strict=True
+        )
+
+
+@responses.activate
+def test_cursor_probe_preflight_programming_error_propagates(monkeypatch):
+    """The never-raise contract covers HTTP/capability failures ONLY: the
+    degrade-and-continue handler catches the dedicated fetch-failure type,
+    not ``Exception`` — a latent programming error inside the preflight's
+    own logic must surface, not silently pin the stream to the slow path."""
+    _mock_probe_metadata()
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.get(f"{SERVICE_URL}Roots(1)/Mids", json={"value": [{"Id": 10}]})
+
+    def _boom(self, *args, **kwargs):
+        raise AttributeError("latent bug in preflight logic")
+
+    monkeypatch.setattr(ODataLakeflowConnect, "_cursor_probe_check_sample", _boom)
+    c = _make()
+    with pytest.raises(AttributeError, match="latent bug"):
+        c._verify_cursor_probe_support(
+            ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified", strict=False
         )
 
 

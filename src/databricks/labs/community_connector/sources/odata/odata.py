@@ -152,6 +152,40 @@ _EDM_TO_SPARK = {
 _NS_EDMX = "{http://docs.oasis-open.org/odata/ns/edmx}"
 _NS_EDM = "{http://docs.oasis-open.org/odata/ns/edm}"
 
+
+def _spark_type_for_property(prop):
+    """Spark type for one CSDL ``<Property>`` element: the static EDM map,
+    except ``Edm.Decimal``, which honours the declared ``Precision`` /
+    ``Scale`` facets (a hardcoded ``DecimalType(38, 18)`` leaves only 20
+    digits left of the point — it can't hold a ``Decimal(38, 0)`` ID
+    column's large values). Facet handling:
+
+    * both facets absent — the historical wide ``DecimalType(38, 18)``,
+      so existing destinations don't shift types;
+    * ``Scale="variable"``/``"floating"`` — also ``(38, 18)`` (Spark's
+      fixed-scale decimal can't express a varying scale);
+    * ``Scale`` absent with ``Precision`` declared — scale 0 (the CSDL
+      default);
+    * values clamped to Spark's 38-digit maximum with
+      ``scale <= precision``."""
+    edm_type = prop.get("Type", "Edm.String")
+    if edm_type != "Edm.Decimal":
+        return _EDM_TO_SPARK.get(edm_type, StringType())
+    raw_precision = prop.get("Precision")
+    raw_scale = prop.get("Scale")
+    if raw_precision is None and raw_scale is None:
+        return DecimalType(38, 18)
+    if raw_scale is None:
+        scale = 0
+    elif raw_scale.isdigit():
+        scale = int(raw_scale)
+    else:  # "variable" / "floating"
+        return DecimalType(38, 18)
+    precision = int(raw_precision) if raw_precision and raw_precision.isdigit() else 38
+    precision = min(max(precision, 1), 38)
+    return DecimalType(precision, min(scale, precision))
+
+
 # Delta tracking constants.
 #
 # Synthetic columns appended to the schema when delta is active so the
@@ -2506,12 +2540,36 @@ class ODataLakeflowConnect(
         triage from a pipeline log nearly impossible. This method picks
         the relevant remediation hints based on which auth mode is
         active on the connection.
+
+        403 gets its own message ahead of the per-mode 401 branches:
+        it is an *authorization* failure (the token/credentials were
+        accepted), so the token-expiry/refresh hints — and the "no
+        refresh path is configured" framing — don't apply.
         """
         status = resp.status_code
         body = _truncate(resp.text, 300) or "(empty body)"
         auth = (self.options.get("auth_type") or "").lower().strip()
         if not auth and self.options.get("token"):
             auth = "bearer"
+        if status == 403:
+            # 403 means the request WAS authenticated but the principal is
+            # not authorized for this resource — a token refresh can't fix
+            # it (which is why the 401-refresh branch deliberately skips
+            # 403), and the "no refresh path is configured" prefix below
+            # would be false and misleading on a fully-configured oauth2
+            # connection. Say what actually needs fixing: permissions.
+            return (
+                f"OData service returned 403 (Forbidden) for {url!r}. The "
+                f"request was authenticated but the principal is not "
+                f"authorized for this resource, so an automatic token "
+                f"refresh cannot fix it. Grant the principal read access "
+                f"to this entity set at the source (role/permission "
+                f"assignment), or supply credentials whose scope covers it "
+                f"(check 'oauth2_scope' and any required admin consent), "
+                f"and confirm tenant/instance identifiers in 'service_url' "
+                f"or 'extra_headers' match the credentials. "
+                f"Server response: {body}"
+            )
         prefix = (
             f"OData service returned {status} for {url!r} and no "
             f"automatic token-refresh path is configured. "
@@ -2678,11 +2736,29 @@ class ODataLakeflowConnect(
         if scope:
             data["scope"] = scope
         token_url = _require(self.options, "oauth2_token_url")
-        resp = requests.post(
-            token_url,
-            data=data,
-            timeout=self.timeout,
-        )
+        # The token endpoint gets the same transient tolerance as the
+        # source itself: a 429/5xx or a network blip here would otherwise
+        # kill the whole read (including mid-read, via the 401-refresh and
+        # pre-emptive-refresh paths in `_http_get_once`) while the source
+        # requests around it enjoy the full retry budget.
+        for attempt in range(self.max_retries + 1):
+            try:
+                resp = requests.post(
+                    token_url,
+                    data=data,
+                    timeout=self.timeout,
+                )
+            except _TRANSIENT_NETWORK_ERRORS as exc:
+                if attempt >= self.max_retries:
+                    raise type(exc)(
+                        f"{exc} (token endpoint {token_url!r}, after " f"{attempt + 1} attempts)"
+                    ) from exc
+                time.sleep(self._backoff_delay(attempt))
+                continue
+            if resp.status_code in _RETRYABLE_HTTP_STATUSES and attempt < self.max_retries:
+                time.sleep(self._retry_after_delay(resp, attempt))
+                continue
+            break
         # Surface a precise, actionable error when the token endpoint
         # itself rejects the request. raise_for_status() would otherwise
         # produce a terse "401 Client Error: Unauthorized for url ..."
@@ -3004,8 +3080,7 @@ class ODataLakeflowConnect(
         fk_columns = self._resolve_fk_columns(segments, namespace)
         fk_fields: list[StructField] = []
         for idx in range(len(segments) - 1):
-            seg = segments[idx]
-            if not any(k[0] == seg for k in fk_columns):
+            if not any(k[0] == idx for k in fk_columns):
                 continue
             ancestor_et = self._entity_type_for(
                 _CONTAINED_PATH_SEP.join(segments[: idx + 1]), namespace
@@ -3014,7 +3089,7 @@ class ODataLakeflowConnect(
             for pk in self._own_primary_keys_for_et(ancestor_et):
                 fk_fields.append(
                     StructField(
-                        fk_columns[(seg, pk)],
+                        fk_columns[(idx, pk)],
                         own.get(pk, StringType()),
                         False,
                     )
@@ -3043,7 +3118,7 @@ class ODataLakeflowConnect(
                 fields.append(
                     StructField(
                         name,
-                        _EDM_TO_SPARK.get(prop.get("Type", "Edm.String"), StringType()),
+                        _spark_type_for_property(prop),
                         prop.get("Nullable", "true").lower() != "false",
                     )
                 )
@@ -3065,14 +3140,13 @@ class ODataLakeflowConnect(
         fk_columns = self._resolve_fk_columns(segments, namespace)
         composite: list[str] = []
         for idx in range(len(segments) - 1):
-            seg = segments[idx]
-            if not any(k[0] == seg for k in fk_columns):
+            if not any(k[0] == idx for k in fk_columns):
                 continue
             ancestor_et = self._entity_type_for(
                 _CONTAINED_PATH_SEP.join(segments[: idx + 1]), namespace
             )
             for pk in self._own_primary_keys_for_et(ancestor_et):
-                composite.append(fk_columns[(seg, pk)])
+                composite.append(fk_columns[(idx, pk)])
         composite.extend(leaf_pks)
         state.primary_keys[cache_key] = composite
         return composite
