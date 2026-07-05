@@ -1802,10 +1802,20 @@ class ODataLakeflowConnect(
             return True
         key = self._delta_cache_key(table_name, table_options)
         if key not in self._delta_capable:
-            self._delta_capable[key] = self._probe_delta_support(table_name, table_options)
+            verdict = self._probe_delta_support(table_name, table_options)
+            if verdict is None:
+                # Transient failure — no verdict. Degrade THIS call to the
+                # cursor/snapshot fallback and cache nothing, so the next
+                # call re-probes instead of pinning delta off for the
+                # instance's whole lifetime on a momentary blip (the same
+                # definitive-only discipline as the other capability probes).
+                return False
+            self._delta_capable[key] = verdict
         return self._delta_capable[key]
 
-    def _probe_delta_support(self, table_name: str, table_options: dict[str, str] | None) -> bool:
+    def _probe_delta_support(
+        self, table_name: str, table_options: dict[str, str] | None
+    ) -> bool | None:
         """Light-touch capability probe.
 
         Sends a small GET against the entity set with the
@@ -1814,11 +1824,15 @@ class ODataLakeflowConnect(
         header is the spec's positive acknowledgement that the server is
         honoring change tracking on this request.
 
-        Returns ``False`` for every failure mode (non-200, missing
-        header, malformed body, network error). The cache is populated
-        with that ``False`` so we don't retry the probe per call — the
-        connector falls back to whatever cursor/snapshot path the
-        user's options imply.
+        Returns a DEFINITIVE verdict only when the probe actually reached
+        the server: ``True`` on a 200 acknowledging the preference,
+        ``False`` when the server answered but didn't acknowledge (missing
+        header, or a non-retryable non-200 — ``_http_get`` only returns
+        such responses; retryable statuses raise after the retry budget).
+        Returns ``None`` — no verdict, the caller caches nothing and
+        re-probes next call — on a transport/auth failure or an exhausted
+        transient, matching the definitive-only discipline of the other
+        capability probes.
         """
         # Force ``$top=1`` for the probe so the response stays small even
         # against entity sets with millions of rows. We only care about
@@ -1833,7 +1847,7 @@ class ODataLakeflowConnect(
                 headers={"Prefer": _DELTA_PREFER},
             )
         except (requests.RequestException, ValueError, RuntimeError, PermissionError):
-            return False
+            return None  # transient/auth — no verdict, re-probe next call
         if resp.status_code != 200:
             return False
         applied = resp.headers.get("Preference-Applied", "")

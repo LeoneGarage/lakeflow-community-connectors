@@ -31,6 +31,7 @@ from urllib.parse import urljoin, urlparse
 from xml.etree import ElementTree as ET
 
 from pyspark.sql.types import StructField
+from requests.utils import requote_uri
 
 from databricks.labs.community_connector.sources.odata._helpers import (
     max_or as _max_or,
@@ -274,10 +275,43 @@ def looks_like_iso8601(s: str) -> bool:
         return False
 
 
+# URL-reserved characters percent-encoded inside GENERATED literal text
+# (row-data-derived values only — user-authored ``filter``/``select`` syntax
+# is never touched). ``requests`` does NOT encode these when sending an
+# already-assembled URL string (it only encodes spaces/non-ASCII, and it
+# preserves existing escapes, so pre-encoding here is safe and decodes
+# correctly server-side):
+#   * ``%`` first (so the escapes below aren't double-escaped);
+#   * ``+`` — form-decoding servers (ASP.NET, servlet stacks) read a raw
+#     query-string ``+`` as a SPACE: a non-UTC ISO watermark
+#     (``…T12:00:00+10:00``) becomes a malformed timestamp → 400 on every
+#     incremental batch; ``+`` inside a quoted seek boundary silently
+#     compares against the wrong value;
+#   * ``&`` — splits the query at the value;
+#   * ``#`` — truncates the whole request at the fragment;
+#   * ``?`` — starts the query string when the literal sits in a PATH
+#     segment (a key predicate ``Parent('A?B')``).
+_LITERAL_ESCAPES = (("%", "%25"), ("+", "%2B"), ("&", "%26"), ("#", "%23"), ("?", "%3F"))
+
+
+def _escape_literal_text(s: str) -> str:
+    """Percent-encode URL-reserved characters in generated literal text
+    (see :data:`_LITERAL_ESCAPES`)."""
+    for raw, enc in _LITERAL_ESCAPES:
+        s = s.replace(raw, enc)
+    return s
+
+
 def odata_literal(value: Any) -> str:
-    """Render a Python value as an OData v4 literal for $filter."""
+    """Render a Python value as an OData v4 literal for a generated
+    ``$filter`` / key predicate. The literal ends up interpolated into a
+    URL string, so URL-reserved characters inside the VALUE text are
+    percent-encoded (see :data:`_LITERAL_ESCAPES`); structural characters
+    (the surrounding single quotes) stay raw."""
     if isinstance(value, datetime):
-        return value.isoformat().replace("+00:00", "Z")
+        # Non-UTC offsets keep a ``+`` (only +00:00 normalizes to Z) —
+        # escape it so the wire form survives form-decoding servers.
+        return _escape_literal_text(value.isoformat().replace("+00:00", "Z"))
     if isinstance(value, date):
         return value.isoformat()
     if isinstance(value, bool):
@@ -286,17 +320,20 @@ def odata_literal(value: Any) -> str:
         return str(value)
     s = str(value)
     if looks_like_iso8601(s):
-        return s
-    return "'" + s.replace("'", "''") + "'"
+        return _escape_literal_text(s)
+    return "'" + _escape_literal_text(s.replace("'", "''")) + "'"
 
 
 # --- client-side pagination URL helpers -----------------------------------
 # These manipulate the connector's own generated URLs, where query options
-# (``$top``/``$filter``/``$orderby``/``$skip``) are stored raw (un-encoded),
-# one per ``&``-separated segment, and no generated value contains a literal
-# ``&``. So splitting on ``&`` and matching on a ``$name=`` prefix is safe —
-# the same convention ``rewrite_top_in_url`` relies on. requests url-encodes
-# the values when the request is actually sent. They live here (rather than in
+# (``$top``/``$filter``/``$orderby``/``$skip``) are stored one per
+# ``&``-separated segment. Generated values contain no literal ``&`` — any
+# ``&`` in row-derived literal text is percent-encoded at generation time by
+# ``odata_literal`` (see ``_LITERAL_ESCAPES``; requests only encodes
+# spaces/non-ASCII in an assembled URL, NOT reserved characters, so the
+# encoding must happen here) — which is what makes splitting on ``&`` and
+# matching on a ``$name=`` prefix safe, the same convention
+# ``rewrite_top_in_url`` relies on. They live here (rather than in
 # ``odata.py``) so both the flat pager (``_client_paginate_pages``) and the
 # inner-``$expand`` continuation builder can use them without an import cycle;
 # ``odata.py`` re-exports them for callers that still import from there.
@@ -1785,14 +1822,24 @@ class ContainedNavMixin:
         The OData v4 JSON batch format resolves a sub-request ``url`` against the
         service root, so an absolute URL under the root is stripped to its
         remainder; an already-relative URL (e.g. a resolved ``@odata.nextLink``
-        that came back service-relative) is returned without a leading slash."""
+        that came back service-relative) is returned without a leading slash.
+
+        The result is percent-encoded via ``requote_uri`` — the same encoding
+        ``requests`` applies to a plain GET's URL — because a sub-request URL
+        rides inside the JSON envelope and never passes through ``requests``'
+        URL preparation: without this, generated ``$orderby=Id asc`` /
+        ``$filter=… gt …`` shapes carry literal spaces, which a strict OData
+        v4 server may reject. ``requote_uri`` preserves existing escapes, so
+        the literal-level encoding from ``odata_literal`` is not doubled."""
         root = self.service_url if self.service_url.endswith("/") else self.service_url + "/"
         if url.startswith(root):
-            return url[len(root) :]
+            return requote_uri(url[len(root) :])
         parsed = urlparse(url)
         if parsed.scheme:
-            return parsed.path.lstrip("/") + (f"?{parsed.query}" if parsed.query else "")
-        return url.lstrip("/")
+            return requote_uri(
+                parsed.path.lstrip("/") + (f"?{parsed.query}" if parsed.query else "")
+            )
+        return requote_uri(url.lstrip("/"))
 
     def _post_batch(self, urls: list[str]) -> list[dict]:
         """POST one OData v4 JSON ``$batch`` of GET sub-requests; return the

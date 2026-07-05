@@ -140,6 +140,33 @@ def test_odata_literal_passes_iso_timestamps_bare():
     assert _odata_literal("2024-05-01T00:00:00Z") == "2024-05-01T00:00:00Z"
 
 
+def test_odata_literal_percent_encodes_url_reserved_characters():
+    """Generated literals ride into URL strings that ``requests`` sends
+    without encoding reserved characters: a raw ``+`` is decoded as a SPACE
+    by form-decoding servers (a non-UTC ISO watermark → malformed timestamp
+    → 400 every batch; ``+`` in a quoted seek boundary → silent wrong
+    comparison), ``&`` splits the query, ``#`` truncates the request, and
+    ``?`` starts the query when the literal sits in a key-predicate path
+    segment. ``odata_literal`` must pre-encode them (requests preserves
+    existing escapes, so this decodes correctly server-side)."""
+    from datetime import datetime, timedelta, timezone
+
+    # The bug case: a non-UTC ISO watermark string keeps its offset ``+``.
+    assert _odata_literal("2025-06-01T12:00:00+10:00") == "2025-06-01T12:00:00%2B10:00"
+    # Same via a tz-aware datetime; UTC still normalizes to a bare Z.
+    tz10 = timezone(timedelta(hours=10))
+    assert _odata_literal(datetime(2025, 6, 1, 12, tzinfo=tz10)) == "2025-06-01T12:00:00%2B10:00"
+    assert _odata_literal(datetime(2025, 6, 1, 12, tzinfo=timezone.utc)) == "2025-06-01T12:00:00Z"
+    # Reserved characters inside quoted string values.
+    assert _odata_literal("A&B") == "'A%26B'"
+    assert _odata_literal("A#B") == "'A%23B'"
+    assert _odata_literal("AB+1") == "'AB%2B1'"
+    assert _odata_literal("A?B") == "'A%3FB'"
+    assert _odata_literal("100%") == "'100%25'"
+    # Quote doubling still composes with the encoding.
+    assert _odata_literal("O'Brien & sons") == "'O''Brien %26 sons'"
+
+
 # ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------
@@ -445,6 +472,43 @@ def test_incremental_first_call_has_no_cursor_filter():
     normalised = captured_urls[0].replace("%20", " ")
     assert " le " not in normalised
     assert " gt " not in normalised
+
+
+@responses.activate
+def test_incremental_non_utc_offset_watermark_is_percent_encoded():
+    """A source emitting local-offset timestamps (SAP-style) puts a ``+`` in
+    the watermark. The generated ``$filter`` must carry it as ``%2B`` — a raw
+    ``+`` is decoded as a SPACE by form-decoding servers, turning the filter
+    into a malformed timestamp and 400-ing every incremental batch."""
+    _mock_metadata()
+    captured_urls = []
+
+    def _callback(request):
+        captured_urls.append(request.url)
+        if "gt" in request.url:
+            return (
+                200,
+                {},
+                '{"value": [{"Id": 2, "ModifiedAt": "2024-03-02T00:00:00+10:00"}]}'
+                if len(captured_urls) == 1
+                else '{"value": []}',
+            )
+        return (200, {}, '{"value": []}')
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Customers", callback=_callback)
+    c = _make()
+    records, offset = c.read_table(
+        "Customers",
+        {"cursor": "2024-03-01T00:00:00+10:00"},
+        {"cursor_field": "ModifiedAt"},
+    )
+    rows = list(records)
+    assert [r["Id"] for r in rows] == [2]
+    assert _drop_lb(offset) == {"cursor": "2024-03-02T00:00:00+10:00"}
+    # The offset's ``+`` reached the wire percent-encoded, never raw.
+    first = captured_urls[0]
+    assert "%2B10:00" in first
+    assert "+10:00" not in first
 
 
 @responses.activate
@@ -2114,6 +2178,29 @@ def test_delta_auto_probe_silent_ignore_falls_back():
     assert rows == [{"Id": 1, "Name": "A", "ModifiedAt": "x"}]
     # Empty offset = snapshot mode. No delta_link in there.
     assert _drop_lb(offset) == {}
+
+
+@responses.activate
+def test_delta_auto_probe_transient_failure_records_nothing():
+    """A transient failure during the ``delta_tracking=auto`` probe degrades
+    that call to the snapshot/cursor path but caches NO verdict — the same
+    definitive-only discipline as the other capability probes. Pinning
+    ``False`` for the instance's lifetime on a momentary 503 would keep a
+    delta-capable stream on the wrong path until the reader is recreated."""
+    _mock_metadata()
+    responses.get(f"{SERVICE_URL}Customers", json={"error": "down"}, status=503)
+    c = _make({"max_retries": "0", "retry_max_delay_seconds": "0"})
+    assert c._delta_active_for("Customers", {"delta_tracking": "auto"}) is False
+    assert not c._delta_capable  # transient → no verdict cached
+    # The server recovers: the SAME instance re-probes and gets the verdict.
+    responses.reset()
+    responses.get(
+        f"{SERVICE_URL}Customers",
+        json={"value": []},
+        headers={"Preference-Applied": "odata.track-changes"},
+    )
+    assert c._delta_active_for("Customers", {"delta_tracking": "auto"}) is True
+    assert list(c._delta_capable.values()) == [True]  # definitive → cached
 
 
 @responses.activate
@@ -9376,6 +9463,29 @@ def test_contained_fetch_batch_snapshot_hydrates_via_batch():
     # the preflight and pin batch_ok=False for a hydrate shape that works).
     assert any("Children" not in u for u in responder.seen)
     assert not any("Children" not in u and "$top=" in u for u in responder.seen)
+
+
+@responses.activate
+def test_batch_subrequest_urls_are_percent_encoded():
+    """Sub-request URLs ride inside the JSON ``$batch`` envelope and never
+    pass through ``requests``' URL preparation — they must be pre-encoded
+    the way requests would encode a plain GET (spaces → %20): a strict
+    OData v4 server may reject a sub-request URL carrying raw spaces."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}]})
+    responder = _batch_responder(
+        [
+            ("Parents(1)/Children", {"value": [{"Id": 11, "Label": "a"}]}),
+            ("Parents", {"value": [{"Id": 1}]}),  # capability preflight
+        ]
+    )
+    responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=responder)
+    c = _make()
+    recs, _ = c.read_table("Parents__Children", {}, {"expand_contained": "false"})
+    assert [r["Id"] for r in recs] == [11]
+    assert all(" " not in u for u in responder.seen), responder.seen
+    # The leaf hydrate carries a stable $orderby — its space arrives as %20.
+    assert any("%20" in u for u in responder.seen if "Children" in u)
 
 
 @responses.activate
