@@ -324,6 +324,18 @@ def _pg_parse_top(url: str) -> int | None:
     return int(raw) if raw and raw.isdigit() else None
 
 
+def _pg_is_continuation(url: str) -> bool:
+    """Whether ``url`` looks like a server-issued continuation link — it
+    carries a ``$skiptoken`` or ``$skip`` (the URLs the connector builds
+    itself carry neither; ``$skip`` paging rewrites via
+    :func:`_pg_set_query` only on URLs that already went through the
+    client-driven drain)."""
+    return any(
+        _pg_get_query(url, name) is not None
+        for name in ("$skiptoken", "%24skiptoken", "$skip", "%24skip")
+    )
+
+
 def _pg_orderby_keys(url: str) -> list[str]:
     """Column names from the URL's ``$orderby``, in order. Returns ``[]``
     when there's no ``$orderby`` or any term is ``desc`` (a ``gt`` seek
@@ -1442,7 +1454,12 @@ class ContainedNavMixin:
         ``True`` only on a conclusive pass the caller may persist as
         ``cursor_probe_ok`` (an *inconclusive* scan is re-checked every batch).
         Raises (``strict``) or returns ``(False, False)`` (non-strict) on a
-        mis-ordering server."""
+        mis-ordering server. A preflight that errors out before reaching a
+        verdict (transport/HTTP failure on the enumeration or trusted-
+        reference fetch — indistinguishable from a transient) likewise
+        degrades a non-strict read to the ``$batch``/plain cascade for this
+        batch while caching and recording nothing; strict raises an
+        actionable error instead of the raw HTTP failure."""
         if (start_offset or {}).get("cursor_probe_ok"):
             return (True, True)
         cache = self.__dict__.setdefault("_cursor_probe_verified", {})
@@ -1470,9 +1487,33 @@ class ContainedNavMixin:
             elif shared is False:
                 cache[cache_key] = (_CURSOR_PROBE_SHARED_FAIL, False)
             else:
-                cache[cache_key] = self._run_cursor_probe_preflight(
-                    segments, namespace, table_options, cursor_field
-                )
+                try:
+                    cache[cache_key] = self._run_cursor_probe_preflight(
+                        segments, namespace, table_options, cursor_field
+                    )
+                except Exception as exc:
+                    # The preflight's enumeration or trusted-reference fetch
+                    # failed before reaching a verdict. Unlike the probe-shape
+                    # rejection handled inside ``_cursor_probe_check_sample``
+                    # (whose sibling fetches just succeeded, making it
+                    # definitive), there is no evidence here to distinguish a
+                    # capability shortfall ($orderby desc / $select rejected
+                    # on direct navigation) from a transient blip — so treat
+                    # it like the other verifiers treat transients: degrade
+                    # THIS read to the $batch/plain cascade, cache and record
+                    # NOTHING (the next batch re-probes), and never let the
+                    # raw HTTP error escape a ``cursor_probe=auto`` read.
+                    msg = (
+                        f"cursor_probe preflight against "
+                        f"{CONTAINED_PATH_SEP.join(segments)!r} failed before reaching "
+                        f"a verdict: {exc}. If this persists (the server rejects "
+                        f"$orderby/$select on direct navigation to the leaf "
+                        f"collection), use cursor_probe=batch or cursor_probe=false."
+                    )
+                    if strict:
+                        raise ValueError(msg) from exc
+                    _LOG.warning("%s Falling back to $batch / the plain N+1 walk.", msg)
+                    return (False, False)
                 problem, conclusive = cache[cache_key]
                 if not strict:
                     if problem:  # clean mis-ordering evidence — a definitive fail
@@ -1790,11 +1831,57 @@ class ContainedNavMixin:
         page-limits while omitting ``@odata.nextLink`` would be silently
         truncated. Re-add the default ``$top`` under keyset/skip/auto so the
         drain can size its pages and seek until empty (nextlink mode is left
-        untouched — it trusts the server's links either way)."""
-        if getattr(self, "_pagination", "nextlink") != "nextlink" and _pg_parse_top(url) is None:
+        untouched — it trusts the server's links either way).
+
+        Server-issued continuation links are exempt from the ``$top``
+        injection: a re-queued ``@odata.nextLink`` (recognisable by its
+        ``$skiptoken``/``$skip``) can land here when the ``$batch`` give-up
+        sentinel fires mid-walk, and OData v4 §11.2.5.7 requires the client
+        to use the nextLink as-is — appending an option to an opaque
+        skiptoken URL can 400 or corrupt the server's paging state. A
+        continuation also proves the server emits links, so the
+        starvation this injection defends against can't occur on it."""
+        if (
+            getattr(self, "_pagination", "nextlink") != "nextlink"
+            and _pg_parse_top(url) is None
+            and not _pg_is_continuation(url)
+        ):
             url = _pg_set_query(url, "$top", DEFAULT_PAGE_SIZE)
         rows = list(self._fetch_pages(url))
         return {"status": 200, "body": {"value": rows}}
+
+    def _checked_batch_subresponse(self, resp: dict, req_url: str) -> dict:
+        """Validate one ``$batch`` sub-response before the drain loops parse it.
+
+        :meth:`_post_batch` deliberately carries per-sub-request HTTP errors
+        inside the envelope for the caller to inspect — and this is that
+        inspection. Without it a 2xx envelope holding one failed sub-response
+        (a throttled or errored leaf-parent) parses as ``rows = []`` and that
+        parent's whole collection is silently skipped; on the cursor walk the
+        other parents still advance the watermark past the failed parent's
+        changed rows, so ``cursor gt since`` never re-reads them — permanent
+        loss.
+
+        A sub-response with a < 400 status passes through untouched. Anything
+        else (an error status, or a shape that isn't a sub-response dict at
+        all) is re-issued as a plain GET via :meth:`_get_as_batch_response`:
+        a transient failure (429/5xx) recovers through ``_http_get``'s
+        retry/backoff/token-refresh path, and a hard 4xx raises out of the
+        read with the server's actual error body — never a silent skip."""
+        status = resp.get("status") if isinstance(resp, dict) else None
+        try:
+            failed = status is None or int(status) >= 400
+        except (TypeError, ValueError):
+            failed = True
+        if not failed:
+            return resp
+        _LOG.warning(
+            "OData $batch sub-response for %r came back with status %r; "
+            "re-issuing as a plain GET so the rows aren't silently skipped.",
+            req_url,
+            status,
+        )
+        return self._get_as_batch_response(req_url)
 
     def _post_batch_adaptive(self, urls: list[str]) -> list[dict]:
         """:meth:`_post_batch` with adaptive sizing: post ``urls`` in chunks no
@@ -1880,7 +1967,13 @@ class ContainedNavMixin:
             if cap is not None and "_batch_size_cap" not in self.__dict__:
                 self.__dict__["_batch_size_cap"] = int(cap)
             return cached
-        probe_url = join_url(self.service_url, segments[0]) + "?$top=1"
+        # Probe with the SAME shape the real hydrate sends: no ``$top`` (the
+        # sub-requests deliberately strip it and let the server drive paging
+        # inside the batch). Probing with ``?$top=1`` would false-fail servers
+        # that reject an explicit ``$top`` — a case the connector explicitly
+        # accommodates on plain snapshot reads — and persist ``batch_ok=False``
+        # even though the actual hydrate shape works.
+        probe_url = join_url(self.service_url, segments[0])
         payload = {
             "requests": [{"id": "0", "method": "GET", "url": self._batch_relative(probe_url)}]
         }
@@ -2363,6 +2456,7 @@ class ContainedNavMixin:
             pending = pending[eff:]
             responses = self._post_batch_adaptive([u for _, u in round_])
             for (key, req_url), resp in zip(round_, responses):
+                resp = self._checked_batch_subresponse(resp, req_url)
                 body = resp.get("body") if isinstance(resp, dict) else None
                 rows = body.get("value", []) if isinstance(body, dict) else []
                 for row in rows:
@@ -3480,6 +3574,7 @@ class ContainedNavMixin:
                 pending = pending[eff:]
                 responses = self._post_batch_adaptive([u for _, u in round_])
                 for (key, req_url), resp in zip(round_, responses):
+                    resp = self._checked_batch_subresponse(resp, req_url)
                     body = resp.get("body") if isinstance(resp, dict) else None
                     rows = body.get("value", []) if isinstance(body, dict) else []
                     chain = chain_by_key[key]

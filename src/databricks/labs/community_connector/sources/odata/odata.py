@@ -18,8 +18,11 @@ Per-table options (allowlisted via externalOptionsAllowList):
     cursor_field          column to drive incremental reads; absent → snapshot
     select                comma-separated $select projection
     filter                additional $filter expression
-    page_size             $top per request; unset → no $top for snapshot
-                          ingest (server default), 1000 for cursor/delta ingest
+    page_size             $top per request; unset → 1000 under the default
+                          client-driven pagination (auto/skip/keyset need a
+                          $top to size pages). Only pagination=nextlink leaves
+                          snapshot ingest without a $top (server default);
+                          cursor/delta ingest defaults to 1000 either way
     max_records_per_batch cap rows returned per read_table call (default 10000)
     delta_tracking        disabled (default) | auto | enabled. Opt-in.
                           When the source honours ``Prefer: odata.track-changes``
@@ -296,10 +299,17 @@ def _clear_metadata_cache() -> None:
 # or have no offset at all (the batch reader behind pipeline snapshot
 # refreshes) would otherwise re-run their preflight probes on every read.
 # Entry shape: ``{"batch_ok": bool, "batch_size_ok": int,
-# "or_filter_ok": bool, "expand_ok": {table_name: bool}}`` — the
-# server-wide verdicts flat, the per-table nested-$expand verdict keyed by
-# contained path (different nesting depths can verify differently).
+# "or_filter_ok": bool, "expand_ok": {table_name: bool},
+# "cursor_probe_ok": {shared_key: bool}}`` — the server-wide verdicts flat,
+# the per-table verdicts (nested-$expand and cursor-probe, listed in
+# ``_PER_TABLE_CAPABILITY_KEYS``) keyed by contained path (different
+# nesting depths can verify differently).
 _CAPABILITY_CACHE: dict[str, dict] = {}
+
+# The verdict keys stored as ``{table_key: bool}`` maps rather than flat
+# server-wide values — the disk merge must union these per table instead of
+# ``setdefault``-shadowing a sibling worker's whole map.
+_PER_TABLE_CAPABILITY_KEYS = ("expand_ok", "cursor_probe_ok")
 
 # On-disk mirror of the capability cache (JSON, not pickle — plain data
 # only). Covers the forked-worker gap the process dict can't (PySpark may
@@ -392,8 +402,12 @@ def _capability_cache_load(service_url: str) -> dict:
     with _CAPABILITY_LOCK:  # only the shared-dict merge needs the lock
         if isinstance(disk, dict):
             for key, value in disk.items():
-                if key == "expand_ok" and isinstance(value, dict):
-                    entry["expand_ok"] = {**value, **entry.get("expand_ok", {})}
+                if key in _PER_TABLE_CAPABILITY_KEYS and isinstance(value, dict):
+                    # Per-table maps union table-by-table (process verdicts
+                    # win) — ``setdefault`` would shadow a sibling worker's
+                    # whole map as soon as this process holds ANY table.
+                    current = entry.get(key)
+                    entry[key] = {**value, **current} if isinstance(current, dict) else dict(value)
                 else:
                     entry.setdefault(key, value)
         _CAPABILITY_DISK_MTIME[path] = mtime
@@ -967,7 +981,9 @@ class ODataLakeflowConnect(
             # falls back to N+1 stays partitionable.
             if self._expand_read_active(table_name, opts, start_offset):
                 # Cursor-based expand keeps a default $top (page_size);
-                # snapshot expand omits $top when page_size is unset.
+                # snapshot expand omits $top when page_size is unset — which
+                # can only happen under pagination=nextlink (every other mode
+                # already defaulted page_size above).
                 if opts.get("cursor_field"):
                     opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
                     return self._with_capabilities(
@@ -980,7 +996,8 @@ class ODataLakeflowConnect(
                 return self._read_contained_expand(table_name, start_offset, opts)
             if opts.get("cursor_field"):
                 # Cursor-based read: default page_size so a $top is sent.
-                # Snapshot (the branch below) leaves it unset → no $top.
+                # Snapshot (the branch below) leaves it unset — no $top only
+                # under pagination=nextlink; other modes defaulted it above.
                 opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
                 return self._with_capabilities(
                     self._read_contained_incremental(
@@ -1533,7 +1550,6 @@ class ODataLakeflowConnect(
                 table_name=table_name,
                 table_options=table_options,
                 sparse_checked=sparse_checked,
-                max_records=max_records,
             )
             fetched_url = resp.url
             current_url, new_delta_link, carry_next_link = self._delta_advance_links(
@@ -1581,9 +1597,17 @@ class ODataLakeflowConnect(
         table_name: str,
         table_options: dict[str, str] | None,
         sparse_checked: bool,
-        max_records: int,
     ) -> bool:
-        """Append delta records from ``payload`` until cap or page exhaustion.
+        """Append every delta record from ``payload`` (one whole page).
+
+        Deliberately NOT capped mid-page: ``max_records_per_batch`` is
+        enforced at page boundaries by :meth:`_delta_advance_links`
+        (stop following ``@odata.nextLink`` once the cap is reached).
+        Breaking mid-page would silently drop the tail of the current
+        page — the persisted ``carry_next_link`` points at the NEXT
+        page, so the skipped rows would never be re-fetched (permanent
+        loss during bootstrap). The cap may therefore overshoot by at
+        most one server page; MERGE dedupes any overlap.
 
         Returns the updated ``sparse_checked`` flag so the caller can
         continue to skip the check on later pages once it's already
@@ -1594,8 +1618,6 @@ class ODataLakeflowConnect(
                 self._check_no_sparse_entity(item, table_name, table_options)
                 sparse_checked = True
             records.append(self._build_delta_record(item, primary_keys))
-            if len(records) >= max_records:
-                break
         return sparse_checked
 
     def _delta_advance_links(
@@ -1613,7 +1635,10 @@ class ODataLakeflowConnect(
         Returns ``(next_url, new_delta_link, carry_next_link)``.
         ``next_url`` is ``None`` when pagination should stop (either we
         hit the cap, saw a terminal deltaLink, or the server omitted
-        both pagination links).
+        both pagination links). The cap check runs AFTER the page was
+        appended in full (see :meth:`_delta_collect_page_records`), so
+        ``carry_next_link`` — the link to the next page — never skips
+        rows: the cap overshoots by at most one server page instead.
         """
         raw_delta = payload.get("@odata.deltaLink")
         raw_next = payload.get("@odata.nextLink")
@@ -1977,7 +2002,7 @@ class ODataLakeflowConnect(
             return True  # not OR evidence — fail open this seek, record nothing
         if resp.status_code in _RETRYABLE_HTTP_STATUSES:  # 429/5xx — transient
             return True  # not OR evidence — fail open this seek, record nothing
-        ok = not (400 <= resp.status_code < 500)  # a non-transient 4xx = OR rejected
+        ok = not 400 <= resp.status_code < 500  # a non-transient 4xx = OR rejected
         self.__dict__["_or_filter_ok"] = ok
         self._store_capability("or_filter_ok", ok)
         return ok

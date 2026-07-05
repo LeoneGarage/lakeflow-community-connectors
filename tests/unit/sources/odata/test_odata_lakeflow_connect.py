@@ -2318,10 +2318,14 @@ def test_delta_sparse_check_honors_select():
 
 
 @responses.activate
-def test_delta_max_records_caps_and_stashes_next_link():
+def test_delta_max_records_caps_at_page_boundary_and_stashes_next_link():
     """A long catch-up after a paused pipeline can return more rows than
-    ``max_records_per_batch``. The connector caps mid-pagination and
-    stashes the unfollowed ``@odata.nextLink`` as the resume point."""
+    ``max_records_per_batch``. The connector caps at the **page boundary**
+    (stops following ``@odata.nextLink``) and stashes the unfollowed link as
+    the resume point. The cap must NOT truncate mid-page: the stashed link
+    points at the NEXT page, so any rows dropped from the current page would
+    never be re-fetched — permanent loss during bootstrap. The cap therefore
+    overshoots by up to one server page instead."""
     _mock_metadata()
     next_link = f"{SERVICE_URL}Customers?$deltatoken=tok-1&$skiptoken=page2"
     responses.add(
@@ -2343,9 +2347,10 @@ def test_delta_max_records_caps_and_stashes_next_link():
         {"delta_tracking": "enabled", "max_records_per_batch": "2"},
     )
     rows = list(records)
-    assert [r["Id"] for r in rows] == [1, 2]
+    # The whole cap-hit page is emitted (bounded overshoot, never loss).
+    assert [r["Id"] for r in rows] == [1, 2, 3]
     # Offset carries both prior delta_link (fallback) AND next_link
-    # (preferred resume point).
+    # (preferred resume point) — pagination stopped at the page boundary.
     assert _drop_lb(offset) == {"delta_link": DELTA_LINK_V1, "next_link": next_link}
 
 
@@ -8562,6 +8567,41 @@ def test_cursor_probe_strict_does_not_raise_on_race():
 
 
 @responses.activate
+def test_cursor_probe_preflight_fetch_error_degrades_instead_of_raising():
+    """A preflight that errors out BEFORE reaching a verdict — the trusted
+    direct-navigation reference fetch 400s (e.g. a server that rejects
+    ``$orderby … desc``/``$select`` on direct navigation) — must not escape a
+    ``cursor_probe=auto`` read as a raw HTTP error. Unlike the probe-shape
+    rejection (whose sibling fetches just succeeded → definitive), this is
+    indistinguishable from a transient: non-strict degrades to the
+    ``$batch``/plain cascade for THIS batch and records NOTHING (the next
+    batch re-probes); strict raises an actionable message instead of the raw
+    failure."""
+    _mock_probe_metadata()
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.get(f"{SERVICE_URL}Roots(1)/Mids", json={"value": [{"Id": 10}]})
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={"error": {"message": "The query specified in the URI is not valid."}},
+        status=400,
+    )
+    c = _make()
+    assert c._verify_cursor_probe_support(
+        ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified", strict=False
+    ) == (False, False)
+    # Nothing cached or recorded anywhere — neither the instance cache nor the
+    # shared capability cache — so the next batch re-probes.
+    assert (("Roots", "Mids", "Leaves"), None) not in c.__dict__.get("_cursor_probe_verified", {})
+    assert c._cached_capability("cursor_probe_ok", table_name="Roots__Mids__Leaves") is None
+
+    c2 = _make()
+    with pytest.raises(ValueError, match="failed before reaching a verdict"):
+        c2._verify_cursor_probe_support(
+            ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified", strict=True
+        )
+
+
+@responses.activate
 def test_cursor_probe_read_table_raises_when_server_misorders_inner_expand():
     """Fail fast: when the inner ``$expand($orderby desc;$top=1)`` returns a
     non-newest leaf (server ignores inner ordering), read_table raises during
@@ -8864,7 +8904,7 @@ def test_cursor_probe_batch_hydrates_via_batch_endpoint():
             # clean leaf-parent → server-filtered empty page
             ("Mids(11)/Leaves", {"value": []}),
             # $batch capability preflight
-            ("Roots?$top=1", {"value": [{"Id": 1}]}),
+            ("Roots", {"value": [{"Id": 1}]}),
         ]
     )
     responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=responder)
@@ -8919,7 +8959,7 @@ def test_cursor_probe_batch_size_suffix_chunks_requests():
                 "Mids(12)/Leaves",
                 {"value": [{"Id": 1201, "RecordLastModified": "2020-06-02T00:00:00Z"}]},
             ),
-            ("Roots?$top=1", {"value": [{"Id": 1}]}),  # capability preflight
+            ("Roots", {"value": [{"Id": 1}]}),  # capability preflight
         ]
     )
     responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=responder)
@@ -8981,7 +9021,7 @@ def test_cursor_probe_batch_follows_nextlink_continuation():
                     "@odata.nextLink": "Roots(1)/Mids(10)/Leaves?$skiptoken=p2",
                 },
             ),
-            ("Roots?$top=1", {"value": [{"Id": 1}]}),
+            ("Roots", {"value": [{"Id": 1}]}),
         ]
     )
     responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=responder)
@@ -9064,7 +9104,7 @@ def test_cursor_probe_auto_cascades_to_batch_when_server_misorders_inner_expand(
                 "Mids(10)/Leaves",
                 {"value": [{"Id": 1001, "RecordLastModified": "2020-09-01T00:00:00Z"}]},
             ),
-            ("Roots?$top=1", {"value": [{"Id": 1}]}),
+            ("Roots", {"value": [{"Id": 1}]}),
         ]
     )
     responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=responder)
@@ -9100,7 +9140,7 @@ def test_contained_fetch_batch_snapshot_hydrates_via_batch():
         [
             ("Parents(1)/Children", {"value": [{"Id": 11, "Label": "a"}]}),
             ("Parents(2)/Children", {"value": [{"Id": 21, "Label": "b"}]}),
-            ("Parents?$top=1", {"value": [{"Id": 1}]}),  # capability preflight
+            ("Parents", {"value": [{"Id": 1}]}),  # capability preflight
         ]
     )
     responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=responder)
@@ -9123,6 +9163,92 @@ def test_contained_fetch_batch_snapshot_hydrates_via_batch():
     )
     # No $top on the batched sub-requests (server-driven paging).
     assert not any("Children" in u and "$top=" in u for u in responder.seen)
+    # The capability probe matches the real sub-request shape — bare collection
+    # URL, no $top (a server that rejects an explicit $top must not false-fail
+    # the preflight and pin batch_ok=False for a hydrate shape that works).
+    assert any("Children" not in u for u in responder.seen)
+    assert not any("Children" not in u and "$top=" in u for u in responder.seen)
+
+
+@responses.activate
+def test_batch_subresponse_transient_error_falls_back_to_plain_get():
+    """A 2xx ``$batch`` envelope carrying one FAILED sub-response (a throttled
+    leaf-parent, status 500) must not silently skip that parent's rows —
+    ``rows = []`` with no error would be permanent loss on a cursor walk (the
+    watermark advances past the failed parent). The drain re-issues the failed
+    part as a plain GET and every row still arrives."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}, {"Id": 2}]})
+
+    def _cb(request):
+        reqs = json.loads(request.body)["requests"]
+        out = []
+        for r in reqs:
+            url = r["url"]
+            if "Parents(1)/Children" in url:
+                out.append(
+                    {"id": r["id"], "status": 200, "body": {"value": [{"Id": 11, "Label": "a"}]}}
+                )
+            elif "Parents(2)/Children" in url:
+                out.append(
+                    {"id": r["id"], "status": 500, "body": {"error": {"message": "throttled"}}}
+                )
+            else:  # capability preflight
+                out.append({"id": r["id"], "status": 200, "body": {"value": [{"Id": 1}]}})
+        return (200, {"Content-Type": "application/json"}, json.dumps({"responses": out}))
+
+    responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=_cb)
+    # Plain-GET recovery target for the failed part.
+    responses.get(
+        f"{SERVICE_URL}Parents(2)/Children",
+        json={"value": [{"Id": 21, "Label": "b"}]},
+        match_querystring=False,
+    )
+
+    c = _make()
+    recs, _ = c.read_table("Parents__Children", {}, {"expand_contained": "false"})
+    rows = sorted((r["Parents_Id"], r["Id"]) for r in recs)
+    assert rows == [(1, 11), (2, 21)]  # nothing silently skipped
+    assert any(
+        call.request.method == "GET" and "Parents(2)/Children" in call.request.url
+        for call in responses.calls
+    )
+
+
+@responses.activate
+def test_batch_subresponse_hard_error_raises_instead_of_silent_skip():
+    """A hard 4xx sub-response is re-issued as a plain GET, which raises with
+    the server's actual error body — a failed part must surface, never quietly
+    drop its parent's rows."""
+    import requests as _requests
+
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}]})
+
+    def _cb(request):
+        reqs = json.loads(request.body)["requests"]
+        out = []
+        for r in reqs:
+            if "Children" in r["url"]:
+                out.append(
+                    {"id": r["id"], "status": 400, "body": {"error": {"message": "bad filter"}}}
+                )
+            else:  # capability preflight
+                out.append({"id": r["id"], "status": 200, "body": {"value": [{"Id": 1}]}})
+        return (200, {"Content-Type": "application/json"}, json.dumps({"responses": out}))
+
+    responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=_cb)
+    # The plain-GET re-issue hits the same 400 and raises with the body.
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={"error": {"message": "bad filter"}},
+        status=400,
+        match_querystring=False,
+    )
+
+    c = _make()
+    with pytest.raises(_requests.exceptions.HTTPError, match="bad filter"):
+        list(c.read_table("Parents__Children", {}, {"expand_contained": "false"})[0])
 
 
 @responses.activate
@@ -9196,7 +9322,7 @@ def test_contained_fetch_batch_reader_stream_hydrates_via_batch():
                 "Parents(1)/Children",
                 {"value": [{"Id": 11, "Label": "a", "ModifiedAt": "2024-01-01T00:00:00Z"}]},
             ),
-            ("Parents?$top=1", {"value": [{"Id": 1}]}),
+            ("Parents", {"value": [{"Id": 1}]}),
         ]
     )
     responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=responder)
@@ -9246,7 +9372,7 @@ def test_contained_fetch_numeric_chunks_batch_by_size():
             ("Parents(1)/Children", {"value": [{"Id": 11}]}),
             ("Parents(2)/Children", {"value": [{"Id": 21}]}),
             ("Parents(3)/Children", {"value": [{"Id": 31}]}),
-            ("Parents?$top=1", {"value": [{"Id": 1}]}),  # capability preflight
+            ("Parents", {"value": [{"Id": 1}]}),  # capability preflight
         ]
     )
     responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=responder)
@@ -9292,7 +9418,7 @@ def test_contained_fetch_auto_size_suffix_chunks_by_n():
             ("Parents(1)/Children", {"value": [{"Id": 11}]}),
             ("Parents(2)/Children", {"value": [{"Id": 21}]}),
             ("Parents(3)/Children", {"value": [{"Id": 31}]}),
-            ("Parents?$top=1", {"value": [{"Id": 1}]}),  # capability preflight
+            ("Parents", {"value": [{"Id": 1}]}),  # capability preflight
         ]
     )
     responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=responder)
@@ -9353,7 +9479,7 @@ def test_batch_too_many_parts_shrinks_and_records_size():
     responses.get(f"{SERVICE_URL}Parents", json={"value": parents})
     responder = _too_many_parts_responder(
         [(f"Parents({i})/Children", {"value": [{"Id": i * 10 + 1}]}) for i in range(1, 6)]
-        + [("Parents?$top=1", {"value": [{"Id": 1}]})],  # 1-part preflight (accepted)
+        + [("Parents", {"value": [{"Id": 1}]})],  # 1-part preflight (accepted)
         max_parts=2,
     )
     responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=responder)
@@ -9377,7 +9503,7 @@ def test_batch_too_many_parts_falls_back_to_single_gets():
     and falls back to a plain per-leaf-parent GET — every row still arrives."""
     _mock_nested_metadata()
     responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}, {"Id": 2}]})
-    responder = _too_many_parts_responder([("Parents?$top=1", {"value": [{"Id": 1}]})], max_parts=1)
+    responder = _too_many_parts_responder([("Parents", {"value": [{"Id": 1}]})], max_parts=1)
     responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=responder)
     # Plain-GET fall-back targets.
     responses.get(
@@ -9418,7 +9544,7 @@ def test_batch_size_ok_seeded_from_offset_avoids_oversized_batch():
     responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}, {"Id": 2}, {"Id": 3}]})
     responder = _too_many_parts_responder(
         [(f"Parents({i})/Children", {"value": [{"Id": i * 10 + 1}]}) for i in range(1, 4)]
-        + [("Parents?$top=1", {"value": [{"Id": 1}]})],
+        + [("Parents", {"value": [{"Id": 1}]})],
         max_parts=2,
     )
     responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=responder)
@@ -9459,7 +9585,7 @@ def test_batch_too_many_parts_persists_size_in_cursor_offset():
                 "Mids(12)/Leaves",
                 {"value": [{"Id": 1201, "RecordLastModified": "2020-06-03T00:00:00Z"}]},
             ),
-            ("Roots?$top=1", {"value": [{"Id": 1}]}),  # capability preflight
+            ("Roots", {"value": [{"Id": 1}]}),  # capability preflight
         ],
         max_parts=2,
     )
@@ -9529,7 +9655,7 @@ def test_batch_overflow_detects_exceeds_maximum_message():
     responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": i} for i in range(1, 6)]})
     responder = _too_many_parts_responder(
         [(f"Parents({i})/Children", {"value": [{"Id": i * 10 + 1}]}) for i in range(1, 6)]
-        + [("Parents?$top=1", {"value": [{"Id": 1}]})],
+        + [("Parents", {"value": [{"Id": 1}]})],
         max_parts=2,
         message="$batch exceeds the maximum of 100 operations",
     )
@@ -9600,7 +9726,7 @@ def test_batch_walk_cap_on_final_chunk_resume_clears_checkpoint():
                 "Mids(11)/Leaves",
                 {"value": [{"Id": 1101, "RecordLastModified": "2020-06-02T00:00:00Z"}]},
             ),
-            ("Roots?$top=1", {"value": [{"Id": 1}]}),  # capability preflight
+            ("Roots", {"value": [{"Id": 1}]}),  # capability preflight
         ]
     )
     responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=responder)
@@ -10043,6 +10169,68 @@ def test_capability_cache_definitive_false_survives_process_cache_clear():
     c2 = _make()
     assert c2._verify_batch_support(["Roots"], {}) is False
     assert sum(1 for call in responses.calls if call.request.method == "POST") == 1
+
+
+def test_capability_cache_disk_merge_unions_per_table_maps():
+    """The disk merge must union BOTH per-table maps (``expand_ok`` AND
+    ``cursor_probe_ok``) table-by-table, process verdicts winning. A plain
+    ``setdefault`` would shadow a sibling worker's whole on-disk map as soon as
+    this process holds ANY table's verdict — re-probing exactly what the merge
+    exists to prevent."""
+    from databricks.labs.community_connector.sources.odata.odata import (
+        _CAPABILITY_DISK_MTIME,
+        _capability_cache_flush,
+    )
+
+    c = _make()
+    # This process already holds table-A verdicts for both per-table maps.
+    c._store_capability("cursor_probe_ok", False, table_name="A__Path")
+    c._store_capability("expand_ok", False, table_name="A__Tbl")
+    # A sibling worker's on-disk state: table A plus its own table-B verdicts.
+    _capability_cache_flush(
+        c.service_url,
+        json.dumps(
+            {
+                "cursor_probe_ok": {"A__Path": True, "B__Path": True},
+                "expand_ok": {"A__Tbl": True, "B__Tbl": True},
+                "batch_ok": True,
+            }
+        ),
+    )
+    _CAPABILITY_DISK_MTIME.clear()  # force the next load to re-merge the file
+    # The sibling's table-B verdicts merged in; table-A keeps the process value.
+    assert c._cached_capability("cursor_probe_ok", table_name="B__Path") is True
+    assert c._cached_capability("cursor_probe_ok", table_name="A__Path") is False
+    assert c._cached_capability("expand_ok", table_name="B__Tbl") is True
+    assert c._cached_capability("expand_ok", table_name="A__Tbl") is False
+    assert c._cached_capability("batch_ok") is True
+
+
+@responses.activate
+def test_plain_get_fallback_leaves_continuation_links_untouched():
+    """The plain-GET fall-back injects the default ``$top`` only into fresh
+    collection URLs. A server-issued continuation (``$skiptoken``/``$skip``) —
+    which can reach the fall-back when the ``$batch`` give-up sentinel fires
+    after a nextLink was re-queued — is used AS-IS (OData v4 §11.2.5.7):
+    appending an option to an opaque skiptoken URL can 400 or corrupt the
+    server's paging state."""
+    seen: list[str] = []
+
+    def _cb(request):
+        seen.append(request.url)
+        return (200, {"Content-Type": "application/json"}, json.dumps({"value": []}))
+
+    responses.add_callback(
+        responses.GET, re.compile(rf"{re.escape(SERVICE_URL)}Parents\(1\)/Children.*"), callback=_cb
+    )
+    c = _make()
+    c.__dict__["_pagination"] = "auto"  # client-driven mode → injection active
+    c._get_as_batch_response(f"{SERVICE_URL}Parents(1)/Children")
+    c._get_as_batch_response(f"{SERVICE_URL}Parents(1)/Children?$skiptoken=opaque-42")
+    fresh = [u for u in seen if "skiptoken" not in u]
+    continuations = [u for u in seen if "skiptoken" in u]
+    assert fresh and all("$top=" in u for u in fresh)  # fresh URL: $top injected
+    assert continuations and all("$top=" not in u for u in continuations)  # as-is
 
 
 def test_capability_cache_concurrent_access_is_thread_safe(monkeypatch):
@@ -10523,7 +10711,7 @@ def test_cursor_probe_nested_expand_hydrates_dirty_via_batch():
                 "Roots(2)/Mids(21)/Leaves",
                 {"value": [{"Id": 2101, "RecordLastModified": "2020-07-01T00:00:00Z"}]},
             ),
-            ("Roots?$top=1", {"value": [{"Id": 1}]}),  # $batch preflight
+            ("Roots", {"value": [{"Id": 1}]}),  # $batch preflight
         ]
     )
     responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=responder)

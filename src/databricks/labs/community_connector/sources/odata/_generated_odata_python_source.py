@@ -946,6 +946,18 @@ def register_lakeflow_source(spark):
         return int(raw) if raw and raw.isdigit() else None
 
 
+    def _pg_is_continuation(url: str) -> bool:
+        """Whether ``url`` looks like a server-issued continuation link — it
+        carries a ``$skiptoken`` or ``$skip`` (the URLs the connector builds
+        itself carry neither; ``$skip`` paging rewrites via
+        :func:`_pg_set_query` only on URLs that already went through the
+        client-driven drain)."""
+        return any(
+            _pg_get_query(url, name) is not None
+            for name in ("$skiptoken", "%24skiptoken", "$skip", "%24skip")
+        )
+
+
     def _pg_orderby_keys(url: str) -> list[str]:
         """Column names from the URL's ``$orderby``, in order. Returns ``[]``
         when there's no ``$orderby`` or any term is ``desc`` (a ``gt`` seek
@@ -2064,7 +2076,12 @@ def register_lakeflow_source(spark):
             ``True`` only on a conclusive pass the caller may persist as
             ``cursor_probe_ok`` (an *inconclusive* scan is re-checked every batch).
             Raises (``strict``) or returns ``(False, False)`` (non-strict) on a
-            mis-ordering server."""
+            mis-ordering server. A preflight that errors out before reaching a
+            verdict (transport/HTTP failure on the enumeration or trusted-
+            reference fetch — indistinguishable from a transient) likewise
+            degrades a non-strict read to the ``$batch``/plain cascade for this
+            batch while caching and recording nothing; strict raises an
+            actionable error instead of the raw HTTP failure."""
             if (start_offset or {}).get("cursor_probe_ok"):
                 return (True, True)
             cache = self.__dict__.setdefault("_cursor_probe_verified", {})
@@ -2092,9 +2109,33 @@ def register_lakeflow_source(spark):
                 elif shared is False:
                     cache[cache_key] = (_CURSOR_PROBE_SHARED_FAIL, False)
                 else:
-                    cache[cache_key] = self._run_cursor_probe_preflight(
-                        segments, namespace, table_options, cursor_field
-                    )
+                    try:
+                        cache[cache_key] = self._run_cursor_probe_preflight(
+                            segments, namespace, table_options, cursor_field
+                        )
+                    except Exception as exc:
+                        # The preflight's enumeration or trusted-reference fetch
+                        # failed before reaching a verdict. Unlike the probe-shape
+                        # rejection handled inside ``_cursor_probe_check_sample``
+                        # (whose sibling fetches just succeeded, making it
+                        # definitive), there is no evidence here to distinguish a
+                        # capability shortfall ($orderby desc / $select rejected
+                        # on direct navigation) from a transient blip — so treat
+                        # it like the other verifiers treat transients: degrade
+                        # THIS read to the $batch/plain cascade, cache and record
+                        # NOTHING (the next batch re-probes), and never let the
+                        # raw HTTP error escape a ``cursor_probe=auto`` read.
+                        msg = (
+                            f"cursor_probe preflight against "
+                            f"{CONTAINED_PATH_SEP.join(segments)!r} failed before reaching "
+                            f"a verdict: {exc}. If this persists (the server rejects "
+                            f"$orderby/$select on direct navigation to the leaf "
+                            f"collection), use cursor_probe=batch or cursor_probe=false."
+                        )
+                        if strict:
+                            raise ValueError(msg) from exc
+                        _LOG.warning("%s Falling back to $batch / the plain N+1 walk.", msg)
+                        return (False, False)
                     problem, conclusive = cache[cache_key]
                     if not strict:
                         if problem:  # clean mis-ordering evidence — a definitive fail
@@ -2412,11 +2453,57 @@ def register_lakeflow_source(spark):
             page-limits while omitting ``@odata.nextLink`` would be silently
             truncated. Re-add the default ``$top`` under keyset/skip/auto so the
             drain can size its pages and seek until empty (nextlink mode is left
-            untouched — it trusts the server's links either way)."""
-            if getattr(self, "_pagination", "nextlink") != "nextlink" and _pg_parse_top(url) is None:
+            untouched — it trusts the server's links either way).
+
+            Server-issued continuation links are exempt from the ``$top``
+            injection: a re-queued ``@odata.nextLink`` (recognisable by its
+            ``$skiptoken``/``$skip``) can land here when the ``$batch`` give-up
+            sentinel fires mid-walk, and OData v4 §11.2.5.7 requires the client
+            to use the nextLink as-is — appending an option to an opaque
+            skiptoken URL can 400 or corrupt the server's paging state. A
+            continuation also proves the server emits links, so the
+            starvation this injection defends against can't occur on it."""
+            if (
+                getattr(self, "_pagination", "nextlink") != "nextlink"
+                and _pg_parse_top(url) is None
+                and not _pg_is_continuation(url)
+            ):
                 url = _pg_set_query(url, "$top", DEFAULT_PAGE_SIZE)
             rows = list(self._fetch_pages(url))
             return {"status": 200, "body": {"value": rows}}
+
+        def _checked_batch_subresponse(self, resp: dict, req_url: str) -> dict:
+            """Validate one ``$batch`` sub-response before the drain loops parse it.
+
+            :meth:`_post_batch` deliberately carries per-sub-request HTTP errors
+            inside the envelope for the caller to inspect — and this is that
+            inspection. Without it a 2xx envelope holding one failed sub-response
+            (a throttled or errored leaf-parent) parses as ``rows = []`` and that
+            parent's whole collection is silently skipped; on the cursor walk the
+            other parents still advance the watermark past the failed parent's
+            changed rows, so ``cursor gt since`` never re-reads them — permanent
+            loss.
+
+            A sub-response with a < 400 status passes through untouched. Anything
+            else (an error status, or a shape that isn't a sub-response dict at
+            all) is re-issued as a plain GET via :meth:`_get_as_batch_response`:
+            a transient failure (429/5xx) recovers through ``_http_get``'s
+            retry/backoff/token-refresh path, and a hard 4xx raises out of the
+            read with the server's actual error body — never a silent skip."""
+            status = resp.get("status") if isinstance(resp, dict) else None
+            try:
+                failed = status is None or int(status) >= 400
+            except (TypeError, ValueError):
+                failed = True
+            if not failed:
+                return resp
+            _LOG.warning(
+                "OData $batch sub-response for %r came back with status %r; "
+                "re-issuing as a plain GET so the rows aren't silently skipped.",
+                req_url,
+                status,
+            )
+            return self._get_as_batch_response(req_url)
 
         def _post_batch_adaptive(self, urls: list[str]) -> list[dict]:
             """:meth:`_post_batch` with adaptive sizing: post ``urls`` in chunks no
@@ -2502,7 +2589,13 @@ def register_lakeflow_source(spark):
                 if cap is not None and "_batch_size_cap" not in self.__dict__:
                     self.__dict__["_batch_size_cap"] = int(cap)
                 return cached
-            probe_url = join_url(self.service_url, segments[0]) + "?$top=1"
+            # Probe with the SAME shape the real hydrate sends: no ``$top`` (the
+            # sub-requests deliberately strip it and let the server drive paging
+            # inside the batch). Probing with ``?$top=1`` would false-fail servers
+            # that reject an explicit ``$top`` — a case the connector explicitly
+            # accommodates on plain snapshot reads — and persist ``batch_ok=False``
+            # even though the actual hydrate shape works.
+            probe_url = join_url(self.service_url, segments[0])
             payload = {
                 "requests": [{"id": "0", "method": "GET", "url": self._batch_relative(probe_url)}]
             }
@@ -2985,6 +3078,7 @@ def register_lakeflow_source(spark):
                 pending = pending[eff:]
                 responses = self._post_batch_adaptive([u for _, u in round_])
                 for (key, req_url), resp in zip(round_, responses):
+                    resp = self._checked_batch_subresponse(resp, req_url)
                     body = resp.get("body") if isinstance(resp, dict) else None
                     rows = body.get("value", []) if isinstance(body, dict) else []
                     for row in rows:
@@ -4102,6 +4196,7 @@ def register_lakeflow_source(spark):
                     pending = pending[eff:]
                     responses = self._post_batch_adaptive([u for _, u in round_])
                     for (key, req_url), resp in zip(round_, responses):
+                        resp = self._checked_batch_subresponse(resp, req_url)
                         body = resp.get("body") if isinstance(resp, dict) else None
                         rows = body.get("value", []) if isinstance(body, dict) else []
                         chain = chain_by_key[key]
@@ -5348,10 +5443,17 @@ def register_lakeflow_source(spark):
     # or have no offset at all (the batch reader behind pipeline snapshot
     # refreshes) would otherwise re-run their preflight probes on every read.
     # Entry shape: ``{"batch_ok": bool, "batch_size_ok": int,
-    # "or_filter_ok": bool, "expand_ok": {table_name: bool}}`` — the
-    # server-wide verdicts flat, the per-table nested-$expand verdict keyed by
-    # contained path (different nesting depths can verify differently).
+    # "or_filter_ok": bool, "expand_ok": {table_name: bool},
+    # "cursor_probe_ok": {shared_key: bool}}`` — the server-wide verdicts flat,
+    # the per-table verdicts (nested-$expand and cursor-probe, listed in
+    # ``_PER_TABLE_CAPABILITY_KEYS``) keyed by contained path (different
+    # nesting depths can verify differently).
     _CAPABILITY_CACHE: dict[str, dict] = {}
+
+    # The verdict keys stored as ``{table_key: bool}`` maps rather than flat
+    # server-wide values — the disk merge must union these per table instead of
+    # ``setdefault``-shadowing a sibling worker's whole map.
+    _PER_TABLE_CAPABILITY_KEYS = ("expand_ok", "cursor_probe_ok")
 
     # On-disk mirror of the capability cache (JSON, not pickle — plain data
     # only). Covers the forked-worker gap the process dict can't (PySpark may
@@ -5444,8 +5546,12 @@ def register_lakeflow_source(spark):
         with _CAPABILITY_LOCK:  # only the shared-dict merge needs the lock
             if isinstance(disk, dict):
                 for key, value in disk.items():
-                    if key == "expand_ok" and isinstance(value, dict):
-                        entry["expand_ok"] = {**value, **entry.get("expand_ok", {})}
+                    if key in _PER_TABLE_CAPABILITY_KEYS and isinstance(value, dict):
+                        # Per-table maps union table-by-table (process verdicts
+                        # win) — ``setdefault`` would shadow a sibling worker's
+                        # whole map as soon as this process holds ANY table.
+                        current = entry.get(key)
+                        entry[key] = {**value, **current} if isinstance(current, dict) else dict(value)
                     else:
                         entry.setdefault(key, value)
             _CAPABILITY_DISK_MTIME[path] = mtime
@@ -6019,7 +6125,9 @@ def register_lakeflow_source(spark):
                 # falls back to N+1 stays partitionable.
                 if self._expand_read_active(table_name, opts, start_offset):
                     # Cursor-based expand keeps a default $top (page_size);
-                    # snapshot expand omits $top when page_size is unset.
+                    # snapshot expand omits $top when page_size is unset — which
+                    # can only happen under pagination=nextlink (every other mode
+                    # already defaulted page_size above).
                     if opts.get("cursor_field"):
                         opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
                         return self._with_capabilities(
@@ -6032,7 +6140,8 @@ def register_lakeflow_source(spark):
                     return self._read_contained_expand(table_name, start_offset, opts)
                 if opts.get("cursor_field"):
                     # Cursor-based read: default page_size so a $top is sent.
-                    # Snapshot (the branch below) leaves it unset → no $top.
+                    # Snapshot (the branch below) leaves it unset — no $top only
+                    # under pagination=nextlink; other modes defaulted it above.
                     opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
                     return self._with_capabilities(
                         self._read_contained_incremental(
@@ -6585,7 +6694,6 @@ def register_lakeflow_source(spark):
                     table_name=table_name,
                     table_options=table_options,
                     sparse_checked=sparse_checked,
-                    max_records=max_records,
                 )
                 fetched_url = resp.url
                 current_url, new_delta_link, carry_next_link = self._delta_advance_links(
@@ -6633,9 +6741,17 @@ def register_lakeflow_source(spark):
             table_name: str,
             table_options: dict[str, str] | None,
             sparse_checked: bool,
-            max_records: int,
         ) -> bool:
-            """Append delta records from ``payload`` until cap or page exhaustion.
+            """Append every delta record from ``payload`` (one whole page).
+
+            Deliberately NOT capped mid-page: ``max_records_per_batch`` is
+            enforced at page boundaries by :meth:`_delta_advance_links`
+            (stop following ``@odata.nextLink`` once the cap is reached).
+            Breaking mid-page would silently drop the tail of the current
+            page — the persisted ``carry_next_link`` points at the NEXT
+            page, so the skipped rows would never be re-fetched (permanent
+            loss during bootstrap). The cap may therefore overshoot by at
+            most one server page; MERGE dedupes any overlap.
 
             Returns the updated ``sparse_checked`` flag so the caller can
             continue to skip the check on later pages once it's already
@@ -6646,8 +6762,6 @@ def register_lakeflow_source(spark):
                     self._check_no_sparse_entity(item, table_name, table_options)
                     sparse_checked = True
                 records.append(self._build_delta_record(item, primary_keys))
-                if len(records) >= max_records:
-                    break
             return sparse_checked
 
         def _delta_advance_links(
@@ -6665,7 +6779,10 @@ def register_lakeflow_source(spark):
             Returns ``(next_url, new_delta_link, carry_next_link)``.
             ``next_url`` is ``None`` when pagination should stop (either we
             hit the cap, saw a terminal deltaLink, or the server omitted
-            both pagination links).
+            both pagination links). The cap check runs AFTER the page was
+            appended in full (see :meth:`_delta_collect_page_records`), so
+            ``carry_next_link`` — the link to the next page — never skips
+            rows: the cap overshoots by at most one server page instead.
             """
             raw_delta = payload.get("@odata.deltaLink")
             raw_next = payload.get("@odata.nextLink")
@@ -7029,7 +7146,7 @@ def register_lakeflow_source(spark):
                 return True  # not OR evidence — fail open this seek, record nothing
             if resp.status_code in _RETRYABLE_HTTP_STATUSES:  # 429/5xx — transient
                 return True  # not OR evidence — fail open this seek, record nothing
-            ok = not (400 <= resp.status_code < 500)  # a non-transient 4xx = OR rejected
+            ok = not 400 <= resp.status_code < 500  # a non-transient 4xx = OR rejected
             self.__dict__["_or_filter_ok"] = ok
             self._store_capability("or_filter_ok", ok)
             return ok
