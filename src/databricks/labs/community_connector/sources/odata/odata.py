@@ -85,6 +85,8 @@ from databricks.labs.community_connector.interface.supports_namespaces import (
 # this module under its line-count budget. Re-exported under the original
 # private names so the rest of this file can keep using them as before.
 from databricks.labs.community_connector.sources.odata._helpers import (
+    cursor_le as _cursor_le,
+    cursor_max as _cursor_max,
     trim_to_distinct_cursor_boundary as _trim_to_distinct_cursor_boundary,
 )
 
@@ -650,7 +652,8 @@ class _MetadataState:
     # All memos are keyed off either ``id(et)`` (for methods taking
     # an ``ET.Element``) or ``(table_name, namespace)``. They're
     # safe across the lifetime of ``root`` because element identity
-    # is stable within one parsed tree.
+    # is stable within one parsed tree — and within one PROCESS: see
+    # ``__getstate__`` for the pickle boundary.
     fields: dict = field(default_factory=dict)
     primary_keys: dict = field(default_factory=dict)
     base_chain: dict = field(default_factory=dict)
@@ -658,6 +661,23 @@ class _MetadataState:
     own_pks: dict = field(default_factory=dict)
     entity_type: dict = field(default_factory=dict)
     fk_columns: dict = field(default_factory=dict)
+
+    def __getstate__(self):
+        """Drop the ``id(et)``-keyed memos at the pickle boundary.
+
+        Spark pickles the reader (and this bundle with it) to executor
+        tasks. There the unpickled tree's elements have NEW addresses, so
+        driver-address keys are guaranteed dead weight (serialized per task,
+        never hit again) — and an address coincidence between a worker
+        element and a stale driver key would silently return the WRONG
+        entity type's fields. The executor re-derives per element on first
+        use (one tree walk); the name-keyed memos stay, they're
+        process-portable. Fork-based workers (no pickle) preserve identity
+        and never pass through here."""
+        state = self.__dict__.copy()
+        for memo in ("base_chain", "own_fields", "own_pks"):
+            state[memo] = {}
+        return state
 
 
 def _next_sequence() -> str:
@@ -1309,7 +1329,11 @@ class ODataLakeflowConnect(
             if skip_null and row.get(cursor_field) is None:
                 continue
             rec_cursor = effective(row)
-            if since is not None and rec_cursor is not None and rec_cursor <= since:
+            # Chronological, not lexical (``_cursor_le``): a server that
+            # renders fractional seconds value-dependently puts ``…00.5Z``
+            # lexically BEFORE ``…00Z`` — a raw ``<=`` would drop the newer
+            # row the server correctly returned, permanently.
+            if since is not None and rec_cursor is not None and _cursor_le(rec_cursor, since):
                 continue
             records.append(row)
             if len(records) >= max_records:
@@ -3211,9 +3235,12 @@ class ODataLakeflowConnect(
         (``_read_contained_incremental_leaf_cursor``) reads. ``{"cursor": None}``
         must never be committed — it would advance ``{}`` → ``{"cursor": None}``
         on an all-null-cursor batch and then loop the no-progress guard — so a
-        null-only batch yields ``since`` (if carried) or ``{}``."""
+        null-only batch yields ``since`` (if carried) or ``{}``. The max is
+        CURSOR-ordered (chronological for ISO renderings — a lexical ``max``
+        prefers ``…00Z`` over the later ``…00.5Z``, regressing the watermark
+        behind emitted rows)."""
         if cursors:
-            return {"cursor": max(cursors)}
+            return {"cursor": _cursor_max(cursors)}
         if since is not None:
             return {"cursor": since}
         return {}

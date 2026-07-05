@@ -34,6 +34,9 @@ from pyspark.sql.types import StructField
 from requests.utils import requote_uri
 
 from databricks.labs.community_connector.sources.odata._helpers import (
+    cursor_le as _cursor_le,
+    cursor_max as _cursor_max,
+    cursor_newer as _cursor_newer,
     max_or as _max_or,
     trim_to_distinct_cursor_boundary as _trim_to_distinct_cursor_boundary,
 )
@@ -1479,12 +1482,16 @@ class ContainedNavMixin:
                 # when that max cursor exceeds the watermark (or on the first
                 # batch, ``since is None``, whenever the leaf-parent has a
                 # leaf at all) — this matches the hydrate's ``cursor gt since``.
+                # Chronological comparisons (``_cursor_newer``): a lexical
+                # ``>`` against a value-dependently-fractional rendering
+                # (``…00.5Z`` vs watermark ``…00Z``) would mark a genuinely
+                # dirty leaf-parent CLEAN and skip its changed leaves.
                 max_cursor = None
                 for child in row.get(leaf_nav) or []:
                     val = child.get(cursor_field)
-                    if val is not None and (max_cursor is None or val > max_cursor):
+                    if val is not None and (max_cursor is None or _cursor_newer(val, max_cursor)):
                         max_cursor = val
-                if max_cursor is not None and (since is None or max_cursor > since):
+                if max_cursor is not None and (since is None or _cursor_newer(max_cursor, since)):
                     yield pchain + [{pk: row.get(pk) for pk in lp_pks}]
 
     def _verify_cursor_probe_support(
@@ -1759,10 +1766,12 @@ class ContainedNavMixin:
                 "to $batch / the plain N+1 walk), or cursor_probe=false for the plain walk.",
             )
         children = (exp_rows[0].get(leaf_nav) if exp_rows else None) or []
-        inner_max = max(
-            (c.get(cursor_field) for c in children if c.get(cursor_field) is not None),
-            default=None,
-        )
+        # Chronological max (``_cursor_max``, not ``max``): a lexical max over
+        # mixed fractional renderings can pick the wrong CHILD's value,
+        # failing the equality below and fabricating a definitive mis-order
+        # verdict against an honest server.
+        inner_vals = [c.get(cursor_field) for c in children if c.get(cursor_field) is not None]
+        inner_max = _cursor_max(inner_vals) if inner_vals else None
         if inner_max == direct_max:
             return ("ok", None)
         # Direction matters, because a fail verdict now outlives the instance
@@ -1775,7 +1784,7 @@ class ContainedNavMixin:
         # than treated as a failure. This keeps one concurrent write from
         # aborting the whole preflight or spuriously raising strict mode.
         try:
-            if inner_max is not None and inner_max > direct_max:
+            if inner_max is not None and _cursor_newer(inner_max, direct_max):
                 return ("skip", None)
         except TypeError:
             pass  # incomparable cursor values — keep the mismatch as evidence
@@ -3026,10 +3035,13 @@ class ContainedNavMixin:
             return {"pending_fetches": list(pending_queue)} if in_flight else {}
         prior_running = (start_offset or {}).get("running_max_cursor")
         batch_cursors = [r.get(cursor_field) for r in emitted if r.get(cursor_field) is not None]
+        # Chronological max (``_cursor_max``): a lexical max over mixed
+        # fractional renderings regresses the running watermark behind
+        # emitted rows.
         if batch_cursors and prior_running is not None:
-            new_running = max([*batch_cursors, prior_running])
+            new_running = _cursor_max([*batch_cursors, prior_running])
         elif batch_cursors:
-            new_running = max(batch_cursors)
+            new_running = _cursor_max(batch_cursors)
         else:
             new_running = prior_running
         since = (start_offset or {}).get("cursor")
@@ -3541,10 +3553,12 @@ class ContainedNavMixin:
                     if skip_null and row.get(cursor_field) is None:
                         continue
                     rec_cursor = effective(row)
+                    # Chronological, not lexical (``_cursor_le``) — see the
+                    # flat re-filter in ``_read_incremental``.
                     if (
                         chain_since is not None
                         and rec_cursor is not None
-                        and rec_cursor <= chain_since
+                        and _cursor_le(rec_cursor, chain_since)
                     ):
                         continue
                     self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
@@ -3683,7 +3697,13 @@ class ContainedNavMixin:
                         if skip_null and row.get(cursor_field) is None:
                             continue
                         rec_cursor = effective(row)
-                        if since is not None and rec_cursor is not None and rec_cursor <= since:
+                        # Chronological, not lexical (``_cursor_le``) — see
+                        # the flat re-filter in ``_read_incremental``.
+                        if (
+                            since is not None
+                            and rec_cursor is not None
+                            and _cursor_le(rec_cursor, since)
+                        ):
                             continue
                         clean = {k: v for k, v in row.items() if not k.startswith("@odata.")}
                         self._tag_with_ancestor_fks(clean, segments, chain, fk_columns)
@@ -4323,7 +4343,7 @@ class ContainedNavMixin:
         """
         emitted = walk_state["emitted"]
         cursors = [r.get(cursor_field) for r in emitted if r.get(cursor_field) is not None]
-        this_batch_max = max(cursors) if cursors else None
+        this_batch_max = _cursor_max(cursors) if cursors else None
         prev_running_max = (start_offset or {}).get("running_max")
         new_running_max = _max_or(this_batch_max, prev_running_max)
         if walk_state["truncated"]:

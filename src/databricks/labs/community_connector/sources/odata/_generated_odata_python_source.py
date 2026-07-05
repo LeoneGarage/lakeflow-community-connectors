@@ -613,6 +613,70 @@ def register_lakeflow_source(spark):
     # src/databricks/labs/community_connector/sources/odata/_helpers.py
     ########################################################
 
+    def cursor_sort_key(value: Any) -> Any:
+        """Chronological sort key for one cursor value.
+
+        The server orders cursor columns chronologically, but the client-side
+        comparisons (re-filters, watermark maxes, probe dirty checks) receive the
+        server's *rendered text* — and OData's JSON format makes fractional
+        seconds optional per value (real stacks — Olingo, SAP — trim trailing
+        zeros), so one column legitimately renders both ``…T23:00:00Z`` and
+        ``…T23:00:00.5Z``. Python string order puts the LATER ``.5Z`` instant
+        first (``.`` < ``Z``), which silently drops server-returned rows at the
+        ``<= since`` re-filters and regresses watermark maxes. ISO-8601-looking
+        strings therefore parse to a datetime for ordering (naive values are
+        pinned to UTC so mixed naive/aware renderings still totally order);
+        anything else orders as itself. Offsets and ``$filter`` literals keep the
+        server's raw text — this key is for COMPARISON only."""
+        if isinstance(value, str):
+            try:
+                dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                return value
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        return value
+
+
+    def cursor_newer(a: Any, b: Any) -> bool:
+        """Whether ``a`` is strictly newer (greater) than ``b`` in cursor order —
+        chronological where both render as ISO-8601 (see
+        :func:`cursor_sort_key`), raw ordering otherwise. A shape-mixed column
+        (one value parses, the other doesn't) falls back to comparing the raw
+        values, preserving the pre-helper behavior for such data."""
+        key_a, key_b = cursor_sort_key(a), cursor_sort_key(b)
+        try:
+            return key_a > key_b
+        except TypeError:
+            return a > b
+
+
+    def cursor_le(a: Any, b: Any) -> bool:
+        """Whether ``a <= b`` in cursor order (see :func:`cursor_newer`)."""
+        key_a, key_b = cursor_sort_key(a), cursor_sort_key(b)
+        try:
+            return key_a <= key_b
+        except TypeError:
+            return a <= b
+
+
+    def cursor_max(values: Any) -> Any:
+        """Max of an iterable of non-``None`` cursor values in cursor order.
+        Pairwise via :func:`cursor_newer` (not ``max(key=…)``) so a shape-mixed
+        iterable degrades per-pair instead of raising, and the FIRST maximal
+        value wins ties — matching ``max``'s tie behavior, so an equal-instant
+        pair rendered two ways (``…Z`` vs ``…+00:00``) keeps the earlier-seen
+        text as the watermark."""
+        result = _SENTINEL = object()
+        for value in values:
+            if result is _SENTINEL or cursor_newer(value, result):
+                result = value
+        if result is _SENTINEL:
+            raise ValueError("cursor_max() arg is an empty sequence")
+        return result
+
+
     def trim_to_distinct_cursor_boundary(
         records: list[dict],
         cursor_field: str,
@@ -648,13 +712,14 @@ def register_lakeflow_source(spark):
 
 
     def max_or(a: Any, b: Any) -> Any:
-        """Max of two values where either may be ``None``. Returns the other
-        when one is ``None``; ``None`` only if both are."""
+        """Max of two values in CURSOR order (see :func:`cursor_newer`) where
+        either may be ``None``. Returns the other when one is ``None``; ``None``
+        only if both are. ``a`` wins ties (matching ``max``'s first-arg-wins)."""
         if a is None:
             return b
         if b is None:
             return a
-        return max(a, b)
+        return b if cursor_newer(b, a) else a
 
 
     ########################################################
@@ -2101,12 +2166,16 @@ def register_lakeflow_source(spark):
                     # when that max cursor exceeds the watermark (or on the first
                     # batch, ``since is None``, whenever the leaf-parent has a
                     # leaf at all) — this matches the hydrate's ``cursor gt since``.
+                    # Chronological comparisons (``_cursor_newer``): a lexical
+                    # ``>`` against a value-dependently-fractional rendering
+                    # (``…00.5Z`` vs watermark ``…00Z``) would mark a genuinely
+                    # dirty leaf-parent CLEAN and skip its changed leaves.
                     max_cursor = None
                     for child in row.get(leaf_nav) or []:
                         val = child.get(cursor_field)
-                        if val is not None and (max_cursor is None or val > max_cursor):
+                        if val is not None and (max_cursor is None or _cursor_newer(val, max_cursor)):
                             max_cursor = val
-                    if max_cursor is not None and (since is None or max_cursor > since):
+                    if max_cursor is not None and (since is None or _cursor_newer(max_cursor, since)):
                         yield pchain + [{pk: row.get(pk) for pk in lp_pks}]
 
         def _verify_cursor_probe_support(
@@ -2381,10 +2450,12 @@ def register_lakeflow_source(spark):
                     "to $batch / the plain N+1 walk), or cursor_probe=false for the plain walk.",
                 )
             children = (exp_rows[0].get(leaf_nav) if exp_rows else None) or []
-            inner_max = max(
-                (c.get(cursor_field) for c in children if c.get(cursor_field) is not None),
-                default=None,
-            )
+            # Chronological max (``_cursor_max``, not ``max``): a lexical max over
+            # mixed fractional renderings can pick the wrong CHILD's value,
+            # failing the equality below and fabricating a definitive mis-order
+            # verdict against an honest server.
+            inner_vals = [c.get(cursor_field) for c in children if c.get(cursor_field) is not None]
+            inner_max = _cursor_max(inner_vals) if inner_vals else None
             if inner_max == direct_max:
                 return ("ok", None)
             # Direction matters, because a fail verdict now outlives the instance
@@ -2397,7 +2468,7 @@ def register_lakeflow_source(spark):
             # than treated as a failure. This keeps one concurrent write from
             # aborting the whole preflight or spuriously raising strict mode.
             try:
-                if inner_max is not None and inner_max > direct_max:
+                if inner_max is not None and _cursor_newer(inner_max, direct_max):
                     return ("skip", None)
             except TypeError:
                 pass  # incomparable cursor values — keep the mismatch as evidence
@@ -3648,10 +3719,13 @@ def register_lakeflow_source(spark):
                 return {"pending_fetches": list(pending_queue)} if in_flight else {}
             prior_running = (start_offset or {}).get("running_max_cursor")
             batch_cursors = [r.get(cursor_field) for r in emitted if r.get(cursor_field) is not None]
+            # Chronological max (``_cursor_max``): a lexical max over mixed
+            # fractional renderings regresses the running watermark behind
+            # emitted rows.
             if batch_cursors and prior_running is not None:
-                new_running = max([*batch_cursors, prior_running])
+                new_running = _cursor_max([*batch_cursors, prior_running])
             elif batch_cursors:
-                new_running = max(batch_cursors)
+                new_running = _cursor_max(batch_cursors)
             else:
                 new_running = prior_running
             since = (start_offset or {}).get("cursor")
@@ -4163,10 +4237,12 @@ def register_lakeflow_source(spark):
                         if skip_null and row.get(cursor_field) is None:
                             continue
                         rec_cursor = effective(row)
+                        # Chronological, not lexical (``_cursor_le``) — see the
+                        # flat re-filter in ``_read_incremental``.
                         if (
                             chain_since is not None
                             and rec_cursor is not None
-                            and rec_cursor <= chain_since
+                            and _cursor_le(rec_cursor, chain_since)
                         ):
                             continue
                         self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
@@ -4305,7 +4381,13 @@ def register_lakeflow_source(spark):
                             if skip_null and row.get(cursor_field) is None:
                                 continue
                             rec_cursor = effective(row)
-                            if since is not None and rec_cursor is not None and rec_cursor <= since:
+                            # Chronological, not lexical (``_cursor_le``) — see
+                            # the flat re-filter in ``_read_incremental``.
+                            if (
+                                since is not None
+                                and rec_cursor is not None
+                                and _cursor_le(rec_cursor, since)
+                            ):
                                 continue
                             clean = {k: v for k, v in row.items() if not k.startswith("@odata.")}
                             self._tag_with_ancestor_fks(clean, segments, chain, fk_columns)
@@ -4945,7 +5027,7 @@ def register_lakeflow_source(spark):
             """
             emitted = walk_state["emitted"]
             cursors = [r.get(cursor_field) for r in emitted if r.get(cursor_field) is not None]
-            this_batch_max = max(cursors) if cursors else None
+            this_batch_max = _cursor_max(cursors) if cursors else None
             prev_running_max = (start_offset or {}).get("running_max")
             new_running_max = _max_or(this_batch_max, prev_running_max)
             if walk_state["truncated"]:
@@ -5898,7 +5980,8 @@ def register_lakeflow_source(spark):
         # All memos are keyed off either ``id(et)`` (for methods taking
         # an ``ET.Element``) or ``(table_name, namespace)``. They're
         # safe across the lifetime of ``root`` because element identity
-        # is stable within one parsed tree.
+        # is stable within one parsed tree — and within one PROCESS: see
+        # ``__getstate__`` for the pickle boundary.
         fields: dict = field(default_factory=dict)
         primary_keys: dict = field(default_factory=dict)
         base_chain: dict = field(default_factory=dict)
@@ -5906,6 +5989,23 @@ def register_lakeflow_source(spark):
         own_pks: dict = field(default_factory=dict)
         entity_type: dict = field(default_factory=dict)
         fk_columns: dict = field(default_factory=dict)
+
+        def __getstate__(self):
+            """Drop the ``id(et)``-keyed memos at the pickle boundary.
+
+            Spark pickles the reader (and this bundle with it) to executor
+            tasks. There the unpickled tree's elements have NEW addresses, so
+            driver-address keys are guaranteed dead weight (serialized per task,
+            never hit again) — and an address coincidence between a worker
+            element and a stale driver key would silently return the WRONG
+            entity type's fields. The executor re-derives per element on first
+            use (one tree walk); the name-keyed memos stay, they're
+            process-portable. Fork-based workers (no pickle) preserve identity
+            and never pass through here."""
+            state = self.__dict__.copy()
+            for memo in ("base_chain", "own_fields", "own_pks"):
+                state[memo] = {}
+            return state
 
 
     def _next_sequence() -> str:
@@ -6557,7 +6657,11 @@ def register_lakeflow_source(spark):
                 if skip_null and row.get(cursor_field) is None:
                     continue
                 rec_cursor = effective(row)
-                if since is not None and rec_cursor is not None and rec_cursor <= since:
+                # Chronological, not lexical (``_cursor_le``): a server that
+                # renders fractional seconds value-dependently puts ``…00.5Z``
+                # lexically BEFORE ``…00Z`` — a raw ``<=`` would drop the newer
+                # row the server correctly returned, permanently.
+                if since is not None and rec_cursor is not None and _cursor_le(rec_cursor, since):
                     continue
                 records.append(row)
                 if len(records) >= max_records:
@@ -8459,9 +8563,12 @@ def register_lakeflow_source(spark):
             (``_read_contained_incremental_leaf_cursor``) reads. ``{"cursor": None}``
             must never be committed — it would advance ``{}`` → ``{"cursor": None}``
             on an all-null-cursor batch and then loop the no-progress guard — so a
-            null-only batch yields ``since`` (if carried) or ``{}``."""
+            null-only batch yields ``since`` (if carried) or ``{}``. The max is
+            CURSOR-ordered (chronological for ISO renderings — a lexical ``max``
+            prefers ``…00Z`` over the later ``…00.5Z``, regressing the watermark
+            behind emitted rows)."""
             if cursors:
-                return {"cursor": max(cursors)}
+                return {"cursor": _cursor_max(cursors)}
             if since is not None:
                 return {"cursor": since}
             return {}
@@ -8943,8 +9050,13 @@ def register_lakeflow_source(spark):
         return base64.b64decode(value)
 
 
+    _cursor_le = cursor_le
+    _cursor_max = cursor_max
+    _cursor_newer = cursor_newer
     _max_or = max_or
     _trim_to_distinct_cursor_boundary = trim_to_distinct_cursor_boundary
+    _cursor_le = cursor_le
+    _cursor_max = cursor_max
     _trim_to_distinct_cursor_boundary = trim_to_distinct_cursor_boundary
     _CONTAINED_PATH_SEP = CONTAINED_PATH_SEP
     _DEFAULT_PAGE_SIZE = DEFAULT_PAGE_SIZE

@@ -140,6 +140,44 @@ def test_odata_literal_passes_iso_timestamps_bare():
     assert _odata_literal("2024-05-01T00:00:00Z") == "2024-05-01T00:00:00Z"
 
 
+def test_cursor_comparisons_are_chronological_not_lexical():
+    """Client-side cursor ordering must match the SERVER's chronological
+    ordering. OData's JSON format makes fractional seconds optional per
+    value (Olingo/SAP trim trailing zeros), so one column renders both
+    ``…00Z`` and ``…00.5Z`` — and Python string order puts the LATER
+    ``.5Z`` first (``.`` < ``Z``), which silently drops re-filtered rows
+    and regresses watermark maxes."""
+    from databricks.labs.community_connector.sources.odata._helpers import (
+        cursor_le,
+        cursor_max,
+        cursor_newer,
+        max_or,
+    )
+
+    # The bug cases: fractional vs whole second, differing precision.
+    assert cursor_newer("2024-01-01T23:00:00.5Z", "2024-01-01T23:00:00Z")
+    assert not cursor_le("2024-01-01T23:00:00.5Z", "2024-01-01T23:00:00Z")
+    assert cursor_newer("2024-01-01T23:00:00.51Z", "2024-01-01T23:00:00.5Z")
+    assert cursor_max(["2024-01-01T23:00:00.5Z", "2024-01-01T23:00:00Z"]) == (
+        "2024-01-01T23:00:00.5Z"
+    )
+    assert max_or("2024-01-01T23:00:00Z", "2024-01-01T23:00:00.5Z") == ("2024-01-01T23:00:00.5Z")
+    # Equal instants rendered two ways tie (neither is newer); the max
+    # keeps the first-seen text as the watermark.
+    assert not cursor_newer("2024-01-01T23:00:00+00:00", "2024-01-01T23:00:00Z")
+    assert cursor_le("2024-01-01T23:00:00+00:00", "2024-01-01T23:00:00Z")
+    assert cursor_max(["2024-01-01T23:00:00Z", "2024-01-01T23:00:00+00:00"]) == (
+        "2024-01-01T23:00:00Z"
+    )
+    # Offsets order chronologically, not textually.
+    assert cursor_newer("2024-01-01T23:00:00Z", "2024-01-02T08:59:00+10:00")
+    # Non-ISO values keep their natural ordering; ints untouched.
+    assert cursor_newer("b", "a") and not cursor_newer("A", "a")
+    assert cursor_newer(10, 9) and cursor_le(9, 10)
+    # A shape-mixed pair degrades to raw comparison instead of raising.
+    assert cursor_newer("zzz", "2024-01-01T00:00:00Z")
+
+
 def test_odata_literal_percent_encodes_url_reserved_characters():
     """Generated literals ride into URL strings that ``requests`` sends
     without encoding reserved characters: a raw ``+`` is decoded as a SPACE
@@ -509,6 +547,43 @@ def test_incremental_non_utc_offset_watermark_is_percent_encoded():
     first = captured_urls[0]
     assert "%2B10:00" in first
     assert "+10:00" not in first
+
+
+@responses.activate
+def test_incremental_fractional_second_rendering_not_dropped():
+    """A server that renders fractional seconds only when non-zero (spec-
+    allowed; Olingo/SAP trim trailing zeros) returns ``…00.5Z`` for a row
+    newer than the ``…00Z`` watermark. Lexically ``.`` < ``Z``, so a raw
+    ``<=`` re-filter dropped the row the server correctly returned — with
+    nothing else new the batch came back empty and the stream quiesced with
+    the row permanently invisible. The chronological comparison keeps it,
+    and the watermark max must not regress behind it either."""
+    _mock_metadata()
+
+    def _callback(request):
+        if " gt " in request.url.replace("%20", " "):
+            # Server-side chronological gt correctly returns the .5Z row
+            # for since=…00Z; the confirming drain seek returns empty.
+            if "23:00:00Z" in request.url.replace("%3A", ":"):
+                return (
+                    200,
+                    {},
+                    '{"value": [{"Id": 2, "ModifiedAt": "2024-01-01T23:00:00.5Z"}]}',
+                )
+            return (200, {}, '{"value": []}')
+        return (200, {}, '{"value": []}')
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Customers", callback=_callback)
+    c = _make()
+    records, offset = c.read_table(
+        "Customers",
+        {"cursor": "2024-01-01T23:00:00Z"},
+        {"cursor_field": "ModifiedAt"},
+    )
+    rows = list(records)
+    assert [r["Id"] for r in rows] == [2]  # not silently dropped
+    # Watermark advanced to the fractional value (no lexical regression).
+    assert _drop_lb(offset) == {"cursor": "2024-01-01T23:00:00.5Z"}
 
 
 @responses.activate
@@ -10590,6 +10665,34 @@ def test_capability_cache_disk_merge_unions_per_table_maps():
     assert c._cached_capability("expand_ok", table_name="B__Tbl") is True
     assert c._cached_capability("expand_ok", table_name="A__Tbl") is False
     assert c._cached_capability("batch_ok") is True
+
+
+@responses.activate
+def test_metadata_id_keyed_memos_dropped_at_pickle_boundary():
+    """Spark pickles the reader (and the parsed-CSDL bundle) to executor
+    tasks, where the unpickled tree's elements have NEW addresses: the
+    ``id(et)``-keyed memos' driver-address keys are dead weight at best and
+    a silently-wrong-schema false hit at worst. ``__getstate__`` must drop
+    them; the executor re-derives per element, yielding the same schema."""
+    import pickle
+
+    _mock_metadata()
+    c = _make()
+    schema = c.get_table_schema("Customers", {})
+    pks = c._primary_keys_for("Customers")
+    state = c._metadata_state()
+    assert state.own_fields and state.own_pks  # id()-keyed memos populated
+
+    c2 = pickle.loads(pickle.dumps(c))
+    state2 = c2._metadata_state()
+    assert state2.own_fields == {}
+    assert state2.own_pks == {}
+    assert state2.base_chain == {}
+    # Name-keyed memos are process-portable and survive.
+    assert state2.fields
+    # Executor-side re-derivation produces identical results.
+    assert c2.get_table_schema("Customers", {}) == schema
+    assert c2._primary_keys_for("Customers") == pks
 
 
 @responses.activate
