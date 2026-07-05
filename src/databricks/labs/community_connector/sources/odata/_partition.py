@@ -263,17 +263,25 @@ class PartitionMixin(SupportsPartitionedStream):
         top_rows = self._discover_top_parent_rows(
             segments, namespace, opts, cursor_field, cursor_lower
         )
-        if cursor_field and any(
-            f.name == cursor_field
-            for f in self._own_fields_for_et(self._entity_type_for(segments[0], namespace))
+        streaming = start_offset is not None or end_offset is not None
+        if (
+            streaming
+            and cursor_field
+            and any(
+                f.name == cursor_field
+                for f in self._own_fields_for_et(self._entity_type_for(segments[0], namespace))
+            )
         ):
-            # Null-cursor top parents are UNSUPPORTED on the partitioned path:
-            # this (unfenced) discovery still sees them, but once a fence is
-            # committed every later batch's ``cursor gt`` discovery filter
-            # excludes them SERVER-SIDE — their subtrees' future changes would
-            # be dropped silently, with no error and no log (the serial
-            # ancestor-cursor path raises on the same configuration). Refuse
-            # here, on the only batch that can still see them.
+            # Null-cursor top parents are UNSUPPORTED on the partitioned
+            # STREAMING path: this (unfenced) first discovery still sees them,
+            # but once a fence is committed every later batch's ``cursor gt``
+            # discovery filter excludes them SERVER-SIDE — their subtrees'
+            # future changes would be dropped silently, with no error and no
+            # log (the serial ancestor-cursor path raises on the same
+            # configuration). Refuse here, on the only batch that can still
+            # see them. The BATCH invocation (no offsets) is exempt: it
+            # re-discovers unfenced every run, so null-cursor parents are
+            # always visible and always read correctly there.
             nulls = [r for r in top_rows if r.get(cursor_field) is None]
             if nulls:
                 raise ValueError(

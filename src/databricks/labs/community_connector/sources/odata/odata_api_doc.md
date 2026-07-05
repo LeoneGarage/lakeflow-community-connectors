@@ -258,9 +258,11 @@ The dispatch in `read_table` recognises any of these and routes through the delt
 Bootstrap (first call, no checkpointed delta state):
 
 ```
-GET <service_url><entity_set>?$top=<page_size>
-Prefer: odata.track-changes
+GET <service_url><entity_set>
+Prefer: odata.track-changes[, odata.maxpagesize=<page_size>]
 ```
+
+No `$top` is ever sent on the delta path: OData `$top` is a **total-result** limit (§11.2.5.3), so it would end change tracking at `page_size` rows and permanently drop the rest of the table from the bootstrap. An explicit user `page_size` is forwarded as `Prefer: odata.maxpagesize` — the spec's per-response sizing hint — instead.
 
 Resume (`delta_link` or `next_link` in offset):
 
@@ -275,7 +277,7 @@ The delta / next links are server-minted opaque URLs; the connector follows them
 Each page in the response's `value` array is one of:
 
 - A regular entity → emitted with all `@odata.*` keys stripped, `_deleted=False`, and a fresh `_lc_sequence`.
-- An `@removed` entry (shape: `{"@removed": {"reason": "deleted"}, "<key>": <id>}`) → emitted with only the primary-key fields populated, `_deleted=True`, and a fresh `_lc_sequence`. Following the `microsoft_teams` precedent, deletions are surfaced in-band rather than via `cdc_with_deletes` + `read_table_deletes`.
+- A tombstone → emitted with only the primary-key fields populated, `_deleted=True`, and a fresh `_lc_sequence`. Both wire shapes are recognized: the v4.01 `@removed` control property (`{"@removed": {"reason": "deleted"}, ...}`) and the v4.0 `$deletedEntity`-context entry. Keys come from inline properties when present (Microsoft Graph style), else are parsed from the `@odata.id`/`id` entity reference (single, composite `K1=v1,K2=v2`, quoted-string and bare-guid forms, coerced by declared Edm type so they MERGE-match the upserts). A tombstone whose primary keys cannot be resolved raises rather than silently losing the deletion. `@removed` with `reason: "changed"` is treated as a delete (with a server-side `filter` it means the row left the filtered set). Following the `microsoft_teams` precedent, deletions are surfaced in-band rather than via `cdc_with_deletes` + `read_table_deletes`.
 
 The terminal page carries `@odata.deltaLink` (the next resume point). Intermediate pages carry `@odata.nextLink`.
 
@@ -296,7 +298,7 @@ The connector detects this case: if a resume call started with `prev_delta_link 
 
 ### Token expiry (HTTP 410)
 
-When the server returns 410 Gone on a stored `delta_link` or `next_link`, the connector silently re-bootstraps: a fresh `Prefer: odata.track-changes` GET against the entity set, emit the full snapshot as `_deleted=False` upserts, return a brand-new `delta_link`. MERGE-by-PK at the destination reconciles re-fetched rows with what's already there.
+When the server returns 410 Gone on a stored link, the connector recovers silently in two tiers: a 410 on a parked mid-pagination `next_link` first retries the retained prior `delta_link` (replaying only the changes-since window); a 410 on the `delta_link` itself re-bootstraps — a fresh `Prefer: odata.track-changes` GET against the entity set, the full snapshot re-emitted as `_deleted=False` upserts, and a brand-new `delta_link`. MERGE-by-PK at the destination reconciles re-fetched rows with what's already there. Conversely, a server that returns change records with the SAME `@odata.deltaLink` as the prior batch raises a no-progress error (the stream would otherwise re-read that change set forever).
 
 ### Sparse-update rejection
 

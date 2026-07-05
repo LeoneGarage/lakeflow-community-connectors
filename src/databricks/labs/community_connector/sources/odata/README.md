@@ -256,6 +256,7 @@ The no-refresh-path row's remediation depends on the configured auth mode:
 | `retry_max_delay_seconds`     | 60      | Per-retry sleep cap (seconds). Applied to both server-supplied `Retry-After` values and the exponential-backoff fallback, so a misbehaving source emitting an hour-long `Retry-After` can't pin a Spark task. |
 | `verbose_http_logging`        | false   | When `true`, logs each HTTP request/response (method, URL, status, timing) at INFO for troubleshooting. Off by default to keep logs quiet and avoid leaking URL query values. |
 | `verbose_http_log_body_chars` | 500     | When `verbose_http_logging` is on, the maximum number of response-body characters logged per request (truncated beyond this). Only consulted when verbose logging is enabled. |
+| `extra_headers`               | (none)  | Comma-separated `Name: value` pairs added to every request's headers (e.g. `"X-Env: prod, Accept-Language: en"`). Values containing commas can't be expressed (the list splits on `,`). Applied before auth headers; a pair without `:` is ignored. |
 
 ## Pipeline (ingest.py)
 
@@ -377,11 +378,38 @@ detects this and falls back to whatever cursor/snapshot config is set.
   missing any property the schema declares. Workaround: restrict the
   schema via `$select` to fields the server always returns, or fall
   back with `delta_tracking=disabled`.
-- **Token expiry triggers a full re-bootstrap.** When the server
-  returns HTTP 410 on a stored delta link, the connector silently
-  re-reads the entire entity set via a fresh `Prefer` GET. Re-fetched
-  rows MERGE cleanly by primary key at the destination, so no data
-  is lost — but HTTP cost spikes for that one batch.
+- **Token expiry triggers a re-read.** When the server returns HTTP 410
+  on a stored link the connector recovers silently: a 410 on a parked
+  mid-pagination `next_link` first retries the retained prior
+  `delta_link` (replaying only the changes-since window); a 410 on the
+  delta link itself re-reads the entire entity set via a fresh `Prefer`
+  GET. Re-fetched rows MERGE cleanly by primary key at the destination,
+  so no data is lost — but HTTP cost spikes for that batch.
+- **`page_size` never becomes `$top` on the delta path.** OData `$top`
+  is a *total-result* limit (§11.2.5.3): sent on the bootstrap it would
+  end change tracking at `page_size` rows and silently drop the rest of
+  the table. An explicit `page_size` is instead forwarded as
+  `Prefer: odata.maxpagesize=<N>` — the spec's per-response sizing
+  hint, which servers may honor or ignore without affecting
+  completeness. Use `max_records_per_batch` (page-boundary enforced)
+  for per-batch sizing.
+- **Tombstone key resolution.** Deletions are recognized in both wire
+  shapes — the v4.01 `@removed` control property and the v4.0
+  `$deletedEntity`-context entry — and the key is taken from inline
+  properties when present (Microsoft Graph style) or parsed from the
+  entry's `@odata.id`/`id` entity reference (single, composite
+  `K1=v1,K2=v2`, quoted-string and bare-guid forms). A tombstone whose
+  primary keys can't be resolved raises rather than emitting a keyless
+  no-op tombstone (which would silently lose the deletion).
+- **`@removed` with `reason: "changed"` is treated as a delete.** On an
+  unfiltered entity set it shouldn't occur; with a server-side `filter`
+  it means the row left the filtered set, and deleting downstream is
+  the consistent interpretation.
+- **A non-advancing delta link raises.** If the server returns change
+  records together with the *same* `@odata.deltaLink` as the prior
+  batch, the stream would re-read that change set forever; the
+  connector raises the same style of no-progress error as the cursor
+  paths instead of churning.
 - **`cursor_field` and `delta_tracking=enabled` are mutually
   exclusive.** Delta tracking is the source of truth for change
   ordering; layering a client-side cursor on top over-constrains the

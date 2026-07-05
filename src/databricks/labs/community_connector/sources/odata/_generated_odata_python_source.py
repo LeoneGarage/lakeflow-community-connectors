@@ -53,7 +53,7 @@ from pyspark.sql.types import (
 )
 from requests.auth import HTTPBasicAuth
 from requests.utils import requote_uri
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 from xml.etree import ElementTree as ET
 import base64
 import hashlib
@@ -6181,17 +6181,25 @@ def register_lakeflow_source(spark):
             top_rows = self._discover_top_parent_rows(
                 segments, namespace, opts, cursor_field, cursor_lower
             )
-            if cursor_field and any(
-                f.name == cursor_field
-                for f in self._own_fields_for_et(self._entity_type_for(segments[0], namespace))
+            streaming = start_offset is not None or end_offset is not None
+            if (
+                streaming
+                and cursor_field
+                and any(
+                    f.name == cursor_field
+                    for f in self._own_fields_for_et(self._entity_type_for(segments[0], namespace))
+                )
             ):
-                # Null-cursor top parents are UNSUPPORTED on the partitioned path:
-                # this (unfenced) discovery still sees them, but once a fence is
-                # committed every later batch's ``cursor gt`` discovery filter
-                # excludes them SERVER-SIDE — their subtrees' future changes would
-                # be dropped silently, with no error and no log (the serial
-                # ancestor-cursor path raises on the same configuration). Refuse
-                # here, on the only batch that can still see them.
+                # Null-cursor top parents are UNSUPPORTED on the partitioned
+                # STREAMING path: this (unfenced) first discovery still sees them,
+                # but once a fence is committed every later batch's ``cursor gt``
+                # discovery filter excludes them SERVER-SIDE — their subtrees'
+                # future changes would be dropped silently, with no error and no
+                # log (the serial ancestor-cursor path raises on the same
+                # configuration). Refuse here, on the only batch that can still
+                # see them. The BATCH invocation (no offsets) is exempt: it
+                # re-discovers unfenced every run, so null-cursor parents are
+                # always visible and always read correctly there.
                 nulls = [r for r in top_rows if r.get(cursor_field) is None]
                 if nulls:
                     raise ValueError(
@@ -6574,6 +6582,70 @@ def register_lakeflow_source(spark):
     _DELTA_PREFER = "odata.track-changes"
     _DELETED_COL = "_deleted"
     _SEQUENCE_COL = "_lc_sequence"
+
+    # ``Name=value`` (named-key) form inside a key predicate — the name is a
+    # simple identifier, so a ``=`` inside a quoted VALUE can't false-match.
+    _KEY_EQ_RE = re.compile(r"^\w+\s*=")
+
+
+    def _split_key_predicate(pred: str) -> list[str]:
+        """Split a key-predicate body on top-level commas, honoring OData
+        string quoting (``''`` escapes a quote inside a quoted value)."""
+        parts: list[str] = []
+        buf: list[str] = []
+        in_quote = False
+        i = 0
+        while i < len(pred):
+            ch = pred[i]
+            if ch == "'":
+                if in_quote and i + 1 < len(pred) and pred[i + 1] == "'":
+                    buf.append("''")
+                    i += 2
+                    continue
+                in_quote = not in_quote
+                buf.append(ch)
+            elif ch == "," and not in_quote:
+                parts.append("".join(buf))
+                buf = []
+            else:
+                buf.append(ch)
+            i += 1
+        if buf:
+            parts.append("".join(buf))
+        return [p.strip() for p in parts if p.strip()]
+
+
+    def _coerce_key_literal(text: str, edm_type: str | None):
+        """One key-predicate literal → the Python value the matching UPSERT
+        rows carry (JSON-decoded), so a tombstone built from an entity
+        reference MERGE-matches them. Quoted strings un-escape ``''``;
+        numeric/boolean Edm types parse; everything else (guids, dates,
+        unknown types) stays as its raw text — exactly how the JSON payload
+        delivers those."""
+        if len(text) >= 2 and text.startswith("'") and text.endswith("'"):
+            return text[1:-1].replace("''", "'")
+        if edm_type in ("Edm.Int16", "Edm.Int32", "Edm.Int64", "Edm.Byte", "Edm.SByte"):
+            try:
+                return int(text)
+            except ValueError:
+                return text
+        if edm_type in ("Edm.Single", "Edm.Double"):
+            try:
+                return float(text)
+            except ValueError:
+                return text
+        if edm_type == "Edm.Boolean" and text.lower() in ("true", "false"):
+            return text.lower() == "true"
+        if edm_type is None:
+            # Untyped fallback: an integer-looking bare literal parses (JSON
+            # would have carried it as a number); anything else stays text.
+            try:
+                return int(text)
+            except ValueError:
+                return text
+        return text
+
+
     # Effectively-unlimited value for ``max_records_per_batch`` when the
     # framework's batch reader is detected (``start_offset is None``).
     # A bare ``sys.maxsize`` is unnecessary — the per-fetch cap arithmetic
@@ -7117,6 +7189,24 @@ def register_lakeflow_source(spark):
             return state
 
 
+    def _parse_conn_int(options: dict, key: str, default, minimum: int) -> int:
+        """Curated parse for a connection-level integer option — same
+        discipline as the per-table numeric parsers (``validate_page_size``,
+        ``parse_max_records``, ``_parse_num_partitions``). A bare ``int()``
+        turns garbage into an uncurated traceback at construction, and a
+        negative ``max_retries`` makes every ``range(max_retries + 1)`` retry
+        loop run ZERO iterations → ``UnboundLocalError`` on ``resp`` instead
+        of any HTTP call."""
+        raw = options.get(key, default)
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            raise ValueError(f"Invalid {key}={raw!r}: expected an integer.") from None
+        if value < minimum:
+            raise ValueError(f"Invalid {key}={raw!r}: must be >= {minimum}.")
+        return value
+
+
     def _next_sequence() -> str:
         """Strictly-increasing per-record sequence value for apply_changes.
 
@@ -7173,15 +7263,15 @@ def register_lakeflow_source(spark):
             # deployments and the previous default surfaced as
             # ``ReadTimeout`` retried-to-exhaustion failures. Connection
             # option ``timeout_seconds`` overrides per deployment.
-            self.timeout = int(options.get("timeout_seconds", "180"))
+            self.timeout = _parse_conn_int(options, "timeout_seconds", "180", 1)
             # On-disk pickle TTL. The default suits typical 1-minute SDP
             # trigger intervals — each trigger spawns a fresh forked
             # worker, the file cache survives, but stale state is bounded.
             # Users with stable schemas can raise this to skip even the
             # first-fork fetch within a longer window; users iterating on
             # the source model can drop it to 0 to disable file caching.
-            self.metadata_cache_ttl_seconds = int(
-                options.get("metadata_cache_ttl_seconds", _METADATA_FILE_CACHE_TTL_SECONDS)
+            self.metadata_cache_ttl_seconds = _parse_conn_int(
+                options, "metadata_cache_ttl_seconds", _METADATA_FILE_CACHE_TTL_SECONDS, 0
             )
             # Retry budget for transient server-side failures (HTTP 429 / 503).
             # 5 attempts at exponential backoff (1, 2, 4, 8, 16 s) covers the
@@ -7190,8 +7280,8 @@ def register_lakeflow_source(spark):
             # indefinitely. `retry_max_delay_seconds` caps any single sleep —
             # honour the server's Retry-After header but never sleep longer
             # than this (some misbehaving servers emit hour-long values).
-            self.max_retries = int(options.get("max_retries", "5"))
-            self.retry_max_delay_seconds = int(options.get("retry_max_delay_seconds", "60"))
+            self.max_retries = _parse_conn_int(options, "max_retries", "5", 0)
+            self.retry_max_delay_seconds = _parse_conn_int(options, "retry_max_delay_seconds", "60", 0)
             # Per-request diagnostic logging. Off by default — when on,
             # writes one INFO line per HTTP request (URL + status + body
             # snippet) to the module logger. The body snippet is the
@@ -7202,7 +7292,9 @@ def register_lakeflow_source(spark):
             ).strip().lower() == "true"
             # How many chars of the response body to include in each INFO
             # log line when ``verbose_http_logging`` is on. Default 500.
-            self.verbose_http_log_body_chars = int(options.get("verbose_http_log_body_chars", "500"))
+            self.verbose_http_log_body_chars = _parse_conn_int(
+                options, "verbose_http_log_body_chars", "500", 0
+            )
             self._session: requests.Session | None = None
             # Parsed CSDL bundle: root + lookup index + per-instance memos.
             # ``None`` until the first ``_metadata_root()`` call.
@@ -7394,6 +7486,11 @@ def register_lakeflow_source(spark):
             # ``_read_contained_expand``) so an uncapped batch doesn't
             # materialise the whole result set in memory.
             opts = dict(table_options or {})
+            # The user's OWN page_size, captured before any default is injected
+            # below — the delta branch must distinguish "user asked for response
+            # sizing" (honored via Prefer: odata.maxpagesize) from "client-paging
+            # default" (dropped outright: $top is fatal to a delta bootstrap).
+            user_page_size = opts.get("page_size")
             # Pagination strategy for this read. keyset/skip/auto drive
             # pagination client-side (for servers that omit @odata.nextLink)
             # and need a $top to size pages, so force a default page_size when
@@ -7437,6 +7534,41 @@ def register_lakeflow_source(spark):
                     "to floor.) Use 'auto' (default) or 'off' for other read "
                     "configurations."
                 )
+            # A user ``select`` must keep the columns the machinery depends on.
+            # Omitting a PK desyncs the schema (drops the column) from
+            # read_table_metadata (still lists it) — apply_changes then MERGEs on
+            # an undeclared column. Omitting the cursor_field is worse and
+            # SILENT: every row's cursor reads None, so under the default
+            # cursor_nulls=coalesce each batch re-reads the whole table forever
+            # behind a synthetic-floor watermark, and under ``ignore`` the read
+            # emits nothing. Both misconfigurations raise here instead.
+            select_raw = (opts.get("select") or "").strip()
+            if select_raw:
+                select_cols = {c.strip() for c in select_raw.split(",") if c.strip()}
+                if "*" not in select_cols:
+                    leaf_et = self._entity_type_for(table_name, opts.get("namespace"))
+                    missing_pks = [
+                        pk for pk in self._own_primary_keys_for_et(leaf_et) if pk not in select_cols
+                    ]
+                    if missing_pks:
+                        raise ValueError(
+                            f"select={select_raw!r} omits primary-key column(s) "
+                            f"{missing_pks} of {table_name!r}. The destination MERGE "
+                            f"keys on them; add them to select (or drop select)."
+                        )
+                    cf = opts.get("cursor_field")
+                    if (
+                        cf
+                        and cf not in select_cols
+                        and any(f.name == cf for f in self._own_fields_for_et(leaf_et))
+                    ):
+                        raise ValueError(
+                            f"select={select_raw!r} omits cursor_field={cf!r}. The "
+                            f"incremental read filters and watermarks on that column; "
+                            f"without it every row's cursor reads null (silent "
+                            f"full-table re-reads under cursor_nulls=coalesce, zero "
+                            f"rows under ignore). Add {cf!r} to select."
+                        )
             # ``auto`` (the default) is a best-effort hint that no-ops where it can't
             # engage, so these conflict checks fire only on an EXPLICIT strategy
             # opt-in (``cursor_probe=nested-expand`` or ``cursor_probe=batch``) — otherwise
@@ -7554,9 +7686,21 @@ def register_lakeflow_source(spark):
                 or "next_link" in offset
                 or self._delta_active_for(table_name, opts)
             ):
-                # Delta (CDC) is cursor-based — keep a default $top.
-                opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
-                return self._read_incremental_delta(table_name, offset, opts)
+                # NEVER send $top on the delta path. OData §11.2.5.3 makes $top a
+                # TOTAL-RESULT limit — the exact trap the pagination docs call out
+                # for the flat walks — and the delta walker follows only raw
+                # @odata.nextLinks (no seek-past-budget fallback, by design). A
+                # spec-compliant server would end the bootstrap at $top rows and
+                # mint the terminal deltaLink there, silently and permanently
+                # dropping every never-again-changed row beyond it. So the
+                # client-paging default injected above is stripped, and an
+                # EXPLICIT user page_size is honored through the spec's
+                # response-sizing mechanism instead (Prefer: odata.maxpagesize —
+                # see _delta_initial_request).
+                delta_opts = {k: v for k, v in opts.items() if k != "page_size"}
+                if user_page_size:
+                    delta_opts["page_size"] = user_page_size
+                return self._read_incremental_delta(table_name, offset, delta_opts)
             if opts.get("cursor_field"):
                 # Cursor-based read: default page_size so a $top is sent.
                 # Snapshot (the branch below) leaves it unset → no $top.
@@ -7978,7 +8122,17 @@ def register_lakeflow_source(spark):
                 max_records=max_records,
             )
             if rebootstrap:
-                # 410 Gone surfaced during pagination → re-bootstrap from
+                if prev_next_link is not None and prev_delta_link is not None:
+                    # The parked mid-pagination link expired, but the offset
+                    # retained the prior delta_link exactly for this: replay the
+                    # changes-since window instead of re-reading the whole entity
+                    # set. Rows between the two links are re-fetched — dup-safe.
+                    # If THAT link 410s too, the recursion's next level has no
+                    # next_link and falls to the full re-bootstrap below.
+                    return self._read_incremental_delta(
+                        table_name, {"delta_link": prev_delta_link}, table_options
+                    )
+                # 410 Gone on the stored delta link → re-bootstrap from
                 # scratch. ``MERGE``-on-PK + ``_lc_sequence`` ordering
                 # reconciles re-fetched rows at the destination; no data
                 # loss, only HTTP cost.
@@ -8015,27 +8169,112 @@ def register_lakeflow_source(spark):
                     f"snapshot or cursor-based reads."
                 )
 
+            if records and prev_delta_link is not None and new_delta_link == prev_delta_link:
+                # Change records came back but the deltaLink did not advance:
+                # every future trigger would re-fetch the SAME change set forever
+                # (MERGE dedupes, but the stream churns without progressing).
+                # Mirror the cursor paths' no-progress raise instead of looping.
+                raise RuntimeError(
+                    f"OData delta read for {table_name!r} returned {len(records)} "
+                    f"change records but the SAME @odata.deltaLink as the prior "
+                    f"batch — the server is not advancing its change cursor, so "
+                    f"the stream would re-read this change set forever. Set "
+                    f"delta_tracking=disabled and use cursor-based incremental "
+                    f"instead."
+                )
             return iter(records), {"delta_link": new_delta_link}
 
-        def _build_delta_record(self, item: dict, primary_keys: list[str]) -> dict:
+        def _build_delta_record(
+            self,
+            item: dict,
+            primary_keys: list[str],
+            *,
+            tombstone: bool | None = None,
+            key_types: dict[str, str] | None = None,
+        ) -> dict:
             """Translate one delta payload entry into the emitted record shape.
 
-            - ``@removed`` entries become tombstones: a record carrying the
-              primary-key fields plus ``_deleted=True``.
+            - Tombstones (``@removed`` entries, or v4.0-format ``$deletedEntity``
+              entries flagged by the caller) become a record carrying the
+              primary-key fields plus ``_deleted=True``. Keys are taken from the
+              INLINE properties when present (Graph style); otherwise parsed out
+              of the entry's ``@odata.id`` / ``id`` entity reference (the
+              v4.01/v4.0 spec shapes carry the key ONLY there). A tombstone whose
+              keys resolve to None raises — a keyless tombstone MERGEs against
+              nothing, silently losing the deletion.
             - Regular adds/changes pass through with all ``@odata.*`` control
               properties stripped and ``_deleted=False``.
 
             Every emitted record gets ``_lc_sequence`` — a strictly monotonic
             string — so apply_changes has a deterministic sequence_by column.
             """
-            if "@removed" in item:
+            is_tombstone = tombstone if tombstone is not None else "@removed" in item
+            if is_tombstone:
                 record: dict = {pk: item.get(pk) for pk in primary_keys}
+                if any(v is None for v in record.values()):
+                    id_text = item.get("@odata.id") or item.get("id")
+                    from_id = (
+                        self._tombstone_keys_from_id(id_text, primary_keys, key_types)
+                        if isinstance(id_text, str)
+                        else None
+                    )
+                    if from_id:
+                        for pk in primary_keys:
+                            if record.get(pk) is None:
+                                record[pk] = from_id.get(pk)
+                if primary_keys and any(record.get(pk) is None for pk in primary_keys):
+                    raise RuntimeError(
+                        f"OData delta tombstone carries no resolvable primary key "
+                        f"(need {primary_keys}, got inline keys "
+                        f"{ {pk: item.get(pk) for pk in primary_keys} }, entity "
+                        f"reference {item.get('@odata.id') or item.get('id')!r}). "
+                        f"A keyless tombstone would MERGE against nothing and the "
+                        f"deletion would be silently lost. If the server's "
+                        f"tombstone format differs, set delta_tracking=disabled "
+                        f"and use cursor/snapshot reads."
+                    )
                 record[_DELETED_COL] = True
             else:
                 record = {k: v for k, v in item.items() if not k.startswith("@odata.")}
                 record[_DELETED_COL] = False
             record[_SEQUENCE_COL] = _next_sequence()
             return record
+
+        def _tombstone_keys_from_id(
+            self,
+            id_text: str,
+            primary_keys: list[str],
+            key_types: dict[str, str] | None,
+        ) -> dict | None:
+            """Parse PK values out of a tombstone's entity reference — the
+            inverse of ``_format_key_predicate``, for ids like
+            ``Customers('ALFKI')``, ``…/Orders(OrderID=1,Lang='en')`` or a full
+            absolute URL. Returns ``None`` when no key predicate is found or the
+            shape doesn't match the PK list; values are coerced by declared Edm
+            type (quoted strings un-escaped, numerics parsed) so the emitted
+            tombstone MERGE-matches the upserts' JSON-decoded values."""
+            path = id_text.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+            seg = path.rsplit("/", 1)[-1]
+            if "%" in seg:
+                seg = unquote(seg)
+            open_idx = seg.find("(")
+            if open_idx < 0 or not seg.endswith(")"):
+                return None
+            parts = _split_key_predicate(seg[open_idx + 1 : -1])
+            if not parts:
+                return None
+            types = key_types or {}
+            out: dict = {}
+            named = [p for p in parts if _KEY_EQ_RE.match(p)]
+            if len(named) == len(parts):
+                for part in parts:
+                    name, _, raw = part.partition("=")
+                    name = name.strip()
+                    out[name] = _coerce_key_literal(raw.strip(), types.get(name))
+                return out if set(out) >= set(primary_keys) else None
+            if len(parts) == 1 and len(primary_keys) == 1:
+                return {primary_keys[0]: _coerce_key_literal(parts[0], types.get(primary_keys[0]))}
+            return None
 
         def _delta_initial_request(
             self,
@@ -8055,9 +8294,19 @@ def register_lakeflow_source(spark):
             if prev_delta_link is not None:
                 return prev_delta_link, None
             segment_filters = _resolve_segment_filters(table_options, [table_name])
+            # No $top on the bootstrap URL — a total-result limit ends change
+            # tracking at page_size rows (see the delta dispatch branch). An
+            # explicit page_size rides the Prefer header as odata.maxpagesize,
+            # the spec's per-RESPONSE sizing hint, which servers may honor or
+            # ignore without affecting the result set's completeness.
+            opts_no_top = {k: v for k, v in (table_options or {}).items() if k != "page_size"}
+            prefer = _DELTA_PREFER
+            page_size = (table_options or {}).get("page_size")
+            if page_size:
+                prefer = f"{_DELTA_PREFER}, odata.maxpagesize={int(page_size)}"
             return (
-                self._build_url(table_name, table_options or {}, extra_filter=segment_filters.get(0)),
-                {"Prefer": _DELTA_PREFER},
+                self._build_url(table_name, opts_no_top, extra_filter=segment_filters.get(0)),
+                {"Prefer": prefer},
             )
 
         def _delta_walk_pages(
@@ -8092,6 +8341,9 @@ def register_lakeflow_source(spark):
             page_index = 0
             bootstrap_verified = not is_bootstrap
             expected_fields = self._delta_expected_fields(table_name, table_options)
+            # PK Edm types for entity-reference tombstones (typed literal
+            # coercion — see _tombstone_keys_from_id). Best-effort.
+            key_types = self._edm_types_for_table(table_name, (table_options or {}).get("namespace"))
             current_url: str | None = url
 
             while current_url:
@@ -8116,6 +8368,7 @@ def register_lakeflow_source(spark):
                     primary_keys=primary_keys,
                     table_name=table_name,
                     expected_fields=expected_fields,
+                    key_types=key_types,
                 )
                 fetched_url = resp.url
                 current_url, new_delta_link, carry_next_link = self._delta_advance_links(
@@ -8202,8 +8455,17 @@ def register_lakeflow_source(spark):
             primary_keys: list[str],
             table_name: str,
             expected_fields: frozenset,
+            key_types: dict[str, str] | None = None,
         ) -> None:
             """Append every delta record from ``payload`` (one whole page).
+
+            Tombstones come in two wire shapes: the v4.01 JSON format's
+            ``@removed`` control property, and the v4.0 format's
+            ``$deletedEntity``-context entry (``@odata.context`` ending in
+            ``/$deletedEntity``, key carried in ``id``, no ``@removed`` at
+            all). Both are routed to the tombstone branch — a v4.0 deleted
+            entry misread as a regular entity would trip the sparse-entity
+            guard with a misleading "partial updates" diagnosis.
 
             Deliberately NOT capped mid-page: ``max_records_per_batch`` is
             enforced at page boundaries by :meth:`_delta_advance_links`
@@ -8223,9 +8485,15 @@ def register_lakeflow_source(spark):
             per-item cost is one set difference.
             """
             for item in payload.get("value", []):
-                if "@removed" not in item:
+                context = str(item.get("@odata.context", "")).lower()
+                is_tombstone = "@removed" in item or "$deletedentity" in context
+                if not is_tombstone:
                     self._check_no_sparse_entity(item, table_name, expected_fields)
-                records.append(self._build_delta_record(item, primary_keys))
+                records.append(
+                    self._build_delta_record(
+                        item, primary_keys, tombstone=is_tombstone, key_types=key_types
+                    )
+                )
 
         def _delta_advance_links(
             self,

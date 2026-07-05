@@ -13598,3 +13598,268 @@ def test_edm_types_for_level_memoizes_failure():
     assert c._edm_types_for_level(["NoSuchSet"], 0, None) == {}
     assert calls["n"] == 1  # second call short-circuits on the failure memo
     del c._entity_type_for
+
+
+# ---------------------------------------------------------------------------
+# Round-29 fixes: delta $top removal + maxpagesize, entity-reference
+# tombstones, next_link-410 fallback, delta no-progress, partition batch
+# null tolerance, select validation, connection-int validation
+# ---------------------------------------------------------------------------
+
+
+@responses.activate
+def test_delta_bootstrap_sends_no_top_and_maps_page_size_to_maxpagesize():
+    """OData $top is a TOTAL-RESULT limit (§11.2.5.3): sent on a delta
+    bootstrap it ends change tracking at page_size rows and silently drops
+    the rest of the table forever. The bootstrap must carry NO $top; an
+    explicit page_size rides Prefer: odata.maxpagesize instead."""
+    _mock_metadata()
+    seen = {}
+
+    def _cb(request):
+        seen["url"] = request.url
+        seen["prefer"] = request.headers.get("Prefer", "")
+        return (
+            200,
+            {"Preference-Applied": "odata.track-changes"},
+            json.dumps(_delta_bootstrap_body([{"Id": 1, "Name": "A", "ModifiedAt": "x"}])),
+        )
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Customers", callback=_cb)
+    c = _make()
+    records, offset = c.read_table(
+        "Customers", None, {"delta_tracking": "enabled", "page_size": "500"}
+    )
+    assert [r["Id"] for r in list(records)] == [1]
+    assert "$top" not in seen["url"] and "%24top" not in seen["url"]
+    assert "odata.track-changes" in seen["prefer"]
+    assert "odata.maxpagesize=500" in seen["prefer"]
+    assert _drop_lb(offset) == {"delta_link": DELTA_LINK_V1}
+
+
+@responses.activate
+def test_delta_bootstrap_default_pagination_sends_no_top():
+    """Even under the default pagination=auto (which injects a client-paging
+    page_size for other reads), the delta bootstrap must carry no $top and
+    no maxpagesize (the user asked for nothing)."""
+    _mock_metadata()
+    seen = {}
+
+    def _cb(request):
+        seen["url"] = request.url
+        seen["prefer"] = request.headers.get("Prefer", "")
+        return (
+            200,
+            {"Preference-Applied": "odata.track-changes"},
+            json.dumps(_delta_bootstrap_body([{"Id": 1, "Name": "A", "ModifiedAt": "x"}])),
+        )
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Customers", callback=_cb)
+    c = _make()
+    records, _ = c.read_table("Customers", None, {"delta_tracking": "enabled"})
+    list(records)
+    assert "$top" not in seen["url"] and "%24top" not in seen["url"]
+    assert "maxpagesize" not in seen["prefer"]
+
+
+@responses.activate
+def test_delta_tombstone_key_parsed_from_entity_reference():
+    """A spec-shaped tombstone carries its key only in @odata.id — the
+    connector must parse it (typed: int PK coerced so it MERGE-matches the
+    upserts), not emit a keyless no-op tombstone."""
+    _mock_metadata()
+    responses.add(
+        responses.GET,
+        DELTA_LINK_V1,
+        json={
+            "value": [
+                {"@removed": {"reason": "deleted"}, "@odata.id": f"{SERVICE_URL}Customers(2)"},
+            ],
+            "@odata.deltaLink": DELTA_LINK_V2,
+        },
+    )
+    c = _make()
+    records, offset = c.read_table(
+        "Customers", {"delta_link": DELTA_LINK_V1}, {"delta_tracking": "enabled"}
+    )
+    (tomb,) = list(records)
+    assert tomb["Id"] == 2 and isinstance(tomb["Id"], int)
+    assert tomb["_deleted"] is True
+    assert _drop_lb(offset) == {"delta_link": DELTA_LINK_V2}
+
+
+@responses.activate
+def test_delta_v40_deleted_entity_context_is_tombstone_not_sparse_error():
+    """A v4.0-format deleted entry ($deletedEntity context + id, no
+    @removed) must become a tombstone — pre-fix it was misread as a regular
+    entity and tripped the sparse-entity guard with a misleading
+    'partial updates' error."""
+    _mock_metadata()
+    responses.add(
+        responses.GET,
+        DELTA_LINK_V1,
+        json={
+            "value": [
+                {
+                    "@odata.context": f"{SERVICE_URL}$metadata#Customers/$deletedEntity",
+                    "id": "Customers(3)",
+                    "reason": "deleted",
+                },
+            ],
+            "@odata.deltaLink": DELTA_LINK_V2,
+        },
+    )
+    c = _make()
+    records, _ = c.read_table(
+        "Customers", {"delta_link": DELTA_LINK_V1}, {"delta_tracking": "enabled"}
+    )
+    (tomb,) = list(records)
+    assert tomb["Id"] == 3
+    assert tomb["_deleted"] is True
+
+
+@responses.activate
+def test_delta_tombstone_without_resolvable_key_raises():
+    """A tombstone with neither inline keys nor a parsable entity reference
+    would MERGE against nothing — the deletion silently lost. Raise."""
+    _mock_metadata()
+    responses.add(
+        responses.GET,
+        DELTA_LINK_V1,
+        json={
+            "value": [{"@removed": {"reason": "deleted"}}],
+            "@odata.deltaLink": DELTA_LINK_V2,
+        },
+    )
+    c = _make()
+    with pytest.raises(RuntimeError, match="resolvable primary key"):
+        records, _ = c.read_table(
+            "Customers", {"delta_link": DELTA_LINK_V1}, {"delta_tracking": "enabled"}
+        )
+        list(records)
+
+
+def test_tombstone_keys_from_id_shapes():
+    """Unit coverage of the entity-reference parser: composite named keys,
+    quoted-string un-escaping, bare guids, absolute URLs, and non-matching
+    shapes returning None."""
+    c = _make()
+    types = {"OrderID": "Edm.Int32", "Lang": "Edm.String", "G": "Edm.Guid"}
+    assert c._tombstone_keys_from_id(
+        "Orders(OrderID=1,Lang='en''x')", ["OrderID", "Lang"], types
+    ) == {"OrderID": 1, "Lang": "en'x"}
+    assert c._tombstone_keys_from_id(
+        f"https://x/svc/Accounts({_GUID})?x=1", ["G"], types
+    ) == {"G": _GUID}
+    assert c._tombstone_keys_from_id("Customers('A,B')", ["Id"], {}) == {"Id": "A,B"}
+    assert c._tombstone_keys_from_id("Customers", ["Id"], {}) is None
+    assert c._tombstone_keys_from_id("Orders(OrderID=1)", ["OrderID", "Lang"], types) is None
+    assert c._tombstone_keys_from_id("Customers(7)", ["A", "B"], {}) is None
+
+
+@responses.activate
+def test_delta_next_link_410_falls_back_to_retained_delta_link():
+    """A 410 on the parked mid-pagination next_link must replay the retained
+    prior delta_link (changes-since window) — not re-bootstrap the whole
+    entity set."""
+    _mock_metadata()
+    next_link = f"{SERVICE_URL}Customers?$deltatoken=tok-1&$skiptoken=page2"
+    responses.add(responses.GET, next_link, status=410)
+    responses.add(
+        responses.GET,
+        DELTA_LINK_V1,
+        json={
+            "value": [{"Id": 9, "Name": "N", "ModifiedAt": "z"}],
+            "@odata.deltaLink": DELTA_LINK_V2,
+        },
+    )
+    c = _make()
+    records, offset = c.read_table(
+        "Customers",
+        {"next_link": next_link, "delta_link": DELTA_LINK_V1},
+        {"delta_tracking": "enabled"},
+    )
+    assert [r["Id"] for r in list(records)] == [9]
+    assert _drop_lb(offset) == {"delta_link": DELTA_LINK_V2}
+    # The plain entity-set bootstrap GET never happened.
+    assert not any(
+        call.request.url.rstrip("/").endswith("Customers") for call in responses.calls
+    )
+
+
+@responses.activate
+def test_delta_same_link_with_records_raises_no_progress():
+    """Change records + the SAME deltaLink as the prior batch would re-read
+    that change set forever — raise like the cursor paths do."""
+    _mock_metadata()
+    responses.add(
+        responses.GET,
+        DELTA_LINK_V1,
+        json={
+            "value": [{"Id": 4, "Name": "D", "ModifiedAt": "w"}],
+            "@odata.deltaLink": DELTA_LINK_V1,  # did not advance
+        },
+    )
+    c = _make()
+    with pytest.raises(RuntimeError, match="SAME @odata.deltaLink"):
+        records, _ = c.read_table(
+            "Customers", {"delta_link": DELTA_LINK_V1}, {"delta_tracking": "enabled"}
+        )
+        list(records)
+
+
+@responses.activate
+def test_partition_null_cursor_parents_allowed_on_batch_invocation():
+    """The null-cursor rejection is a STREAMING-fence hazard: the batch
+    invocation re-discovers unfenced every run, so null-cursor parents are
+    always visible and must keep working (round-28 guard was over-broad)."""
+    responses.get(f"{SERVICE_URL}$metadata", body=GUID_CURSOR_METADATA_XML, status=200)
+    responses.get(
+        f"{SERVICE_URL}Accounts",
+        json={
+            "value": [
+                {"AccountId": _GUID, "Name": "2020-06-01T00:00:00Z"},
+                {"AccountId": _GUID2, "Name": None},
+            ]
+        },
+        match_querystring=False,
+    )
+    c = _make()
+    parts = c.get_partitions(
+        "Accounts__Contacts",
+        {"cursor_field": "Name", "expand_contained": "false", "num_partitions": "2"},
+    )
+    assert parts and all("top_parent_rows" in p for p in parts)
+
+
+@responses.activate
+def test_select_omitting_pk_or_cursor_raises():
+    """A user select that strips the PK desyncs schema from
+    read_table_metadata's MERGE keys; one that strips the cursor_field
+    silently re-reads the whole table forever under coalesce. Both raise."""
+    _mock_metadata()
+    c = _make()
+    with pytest.raises(ValueError, match="primary-key"):
+        c.read_table(
+            "Customers",
+            {"cursor": "x"},
+            {"cursor_field": "ModifiedAt", "select": "Name,ModifiedAt"},
+        )
+    with pytest.raises(ValueError, match="cursor_field"):
+        c.read_table(
+            "Customers", {"cursor": "x"}, {"cursor_field": "ModifiedAt", "select": "Id,Name"}
+        )
+
+
+def test_connection_int_options_curated_validation():
+    """Connection-level numerics get the same curated validation as the
+    per-table numeric options — a negative max_retries previously made the
+    retry loops run zero iterations (UnboundLocalError on resp)."""
+    for key, bad in (
+        ("max_retries", "-1"),
+        ("timeout_seconds", "0"),
+        ("timeout_seconds", "abc"),
+        ("retry_max_delay_seconds", "-5"),
+    ):
+        with pytest.raises(ValueError, match=key):
+            ODataLakeflowConnect({"service_url": SERVICE_URL, key: bad})
