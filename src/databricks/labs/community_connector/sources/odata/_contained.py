@@ -595,6 +595,30 @@ def fk_column_name(segment: str, pk_name: str) -> str:
     return f"{segment}_{pk_name}"
 
 
+def validate_page_size(opts: dict) -> None:
+    """Reject a non-positive / non-numeric ``page_size`` with a curated error.
+
+    ``$top=0`` is the nasty case: it's a perfectly valid URL the server
+    answers with an empty page, which the client-driven drain reads as
+    exhaustion — every read of the table would silently emit zero rows. A
+    non-numeric value would ride into the URL raw and surface only as a
+    confusing server 400. Every other numeric table option raises a curated
+    error on garbage; ``page_size`` shouldn't be the silent one. Called from
+    ``read_table`` and the partition entry points (``is_partitioned`` /
+    ``get_partitions``), which don't route through ``read_table``."""
+    raw = opts.get("page_size")
+    if raw is None:
+        return
+    text = str(raw).strip()
+    if not text.isdigit() or int(text) < 1:
+        raise ValueError(
+            f"page_size={raw!r} is not a positive integer. page_size sets "
+            f"the per-request $top; use a value >= 1, or unset it for the "
+            f"default (1000 — or, under pagination=nextlink, no $top at "
+            f"all on snapshot reads)."
+        )
+
+
 def _ancestor_pk_order_by(ancestor_pks: list[str]) -> str:
     """Build a stable PK-only ``$orderby`` clause for ancestor key
     enumeration. OData v4 §11.2.5.7 (server-driven paging) doesn't

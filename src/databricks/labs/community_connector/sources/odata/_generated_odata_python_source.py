@@ -1217,6 +1217,30 @@ def register_lakeflow_source(spark):
         return f"{segment}_{pk_name}"
 
 
+    def validate_page_size(opts: dict) -> None:
+        """Reject a non-positive / non-numeric ``page_size`` with a curated error.
+
+        ``$top=0`` is the nasty case: it's a perfectly valid URL the server
+        answers with an empty page, which the client-driven drain reads as
+        exhaustion — every read of the table would silently emit zero rows. A
+        non-numeric value would ride into the URL raw and surface only as a
+        confusing server 400. Every other numeric table option raises a curated
+        error on garbage; ``page_size`` shouldn't be the silent one. Called from
+        ``read_table`` and the partition entry points (``is_partitioned`` /
+        ``get_partitions``), which don't route through ``read_table``."""
+        raw = opts.get("page_size")
+        if raw is None:
+            return
+        text = str(raw).strip()
+        if not text.isdigit() or int(text) < 1:
+            raise ValueError(
+                f"page_size={raw!r} is not a positive integer. page_size sets "
+                f"the per-request $top; use a value >= 1, or unset it for the "
+                f"default (1000 — or, under pagination=nextlink, no $top at "
+                f"all on snapshot reads)."
+            )
+
+
     def _ancestor_pk_order_by(ancestor_pks: list[str]) -> str:
         """Build a stable PK-only ``$orderby`` clause for ancestor key
         enumeration. OData v4 §11.2.5.7 (server-driven paging) doesn't
@@ -4932,6 +4956,9 @@ def register_lakeflow_source(spark):
             if parse_contained_path(table_name) is None:
                 return False
             opts = getattr(self, "options", {}) or {}
+            # Fail fast at stream setup: a partitionable table never routes
+            # through read_table, so its option validation must run here.
+            validate_page_size(opts)
             # Reset any per-table shared-cache verdict pinned non-``auto`` here too:
             # a partitionable table streams through the partition path (this →
             # get_partitions → read_partition), never read_table, so without this
@@ -5019,6 +5046,7 @@ def register_lakeflow_source(spark):
                 # Flat table — let the existing serial path handle it.
                 return [{}]
             opts = table_options or {}
+            validate_page_size(opts)
             # Reset any per-table shared-cache verdict pinned non-``auto`` on the
             # partition path too (called every microbatch for a partitioned stream,
             # which never reaches read_table's reset). Table-scoped + idempotent;
@@ -6143,6 +6171,7 @@ def register_lakeflow_source(spark):
                         "only changes how a leaf-owned cursor read is executed). Set "
                         "cursor_field or drop cursor_probe."
                     )
+            _validate_page_size(opts)
             if self._pagination != "nextlink":
                 opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
             if start_offset is None:
@@ -8858,6 +8887,7 @@ def register_lakeflow_source(spark):
     _odata_literal = odata_literal
     _parse_contained_path = parse_contained_path
     _resolve_segment_filters = resolve_segment_filters
+    _validate_page_size = validate_page_size
 
 
     ########################################################

@@ -2622,6 +2622,34 @@ def test_decimal_precision_scale_facets_honoured():
     assert types["BigId"] == DecimalType(38, 0)
 
 
+@responses.activate
+def test_page_size_rejects_non_positive_and_non_numeric():
+    """``page_size`` must be a positive integer. ``$top=0`` is a valid URL
+    the server answers with an empty page — the client-driven drain reads
+    that as exhaustion, so every read would silently emit ZERO rows; a
+    non-numeric value rides into the URL raw and surfaces only as a
+    confusing server 400. Reject both up front like every other numeric
+    table option."""
+    _mock_metadata()
+    c = _make()
+    for bad in ("0", "-5", "abc", "4.5"):
+        with pytest.raises(ValueError, match="positive integer"):
+            c.read_table("Customers", None, {"page_size": bad})
+
+
+@responses.activate
+def test_page_size_validated_on_partition_entry_points():
+    """A partitionable table streams through is_partitioned/get_partitions,
+    never read_table — its page_size validation must fire there too."""
+    _mock_nested_metadata()
+    c = _make({"page_size": "0"})  # is_partitioned reads self.options
+    with pytest.raises(ValueError, match="positive integer"):
+        c.is_partitioned("Parents__Children")
+    c2 = _make()
+    with pytest.raises(ValueError, match="positive integer"):
+        c2.get_partitions("Parents__Children", {"page_size": "abc"})
+
+
 # --- Path parsing / discovery ---
 
 

@@ -115,6 +115,7 @@ from databricks.labs.community_connector.sources.odata._contained import (
     odata_literal as _odata_literal,
     parse_contained_path as _parse_contained_path,
     resolve_segment_filters as _resolve_segment_filters,
+    validate_page_size as _validate_page_size,
 )
 from databricks.labs.community_connector.sources.odata._partition import (
     PartitionMixin,
@@ -969,6 +970,7 @@ class ODataLakeflowConnect(
                     "only changes how a leaf-owned cursor read is executed). Set "
                     "cursor_field or drop cursor_probe."
                 )
+        _validate_page_size(opts)
         if self._pagination != "nextlink":
             opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
         if start_offset is None:

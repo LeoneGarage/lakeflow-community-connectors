@@ -53,6 +53,7 @@ from databricks.labs.community_connector.sources.odata._contained import (
     combine_filters,
     parse_contained_path,
     resolve_segment_filters,
+    validate_page_size,
 )
 
 
@@ -91,6 +92,9 @@ class PartitionMixin(SupportsPartitionedStream):
         if parse_contained_path(table_name) is None:
             return False
         opts = getattr(self, "options", {}) or {}
+        # Fail fast at stream setup: a partitionable table never routes
+        # through read_table, so its option validation must run here.
+        validate_page_size(opts)
         # Reset any per-table shared-cache verdict pinned non-``auto`` here too:
         # a partitionable table streams through the partition path (this →
         # get_partitions → read_partition), never read_table, so without this
@@ -178,6 +182,7 @@ class PartitionMixin(SupportsPartitionedStream):
             # Flat table — let the existing serial path handle it.
             return [{}]
         opts = table_options or {}
+        validate_page_size(opts)
         # Reset any per-table shared-cache verdict pinned non-``auto`` on the
         # partition path too (called every microbatch for a partitioned stream,
         # which never reaches read_table's reset). Table-scoped + idempotent;
