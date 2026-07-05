@@ -199,6 +199,26 @@ def jsonify_complex_values(row: dict) -> dict:
     return row
 
 
+def pad_row_to_fields(row: dict, field_names) -> dict:
+    """Return ``row`` with an explicit ``None`` for every name in
+    ``field_names`` it doesn't already carry.
+
+    OData servers may legally omit null-valued properties from a JSON entity,
+    and the framework's row parser rejects a declared column that is *absent*
+    (even a nullable one is fine as an explicit ``None``, but a non-nullable
+    absent column raises and kills the batch). Padding to the declared schema
+    makes an omit-null response parse cleanly. Returns ``row`` unchanged (no
+    copy) when it's already complete — the common case — otherwise a new dict,
+    never mutating the caller's row (lookback re-emits the same object)."""
+    missing = [n for n in field_names if n not in row]
+    if not missing:
+        return row
+    padded = dict(row)
+    for name in missing:
+        padded[name] = None
+    return padded
+
+
 def parse_max_records(table_options: dict | None) -> int:
     """Parse the ``max_records_per_batch`` table option (default 10000) with
     curated validation. The cap counts EMITTED rows per batch, so ``0`` or a

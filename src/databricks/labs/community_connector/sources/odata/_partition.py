@@ -66,6 +66,7 @@ from databricks.labs.community_connector.sources.odata._helpers import (
     cursor_le as _cursor_le,
     jsonify_complex_values as _jsonify_complex_values,
     max_or as _max_or,
+    pad_row_to_fields,
 )
 
 
@@ -211,6 +212,12 @@ class PartitionMixin(SupportsPartitionedStream):
         opts = table_options or {}
         validate_page_size(opts)
         num_partitions = _parse_num_partitions(opts)
+        # Validate ``contained_fetch`` here too (not just ``is_partitioned``):
+        # the batch reader can reach ``get_partitions`` without a prior
+        # ``is_partitioned`` call, and a typo'd value should fail the same way
+        # on every partition entry point. Inert on the read itself (partition
+        # walks are always plain N+1), but consistency > silence.
+        self._contained_fetch_batch_size(opts)
         # Reset any per-table shared-cache verdict pinned non-``auto`` on the
         # partition path too (called every microbatch for a partitioned stream,
         # which never reaches read_table's reset). Table-scoped + idempotent;
@@ -338,10 +345,17 @@ class PartitionMixin(SupportsPartitionedStream):
             opts = {**opts, "page_size": opts.get("page_size", DEFAULT_PAGE_SIZE)}
         top_parent_rows = partition["top_parent_rows"]
         cursor_lower = partition.get("cursor_lower")
-        # Same emit-boundary JSON rendering of structured values as
-        # read_table (see _helpers.jsonify_complex_values).
+        # Same emit-boundary treatment as read_table: pad each row to the
+        # declared schema (so a server that omits a null-valued non-nullable
+        # property doesn't hard-fail the framework parser) then JSON-render
+        # structured values. ``get_table_schema`` is memoized.
+        field_names = tuple(f.name for f in self.get_table_schema(table_name, opts).fields)
+
+        def _emit(row):
+            return _jsonify_complex_values(pad_row_to_fields(row, field_names))
+
         return map(
-            _jsonify_complex_values,
+            _emit,
             self._iter_partition_rows(segments, opts, top_parent_rows, cursor_field, cursor_lower),
         )
 

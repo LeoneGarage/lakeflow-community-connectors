@@ -556,7 +556,9 @@ def test_incremental_first_call_has_no_cursor_filter():
         {"cursor_field": "ModifiedAt", "max_records_per_batch": "10"},
     )
     rows = list(records)
-    assert rows == [{"Id": 1, "ModifiedAt": "2024-03-01T00:00:00Z"}]
+    # ``Name`` is padded to None: the emit boundary fills declared columns the
+    # server omitted so a null-omitting response parses cleanly.
+    assert rows == [{"Id": 1, "Name": None, "ModifiedAt": "2024-03-01T00:00:00Z"}]
     assert _drop_lb(offset) == {"cursor": "2024-03-01T00:00:00Z"}
     # Neither `le` nor `gt` should appear on the FIRST call — no cursor
     # filter at all when resuming from an empty offset.
@@ -5280,6 +5282,7 @@ def test_contained_expand_truncates_at_page_boundary_queues_only_next_page():
     assert "cursor" not in offset
 
 
+@responses.activate
 def test_read_table_disables_cap_when_start_offset_none_and_cap_unset(caplog):
     """Spark's batch reader (``LakeflowBatchReader``) calls
     ``read_table`` with ``start_offset=None`` and discards the
@@ -8438,7 +8441,8 @@ def test_partition_empty_descriptor_falls_back_to_read_table():
     )
     c = _make()
     rows = list(c.read_partition("Customers", {}, {}))
-    assert rows == [{"Id": 1, "Name": "x"}]
+    # ``ModifiedAt`` padded to None (declared column the mock omitted).
+    assert rows == [{"Id": 1, "Name": "x", "ModifiedAt": None}]
 
 
 @responses.activate
@@ -14941,3 +14945,163 @@ def test_partitioned_contained_fetch_garbage_rejected():
     c = _make({"num_partitions": "2", "contained_fetch": "garbadge"})
     with pytest.raises(ValueError, match="contained_fetch"):
         c.is_partitioned("Parents__Children")
+
+
+# ---------------------------------------------------------------------------
+# Round-35 fixes: cross-host redirect credential guard, $batch error-body
+# re-issue, non-delta schema padding
+# ---------------------------------------------------------------------------
+
+
+@responses.activate
+def test_cross_host_redirect_refused_not_credential_leak():
+    """Round 34 guarded the @odata.nextLink vector but session.request
+    followed 3xx redirects internally with the credential attached — and
+    requests strips only Authorization cross-host, leaking api_key /
+    extra_headers. allow_redirects=False + the origin check now refuses an
+    off-host Location."""
+    _mock_metadata()
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        status=302,
+        headers={"Location": "https://evil.attacker.com/collect"},
+    )
+    captured = {}
+
+    def _evil(request):
+        captured["x-api-key"] = request.headers.get("x-api-key")
+        captured["X-Tenant"] = request.headers.get("X-Tenant")
+        return (200, {}, '{"value": []}')
+
+    responses.add_callback(responses.GET, "https://evil.attacker.com/collect", callback=_evil)
+    c = _make(
+        {
+            "auth_type": "api_key",
+            "api_key": "SECRET-APIKEY",
+            "extra_headers": "X-Tenant:SECRET-TENANT",
+        }
+    )
+    with pytest.raises(PermissionError, match="different origin"):
+        rows, _ = c.read_table("Customers", None, {"pagination": "nextlink"})
+        list(rows)
+    # The attacker host never received the request (never followed).
+    assert captured == {}
+    assert not any("evil.attacker.com" in call.request.url for call in responses.calls)
+
+
+@responses.activate
+def test_same_host_redirect_followed():
+    """A same-origin 3xx (server-side URL normalization) is still followed
+    manually so legitimate redirects keep working."""
+    _mock_metadata()
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        status=301,
+        headers={"Location": f"{SERVICE_URL}Customers/"},
+    )
+    responses.get(f"{SERVICE_URL}Customers/", json={"value": [{"Id": 1, "Name": "A"}]})
+    c = _make({"token": "t"})
+    rows, _ = c.read_table("Customers", None, {"pagination": "nextlink"})
+    assert [r["Id"] for r in list(rows)] == [1]
+
+
+@responses.activate
+def test_batch_subresponse_error_body_under_200_reissued():
+    """A 200-status $batch sub-response whose body is an OData error envelope
+    ({"error": {...}}, no "value") is a dict, so round 34's non-dict gate let
+    it through — draining to rows=[] and silently dropping that parent. It's
+    now re-issued as a plain GET."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}, {"Id": 2}]})
+
+    def _cb(request):
+        out = []
+        for r in json.loads(request.body)["requests"]:
+            if "Parents(1)/Children" in r["url"]:
+                out.append({"id": r["id"], "status": 200, "body": {"value": [{"Id": 11}]}})
+            elif "Parents(2)/Children" in r["url"]:
+                # 200 status but an error envelope body (spec-violating, but
+                # seen in the wild) — must not drain to [].
+                out.append({"id": r["id"], "status": 200, "body": {"error": {"message": "x"}}})
+            else:
+                out.append({"id": r["id"], "status": 200, "body": {"value": [{"Id": 1}]}})
+        return (200, {}, json.dumps({"responses": out}))
+
+    responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=_cb)
+    responses.get(
+        f"{SERVICE_URL}Parents(2)/Children",
+        json={"value": [{"Id": 22}]},
+        match_querystring=False,
+    )
+    c = _make()
+    recs, _ = c.read_table("Parents__Kids" if False else "Parents__Children", {}, {"expand_contained": "false"})
+    ids = sorted(r["Id"] for r in recs)
+    assert ids == [11, 22]  # parent 2 recovered via plain GET, not dropped
+
+
+@responses.activate
+def test_batch_empty_collection_dict_body_not_reissued():
+    """A genuine empty-collection 200 ({"value": []}) is a drainable dict and
+    must NOT be re-issued — only error/non-dict bodies are."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}, {"Id": 2}]})
+
+    def _cb(request):
+        out = []
+        for r in json.loads(request.body)["requests"]:
+            if "Parents(1)/Children" in r["url"]:
+                out.append({"id": r["id"], "status": 200, "body": {"value": [{"Id": 11}]}})
+            elif "Parents(2)/Children" in r["url"]:
+                out.append({"id": r["id"], "status": 200, "body": {"value": []}})
+            else:
+                out.append({"id": r["id"], "status": 200, "body": {"value": [{"Id": 1}]}})
+        return (200, {}, json.dumps({"responses": out}))
+
+    responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=_cb)
+    c = _make()
+    recs, _ = c.read_table("Parents__Children", {}, {"expand_contained": "false"})
+    assert sorted(r["Id"] for r in recs) == [11]
+    # No plain-GET re-issue happened for parent 2 (empty is legit).
+    assert not any(
+        call.request.method == "GET" and "Parents(2)/Children" in call.request.url
+        for call in responses.calls
+    )
+
+
+NONNULL_FLAT_METADATA_XML = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="N" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Item">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="Req" Type="Edm.String" Nullable="false"/>
+        <Property Name="Opt" Type="Edm.String"/>
+      </EntityType>
+      <EntityContainer Name="C"><EntitySet Name="Items" EntityType="N.Item"/></EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+
+@responses.activate
+def test_non_delta_read_pads_omitted_nonnullable_property():
+    """A non-delta read no longer hard-fails when the server omits a
+    Nullable="false" property (OData servers may omit null-valued
+    properties) — the emit boundary pads it to explicit None, which
+    parse_value accepts, so the row flows instead of killing the batch."""
+    from databricks.labs.community_connector.libs.utils import parse_value
+
+    responses.get(f"{SERVICE_URL}$metadata", body=NONNULL_FLAT_METADATA_XML, status=200)
+    responses.get(f"{SERVICE_URL}Items", json={"value": [{"Id": 2, "Opt": "y"}]})  # Req omitted
+    c = _make({"token": "t"})
+    schema = c.get_table_schema("Items", {})
+    rows, _ = c.read_table("Items", None, {"pagination": "nextlink"})
+    (row,) = list(rows)
+    assert row["Req"] is None and row["Opt"] == "y"
+    # And the padded row parses against the (non-nullable Req) schema.
+    parsed = parse_value(row, schema)
+    assert parsed["Id"] == 2 and parsed["Req"] is None

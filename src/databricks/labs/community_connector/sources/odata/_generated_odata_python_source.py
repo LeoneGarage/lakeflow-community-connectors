@@ -801,6 +801,26 @@ def register_lakeflow_source(spark):
         return row
 
 
+    def pad_row_to_fields(row: dict, field_names) -> dict:
+        """Return ``row`` with an explicit ``None`` for every name in
+        ``field_names`` it doesn't already carry.
+
+        OData servers may legally omit null-valued properties from a JSON entity,
+        and the framework's row parser rejects a declared column that is *absent*
+        (even a nullable one is fine as an explicit ``None``, but a non-nullable
+        absent column raises and kills the batch). Padding to the declared schema
+        makes an omit-null response parse cleanly. Returns ``row`` unchanged (no
+        copy) when it's already complete — the common case — otherwise a new dict,
+        never mutating the caller's row (lookback re-emits the same object)."""
+        missing = [n for n in field_names if n not in row]
+        if not missing:
+            return row
+        padded = dict(row)
+        for name in missing:
+            padded[name] = None
+        return padded
+
+
     def parse_max_records(table_options: dict | None) -> int:
         """Parse the ``max_records_per_batch`` table option (default 10000) with
         curated validation. The cap counts EMITTED rows per batch, so ``0`` or a
@@ -1487,7 +1507,13 @@ def register_lakeflow_source(spark):
         a lower cursor would sort "before" the park and be skipped unwalked —
         permanent subtree loss on a completely stable source). Values stay RAW
         (the server's rendered text); all ordering happens in
-        :func:`_chain_strictly_before` via the chronological comparators."""
+        :func:`_chain_strictly_before` via the chronological comparators.
+
+        MUST return a ``list`` (not a tuple): this key is parked in the resume
+        offset and JSON round-trips to a list, so the resume-skip equality
+        (``chain == parked_chain``) only holds if the freshly-built key is also a
+        list. A tuple would silently defeat the skip (harmless — the walk just
+        reprocesses the parked boundary, duplicate-safe — but slower)."""
         key: list = []
         for idx, level_keys in enumerate(chain):
             if ancestor_cursor is not _NO_ANCESTOR_CURSOR and idx == cursor_level:
@@ -3165,14 +3191,19 @@ def register_lakeflow_source(spark):
                 bad_status = status is None or int(status) >= 400
             except (TypeError, ValueError):
                 bad_status = True
-            # A <400 sub-response whose body isn't a JSON object can't be drained
-            # (the loops read ``body.get("value")``) — re-fetch it as a plain GET
-            # so ``_fetch_page_payload`` parses it properly rather than dropping
-            # the parent. An empty-collection 200 legitimately carries
-            # ``{"value": []}`` (a dict), so this only re-issues genuine
-            # non-object bodies.
-            non_dict_body = isinstance(resp, dict) and not isinstance(resp.get("body"), dict)
-            if not bad_status and not non_dict_body:
+            body = resp.get("body") if isinstance(resp, dict) else None
+            # A <400 sub-response the drains can't read is re-fetched as a plain
+            # GET (so ``_fetch_page_payload`` parses it properly) rather than
+            # dropping the parent. Two undrainable shapes:
+            #   * body isn't a JSON object (a string — the JSON-batch spec's form
+            #     for non-JSON media — or absent): ``body.get("value")`` is N/A.
+            #   * body is a dict carrying an OData ``error`` envelope but no
+            #     ``value``: a spec-violating "success status, error body" reply
+            #     drains to ``rows = []`` and the cursor walk advances past it.
+            # An empty-collection 200 legitimately carries ``{"value": []}`` (a
+            # dict WITH ``value``), so it passes through untouched.
+            undrainable_body = not isinstance(body, dict) or ("value" not in body and "error" in body)
+            if not bad_status and not undrainable_body:
                 return resp
             _LOG.warning(
                 "OData $batch sub-response for %r unusable (status %r, "
@@ -3180,7 +3211,7 @@ def register_lakeflow_source(spark):
                 "silently skipped.",
                 req_url,
                 status,
-                type(resp.get("body")).__name__ if isinstance(resp, dict) else "n/a",
+                type(body).__name__,
             )
             return self._get_as_batch_response(req_url, edm_types)
 
@@ -4088,6 +4119,10 @@ def register_lakeflow_source(spark):
                 # PK-only elsewhere) — the churn-stable within-page identity.
                 # ``pks_per_level`` covers ancestor levels only; leaf-level
                 # pages (inner continuations) use the leaf's own PKs.
+                # MUST return a ``list``: parked as ``boundary`` in the offset and
+                # compared (``row_key == boundary``) after a JSON round-trip that
+                # makes it a list — a tuple would silently break the resume-skip
+                # (duplicate-safe, never loss, just re-work).
                 key: list = []
                 if cur_field is not None and level == cur_level:
                     key.append(row.get(cur_field))
@@ -6199,6 +6234,12 @@ def register_lakeflow_source(spark):
             opts = table_options or {}
             validate_page_size(opts)
             num_partitions = _parse_num_partitions(opts)
+            # Validate ``contained_fetch`` here too (not just ``is_partitioned``):
+            # the batch reader can reach ``get_partitions`` without a prior
+            # ``is_partitioned`` call, and a typo'd value should fail the same way
+            # on every partition entry point. Inert on the read itself (partition
+            # walks are always plain N+1), but consistency > silence.
+            self._contained_fetch_batch_size(opts)
             # Reset any per-table shared-cache verdict pinned non-``auto`` on the
             # partition path too (called every microbatch for a partitioned stream,
             # which never reaches read_table's reset). Table-scoped + idempotent;
@@ -6326,10 +6367,17 @@ def register_lakeflow_source(spark):
                 opts = {**opts, "page_size": opts.get("page_size", DEFAULT_PAGE_SIZE)}
             top_parent_rows = partition["top_parent_rows"]
             cursor_lower = partition.get("cursor_lower")
-            # Same emit-boundary JSON rendering of structured values as
-            # read_table (see _helpers.jsonify_complex_values).
+            # Same emit-boundary treatment as read_table: pad each row to the
+            # declared schema (so a server that omits a null-valued non-nullable
+            # property doesn't hard-fail the framework parser) then JSON-render
+            # structured values. ``get_table_schema`` is memoized.
+            field_names = tuple(f.name for f in self.get_table_schema(table_name, opts).fields)
+
+            def _emit(row):
+                return _jsonify_complex_values(pad_row_to_fields(row, field_names))
+
             return map(
-                _jsonify_complex_values,
+                _emit,
                 self._iter_partition_rows(segments, opts, top_parent_rows, cursor_field, cursor_lower),
             )
 
@@ -6931,6 +6979,10 @@ def register_lakeflow_source(spark):
     # 500/502/504 fall back to pure exponential backoff (Retry-After is
     # rarely emitted on those, and we shouldn't trust it if it is).
     _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+    # Cap on manually-followed same-origin redirects per request (redirect-loop
+    # guard). Off-origin redirects never count — they raise immediately.
+    _MAX_SAME_ORIGIN_REDIRECTS = 5
 
     # Module logger. Always-on:
     #   * WARNING — every retry (network/429/503/JSON decode), so an
@@ -7759,9 +7811,24 @@ def register_lakeflow_source(spark):
             an unparseable Python repr). List results stay lists (tests and any
             len()-callers rely on that); iterators stay lazy."""
             records, offset = self._read_table_dispatch(table_name, start_offset, table_options)
+            # Declared column names for this read (respects ``select`` / streams /
+            # ancestor-FK exclusions and the delta synthetics). Emitted rows are
+            # padded to it with explicit ``None`` for any absent column: the
+            # framework parser rejects an ABSENT non-nullable column but accepts
+            # an explicit null, and a server may legally omit null-valued
+            # properties from the JSON — without the pad the first such row would
+            # hard-fail the whole batch with a cryptic framework error (the delta
+            # path already pads tombstones for the same reason; this extends it to
+            # every read shape). ``get_table_schema`` is memoized, so this is a
+            # dict lookup after the first call.
+            field_names = tuple(f.name for f in self.get_table_schema(table_name, table_options).fields)
+
+            def _emit(row: dict) -> dict:
+                return _jsonify_complex_values(_pad_row_to_fields(row, field_names))
+
             if isinstance(records, list):
-                return [_jsonify_complex_values(r) for r in records], offset
-            return map(_jsonify_complex_values, records), offset
+                return [_emit(r) for r in records], offset
+            return map(_emit, records), offset
 
         def _read_table_dispatch(
             self, table_name: str, start_offset: dict, table_options: dict[str, str]
@@ -9747,6 +9814,37 @@ def register_lakeflow_source(spark):
                     f"this connector does not support it."
                 )
 
+        def _request_same_origin(
+            self, session: requests.Session, method: str, url: str, **kwargs: Any
+        ) -> requests.Response:
+            """Issue one request with ``allow_redirects=False`` and manually
+            follow only SAME-ORIGIN 3xx redirects (bounded), raising on the first
+            off-origin ``Location``.
+
+            ``requests``' auto-redirect would follow a cross-host ``Location``
+            with the session's credentials attached — and its ``rebuild_auth``
+            strips only ``Authorization``, leaving ``api_key`` / ``extra_headers``
+            exposed to the redirect target. The connector never needs
+            auto-redirect (every next URL is built explicitly from
+            ``@odata.nextLink``); same-origin redirects (server-side URL
+            normalization) are still followed here so a trailing-slash / case 301
+            keeps working."""
+            for _ in range(_MAX_SAME_ORIGIN_REDIRECTS + 1):
+                resp = session.request(
+                    method, url, timeout=self.timeout, allow_redirects=False, **kwargs
+                )
+                self._log_http_response(method, url, resp)
+                if not resp.is_redirect:
+                    return resp
+                target = urljoin(url, resp.headers.get("Location", ""))
+                self._require_same_origin(target)  # off-origin → PermissionError
+                url = target
+                self._log_http_request(method, url)
+            raise RuntimeError(
+                f"OData request exceeded {_MAX_SAME_ORIGIN_REDIRECTS} same-origin "
+                f"redirects starting from {url!r} — likely a redirect loop."
+            )
+
         def _http_get_once(
             self, session: requests.Session, url: str, method: str = "GET", **kwargs: Any
         ) -> requests.Response:
@@ -9755,13 +9853,11 @@ def register_lakeflow_source(spark):
             if self._should_preemptively_refresh():
                 session.headers["Authorization"] = f"Bearer {self._oauth2_token()}"
             self._log_http_request(method, url)
-            resp = session.request(method, url, timeout=self.timeout, **kwargs)
-            self._log_http_response(method, url, resp)
+            resp = self._request_same_origin(session, method, url, **kwargs)
             if resp.status_code == 401 and self._has_oauth_refresh_path():
                 session.headers["Authorization"] = f"Bearer {self._oauth2_token()}"
                 self._log_http_request(method, url)
-                resp = session.request(method, url, timeout=self.timeout, **kwargs)
-                self._log_http_response(method, url, resp)
+                resp = self._request_same_origin(session, method, url, **kwargs)
                 if resp.status_code == 401:
                     # We just minted a token straight from the OAuth provider
                     # and the source still rejected it — the access token isn't
@@ -10086,6 +10182,12 @@ def register_lakeflow_source(spark):
                         token_url,
                         data=data,
                         timeout=self.timeout,
+                        # No auto-redirect: a 3xx from the token endpoint would
+                        # otherwise re-POST the ``client_secret`` body to the
+                        # redirect target (``requests`` re-sends the body on a
+                        # 307/308). The token URL is operator-configured, so a
+                        # redirect here is unexpected — surface it, don't follow.
+                        allow_redirects=False,
                     )
                 except _TRANSIENT_NETWORK_ERRORS as exc:
                     if attempt >= self.max_retries:
@@ -11226,6 +11328,7 @@ def register_lakeflow_source(spark):
     _cursor_max = cursor_max
     _jsonify_complex_values = jsonify_complex_values
     _max_or = max_or
+    _pad_row_to_fields = pad_row_to_fields
     _parse_iso8601 = parse_iso8601
     _parse_max_records = parse_max_records
     _trim_to_distinct_cursor_boundary = trim_to_distinct_cursor_boundary

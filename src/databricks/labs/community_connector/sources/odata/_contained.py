@@ -695,7 +695,13 @@ def _chain_resume_key(
     a lower cursor would sort "before" the park and be skipped unwalked —
     permanent subtree loss on a completely stable source). Values stay RAW
     (the server's rendered text); all ordering happens in
-    :func:`_chain_strictly_before` via the chronological comparators."""
+    :func:`_chain_strictly_before` via the chronological comparators.
+
+    MUST return a ``list`` (not a tuple): this key is parked in the resume
+    offset and JSON round-trips to a list, so the resume-skip equality
+    (``chain == parked_chain``) only holds if the freshly-built key is also a
+    list. A tuple would silently defeat the skip (harmless — the walk just
+    reprocesses the parked boundary, duplicate-safe — but slower)."""
     key: list = []
     for idx, level_keys in enumerate(chain):
         if ancestor_cursor is not _NO_ANCESTOR_CURSOR and idx == cursor_level:
@@ -2373,14 +2379,19 @@ class ContainedNavMixin:
             bad_status = status is None or int(status) >= 400
         except (TypeError, ValueError):
             bad_status = True
-        # A <400 sub-response whose body isn't a JSON object can't be drained
-        # (the loops read ``body.get("value")``) — re-fetch it as a plain GET
-        # so ``_fetch_page_payload`` parses it properly rather than dropping
-        # the parent. An empty-collection 200 legitimately carries
-        # ``{"value": []}`` (a dict), so this only re-issues genuine
-        # non-object bodies.
-        non_dict_body = isinstance(resp, dict) and not isinstance(resp.get("body"), dict)
-        if not bad_status and not non_dict_body:
+        body = resp.get("body") if isinstance(resp, dict) else None
+        # A <400 sub-response the drains can't read is re-fetched as a plain
+        # GET (so ``_fetch_page_payload`` parses it properly) rather than
+        # dropping the parent. Two undrainable shapes:
+        #   * body isn't a JSON object (a string — the JSON-batch spec's form
+        #     for non-JSON media — or absent): ``body.get("value")`` is N/A.
+        #   * body is a dict carrying an OData ``error`` envelope but no
+        #     ``value``: a spec-violating "success status, error body" reply
+        #     drains to ``rows = []`` and the cursor walk advances past it.
+        # An empty-collection 200 legitimately carries ``{"value": []}`` (a
+        # dict WITH ``value``), so it passes through untouched.
+        undrainable_body = not isinstance(body, dict) or ("value" not in body and "error" in body)
+        if not bad_status and not undrainable_body:
             return resp
         _LOG.warning(
             "OData $batch sub-response for %r unusable (status %r, "
@@ -2388,7 +2399,7 @@ class ContainedNavMixin:
             "silently skipped.",
             req_url,
             status,
-            type(resp.get("body")).__name__ if isinstance(resp, dict) else "n/a",
+            type(body).__name__,
         )
         return self._get_as_batch_response(req_url, edm_types)
 
@@ -3296,6 +3307,10 @@ class ContainedNavMixin:
             # PK-only elsewhere) — the churn-stable within-page identity.
             # ``pks_per_level`` covers ancestor levels only; leaf-level
             # pages (inner continuations) use the leaf's own PKs.
+            # MUST return a ``list``: parked as ``boundary`` in the offset and
+            # compared (``row_key == boundary``) after a JSON round-trip that
+            # makes it a list — a tuple would silently break the resume-skip
+            # (duplicate-safe, never loss, just re-work).
             key: list = []
             if cur_field is not None and level == cur_level:
                 key.append(row.get(cur_field))

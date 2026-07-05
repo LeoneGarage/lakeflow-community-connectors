@@ -91,6 +91,7 @@ from databricks.labs.community_connector.sources.odata._helpers import (
     cursor_max as _cursor_max,
     jsonify_complex_values as _jsonify_complex_values,
     max_or as _max_or,
+    pad_row_to_fields as _pad_row_to_fields,
     parse_iso8601 as _parse_iso8601,
     parse_max_records as _parse_max_records,
     trim_to_distinct_cursor_boundary as _trim_to_distinct_cursor_boundary,
@@ -418,6 +419,10 @@ _TRANSIENT_NETWORK_ERRORS = (
 # 500/502/504 fall back to pure exponential backoff (Retry-After is
 # rarely emitted on those, and we shouldn't trust it if it is).
 _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+# Cap on manually-followed same-origin redirects per request (redirect-loop
+# guard). Off-origin redirects never count — they raise immediately.
+_MAX_SAME_ORIGIN_REDIRECTS = 5
 
 # Module logger. Always-on:
 #   * WARNING — every retry (network/429/503/JSON decode), so an
@@ -1246,9 +1251,24 @@ class ODataLakeflowConnect(
         an unparseable Python repr). List results stay lists (tests and any
         len()-callers rely on that); iterators stay lazy."""
         records, offset = self._read_table_dispatch(table_name, start_offset, table_options)
+        # Declared column names for this read (respects ``select`` / streams /
+        # ancestor-FK exclusions and the delta synthetics). Emitted rows are
+        # padded to it with explicit ``None`` for any absent column: the
+        # framework parser rejects an ABSENT non-nullable column but accepts
+        # an explicit null, and a server may legally omit null-valued
+        # properties from the JSON — without the pad the first such row would
+        # hard-fail the whole batch with a cryptic framework error (the delta
+        # path already pads tombstones for the same reason; this extends it to
+        # every read shape). ``get_table_schema`` is memoized, so this is a
+        # dict lookup after the first call.
+        field_names = tuple(f.name for f in self.get_table_schema(table_name, table_options).fields)
+
+        def _emit(row: dict) -> dict:
+            return _jsonify_complex_values(_pad_row_to_fields(row, field_names))
+
         if isinstance(records, list):
-            return [_jsonify_complex_values(r) for r in records], offset
-        return map(_jsonify_complex_values, records), offset
+            return [_emit(r) for r in records], offset
+        return map(_emit, records), offset
 
     def _read_table_dispatch(
         self, table_name: str, start_offset: dict, table_options: dict[str, str]
@@ -3234,6 +3254,37 @@ class ODataLakeflowConnect(
                 f"this connector does not support it."
             )
 
+    def _request_same_origin(
+        self, session: requests.Session, method: str, url: str, **kwargs: Any
+    ) -> requests.Response:
+        """Issue one request with ``allow_redirects=False`` and manually
+        follow only SAME-ORIGIN 3xx redirects (bounded), raising on the first
+        off-origin ``Location``.
+
+        ``requests``' auto-redirect would follow a cross-host ``Location``
+        with the session's credentials attached — and its ``rebuild_auth``
+        strips only ``Authorization``, leaving ``api_key`` / ``extra_headers``
+        exposed to the redirect target. The connector never needs
+        auto-redirect (every next URL is built explicitly from
+        ``@odata.nextLink``); same-origin redirects (server-side URL
+        normalization) are still followed here so a trailing-slash / case 301
+        keeps working."""
+        for _ in range(_MAX_SAME_ORIGIN_REDIRECTS + 1):
+            resp = session.request(
+                method, url, timeout=self.timeout, allow_redirects=False, **kwargs
+            )
+            self._log_http_response(method, url, resp)
+            if not resp.is_redirect:
+                return resp
+            target = urljoin(url, resp.headers.get("Location", ""))
+            self._require_same_origin(target)  # off-origin → PermissionError
+            url = target
+            self._log_http_request(method, url)
+        raise RuntimeError(
+            f"OData request exceeded {_MAX_SAME_ORIGIN_REDIRECTS} same-origin "
+            f"redirects starting from {url!r} — likely a redirect loop."
+        )
+
     def _http_get_once(
         self, session: requests.Session, url: str, method: str = "GET", **kwargs: Any
     ) -> requests.Response:
@@ -3242,13 +3293,11 @@ class ODataLakeflowConnect(
         if self._should_preemptively_refresh():
             session.headers["Authorization"] = f"Bearer {self._oauth2_token()}"
         self._log_http_request(method, url)
-        resp = session.request(method, url, timeout=self.timeout, **kwargs)
-        self._log_http_response(method, url, resp)
+        resp = self._request_same_origin(session, method, url, **kwargs)
         if resp.status_code == 401 and self._has_oauth_refresh_path():
             session.headers["Authorization"] = f"Bearer {self._oauth2_token()}"
             self._log_http_request(method, url)
-            resp = session.request(method, url, timeout=self.timeout, **kwargs)
-            self._log_http_response(method, url, resp)
+            resp = self._request_same_origin(session, method, url, **kwargs)
             if resp.status_code == 401:
                 # We just minted a token straight from the OAuth provider
                 # and the source still rejected it — the access token isn't
@@ -3573,6 +3622,12 @@ class ODataLakeflowConnect(
                     token_url,
                     data=data,
                     timeout=self.timeout,
+                    # No auto-redirect: a 3xx from the token endpoint would
+                    # otherwise re-POST the ``client_secret`` body to the
+                    # redirect target (``requests`` re-sends the body on a
+                    # 307/308). The token URL is operator-configured, so a
+                    # redirect here is unexpected — surface it, don't follow.
+                    allow_redirects=False,
                 )
             except _TRANSIENT_NETWORK_ERRORS as exc:
                 if attempt >= self.max_retries:
