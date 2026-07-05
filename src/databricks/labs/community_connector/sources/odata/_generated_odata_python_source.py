@@ -3149,24 +3149,38 @@ def register_lakeflow_source(spark):
             changed rows, so ``cursor gt since`` never re-reads them — permanent
             loss.
 
-            A sub-response with a < 400 status passes through untouched. Anything
-            else (an error status, or a shape that isn't a sub-response dict at
-            all) is re-issued as a plain GET via :meth:`_get_as_batch_response`:
-            a transient failure (429/5xx) recovers through ``_http_get``'s
-            retry/backoff/token-refresh path, and a hard 4xx raises out of the
-            read with the server's actual error body — never a silent skip."""
+            A sub-response with a < 400 status AND a dict ``body`` passes through
+            untouched. Anything else — an error status, a shape that isn't a
+            sub-response dict, OR a 2xx whose ``body`` is a string/absent (the
+            JSON-batch spec lets a server serialize a sub-response body as a
+            JSON *string* for non-JSON media; the drains take ``rows = []`` for
+            a non-dict body, so that parent's whole collection would vanish and
+            the cursor walk would advance past it) — is re-issued as a plain GET
+            via :meth:`_get_as_batch_response`: a transient failure (429/5xx)
+            recovers through ``_http_get``'s retry/backoff/token-refresh path,
+            and a hard 4xx raises out of the read with the server's actual error
+            body — never a silent skip."""
             status = resp.get("status") if isinstance(resp, dict) else None
             try:
-                failed = status is None or int(status) >= 400
+                bad_status = status is None or int(status) >= 400
             except (TypeError, ValueError):
-                failed = True
-            if not failed:
+                bad_status = True
+            # A <400 sub-response whose body isn't a JSON object can't be drained
+            # (the loops read ``body.get("value")``) — re-fetch it as a plain GET
+            # so ``_fetch_page_payload`` parses it properly rather than dropping
+            # the parent. An empty-collection 200 legitimately carries
+            # ``{"value": []}`` (a dict), so this only re-issues genuine
+            # non-object bodies.
+            non_dict_body = isinstance(resp, dict) and not isinstance(resp.get("body"), dict)
+            if not bad_status and not non_dict_body:
                 return resp
             _LOG.warning(
-                "OData $batch sub-response for %r came back with status %r; "
-                "re-issuing as a plain GET so the rows aren't silently skipped.",
+                "OData $batch sub-response for %r unusable (status %r, "
+                "body type %s); re-issuing as a plain GET so the rows aren't "
+                "silently skipped.",
                 req_url,
                 status,
+                type(resp.get("body")).__name__ if isinstance(resp, dict) else "n/a",
             )
             return self._get_as_batch_response(req_url, edm_types)
 
@@ -6079,9 +6093,14 @@ def register_lakeflow_source(spark):
                 return False
             opts = getattr(self, "options", {}) or {}
             # Fail fast at stream setup: a partitionable table never routes
-            # through read_table, so its option validation must run here.
+            # through read_table, so its option validation must run here. This
+            # includes ``contained_fetch`` — it has no other parse on the
+            # partition path (``expand_contained`` is parsed just below), so a
+            # typo'd value would otherwise be silently accepted, the one enum
+            # still silent where the round-33 dispatch fix made the rest loud.
             validate_page_size(opts)
             _parse_num_partitions(opts)
+            self._contained_fetch_batch_size(opts)
             # Reset any per-table shared-cache verdict pinned non-``auto`` here too:
             # a partitionable table streams through the partition path (this →
             # get_partitions → read_partition), never read_table, so without this
@@ -6928,6 +6947,17 @@ def register_lakeflow_source(spark):
     _LOG = logging.getLogger(__name__)
 
 
+    def _url_origin(url: str) -> tuple[str, str, int | None]:
+        """``(scheme, host, port)`` for same-origin comparison, host lower-cased
+        and the default port for the scheme filled in so ``https://h`` and
+        ``https://h:443`` compare equal."""
+        p = urlparse(url)
+        scheme = (p.scheme or "").lower()
+        host = (p.hostname or "").lower()
+        port = p.port if p.port is not None else {"http": 80, "https": 443}.get(scheme)
+        return (scheme, host, port)
+
+
     def _cache_owner_tag() -> str:
         """Per-user tag baked into every tempdir cache filename. The system
         tempdir is world-writable on multi-user hosts and both cache paths are
@@ -7503,6 +7533,12 @@ def register_lakeflow_source(spark):
             super().__init__(options)
             self.service_url = _require(options, "service_url")
             parsed_root = urlparse(self.service_url)
+            # (scheme, host, port) the credential-bearing session may talk to.
+            # Every request URL — including server-supplied ``@odata.nextLink``s
+            # — is checked against this before the auth-carrying session sends
+            # it, so a malicious/compromised source (or a MITM injecting one
+            # nextLink field) can't redirect the Authorization header off-origin.
+            self._service_origin = _url_origin(self.service_url)
             if parsed_root.username or parsed_root.password:
                 # The URL is echoed verbatim in logs (verbose_http_logging,
                 # every retry/no-progress warning) and in error messages —
@@ -9686,10 +9722,36 @@ def register_lakeflow_source(spark):
             capped = min(float(2**attempt), float(self.retry_max_delay_seconds))
             return capped * random.uniform(0.5, 1.0)
 
+        def _require_same_origin(self, url: str) -> None:
+            """Refuse to send the credential-bearing session off the
+            ``service_url`` origin. Every request funnels through here, so a
+            server-supplied ``@odata.nextLink`` (or any other URL the connector
+            follows) pointing at a different scheme/host/port raises instead of
+            leaking the ``Authorization`` header (or ``session.auth`` /
+            api-key header) to that host — the protection ``requests`` applies
+            to cross-host *redirects* (``rebuild_auth``) doesn't engage when
+            the connector builds the next request directly."""
+            origin = _url_origin(url)
+            if origin != self._service_origin:
+                raise PermissionError(
+                    f"OData connector refused to follow a URL to a different "
+                    f"origin than 'service_url'. The credentialed session may "
+                    f"only talk to {self._service_origin[0]}://"
+                    f"{self._service_origin[1]}"
+                    f"{'' if self._service_origin[2] is None else ':' + str(self._service_origin[2])}"
+                    f", but was asked to reach {origin[0]}://{origin[1]}"
+                    f"{'' if origin[2] is None else ':' + str(origin[2])} "
+                    f"(likely a server-supplied @odata.nextLink pointing off-host). "
+                    f"Following it would send the Authorization header to that "
+                    f"host. If the service legitimately paginates across hosts, "
+                    f"this connector does not support it."
+                )
+
         def _http_get_once(
             self, session: requests.Session, url: str, method: str = "GET", **kwargs: Any
         ) -> requests.Response:
             """One auth-aware request attempt; throttle handling lives in `_http_get`."""
+            self._require_same_origin(url)
             if self._should_preemptively_refresh():
                 session.headers["Authorization"] = f"Bearer {self._oauth2_token()}"
             self._log_http_request(method, url)

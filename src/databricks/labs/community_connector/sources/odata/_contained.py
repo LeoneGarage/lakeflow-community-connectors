@@ -2357,24 +2357,38 @@ class ContainedNavMixin:
         changed rows, so ``cursor gt since`` never re-reads them — permanent
         loss.
 
-        A sub-response with a < 400 status passes through untouched. Anything
-        else (an error status, or a shape that isn't a sub-response dict at
-        all) is re-issued as a plain GET via :meth:`_get_as_batch_response`:
-        a transient failure (429/5xx) recovers through ``_http_get``'s
-        retry/backoff/token-refresh path, and a hard 4xx raises out of the
-        read with the server's actual error body — never a silent skip."""
+        A sub-response with a < 400 status AND a dict ``body`` passes through
+        untouched. Anything else — an error status, a shape that isn't a
+        sub-response dict, OR a 2xx whose ``body`` is a string/absent (the
+        JSON-batch spec lets a server serialize a sub-response body as a
+        JSON *string* for non-JSON media; the drains take ``rows = []`` for
+        a non-dict body, so that parent's whole collection would vanish and
+        the cursor walk would advance past it) — is re-issued as a plain GET
+        via :meth:`_get_as_batch_response`: a transient failure (429/5xx)
+        recovers through ``_http_get``'s retry/backoff/token-refresh path,
+        and a hard 4xx raises out of the read with the server's actual error
+        body — never a silent skip."""
         status = resp.get("status") if isinstance(resp, dict) else None
         try:
-            failed = status is None or int(status) >= 400
+            bad_status = status is None or int(status) >= 400
         except (TypeError, ValueError):
-            failed = True
-        if not failed:
+            bad_status = True
+        # A <400 sub-response whose body isn't a JSON object can't be drained
+        # (the loops read ``body.get("value")``) — re-fetch it as a plain GET
+        # so ``_fetch_page_payload`` parses it properly rather than dropping
+        # the parent. An empty-collection 200 legitimately carries
+        # ``{"value": []}`` (a dict), so this only re-issues genuine
+        # non-object bodies.
+        non_dict_body = isinstance(resp, dict) and not isinstance(resp.get("body"), dict)
+        if not bad_status and not non_dict_body:
             return resp
         _LOG.warning(
-            "OData $batch sub-response for %r came back with status %r; "
-            "re-issuing as a plain GET so the rows aren't silently skipped.",
+            "OData $batch sub-response for %r unusable (status %r, "
+            "body type %s); re-issuing as a plain GET so the rows aren't "
+            "silently skipped.",
             req_url,
             status,
+            type(resp.get("body")).__name__ if isinstance(resp, dict) else "n/a",
         )
         return self._get_as_batch_response(req_url, edm_types)
 

@@ -434,6 +434,17 @@ _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 _LOG = logging.getLogger(__name__)
 
 
+def _url_origin(url: str) -> tuple[str, str, int | None]:
+    """``(scheme, host, port)`` for same-origin comparison, host lower-cased
+    and the default port for the scheme filled in so ``https://h`` and
+    ``https://h:443`` compare equal."""
+    p = urlparse(url)
+    scheme = (p.scheme or "").lower()
+    host = (p.hostname or "").lower()
+    port = p.port if p.port is not None else {"http": 80, "https": 443}.get(scheme)
+    return (scheme, host, port)
+
+
 def _cache_owner_tag() -> str:
     """Per-user tag baked into every tempdir cache filename. The system
     tempdir is world-writable on multi-user hosts and both cache paths are
@@ -1009,6 +1020,12 @@ class ODataLakeflowConnect(
         super().__init__(options)
         self.service_url = _require(options, "service_url")
         parsed_root = urlparse(self.service_url)
+        # (scheme, host, port) the credential-bearing session may talk to.
+        # Every request URL — including server-supplied ``@odata.nextLink``s
+        # — is checked against this before the auth-carrying session sends
+        # it, so a malicious/compromised source (or a MITM injecting one
+        # nextLink field) can't redirect the Authorization header off-origin.
+        self._service_origin = _url_origin(self.service_url)
         if parsed_root.username or parsed_root.password:
             # The URL is echoed verbatim in logs (verbose_http_logging,
             # every retry/no-progress warning) and in error messages —
@@ -3192,10 +3209,36 @@ class ODataLakeflowConnect(
         capped = min(float(2**attempt), float(self.retry_max_delay_seconds))
         return capped * random.uniform(0.5, 1.0)
 
+    def _require_same_origin(self, url: str) -> None:
+        """Refuse to send the credential-bearing session off the
+        ``service_url`` origin. Every request funnels through here, so a
+        server-supplied ``@odata.nextLink`` (or any other URL the connector
+        follows) pointing at a different scheme/host/port raises instead of
+        leaking the ``Authorization`` header (or ``session.auth`` /
+        api-key header) to that host — the protection ``requests`` applies
+        to cross-host *redirects* (``rebuild_auth``) doesn't engage when
+        the connector builds the next request directly."""
+        origin = _url_origin(url)
+        if origin != self._service_origin:
+            raise PermissionError(
+                f"OData connector refused to follow a URL to a different "
+                f"origin than 'service_url'. The credentialed session may "
+                f"only talk to {self._service_origin[0]}://"
+                f"{self._service_origin[1]}"
+                f"{'' if self._service_origin[2] is None else ':' + str(self._service_origin[2])}"
+                f", but was asked to reach {origin[0]}://{origin[1]}"
+                f"{'' if origin[2] is None else ':' + str(origin[2])} "
+                f"(likely a server-supplied @odata.nextLink pointing off-host). "
+                f"Following it would send the Authorization header to that "
+                f"host. If the service legitimately paginates across hosts, "
+                f"this connector does not support it."
+            )
+
     def _http_get_once(
         self, session: requests.Session, url: str, method: str = "GET", **kwargs: Any
     ) -> requests.Response:
         """One auth-aware request attempt; throttle handling lives in `_http_get`."""
+        self._require_same_origin(url)
         if self._should_preemptively_refresh():
             session.headers["Authorization"] = f"Bearer {self._oauth2_token()}"
         self._log_http_request(method, url)

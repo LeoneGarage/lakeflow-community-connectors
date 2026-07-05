@@ -14835,3 +14835,109 @@ def test_select_restricted_delta_tombstone_pads_to_selected_schema():
     assert tombstone["Name"] is None and "ModifiedAt" not in tombstone
     parsed = parse_value(tombstone, schema)
     assert parsed["Id"] == 3 and parsed["_deleted"] is True
+
+
+# ---------------------------------------------------------------------------
+# Round-34 fixes: cross-origin credential guard, $batch non-dict body re-issue,
+# partitioned contained_fetch validation
+# ---------------------------------------------------------------------------
+
+
+@responses.activate
+def test_cross_host_nextlink_refused_not_credential_leak():
+    """A server-supplied @odata.nextLink pointing at a DIFFERENT host must be
+    refused — following it would send the session's Authorization header to
+    that host (requests' own cross-host redirect auth-stripping never engages
+    because the connector builds the next request directly). Same-origin
+    nextLinks still work."""
+    _mock_metadata()
+    responses.get(
+        f"{SERVICE_URL}Customers",
+        json={
+            "value": [{"Id": 1, "Name": "A"}],
+            "@odata.nextLink": "https://evil.attacker.com/collect?p=2",
+        },
+        match_querystring=False,
+    )
+    c = _make({"token": "secret-xyz"})
+    with pytest.raises(PermissionError, match="different origin"):
+        rows, _ = c.read_table("Customers", None, {"pagination": "nextlink"})
+        list(rows)
+    # The attacker host was never contacted.
+    assert not any("evil.attacker.com" in call.request.url for call in responses.calls)
+
+
+@responses.activate
+def test_same_origin_nextlink_still_followed():
+    """The origin guard must not break legitimate same-host pagination
+    (absolute nextLink on the service's own host)."""
+    _mock_metadata()
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        json={
+            "value": [{"Id": 1, "Name": "A"}],
+            "@odata.nextLink": f"{SERVICE_URL}Customers?$skiptoken=p2",
+        },
+        match_querystring=False,
+    )
+    responses.get(
+        f"{SERVICE_URL}Customers?$skiptoken=p2",
+        json={"value": [{"Id": 2, "Name": "B"}]},
+    )
+    c = _make({"token": "t"})
+    rows, _ = c.read_table("Customers", None, {"pagination": "nextlink"})
+    assert [r["Id"] for r in list(rows)] == [1, 2]
+
+
+@responses.activate
+def test_batch_subresponse_string_body_reissued_not_dropped():
+    """A 2xx $batch sub-response whose `body` is a JSON STRING (spec-legal for
+    non-JSON media) previously drained to rows=[] — silently dropping that
+    parent's whole collection and letting the cursor walk advance past it. It's
+    now re-issued as a plain GET so every row still arrives."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}, {"Id": 2}]})
+
+    def _cb(request):
+        reqs = json.loads(request.body)["requests"]
+        out = []
+        for r in reqs:
+            if "Parents(1)/Children" in r["url"]:
+                out.append(
+                    {"id": r["id"], "status": 200, "body": {"value": [{"Id": 11, "Label": "a"}]}}
+                )
+            elif "Parents(2)/Children" in r["url"]:
+                # Body serialized as a STRING rather than an inline object.
+                out.append(
+                    {"id": r["id"], "status": 200, "body": '{"value":[{"Id":21,"Label":"b"}]}'}
+                )
+            else:  # capability preflight
+                out.append({"id": r["id"], "status": 200, "body": {"value": [{"Id": 1}]}})
+        return (200, {"Content-Type": "application/json"}, json.dumps({"responses": out}))
+
+    responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=_cb)
+    responses.get(
+        f"{SERVICE_URL}Parents(2)/Children",
+        json={"value": [{"Id": 21, "Label": "b"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    recs, _ = c.read_table("Parents__Children", {}, {"expand_contained": "false"})
+    rows = sorted((r["Parents_Id"], r["Id"]) for r in recs)
+    assert rows == [(1, 11), (2, 21)]  # parent 2 not silently dropped
+    assert any(
+        call.request.method == "GET" and "Parents(2)/Children" in call.request.url
+        for call in responses.calls
+    )
+
+
+@responses.activate
+def test_partitioned_contained_fetch_garbage_rejected():
+    """`contained_fetch` garbage was silently accepted on the partitioned
+    streaming path — validation lived only in read_table's dispatch, which a
+    partitioned stream never routes through. is_partitioned now parses it."""
+    _mock_nested_metadata()
+    c = _make({"num_partitions": "2", "contained_fetch": "garbadge"})
+    with pytest.raises(ValueError, match="contained_fetch"):
+        c.is_partitioned("Parents__Children")

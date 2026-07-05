@@ -105,9 +105,14 @@ class PartitionMixin(SupportsPartitionedStream):
             return False
         opts = getattr(self, "options", {}) or {}
         # Fail fast at stream setup: a partitionable table never routes
-        # through read_table, so its option validation must run here.
+        # through read_table, so its option validation must run here. This
+        # includes ``contained_fetch`` — it has no other parse on the
+        # partition path (``expand_contained`` is parsed just below), so a
+        # typo'd value would otherwise be silently accepted, the one enum
+        # still silent where the round-33 dispatch fix made the rest loud.
         validate_page_size(opts)
         _parse_num_partitions(opts)
+        self._contained_fetch_batch_size(opts)
         # Reset any per-table shared-cache verdict pinned non-``auto`` here too:
         # a partitionable table streams through the partition path (this →
         # get_partitions → read_partition), never read_table, so without this
