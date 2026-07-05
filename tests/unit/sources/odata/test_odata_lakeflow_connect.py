@@ -8587,11 +8587,16 @@ def test_partition_lookback_floors_read_boundary_not_fence():
     from urllib.parse import unquote
 
     _mock_nested_metadata()
-    responses.get(
-        f"{SERVICE_URL}Parents",
-        json={"value": [{"Id": 1, "Name": "2024-05-01T00:05:00Z"}]},
-        match_querystring=False,
-    )
+
+    def _parents(request):
+        # Filter-aware: the fenced-batch ``eq null`` guard probe must see
+        # no null-cursor parents (a filter-blind mock would feed the probe
+        # the discovery rows and false-positive the guard).
+        if "eq null" in unquote(request.url):
+            return (200, {}, '{"value": []}')
+        return (200, {}, '{"value": [{"Id": 1, "Name": "2024-05-01T00:05:00Z"}]}')
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents)
     c = _make()
     parts = c.get_partitions(
         "Parents__Children",
@@ -14698,3 +14703,135 @@ def test_alias_error_message_names_requested_alias():
     c = _make()
     with pytest.raises(ValueError, match=r"'ta' \(alias of 'T'\)"):
         c.get_table_schema("Nope", {"namespace": "ta"})
+
+
+# ---------------------------------------------------------------------------
+# Round-33 fixes: vanished-parent tolerance, per-batch null-cursor probe,
+# dispatch-validated shape options, delta_ok reset path
+# ---------------------------------------------------------------------------
+
+
+@responses.activate
+def test_partitioned_read_skips_vanished_parent():
+    """The partition descriptor is frozen at planning, so a parent deleted
+    mid-batch previously 404'd every Spark task retry and killed the
+    streaming query. The vanished chain is now skipped with a warning and
+    the surviving parents' rows still emit."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents(1)/Children", json={"error": "gone"}, status=404)
+    responses.get(
+        f"{SERVICE_URL}Parents(2)/Children",
+        json={"value": [{"Id": 21, "Label": "ok"}]},
+    )
+    c = _make()
+    rows = list(
+        c.read_partition(
+            "Parents__Children",
+            {"top_parent_rows": [{"Id": 1}, {"Id": 2}], "cursor_lower": None},
+            {},
+        )
+    )
+    assert [r["Id"] for r in rows] == [21]
+    assert rows[0]["Parents_Id"] == 2
+
+
+@responses.activate
+def test_partitioned_stream_null_cursor_probe_catches_late_arrivals():
+    """The round-29 null-cursor guard inspected discovery rows only — dead
+    after batch 1, because the fence filter hides null-cursor parents
+    server-side. Fenced batches now run a one-request ``eq null`` probe, so
+    a parent INSERTED with a null cursor mid-stream raises instead of its
+    subtree being silently dropped forever."""
+    from urllib.parse import unquote as _unq
+
+    _mock_nested_metadata()
+
+    def _parents(request):
+        if "eq null" in _unq(request.url):
+            # The mid-stream-inserted null-cursor parent.
+            return (200, {}, '{"value": [{"Id": 9}]}')
+        return (200, {}, '{"value": [{"Id": 1, "Name": "2024-05-02T00:00:00Z"}]}')
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents)
+    c = _make()
+    with pytest.raises(ValueError, match="null 'Name'"):
+        c.get_partitions(
+            "Parents__Children",
+            {"cursor_field": "Name"},
+            {"cursor": "2024-05-01T00:00:00Z"},
+            {"cursor": "2024-05-02T00:00:00Z"},
+        )
+
+
+@responses.activate
+def test_contained_shape_options_validated_on_flat_dispatch():
+    """`contained_fetch` / `expand_contained` garbage was silently accepted
+    on flat tables (their parsers only ran on contained paths) — the one
+    place a typo'd enum option wasn't loud. Both now validate at dispatch,
+    before any table HTTP."""
+    _mock_metadata()
+    c = _make({"token": "t"})
+    with pytest.raises(ValueError, match="contained_fetch"):
+        c.read_table("Customers", None, {"contained_fetch": "garbadge"})
+    with pytest.raises(ValueError, match="expand_contained"):
+        c.read_table("Customers", None, {"expand_contained": "yes"})
+    # Only $metadata was fetched — the errors fired pre-HTTP.
+    assert all("$metadata" in call.request.url for call in responses.calls)
+
+
+@responses.activate
+def test_delta_ok_purged_on_explicit_setting():
+    """`delta_ok` previously had no reset path — asymmetric with
+    `expand_ok`/`cursor_probe_ok`, whose explicit non-auto values purge the
+    shared cache entry so a later switch back to auto re-probes."""
+    _mock_metadata()
+    c = _make()
+    c._store_capability("delta_ok", False, table_name="Customers")
+    assert c._delta_active_for("Customers", {"delta_tracking": "disabled"}) is False
+    assert c._cached_capability("delta_ok", table_name="Customers") is None
+    c._store_capability("delta_ok", False, table_name="Customers")
+    assert c._delta_active_for("Customers", {"delta_tracking": "enabled"}) is True
+    assert c._cached_capability("delta_ok", table_name="Customers") is None
+    # auto keeps (and uses) the verdict.
+    c._store_capability("delta_ok", True, table_name="Customers")
+    assert c._delta_active_for("Customers", {"delta_tracking": "auto"}) is True
+    assert c._cached_capability("delta_ok", table_name="Customers") is True
+
+
+@responses.activate
+def test_client_paginate_value_null_tolerated():
+    """The client-driven pagination walk has its own value-array site —
+    a spec-invalid `"value": null` reads as an empty page there too."""
+    _mock_metadata()
+    responses.get(f"{SERVICE_URL}Customers", json={"value": None}, match_querystring=False)
+    c = _make({"token": "t"})
+    records, _ = c.read_table("Customers", None, {"pagination": "skip"})
+    assert list(records) == []
+
+
+@responses.activate
+def test_select_restricted_delta_tombstone_pads_to_selected_schema():
+    """With `select`, the tombstone pad set and the declared schema must be
+    the SAME subset: selected non-key columns padded to None, non-selected
+    columns absent from both — the framework parse is the referee."""
+    from databricks.labs.community_connector.libs.utils import parse_value
+
+    responses.get(f"{SERVICE_URL}$metadata", body=NONNULL_METADATA_XML, status=200)
+    delta_link = f"{SERVICE_URL}Customers?$deltatoken=t1"
+    responses.add(
+        responses.GET,
+        delta_link,
+        json={
+            "value": [{"Id": 3, "@removed": {"reason": "deleted"}}],
+            "@odata.deltaLink": f"{SERVICE_URL}Customers?$deltatoken=t2",
+        },
+    )
+    c = _make()
+    opts = {"delta_tracking": "enabled", "select": "Id,Name"}
+    schema = c.get_table_schema("Customers", opts)
+    assert {f.name for f in schema.fields} == {"Id", "Name", "_deleted", "_lc_sequence"}
+    records, _ = c.read_table("Customers", {"delta_link": delta_link}, opts)
+    (tombstone,) = list(records)
+    assert tombstone["Name"] is None and "ModifiedAt" not in tombstone
+    parsed = parse_value(tombstone, schema)
+    assert parsed["Id"] == 3 and parsed["_deleted"] is True

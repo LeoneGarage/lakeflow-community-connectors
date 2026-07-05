@@ -1366,6 +1366,12 @@ class ODataLakeflowConnect(
                     "cursor_field or drop cursor_probe."
                 )
         _validate_page_size(opts)
+        # Validate the contained-read shape options for EVERY table, flat
+        # included: their parsers otherwise run only on contained paths (and
+        # ``contained_fetch``'s only after enumeration HTTP), so a typo'd
+        # value was silent exactly where every other enum option is loud.
+        self._expand_contained_mode(opts)
+        self._contained_fetch_batch_size(opts)
         if self._pagination != "nextlink":
             opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
         if start_offset is None:
@@ -2457,6 +2463,16 @@ class ODataLakeflowConnect(
           5. ``delta_tracking=auto`` → probe once, cache, decide.
         """
         setting = self._delta_setting(table_options)
+        if setting != "auto":
+            # Explicit pin (enabled/disabled): purge the shared ``auto``
+            # verdict so a later switch back to ``auto`` re-probes — the
+            # same reset discipline as ``expand_ok``/``cursor_probe_ok``.
+            # Idempotent and cheap (no file rewrite once the entry is
+            # gone), so running on every non-auto call is fine.
+            key = self._delta_cache_key(table_name, table_options)
+            self._delta_capable.pop(key, None)
+            shared_key = f"{key[0]}:{key[1]}" if key[0] else key[1]
+            _capability_cache_drop(self.service_url, {"delta_ok"}, table_name=shared_key)
         if setting == "disabled":
             return False
         if (table_options or {}).get("cursor_field"):

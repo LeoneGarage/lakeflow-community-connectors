@@ -941,6 +941,28 @@ def register_lakeflow_source(spark):
     _TRANSIENT_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 
 
+    def _is_vanished_error(exc: requests.HTTPError) -> bool:
+        """Whether ``exc`` is a 404/410 — the entity addressed by the URL is
+        gone. On the partitioned walk that means a parent frozen into the task
+        descriptor at planning was deleted before this task walked it."""
+        status = getattr(exc.response, "status_code", None)
+        return status in (404, 410)
+
+
+    def _log_vanished_parent(chain: list, exc: requests.HTTPError) -> None:
+        """One warning per skipped parent subtree. The next batch's re-plan
+        re-discovers the live parent set, so the skip is self-healing; rows of
+        the deleted parent already at the destination linger exactly as they
+        would on any non-delta path (no tombstones)."""
+        status = getattr(exc.response, "status_code", None)
+        _LOG.warning(
+            "partitioned read: parent chain %r vanished mid-batch (HTTP %s) — "
+            "skipping its subtree; the next batch re-discovers the live parent set.",
+            chain,
+            status,
+        )
+
+
     class _BatchTooManyParts(RuntimeError):
         """Raised by :meth:`_post_batch` when the server rejects a ``$batch`` for
         carrying too many sub-requests (e.g. Hexagon Smart API: "OData batch message
@@ -2315,6 +2337,7 @@ def register_lakeflow_source(spark):
             cursor_field: str,
             since: Any,
             top_parent_rows: list[dict] | None = None,
+            tolerate_vanished: bool = False,
         ) -> Iterator[tuple[list[dict[str, Any]], Any]]:
             """Like ``_iter_parent_key_chains`` but applies a cursor filter at
             the ancestor that owns ``cursor_field``. Yields
@@ -2326,7 +2349,11 @@ def register_lakeflow_source(spark):
             fetching the whole top-level set. Each row dict must carry the
             top-level entity's PKs (and, when ``cursor_level == 0``, the
             cursor value). The supplied subset is consumed in order without
-            re-fetching."""
+            re-fetching.
+
+            ``tolerate_vanished`` (partitioned callers): skip-with-warning a
+            parent whose sub-level fetch 404/410s — see
+            :meth:`_iter_parent_key_chains`."""
             segment_filters = resolve_segment_filters(table_options, segments)
 
             def _walk(level: int, chain: list[dict[str, Any]], cur_val: Any):
@@ -2386,8 +2413,14 @@ def register_lakeflow_source(spark):
                 for row in row_source:
                     next_cur = row.get(cursor_field) if level == cursor_level else cur_val
                     chain.append({pk: row.get(pk) for pk in ancestor_pks})
-                    yield from _walk(level + 1, chain, next_cur)
-                    chain.pop()
+                    try:
+                        yield from _walk(level + 1, chain, next_cur)
+                    except requests.HTTPError as exc:
+                        if not (tolerate_vanished and _is_vanished_error(exc)):
+                            raise
+                        _log_vanished_parent(chain, exc)
+                    finally:
+                        chain.pop()
 
             yield from _walk(0, [], None)
 
@@ -2397,6 +2430,7 @@ def register_lakeflow_source(spark):
             namespace: str | None,
             table_options: dict[str, str] | None,
             top_parent_rows: list[dict] | None = None,
+            tolerate_vanished: bool = False,
         ) -> Iterator[list[dict[str, Any]]]:
             """Yield every ancestor key chain (len = len(segments) - 1) reaching
             the leaf. Each level fetched with ``$select=<pks>``; user ``filter``
@@ -2405,7 +2439,15 @@ def register_lakeflow_source(spark):
 
             ``top_parent_rows`` lets a partitioned caller supply a pre-
             discovered subset of level-0 rows; when provided, the level-0
-            HTTP fetch is skipped and the rows are consumed in order."""
+            HTTP fetch is skipped and the rows are consumed in order.
+
+            ``tolerate_vanished``: a parent whose sub-level fetch 404/410s is
+            skipped with a warning instead of failing the walk. ONLY the
+            partitioned path sets this — its parent set is frozen into the
+            task descriptor at planning, so a parent deleted mid-batch would
+            otherwise fail every Spark task retry deterministically (the
+            serial walks re-enumerate parents each trigger and self-heal
+            without it)."""
             segment_filters = resolve_segment_filters(table_options, segments)
 
             def _walk(level: int, chain: list[dict[str, Any]]):
@@ -2450,8 +2492,14 @@ def register_lakeflow_source(spark):
                     row_source = self._fetch_pages(url, self._edm_types_for_et(ancestor_et))
                 for row in row_source:
                     chain.append({pk: row.get(pk) for pk in ancestor_pks})
-                    yield from _walk(level + 1, chain)
-                    chain.pop()
+                    try:
+                        yield from _walk(level + 1, chain)
+                    except requests.HTTPError as exc:
+                        if not (tolerate_vanished and _is_vanished_error(exc)):
+                            raise
+                        _log_vanished_parent(chain, exc)
+                    finally:
+                        chain.pop()
 
             yield from _walk(0, [])
 
@@ -6200,26 +6248,24 @@ def register_lakeflow_source(spark):
                 )
             ):
                 # Null-cursor top parents are UNSUPPORTED on the partitioned
-                # STREAMING path: this (unfenced) first discovery still sees them,
-                # but once a fence is committed every later batch's ``cursor gt``
-                # discovery filter excludes them SERVER-SIDE — their subtrees'
-                # future changes would be dropped silently, with no error and no
-                # log (the serial ancestor-cursor path raises on the same
-                # configuration). Refuse here, on the only batch that can still
-                # see them. The BATCH invocation (no offsets) is exempt: it
-                # re-discovers unfenced every run, so null-cursor parents are
-                # always visible and always read correctly there.
+                # STREAMING path: once a fence is committed every batch's
+                # ``cursor gt`` discovery filter excludes them SERVER-SIDE —
+                # their subtrees' future changes would be dropped silently, with
+                # no error and no log (the serial ancestor-cursor path raises on
+                # the same configuration). The unfenced FIRST batch still sees
+                # them in ``top_rows``; every fenced batch runs a one-request
+                # ``eq null`` probe instead, so a null-cursor parent INSERTED
+                # mid-stream is caught too, not just pre-existing ones. The
+                # BATCH invocation (no offsets) is exempt: it re-discovers
+                # unfenced every run, so null-cursor parents are always visible
+                # and always read correctly there.
                 nulls = [r for r in top_rows if r.get(cursor_field) is None]
                 if nulls:
-                    raise ValueError(
-                        f"Partitioned read of {table_name!r}: {len(nulls)} top-level "
-                        f"parent(s) have a null {cursor_field!r}. Null-cursor parents "
-                        f"are invisible to the partitioned fence filter after the "
-                        f"first batch, so their contained rows would be silently "
-                        f"dropped. Exclude them server-side (e.g. "
-                        f'filter_at_{segments[0]}="{cursor_field} ne null"), fix the '
-                        f"data, or read serially (num_partitions unset)."
-                    )
+                    self._raise_null_cursor_parents(table_name, segments, cursor_field, len(nulls))
+                if cursor_lower is not None and self._null_cursor_parents_exist(
+                    segments, namespace, opts, cursor_field
+                ):
+                    self._raise_null_cursor_parents(table_name, segments, cursor_field, None)
             if not top_rows:
                 return []
             return _bin_pack(top_rows, num_partitions, cursor_lower)
@@ -6326,6 +6372,50 @@ def register_lakeflow_source(spark):
                     raise
                 return _first_value(seg_filter)
 
+        def _raise_null_cursor_parents(
+            self, table_name: str, segments: list[str], cursor_field: str, count: int | None
+        ) -> None:
+            """The shared refusal for null-cursor top parents on the partitioned
+            streaming path — from the first batch's in-discovery check (exact
+            ``count``) or a fenced batch's probe (``count=None``)."""
+            found = f"{count} top-level parent(s) have" if count else "a top-level parent has"
+            raise ValueError(
+                f"Partitioned read of {table_name!r}: {found} a null "
+                f"{cursor_field!r}. Null-cursor parents are invisible to the "
+                f"partitioned fence filter, so their contained rows would be "
+                f"silently dropped. Exclude them server-side (e.g. "
+                f'filter_at_{segments[0]}="{cursor_field} ne null"), fix the '
+                f"data, or read serially (num_partitions unset)."
+            )
+
+        def _null_cursor_parents_exist(
+            self,
+            segments: list[str],
+            namespace: str | None,
+            table_options: dict[str, str],
+            cursor_field: str,
+        ) -> bool:
+            """One ``$top=1`` probe for null-cursor top parents. Fenced batches
+            need it because their ``cursor gt fence`` discovery filter hides
+            null-cursor rows server-side — without the probe the round-29 guard
+            is dead after batch 1 and a parent inserted with a null cursor is
+            silently invisible forever. Best-effort: a server that rejects the
+            ``eq null`` filter — or any transport/transient failure — keeps the
+            (first-batch-only) guard behavior rather than failing the batch
+            (the same fail-open discipline as the capability probes)."""
+            segment_filters = resolve_segment_filters(table_options, segments)
+            extra = combine_filters(f"{cursor_field} eq null", segment_filters.get(0))
+            pks = self._own_primary_keys_for_et(self._entity_type_for(segments[0], namespace))
+            url = self._build_url(
+                segments[0],
+                {"select": ",".join(pks), "page_size": "1"},
+                extra_filter=extra,
+            )
+            try:
+                return next(iter(self._fetch_pages(url)), None) is not None
+            except (requests.RequestException, RuntimeError):
+                return False
+
         def _discover_top_parent_rows(
             self,
             segments: list[str],
@@ -6377,6 +6467,20 @@ def register_lakeflow_source(spark):
             url = self._build_url(top_set, opts, extra_filter=extra_filter, order_by=order_by)
             return list(self._fetch_pages(url, self._edm_types_for_et(ancestor_et)))
 
+        def _leaf_pages_tolerating_vanished(self, url: str, leaf_types, chain: list) -> Iterator[dict]:
+            """One chain's leaf pages, skipping the chain when its parent
+            vanished (404/410) between planning and this task's walk. The
+            partition descriptor is frozen at planning, so without the skip a
+            parent deleted mid-batch fails every Spark task retry
+            deterministically and kills the streaming query (the serial walks
+            re-enumerate each trigger and self-heal without this)."""
+            try:
+                yield from self._fetch_pages(url, leaf_types)
+            except requests.HTTPError as exc:
+                if not _is_vanished_error(exc):
+                    raise
+                _log_vanished_parent(chain, exc)
+
         def _iter_partition_rows(
             self,
             segments: list[str],
@@ -6402,7 +6506,11 @@ def register_lakeflow_source(spark):
             leaf_types = self._edm_types_for_level(segments, len(segments) - 1, namespace)
             if not cursor_field:
                 for chain in self._iter_parent_key_chains(
-                    segments, namespace, table_options, top_parent_rows=top_parent_rows
+                    segments,
+                    namespace,
+                    table_options,
+                    top_parent_rows=top_parent_rows,
+                    tolerate_vanished=True,
                 ):
                     url = self._build_contained_url(
                         segments,
@@ -6411,7 +6519,7 @@ def register_lakeflow_source(spark):
                         extra_filter=leaf_seg_filter,
                         order_by=leaf_order_by,
                     )
-                    for row in self._fetch_pages(url, leaf_types):
+                    for row in self._leaf_pages_tolerating_vanished(url, leaf_types, chain):
                         self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                         yield row
                 return
@@ -6433,12 +6541,13 @@ def register_lakeflow_source(spark):
                 cursor_field,
                 cursor_lower,
                 top_parent_rows=top_parent_rows,
+                tolerate_vanished=True,
             )
             for chain, ancestor_cursor in chains_iter:
                 url = self._build_contained_url(
                     segments, chain, table_options, extra_filter=leaf_seg_filter, order_by=leaf_order_by
                 )
-                for row in self._fetch_pages(url, leaf_types):
+                for row in self._leaf_pages_tolerating_vanished(url, leaf_types, chain):
                     self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                     if cursor_level == len(segments) - 1:
                         # Leaf-cursor mode: filter per row by ``cursor gt
@@ -7751,6 +7860,12 @@ def register_lakeflow_source(spark):
                         "cursor_field or drop cursor_probe."
                     )
             _validate_page_size(opts)
+            # Validate the contained-read shape options for EVERY table, flat
+            # included: their parsers otherwise run only on contained paths (and
+            # ``contained_fetch``'s only after enumeration HTTP), so a typo'd
+            # value was silent exactly where every other enum option is loud.
+            self._expand_contained_mode(opts)
+            self._contained_fetch_batch_size(opts)
             if self._pagination != "nextlink":
                 opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
             if start_offset is None:
@@ -8842,6 +8957,16 @@ def register_lakeflow_source(spark):
               5. ``delta_tracking=auto`` → probe once, cache, decide.
             """
             setting = self._delta_setting(table_options)
+            if setting != "auto":
+                # Explicit pin (enabled/disabled): purge the shared ``auto``
+                # verdict so a later switch back to ``auto`` re-probes — the
+                # same reset discipline as ``expand_ok``/``cursor_probe_ok``.
+                # Idempotent and cheap (no file rewrite once the entry is
+                # gone), so running on every non-auto call is fine.
+                key = self._delta_cache_key(table_name, table_options)
+                self._delta_capable.pop(key, None)
+                shared_key = f"{key[0]}:{key[1]}" if key[0] else key[1]
+                _capability_cache_drop(self.service_url, {"delta_ok"}, table_name=shared_key)
             if setting == "disabled":
                 return False
             if (table_options or {}).get("cursor_field"):

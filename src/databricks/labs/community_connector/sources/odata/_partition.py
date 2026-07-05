@@ -56,6 +56,8 @@ from databricks.labs.community_connector.interface.supports_partition import (
 from databricks.labs.community_connector.sources.odata._contained import (
     DEFAULT_PAGE_SIZE,
     _ancestor_pk_order_by,
+    _is_vanished_error,
+    _log_vanished_parent,
     combine_filters,
     resolve_segment_filters,
     validate_page_size,
@@ -272,26 +274,24 @@ class PartitionMixin(SupportsPartitionedStream):
             )
         ):
             # Null-cursor top parents are UNSUPPORTED on the partitioned
-            # STREAMING path: this (unfenced) first discovery still sees them,
-            # but once a fence is committed every later batch's ``cursor gt``
-            # discovery filter excludes them SERVER-SIDE — their subtrees'
-            # future changes would be dropped silently, with no error and no
-            # log (the serial ancestor-cursor path raises on the same
-            # configuration). Refuse here, on the only batch that can still
-            # see them. The BATCH invocation (no offsets) is exempt: it
-            # re-discovers unfenced every run, so null-cursor parents are
-            # always visible and always read correctly there.
+            # STREAMING path: once a fence is committed every batch's
+            # ``cursor gt`` discovery filter excludes them SERVER-SIDE —
+            # their subtrees' future changes would be dropped silently, with
+            # no error and no log (the serial ancestor-cursor path raises on
+            # the same configuration). The unfenced FIRST batch still sees
+            # them in ``top_rows``; every fenced batch runs a one-request
+            # ``eq null`` probe instead, so a null-cursor parent INSERTED
+            # mid-stream is caught too, not just pre-existing ones. The
+            # BATCH invocation (no offsets) is exempt: it re-discovers
+            # unfenced every run, so null-cursor parents are always visible
+            # and always read correctly there.
             nulls = [r for r in top_rows if r.get(cursor_field) is None]
             if nulls:
-                raise ValueError(
-                    f"Partitioned read of {table_name!r}: {len(nulls)} top-level "
-                    f"parent(s) have a null {cursor_field!r}. Null-cursor parents "
-                    f"are invisible to the partitioned fence filter after the "
-                    f"first batch, so their contained rows would be silently "
-                    f"dropped. Exclude them server-side (e.g. "
-                    f'filter_at_{segments[0]}="{cursor_field} ne null"), fix the '
-                    f"data, or read serially (num_partitions unset)."
-                )
+                self._raise_null_cursor_parents(table_name, segments, cursor_field, len(nulls))
+            if cursor_lower is not None and self._null_cursor_parents_exist(
+                segments, namespace, opts, cursor_field
+            ):
+                self._raise_null_cursor_parents(table_name, segments, cursor_field, None)
         if not top_rows:
             return []
         return _bin_pack(top_rows, num_partitions, cursor_lower)
@@ -398,6 +398,50 @@ class PartitionMixin(SupportsPartitionedStream):
                 raise
             return _first_value(seg_filter)
 
+    def _raise_null_cursor_parents(
+        self, table_name: str, segments: list[str], cursor_field: str, count: int | None
+    ) -> None:
+        """The shared refusal for null-cursor top parents on the partitioned
+        streaming path — from the first batch's in-discovery check (exact
+        ``count``) or a fenced batch's probe (``count=None``)."""
+        found = f"{count} top-level parent(s) have" if count else "a top-level parent has"
+        raise ValueError(
+            f"Partitioned read of {table_name!r}: {found} a null "
+            f"{cursor_field!r}. Null-cursor parents are invisible to the "
+            f"partitioned fence filter, so their contained rows would be "
+            f"silently dropped. Exclude them server-side (e.g. "
+            f'filter_at_{segments[0]}="{cursor_field} ne null"), fix the '
+            f"data, or read serially (num_partitions unset)."
+        )
+
+    def _null_cursor_parents_exist(
+        self,
+        segments: list[str],
+        namespace: str | None,
+        table_options: dict[str, str],
+        cursor_field: str,
+    ) -> bool:
+        """One ``$top=1`` probe for null-cursor top parents. Fenced batches
+        need it because their ``cursor gt fence`` discovery filter hides
+        null-cursor rows server-side — without the probe the round-29 guard
+        is dead after batch 1 and a parent inserted with a null cursor is
+        silently invisible forever. Best-effort: a server that rejects the
+        ``eq null`` filter — or any transport/transient failure — keeps the
+        (first-batch-only) guard behavior rather than failing the batch
+        (the same fail-open discipline as the capability probes)."""
+        segment_filters = resolve_segment_filters(table_options, segments)
+        extra = combine_filters(f"{cursor_field} eq null", segment_filters.get(0))
+        pks = self._own_primary_keys_for_et(self._entity_type_for(segments[0], namespace))
+        url = self._build_url(
+            segments[0],
+            {"select": ",".join(pks), "page_size": "1"},
+            extra_filter=extra,
+        )
+        try:
+            return next(iter(self._fetch_pages(url)), None) is not None
+        except (requests.RequestException, RuntimeError):
+            return False
+
     def _discover_top_parent_rows(
         self,
         segments: list[str],
@@ -449,6 +493,20 @@ class PartitionMixin(SupportsPartitionedStream):
         url = self._build_url(top_set, opts, extra_filter=extra_filter, order_by=order_by)
         return list(self._fetch_pages(url, self._edm_types_for_et(ancestor_et)))
 
+    def _leaf_pages_tolerating_vanished(self, url: str, leaf_types, chain: list) -> Iterator[dict]:
+        """One chain's leaf pages, skipping the chain when its parent
+        vanished (404/410) between planning and this task's walk. The
+        partition descriptor is frozen at planning, so without the skip a
+        parent deleted mid-batch fails every Spark task retry
+        deterministically and kills the streaming query (the serial walks
+        re-enumerate each trigger and self-heal without this)."""
+        try:
+            yield from self._fetch_pages(url, leaf_types)
+        except requests.HTTPError as exc:
+            if not _is_vanished_error(exc):
+                raise
+            _log_vanished_parent(chain, exc)
+
     def _iter_partition_rows(
         self,
         segments: list[str],
@@ -474,7 +532,11 @@ class PartitionMixin(SupportsPartitionedStream):
         leaf_types = self._edm_types_for_level(segments, len(segments) - 1, namespace)
         if not cursor_field:
             for chain in self._iter_parent_key_chains(
-                segments, namespace, table_options, top_parent_rows=top_parent_rows
+                segments,
+                namespace,
+                table_options,
+                top_parent_rows=top_parent_rows,
+                tolerate_vanished=True,
             ):
                 url = self._build_contained_url(
                     segments,
@@ -483,7 +545,7 @@ class PartitionMixin(SupportsPartitionedStream):
                     extra_filter=leaf_seg_filter,
                     order_by=leaf_order_by,
                 )
-                for row in self._fetch_pages(url, leaf_types):
+                for row in self._leaf_pages_tolerating_vanished(url, leaf_types, chain):
                     self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                     yield row
             return
@@ -505,12 +567,13 @@ class PartitionMixin(SupportsPartitionedStream):
             cursor_field,
             cursor_lower,
             top_parent_rows=top_parent_rows,
+            tolerate_vanished=True,
         )
         for chain, ancestor_cursor in chains_iter:
             url = self._build_contained_url(
                 segments, chain, table_options, extra_filter=leaf_seg_filter, order_by=leaf_order_by
             )
-            for row in self._fetch_pages(url, leaf_types):
+            for row in self._leaf_pages_tolerating_vanished(url, leaf_types, chain):
                 self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                 if cursor_level == len(segments) - 1:
                     # Leaf-cursor mode: filter per row by ``cursor gt

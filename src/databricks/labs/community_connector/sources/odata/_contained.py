@@ -149,6 +149,28 @@ _EXPAND_PREFLIGHT_PAGE = "25"
 _TRANSIENT_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 
 
+def _is_vanished_error(exc: requests.HTTPError) -> bool:
+    """Whether ``exc`` is a 404/410 — the entity addressed by the URL is
+    gone. On the partitioned walk that means a parent frozen into the task
+    descriptor at planning was deleted before this task walked it."""
+    status = getattr(exc.response, "status_code", None)
+    return status in (404, 410)
+
+
+def _log_vanished_parent(chain: list, exc: requests.HTTPError) -> None:
+    """One warning per skipped parent subtree. The next batch's re-plan
+    re-discovers the live parent set, so the skip is self-healing; rows of
+    the deleted parent already at the destination linger exactly as they
+    would on any non-delta path (no tombstones)."""
+    status = getattr(exc.response, "status_code", None)
+    _LOG.warning(
+        "partitioned read: parent chain %r vanished mid-batch (HTTP %s) — "
+        "skipping its subtree; the next batch re-discovers the live parent set.",
+        chain,
+        status,
+    )
+
+
 class _BatchTooManyParts(RuntimeError):
     """Raised by :meth:`_post_batch` when the server rejects a ``$batch`` for
     carrying too many sub-requests (e.g. Hexagon Smart API: "OData batch message
@@ -1523,6 +1545,7 @@ class ContainedNavMixin:
         cursor_field: str,
         since: Any,
         top_parent_rows: list[dict] | None = None,
+        tolerate_vanished: bool = False,
     ) -> Iterator[tuple[list[dict[str, Any]], Any]]:
         """Like ``_iter_parent_key_chains`` but applies a cursor filter at
         the ancestor that owns ``cursor_field``. Yields
@@ -1534,7 +1557,11 @@ class ContainedNavMixin:
         fetching the whole top-level set. Each row dict must carry the
         top-level entity's PKs (and, when ``cursor_level == 0``, the
         cursor value). The supplied subset is consumed in order without
-        re-fetching."""
+        re-fetching.
+
+        ``tolerate_vanished`` (partitioned callers): skip-with-warning a
+        parent whose sub-level fetch 404/410s — see
+        :meth:`_iter_parent_key_chains`."""
         segment_filters = resolve_segment_filters(table_options, segments)
 
         def _walk(level: int, chain: list[dict[str, Any]], cur_val: Any):
@@ -1594,8 +1621,14 @@ class ContainedNavMixin:
             for row in row_source:
                 next_cur = row.get(cursor_field) if level == cursor_level else cur_val
                 chain.append({pk: row.get(pk) for pk in ancestor_pks})
-                yield from _walk(level + 1, chain, next_cur)
-                chain.pop()
+                try:
+                    yield from _walk(level + 1, chain, next_cur)
+                except requests.HTTPError as exc:
+                    if not (tolerate_vanished and _is_vanished_error(exc)):
+                        raise
+                    _log_vanished_parent(chain, exc)
+                finally:
+                    chain.pop()
 
         yield from _walk(0, [], None)
 
@@ -1605,6 +1638,7 @@ class ContainedNavMixin:
         namespace: str | None,
         table_options: dict[str, str] | None,
         top_parent_rows: list[dict] | None = None,
+        tolerate_vanished: bool = False,
     ) -> Iterator[list[dict[str, Any]]]:
         """Yield every ancestor key chain (len = len(segments) - 1) reaching
         the leaf. Each level fetched with ``$select=<pks>``; user ``filter``
@@ -1613,7 +1647,15 @@ class ContainedNavMixin:
 
         ``top_parent_rows`` lets a partitioned caller supply a pre-
         discovered subset of level-0 rows; when provided, the level-0
-        HTTP fetch is skipped and the rows are consumed in order."""
+        HTTP fetch is skipped and the rows are consumed in order.
+
+        ``tolerate_vanished``: a parent whose sub-level fetch 404/410s is
+        skipped with a warning instead of failing the walk. ONLY the
+        partitioned path sets this — its parent set is frozen into the
+        task descriptor at planning, so a parent deleted mid-batch would
+        otherwise fail every Spark task retry deterministically (the
+        serial walks re-enumerate parents each trigger and self-heal
+        without it)."""
         segment_filters = resolve_segment_filters(table_options, segments)
 
         def _walk(level: int, chain: list[dict[str, Any]]):
@@ -1658,8 +1700,14 @@ class ContainedNavMixin:
                 row_source = self._fetch_pages(url, self._edm_types_for_et(ancestor_et))
             for row in row_source:
                 chain.append({pk: row.get(pk) for pk in ancestor_pks})
-                yield from _walk(level + 1, chain)
-                chain.pop()
+                try:
+                    yield from _walk(level + 1, chain)
+                except requests.HTTPError as exc:
+                    if not (tolerate_vanished and _is_vanished_error(exc)):
+                        raise
+                    _log_vanished_parent(chain, exc)
+                finally:
+                    chain.pop()
 
         yield from _walk(0, [])
 
