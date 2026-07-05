@@ -199,18 +199,25 @@ def jsonify_complex_values(row: dict) -> dict:
     return row
 
 
-def pad_row_to_fields(row: dict, field_names) -> dict:
+def pad_row_to_fields(row: dict, field_names, never_pad=frozenset()) -> dict:
     """Return ``row`` with an explicit ``None`` for every name in
-    ``field_names`` it doesn't already carry.
+    ``field_names`` it doesn't already carry — except names in ``never_pad``.
 
     OData servers may legally omit null-valued properties from a JSON entity,
     and the framework's row parser rejects a declared column that is *absent*
     (even a nullable one is fine as an explicit ``None``, but a non-nullable
     absent column raises and kills the batch). Padding to the declared schema
-    makes an omit-null response parse cleanly. Returns ``row`` unchanged (no
-    copy) when it's already complete — the common case — otherwise a new dict,
+    makes an omit-null response parse cleanly.
+
+    ``never_pad`` holds the columns whose absence must STAY loud because the
+    omit-null rationale can't apply to them: primary keys (a key is never
+    null, so a missing one means a broken response — padding it would send a
+    silent null-key row into the destination's ``apply_changes`` MERGE) and
+    the connector-stamped delta synthetics (absence there is a connector
+    stamping bug, not server behavior). Returns ``row`` unchanged (no copy)
+    when nothing needs padding — the common case — otherwise a new dict,
     never mutating the caller's row (lookback re-emits the same object)."""
-    missing = [n for n in field_names if n not in row]
+    missing = [n for n in field_names if n not in row and n not in never_pad]
     if not missing:
         return row
     padded = dict(row)

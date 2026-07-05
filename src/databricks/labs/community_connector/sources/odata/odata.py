@@ -365,6 +365,28 @@ _SEQUENCE_COUNTER = _SequenceCounter()
 # costs a duplicate fetch, never a torn value.
 _METADATA_CACHE: dict[str, tuple[str, ET.Element, "_CsdlIndex", float]] = {}
 
+# Expired entries for a service are only popped when THAT service is next
+# read, so a long-lived driver serving many distinct services would retain
+# one multi-MB parsed tree per service forever. Cap the cache and evict
+# oldest-first on insert (per-entry TTLs belong to the writing instance, so
+# age is the only cross-service eviction signal); an evicted service just
+# re-fetches on its next read.
+_METADATA_CACHE_MAX_SERVICES = 16
+
+
+def _metadata_cache_put(
+    service_url: str, entry: tuple[str, ET.Element, "_CsdlIndex", float]
+) -> None:
+    """Insert into :data:`_METADATA_CACHE`, evicting the oldest entries
+    (by their ``fetched_at`` stamp) beyond :data:`_METADATA_CACHE_MAX_SERVICES`.
+    Same lock-free discipline as the cache itself — a racing double-evict
+    just costs the loser a re-fetch."""
+    _METADATA_CACHE[service_url] = entry
+    while len(_METADATA_CACHE) > _METADATA_CACHE_MAX_SERVICES:
+        oldest = min(_METADATA_CACHE, key=lambda k: _METADATA_CACHE[k][3])
+        _METADATA_CACHE.pop(oldest, None)
+
+
 # On-disk CSDL cache. PySpark's Python Data Source forks a fresh
 # ``pyspark.daemon`` worker for schema inference on every ``.load()``
 # call, so the process-wide cache above doesn't survive — each fork
@@ -994,7 +1016,12 @@ def _next_sequence() -> str:
     key in the same nanosecond could mint equal sequences — an
     astronomically unlikely tie apply_changes resolves arbitrarily,
     accepted rather than paying a per-partition discriminator on every
-    row.
+    row. Cross-batch ordering ASSUMES a non-regressing wall clock: after
+    a backwards step (VM snapshot restore, hard NTP correction) a later
+    batch's rows sequence BELOW already-applied ones and lose the MERGE
+    until the clock passes its old high-water mark — accepted; a
+    monotonic source would instead regress on every process restart,
+    which is the common case.
 
     ``time.time_ns()`` skips the ``datetime`` + ``strftime`` round-
     trip the previous ISO-8601 format paid per row — meaningful for
@@ -1274,11 +1301,18 @@ class ODataLakeflowConnect(
         # every read shape). ``get_table_schema`` itself isn't memoized, but
         # everything it reads (metadata bundle, field cache, capability
         # verdicts) is — this call rebuilds the schema from cached parts with
-        # no I/O after the first call.
+        # no I/O after the first call. Primary keys and the delta synthetics
+        # are exempt from padding: a server never legally omits a KEY (so a
+        # missing one is a broken response that must fail loudly, not MERGE a
+        # null-key row), and the synthetics are stamped by the connector
+        # itself (absence = stamping bug).
         field_names = tuple(f.name for f in self.get_table_schema(table_name, table_options).fields)
+        never_pad = frozenset(
+            self._primary_keys_for(table_name, (table_options or {}).get("namespace")) or ()
+        ) | {_DELETED_COL, _SEQUENCE_COL}
 
         def _emit(row: dict) -> dict:
-            return _jsonify_complex_values(_pad_row_to_fields(row, field_names))
+            return _jsonify_complex_values(_pad_row_to_fields(row, field_names, never_pad))
 
         if isinstance(records, list):
             return [_emit(r) for r in records], offset
@@ -1318,7 +1352,12 @@ class ODataLakeflowConnect(
         # the user left it unset. Held on ``self`` for the duration of the
         # read so the shared fetch primitives pick it up without threading
         # it through every call site; defaults to nextlink (today's
-        # behaviour) for any path that doesn't set it.
+        # behaviour) for any path that doesn't set it. This (like every
+        # read-scoped field below) leans on the framework's SERIAL-calls
+        # contract: one instance serves one table's calls sequentially, and
+        # the lazy batch-mode generators are drained before any other entry
+        # point runs on this instance. An interleaving framework would
+        # clobber these mid-drain.
         self._pagination = self._parse_pagination(opts)
         self._set_excluded_ancestor_columns(opts)
         # Overlap re-read window for non-atomic walks. Held on ``self`` for
@@ -1533,12 +1572,56 @@ class ODataLakeflowConnect(
             # Cursor-based read: default page_size so a $top is sent.
             # Snapshot (the branch below) leaves it unset → no $top.
             opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
-            return self._with_capabilities(
-                self._read_incremental(table_name, start_offset, opts, opts["cursor_field"]),
-                opts,
+            return self._stamp_delta_verdict(
+                self._with_capabilities(
+                    self._read_incremental(table_name, start_offset, opts, opts["cursor_field"]),
+                    opts,
+                    table_name,
+                ),
                 table_name,
+                opts,
             )
-        return self._read_snapshot(table_name, opts)
+        return self._stamp_delta_verdict(self._read_snapshot(table_name, opts), table_name, opts)
+
+    def _stamp_delta_verdict(
+        self, result: tuple, table_name: str, table_options: dict | None
+    ) -> tuple:
+        """Thread the definitive ``delta_tracking=auto`` probe verdict into the
+        outgoing offset (``delta_ok``) so a stream that has decided its read
+        shape once never re-decides differently.
+
+        Only the FALLBACK direction needs the stamp: the delta path's own
+        offsets carry ``delta_link``/``next_link`` and the offset-shape check
+        in ``_read_table_dispatch`` routes them back to the delta path
+        regardless of later verdicts. A bare cursor/snapshot offset, though,
+        would let a later batch's re-probe (15-minute shared cache expired +
+        a ``Preference-Applied``-flapping server) flip the stream ONTO the
+        delta path mid-stream — emitting ``_deleted``/``_lc_sequence`` columns
+        the setup-frozen schema never declared; the framework parser drops
+        undeclared columns silently, so a delta tombstone MERGEs as a live
+        all-null-column upsert over good destination values.
+
+        Definitive verdicts only: a transient probe failure leaves
+        ``_delta_capable`` unset and stamps nothing, so a blip can't pin
+        delta off durably (the checkpoint is immortal). A cursor-configured
+        table never probes (cursor wins deterministically) so nothing is
+        stamped there. Explicit ``enabled``/``disabled`` stamps nothing and
+        scrubs an existing flag — the same non-``auto`` reset discipline as
+        the other persisted verdicts. Cost: a snapshot stream under an
+        explicit ``delta_tracking=auto`` pays one extra re-read on the
+        ``{}`` → ``{"delta_ok": False}`` transition, then quiesces as before
+        (the stamp is deterministic per batch)."""
+        records, offset = result
+        if not isinstance(offset, dict):
+            return result
+        if self._delta_setting(table_options) != "auto":
+            if "delta_ok" in offset:
+                return records, {k: v for k, v in offset.items() if k != "delta_ok"}
+            return result
+        key = self._delta_cache_key(table_name, table_options)
+        if key in self._delta_capable and "delta_ok" not in offset:
+            return records, {**offset, "delta_ok": self._delta_capable[key]}
+        return result
 
     def _seed_capability_caches(
         self,
@@ -1576,6 +1659,15 @@ class ODataLakeflowConnect(
             # shared cache so a fixed server gets re-probed.
             memo = self.__dict__.setdefault("_expand_supported", {})
             memo[self._expand_shared_key(table_name, table_options)] = True
+        if isinstance(off.get("delta_ok"), bool) and self._delta_setting(table_options) == "auto":
+            # The stream's OWN persisted delta verdict wins over the shared
+            # cache and the probe: schema/read_table_metadata were frozen at
+            # setup from one verdict, and a re-probe that flips it (15-min
+            # shared cache expired + a Preference-Applied-flapping server)
+            # would emit synthetic columns the declared schema lacks — the
+            # framework parser drops them silently and a delta tombstone
+            # then MERGEs as a live all-null row. See _stamp_delta_verdict.
+            self._delta_capable[self._delta_cache_key(table_name, table_options)] = off["delta_ok"]
 
     def _merge_capability_caches(self, offset: dict, table_name: str | None = None) -> dict:
         """Thread the per-instance OR / $batch / batch-size verdicts into the
@@ -3717,7 +3809,14 @@ class ODataLakeflowConnect(
                     f"client. Check that 'oauth2_refresh_token' was issued by "
                     f"the same 'oauth2_client_id' configured on this "
                     f"connection, and re-run the authorization-code flow if "
-                    f"needed. Server response: {hint}"
+                    f"needed. If the provider ROTATES refresh tokens "
+                    f"(single-use, e.g. Azure AD B2C or Okta with rotation "
+                    f"on) and this connection uses partitioned/parallel "
+                    f"reads, a parallel reader process may have consumed the "
+                    f"rotation this process never saw — use the "
+                    f"client_credentials flow (no refresh token) or "
+                    f"num_partitions=1 with such providers. Server "
+                    f"response: {hint}"
                 ) from None
             raise ValueError(
                 f"OAuth2 token endpoint returned {resp.status_code} for the "
@@ -3844,7 +3943,7 @@ class ODataLakeflowConnect(
             # Stamp with the FILE's fetch time (its mtime), not now() —
             # the process entry must expire when the on-disk one would,
             # or an old document gains a second TTL lease per process.
-            _METADATA_CACHE[self.service_url] = (xml_text, root, index, fetched_at)
+            _metadata_cache_put(self.service_url, (xml_text, root, index, fetched_at))
             return self._metadata
         session = self._get_session()
         url = _join_url(self.service_url, "$metadata")
@@ -3855,7 +3954,7 @@ class ODataLakeflowConnect(
         index = _build_csdl_index(root)
         self._metadata = _MetadataState(root=root, index=index)
         if ttl > 0:
-            _METADATA_CACHE[self.service_url] = (xml_text, root, index, time.time())
+            _metadata_cache_put(self.service_url, (xml_text, root, index, time.time()))
         self._write_metadata_file_cache(xml_text, root)
         return self._metadata
 

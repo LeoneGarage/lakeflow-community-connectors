@@ -123,6 +123,7 @@ def _drop_lb(offset):
         "batch_size_ok",
         "or_filter_ok",
         "expand_ok",
+        "delta_ok",
     }
     return {
         k: v for k, v in (offset or {}).items() if k not in _bookkeeping and not k.startswith("lb_")
@@ -15398,3 +15399,230 @@ def test_cursor_nulls_empty_string_defaults():
     delta_tracking/pagination/expand_contained empty-string handling."""
     c = _make({"token": "t"})
     assert c._parse_cursor_nulls({"cursor_nulls": ""}) == ("coalesce", 2000)
+
+
+# ---------------------------------------------------------------------------
+# Round 37 — park identity both mismatch directions, delta_ok offset pinning,
+# never-pad primary keys, rotation-aware OAuth error, metadata cache cap
+# ---------------------------------------------------------------------------
+
+
+@responses.activate
+def test_ancestor_parked_link_survives_cursor_rendering_flip():
+    """A PK-matched parked chain must NEVER take the strictly-before seek
+    skip. When the parked parent's cursor TEXT changes to a form that sorts
+    before the parked key — a same-instant rendering flip (``…00Z`` →
+    ``…00.000Z``, e.g. a mixed-version load balancer) or a genuine
+    regression — the round-36 identity fell through to the generic skip,
+    dropping the parked link and losing the collection's undrained
+    remainder while running_max committed past it. The fix re-walks the
+    chain in full: duplicate-safe in BOTH mismatch directions."""
+    _mock_nested_metadata()
+    parents = [
+        {"Id": 10, "Name": "2024-01-01T00:00:00Z"},
+        {"Id": 20, "Name": "2024-06-01T00:00:00Z"},
+    ]
+    page1 = [{"Id": 101, "Label": "a"}, {"Id": 102, "Label": "b"}]
+    page2 = [{"Id": 103, "Label": "c"}, {"Id": 104, "Label": "d"}]
+
+    def _parents_cb(req):
+        from urllib.parse import parse_qs, unquote, urlparse
+
+        flt = unquote(parse_qs(urlparse(req.url).query).get("$filter", [""])[0])
+        rows = list(parents)
+        m = re.search(r"Name gt '?([^'&]+?)'?(?:\s|$)", flt)
+        if m:
+            rows = [r for r in rows if r["Name"] > m.group(1)]
+        rows.sort(key=lambda r: (r["Name"], r["Id"]))
+        return (200, {}, json.dumps({"value": rows}))
+
+    def _children10_cb(req):
+        if "%24skiptoken=abc" in req.url or "$skiptoken=abc" in req.url:
+            return (200, {}, json.dumps({"value": page2}))
+        return (
+            200,
+            {},
+            json.dumps(
+                {
+                    "value": page1,
+                    "@odata.nextLink": f"{SERVICE_URL}Parents(10)/Children?$skiptoken=abc",
+                }
+            ),
+        )
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents_cb)
+    responses.add_callback(
+        responses.GET, f"{SERVICE_URL}Parents(10)/Children", callback=_children10_cb
+    )
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(20)/Children",
+        callback=lambda _r: (200, {}, json.dumps({"value": [{"Id": 201, "Label": "e"}]})),
+    )
+    c = _make()
+    opts = {
+        "cursor_field": "Name",  # ancestor level 0
+        "max_records_per_batch": "2",
+        "pagination": "nextlink",
+        "expand_contained": "false",
+    }
+    recs1, offset = c.read_table("Parents__Children", {}, opts)
+    emitted = list(recs1)
+    # Batch 1 drains page 1 (cap) and parks P10 WITH its page-2 link.
+    assert offset.get("parent_keys") == [{"Id": 10}]
+    assert offset.get("chain_next_link")
+
+    # Same instant, new rendering — sorts strictly BEFORE the parked text
+    # in the raw tie-break ('.' < 'Z').
+    parents[0]["Name"] = "2024-01-01T00:00:00.000Z"
+
+    for _ in range(6):
+        recs, offset = c.read_table("Parents__Children", offset, opts)
+        emitted.extend(recs)
+        if set(offset) - {"lb_history", "lb_cycle_started"} == {"cursor"}:
+            break
+    ids = {r["Id"] for r in emitted}
+    # Page 2 must be delivered (duplicates of page 1 are fine).
+    assert {103, 104} <= ids and 201 in ids
+    assert offset["cursor"] == "2024-06-01T00:00:00Z"
+
+
+@responses.activate
+def test_delta_auto_fallback_stamps_delta_ok_into_offset():
+    """A definitive negative delta probe under ``delta_tracking=auto`` pins
+    the fallback decision into the outgoing offset (``delta_ok: false``), so
+    the stream's read shape can't flip later (see the offset-wins test
+    below)."""
+    _mock_metadata()
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        callback=lambda _r: (200, {}, '{"value": [{"Id": 1, "Name": "A", "ModifiedAt": "x"}]}'),
+    )
+    c = _make()
+    records, offset = c.read_table("Customers", {}, {"delta_tracking": "auto"})
+    list(records)
+    assert offset.get("delta_ok") is False
+
+
+@responses.activate
+def test_delta_auto_offset_verdict_wins_over_flapping_server():
+    """An offset carrying ``delta_ok: false`` keeps the stream on the
+    fallback path even when the server NOW acknowledges the delta probe
+    (Preference-Applied flap after the 15-min shared cache expired). Without
+    the pin, the read would flip onto the delta path mid-stream and emit
+    ``_deleted``/``_lc_sequence`` columns the setup-frozen schema never
+    declared — the framework parser drops them silently and a tombstone
+    MERGEs as a live all-null row."""
+    _mock_metadata()
+    prefer_seen = {"n": 0}
+
+    def _cb(request):
+        if request.headers.get("Prefer"):
+            prefer_seen["n"] += 1
+            return (
+                200,
+                {"Preference-Applied": "odata.track-changes"},
+                json.dumps(_delta_bootstrap_body([{"Id": 9, "Name": "Z", "ModifiedAt": "y"}])),
+            )
+        return (200, {}, '{"value": [{"Id": 1, "Name": "A", "ModifiedAt": "x"}]}')
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Customers", callback=_cb)
+    c = _make()
+    records, offset = c.read_table("Customers", {"delta_ok": False}, {"delta_tracking": "auto"})
+    rows = list(records)
+    # Snapshot fallback held: no probe ran, no synthetic columns emitted.
+    assert prefer_seen["n"] == 0
+    assert rows and all("_deleted" not in r and "_lc_sequence" not in r for r in rows)
+    assert offset.get("delta_ok") is False
+
+
+@responses.activate
+def test_delta_ok_scrubbed_on_explicit_setting():
+    """Explicit ``delta_tracking`` (or the disabled default) scrubs a
+    persisted ``delta_ok`` from the outgoing offset — the same non-auto
+    reset discipline as every other verdict, so returning to ``auto``
+    re-probes."""
+    _mock_metadata()
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        callback=lambda _r: (
+            200,
+            {},
+            '{"value": [{"Id": 2, "Name": "B", "ModifiedAt": "2024-05-01T00:00:00Z"}]}',
+        ),
+    )
+    c = _make()
+    records, offset = c.read_table(
+        "Customers",
+        {"cursor": "2024-01-01T00:00:00Z", "delta_ok": False},
+        {"cursor_field": "ModifiedAt"},
+    )
+    list(records)
+    assert "delta_ok" not in offset
+
+
+@responses.activate
+def test_missing_primary_key_not_padded_stays_loud():
+    """The emit-boundary padding must NOT pad primary-key columns: a server
+    never legally omits a KEY (the omit-null rationale can't apply), so a
+    missing one is a broken response that must keep failing loudly in the
+    framework parser — padding it would send a silent null-key row into the
+    destination MERGE."""
+    responses.get(f"{SERVICE_URL}$metadata", body=NONNULL_FLAT_METADATA_XML, status=200)
+    responses.get(f"{SERVICE_URL}Items", json={"value": [{"Opt": "y"}]})  # Id AND Req omitted
+    c = _make({"token": "t"})
+    rows, _ = c.read_table("Items", None, {"pagination": "nextlink"})
+    (row,) = list(rows)
+    # Non-key column padded (omit-null tolerance)…
+    assert row["Req"] is None
+    # …but the PK stays ABSENT so the framework parser still raises.
+    assert "Id" not in row
+
+
+@responses.activate
+def test_oauth_refresh_failure_names_parallel_rotation():
+    """The refresh-grant failure error names concurrent rotation by a
+    parallel reader process as a likely cause (single-use-rotation providers
+    + partitioned reads), so users don't chase a nonexistent credential
+    problem."""
+    responses.post(
+        "https://idp.example.com/token",
+        status=400,
+        json={"error": "invalid_grant"},
+    )
+    _mock_metadata()
+    c = _make(
+        {
+            "auth_type": "oauth2",
+            "oauth2_token_url": "https://idp.example.com/token",
+            "oauth2_client_id": "id",
+            "oauth2_client_secret": "secret",
+            "oauth2_refresh_token": "rt",
+        }
+    )
+    with pytest.raises(ValueError, match="parallel reader.*num_partitions=1"):
+        c.list_tables()
+
+
+def test_metadata_cache_capped_eviction():
+    """The process-wide metadata cache evicts oldest-first beyond its cap,
+    so a long-lived driver serving many distinct services doesn't retain one
+    multi-MB parsed tree per service forever."""
+    from databricks.labs.community_connector.sources.odata import odata as odata_mod
+
+    saved = dict(odata_mod._METADATA_CACHE)
+    odata_mod._METADATA_CACHE.clear()
+    try:
+        cap = odata_mod._METADATA_CACHE_MAX_SERVICES
+        for i in range(cap + 3):
+            odata_mod._metadata_cache_put(f"https://svc{i}/", ("x", None, None, float(i)))
+        assert len(odata_mod._METADATA_CACHE) == cap
+        # The three oldest (0, 1, 2) were evicted; the newest survive.
+        assert f"https://svc{cap + 2}/" in odata_mod._METADATA_CACHE
+        assert "https://svc0/" not in odata_mod._METADATA_CACHE
+        assert "https://svc2/" not in odata_mod._METADATA_CACHE
+    finally:
+        odata_mod._METADATA_CACHE.clear()
+        odata_mod._METADATA_CACHE.update(saved)

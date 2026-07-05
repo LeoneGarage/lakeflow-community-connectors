@@ -3134,6 +3134,10 @@ class ContainedNavMixin:
         # ``_build_expand_continuation_url``). Stashed on ``self`` — like
         # ``self._pagination`` — so it survives into the lazy streaming
         # generator without threading through every flatten call site.
+        # Leans on the framework's serial-calls contract (see the
+        # ``_pagination`` stash in ``_read_table_dispatch``): the lazy
+        # generator is drained before any other entry point runs on this
+        # instance, so nothing can clobber the stash mid-drain.
         self._expand_cont_opts = table_options
         self._expand_cont_since = (start_offset or {}).get("cursor")
         # Per-level property→Edm-type maps for the same recursion (and the
@@ -5207,8 +5211,17 @@ class ContainedNavMixin:
                     # Cursor renderings compare as raw text — a mismatch from a
                     # rendering change (not a real update) just costs a
                     # duplicate-safe re-walk.
-                    at_parked = chain == parked_chain and ancestor_cursor == parked_cursor
-                    if not at_parked and _chain_strictly_before(
+                    pk_match = chain == parked_chain
+                    at_parked = pk_match and ancestor_cursor == parked_cursor
+                    # A PK-matched chain must NEVER take the strictly-before
+                    # skip: when its cursor text changed AND sorts before the
+                    # parked key (same-instant rendering flip, or a genuine
+                    # regression), the generic skip would drop the chain — and
+                    # its parked link — losing the collection's undrained
+                    # remainder while running_max commits past it. Ending the
+                    # seek here re-walks it in full instead: duplicate-safe in
+                    # BOTH mismatch directions, as promised above.
+                    if not pk_match and _chain_strictly_before(
                         _chain_resume_key(chain, ancestor_cursor, cursor_level), parked_key
                     ):
                         parent_idx += 1
