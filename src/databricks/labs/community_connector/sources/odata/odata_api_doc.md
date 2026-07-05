@@ -298,7 +298,7 @@ The connector detects this case: if a resume call started with `prev_delta_link 
 
 ### Token expiry (HTTP 410)
 
-When the server returns 410 Gone on a stored link, the connector recovers silently in two tiers: a 410 on a parked mid-pagination `next_link` first retries the retained prior `delta_link` (replaying only the changes-since window); a 410 on the `delta_link` itself re-bootstraps — a fresh `Prefer: odata.track-changes` GET against the entity set, the full snapshot re-emitted as `_deleted=False` upserts, and a brand-new `delta_link`. MERGE-by-PK at the destination reconciles re-fetched rows with what's already there. Conversely, a server that returns change records with the SAME `@odata.deltaLink` as the prior batch raises a no-progress error (the stream would otherwise re-read that change set forever).
+When the server returns 410 Gone on a stored link, the connector recovers silently in two tiers: a 410 on a parked mid-pagination `next_link` first retries the retained prior `delta_link` (replaying only the changes-since window); a 410 on the `delta_link` itself re-bootstraps — a fresh `Prefer: odata.track-changes` GET against the entity set, the full snapshot re-emitted as `_deleted=False` upserts, and a brand-new `delta_link`. MERGE-by-PK at the destination reconciles re-fetched rows with what's already there. Conversely, a server that returns change records with the SAME `@odata.deltaLink` as the prior batch — or with the terminal delta link omitted entirely — raises a no-progress error (the stream would otherwise re-read that change set forever).
 
 ### Sparse-update rejection
 

@@ -4584,8 +4584,12 @@ def test_pagination_auto_guard_stops_self_referential_link():
 @responses.activate
 def test_delta_walk_guard_stops_self_referential_link():
     """The delta walk guards against a self-referential @odata.nextLink: the
-    server points the continuation back at the same URL. The walk stops after
-    emitting the page and resumes next run from the prior delta_link."""
+    server points the continuation back at the same URL. The self-loop is
+    detected before re-fetching, and — since the broken chain produced
+    records with no advanced change cursor — the no-progress guard raises
+    rather than emitting the same records against the same offset forever
+    (round-30: previously this returned rows + the unchanged prior link,
+    which was byte-for-byte the infinite-churn shape)."""
     _mock_metadata()
     calls = []
 
@@ -4604,13 +4608,12 @@ def test_delta_walk_guard_stops_self_referential_link():
 
     responses.add_callback(responses.GET, DELTA_LINK_V1, callback=cb)
     c = _make()
-    records, offset = c.read_table(
-        "Customers", {"delta_link": DELTA_LINK_V1}, {"delta_tracking": "enabled"}
-    )
-    rows = list(records)
-    assert [r["Id"] for r in rows] == [10]
+    with pytest.raises(RuntimeError, match="no terminal @odata.deltaLink"):
+        records, _ = c.read_table(
+            "Customers", {"delta_link": DELTA_LINK_V1}, {"delta_tracking": "enabled"}
+        )
+        list(records)
     assert len(calls) == 1  # self-loop detected before re-fetching
-    assert _drop_lb(offset) == {"delta_link": DELTA_LINK_V1}
 
 
 @responses.activate
@@ -11517,7 +11520,12 @@ def test_expand_contained_auto_falls_back_when_expand_ignored():
     c = _make()
     recs, offset = c.read_table(PROBE_TABLE, {"cursor": since}, dict(_EXPAND_AUTO_OPTS))
     assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs] == [(1, 10, 1001)]
-    assert offset.get("expand_ok") is False
+    # Round-30: the FAIL never rides the checkpoint (offsets are immortal —
+    # a baked-in false would skip the preflight even after the server is
+    # fixed). It lives in the TTL'd shared cache instead, like
+    # cursor_probe_ok.
+    assert "expand_ok" not in offset
+    assert c._cached_capability("expand_ok", table_name=PROBE_TABLE) is False
     # Fallback hydrated via per-parent GETs.
     assert any(
         call.request.method == "GET" and "Mids(10)/Leaves" in call.request.url
@@ -11549,12 +11557,25 @@ def test_expand_contained_auto_definitive_4xx_falls_back_and_persists():
     c = _make()
     recs, offset = c.read_table(PROBE_TABLE, {"cursor": since}, dict(_EXPAND_AUTO_OPTS))
     assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs] == [(1, 10, 1001)]
-    assert offset.get("expand_ok") is False
-    # A recreated reader seeded with the False verdict never retries $expand.
+    # Round-30: the fail is persisted in the TTL'd shared cache, never the
+    # checkpoint — offsets are immortal, and a baked-in false would skip the
+    # preflight even after the server is fixed.
+    assert "expand_ok" not in offset
+    assert c._cached_capability("expand_ok", table_name=PROBE_TABLE) is False
+    # A recreated reader consults the shared cache and never retries $expand.
     n_before = len(responses.calls)
     c2 = _make()
     list(c2.read_table(PROBE_TABLE, offset, dict(_EXPAND_AUTO_OPTS))[0])
     assert not any("$expand" in unquote(call.request.url) for call in responses.calls[n_before:])
+    # Once the cached fail expires (TTL / process restart), a fresh reader
+    # RE-PROBES — exactly the recovery a fixed server needs.
+    from databricks.labs.community_connector.sources.odata.odata import _clear_capability_cache
+
+    _clear_capability_cache()
+    n_before = len(responses.calls)
+    c3 = _make()
+    list(c3.read_table(PROBE_TABLE, offset, dict(_EXPAND_AUTO_OPTS))[0])
+    assert any("$expand" in unquote(call.request.url) for call in responses.calls[n_before:])
 
 
 @responses.activate
@@ -13406,8 +13427,18 @@ def test_leaf_cursor_walk_keyset_seek_guid_boundary_bare():
         if f"ContactId gt {_GUID2}" in url:  # correctly-typed bare seek
             return (200, {}, json.dumps({"value": []}))
         if "ContactId gt" in url:  # quoted seek — server would 400; loop the page
-            return (200, {}, json.dumps({"value": [{"ContactId": _GUID2, "ModifiedAt": "2020-06-01T00:00:00Z"}]}))
-        return (200, {}, json.dumps({"value": [{"ContactId": _GUID2, "ModifiedAt": "2020-06-01T00:00:00Z"}]}))
+            return (
+                200,
+                {},
+                json.dumps(
+                    {"value": [{"ContactId": _GUID2, "ModifiedAt": "2020-06-01T00:00:00Z"}]}
+                ),
+            )
+        return (
+            200,
+            {},
+            json.dumps({"value": [{"ContactId": _GUID2, "ModifiedAt": "2020-06-01T00:00:00Z"}]}),
+        )
 
     responses.add_callback(
         responses.GET, f"{SERVICE_URL}Accounts({_GUID})/Contacts", callback=_contacts_cb
@@ -13548,9 +13579,7 @@ def test_latest_offset_honours_pagination_option():
     c = _make()
     with pytest.raises(ValueError, match="pagination"):
         c.latest_offset("Accounts__Contacts", {"cursor_field": "Name", "pagination": "bogus"})
-    off = c.latest_offset(
-        "Accounts__Contacts", {"cursor_field": "Name", "pagination": "nextlink"}
-    )
+    off = c.latest_offset("Accounts__Contacts", {"cursor_field": "Name", "pagination": "nextlink"})
     assert off == {"cursor": "2020-06-01T00:00:00Z"}
     assert c._pagination == "nextlink"
 
@@ -13565,7 +13594,12 @@ def test_partition_discovery_rejects_null_cursor_parents():
     responses.get(f"{SERVICE_URL}$metadata", body=GUID_CURSOR_METADATA_XML, status=200)
     responses.get(
         f"{SERVICE_URL}Accounts",
-        json={"value": [{"AccountId": _GUID, "Name": "2020-06-01T00:00:00Z"}, {"AccountId": _GUID2, "Name": None}]},
+        json={
+            "value": [
+                {"AccountId": _GUID, "Name": "2020-06-01T00:00:00Z"},
+                {"AccountId": _GUID2, "Name": None},
+            ]
+        },
         match_querystring=False,
     )
     c = _make()
@@ -13748,9 +13782,9 @@ def test_tombstone_keys_from_id_shapes():
     assert c._tombstone_keys_from_id(
         "Orders(OrderID=1,Lang='en''x')", ["OrderID", "Lang"], types
     ) == {"OrderID": 1, "Lang": "en'x"}
-    assert c._tombstone_keys_from_id(
-        f"https://x/svc/Accounts({_GUID})?x=1", ["G"], types
-    ) == {"G": _GUID}
+    assert c._tombstone_keys_from_id(f"https://x/svc/Accounts({_GUID})?x=1", ["G"], types) == {
+        "G": _GUID
+    }
     assert c._tombstone_keys_from_id("Customers('A,B')", ["Id"], {}) == {"Id": "A,B"}
     assert c._tombstone_keys_from_id("Customers", ["Id"], {}) is None
     assert c._tombstone_keys_from_id("Orders(OrderID=1)", ["OrderID", "Lang"], types) is None
@@ -13782,9 +13816,7 @@ def test_delta_next_link_410_falls_back_to_retained_delta_link():
     assert [r["Id"] for r in list(records)] == [9]
     assert _drop_lb(offset) == {"delta_link": DELTA_LINK_V2}
     # The plain entity-set bootstrap GET never happened.
-    assert not any(
-        call.request.url.rstrip("/").endswith("Customers") for call in responses.calls
-    )
+    assert not any(call.request.url.rstrip("/").endswith("Customers") for call in responses.calls)
 
 
 @responses.activate
@@ -13863,3 +13895,169 @@ def test_connection_int_options_curated_validation():
     ):
         with pytest.raises(ValueError, match=key):
             ODataLakeflowConnect({"service_url": SERVICE_URL, key: bad})
+
+
+# ---------------------------------------------------------------------------
+# Round-30 fixes: per-user cache hardening, verdict reset paths, pass-only
+# expand_ok, root-wins typing, Edm.Stream delta exclusion
+# ---------------------------------------------------------------------------
+
+
+def test_cache_paths_are_per_user_and_reader_checks_ownership(monkeypatch, tmp_path):
+    """Both tempdir caches previously sat at predictable world-writable paths
+    keyed only by service_url — the pickle one feeds pickle.load (arbitrary
+    code execution if pre-planted by another local user), the JSON one could
+    force an unverified $expand read. Paths now embed the owner tag, and the
+    readers refuse foreign-owned files."""
+    from databricks.labs.community_connector.sources.odata import odata as odata_mod
+
+    tag = odata_mod._cache_owner_tag()
+    assert f"_{tag}_" in odata_mod._metadata_cache_path(SERVICE_URL)
+    assert f"_{tag}_" in odata_mod._capability_cache_path(SERVICE_URL)
+
+    # Wiring: a file the ownership check rejects is never unpickled.
+    c = _make()
+    path = odata_mod._metadata_cache_path(SERVICE_URL)
+    import pickle as _pickle
+    from xml.etree import ElementTree as _ET
+
+    with open(path, "wb") as fh:
+        _pickle.dump((METADATA_XML, _ET.fromstring(METADATA_XML)), fh)
+    try:
+        monkeypatch.setattr(odata_mod, "_cache_file_owned_by_us", lambda p: False)
+        assert c._read_metadata_file_cache() is None
+        monkeypatch.setattr(odata_mod, "_cache_file_owned_by_us", lambda p: True)
+        assert c._read_metadata_file_cache() is not None
+    finally:
+        import os as _os
+
+        _os.remove(path)
+
+
+def test_or_filter_ok_scrubbed_on_explicit_nonconsuming_pagination():
+    """`or_filter_ok` previously had NO reset path — a wrongly-false verdict
+    (e.g. persisted by a pre-typed-seek build's quoted-guid probe) pinned the
+    fragile $skip walk forever. An explicit pagination mode that never
+    consumes the verdict (skip / nextlink) now scrubs it, giving checkpoints
+    an escape hatch."""
+    c = _make()
+    off = {"cursor": "x", "or_filter_ok": False}
+    c.__dict__["_or_filter_ok"] = False
+    assert c._scrub_nonauto_verdicts(dict(off), {"pagination": "skip"}) == {"cursor": "x"}
+    assert "_or_filter_ok" not in c.__dict__  # instance memo cleared too
+    c.__dict__["_or_filter_ok"] = False
+    assert c._scrub_nonauto_verdicts(dict(off), {"pagination": "nextlink"}) == {"cursor": "x"}
+    # Modes that CONSUME the verdict keep it.
+    assert c._scrub_nonauto_verdicts(dict(off), {"pagination": "keyset"})["or_filter_ok"] is False
+    assert c._scrub_nonauto_verdicts(dict(off), {"pagination": "auto"})["or_filter_ok"] is False
+    assert c._scrub_nonauto_verdicts(dict(off), {})["or_filter_ok"] is False
+
+
+def test_expand_ok_offset_carries_pass_only():
+    """The checkpoint is immortal, so only the PASS may ride it: a memoized
+    fail must stay out of the outgoing offset, and a poisoned checkpoint's
+    ``expand_ok: false`` must not seed the memo (the preflight re-runs)."""
+    c = _make()
+    key = c._expand_shared_key("Roots__Mids__Leaves", None)
+    c.__dict__["_expand_supported"] = {key: False}
+    assert "expand_ok" not in c._merge_capability_caches({"cursor": "y"}, key)
+    c.__dict__["_expand_supported"] = {key: True}
+    assert c._merge_capability_caches({"cursor": "y"}, key)["expand_ok"] is True
+    # Seed side: a false from an old (pre-fix) checkpoint is ignored.
+    c2 = _make()
+    c2._seed_capability_caches(
+        "Roots__Mids__Leaves", None, {"cursor": "x", "expand_ok": False}
+    )
+    assert not c2.__dict__.get("_expand_supported")
+    c2._seed_capability_caches("Roots__Mids__Leaves", None, {"cursor": "x", "expand_ok": True})
+    assert c2.__dict__["_expand_supported"] == {key: True}
+
+
+REDECLARE_METADATA_XML = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="R" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Base">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="V" Type="Edm.Int32"/>
+      </EntityType>
+      <EntityType Name="Derived" BaseType="R.Base">
+        <Property Name="V" Type="Edm.String"/>
+      </EntityType>
+      <EntityContainer Name="C">
+        <EntitySet Name="Deriveds" EntityType="R.Derived"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+
+@responses.activate
+def test_edm_types_root_wins_matching_schema_resolution():
+    """On (spec-forbidden) redeclaring metadata the literal-typing map must
+    agree with the SCHEMA resolver (closest-to-root wins) — a seek boundary
+    quoted for the leaf declaration while the schema parses the root type
+    would desync the wire filter from the declared column."""
+    responses.get(f"{SERVICE_URL}$metadata", body=REDECLARE_METADATA_XML, status=200)
+    c = _make()
+    assert c._edm_types_for_table("Deriveds", None)["V"] == "Edm.Int32"
+    schema = c.get_table_schema("Deriveds", {})
+    (v_field,) = [f for f in schema.fields if f.name == "V"]
+    assert v_field.dataType == IntegerType()
+
+
+STREAM_METADATA_XML = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="S" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Doc">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="Name" Type="Edm.String"/>
+        <Property Name="Content" Type="Edm.Stream"/>
+      </EntityType>
+      <EntityContainer Name="C">
+        <EntitySet Name="Docs" EntityType="S.Doc"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+
+@responses.activate
+def test_delta_stream_property_not_expected_in_payload():
+    """Edm.Stream values are media references the JSON payload never carries
+    (§11.2.4): the sparse-entity guard must not demand them — pre-fix every
+    healthy entity on a stream-bearing type failed delta with a misleading
+    'partial updates' error. A genuinely sparse entity still raises."""
+    responses.get(f"{SERVICE_URL}$metadata", body=STREAM_METADATA_XML, status=200)
+    delta_link = f"{SERVICE_URL}Docs?$deltatoken=t1"
+    responses.add(
+        responses.GET,
+        delta_link,
+        json={
+            "value": [{"Id": 1, "Name": "ok"}],  # no Content — always absent
+            "@odata.deltaLink": f"{SERVICE_URL}Docs?$deltatoken=t2",
+        },
+    )
+    c = _make()
+    records, _ = c.read_table("Docs", {"delta_link": delta_link}, {"delta_tracking": "enabled"})
+    (row,) = list(records)
+    assert row["Id"] == 1 and row["_deleted"] is False
+
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Docs?$deltatoken=t2",
+        json={
+            "value": [{"Id": 2}],  # missing Name — genuinely sparse
+            "@odata.deltaLink": f"{SERVICE_URL}Docs?$deltatoken=t3",
+        },
+    )
+    with pytest.raises(RuntimeError, match="missing"):
+        records, _ = c.read_table(
+            "Docs", {"delta_link": f"{SERVICE_URL}Docs?$deltatoken=t2"}, {"delta_tracking": "enabled"}
+        )
+        list(records)

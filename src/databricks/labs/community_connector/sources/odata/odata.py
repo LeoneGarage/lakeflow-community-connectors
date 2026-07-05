@@ -406,10 +406,41 @@ _RETRYABLE_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
 _LOG = logging.getLogger(__name__)
 
 
+def _cache_owner_tag() -> str:
+    """Per-user tag baked into every tempdir cache filename. The system
+    tempdir is world-writable on multi-user hosts and both cache paths are
+    otherwise predictable (digest of ``service_url`` only) — another local
+    user could pre-create the file. For the CSDL cache that file feeds
+    ``pickle.load`` (arbitrary code execution); for the capability JSON it
+    could force an unverified ``$expand`` read. A per-user filename plus the
+    ownership check in the readers closes both."""
+    try:
+        return str(os.getuid())
+    except AttributeError:  # Windows — no uid; fall back to the login name
+        import getpass
+
+        try:
+            return getpass.getuser()
+        except Exception:  # noqa: BLE001 — cache tag must never fail
+            return "user"
+
+
+def _cache_file_owned_by_us(path: str) -> bool:
+    """Whether ``path`` is owned by the current uid (POSIX). On platforms
+    without ``os.getuid`` the per-user filename is the only guard."""
+    try:
+        return os.stat(path).st_uid == os.getuid()
+    except AttributeError:
+        return True
+    except OSError:
+        return False
+
+
 def _metadata_cache_path(service_url: str) -> str:
-    """Tempdir path for the pickled CSDL of ``service_url``."""
+    """Tempdir path for the pickled CSDL of ``service_url`` (per-user —
+    see :func:`_cache_owner_tag`)."""
     digest = hashlib.sha256(service_url.encode("utf-8")).hexdigest()[:16]
-    return os.path.join(tempfile.gettempdir(), f"odata_csdl_{digest}.pickle")
+    return os.path.join(tempfile.gettempdir(), f"odata_csdl_{_cache_owner_tag()}_{digest}.pickle")
 
 
 def _clear_metadata_cache() -> None:
@@ -509,9 +540,10 @@ _CAPABILITY_LOCK = _PicklableRLock()
 
 
 def _capability_cache_path(service_url: str) -> str:
-    """Tempdir path for the capability-verdict JSON of ``service_url``."""
+    """Tempdir path for the capability-verdict JSON of ``service_url``
+    (per-user — see :func:`_cache_owner_tag`)."""
     digest = hashlib.sha256(service_url.encode("utf-8")).hexdigest()[:16]
-    return os.path.join(tempfile.gettempdir(), f"odata_caps_{digest}.json")
+    return os.path.join(tempfile.gettempdir(), f"odata_caps_{_cache_owner_tag()}_{digest}.json")
 
 
 def _capability_cache_flush(service_url: str, payload: str) -> None:
@@ -562,6 +594,13 @@ def _capability_cache_load(service_url: str) -> dict:
         return entry  # stale on disk — ignore it (process entry stands)
     if _CAPABILITY_DISK_MTIME.get(path) == mtime:
         return entry  # already merged this exact disk state
+    if not _cache_file_owned_by_us(path):
+        # A foreign-owned file at our (predictable) cache path is not ours to
+        # trust: a poisoned ``expand_ok: true`` would force an UNVERIFIED
+        # $expand read — the deep-row-loss case the preflight exists to
+        # prevent. The per-user filename already makes this unreachable in
+        # practice; defense-in-depth backstop.
+        return entry
     try:
         with open(path, "r", encoding="utf-8") as fh:  # blocking read, lock-free
             disk = json.load(fh)
@@ -1363,9 +1402,14 @@ class ODataLakeflowConnect(
             self.__dict__["_batch_supported"] = bool(off["batch_ok"])
         if "batch_size_ok" in off:
             self.__dict__["_batch_size_cap"] = int(off["batch_size_ok"])
-        if "expand_ok" in off:
+        if off.get("expand_ok"):
+            # PASS verdicts only — by design the offset never carries a fail
+            # (see _merge_capability_caches), and a checkpoint poisoned with
+            # ``expand_ok: false`` by a pre-fix build must not seed a memo
+            # that skips the preflight forever; fails live in the 15-minute
+            # shared cache so a fixed server gets re-probed.
             memo = self.__dict__.setdefault("_expand_supported", {})
-            memo[self._expand_shared_key(table_name, table_options)] = bool(off["expand_ok"])
+            memo[self._expand_shared_key(table_name, table_options)] = True
 
     def _merge_capability_caches(self, offset: dict, table_name: str | None = None) -> dict:
         """Thread the per-instance OR / $batch / batch-size verdicts into the
@@ -1389,8 +1433,13 @@ class ODataLakeflowConnect(
         if "_batch_size_cap" in self.__dict__ and "batch_size_ok" not in offset:
             add["batch_size_ok"] = self.__dict__["_batch_size_cap"]
         expand_memo = self.__dict__.get("_expand_supported") or {}
-        if table_name in expand_memo and "expand_ok" not in offset:
-            add["expand_ok"] = expand_memo[table_name]
+        if expand_memo.get(table_name) is True and "expand_ok" not in offset:
+            # The PASS only. A fail baked into the checkpoint would be
+            # immortal (offsets never expire) and skip the preflight even
+            # after the server is fixed — fails belong in the 15-minute
+            # shared cache, exactly like ``cursor_probe_ok`` (the README's
+            # "the offset only ever carries the pass" contract).
+            add["expand_ok"] = True
         return {**offset, **add} if add else offset
 
     def _cached_capability(self, key: str, table_name: str | None = None):
@@ -1438,10 +1487,20 @@ class ODataLakeflowConnect(
         if cp_mode != "auto":
             drop.add("cursor_probe_ok")
         # ``expand_contained`` owns the nested-$expand verdict (``expand_ok``):
-        # an explicit ``true``/``false`` (or the unset ``false`` default)
-        # scrubs it so a later switch to ``auto`` re-runs the preflight.
+        # an explicit ``true``/``false`` scrubs it so a later switch back to
+        # ``auto`` (the unset DEFAULT, which keeps the verdict) re-runs the
+        # preflight.
         if self._expand_contained_mode(table_options) != "auto":
             drop.add("expand_ok")
+        # ``pagination`` owns the OR-across-columns keyset verdict
+        # (``or_filter_ok``): an explicit mode that never CONSUMES it
+        # (``skip`` pages positionally, ``nextlink`` follows server links)
+        # scrubs it — this is also the user's only escape hatch for a
+        # wrongly-false verdict persisted by an old checkpoint (pin
+        # ``pagination=skip`` for one batch, then unpin), since the offset
+        # copy otherwise never expires.
+        if (table_options or {}).get("pagination", "").strip().lower() in ("skip", "nextlink"):
+            drop.add("or_filter_ok")
         batch_live = self._contained_fetch_is_auto(table_options) or (
             cp_mode == "auto" and not self._contained_fetch_forces_single(table_options)
         )
@@ -1458,9 +1517,13 @@ class ODataLakeflowConnect(
         # separately and unconditionally by ``_purge_nonauto_table_verdicts``
         # (table-scoped, so it also safely covers the bare-offset snapshot /
         # batch-reader paths this offset scrub can't see).
-        recorded_batch = drop & {"batch_ok", "batch_size_ok"} & offset.keys()
-        if recorded_batch:
-            _capability_cache_drop(self.service_url, recorded_batch)
+        recorded_server_wide = drop & {"batch_ok", "batch_size_ok", "or_filter_ok"} & offset.keys()
+        if recorded_server_wide:
+            _capability_cache_drop(self.service_url, recorded_server_wide)
+        if "or_filter_ok" in drop:
+            # Also clear the instance memo so THIS read doesn't keep consuming
+            # the verdict it just scrubbed from the outgoing offset.
+            self.__dict__.pop("_or_filter_ok", None)
         return {k: v for k, v in offset.items() if k not in drop}
 
     def _purge_nonauto_table_verdicts(self, table_name: str, table_options: dict | None) -> None:
@@ -1778,32 +1841,35 @@ class ODataLakeflowConnect(
                 offset["delta_link"] = prev_delta_link
             return iter(records), offset
 
-        if new_delta_link is None:
-            # Reached end of stream without a deltaLink. Server is
+        if new_delta_link is None and prev_delta_link is None:
+            # Bootstrap reached end of stream without a deltaLink. Server is
             # misbehaving (spec requires the terminal page to carry one).
-            # Resume from the prior delta_link if we have one — better
-            # than losing the offset entirely.
-            if prev_delta_link is not None:
-                return iter(records), {"delta_link": prev_delta_link}
             raise RuntimeError(
                 f"OData delta bootstrap for {table_name!r} ended without an "
                 f"@odata.deltaLink. The server may have aborted change "
                 f"tracking. Set delta_tracking=disabled to fall back to "
                 f"snapshot or cursor-based reads."
             )
-
-        if records and prev_delta_link is not None and new_delta_link == prev_delta_link:
-            # Change records came back but the deltaLink did not advance:
-            # every future trigger would re-fetch the SAME change set forever
+        if prev_delta_link is not None and (
+            new_delta_link is None or new_delta_link == prev_delta_link
+        ):
+            # ``records`` is non-empty here: the empty-record cases returned
+            # above (Graph-rotation guard / cap park). Change records with a
+            # change cursor that OMITTED the terminal link or did NOT advance
+            # both mean every future trigger re-fetches the SAME set forever
             # (MERGE dedupes, but the stream churns without progressing).
             # Mirror the cursor paths' no-progress raise instead of looping.
+            shape = (
+                "no terminal @odata.deltaLink"
+                if new_delta_link is None
+                else "the SAME @odata.deltaLink as the prior batch"
+            )
             raise RuntimeError(
                 f"OData delta read for {table_name!r} returned {len(records)} "
-                f"change records but the SAME @odata.deltaLink as the prior "
-                f"batch — the server is not advancing its change cursor, so "
-                f"the stream would re-read this change set forever. Set "
-                f"delta_tracking=disabled and use cursor-based incremental "
-                f"instead."
+                f"change records but {shape} — the server is not advancing "
+                f"its change cursor, so the stream would re-read this change "
+                f"set forever. Set delta_tracking=disabled and use "
+                f"cursor-based incremental instead."
             )
         return iter(records), {"delta_link": new_delta_link}
 
@@ -2165,16 +2231,22 @@ class ODataLakeflowConnect(
     ) -> frozenset:
         """The key set every non-tombstone delta entity must carry: the
         declared schema for the table, less any selection imposed by
-        ``$select`` and less the synthetic ``_deleted`` / ``_lc_sequence``
-        columns we add ourselves. Computed once per delta walk and passed
-        into the per-item :meth:`_check_no_sparse_entity`."""
+        ``$select``, less the synthetic ``_deleted`` / ``_lc_sequence``
+        columns we add ourselves, and less any ``Edm.Stream`` properties —
+        stream values are media references the JSON payload NEVER carries
+        (§11.2.4), so demanding them would fail every healthy entity with
+        the sparse-entity error's wrong "partial updates" diagnosis.
+        Computed once per delta walk and passed into the per-item
+        :meth:`_check_no_sparse_entity`."""
+        namespace = (table_options or {}).get("namespace")
         select = (table_options or {}).get("select")
         if select:
             expected = {c.strip() for c in select.split(",") if c.strip()}
         else:
-            namespace = (table_options or {}).get("namespace")
             expected = {f.name for f in self._fields_for(table_name, namespace)}
-        return frozenset(expected - {_DELETED_COL, _SEQUENCE_COL})
+        edm_types = self._edm_types_for_table(table_name, namespace)
+        streams = {name for name, t in edm_types.items() if t == "Edm.Stream"}
+        return frozenset(expected - {_DELETED_COL, _SEQUENCE_COL} - streams)
 
     def _check_no_sparse_entity(
         self,
@@ -3419,6 +3491,13 @@ class ODataLakeflowConnect(
             return None
         if time.time() - mtime > self.metadata_cache_ttl_seconds:
             return None
+        if not _cache_file_owned_by_us(path):
+            # NEVER unpickle a file another uid put at our (predictable)
+            # cache path — unpickling is arbitrary code execution, and the
+            # shape check below runs after the damage. The per-user filename
+            # already makes this unreachable in practice; this is the
+            # defense-in-depth backstop.
+            return None
         try:
             with open(path, "rb") as fh:
                 payload = pickle.load(fh)
@@ -3709,7 +3788,11 @@ class ODataLakeflowConnect(
 
     def _edm_types_for_et(self, et: ET.Element) -> dict[str, str]:
         """Declared property → Edm-type map over the base-type chain
-        (closest-to-leaf declaration wins, matching field resolution).
+        (closest-to-ROOT declaration wins, matching ``_own_fields_for_et``
+        — the SCHEMA resolver: the seek/predicate literal must be quoted
+        for the type the schema declares and the framework parser expects,
+        so on (spec-forbidden) redeclaring metadata the two must not
+        diverge).
 
         Feeds ``odata_literal_typed`` at the key-predicate / keyset-seek
         render sites: the OData JSON payload delivers ``Edm.Guid`` (and, on
@@ -3723,7 +3806,9 @@ class ODataLakeflowConnect(
         if cached is not None:
             return cached
         result: dict[str, str] = {}
-        for type_el in self._resolve_base_chain(et):
+        # ``reversed``: root-first, first declaration wins — the same
+        # direction ``_own_fields_for_et`` resolves the schema with.
+        for type_el in reversed(self._resolve_base_chain(et)):
             for prop in type_el.findall(f"{_NS_EDM}Property"):
                 name = prop.get("Name")
                 if name and name not in result:
