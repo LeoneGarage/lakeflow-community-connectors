@@ -111,20 +111,22 @@ def _make(options=None):
 
 def _drop_lb(offset):
     """Strip non-logical bookkeeping from an offset for stable equality asserts:
-    the ``auto`` cursor_lookback history (``lb_history``, non-deterministic
+    the ``auto`` cursor_lookback state (every ``lb_*`` key — the duration
+    history and the in-flight cycle anchor, both non-deterministic
     wall-clock) and the persisted capability verdicts (``cursor_probe_ok`` /
     ``batch_ok`` / ``batch_size_ok`` / ``or_filter_ok``, one-time-set markers
     threaded across microbatches). Tests assert the cursor/resume state, not this
     bookkeeping — mirrors the no-progress comparison in ``_finalize_cursor_read``."""
     _bookkeeping = {
-        "lb_history",
         "cursor_probe_ok",
         "batch_ok",
         "batch_size_ok",
         "or_filter_ok",
         "expand_ok",
     }
-    return {k: v for k, v in (offset or {}).items() if k not in _bookkeeping}
+    return {
+        k: v for k, v in (offset or {}).items() if k not in _bookkeeping and not k.startswith("lb_")
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -4178,11 +4180,12 @@ def test_cursor_lookback_auto_attach_history():
         "cursor": "X",
         "lb_history": [7, 0.000000123],
     }
-    # in-flight carries the prior history unchanged
-    assert c._attach_lookback_state({"pending_fetches": []}, {"lb_history": [9]}, True, 0.0) == {
-        "pending_fetches": [],
-        "lb_history": [9],
-    }
+    # in-flight carries the prior history unchanged and stamps the cycle
+    # anchor (wall clock; exact value asserted in the dedicated cycle-span
+    # test) so completion can measure the whole capped cycle
+    in_flight = c._attach_lookback_state({"pending_fetches": []}, {"lb_history": [9]}, True, 0.0)
+    assert in_flight["pending_fetches"] == [] and in_flight["lb_history"] == [9]
+    assert isinstance(in_flight["lb_cycle_started"], float)
     # idle (out is the same object as start) -> untouched
     start = {"cursor": "X", "lb_history": [7]}
     assert c._attach_lookback_state(start, start, False, 5.0) is start
@@ -13228,23 +13231,34 @@ def test_leaf_empty_completion_clears_foreign_expand_keys():
 
 
 @responses.activate
-def test_ancestor_cursor_explicit_lookback_raises():
+def test_ancestor_cursor_explicit_lookback_floors_enumeration():
     """An explicit ``cursor_lookback_seconds`` on an ANCESTOR-level
-    ``cursor_field`` used to silently no-op (the window only floors the
-    leaf/expand read filters). It must refuse instead."""
+    ``cursor_field`` floors the ancestor ENUMERATION filter (it used to be
+    rejected as a no-op — but re-enumerating recently-dirty ancestors
+    re-reads their whole subtrees, which is exactly the duplicate-safe
+    overlap this walk needs). Committed watermark 2020-01-01T00:00:00Z with
+    a 3600s window must put ``gt 2019-12-31T23:00:00Z`` on the wire."""
+    from urllib.parse import unquote
+
     _mock_probe_metadata()
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]}, match_querystring=False)
+    responses.get(f"{SERVICE_URL}Roots(1)/Mids", json={"value": []}, match_querystring=False)
     c = _make()
-    with pytest.raises(ValueError, match="ANCESTOR"):
-        c.read_table(
-            PROBE_TABLE,
-            {"cursor": "2020-01-01T00:00:00Z"},
-            {
-                "cursor_field": "MidOnly",  # lives on Mids — an ancestor level
-                "cursor_lookback_seconds": "3600",
-                "expand_contained": "false",
-                "cursor_probe": "false",
-            },
-        )
+    rows, _ = c.read_table(
+        PROBE_TABLE,
+        {"cursor": "2020-01-01T00:00:00Z"},
+        {
+            "cursor_field": "MidOnly",  # lives on Mids — an ancestor level
+            "cursor_lookback_seconds": "3600",
+            "expand_contained": "false",
+            "cursor_probe": "false",
+        },
+    )
+    list(rows)
+    mids_urls = [
+        unquote(call.request.url) for call in responses.calls if "/Mids" in call.request.url
+    ]
+    assert mids_urls and all("MidOnly gt 2019-12-31T23:00:00Z" in u for u in mids_urls)
 
 
 @responses.activate
@@ -15036,7 +15050,7 @@ def test_batch_subresponse_error_body_under_200_reissued():
         match_querystring=False,
     )
     c = _make()
-    recs, _ = c.read_table("Parents__Kids" if False else "Parents__Children", {}, {"expand_contained": "false"})
+    recs, _ = c.read_table("Parents__Children", {}, {"expand_contained": "false"})
     ids = sorted(r["Id"] for r in recs)
     assert ids == [11, 22]  # parent 2 recovered via plain GET, not dropped
 
@@ -15105,3 +15119,282 @@ def test_non_delta_read_pads_omitted_nonnullable_property():
     # And the padded row parses against the (non-nullable Req) schema.
     parsed = parse_value(row, schema)
     assert parsed["Id"] == 2 and parsed["Req"] is None
+
+
+# ---------------------------------------------------------------------------
+# Round 36 — parked-parent cursor advance, expand-mode leaf select,
+# redirect error surfacing, $batch value-list gate, lookback cycle span,
+# option-parse hygiene
+# ---------------------------------------------------------------------------
+
+
+@responses.activate
+def test_ancestor_walk_parked_parent_cursor_advance_rewalked():
+    """A cap-parked parent whose ANCESTOR cursor advanced between batches must
+    be re-walked in full at its new enumeration position — PK-only park
+    matching skipped it (exclusive park) or resumed its stale mid-page link,
+    and the batch's running_max then committed past the parent's new cursor,
+    locking its updated subtree out of every future ``cursor gt`` filter:
+    permanent silent loss on the most common churn shape (only the parked
+    parent changes between triggers)."""
+    _mock_nested_metadata()
+    parents = [
+        {"Id": 10, "Name": "2024-01-01T00:00:00Z"},
+        {"Id": 20, "Name": "2024-06-01T00:00:00Z"},
+    ]
+    children = {
+        10: [{"Id": 101, "Label": "v1"}, {"Id": 102, "Label": "v1"}],
+        20: [{"Id": 201, "Label": "v1"}],
+    }
+
+    def _parents_cb(req):
+        from urllib.parse import parse_qs, unquote, urlparse
+
+        flt = unquote(parse_qs(urlparse(req.url).query).get("$filter", [""])[0])
+        rows = list(parents)
+        m = re.search(r"Name gt '?([^'&]+?)'?(?:\s|$)", flt)
+        if m:
+            rows = [r for r in rows if r["Name"] > m.group(1)]
+        rows.sort(key=lambda r: (r["Name"], r["Id"]))
+        return (200, {}, json.dumps({"value": rows}))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents_cb)
+    for pid in (10, 20):
+        responses.add_callback(
+            responses.GET,
+            f"{SERVICE_URL}Parents({pid})/Children",
+            callback=lambda _r, pid=pid: (200, {}, json.dumps({"value": children[pid]})),
+        )
+    c = _make()
+    opts = {
+        "cursor_field": "Name",  # lives on Parents — ancestor level 0
+        "max_records_per_batch": "2",
+        "pagination": "nextlink",
+        "expand_contained": "false",
+    }
+    recs1, off1 = c.read_table("Parents__Children", {}, opts)
+    rows1 = list(recs1)
+    # Batch 1 drains P10 (2 rows = cap) and parks it exclusively.
+    assert off1.get("parent_keys") == [{"Id": 10}]
+
+    # Between batches ONLY the parked parent churns: cursor advances,
+    # children updated. No other chain enumerates between its old and new
+    # position, so a PK-only seek would skip it outright.
+    parents[0]["Name"] = "2024-03-01T00:00:00Z"
+    children[10] = [{"Id": 101, "Label": "v2"}, {"Id": 102, "Label": "v2"}]
+
+    emitted = list(rows1)
+    offset = off1
+    for _ in range(4):  # bounded: cap=2 → at most 4 batches to quiesce
+        recs, offset = c.read_table("Parents__Children", offset, opts)
+        emitted.extend(recs)
+        if set(offset) - {"lb_history", "lb_cycle_started"} == {"cursor"}:
+            break
+    got = {(r["Id"], r["Label"]) for r in emitted}
+    # The updated subtree must be re-emitted (duplicate-safe), never lost.
+    assert {(101, "v2"), (102, "v2"), (201, "v1")} <= got
+    # And the final watermark is the true max.
+    assert offset["cursor"] == "2024-06-01T00:00:00Z"
+
+
+@responses.activate
+def test_expand_url_user_select_lands_on_leaf_clause_not_top():
+    """The ``select`` option is LEAF-scoped (docs, schema derivation, and the
+    N+1 path all agree) — in expand mode it must ride the innermost
+    ``$expand(...)`` clause, not the top segment's URL, where a leaf-only
+    column 400s the server and a cross-level name silently mis-projects."""
+    _mock_nested_metadata()
+    c = _make()
+    url = c._build_expand_url(["Parents", "Children"], {"select": "Id,Label", "page_size": "100"})
+    top, expand_clause = url.split("$expand=", 1)
+    assert "$select" not in top
+    assert "$select=Id,Label" in expand_clause
+
+
+@responses.activate
+def test_expand_url_user_select_merges_with_cursor_select_at_leaf():
+    """When a cursor projection targets the leaf level too, the user's leaf
+    ``select`` merges with it — deduped, user's order first."""
+    _mock_nested_metadata()
+    c = _make()
+    url = c._build_expand_url(
+        ["Parents", "Children"],
+        {"select": "Id,Label"},
+        cursor_level=1,
+        cursor_filter="ModifiedAt gt 2020-01-01T00:00:00Z",
+        cursor_order="ModifiedAt asc,Id asc",
+        cursor_select="ModifiedAt,Label",
+    )
+    expand_clause = url.split("$expand=", 1)[1]
+    assert "$select=Id,Label,ModifiedAt" in expand_clause
+
+
+@responses.activate
+def test_token_endpoint_redirect_curated_error():
+    """A 3xx from the OAuth2 token endpoint (allow_redirects=False) must
+    surface as a curated config error naming the Location — not fall through
+    to resp.json() on the empty redirect body and mis-diagnose as
+    "malformed JSON … escalate to the identity provider"."""
+    responses.post(
+        "https://idp.example.com/token",
+        status=301,
+        headers={"Location": "https://idp.example.com/v2/token"},
+    )
+    _mock_metadata()
+    c = _make(
+        {
+            "auth_type": "oauth2",
+            "oauth2_token_url": "https://idp.example.com/token",
+            "oauth2_client_id": "id",
+            "oauth2_client_secret": "secret",
+        }
+    )
+    with pytest.raises(ValueError, match="redirect.*oauth2_token_url|oauth2_token_url"):
+        c.list_tables()
+
+
+@responses.activate
+def test_data_url_3xx_without_location_curated_error():
+    """A 3xx the same-origin follow loop can't act on (no Location header)
+    must raise naming the status — not flow onward and die as a bare
+    'Expecting value' JSON parse error on the empty body."""
+    _mock_metadata()
+    responses.add(responses.GET, f"{SERVICE_URL}Customers", status=302)
+    c = _make({"token": "t"})
+    with pytest.raises(RuntimeError, match="HTTP 302 without a followable"):
+        rows, _ = c.read_table("Customers", None, {"pagination": "nextlink"})
+        list(rows)
+
+
+@responses.activate
+def test_batch_subresponse_dict_without_value_reissued():
+    """A 200 $batch sub-response whose dict body has NEITHER "value" NOR
+    "error" (an OData-v2-style {"d": …} gateway shape, a JSON proxy page)
+    drained to rows=[] — a silent parent skip the cursor walk then advances
+    past. Every sub-request is a collection GET, so a drainable body is
+    exactly one whose "value" is a LIST; anything else is re-issued."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}, {"Id": 2}]})
+
+    def _cb(request):
+        out = []
+        for r in json.loads(request.body)["requests"]:
+            if "Parents(1)/Children" in r["url"]:
+                out.append({"id": r["id"], "status": 200, "body": {"value": [{"Id": 11}]}})
+            else:
+                # v2-gateway shape: success status, no "value", no "error".
+                out.append(
+                    {"id": r["id"], "status": 200, "body": {"d": {"results": [{"Id": 999}]}}}
+                )
+        return (200, {}, json.dumps({"responses": out}))
+
+    responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=_cb)
+    responses.get(
+        f"{SERVICE_URL}Parents(2)/Children",
+        json={"value": [{"Id": 22}]},
+        match_querystring=False,
+    )
+    c = _make()
+    recs, _ = c.read_table("Parents__Children", {}, {"expand_contained": "false"})
+    ids = sorted(r["Id"] for r in recs)
+    assert ids == [11, 22]  # parent 2 recovered via plain GET, not dropped
+
+
+@responses.activate
+def test_batch_subresponse_null_value_reissued():
+    """{"value": null} (non-list value) used to crash the drain loudly
+    (TypeError iterating None); it is now re-issued as a plain GET like every
+    other undrainable body."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}, {"Id": 2}]})
+
+    def _cb(request):
+        out = []
+        for r in json.loads(request.body)["requests"]:
+            if "Parents(1)/Children" in r["url"]:
+                out.append({"id": r["id"], "status": 200, "body": {"value": [{"Id": 11}]}})
+            else:
+                out.append({"id": r["id"], "status": 200, "body": {"value": None}})
+        return (200, {}, json.dumps({"responses": out}))
+
+    responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=_cb)
+    responses.get(
+        f"{SERVICE_URL}Parents(2)/Children",
+        json={"value": [{"Id": 22}]},
+        match_querystring=False,
+    )
+    c = _make()
+    recs, _ = c.read_table("Parents__Children", {}, {"expand_contained": "false"})
+    assert sorted(r["Id"] for r in recs) == [11, 22]
+
+
+def test_lookback_history_records_cycle_span_not_final_batch(monkeypatch):
+    """A capped walk spanning several batches must record the WHOLE cycle's
+    wall-clock span (first capped batch to completion, trigger intervals
+    included) into lb_history — the churn-exposure window of the cycle is the
+    full span, not the final batch's drain time. In-flight batches stamp
+    lb_cycle_started once; completion consumes and clears it."""
+    c = _make()
+    now = {"t": 1000.0}
+    monkeypatch.setattr(time, "time", lambda: now["t"])
+    # Batch 1 (capped, walk took 5s): anchors the cycle at 995.0.
+    out1 = c._attach_lookback_state({"parent_idx": 1}, {}, True, 5.0)
+    assert out1["lb_cycle_started"] == 995.0
+    # Batch 2 (still capped, later trigger): anchor carried unchanged.
+    now["t"] = 1300.0
+    out2 = c._attach_lookback_state({"parent_idx": 2}, out1, True, 3.0)
+    assert out2["lb_cycle_started"] == 995.0
+    # Completion at t=1600 with a 2s final drain: records the 605s span
+    # (1600 - 995), not 2s, and drops the anchor from the offset.
+    now["t"] = 1600.0
+    out3 = c._attach_lookback_state({"cursor": "x"}, out2, False, 2.0)
+    assert out3["lb_history"] == [605.0]
+    assert "lb_cycle_started" not in out3
+    # Single-batch walk (no anchor): records its own elapsed as before.
+    out4 = c._attach_lookback_state({"cursor": "y"}, {"cursor": "x"}, False, 2.5)
+    assert out4["lb_history"] == [2.5]
+
+
+def test_api_key_header_stripped_and_empty_defaults():
+    """A padded api_key_header is stripped (requests raises an uncurated
+    InvalidHeader on whitespace); an explicitly-empty one falls back to the
+    documented x-api-key default instead of an empty header name."""
+    c = _make({"auth_type": "api_key", "api_key": "k", "api_key_header": " X-My-Key "})
+    assert c._get_session().headers["X-My-Key"] == "k"
+    c2 = _make({"auth_type": "api_key", "api_key": "k", "api_key_header": ""})
+    assert c2._get_session().headers["x-api-key"] == "k"
+
+
+def test_api_key_header_invalid_raises_curated():
+    """Garbage header names fail fast with the option named, not at first
+    request deep inside requests."""
+    c = _make({"auth_type": "api_key", "api_key": "k", "api_key_header": "bad header"})
+    with pytest.raises(ValueError, match="api_key_header"):
+        c._get_session()
+
+
+@responses.activate
+def test_select_star_keeps_full_schema():
+    """``select=*`` is valid OData (§11.2.4.2.1: all structural properties)
+    and passes option validation — the schema must stay unfiltered too. The
+    literal-name filter used to drop every non-FK column (flat tables then
+    failed the non-empty-schema check outright)."""
+    _mock_metadata()
+    c = _make({"token": "t"})
+    schema = c.get_table_schema("Customers", {"select": "*"})
+    assert [f.name for f in schema.fields] == ["Id", "Name", "ModifiedAt"]
+
+
+def test_verbose_http_logging_strict_parse():
+    """Enum-strict like every other option: a typo'd "1"/"yes" would
+    otherwise silently mean OFF — the opposite of what a triaging user
+    asked for."""
+    with pytest.raises(ValueError, match="verbose_http_logging"):
+        _make({"token": "t", "verbose_http_logging": "1"})
+
+
+def test_cursor_nulls_empty_string_defaults():
+    """cursor_nulls="" means unset → coalesce default, consistent with
+    delta_tracking/pagination/expand_contained empty-string handling."""
+    c = _make({"token": "t"})
+    assert c._parse_cursor_nulls({"cursor_nulls": ""}) == ("coalesce", 2000)

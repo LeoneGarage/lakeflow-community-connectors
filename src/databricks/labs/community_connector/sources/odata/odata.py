@@ -1072,9 +1072,15 @@ class ODataLakeflowConnect(
         # snippet) to the module logger. The body snippet is the
         # source's response data, so enabling this emits source rows
         # into pipeline logs; turn it on only for triage.
-        self.verbose_http_logging = (
-            options.get("verbose_http_logging") or "false"
-        ).strip().lower() == "true"
+        verbose_raw = (options.get("verbose_http_logging") or "false").strip().lower()
+        if verbose_raw not in ("true", "false"):
+            # Strict like every other enum option — a typo'd "1"/"yes" would
+            # otherwise silently mean OFF, the opposite of what the user
+            # asked for while triaging.
+            raise ValueError(
+                f"Invalid verbose_http_logging={verbose_raw!r}: expected 'true' or 'false'."
+            )
+        self.verbose_http_logging = verbose_raw == "true"
         # How many chars of the response body to include in each INFO
         # log line when ``verbose_http_logging`` is on. Default 500.
         self.verbose_http_log_body_chars = _parse_conn_int(
@@ -1184,10 +1190,16 @@ class ODataLakeflowConnect(
         select = (table_options or {}).get("select")
         if select:
             wanted = {c.strip() for c in select.split(",")}
-            # ``select`` filters leaf columns only; FK columns survive.
-            segments = self._table_segments(table_name) or [table_name]
-            fk_names = set(self._resolve_fk_columns(segments, namespace).values())
-            fields = [f for f in fields if f.name in fk_names or f.name in wanted]
+            # ``$select=*`` means every structural property (OData v4
+            # §11.2.4.2.1) — the wire is unprojected, so the schema must be
+            # too. Without this, no field is literally named ``*`` and the
+            # filter below would silently drop every non-FK column (flat
+            # tables then fail the non-empty-schema check outright).
+            if "*" not in wanted:
+                # ``select`` filters leaf columns only; FK columns survive.
+                segments = self._table_segments(table_name) or [table_name]
+                fk_names = set(self._resolve_fk_columns(segments, namespace).values())
+                fields = [f for f in fields if f.name in fk_names or f.name in wanted]
         # Contained path + cursor_field lives on an ancestor → propagate
         # the ancestor's cursor column type onto the leaf schema. The
         # incremental read path stamps the value onto each emitted row.
@@ -1259,8 +1271,10 @@ class ODataLakeflowConnect(
         # properties from the JSON — without the pad the first such row would
         # hard-fail the whole batch with a cryptic framework error (the delta
         # path already pads tombstones for the same reason; this extends it to
-        # every read shape). ``get_table_schema`` is memoized, so this is a
-        # dict lookup after the first call.
+        # every read shape). ``get_table_schema`` itself isn't memoized, but
+        # everything it reads (metadata bundle, field cache, capability
+        # verdicts) is — this call rebuilds the schema from cached parts with
+        # no I/O after the first call.
         field_names = tuple(f.name for f in self.get_table_schema(table_name, table_options).fields)
 
         def _emit(row: dict) -> dict:
@@ -1311,16 +1325,17 @@ class ODataLakeflowConnect(
         # the read's duration (like ``_pagination``); the floor is applied
         # only to the read filter (``_apply_cursor_lookback``), never to the
         # committed offset. Applies to every contained cursor-read path —
-        # ``expand_contained=true``, the N+1 leaf-cursor walk, and the
-        # ``cursor_probe`` hydrate — each of which self-sizes the ``auto``
-        # window from its measured walk duration. No-op for non-timestamp
-        # cursors.
+        # ``expand_contained=true``, the N+1 leaf-cursor walk, the
+        # ``cursor_probe`` hydrate, and the ancestor-cursor walk (floored at
+        # the ancestor enumeration filter) — each of which self-sizes the
+        # ``auto`` window from its measured walk/cycle duration. No-op for
+        # non-timestamp cursors.
         self._cursor_lookback = self._parse_cursor_lookback(opts)
         # ``auto`` tuning knobs (ignored for static/off modes).
         self._cursor_lookback_factor = self._parse_cursor_lookback_factor(opts)
         self._cursor_lookback_max_seconds = self._parse_cursor_lookback_ceiling(opts)
-        # Resolved per-read in the expand-cursor path (see
-        # ``_read_contained_expand``); stays 0 for every other read.
+        # Resolved per-read by each contained cursor-read path; stays 0 for
+        # every other read.
         self._active_lookback_seconds = 0
         # Only an EXPLICIT positive window is validated against the read
         # config — the default ``auto`` is a no-op outside the expand-cursor
@@ -1333,12 +1348,12 @@ class ODataLakeflowConnect(
         ):
             raise ValueError(
                 "cursor_lookback_seconds (an explicit value) is supported "
-                "only with a LEAF-level cursor_field on a contained path — it "
-                "floors the read filter for the non-atomic "
-                "expand_contained=true walk and the leaf-cursor N+1 / "
-                "cursor_probe walk. (An ancestor-level cursor_field is "
-                "rejected at read time — that walk has no leaf read filter "
-                "to floor.) Use 'auto' (default) or 'off' for other read "
+                "only with a cursor_field on a contained path — it floors "
+                "the read filter for the non-atomic expand_contained=true "
+                "walk, the leaf-cursor N+1 / cursor_probe walk, and the "
+                "ancestor-cursor walk (where it floors the ancestor "
+                "enumeration filter, re-reading recently-dirty subtrees). "
+                "Use 'auto' (default) or 'off' for other read "
                 "configurations."
             )
         # A user ``select`` must keep the columns the machinery depends on.
@@ -3275,6 +3290,21 @@ class ODataLakeflowConnect(
             )
             self._log_http_response(method, url, resp)
             if not resp.is_redirect:
+                if 300 <= resp.status_code < 400:
+                    # A 3xx the follow loop can't act on (no ``Location``
+                    # header, or a non-redirect 3xx like 300/304 — the
+                    # connector never sends conditional headers, so a 304 is
+                    # as anomalous as any other). Left to flow onward it dies
+                    # much later as a bare JSON/XML parse error on the empty
+                    # body with zero HTTP context; name the status here
+                    # instead.
+                    raise RuntimeError(
+                        f"OData request to {url!r} returned HTTP "
+                        f"{resp.status_code} without a followable same-origin "
+                        f"redirect Location — the connector cannot act on it. "
+                        f"Check the service URL and any proxy in front of "
+                        f"the service."
+                    )
                 return resp
             target = urljoin(url, resp.headers.get("Location", ""))
             self._require_same_origin(target)  # off-origin → PermissionError
@@ -3535,7 +3565,18 @@ class ODataLakeflowConnect(
                 _require(self.options, "password"),
             )
         elif auth_type == "api_key":
-            header = self.options.get("api_key_header", "x-api-key")
+            # Strip and default-on-empty: a padded or explicitly-empty
+            # value would otherwise raise requests' uncurated
+            # ``InvalidHeader`` deep inside the first request. Validate the
+            # rest as an RFC 7230 header token so garbage fails here, with
+            # the option named, not at send time.
+            header = (self.options.get("api_key_header") or "").strip() or "x-api-key"
+            if not re.fullmatch(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+", header):
+                raise ValueError(
+                    f"Invalid api_key_header={header!r}: not a valid HTTP "
+                    f"header name (letters, digits, and !#$%&'*+-.^_`|~ "
+                    f"only, no spaces)."
+                )
             session.headers[header] = _require(self.options, "api_key")
         elif auth_type == "oauth2":
             # Two sub-modes share this branch:
@@ -3640,6 +3681,27 @@ class ODataLakeflowConnect(
                 time.sleep(self._retry_after_delay(resp, attempt))
                 continue
             break
+        if 300 <= resp.status_code < 400:
+            # ``allow_redirects=False`` above surfaces the redirect here —
+            # following it would re-POST the ``client_secret`` body to the
+            # redirect target. Without this branch it falls past the >=400
+            # ladder into ``resp.json()`` on the (empty) redirect body and
+            # mis-diagnoses as "malformed JSON … escalate to the identity
+            # provider". The Location value is safe to print (a URL the
+            # provider chose to advertise; no credentials in it).
+            location = (resp.headers.get("Location") or "").strip()
+            raise ValueError(
+                f"OAuth2 token endpoint {token_url!r} responded with a "
+                f"redirect (HTTP {resp.status_code}"
+                + (f" to {location!r}" if location else "")
+                + "). The connector does not follow token-endpoint "
+                "redirects — that would re-send the client credentials to "
+                "the redirect target. Update 'oauth2_token_url' to the "
+                "endpoint's canonical URL"
+                + (f" (likely {location!r})" if location else "")
+                + " and check for an http:// URL that the provider "
+                "upgrades to https://."
+            )
         # Surface a precise, actionable error when the token endpoint
         # itself rejects the request. raise_for_status() would otherwise
         # produce a terse "401 Client Error: Unauthorized for url ..."
@@ -4392,30 +4454,57 @@ class ODataLakeflowConnect(
         ``_resolve_active_lookback`` sizes the window from its max.
 
         * In-flight (the walk spans more cap-resume batches): carry the prior
-          history unchanged so the read floor stays stable until completion.
+          history unchanged so the read floor stays stable until completion,
+          and stamp ``lb_cycle_started`` (wall-clock epoch, set once at the
+          cycle's first batch) so completion can measure the WHOLE cycle.
         * Idled (``out_offset is start_offset`` — quiescent overlap re-read):
           keep the prior history; a quiescent walk only re-reads the small
           overlap and would under-represent a real walk.
-        * Completed a progressing walk: append this batch's wall-clock
-          ``elapsed`` (rounded to nanoseconds, capped to the last N).
+        * Completed a progressing walk: append the cycle's wall-clock span —
+          ``now - lb_cycle_started`` when the walk spanned multiple capped
+          batches (the churn-exposure window of a capped cycle is the full
+          span INCLUDING the trigger intervals between batches, so sizing
+          from one batch's drain time alone under-covers it), else this
+          batch's ``elapsed`` (rounded to nanoseconds, capped to the last N).
           Sub-second walks ARE recorded — on a small/fast source the
           mid-walk-arrival window is itself sub-second, so a sub-second
           overlap is exactly what recovers rows that landed just below the
           committed watermark; the old whole-second rounding floored those to
           a zero window and stranded them. Idle/empty batches never reach
           here (``out_offset is start_offset``), so only real walks are
-          captured — never a no-op zero.
+          captured — never a no-op zero. A pathological multi-hour cycle
+          can't blow the window up: ``_resolve_active_lookback`` clamps to
+          ``cursor_lookback_max_seconds``.
         """
         if getattr(self, "_cursor_lookback", "auto") != "auto":
             return out_offset
         if out_offset is start_offset:
             return out_offset
         history = list((start_offset or {}).get("lb_history") or [])
-        if not in_flight:
-            measured = round(elapsed, 9)
-            if measured > 0:
-                history.append(measured)
-                history = history[-_LOOKBACK_AUTO_WINDOW:]
+        cycle_started = (start_offset or {}).get("lb_cycle_started")
+        if in_flight:
+            out = {k: v for k, v in out_offset.items() if k != "lb_cycle_started"}
+            if cycle_started is None:
+                # First capped batch of a cycle: anchor at this batch's start
+                # (wall clock; ``elapsed`` is a duration, safe to subtract).
+                cycle_started = round(time.time() - elapsed, 3)
+            out["lb_cycle_started"] = cycle_started
+            if history:
+                out["lb_history"] = history
+            return out
+        measured = round(elapsed, 9)
+        if cycle_started is not None:
+            try:
+                # Multi-batch cycle: the exposure span is first-batch start to
+                # now. ``max`` guards a skewed/stepped wall clock — never
+                # record less than the final batch's own walk.
+                measured = max(measured, round(time.time() - float(cycle_started), 9))
+            except (TypeError, ValueError):
+                pass
+        if measured > 0:
+            history.append(measured)
+            history = history[-_LOOKBACK_AUTO_WINDOW:]
+        out_offset = {k: v for k, v in out_offset.items() if k != "lb_cycle_started"}
         if not history:
             return out_offset
         return {**out_offset, "lb_history": history}
@@ -4482,7 +4571,10 @@ class ODataLakeflowConnect(
         (default ``2000``). The year suffix is only valid with
         ``coalesce``. Raises on an unrecognised mode or a malformed year.
         """
-        raw = (table_options or {}).get("cursor_nulls", "coalesce").strip().lower()
+        # ``or``-defaulting (not ``.get`` default) so an explicitly-empty
+        # value means "unset" — consistent with delta_tracking / pagination /
+        # expand_contained, which all treat "" as their default.
+        raw = ((table_options or {}).get("cursor_nulls") or "coalesce").strip().lower()
         mode, _, floor = raw.partition(":")
         mode = mode.strip()
         if mode not in ("coalesce", "error", "ignore"):

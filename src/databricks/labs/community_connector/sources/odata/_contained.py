@@ -1347,13 +1347,21 @@ class ContainedNavMixin:
         namespace = (table_options or {}).get("namespace")
         opts = table_options or {}
         has_children = start_level < len(segments) - 1
-        # The table's ``filter`` option is the leaf filter — same as N+1
-        # mode, where it lands at the leaf URL — so strip it from the
-        # start-level query params when there are deeper levels. It re-enters
-        # at the innermost ``$expand(...)`` clause below. Without this split,
-        # ``filter="Id eq 3"`` on a ``Instances__Projects`` table would land
-        # at Instances (wrong segment) and 400 the server.
-        top_opts = {k: v for k, v in opts.items() if k != "filter"} if has_children else dict(opts)
+        # The table's ``filter`` and ``select`` options are LEAF-scoped —
+        # same as N+1 mode, where they land at the leaf URL, and same as the
+        # schema derivation / option validation, which resolve them against
+        # the leaf entity type — so strip both from the start-level query
+        # params when there are deeper levels. They re-enter at the innermost
+        # ``$expand(...)`` clause below. Without this split, ``filter="Id eq
+        # 3"`` (or ``select="Id,Label"``) on a ``Instances__Projects`` table
+        # would land at Instances (wrong segment): a leaf-only column 400s
+        # the server, and a name shared across levels silently projects the
+        # TOP entity while the leaf comes back unprojected.
+        top_opts = (
+            {k: v for k, v in opts.items() if k not in ("filter", "select")}
+            if has_children
+            else dict(opts)
+        )
         if per_level_tops is not None:
             # Override page_size in the opts dict ``_format_query_params``
             # reads from, so the start-level ``$top`` reflects the dynamic
@@ -1374,6 +1382,7 @@ class ContainedNavMixin:
         if not has_children:
             return f"{base}?{query}"
         user_leaf_filter = opts.get("filter")
+        user_leaf_select = opts.get("select")
         inner = ""
         for i in range(len(segments) - 1, start_level, -1):
             is_leaf = i == len(segments) - 1
@@ -1386,8 +1395,17 @@ class ContainedNavMixin:
                 segment_filters.get(i),
                 user_leaf_filter if is_leaf else None,
             )
-            if cursor_level == i and cursor_select:
-                parts.append(f"$select={cursor_select}")
+            level_select = cursor_select if cursor_level == i and cursor_select else None
+            if is_leaf and user_leaf_select:
+                # Leaf-scoped user projection, merged (deduped, user order
+                # first) with any cursor projection targeting the same level.
+                merged = [c.strip() for c in user_leaf_select.split(",") if c.strip()]
+                for col in (level_select or "").split(","):
+                    if col.strip() and col.strip() not in merged:
+                        merged.append(col.strip())
+                level_select = ",".join(merged)
+            if level_select:
+                parts.append(f"$select={level_select}")
             if level_filter:
                 parts.append(f"$filter={level_filter}")
             level_order = self._expand_level_order_by(
@@ -2382,15 +2400,18 @@ class ContainedNavMixin:
         body = resp.get("body") if isinstance(resp, dict) else None
         # A <400 sub-response the drains can't read is re-fetched as a plain
         # GET (so ``_fetch_page_payload`` parses it properly) rather than
-        # dropping the parent. Two undrainable shapes:
-        #   * body isn't a JSON object (a string — the JSON-batch spec's form
-        #     for non-JSON media — or absent): ``body.get("value")`` is N/A.
-        #   * body is a dict carrying an OData ``error`` envelope but no
-        #     ``value``: a spec-violating "success status, error body" reply
-        #     drains to ``rows = []`` and the cursor walk advances past it.
-        # An empty-collection 200 legitimately carries ``{"value": []}`` (a
-        # dict WITH ``value``), so it passes through untouched.
-        undrainable_body = not isinstance(body, dict) or ("value" not in body and "error" in body)
+        # dropping the parent. Every sub-request this connector issues is a
+        # COLLECTION GET (both ``$batch`` producers build URLs via
+        # ``_build_contained_url``), so a drainable body is exactly a JSON
+        # object whose ``value`` is a LIST. Anything else — a string body
+        # (the JSON-batch spec's form for non-JSON media), an OData ``error``
+        # envelope behind a success status, a v2-style ``{"d": …}`` gateway
+        # shape (no ``value`` at all — the drains would silently take
+        # ``rows = []`` and the cursor walk would advance past the parent),
+        # or ``{"value": null}`` / a non-list ``value`` (the drains would
+        # crash iterating it) — is re-issued. An empty-collection 200
+        # (``{"value": []}``) passes through untouched.
+        undrainable_body = not isinstance(body, dict) or not isinstance(body.get("value"), list)
         if not bad_status and not undrainable_body:
             return resp
         _LOG.warning(
@@ -3727,9 +3748,10 @@ class ContainedNavMixin:
         """``(cursor_level, $filter, $orderby, $select)`` for ``$expand``
         mode. Returns ``(-1, None, None, None)`` when no cursor is set;
         the caller raises if the cursor isn't a property of any segment.
-        ``$select`` is non-empty only when the cursor lives on a non-top
-        segment — it forces the server to project the cursor column on
-        the expanded ancestor (some servers default-omit it)."""
+        The ``$select`` slot is always ``None`` today (see the comment
+        below) but stays in the tuple: ``_build_expand_url`` merges it
+        into the cursor level's clause, and the leaf level additionally
+        merges the user's leaf-scoped ``select`` option."""
         if not cursor_field:
             return -1, None, None, None
         cursor_level = self._find_cursor_level(segments, namespace, cursor_field)
@@ -4728,21 +4750,6 @@ class ContainedNavMixin:
                 use_batch=use_batch,
                 persist_batch_ok=persist_batch_ok,
             )
-        if isinstance(self._cursor_lookback, int) and self._cursor_lookback > 0:
-            # Only resolvable HERE: option validation can't see $metadata, so
-            # it can't tell a leaf-level cursor_field from an ancestor-level
-            # one. The ancestor-cursor walk re-reads the whole subtree of any
-            # ancestor with cursor > since — there is no leaf read filter for
-            # a lookback window to floor, so an explicit window would
-            # silently do nothing. Refuse instead of no-op.
-            raise ValueError(
-                f"cursor_lookback_seconds (an explicit value) has no effect "
-                f"when cursor_field={cursor_field!r} lives on an ANCESTOR "
-                f"level of {table_name!r} (the ancestor-cursor walk re-reads "
-                f"each dirty ancestor's whole subtree; there is no leaf read "
-                f"filter to floor). Use 'auto' (default) or 'off', or move "
-                f"the cursor to a leaf-level field."
-            )
         return self._read_contained_incremental_ancestor_cursor(
             table_name, segments, start_offset, table_options, cursor_field, cursor_level
         )
@@ -5071,11 +5078,25 @@ class ContainedNavMixin:
         construction, so a within-chain ``cursor gt`` rebuild would
         either re-fetch the whole chain or skip the whole chain — there
         is no meaningful split.
+
+        The lookback floor applies to the ANCESTOR enumeration filter
+        (``cursor gt <since - window>``): re-enumerating recently-dirty
+        ancestors re-reads their whole subtrees, which is exactly the
+        duplicate-safe recovery this walk needs — a parent updated
+        mid-cycle whose cursor lands below the cycle's final
+        ``running_max`` is otherwise excluded by ``cursor gt
+        <watermark>`` forever. The committed watermark is never floored
+        (``_ancestor_cursor_offset`` folds true stamped maxes), and the
+        floor stays stable across a capped cycle's batches because the
+        ``auto`` history is carried unchanged while in-flight.
         """
         namespace = (table_options or {}).get("namespace")
         since = (start_offset or {}).get("cursor")
+        self._active_lookback_seconds = self._resolve_active_lookback(start_offset)
+        read_since = self._apply_cursor_lookback(since)
+        walk_start = time.monotonic()
         chains_iter = self._iter_parent_chains_with_cursor(
-            segments, namespace, table_options, cursor_level, cursor_field, since
+            segments, namespace, table_options, cursor_level, cursor_field, read_since
         )
         segment_filters = resolve_segment_filters(table_options, segments)
         walk_state = self._walk_ancestor_chains(
@@ -5091,11 +5112,17 @@ class ContainedNavMixin:
             parked_chain=(start_offset or {}).get("parent_keys"),
             parked_cursor=(start_offset or {}).get("parent_cursor"),
             cursor_level=cursor_level,
+            # New-rows-only cap accounting keys on the COMMITTED watermark,
+            # never the floored read filter — overlap re-reads don't burn cap.
             count_floor=since,
         )
+        walk_elapsed = time.monotonic() - walk_start
         end_offset = self._ancestor_cursor_offset(walk_state, start_offset, since, cursor_field)
-        return self._finalize_cursor_read(
+        records, out_offset = self._finalize_cursor_read(
             start_offset, end_offset, walk_state["emitted"], table_name, cursor_field
+        )
+        return records, self._attach_lookback_state(
+            out_offset, start_offset, walk_state["truncated"], walk_elapsed
         )
 
     def _walk_ancestor_chains(
@@ -5168,7 +5195,19 @@ class ContainedNavMixin:
             use_link = False
             if parked_key is not None:
                 if seeking:
-                    at_parked = chain == parked_chain
+                    # Park identity is PK **and** cursor: a parked parent whose
+                    # cursor advanced between batches is NOT "the parked chain"
+                    # any more — it re-enumerates at its new (later) position
+                    # and must be re-walked in full there, because the server
+                    # is saying its subtree changed since we drained it. PK-only
+                    # matching would skip it (exclusive park) or resume its
+                    # STALE mid-page link (link park), and either way this
+                    # batch's ``running_max`` then commits past its new cursor,
+                    # so ``cursor gt <watermark>`` locks the update out forever.
+                    # Cursor renderings compare as raw text — a mismatch from a
+                    # rendering change (not a real update) just costs a
+                    # duplicate-safe re-walk.
+                    at_parked = chain == parked_chain and ancestor_cursor == parked_cursor
                     if not at_parked and _chain_strictly_before(
                         _chain_resume_key(chain, ancestor_cursor, cursor_level), parked_key
                     ):

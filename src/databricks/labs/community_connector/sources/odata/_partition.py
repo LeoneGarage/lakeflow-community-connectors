@@ -348,7 +348,8 @@ class PartitionMixin(SupportsPartitionedStream):
         # Same emit-boundary treatment as read_table: pad each row to the
         # declared schema (so a server that omits a null-valued non-nullable
         # property doesn't hard-fail the framework parser) then JSON-render
-        # structured values. ``get_table_schema`` is memoized.
+        # structured values. ``get_table_schema`` rebuilds from memoized
+        # parts — no I/O after the first call.
         field_names = tuple(f.name for f in self.get_table_schema(table_name, opts).fields)
 
         def _emit(row):
