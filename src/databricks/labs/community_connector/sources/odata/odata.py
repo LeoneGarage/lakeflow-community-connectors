@@ -357,7 +357,11 @@ _SEQUENCE_COUNTER = _SequenceCounter()
 # layer exactly like the on-disk one: entries expire after the TTL and
 # a TTL of 0 disables the layer entirely. Without the stamp a
 # long-running driver would serve the same parsed ``$metadata`` forever
-# regardless of the configured TTL.
+# regardless of the configured TTL. Deliberately lock-free (unlike the
+# capability cache, whose entries are MERGED read-modify-write under
+# ``_CAPABILITY_LOCK``): entries here are immutable tuples swapped
+# whole, and the worst race — two threads observing an expired entry —
+# costs a duplicate fetch, never a torn value.
 _METADATA_CACHE: dict[str, tuple[str, ET.Element, "_CsdlIndex", float]] = {}
 
 # On-disk CSDL cache. PySpark's Python Data Source forks a fresh
@@ -370,6 +374,18 @@ _METADATA_CACHE: dict[str, tuple[str, ET.Element, "_CsdlIndex", float]] = {}
 # first. The TTL is short so subsequent pipeline triggers pick up
 # upstream schema changes; per-trigger we still pay one fresh fetch.
 _METADATA_FILE_CACHE_TTL_SECONDS = 60
+
+# Rotated OAuth2 refresh tokens, keyed by
+# ``(token_url, client_id, ORIGINAL refresh token as supplied on the
+# connection)``. Providers with single-use rotation revoke the old token
+# on every refresh — but SDP constructs a FRESH connector from the
+# connection's original options on every load/microbatch, so an
+# instance-local write-back would replay the revoked original next batch
+# and hard-fail the stream. Keying by the original supplied value lets
+# every recreated instance find the latest rotation; chained rotations
+# update the same entry. Plain dict ops (GIL-atomic) — worst race is two
+# refreshes where one rotation wins, exactly the provider-side reality.
+_ROTATED_REFRESH_TOKENS: dict[tuple[str, str, str], str] = {}
 
 # Network-level exceptions treated as transient by ``_http_get``'s retry
 # loop. ``ConnectionError`` covers TCP resets, DNS failures, and remote
@@ -464,13 +480,31 @@ def _replace_with_private_tmp(path: str, data: bytes) -> bool:
     at (the tempdir is world-writable on multi-user hosts). Best-effort:
     returns ``False`` on any OSError, ``True`` once ``os.replace`` lands."""
     tmp = f"{path}.{os.getpid()}.{os.urandom(4).hex()}.tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    # O_BINARY: without it the Windows CRT applies text-mode LF→CRLF
+    # translation to the fd, corrupting the pickle/JSON bytes (readers
+    # then fail closed — a silent permanent cache miss, not corruption).
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
     try:
         fd = os.open(tmp, flags, 0o600)
     except OSError:
         return False
     try:
-        with os.fdopen(fd, "wb") as fh:
+        fh = os.fdopen(fd, "wb")
+    except OSError:
+        os.close(fd)  # fdopen failed to take ownership — don't leak the fd
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+    try:
+        with fh:
             fh.write(data)
         os.replace(tmp, path)
         return True
@@ -742,6 +776,13 @@ def _clear_capability_cache() -> None:
         pass
 
 
+def _clear_rotated_refresh_tokens() -> None:
+    """Clear the process-wide rotated-refresh-token stash. Tests use this
+    between cases that reuse the same token endpoint / client id with
+    different mocked rotation behaviours."""
+    _ROTATED_REFRESH_TOKENS.clear()
+
+
 @dataclass
 class _CsdlIndex:
     """One-time index of a parsed CSDL document.
@@ -932,7 +973,12 @@ def _next_sequence() -> str:
     ``apply_changes`` matches the underlying numeric ordering. The
     nanosecond timestamp tracks wall-clock so values stay ordered
     across process restarts (latest data wins per key); the counter
-    breaks ties for records emitted in the same nanosecond.
+    breaks ties for records emitted in the same nanosecond. The counter
+    is per-process, so two PARTITION tasks emitting the same primary
+    key in the same nanosecond could mint equal sequences — an
+    astronomically unlikely tie apply_changes resolves arbitrarily,
+    accepted rather than paying a per-partition discriminator on every
+    row.
 
     ``time.time_ns()`` skips the ``datetime`` + ``strftime`` round-
     trip the previous ISO-8601 format paid per row — meaningful for
@@ -1068,7 +1114,11 @@ class ODataLakeflowConnect(
         contained: set[str] = set()
         for es_name in flat:
             contained.update(self._enumerate_contained_paths(es_name, target))
-        return flat + sorted(contained)
+        # Dedup against flat: a containment-path spelling that collides
+        # with a declared flat set (e.g. flat ``My__Set`` next to ``My``
+        # with a contained ``Set``) is shadowed by the flat set anyway —
+        # listing it twice would fabricate a duplicate table.
+        return flat + sorted(contained - set(flat))
 
     def get_table_schema(self, table_name: str, table_options: dict[str, str]) -> StructType:
         namespace = (table_options or {}).get("namespace")
@@ -1938,6 +1988,7 @@ class ODataLakeflowConnect(
         *,
         tombstone: bool | None = None,
         key_types: dict[str, str] | None = None,
+        pad_fields: frozenset | None = None,
     ) -> dict:
         """Translate one delta payload entry into the emitted record shape.
 
@@ -1948,7 +1999,13 @@ class ODataLakeflowConnect(
           of the entry's ``@odata.id`` / ``id`` entity reference (the
           v4.01/v4.0 spec shapes carry the key ONLY there). A tombstone whose
           keys resolve to None raises — a keyless tombstone MERGEs against
-          nothing, silently losing the deletion.
+          nothing, silently losing the deletion. Every remaining schema
+          column (``pad_fields``) is padded with an EXPLICIT ``None``: the
+          framework parser rejects a non-nullable column that is *absent*
+          but accepts an explicit null, and a tombstone legitimately carries
+          nothing but its keys — without the padding the first delete on any
+          schema with a ``Nullable="false"`` non-key property kills the
+          batch.
         - Regular adds/changes pass through with all ``@odata.*`` control
           properties stripped and ``_deleted=False``.
 
@@ -1980,6 +2037,8 @@ class ODataLakeflowConnect(
                     f"tombstone format differs, set delta_tracking=disabled "
                     f"and use cursor/snapshot reads."
                 )
+            for name in pad_fields or ():
+                record.setdefault(name, None)
             record[_DELETED_COL] = True
         else:
             record = {k: v for k, v in item.items() if not k.startswith("@odata.")}
@@ -2231,14 +2290,27 @@ class ODataLakeflowConnect(
         MERGE. ``expected_fields`` is precomputed once per walk, so the
         per-item cost is one set difference.
         """
-        for item in payload.get("value", []):
+        for item in payload.get("value") or []:
+            if not isinstance(item, dict):
+                # Spec-invalid entry (null / scalar in the value array):
+                # raise a precise error instead of an AttributeError deep
+                # in the tombstone sniff.
+                raise RuntimeError(
+                    f"OData delta response for {table_name!r} carried a "
+                    f"malformed entry in 'value': expected an object, got "
+                    f"{item!r}."
+                )
             context = str(item.get("@odata.context", "")).lower()
             is_tombstone = "@removed" in item or "$deletedentity" in context
             if not is_tombstone:
                 self._check_no_sparse_entity(item, table_name, expected_fields)
             records.append(
                 self._build_delta_record(
-                    item, primary_keys, tombstone=is_tombstone, key_types=key_types
+                    item,
+                    primary_keys,
+                    tombstone=is_tombstone,
+                    key_types=key_types,
+                    pad_fields=expected_fields,
                 )
             )
 
@@ -2400,6 +2472,18 @@ class ODataLakeflowConnect(
             return True
         key = self._delta_cache_key(table_name, table_options)
         if key not in self._delta_capable:
+            # Shared (process + file, 15-min TTL) cache first: schema
+            # inference and the streaming read run in different forked
+            # workers, and an instance-only verdict lets a server that
+            # flaps its Preference-Applied ack between the two probes
+            # desync the declared schema from the emitted rows (synthetic
+            # columns declared-but-absent, or emitted-but-undeclared).
+            # One persisted verdict keeps every process on one answer.
+            shared_key = f"{key[0]}:{key[1]}" if key[0] else key[1]
+            shared = self._cached_capability("delta_ok", table_name=shared_key)
+            if isinstance(shared, bool):
+                self._delta_capable[key] = shared
+                return shared
             verdict = self._probe_delta_support(table_name, table_options)
             if verdict is None:
                 # Transient failure — no verdict. Degrade THIS call to the
@@ -2409,6 +2493,7 @@ class ODataLakeflowConnect(
                 # definitive-only discipline as the other capability probes).
                 return False
             self._delta_capable[key] = verdict
+            self._store_capability("delta_ok", verdict, table_name=shared_key)
         return self._delta_capable[key]
 
     def _probe_delta_support(
@@ -2427,10 +2512,8 @@ class ODataLakeflowConnect(
         ``False`` when the server answered but didn't acknowledge (missing
         header, or a non-transient non-200). Returns ``None`` — no verdict,
         the caller caches nothing and re-probes next call — on a
-        transport/auth failure, an exhausted transient, or a transient
-        status the retry loop passes through (408, which ``_http_get``
-        doesn't retry), matching the definitive-only discipline of the
-        other capability probes.
+        transport/auth failure or an exhausted transient, matching the
+        definitive-only discipline of the other capability probes.
         """
         # Force ``$top=1`` for the probe so the response stays small even
         # against entity sets with millions of rows. We only care about
@@ -2579,7 +2662,7 @@ class ODataLakeflowConnect(
         prev_fp: int | None = None
         while next_url:
             resp, payload = self._fetch_page_payload(session, next_url)
-            raw_items = payload.get("value", [])
+            raw_items = payload.get("value") or []  # `or`: tolerate a spec-invalid null
             page_rows = [
                 {k: v for k, v in item.items() if not k.startswith("@odata.")} for item in raw_items
             ]
@@ -2744,7 +2827,7 @@ class ODataLakeflowConnect(
         saw_next_link = False
         while cur_url is not None:
             resp, payload = self._fetch_page_payload(session, cur_url)
-            raw_items = payload.get("value", [])
+            raw_items = payload.get("value") or []  # `or`: tolerate a spec-invalid null
             page_rows = [
                 {k: v for k, v in item.items() if not k.startswith("@odata.")} for item in raw_items
             ]
@@ -3368,21 +3451,25 @@ class ODataLakeflowConnect(
         self._session = session
         return session
 
-    def _oauth2_token(self) -> str:
-        """Mint an OAuth2 access token.
+    def _oauth2_grant_payload(self) -> tuple[dict, tuple[str, str, str] | None]:
+        """The token-endpoint form body + the rotation-stash key.
 
-        Picks the grant type from what's available in `self.options`:
-          * `oauth2_refresh_token` present -> `refresh_token` grant
-            (user-flow refresh). Client id/secret are required so the
-            token endpoint can authenticate the client.
-          * Otherwise -> `client_credentials` grant (server-to-server).
-
-        Some providers issue a rotated refresh token in the response;
-        when that happens, the new value is written back into
-        `self.options` so the next refresh uses it.
-        """
+        ``oauth2_refresh_token`` present → ``refresh_token`` grant, with
+        the latest process-wide rotation substituted for the supplied
+        value; otherwise the ``client_credentials`` grant (no rotation,
+        key ``None``). The stash key anchors on the FIRST token this
+        instance ever saw — the connection's supplied value, which every
+        recreated instance derives identically."""
         refresh_token = self.options.get("oauth2_refresh_token")
+        rotation_key: tuple[str, str, str] | None = None
         if refresh_token:
+            original = self.__dict__.setdefault("_original_refresh_token", refresh_token)
+            rotation_key = (
+                _require(self.options, "oauth2_token_url"),
+                _require(self.options, "oauth2_client_id"),
+                original,
+            )
+            refresh_token = _ROTATED_REFRESH_TOKENS.get(rotation_key, refresh_token)
             data = {
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
@@ -3398,6 +3485,23 @@ class ODataLakeflowConnect(
         scope = self.options.get("oauth2_scope")
         if scope:
             data["scope"] = scope
+        return data, rotation_key
+
+    def _oauth2_token(self) -> str:
+        """Mint an OAuth2 access token.
+
+        Picks the grant type from what's available in `self.options`:
+          * `oauth2_refresh_token` present -> `refresh_token` grant
+            (user-flow refresh). Client id/secret are required so the
+            token endpoint can authenticate the client.
+          * Otherwise -> `client_credentials` grant (server-to-server).
+
+        Some providers issue a rotated refresh token in the response;
+        when that happens, the new value is written back into
+        `self.options` AND the process-wide rotation stash (see
+        :data:`_ROTATED_REFRESH_TOKENS`) so recreated instances use it.
+        """
+        data, rotation_key = self._oauth2_grant_payload()
         token_url = _require(self.options, "oauth2_token_url")
         # The token endpoint gets the same transient tolerance as the
         # source itself: a 429/5xx or a network blip here would otherwise
@@ -3479,7 +3583,13 @@ class ODataLakeflowConnect(
             raise RuntimeError("OAuth2 token endpoint did not return access_token.")
         rotated_refresh = payload.get("refresh_token")
         if rotated_refresh:
+            # Instance-local for this run's requests AND process-wide so
+            # the fresh instance SDP builds for the next microbatch (from
+            # the connection's ORIGINAL options) finds the rotation
+            # instead of replaying a token the provider may have revoked.
             self.options["oauth2_refresh_token"] = rotated_refresh
+            if rotation_key is not None:
+                _ROTATED_REFRESH_TOKENS[rotation_key] = rotated_refresh
         # Track wall-clock deadline so `_http_get` can refresh the token
         # *before* the source returns 401. Subtract a 60 s safety margin
         # to cover clock skew + in-flight request latency. Absent
@@ -3625,7 +3735,10 @@ class ODataLakeflowConnect(
             return
         try:
             data = pickle.dumps((xml_text, root), protocol=pickle.HIGHEST_PROTOCOL)
-        except pickle.PicklingError:
+        except (pickle.PicklingError, RecursionError):
+            # RecursionError: a pathologically deep CSDL tree can blow the
+            # pickler's stack — the cache is an optimization, never worth
+            # failing the read over.
             return
         _replace_with_private_tmp(_metadata_cache_path(self.service_url), data)
 
@@ -3635,19 +3748,35 @@ class ODataLakeflowConnect(
 
     def _table_segments(self, table_name: str) -> list[str] | None:
         """:func:`parse_contained_path` with the declared-flat-set override:
-        a name declared VERBATIM as a top-level entity set is always read
-        flat, even when it contains ``__``. CSDL SimpleIdentifiers legally
-        allow consecutive underscores, so ``My__Set`` can be a real entity
-        set — without the override ``list_tables`` emits a name the read
-        path then splits into a nonexistent containment path and can never
-        resolve. Every table-name split in the connector goes through here;
-        the raw parser is only for contexts with no metadata access."""
+        the LONGEST prefix declared as a top-level entity set becomes
+        ``segments[0]``, even when it contains ``__``. CSDL
+        SimpleIdentifiers legally allow consecutive underscores, so
+        ``My__Set`` can be a real entity set — without the override
+        ``list_tables`` emits names (``My__Set``, and its contained
+        children like ``My__Set__Kids``) the read path then splits into a
+        nonexistent containment path and can never resolve. Longest-prefix
+        also pins the collision rule the README documents: a declared flat
+        set always shadows a containment-path spelling of the same name.
+        Every table-name split in the connector goes through here; the raw
+        parser is only for contexts with no metadata access."""
         if _CONTAINED_PATH_SEP in table_name:
             try:
-                if table_name in self._metadata_state().index.entity_set_by_name:
-                    return None
+                declared = self._metadata_state().index.entity_set_by_name
             except Exception:  # noqa: BLE001 — let the parse/resolve error surface instead
-                pass
+                declared = None
+            if declared is not None:
+                if table_name in declared:
+                    return None
+                parts = table_name.split(_CONTAINED_PATH_SEP)
+                # Longest declared ``__``-bearing prefix wins; the remainder
+                # parses as the containment path under it. k=1 (a plain
+                # single-segment head) is the raw parser's own result, and
+                # empty remainder segments fall through so the parser raises
+                # its precise empty-segment error.
+                for k in range(len(parts) - 1, 1, -1):
+                    head = _CONTAINED_PATH_SEP.join(parts[:k])
+                    if head in declared and all(parts[k:]):
+                        return [head] + parts[k:]
         return _parse_contained_path(table_name)
 
     def _entity_type_for(self, table_name: str, namespace: str | None = None) -> ET.Element:
@@ -3684,16 +3813,24 @@ class ODataLakeflowConnect(
         """Resolve a top-level entity-set name to its EntityType element."""
         index = self._metadata_state().index
         candidates = index.entity_set_by_name.get(table_name) or []
+        requested_ns = namespace
         if namespace is not None:
             # Accept the schema's ``Alias`` as well as its canonical
             # ``Namespace`` — CSDL lets type references use either, so
-            # the table option should too.
+            # the table option should too. Error messages echo what the
+            # user actually passed (``requested_ns``), naming the
+            # canonical resolution when it differs.
             namespace = index.alias_to_namespace.get(namespace, namespace)
             matches = [(ns, ref) for ns, ref in candidates if ns == namespace]
         else:
             matches = list(candidates)
         if not matches:
             if namespace is not None:
+                shown = (
+                    f"{requested_ns!r}"
+                    if requested_ns == namespace
+                    else f"{requested_ns!r} (alias of {namespace!r})"
+                )
                 hint = sorted(index.entity_set_names_by_ns.get(namespace, []))
                 if not hint:
                     # The requested namespace has zero entity sets — common
@@ -3702,13 +3839,13 @@ class ODataLakeflowConnect(
                     # the schema whose <EntityContainer> declares the sets.
                     raise ValueError(
                         f"Entity set {table_name!r} not found in namespace "
-                        f"{namespace!r}. Namespace {namespace!r} declares "
+                        f"{shown}. Namespace {shown} declares "
                         f"no entity sets (probably a type-only schema). "
                         f"Namespaces with entity sets: {sorted(index.namespaces_with_sets)}."
                     )
                 raise ValueError(
                     f"Entity set {table_name!r} not found in namespace "
-                    f"{namespace!r}. Available in this namespace: {hint}"
+                    f"{shown}. Available in this namespace: {hint}"
                 )
             raise ValueError(
                 f"Entity set {table_name!r} not found in $metadata. "
@@ -3808,7 +3945,15 @@ class ODataLakeflowConnect(
 
     def _fields_for(self, table_name: str, namespace: str | None = None) -> list[StructField]:
         state = self._metadata_state()
-        cache_key = (table_name, namespace)
+        # The result embeds the exclusion-FILTERED FK columns, so the
+        # current ``exclude_ancestor_columns`` set must be part of the key:
+        # a (table, namespace)-only key would freeze schema AND composite
+        # PK at the first call's exclusions while row stamping follows the
+        # current ones — hard parse failures one way, silent MERGE
+        # collisions the other (``_resolve_fk_columns`` itself caches
+        # unfiltered for exactly this reason).
+        excluded = getattr(self, "_excluded_ancestor_columns", frozenset())
+        cache_key = (table_name, namespace, excluded)
         cached = state.fields.get(cache_key)
         if cached is not None:
             return cached
@@ -3857,11 +4002,18 @@ class ODataLakeflowConnect(
                 if name in seen:
                     continue
                 seen.add(name)
+                nullable = prop.get("Nullable", "true").lower() != "false"
+                if prop.get("Type") == "Edm.Stream":
+                    # §11.2.4: stream values are media references the JSON
+                    # payload NEVER carries — honoring Nullable="false" here
+                    # would fail EVERY row of the table on the framework's
+                    # absent-non-nullable check. The column is always null.
+                    nullable = True
                 fields.append(
                     StructField(
                         name,
                         _spark_type_for_property(prop),
-                        prop.get("Nullable", "true").lower() != "false",
+                        nullable,
                     )
                 )
         state.own_fields[cache_key] = fields
@@ -3869,7 +4021,10 @@ class ODataLakeflowConnect(
 
     def _primary_keys_for(self, table_name: str, namespace: str | None = None) -> list[str]:
         state = self._metadata_state()
-        cache_key = (table_name, namespace)
+        # Exclusion-aware key — same poisoning door as ``_fields_for``:
+        # the composite PK embeds the filtered FK columns.
+        excluded = getattr(self, "_excluded_ancestor_columns", frozenset())
+        cache_key = (table_name, namespace, excluded)
         cached = state.primary_keys.get(cache_key)
         if cached is not None:
             return cached

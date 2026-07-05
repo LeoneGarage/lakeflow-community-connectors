@@ -2507,7 +2507,15 @@ def test_delta_resume_emits_changes_and_removes_via_in_band_deleted_flag():
     assert change["Id"] == 5
     assert change["Name"] == "E"
     assert change["_deleted"] is False
-    assert tombstone == {"Id": 2, "_deleted": True, "_lc_sequence": tombstone["_lc_sequence"]}
+    # Non-key columns ride the tombstone as EXPLICIT NULLs — the framework
+    # parser rejects an ABSENT non-nullable column but accepts a null one.
+    assert tombstone == {
+        "Id": 2,
+        "Name": None,
+        "ModifiedAt": None,
+        "_deleted": True,
+        "_lc_sequence": tombstone["_lc_sequence"],
+    }
     assert _drop_lb(offset) == {"delta_link": DELTA_LINK_V2}
 
 
@@ -14389,3 +14397,304 @@ def test_duplicate_set_in_single_namespace_gets_precise_error():
     c = _make()
     with pytest.raises(ValueError, match="more than once in namespace"):
         c.get_table_schema("Things", {})
+
+
+# ---------------------------------------------------------------------------
+# Round-32 fixes: tombstone NULL padding, exclusion-aware memos, stream
+# nullability, shared delta verdict, dunder-prefix children, rotation stash
+# ---------------------------------------------------------------------------
+
+
+NONNULL_METADATA_XML = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="N" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Customer">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="Name" Type="Edm.String" Nullable="false"/>
+        <Property Name="ModifiedAt" Type="Edm.DateTimeOffset"/>
+      </EntityType>
+      <EntityContainer Name="C">
+        <EntitySet Name="Customers" EntityType="N.Customer"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+
+@responses.activate
+def test_delta_tombstone_parses_against_non_nullable_schema():
+    """A tombstone carries only its keys, but the framework parser rejects
+    a non-nullable column that is ABSENT (while accepting an explicit
+    null) — pre-fix the first delete on any schema with a
+    Nullable="false" non-key property killed the batch. Tombstones are
+    now padded with explicit NULLs for every remaining schema column."""
+    from databricks.labs.community_connector.libs.utils import parse_value
+
+    responses.get(f"{SERVICE_URL}$metadata", body=NONNULL_METADATA_XML, status=200)
+    delta_link = f"{SERVICE_URL}Customers?$deltatoken=t1"
+    responses.add(
+        responses.GET,
+        delta_link,
+        json={
+            "value": [{"Id": 2, "@removed": {"reason": "deleted"}}],
+            "@odata.deltaLink": f"{SERVICE_URL}Customers?$deltatoken=t2",
+        },
+    )
+    c = _make()
+    schema = c.get_table_schema("Customers", {"delta_tracking": "enabled"})
+    records, _ = c.read_table(
+        "Customers", {"delta_link": delta_link}, {"delta_tracking": "enabled"}
+    )
+    (tombstone,) = list(records)
+    assert tombstone["Name"] is None and tombstone["ModifiedAt"] is None
+    # The framework must accept the padded record against the declared
+    # (non-nullable Name) schema — this is the actual pre-fix crash site.
+    parsed = parse_value(tombstone, schema)
+    assert parsed["Id"] == 2 and parsed["_deleted"] is True
+
+
+@responses.activate
+def test_fields_and_pk_memos_are_exclusion_aware():
+    """The `_fields_for`/`_primary_keys_for` memos embedded the
+    exclusion-FILTERED FK columns under a (table, namespace)-only key, so
+    a shared instance froze schema AND composite PK at the first call's
+    `exclude_ancestor_columns` while row stamping followed the current
+    one — hard parse failures one way, silent MERGE collisions the other."""
+    _mock_nested_metadata()
+    c = _make()
+    with_fk = c.get_table_schema("Parents__Children", {})
+    assert "Parents_Id" in {f.name for f in with_fk.fields}
+    without_fk = c.get_table_schema("Parents__Children", {"exclude_ancestor_columns": "Parents_Id"})
+    assert "Parents_Id" not in {f.name for f in without_fk.fields}
+    # And back again on the SAME instance — pre-fix this returned the
+    # excluded shape from the memo.
+    again = c.get_table_schema("Parents__Children", {})
+    assert "Parents_Id" in {f.name for f in again.fields}
+
+    # Composite PK follows the same rule.
+    pks = c.read_table_metadata("Parents__Children", {})["primary_keys"]
+    assert pks == ["Parents_Id", "Id"]
+    pks_excl = c.read_table_metadata(
+        "Parents__Children", {"exclude_ancestor_columns": "Parents_Id"}
+    )["primary_keys"]
+    assert pks_excl == ["Id"]
+    pks_back = c.read_table_metadata("Parents__Children", {})["primary_keys"]
+    assert pks_back == ["Parents_Id", "Id"]
+
+
+NONNULL_STREAM_METADATA_XML = STREAM_METADATA_XML.replace(
+    '<Property Name="Content" Type="Edm.Stream"/>',
+    '<Property Name="Content" Type="Edm.Stream" Nullable="false"/>',
+)
+
+
+@responses.activate
+def test_stream_property_forced_nullable_in_schema():
+    """Stream values never appear in JSON payloads (§11.2.4), so honoring
+    Nullable="false" on an Edm.Stream property would fail EVERY row of the
+    table on the framework's absent-non-nullable check."""
+    responses.get(f"{SERVICE_URL}$metadata", body=NONNULL_STREAM_METADATA_XML, status=200)
+    c = _make()
+    schema = c.get_table_schema("Docs", {})
+    (content,) = [f for f in schema.fields if f.name == "Content"]
+    assert content.nullable is True
+
+
+@responses.activate
+def test_delta_auto_verdict_shared_across_instances():
+    """Schema inference and the streaming read run in different forked
+    workers; an instance-only probe verdict lets a flapping server desync
+    the declared schema from the emitted rows. The definitive verdict now
+    rides the process/file capability cache: a second instance resolves
+    delta WITHOUT re-probing (no probe mock is registered for it — an
+    attempted probe would come back as no-verdict and resolve False)."""
+    _mock_metadata()
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Customers",
+        json={"value": []},
+        headers={"Preference-Applied": "odata.track-changes"},
+        match_querystring=False,
+    )
+    c1 = _make()
+    assert c1._delta_active_for("Customers", {"delta_tracking": "auto"}) is True
+    responses.reset()  # no $metadata, no probe endpoint from here on
+    c2 = _make()
+    c2._metadata = c1._metadata  # metadata via cache; probe is the question
+    assert c2._delta_active_for("Customers", {"delta_tracking": "auto"}) is True
+
+
+DUNDER_KIDS_METADATA_XML = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="D" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Kid">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="Note" Type="Edm.String"/>
+      </EntityType>
+      <EntityType Name="Thing">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <NavigationProperty Name="Kids" Type="Collection(D.Kid)" ContainsTarget="true"/>
+      </EntityType>
+      <EntityContainer Name="C">
+        <EntitySet Name="My__Set" EntityType="D.Thing"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+
+@responses.activate
+def test_dunder_set_contained_children_are_readable():
+    """Round 31 made a flat `My__Set` readable, but its contained children
+    (`My__Set__Kids`) still split into a nonexistent containment path —
+    the same listed-but-unreadable class one level deeper. The longest
+    declared flat prefix now becomes the root segment."""
+    responses.get(f"{SERVICE_URL}$metadata", body=DUNDER_KIDS_METADATA_XML, status=200)
+    responses.get(f"{SERVICE_URL}My__Set", json={"value": [{"Id": 1}]})
+    responses.get(
+        f"{SERVICE_URL}My__Set(1)/Kids",
+        json={"value": [{"Id": 7, "Note": "n"}]},
+    )
+    c = _make()
+    assert c.list_tables() == ["My__Set", "My__Set__Kids"]
+    assert c._table_segments("My__Set__Kids") == ["My__Set", "Kids"]
+    schema = c.get_table_schema("My__Set__Kids", {})
+    assert {f.name for f in schema.fields} == {"My__Set_Id", "Id", "Note"}
+    records, _ = c.read_table("My__Set__Kids", None, {})
+    (row,) = list(records)
+    assert row["Id"] == 7 and row["My__Set_Id"] == 1
+
+
+COLLIDE_METADATA_XML = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="D" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Sub">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+      </EntityType>
+      <EntityType Name="Root">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <NavigationProperty Name="Set" Type="Collection(D.Sub)" ContainsTarget="true"/>
+      </EntityType>
+      <EntityType Name="Thing">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+      </EntityType>
+      <EntityContainer Name="C">
+        <EntitySet Name="My" EntityType="D.Root"/>
+        <EntitySet Name="My__Set" EntityType="D.Thing"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+
+@responses.activate
+def test_flat_set_shadows_colliding_containment_path_and_listing_dedups():
+    """When a declared flat `My__Set` collides with the containment-path
+    spelling of `My`→`Set`, the flat set wins (documented shadowing) and
+    namespace listings must not fabricate a duplicate table entry."""
+    responses.get(f"{SERVICE_URL}$metadata", body=COLLIDE_METADATA_XML, status=200)
+    c = _make()
+    listed = c.list_tables_in_namespace(["D"])
+    assert listed.count("My__Set") == 1
+    assert c._table_segments("My__Set") is None  # flat wins
+
+
+@responses.activate
+def test_rotated_refresh_token_survives_instance_recreation():
+    """SDP builds a FRESH connector from the connection's original options
+    every microbatch. With single-use-rotation providers the pre-fix
+    instance-local write-back replayed the revoked original token on the
+    next batch; the process-wide stash now hands every recreated instance
+    the latest rotation."""
+    _mock_metadata()
+    seen_refresh_tokens = []
+
+    def _token(request):
+        body = request.body.decode() if isinstance(request.body, bytes) else request.body
+        for pair in body.split("&"):
+            k, _, v = pair.partition("=")
+            if k == "refresh_token":
+                seen_refresh_tokens.append(v)
+        return (
+            200,
+            {},
+            json.dumps(
+                {
+                    "access_token": f"at-{len(seen_refresh_tokens)}",
+                    "refresh_token": f"rot-{len(seen_refresh_tokens)}",
+                    "token_type": "Bearer",
+                }
+            ),
+        )
+
+    responses.add_callback(responses.POST, "https://idp.example.com/token", callback=_token)
+    opts = {
+        "auth_type": "oauth2",
+        "oauth2_token_url": "https://idp.example.com/token",
+        "oauth2_client_id": "id",
+        "oauth2_client_secret": "secret",
+        "oauth2_refresh_token": "original",
+    }
+    c1 = _make(opts)
+    c1._get_session()  # session construction mints via refresh grant → rotation recorded
+    # Fresh instance from the ORIGINAL options — exactly how SDP rebuilds
+    # the connector each microbatch. (list_tables would be served from the
+    # process metadata cache without ever building a session, so exercise
+    # the session mint directly.)
+    c2 = _make(opts)
+    c2._get_session()
+    assert seen_refresh_tokens == ["original", "rot-1"]
+
+
+@responses.activate
+def test_value_null_tolerated_as_empty_page():
+    """A spec-invalid `"value": null` previously crashed iterating None;
+    it now reads as an empty page."""
+    _mock_metadata()
+    responses.get(f"{SERVICE_URL}Customers", json={"value": None}, match_querystring=False)
+    c = _make({"token": "t"})
+    records, _ = c.read_table("Customers", None, {"pagination": "nextlink"})
+    assert list(records) == []
+
+
+@responses.activate
+def test_malformed_delta_entry_raises_precise_error():
+    """A null entry in a delta `value` array previously died with an
+    AttributeError inside the tombstone sniff; it now raises a precise
+    RuntimeError naming the malformed entry."""
+    _mock_metadata()
+    delta_link = f"{SERVICE_URL}Customers?$deltatoken=t1"
+    responses.add(
+        responses.GET,
+        delta_link,
+        json={"value": [None], "@odata.deltaLink": f"{SERVICE_URL}Customers?$deltatoken=t2"},
+    )
+    c = _make()
+    with pytest.raises(RuntimeError, match="malformed entry"):
+        records, _ = c.read_table(
+            "Customers", {"delta_link": delta_link}, {"delta_tracking": "enabled"}
+        )
+        list(records)
+
+
+@responses.activate
+def test_alias_error_message_names_requested_alias():
+    """A user passing the schema Alias should see the alias they typed in
+    the not-found error (with the canonical resolution alongside), not a
+    namespace name they never wrote."""
+    responses.get(f"{SERVICE_URL}$metadata", body=TYPEDEF_METADATA_XML, status=200)
+    c = _make()
+    with pytest.raises(ValueError, match=r"'ta' \(alias of 'T'\)"):
+        c.get_table_schema("Nope", {"namespace": "ta"})

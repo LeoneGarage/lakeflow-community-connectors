@@ -400,7 +400,16 @@ detects this and falls back to whatever cursor/snapshot config is set.
   entry's `@odata.id`/`id` entity reference (single, composite
   `K1=v1,K2=v2`, quoted-string and bare-guid forms). A tombstone whose
   primary keys can't be resolved raises rather than emitting a keyless
-  no-op tombstone (which would silently lose the deletion).
+  no-op tombstone (which would silently lose the deletion). Emitted
+  tombstones are padded with explicit NULLs for every non-key column,
+  so `Nullable="false"` properties in the source schema don't fail the
+  framework's absent-column check on delete rows.
+- **The `auto` probe verdict is shared across processes.** Schema
+  inference and the streaming read run in different forked workers; the
+  definitive probe outcome is persisted in the process/file capability
+  cache (15-minute TTL) so both resolve to the same answer even when a
+  server (e.g. behind a mixed-version load balancer) flaps its
+  `Preference-Applied` acknowledgement.
 - **`@removed` with `reason: "changed"` is treated as a delete.** On an
   unfiltered entity set it shouldn't occur; with a server-side `filter`
   it means the row left the filtered set, and deleting downstream is
@@ -470,10 +479,12 @@ Parents__Tags
 
 A top-level entity set whose *own* name legally contains `__` (CSDL
 identifiers allow consecutive underscores, e.g. `My__Set`) always wins over
-the containment-path interpretation: a name declared verbatim in
-`$metadata` is read flat. In the pathological service that declares both
-`My__Set` *and* a `My` set with a contained `Set` collection, the flat set
-shadows the contained path.
+the containment-path interpretation: the **longest declared prefix** of a
+table name becomes the root segment, so `My__Set` is read flat and its
+contained collections (`My__Set__Kids`) resolve under it. In the
+pathological service that declares both `My__Set` *and* a `My` set with a
+contained `Set` collection, the flat set shadows the contained path (and
+namespace listings dedup the colliding spelling).
 
 ### Structured property values
 
@@ -482,6 +493,10 @@ CSDL properties map to `StringType` columns, and any structured
 (object/array) value in an emitted row is rendered as **JSON text**
 (e.g. `{"City":"Y","Zip":10001}`) rather than a Python repr — parse it
 downstream with `from_json`. Scalar values pass through untouched.
+`Edm.Stream` properties surface as always-NULL `StringType` columns and
+are forced nullable regardless of the CSDL `Nullable` attribute —
+stream values are media references the JSON payload never carries, so
+honoring `Nullable="false"` would fail every row of the table.
 
 ### Schema augmentation
 

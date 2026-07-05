@@ -100,7 +100,7 @@ Notes:
 - **Basic.** Sent as `Authorization: Basic <base64(user:pass)>` via `requests.auth.HTTPBasicAuth`. Common for on-prem SAP NetWeaver / Gateway.
 - **API key.** Sent as `<header-name>: <key>`. The header name defaults to `x-api-key` and is configurable per service via `api_key_header`.
 - **OAuth2 (client credentials).** At session-construction time the connector POSTs `grant_type=client_credentials` to `oauth2_token_url` and caches the access token on the session for the run. Client authentication is `client_secret_post` (id + secret in the form body) only; token endpoints that mandate `client_secret_basic` (HTTP Basic on the token endpoint — e.g. Okta's default posture) are not supported. The 401-triggered refresh applies only under `auth_type=oauth2` — with any other auth type, leftover `oauth2_*` options are ignored and a 401 raises the standard actionable error for that auth type.
-- **OAuth2 (authorization code / user-delegated).** The user runs the authorization-code flow once (externally — e.g. via the SDK's OAuth helpers) and supplies the resulting `oauth2_access_token` and `oauth2_refresh_token` on the connection. The connector uses the pre-supplied access token directly; on HTTP 401 from the source it POSTs `grant_type=refresh_token` to `oauth2_token_url` (with `client_id` + `client_secret` for client authentication) and retries the request once. Providers that rotate refresh tokens have the new value tracked in-process for the rest of the run.
+- **OAuth2 (authorization code / user-delegated).** The user runs the authorization-code flow once (externally — e.g. via the SDK's OAuth helpers) and supplies the resulting `oauth2_access_token` and `oauth2_refresh_token` on the connection. The connector uses the pre-supplied access token directly; on HTTP 401 from the source it POSTs `grant_type=refresh_token` to `oauth2_token_url` (with `client_id` + `client_secret` for client authentication) and retries the request once. Providers that rotate refresh tokens have the new value tracked in a process-wide stash keyed to the originally-supplied token, so the fresh connector instance SDP builds for each microbatch picks up the latest rotation instead of replaying a possibly-revoked original. The stash does not survive a driver restart: with single-use-rotation providers, a restart replays the original token — if the provider revoked it, re-run the authorization flow and update the connection.
 
 Tokens, passwords, API keys, and OAuth client secrets are all declared `secret: true` in `connector_spec.yaml` and are masked by the Unity Catalog connection store.
 
@@ -231,7 +231,7 @@ OData v4 §11.3 ("Requesting Changes") defines a server-driven change-tracking p
 
 ### Capability detection
 
-`delta_tracking=auto` performs a one-time probe per `(namespace, table)` pair. The probe sends an entity-set GET with `$top=1` and the header `Prefer: odata.track-changes`. The connector inspects the response:
+`delta_tracking=auto` performs a one-time probe per `(namespace, table)` pair; the definitive verdict is persisted in the process/file capability cache (15-minute TTL) so schema inference and the streaming read — which run in different forked workers — resolve to the same answer even against a server whose acknowledgement flaps. The probe sends an entity-set GET with `$top=1` and the header `Prefer: odata.track-changes`. The connector inspects the response:
 
 - 200 + `Preference-Applied: odata.track-changes` header → delta supported. Cached.
 - 200 + missing `Preference-Applied` header → server silently ignored the prefer. Falls back to whatever cursor/snapshot config is set. Cached.
@@ -359,7 +359,7 @@ Emitted: zero rows. Offset: `{"delta_link": "https://...users?$deltatoken=B"}` �
 
 OData v4 §13.4.3 defines `<NavigationProperty ContainsTarget="true">` on an EntityType: a collection that is *owned by* the parent entity rather than declared as a top-level EntitySet. The contained collection is addressed by traversing the parent's key — `GET Parent(<key>)/ContainedNavProp` — and each parent has its own independent contained collection. The protocol allows recursive containment, so a service can declare `Parent → Child → Grandchild → ...` chains.
 
-The connector surfaces these as double-underscore-pathed tables (`__` between segments — slash isn't valid in Spark SQL identifiers, which the framework uses for view names) alongside top-level entity sets, e.g. `Parents__Children__Notes`, up to **10 segments deep** (the depth cap prevents pathological discovery walks on services that declare circular containment; cycles within the cap are also detected and broken). Path parsing rejects empty segments and over-depth paths at `read_table_metadata` / `get_table_schema` time. A top-level entity set whose own name contains `__` (legal in CSDL identifiers) is recognized verbatim and always read flat — the declared flat set wins over the containment-path interpretation of the same spelling.
+The connector surfaces these as double-underscore-pathed tables (`__` between segments — slash isn't valid in Spark SQL identifiers, which the framework uses for view names) alongside top-level entity sets, e.g. `Parents__Children__Notes`, up to **10 segments deep** (the depth cap prevents pathological discovery walks on services that declare circular containment; cycles within the cap are also detected and broken). Path parsing rejects empty segments and over-depth paths at `read_table_metadata` / `get_table_schema` time. A name whose longest prefix matches a declared top-level entity set is split there: a set legally named `My__Set` is read flat, and its contained collections (`My__Set__Kids`) resolve with `My__Set` as the root segment — a declared flat set always shadows the containment-path interpretation of the same spelling.
 
 ### Discovery
 
@@ -464,7 +464,7 @@ EDM primitive types are mapped to Spark types as follows. Any unrecognized type 
 | `Edm.Guid` | `StringType` | |
 | `Edm.Binary` | `BinaryType` | Base64-encoded on the wire; downstream callers can use `_decode_binary` to materialize bytes. |
 
-Complex-typed, enum-typed, `Collection(...)`, and TypeDefinition-typed `<Property>` elements are surfaced as `StringType` columns, with structured (object/array) values rendered as **JSON text** at the emit boundary (parseable downstream with `from_json`). Only navigation properties are unsurfaced.
+Complex-typed, enum-typed, `Collection(...)`, and TypeDefinition-typed `<Property>` elements are surfaced as `StringType` columns, with structured (object/array) values rendered as **JSON text** at the emit boundary (parseable downstream with `from_json`). `Edm.Stream` properties surface as always-NULL `StringType` columns, forced nullable regardless of the CSDL `Nullable` attribute (stream values are media references the JSON payload never carries — §11.2.4). Only navigation properties are unsurfaced.
 
 ---
 
