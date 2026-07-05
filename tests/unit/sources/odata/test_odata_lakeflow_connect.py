@@ -7256,6 +7256,96 @@ def test_expand_midpage_park_resumes_by_row_key_not_position():
     assert sorted(got) == [101, 301, 401]
 
 
+def _expand_inner_park_batch1(c):
+    """Shared setup: batch 1 of an expand read parks an inner-collection
+    continuation under parent 1 (server pages Children with
+    ``Children@odata.nextLink``) in ``pending_fetches``."""
+    inner_link = f"{SERVICE_URL}Parents(1)/Children?$skiptoken=t1"
+    responses.get(
+        f"{SERVICE_URL}Parents",
+        json={
+            "value": [
+                {
+                    "Id": 1,
+                    "Name": "2024-01-01T00:00:00Z",
+                    "Children": [
+                        {"Id": 11, "Label": "a"},
+                        {"Id": 12, "Label": "b"},
+                    ],
+                    "Children@odata.nextLink": inner_link,
+                },
+                {
+                    "Id": 2,
+                    "Name": "2024-01-02T00:00:00Z",
+                    "Children": [{"Id": 21, "Label": "c"}],
+                },
+            ]
+        },
+        match_querystring=False,
+    )
+    opts = {
+        "expand_contained": "true",
+        "cursor_field": "Name",
+        "max_records_per_batch": "3",
+        "pagination": "nextlink",
+    }
+    recs1, offset1 = c.read_table("Parents__Children", {}, opts)
+    assert sorted(r["Id"] for r in recs1) == [11, 12, 21]
+    pending = offset1["pending_fetches"]
+    assert len(pending) == 1 and pending[0]["url"] == inner_link
+    return opts, offset1
+
+
+@responses.activate
+def test_expand_parked_continuation_for_deleted_parent_drops_subtree():
+    """A parked ``pending_fetches`` continuation is an entity-scoped URL;
+    if its parent is deleted between batches the URL 404s FOREVER —
+    re-raising turned the checkpoint into a permanently failing stream
+    only a full refresh could recover. The resume must instead confirm
+    the parent is gone (the from-scratch rebuild 404s too) and drop the
+    subtree, duplicate-safe."""
+    _mock_nested_metadata()
+    c = _make()
+    opts, offset1 = _expand_inner_park_batch1(c)
+    # Parent 1 deleted: BOTH the parked continuation and any rebuilt
+    # collection URL under it now 404.
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children",
+        callback=lambda _r: (404, {}, json.dumps({"error": {"message": "not found"}})),
+    )
+    recs2, offset2 = c.read_table("Parents__Children", offset1, opts)
+    # No raise; the dead subtree is dropped and the walk completes.
+    assert list(recs2) == []
+    assert "pending_fetches" not in offset2
+
+
+@responses.activate
+def test_expand_stale_inner_continuation_rebuilds_from_scratch():
+    """The SAME 404/410 can mean the server continuation went stale
+    (expired ``$skiptoken``) while the parent still exists — dropping the
+    item there would silently lose the rest of the collection. The
+    resume rebuilds the collection URL from the parked chain and re-reads
+    it from scratch: bounded duplicates, never loss."""
+    _mock_nested_metadata()
+    c = _make()
+    opts, offset1 = _expand_inner_park_batch1(c)
+
+    def children_cb(req):
+        if "skiptoken" in req.url:
+            return (410, {}, json.dumps({"error": {"message": "token expired"}}))
+        # The rebuilt from-scratch URL: the collection's remaining row.
+        return (200, {}, json.dumps({"value": [{"Id": 13, "Label": "d"}]}))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents(1)/Children", callback=children_cb)
+    recs2, offset2 = c.read_table("Parents__Children", offset1, opts)
+    rows = list(recs2)
+    # The rebuilt read recovered the collection's remaining row, tagged
+    # with the PARKED chain's parent.
+    assert [(r["Parents_Id"], r["Id"]) for r in rows] == [(1, 13)]
+    assert "pending_fetches" not in offset2
+
+
 @responses.activate
 def test_capped_walk_watermark_survives_empty_resume_completion():
     """A truncated batch's max cursor must survive a resume that completes

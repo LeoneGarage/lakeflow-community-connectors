@@ -2350,11 +2350,16 @@ def register_lakeflow_source(spark):
             read: it enumerates leaf-grandparent tuples the same way, then runs
             one :meth:`_build_probe_url` per tuple and emits the leaf-parent key
             (extending the chain) only for parents the probe flags dirty. Like
-            the plain enumerator it is consumed lazily and is deterministic for
-            a fixed ``since``, so the leaf-cursor walk's flat ``parent_idx``
-            resume works unchanged — a resumed batch re-probes the skipped
-            parents (cheap; no leaf fetches) exactly as the plain walk re-pages
-            skipped ancestors.
+            the plain enumerator it is consumed lazily and — LOAD-BEARING — it
+            yields chains in **PK order at every level**: grandparents via
+            ``_iter_parent_key_chains``' PK ``$orderby``, leaf-parents via the
+            probe URL's own outer ``$orderby=<pks> asc``
+            (:meth:`_build_probe_url`). The capped walk's key-based resume
+            (``parent_keys``, :func:`_chain_strictly_before`) skips
+            "already-walked" chains by exactly that ordering; dropping either
+            ``$orderby`` would silently skip dirty parents that enumerate after
+            a park. A resumed batch re-probes the skipped parents (cheap; no
+            leaf fetches) exactly as the plain walk re-pages skipped ancestors.
 
             ``since`` is ``None`` on the first batch → every leaf-parent with any
             leaf reads as dirty, so the first incremental batch behaves like the
@@ -3799,7 +3804,13 @@ def register_lakeflow_source(spark):
                 # Fetch one page only — pulling further pages of THIS
                 # collection waits until the next dequeue so we can check
                 # the cap between them.
-                page_rows, page_next_url = self._fetch_one_expand_page(url)
+                try:
+                    page_rows, page_next_url = self._fetch_one_expand_page(url)
+                except requests.HTTPError as exc:
+                    replacement = self._recover_expand_item(exc, item, segments, cur_field)
+                    if replacement is not None:
+                        queue.insert(0, replacement)
+                    continue
                 if not page_rows:
                     if page_next_url:
                         queue.append(
@@ -3902,7 +3913,16 @@ def register_lakeflow_source(spark):
                 item_tops = (
                     compute_expand_tops_for_root(page_size, len(segments), level) if page_size else None
                 )
-                page_rows, page_next_url = self._fetch_one_expand_page(url)
+                # Same deleted-parent / stale-continuation recovery as the
+                # drainer: inner continuations queued earlier in THIS walk can
+                # 404 when the parent vanishes mid-walk.
+                try:
+                    page_rows, page_next_url = self._fetch_one_expand_page(url)
+                except requests.HTTPError as exc:
+                    replacement = self._recover_expand_item(exc, item, segments, cur_field)
+                    if replacement is not None:
+                        queue.insert(0, replacement)
+                    continue
                 if not page_rows:
                     if page_next_url:
                         queue.append(
@@ -3942,6 +3962,77 @@ def register_lakeflow_source(spark):
                             "skip": 0,
                         }
                     )
+
+        def _recover_expand_item(
+            self,
+            exc: requests.HTTPError,
+            item: dict,
+            segments: list[str],
+            cursor_field: str | None,
+        ) -> dict | None:
+            """Handle a 404/410 on a parked expand work item's URL.
+
+            Level >= 1 items carry ENTITY-SCOPED URLs
+            (``Parents(k)/Children?$skiptoken=…``) parked across batches in
+            ``pending_fetches`` — and the world moves between batches. Two
+            distinct causes produce the same status:
+
+            * the parent entity was **deleted** → every URL under it is dead
+              forever; re-raising turns the checkpoint into a permanently
+              failing stream (the resume replays the same dead URL on every
+              trigger — only a full refresh recovers);
+            * the **continuation went stale** (e.g. an expired server
+              ``$skiptoken``) while the parent still exists → dropping the
+              item would silently lose the rest of that collection.
+
+            Disambiguate by REBUILDING the item's collection URL from scratch
+            from its parked chain (``_build_expand_continuation_url`` with
+            ``mode="skip"``, ``inline_count=0`` — the full child collection
+            with the read's cursor filter/order and grandchild expands
+            intact) and re-queueing it marked ``rebuilt``: if the parent is
+            gone, the rebuilt URL 404s too and the second recovery pass DROPS
+            the item (duplicate-safe — the subtree no longer exists
+            server-side; already-emitted rows stand); if the parent lives,
+            the fresh fetch re-reads the collection from scratch (bounded
+            duplicates, no loss).
+
+            Returns the replacement item, or ``None`` to drop. Level-0 URLs
+            and non-404/410 statuses re-raise: the top-level collection
+            vanishing is a config/service error, not row churn.
+            """
+            status = exc.response.status_code if exc.response is not None else None
+            level = item.get("level", 0)
+            if status not in (404, 410) or level < 1:
+                raise exc
+            chain = [dict(p) for p in item.get("chain") or []]
+            if item.get("rebuilt"):
+                _LOG.warning(
+                    "expand resume: parent %s no longer exists (HTTP %s on the "
+                    "rebuilt collection URL too) — dropping its parked subtree. "
+                    "Rows already emitted for it remain; the deletion is not "
+                    "propagated (connector is insert/upsert-only).",
+                    chain,
+                    status,
+                )
+                return None
+            _LOG.warning(
+                "expand resume: parked continuation for parent %s returned "
+                "HTTP %s (deleted parent, or a stale server continuation) — "
+                "rebuilding the collection URL from scratch and retrying once.",
+                chain,
+                status,
+            )
+            fresh_url = self._build_expand_continuation_url(
+                segments, level - 1, chain, cursor_field, "skip", {}, 0
+            )
+            return {
+                "url": fresh_url,
+                "level": level,
+                "chain": chain,
+                "cur_val": item.get("cur_val"),
+                "skip": 0,
+                "rebuilt": True,
+            }
 
         def _fetch_one_expand_page(self, url: str) -> tuple[list[dict], str | None]:
             """One HTTP GET; returns ``(page_rows, next_url)``. Thin wrapper
