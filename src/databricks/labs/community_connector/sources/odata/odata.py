@@ -88,7 +88,9 @@ from databricks.labs.community_connector.sources.odata._helpers import (
     cursor_le as _cursor_le,
     cursor_max as _cursor_max,
     jsonify_complex_values as _jsonify_complex_values,
+    max_or as _max_or,
     parse_iso8601 as _parse_iso8601,
+    parse_max_records as _parse_max_records,
     trim_to_distinct_cursor_boundary as _trim_to_distinct_cursor_boundary,
 )
 
@@ -725,6 +727,7 @@ class _MetadataState:
     own_pks: dict = field(default_factory=dict)
     entity_type: dict = field(default_factory=dict)
     fk_columns: dict = field(default_factory=dict)
+    edm_types: dict = field(default_factory=dict)
 
     def __getstate__(self):
         """Drop the ``id(et)``-keyed memos at the pickle boundary.
@@ -739,7 +742,7 @@ class _MetadataState:
         process-portable. Fork-based workers (no pickle) preserve identity
         and never pass through here."""
         state = self.__dict__.copy()
-        for memo in ("base_chain", "own_fields", "own_pks"):
+        for memo in ("base_chain", "own_fields", "own_pks", "edm_types"):
             state[memo] = {}
         return state
 
@@ -1056,10 +1059,13 @@ class ODataLakeflowConnect(
         ):
             raise ValueError(
                 "cursor_lookback_seconds (an explicit value) is supported "
-                "only with a cursor_field on a contained path — it floors the "
-                "read filter for the non-atomic expand_contained=true walk and "
-                "the leaf-cursor N+1 / cursor_probe walk. Use 'auto' (default) "
-                "or 'off' for other read configurations."
+                "only with a LEAF-level cursor_field on a contained path — it "
+                "floors the read filter for the non-atomic "
+                "expand_contained=true walk and the leaf-cursor N+1 / "
+                "cursor_probe walk. (An ancestor-level cursor_field is "
+                "rejected at read time — that walk has no leaf read filter "
+                "to floor.) Use 'auto' (default) or 'off' for other read "
+                "configurations."
             )
         # ``auto`` (the default) is a best-effort hint that no-ops where it can't
         # engage, so these conflict checks fire only on an EXPLICIT strategy
@@ -1387,7 +1393,7 @@ class ODataLakeflowConnect(
             extra_filter=segment_filters.get(0),
             order_by=pk_order or None,
         )
-        return self._fetch_pages(url), {}
+        return self._fetch_pages(url, self._edm_types_for_table(table_name, namespace)), {}
 
     def _read_incremental(
         self,
@@ -1441,7 +1447,7 @@ class ODataLakeflowConnect(
             extra_filter=extra_filter,
             order_by=",".join(order_terms),
         )
-        max_records = int(table_options.get("max_records_per_batch", "10000"))
+        max_records = _parse_max_records(table_options)
         # ``cursor_nulls`` policy: ``effective`` yields the value used for
         # filtering/trim/watermark (a synthetic floor for nulls under
         # ``coalesce``); ``skip_null`` drops null-cursor rows under
@@ -1453,7 +1459,7 @@ class ODataLakeflowConnect(
 
         records: list[dict] = []
         truncated = False
-        for row in self._fetch_pages(url):
+        for row in self._fetch_pages(url, self._edm_types_for_table(table_name, namespace)):
             if skip_null and row.get(cursor_field) is None:
                 continue
             rec_cursor = effective(row)
@@ -1544,7 +1550,7 @@ class ODataLakeflowConnect(
         skip_null, _effective = self._make_cursor_resolver(
             table_name, namespace, cursor_field, table_options
         )
-        for row in self._fetch_pages(url):
+        for row in self._fetch_pages(url, self._edm_types_for_table(table_name, namespace)):
             if skip_null and row.get(cursor_field) is None:
                 continue
             yield row
@@ -1588,7 +1594,7 @@ class ODataLakeflowConnect(
 
         namespace = (table_options or {}).get("namespace")
         primary_keys = self._primary_keys_for(table_name, namespace)
-        max_records = int((table_options or {}).get("max_records_per_batch", "10000"))
+        max_records = _parse_max_records(table_options)
 
         records, new_delta_link, carry_next_link, rebootstrap = self._delta_walk_pages(
             url=url,
@@ -2110,7 +2116,7 @@ class ODataLakeflowConnect(
             params.append(f"$orderby={order_by}")
         return "&".join(params)
 
-    def _fetch_pages(self, url: str) -> Iterator[dict]:
+    def _fetch_pages(self, url: str, edm_types: dict[str, str] | None = None) -> Iterator[dict]:
         """Walk a collection's pages, yielding raw JSON dicts (no coercion).
 
         Thin row-flattening wrapper over :meth:`_fetch_pages_with_links`,
@@ -2118,8 +2124,10 @@ class ODataLakeflowConnect(
         auto). The whole collection is drained within this call: under the
         default ``auto`` a server that page-limits below ``$top`` without a
         continuation link is still fully drained (keep seeking until empty).
+        ``edm_types`` (the collection's declared property types, when the
+        caller has them) types the keyset-seek boundary literals.
         """
-        for page_rows, _ in self._fetch_pages_with_links(url):
+        for page_rows, _ in self._fetch_pages_with_links(url, edm_types):
             yield from page_rows
 
     def _parse_pagination(self, table_options: dict[str, str] | None) -> str:
@@ -2143,7 +2151,9 @@ class ODataLakeflowConnect(
             )
         return raw
 
-    def _fetch_pages_with_links(self, url: str) -> Iterator[tuple[list[dict], str | None]]:
+    def _fetch_pages_with_links(
+        self, url: str, edm_types: dict[str, str] | None = None
+    ) -> Iterator[tuple[list[dict], str | None]]:
         """Page-aware fetch: yields ``(page_rows, next_url)`` per response,
         where ``next_url`` resumes the next page (``None`` at the end).
 
@@ -2166,7 +2176,7 @@ class ODataLakeflowConnect(
         """
         mode = getattr(self, "_pagination", "nextlink")
         if mode != "nextlink":
-            yield from self._client_paginate_pages(url, mode)
+            yield from self._client_paginate_pages(url, mode, edm_types)
             return
         session = self._get_session()
         next_url: str | None = url
@@ -2208,7 +2218,11 @@ class ODataLakeflowConnect(
             next_url = new_next
 
     def _verify_or_filter_support(
-        self, base_url: str, order_keys: list[str], sample_row: dict
+        self,
+        base_url: str,
+        order_keys: list[str],
+        sample_row: dict,
+        edm_types: dict[str, str] | None = None,
     ) -> bool:
         """One-shot, per-instance probe: does the server accept an
         OR-across-**different-columns** ``$filter`` — the composite keyset-seek
@@ -2243,7 +2257,7 @@ class ODataLakeflowConnect(
         if cached is not None:
             self.__dict__["_or_filter_ok"] = cached
             return cached
-        seek = _pg_keyset_filter(order_keys, sample_row)
+        seek = _pg_keyset_filter(order_keys, sample_row, edm_types)
         if seek is None or " or " not in seek:
             return True  # no OR-across-columns built for this key set — nothing to probe
         probe = _pg_strip_query(
@@ -2271,7 +2285,7 @@ class ODataLakeflowConnect(
         return ok
 
     def _client_paginate_pages(
-        self, url: str, mode: str
+        self, url: str, mode: str, edm_types: dict[str, str] | None = None
     ) -> Iterator[tuple[list[dict], str | None]]:
         """Client-driven pagination for servers that don't (always) emit
         ``@odata.nextLink``. Yields ``(page_rows, next_url)`` like
@@ -2425,7 +2439,9 @@ class ODataLakeflowConnect(
             # no-progress guard above bounds a server that ignores the
             # seek/$skip — auto then stops with this page's rows, exactly as the
             # old short-page default did, minus the dropped duplicate.
-            if can_keyset and not self._verify_or_filter_support(url, order_keys, page_rows[-1]):
+            if can_keyset and not self._verify_or_filter_support(
+                url, order_keys, page_rows[-1], edm_types
+            ):
                 # Composite keyset seek would build an OR-across-columns filter
                 # the server rejects (Hexagon Smart API). Drop to $skip (mode B)
                 # for the rest of this collection — and, via the cached verdict,
@@ -2440,7 +2456,7 @@ class ODataLakeflowConnect(
                 )
                 can_keyset = False
             if can_keyset:
-                seek = _pg_keyset_filter(order_keys, page_rows[-1])
+                seek = _pg_keyset_filter(order_keys, page_rows[-1], edm_types)
                 if seek is not None:
                     nxt = _pg_keyset_seek_url(url, base_filter, seek)
                 else:
@@ -3017,7 +3033,17 @@ class ODataLakeflowConnect(
                 f"'oauth2_client_secret', 'oauth2_token_url', and "
                 f"'oauth2_scope' on this connection. Server response: {hint}"
             ) from None
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            # 403 / retry-exhausted 5xx / anything else: same actionable shape
+            # as the 400/401 branches instead of raise_for_status()'s terse
+            # one-liner. The hint extractor is safe here — OAuth ERROR bodies
+            # carry error codes/descriptions, never live tokens (only 2xx
+            # bodies do, and those are handled below with the body withheld).
+            hint = _extract_oauth_error_hint(resp)
+            raise ValueError(
+                f"OAuth2 token endpoint {token_url!r} returned "
+                f"{resp.status_code}. Server response: {hint}"
+            ) from None
         try:
             payload = resp.json()
         except ValueError:
@@ -3420,6 +3446,40 @@ class ODataLakeflowConnect(
         state.own_pks[cache_key] = result
         return result
 
+    def _edm_types_for_et(self, et: ET.Element) -> dict[str, str]:
+        """Declared property → Edm-type map over the base-type chain
+        (closest-to-leaf declaration wins, matching field resolution).
+
+        Feeds ``odata_literal_typed`` at the key-predicate / keyset-seek
+        render sites: the OData JSON payload delivers ``Edm.Guid`` (and, on
+        IEEE754Compatible servers, ``Edm.Int64``/``Edm.Decimal``) values as
+        JSON strings, so only the declared type can decide whether the wire
+        literal is quoted. Missing/undeclared properties simply aren't in the
+        map — the renderer falls back to the value sniff for those."""
+        state = self._metadata_state()
+        cache_key = id(et)
+        cached = state.edm_types.get(cache_key)
+        if cached is not None:
+            return cached
+        result: dict[str, str] = {}
+        for type_el in self._resolve_base_chain(et):
+            for prop in type_el.findall(f"{_NS_EDM}Property"):
+                name = prop.get("Name")
+                if name and name not in result:
+                    result[name] = prop.get("Type", "Edm.String")
+        state.edm_types[cache_key] = result
+        return result
+
+    def _edm_types_for_table(self, table_name: str, namespace: str | None) -> dict[str, str]:
+        """Best-effort :meth:`_edm_types_for_et` by table name / contained
+        path. Resolution failure returns ``{}`` (sniff-based literal
+        rendering) — typing seek literals must never break a read that
+        worked untyped."""
+        try:
+            return self._edm_types_for_et(self._entity_type_for(table_name, namespace))
+        except Exception:  # noqa: BLE001 — metadata gaps must not break reads
+            return {}
+
     # ------------------------------------------------------------------
     # Cursor filter formatting
     # ------------------------------------------------------------------
@@ -3450,9 +3510,14 @@ class ODataLakeflowConnect(
         null-only batch yields ``since`` (if carried) or ``{}``. The max is
         CURSOR-ordered (chronological for ISO renderings — a lexical ``max``
         prefers ``…00Z`` over the later ``…00.5Z``, regressing the watermark
-        behind emitted rows)."""
+        behind emitted rows) and FLOORED at ``since``: with an active lookback
+        window the read filter sits below the committed watermark, and if the
+        watermark-defining row was deleted between batches the overlap's own
+        max lands below ``since`` — committing it would regress the watermark
+        (duplicate-safe, but the window re-reads grow and can repeat every
+        batch)."""
         if cursors:
-            return {"cursor": _cursor_max(cursors)}
+            return {"cursor": _max_or(_cursor_max(cursors), since)}
         if since is not None:
             return {"cursor": since}
         return {}

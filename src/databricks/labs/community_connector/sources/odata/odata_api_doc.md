@@ -185,7 +185,7 @@ The cursor filter is:
 There is **no wall-clock ceiling** on the cursor. `max_records_per_batch` is the only per-call cap. Two consequences:
 
 * **Continuous SDP pipelines work.** A single connector instance can live for the entire stream and still see fresh source state on every micro-batch, because the connector never freezes a "snapshot at startup" timestamp that would shut out later-arriving rows.
-* **The cursor column doesn't have to be a timestamp.** Monotonic integer IDs, GUIDs, lexicographic strings — anything the server can order in `$orderby` and compare in `$filter` works the same way. The connector emits the cursor value verbatim using `_odata_literal`, so an `Edm.Int32` cursor produces `OrderID gt 10248` (no quotes), an `Edm.DateTimeOffset` cursor produces `ModifiedAt gt 2024-03-01T00:00:00Z`, and so on.
+* **The cursor column doesn't have to be a timestamp.** Monotonic integer IDs, lexicographic strings — anything the server can order in `$orderby` and compare in `$filter` works the same way. The connector emits the cursor value verbatim using `_odata_literal`, so an `Edm.Int32` cursor produces `OrderID gt 10248` (no quotes), an `Edm.DateTimeOffset` cursor produces `ModifiedAt gt 2024-03-01T00:00:00Z`, and so on. One caveat: the cursor-watermark path is value-sniffed (watermarks round-trip through offsets and may be synthetic floors, not properties), so an `Edm.Guid` cursor renders **quoted** in the `gt` filter — accepted by many services but rejected by strict stacks; prefer a timestamp or integer cursor there. (Key predicates and keyset-seek boundaries are metadata-typed and render guids bare — see the N+1 section.)
 
 ### Why primary keys are appended to `$orderby`
 
@@ -398,7 +398,7 @@ Selected via `expand_contained`:
 
 Pagination (`@odata.nextLink`) walks happen *within* each per-parent fetch. Cost is O(product of parent fanouts) HTTP round trips; bandwidth is proportional to leaf row count plus a small overhead for the PK-only enumerations.
 
-Key predicate quoting: single-key parents use the bare form `(value)`; composite-key parents use the named form `(K1=v1,K2=v2)`. String values pass through `_odata_literal` for single-quote escaping; timestamps pass through bare per OData v4 §5.1.1.6.1.
+Key predicate quoting: single-key parents use the bare form `(value)`; composite-key parents use the named form `(K1=v1,K2=v2)`. Quoting is decided by the property's **declared Edm type** from `$metadata` (`odata_literal_typed`): `Edm.Guid` (and numeric/date types the server may render as JSON strings) emit **bare** per the OData v4 ABNF — strict stacks (Olingo, SAP) 400 on a quoted guid predicate — while `Edm.String` keys are **always** single-quote-escaped and quoted, even when the value happens to look like a timestamp (`'2024-01-01'`). The same typed rendering covers the per-leaf-parent PK `$filter` and keyset-seek boundaries; only where the type can't be resolved does the older value-sniff (quote anything non-ISO-looking) apply.
 
 **Single `$expand` chain (`expand_contained=true`; `auto` — the default — on a preflight-verified server).** One HTTP request per pipeline trigger:
 

@@ -199,6 +199,27 @@ def jsonify_complex_values(row: dict) -> dict:
     return row
 
 
+def parse_max_records(table_options: dict | None) -> int:
+    """Parse the ``max_records_per_batch`` table option (default 10000) with
+    curated validation. The cap counts EMITTED rows per batch, so ``0`` or a
+    negative value would make every walk park (or livelock) without emitting
+    a single row — reject it up front instead of silently reading nothing."""
+    raw = (table_options or {}).get("max_records_per_batch", "10000")
+    try:
+        value = int(str(raw).strip())
+    except (ValueError, TypeError):
+        raise ValueError(
+            f"Invalid max_records_per_batch={raw!r}: expected a positive integer."
+        ) from None
+    if value < 1:
+        raise ValueError(
+            f"Invalid max_records_per_batch={raw!r}: must be >= 1 — the cap "
+            f"bounds rows emitted per batch, and a non-positive cap would "
+            f"emit nothing forever."
+        )
+    return value
+
+
 def max_or(a: Any, b: Any) -> Any:
     """Max of two values in CURSOR order (see :func:`cursor_newer`) where
     either may be ``None``. Returns the other when one is ``None``; ``None``

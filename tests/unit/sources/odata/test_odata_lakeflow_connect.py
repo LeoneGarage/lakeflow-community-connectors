@@ -7478,18 +7478,24 @@ def test_expand_pending_queue_length_is_soft_capped(monkeypatch):
     }
     got: list[int] = []
     offset: dict = {}
+    parked = False
     for _ in range(25):
         records, offset = c.read_table("Parents__Children", offset, opts)
         got.extend(r["Id"] for r in records)
         pending = offset.get("pending_fetches")
         if not pending:
             break
+        parked = True
         # Parked queues stay near the ceiling — soft cap: threshold (3)
         # plus at most the in-flight page's own fan-out (6 rows here) —
         # never unbounded growth.
         assert len(pending) <= 9
     else:
         raise AssertionError("expand queue never drained")
+    # The ceiling must actually FIRE for this test to prove anything: with
+    # the feature deleted, batch 1 drains everything (12 rows < cap 100)
+    # and the length assertion above never executes.
+    assert parked, "queue ceiling never parked — feature inert, test vacuous"
     # Every inline and every paged child arrived exactly once each cycle.
     assert sorted(set(got)) == sorted(
         [i * 100 + 1 for i in range(1, 7)] + [i * 100 + 2 for i in range(1, 7)]
@@ -12292,15 +12298,28 @@ def test_expand_contained_auto_pin_unpin_lifecycle_across_stream():
     reads N+1, scrubs the flag from the checkpoint AND purges the shared cache
     → re-selecting ``auto`` re-runs the preflight from scratch. Rows flow
     correctly at every step."""
+    from urllib.parse import unquote
+
     _mock_probe_metadata()
     since = "2020-01-01T00:00:00Z"
-    responses.add_callback(
-        responses.GET,
-        f"{SERVICE_URL}Roots",
-        callback=_expand_auto_roots_callback(
-            expand_body=_switch_tree(1001, "2020-06-01T00:00:00Z")
-        ),
-    )
+
+    # Since-aware $expand body: a real server honors the ``gt <since>``
+    # cursor filter, so once microbatch 2 advances the watermark to
+    # 2020-07-01 the expand read must serve a NEWER leaf — an ignored
+    # filter returning only stale rows now (correctly) trips the
+    # no-progress guard, since completion cursors are floored at ``since``
+    # instead of regressing.
+    def _roots_cb(request):
+        url = unquote(request.url)
+        if "$expand" not in url:
+            return (200, {}, json.dumps({"value": [{"Id": 1}]}))
+        if "gt 2020-07-01" in url:
+            body = _switch_tree(1003, "2020-08-01T00:00:00Z")
+        else:
+            body = _switch_tree(1001, "2020-06-01T00:00:00Z")
+        return (200, {}, json.dumps(body))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Roots", callback=_roots_cb)
     responses.get(f"{SERVICE_URL}Roots(1)/Mids", json={"value": [{"Id": 10}]})
     responses.get(
         f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
@@ -12878,3 +12897,460 @@ def test_scrub_batch_verdicts_kept_while_auto_consumer_live():
     ) == {"cursor": "x"}
     # contained_fetch auto keeps the batch verdicts regardless of cursor_probe.
     assert c._scrub_nonauto_verdicts(off, {"cursor_probe": "false"}) == off
+
+
+# ---------------------------------------------------------------------------
+# Round-27 fixes: typed literals, queue-park preservation, watermark floors,
+# %24filter folding, $batch envelope retry, curated option validation
+# ---------------------------------------------------------------------------
+
+GUID_METADATA_XML = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="G" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Account">
+        <Key><PropertyRef Name="AccountId"/></Key>
+        <Property Name="AccountId" Type="Edm.Guid" Nullable="false"/>
+        <Property Name="Name" Type="Edm.String"/>
+        <NavigationProperty Name="Contacts" Type="Collection(G.Contact)" ContainsTarget="true"/>
+      </EntityType>
+      <EntityType Name="Contact">
+        <Key><PropertyRef Name="ContactId"/></Key>
+        <Property Name="ContactId" Type="Edm.Guid" Nullable="false"/>
+        <Property Name="ModifiedAt" Type="Edm.DateTimeOffset"/>
+      </EntityType>
+      <EntityType Name="DayBatch">
+        <Key><PropertyRef Name="Day"/></Key>
+        <Property Name="Day" Type="Edm.String" Nullable="false"/>
+        <NavigationProperty Name="Items" Type="Collection(G.DayItem)" ContainsTarget="true"/>
+      </EntityType>
+      <EntityType Name="DayItem">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+      </EntityType>
+      <EntityContainer Name="C">
+        <EntitySet Name="Accounts" EntityType="G.Account"/>
+        <EntitySet Name="DayBatches" EntityType="G.DayBatch"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+_GUID = "550e8400-e29b-41d4-a716-446655440000"
+
+
+def _mock_guid_metadata():
+    responses.get(f"{SERVICE_URL}$metadata", body=GUID_METADATA_XML, status=200)
+
+
+@responses.activate
+def test_guid_key_predicate_renders_bare():
+    """An ``Edm.Guid`` key arrives as a JSON string, but its key predicate
+    must be UNQUOTED per the OData v4 ABNF — strict servers (Olingo, SAP)
+    400 on ``Accounts('<guid>')``. The value sniff can't know this; the
+    declared type must win."""
+    from urllib.parse import unquote
+
+    _mock_guid_metadata()
+    responses.get(
+        f"{SERVICE_URL}Accounts", json={"value": [{"AccountId": _GUID}]}, match_querystring=False
+    )
+    # ONLY the bare-predicate URL is registered — a quoted predicate would
+    # hit an unregistered URL and fail the read outright.
+    responses.get(
+        f"{SERVICE_URL}Accounts({_GUID})/Contacts",
+        json={"value": [{"ContactId": _GUID, "ModifiedAt": "2020-06-01T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    recs, _ = c.read_table(
+        "Accounts__Contacts", {}, {"contained_fetch": "single", "pagination": "nextlink"}
+    )
+    assert [r["ContactId"] for r in recs] == [_GUID]
+    urls = [unquote(call.request.url) for call in responses.calls]
+    assert any(f"Accounts({_GUID})/Contacts" in u for u in urls)
+    assert not any("Accounts('" in u for u in urls)
+
+
+@responses.activate
+def test_string_key_iso_lookalike_stays_quoted():
+    """The inverse hole: an ``Edm.String`` key whose VALUE happens to look
+    ISO-8601 (``"2024-01-01"``) passed the bare-timestamp sniff and rendered
+    UNQUOTED — an invalid key predicate for a string-typed key."""
+    from urllib.parse import unquote
+
+    _mock_guid_metadata()
+    responses.get(
+        f"{SERVICE_URL}DayBatches", json={"value": [{"Day": "2024-01-01"}]}, match_querystring=False
+    )
+    responses.get(
+        f"{SERVICE_URL}DayBatches('2024-01-01')/Items",
+        json={"value": [{"Id": 7}]},
+        match_querystring=False,
+    )
+    c = _make()
+    recs, _ = c.read_table(
+        "DayBatches__Items", {}, {"contained_fetch": "single", "pagination": "nextlink"}
+    )
+    assert [r["Id"] for r in recs] == [7]
+    urls = [unquote(call.request.url) for call in responses.calls]
+    assert any("DayBatches('2024-01-01')/Items" in u for u in urls)
+
+
+@responses.activate
+def test_keyset_seek_guid_boundary_renders_bare():
+    """A keyset walk over a guid ``$orderby`` column must render the seek
+    boundary BARE: ``AccountId gt '<guid>'`` is a type mismatch on strict
+    servers (400 on every page-2 fetch)."""
+    from urllib.parse import unquote
+
+    _mock_guid_metadata()
+    state = {"calls": 0}
+
+    def _accounts_cb(request):
+        state["calls"] += 1
+        url = unquote(request.url)
+        if "gt" in url:
+            return (200, {}, json.dumps({"value": []}))
+        return (
+            200,
+            {},
+            json.dumps({"value": [{"AccountId": _GUID, "Name": "a"}]}),
+        )
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Accounts", callback=_accounts_cb)
+    c = _make()
+    recs, _ = c.read_table("Accounts", {}, {"pagination": "keyset", "page_size": "1"})
+    assert [r["AccountId"] for r in recs] == [_GUID]
+    seek_urls = [
+        unquote(call.request.url) for call in responses.calls if "gt" in unquote(call.request.url)
+    ]
+    assert seek_urls, "keyset never issued a seek"
+    assert any(f"AccountId gt {_GUID}" in u for u in seek_urls)
+    assert not any(f"gt '{_GUID}'" in u for u in seek_urls)
+
+
+def test_pg_keyset_filter_typed_literals():
+    """Unit shape of the typed seek: guid boundary bare, ISO-looking string
+    boundary quoted; untyped columns keep the value sniff."""
+    from databricks.labs.community_connector.sources.odata._contained import _pg_keyset_filter
+
+    row = {"g": _GUID, "s": "2024-01-01"}
+    types = {"g": "Edm.Guid", "s": "Edm.String"}
+    seek = _pg_keyset_filter(["g", "s"], row, types)
+    assert f"g gt {_GUID}" in seek
+    assert "s gt '2024-01-01'" in seek
+    assert f"g eq {_GUID}" in seek
+    # Untyped fallback preserves the pre-round-27 sniff behavior.
+    sniffed = _pg_keyset_filter(["g", "s"], row)
+    assert f"g gt '{_GUID}'" in sniffed
+    assert "s gt 2024-01-01" in sniffed
+
+
+def test_odata_literal_numeric_and_slash_edges():
+    """Exponent ``+`` percent-encoded (form-decoding servers read a raw
+    ``+`` as a space), non-finite floats use the OData spellings, and ``/``
+    in a string literal can't split a path segment."""
+    assert _odata_literal(1e20) == "1e%2B20"
+    assert _odata_literal(float("inf")) == "INF"
+    assert _odata_literal(float("-inf")) == "-INF"
+    assert _odata_literal(float("nan")) == "NaN"
+    assert _odata_literal("A/B") == "'A%2FB'"
+
+
+def test_pg_filter_percent24_spelling_folded():
+    """A server-issued continuation can carry ``%24filter=`` instead of
+    ``$filter=``. The filter readers must see it and the writers must FOLD
+    it into the one ``$filter`` param — two filter params make the server
+    pick one arbitrarily (or 400)."""
+    from databricks.labs.community_connector.sources.odata._contained import (
+        _pg_base_filter,
+        _pg_keyset_seek_url,
+        _pg_with_extra_filter,
+    )
+
+    url = "https://x/E?%24filter=a eq 1&%24top=5"
+    assert _pg_base_filter(url) == "a eq 1"
+    out = _pg_with_extra_filter(url, "b gt 2")
+    assert "%24filter" not in out
+    assert "$filter=(a eq 1) and (b gt 2)" in out
+    seek_url = _pg_keyset_seek_url(url, _pg_base_filter(url), "k gt 3")
+    assert "%24filter" not in seek_url
+    assert seek_url.count("$filter=") == 1
+    assert "$filter=(a eq 1) and (k gt 3)" in seek_url
+
+
+@responses.activate
+def test_expand_queue_park_before_first_emit_preserves_queue(monkeypatch):
+    """Round-26 regression: the ``_MAX_PENDING_FETCHES`` ceiling can park a
+    non-empty queue BEFORE any leaf row is emitted (a server that defers
+    every inner collection behind ``<Nav>@odata.nextLink``). The idle
+    shortcut in ``_read_contained_expand`` must not treat that as an empty
+    batch and echo ``start_offset`` — that discards the queue and the read
+    livelocks at zero rows forever."""
+    from databricks.labs.community_connector.sources.odata import _contained as _contained_mod
+
+    monkeypatch.setattr(_contained_mod, "_MAX_PENDING_FETCHES", 3)
+    _mock_nested_metadata()
+    parents = []
+    for i in range(1, 7):
+        parents.append(
+            {
+                "Id": i,
+                "Name": f"2024-01-0{i}T00:00:00Z",
+                "Children": [],  # nothing inline — all children deferred
+                "Children@odata.nextLink": f"{SERVICE_URL}Parents({i})/Children?$skiptoken=k{i}",
+            }
+        )
+        responses.get(
+            f"{SERVICE_URL}Parents({i})/Children",
+            json={"value": [{"Id": i * 100 + 2, "Label": "paged"}]},
+            match_querystring=False,
+        )
+    responses.get(f"{SERVICE_URL}Parents", json={"value": parents}, match_querystring=False)
+    c = _make()
+    opts = {
+        "expand_contained": "true",
+        "cursor_field": "Name",
+        "max_records_per_batch": "100",
+        "pagination": "nextlink",
+    }
+    records, offset = c.read_table("Parents__Children", {}, opts)
+    assert list(records) == []  # ceiling parked before the first leaf row...
+    assert offset.get("pending_fetches"), "parked queue was dropped from the offset"
+    got: list[int] = []
+    for _ in range(25):
+        records, offset = c.read_table("Parents__Children", offset, opts)
+        got.extend(r["Id"] for r in records)
+        if not offset.get("pending_fetches"):
+            break
+    else:
+        raise AssertionError("expand queue never drained")
+    assert sorted(set(got)) == sorted(i * 100 + 2 for i in range(1, 7))
+
+
+def test_cursor_completion_floored_at_since():
+    """A completing batch whose max cursor sits BELOW the committed
+    watermark (lookback overlap after the watermark-defining row was
+    deleted) must not regress the committed cursor."""
+    c = _make()
+    assert c._cursor_max_end_offset(["2020-05-30T00:00:00Z"], "2020-06-01T00:00:00Z") == {
+        "cursor": "2020-06-01T00:00:00Z"
+    }
+    assert c._cursor_max_end_offset(["2020-06-02T00:00:00Z"], "2020-06-01T00:00:00Z") == {
+        "cursor": "2020-06-02T00:00:00Z"
+    }
+    # Same floor on the expand walk's completion fold.
+    assert c._build_expand_end_offset(
+        [{"M": "2020-05-30T00:00:00Z"}], "M", {"cursor": "2020-06-01T00:00:00Z"}, []
+    ) == {"cursor": "2020-06-01T00:00:00Z"}
+
+
+@responses.activate
+def test_leaf_empty_completion_clears_foreign_expand_keys():
+    """An ``expand_contained`` park flipped to the N+1 walk: on empty
+    completion the leaf caller must clear the FOREIGN expand keys
+    (``pending_fetches`` / ``running_max_cursor`` — and the ancestor walk's
+    ``parent_cursor``) rather than let them ride every future offset, and
+    must fold the stale running max into the committed cursor so those
+    already-emitted rows aren't re-read forever."""
+    _mock_probe_metadata()
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]}, match_querystring=False)
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids", json={"value": [{"Id": 10}]}, match_querystring=False
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves", json={"value": []}, match_querystring=False
+    )
+    start = {
+        "cursor": "2020-06-01T00:00:00Z",
+        "parent_idx": 5,  # resumed checkpoint past every chain → empty completion
+        "parent_cursor": "2020-03-01T00:00:00Z",
+        "pending_fetches": [
+            {"url": f"{SERVICE_URL}Roots?$marker=stale", "level": 0, "chain": [], "skip": 0}
+        ],
+        "running_max_cursor": "2020-06-05T00:00:00Z",
+    }
+    c = _make()
+    recs, offset = c.read_table(PROBE_TABLE, start, _switch_opts("false"))
+    assert list(recs) == []
+    assert offset == {"cursor": "2020-06-05T00:00:00Z"}
+
+
+@responses.activate
+def test_ancestor_cursor_explicit_lookback_raises():
+    """An explicit ``cursor_lookback_seconds`` on an ANCESTOR-level
+    ``cursor_field`` used to silently no-op (the window only floors the
+    leaf/expand read filters). It must refuse instead."""
+    _mock_probe_metadata()
+    c = _make()
+    with pytest.raises(ValueError, match="ANCESTOR"):
+        c.read_table(
+            PROBE_TABLE,
+            {"cursor": "2020-01-01T00:00:00Z"},
+            {
+                "cursor_field": "MidOnly",  # lives on Mids — an ancestor level
+                "cursor_lookback_seconds": "3600",
+                "expand_contained": "false",
+                "cursor_probe": "false",
+            },
+        )
+
+
+@responses.activate
+def test_max_records_per_batch_curated_validation():
+    """``max_records_per_batch`` caps EMITTED rows — 0/negative would park
+    (or livelock) forever without emitting, and a non-numeric value crashed
+    with a bare int() traceback. Both get a curated error now."""
+    _mock_metadata()
+    c = _make()
+    for bad in ("0", "-3", "abc"):
+        with pytest.raises(ValueError, match="max_records_per_batch"):
+            c.read_table(
+                "Customers",
+                {"cursor": "2020-01-01T00:00:00Z"},
+                {"cursor_field": "ModifiedAt", "max_records_per_batch": bad},
+            )
+
+
+@responses.activate
+def test_inner_next_link_service_root_relative_resolves_against_root():
+    """A per-property ``<Nav>@odata.nextLink`` may be SERVICE-ROOT-relative
+    (Hexagon SCApi, SAP Gateway). Resolving it with a plain ``urljoin``
+    against the deep continuation URL doubles the ancestor path
+    (``Roots(1)/Roots(1)/…`` → 404 + a rebuild-recovery full re-read); it
+    must route through ``_resolve_next_link`` like top-level links."""
+    from urllib.parse import unquote
+
+    _mock_probe_metadata()
+    responses.get(
+        f"{SERVICE_URL}Roots",
+        json={
+            "value": [
+                {
+                    "Id": 1,
+                    "Mids": [],
+                    "Mids@odata.nextLink": f"{SERVICE_URL}Roots(1)/Mids?$skiptoken=m",
+                }
+            ]
+        },
+        match_querystring=False,
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids",
+        json={
+            "value": [
+                {
+                    "Id": 10,
+                    "Leaves": [],
+                    # service-root-relative — restates the path from the root
+                    "Leaves@odata.nextLink": "Roots(1)/Mids(10)/Leaves?$skiptoken=z",
+                }
+            ]
+        },
+        match_querystring=False,
+    )
+    responses.get(
+        f"{SERVICE_URL}Roots(1)/Mids(10)/Leaves",
+        json={"value": [{"Id": 1001, "RecordLastModified": "2020-06-01T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    recs, _ = c.read_table(PROBE_TABLE, {}, {"expand_contained": "true", "pagination": "nextlink"})
+    assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs] == [(1, 10, 1001)]
+    urls = [unquote(call.request.url) for call in responses.calls]
+    assert not any("Roots(1)/Roots(1)" in u for u in urls), "ancestor path doubled"
+
+
+@responses.activate
+def test_batch_envelope_corrupt_200_retried_once():
+    """The ``$batch`` envelope is the LARGEST response the connector ever
+    receives — the exact truncated-200 shape ``_fetch_page_payload`` retries
+    for on plain GETs. One corrupt envelope must re-POST (GET-only
+    sub-requests, safe), not kill the whole read."""
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.get(f"{SERVICE_URL}Roots(1)/Mids", json={"value": [{"Id": 10}]})
+    good = _batch_responder(
+        [
+            (
+                "Mids(10)/Leaves",
+                {"value": [{"Id": 1001, "RecordLastModified": "2020-06-01T00:00:00Z"}]},
+            ),
+        ]
+    )
+    state = {"hydrates": 0}
+
+    def _cb(request):
+        body = request.body.decode() if isinstance(request.body, bytes) else request.body
+        if "Leaves" in body:
+            state["hydrates"] += 1
+            if state["hydrates"] == 1:
+                return (200, {"Content-Type": "application/json"}, '{"responses": [{"id"')
+        return good(request)
+
+    responses.add_callback(responses.POST, f"{SERVICE_URL}$batch", callback=_cb)
+    c = _make()
+    recs, _ = c.read_table(
+        PROBE_TABLE,
+        {"cursor": since, "batch_ok": True},  # verdict seeded → no preflight POST
+        {"cursor_field": "RecordLastModified", "cursor_probe": "batch", "pagination": "nextlink"},
+    )
+    assert [r["Id"] for r in recs] == [1001]
+    assert state["hydrates"] == 2  # corrupt once, re-POSTed once
+
+
+@responses.activate
+def test_batch_envelope_corrupt_200_twice_raises_actionable():
+    """Twice-corrupt envelope: raise with the URL and a truncated body
+    excerpt instead of a bare JSONDecodeError."""
+    _mock_probe_metadata()
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
+    responses.get(f"{SERVICE_URL}Roots(1)/Mids", json={"value": [{"Id": 10}]})
+    responses.add_callback(
+        responses.POST,
+        f"{SERVICE_URL}$batch",
+        callback=lambda request: (200, {"Content-Type": "application/json"}, "{trunc"),
+    )
+    c = _make()
+    with pytest.raises(RuntimeError, match="malformed JSON body twice"):
+        recs, _ = c.read_table(
+            PROBE_TABLE,
+            {"cursor": "2020-01-01T00:00:00Z", "batch_ok": True},
+            {
+                "cursor_field": "RecordLastModified",
+                "cursor_probe": "batch",
+                "pagination": "nextlink",
+            },
+        )
+        list(recs)
+
+
+@responses.activate
+def test_token_endpoint_403_raises_actionable_error():
+    """Non-400/401 token-endpoint rejections (403 policy blocks, retry-
+    exhausted 5xx) used to surface as raise_for_status()'s terse one-liner.
+    They get the same actionable shape as the 400/401 branches — and never
+    echo the client secret."""
+    _mock_metadata()
+    responses.post(
+        "https://idp.example.com/token",
+        json={"error": "forbidden_by_policy"},
+        status=403,
+    )
+    c = _make(
+        {
+            "auth_type": "oauth2",
+            "oauth2_token_url": "https://idp.example.com/token",
+            "oauth2_client_id": "id",
+            "oauth2_client_secret": "s3cr3t-value",
+        }
+    )
+    with pytest.raises(ValueError) as ei:
+        c.list_tables()
+    msg = str(ei.value)
+    assert "403" in msg
+    assert "forbidden_by_policy" in msg
+    assert "s3cr3t-value" not in msg

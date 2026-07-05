@@ -800,6 +800,27 @@ def register_lakeflow_source(spark):
         return row
 
 
+    def parse_max_records(table_options: dict | None) -> int:
+        """Parse the ``max_records_per_batch`` table option (default 10000) with
+        curated validation. The cap counts EMITTED rows per batch, so ``0`` or a
+        negative value would make every walk park (or livelock) without emitting
+        a single row — reject it up front instead of silently reading nothing."""
+        raw = (table_options or {}).get("max_records_per_batch", "10000")
+        try:
+            value = int(str(raw).strip())
+        except (ValueError, TypeError):
+            raise ValueError(
+                f"Invalid max_records_per_batch={raw!r}: expected a positive integer."
+            ) from None
+        if value < 1:
+            raise ValueError(
+                f"Invalid max_records_per_batch={raw!r}: must be >= 1 — the cap "
+                f"bounds rows emitted per batch, and a non-positive cap would "
+                f"emit nothing forever."
+            )
+        return value
+
+
     def max_or(a: Any, b: Any) -> Any:
         """Max of two values in CURSOR order (see :func:`cursor_newer`) where
         either may be ``None``. Returns the other when one is ``None``; ``None``
@@ -1082,8 +1103,19 @@ def register_lakeflow_source(spark):
     #   * ``&`` — splits the query at the value;
     #   * ``#`` — truncates the whole request at the fragment;
     #   * ``?`` — starts the query string when the literal sits in a PATH
-    #     segment (a key predicate ``Parent('A?B')``).
-    _LITERAL_ESCAPES = (("%", "%25"), ("+", "%2B"), ("&", "%26"), ("#", "%23"), ("?", "%3F"))
+    #     segment (a key predicate ``Parent('A?B')``);
+    #   * ``/`` — splits the PATH segment when the literal sits in a key
+    #     predicate (``Parent('A/B')`` parses as two segments). ``%2F`` is the
+    #     spec form inside quoted path literals; in a query string it decodes
+    #     back to ``/`` server-side, so encoding it in both contexts is safe.
+    _LITERAL_ESCAPES = (
+        ("%", "%25"),
+        ("+", "%2B"),
+        ("&", "%26"),
+        ("#", "%23"),
+        ("?", "%3F"),
+        ("/", "%2F"),
+    )
 
 
     def _escape_literal_text(s: str) -> str:
@@ -1109,11 +1141,65 @@ def register_lakeflow_source(spark):
         if isinstance(value, bool):
             return "true" if value else "false"
         if isinstance(value, int | float | Decimal):
-            return str(value)
+            if isinstance(value, float) and not math.isfinite(value):
+                # OData ABNF spells these ``NaN`` / ``INF`` / ``-INF``;
+                # Python's ``nan`` / ``inf`` are not valid wire literals.
+                return "NaN" if math.isnan(value) else ("INF" if value > 0 else "-INF")
+            # ``str(1e20)`` renders ``1e+20`` — the exponent's ``+`` must be
+            # escaped like any literal ``+`` (form-decoding servers read a raw
+            # query-string ``+`` as a space → malformed number → 400).
+            return _escape_literal_text(str(value))
         s = str(value)
         if looks_like_iso8601(s):
             return _escape_literal_text(s)
         return "'" + _escape_literal_text(s.replace("'", "''")) + "'"
+
+
+    # Edm types whose literals are BARE (unquoted) on the wire even though the
+    # OData JSON payload delivers the value as a JSON string. ``Edm.Guid`` is the
+    # big one — guid key predicates / seek boundaries are unquoted per the v4
+    # ABNF, and strict stacks (Olingo, SAP) 400 on ``Set('<guid>')``. The numeric
+    # types cover IEEE754Compatible servers that render Int64/Decimal as strings.
+    _EDM_BARE_TYPES = frozenset(
+        {
+            "Edm.Guid",
+            "Edm.Boolean",
+            "Edm.Byte",
+            "Edm.SByte",
+            "Edm.Int16",
+            "Edm.Int32",
+            "Edm.Int64",
+            "Edm.Single",
+            "Edm.Double",
+            "Edm.Decimal",
+            "Edm.Date",
+            "Edm.DateTimeOffset",
+            "Edm.TimeOfDay",
+        }
+    )
+
+
+    def odata_literal_typed(value: Any, edm_type: str | None) -> str:
+        """:func:`odata_literal` with the property's declared Edm type steering
+        the quote decision for STRING values, instead of value sniffing.
+
+        The sniff in :func:`odata_literal` misfires in both directions on typed
+        columns: an ``Edm.Guid`` key arrives as a JSON string and gets QUOTED
+        (strict servers 400 the key predicate / keyset seek), while an
+        ``Edm.String`` key whose text happens to look ISO-8601 (``"2024-01-01"``)
+        gets rendered BARE (invalid predicate). When the caller knows the declared
+        type — key predicates and ``$orderby`` seek boundaries, where the CSDL is
+        already indexed — that type wins. Falls back to :func:`odata_literal` for
+        non-string values, unknown/missing types, and types with wrapped literal
+        forms this connector never generates (``Edm.Duration``, ``Edm.Binary``,
+        enums). The untyped cursor-watermark path keeps the ISO sniff — watermarks
+        round-trip through offsets and may be synthetic floors, not properties."""
+        if isinstance(value, str) and edm_type:
+            if edm_type in _EDM_BARE_TYPES:
+                return _escape_literal_text(value)
+            if edm_type == "Edm.String":
+                return "'" + _escape_literal_text(value.replace("'", "''")) + "'"
+        return odata_literal(value)
 
 
     # --- client-side pagination URL helpers -----------------------------------
@@ -1227,14 +1313,20 @@ def register_lakeflow_source(spark):
         return [k for k in keys if k]
 
 
-    def _pg_keyset_filter(order_keys: list[str], row: dict) -> str | None:
+    def _pg_keyset_filter(
+        order_keys: list[str], row: dict, edm_types: dict[str, str] | None = None
+    ) -> str | None:
         """Build the ascending seek predicate placing the cursor strictly after
         ``row`` in ``order_keys`` order::
 
             (k1 gt v1) or (k1 eq v1 and k2 gt v2) or …
 
         Returns ``None`` if any key's value is null (no comparable boundary —
-        the caller falls back to ``$skip``)."""
+        the caller falls back to ``$skip``). ``edm_types`` (property → declared
+        Edm type, when the caller has the CSDL in reach) steers quoting via
+        :func:`odata_literal_typed` — a guid boundary must render BARE, an
+        ISO-looking string boundary must stay QUOTED."""
+        types = edm_types or {}
         vals = []
         for k in order_keys:
             v = row.get(k)
@@ -1243,21 +1335,36 @@ def register_lakeflow_source(spark):
             vals.append((k, v))
         clauses = []
         for i, (k, v) in enumerate(vals):
-            terms = [f"{vals[j][0]} eq {odata_literal(vals[j][1])}" for j in range(i)]
-            terms.append(f"{k} gt {odata_literal(v)}")
+            terms = [
+                f"{vals[j][0]} eq {odata_literal_typed(vals[j][1], types.get(vals[j][0]))}"
+                for j in range(i)
+            ]
+            terms.append(f"{k} gt {odata_literal_typed(v, types.get(k))}")
             clauses.append(" and ".join(terms))
         if len(clauses) == 1:
             return clauses[0]
         return " or ".join(f"({c})" for c in clauses)
 
 
+    def _pg_get_filter(url: str) -> str | None:
+        """The URL's ``$filter`` value, matching the ``%24filter`` spelling a
+        server-issued continuation may carry (mirroring ``_pg_parse_top`` /
+        ``_pg_orderby_keys`` — the positional params already get this via
+        ``_pg_param_name``, but the filter readers matched only the literal
+        ``$``)."""
+        val = _pg_get_query(url, "$filter")
+        return val if val is not None else _pg_get_query(url, "%24filter")
+
+
     def _pg_with_extra_filter(url: str, clause: str) -> str:
         """AND ``clause`` into the URL's ``$filter`` (replacing any prior seek —
         the caller always rebuilds from the original base URL, so seeks never
-        accumulate)."""
-        existing = _pg_get_query(url, "$filter")
+        accumulate). A ``%24filter`` spelling is folded into the one ``$filter``
+        param (never left behind — two filter params make the server pick one
+        arbitrarily or 400)."""
+        existing = _pg_get_filter(url)
         combined = f"({existing}) and ({clause})" if existing else clause
-        return _pg_set_query(url, "$filter", combined)
+        return _pg_set_query(_pg_strip_query(url, "%24filter"), "$filter", combined)
 
 
     # Connector-private query option carrying the stable base ``$filter`` across
@@ -1279,11 +1386,13 @@ def register_lakeflow_source(spark):
     def _pg_base_filter(url: str) -> str | None:
         """The stable base ``$filter`` for a keyset walk: the stashed ``__pgbase``
         if present (a resumed walk), else the URL's current ``$filter`` (the first
-        page, before any seek). An empty ``__pgbase`` marker means 'no base'."""
+        page, before any seek — matched in both the ``$`` and ``%24`` spellings,
+        see :func:`_pg_get_filter`). An empty ``__pgbase`` marker means 'no
+        base'."""
         marker = _pg_get_query(url, _PG_BASE)
         if marker is not None:
             return marker or None
-        return _pg_get_query(url, "$filter")
+        return _pg_get_filter(url)
 
 
     def _pg_keyset_seek_url(url: str, base_filter: str | None, seek: str) -> str:
@@ -1304,7 +1413,11 @@ def register_lakeflow_source(spark):
         rows inside the seek window on every seek page — see
         :func:`_pg_strip_positional`."""
         combined = f"({base_filter}) and ({seek})" if base_filter else seek
-        out = _pg_set_query(_pg_strip_positional(url), "$filter", combined)
+        # Strip an encoded ``%24filter`` spelling before setting ``$filter`` so a
+        # server-issued continuation resumed into this walk never ends up with
+        # two filter params (the base was already recovered via _pg_get_filter).
+        cleaned = _pg_strip_query(_pg_strip_positional(url), "%24filter")
+        out = _pg_set_query(cleaned, "$filter", combined)
         return _pg_set_query(out, _PG_BASE, base_filter or "")
 
 
@@ -1777,21 +1890,58 @@ def register_lakeflow_source(spark):
 
         # --- URL construction --------------------------------------------------
 
-        def _format_key_predicate(self, pk_values: dict[str, Any]) -> str:
-            """``(value)`` for single key; ``(K1=v1,K2=v2)`` for composite."""
+        def _format_key_predicate(
+            self, pk_values: dict[str, Any], edm_types: dict[str, str] | None = None
+        ) -> str:
+            """``(value)`` for single key; ``(K1=v1,K2=v2)`` for composite.
+            ``edm_types`` (the level's declared property types) steers quoting —
+            a guid key renders BARE, an ISO-looking string key stays QUOTED."""
+            types = edm_types or {}
             if len(pk_values) == 1:
-                return f"({odata_literal(next(iter(pk_values.values())))})"
-            return "(" + ",".join(f"{k}={odata_literal(v)}" for k, v in pk_values.items()) + ")"
+                ((k, v),) = pk_values.items()
+                return f"({odata_literal_typed(v, types.get(k))})"
+            return (
+                "("
+                + ",".join(f"{k}={odata_literal_typed(v, types.get(k))}" for k, v in pk_values.items())
+                + ")"
+            )
 
-        def _build_contained_path(self, segments: list[str], key_chain: list[dict[str, Any]]) -> str:
-            """``A(1)/B('x')/C`` — leaf segment has no key; ``key_chain`` len = N-1."""
+        def _edm_types_for_level(
+            self, segments: list[str], level: int, namespace: str | None
+        ) -> dict[str, str]:
+            """Best-effort property-type map for the collection at
+            ``segments[level]``. Resolution failure (e.g. an entity-set name
+            ambiguous across namespaces when the caller has no ``namespace`` in
+            scope) degrades to ``{}`` — sniff-based literal rendering — rather
+            than failing a URL build that worked untyped for years."""
+            try:
+                et = self._entity_type_for(CONTAINED_PATH_SEP.join(segments[: level + 1]), namespace)
+                return self._edm_types_for_et(et)
+            except Exception:  # noqa: BLE001 — metadata gaps must not break URL builds
+                return {}
+
+        def _build_contained_path(
+            self,
+            segments: list[str],
+            key_chain: list[dict[str, Any]],
+            namespace: str | None = None,
+        ) -> str:
+            """``A(1)/B('x')/C`` — leaf segment has no key; ``key_chain`` len = N-1.
+            Key values render TYPED per level (guid bare / string quoted); the
+            type lookup is best-effort, so callers without a ``namespace`` in
+            scope still work (sniff-rendered) on ambiguous multi-namespace
+            services."""
             if len(key_chain) != len(segments) - 1:
                 raise ValueError(
                     f"key_chain length {len(key_chain)} does not match "
                     f"non-leaf segment count {len(segments) - 1}"
                 )
             return _URL_SEGMENT_SEP.join(
-                f"{seg}{self._format_key_predicate(key_chain[i])}" if i < len(key_chain) else seg
+                (
+                    f"{seg}{self._format_key_predicate(key_chain[i], self._edm_types_for_level(segments, i, namespace))}"
+                    if i < len(key_chain)
+                    else seg
+                )
                 for i, seg in enumerate(segments)
             )
 
@@ -1805,7 +1955,10 @@ def register_lakeflow_source(spark):
             order_by: str | None = None,
         ) -> str:
             """Full URL for a contained-collection read at one parent tuple."""
-            base = join_url(self.service_url, self._build_contained_path(segments, key_chain))
+            base = join_url(
+                self.service_url,
+                self._build_contained_path(segments, key_chain, table_options.get("namespace")),
+            )
             return f"{base}?{self._format_query_params(table_options, extra_filter, order_by)}"
 
         # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -2342,7 +2495,10 @@ def register_lakeflow_source(spark):
             if order_by:
                 outer.append(f"$orderby={order_by}")
             outer.append(f"$expand={leaf_nav}({';'.join(inner)})")
-            base = join_url(self.service_url, self._build_contained_path(parent_segments, parent_chain))
+            base = join_url(
+                self.service_url,
+                self._build_contained_path(parent_segments, parent_chain, namespace),
+            )
             return f"{base}?{'&'.join(outer)}"
 
         def _iter_dirty_leaf_parent_chains(
@@ -2593,7 +2749,7 @@ def register_lakeflow_source(spark):
             scanned = 0
             for pchain in self._iter_parent_key_chains(parent_segments, namespace, table_options):
                 lp_base = join_url(
-                    self.service_url, self._build_contained_path(parent_segments, pchain)
+                    self.service_url, self._build_contained_path(parent_segments, pchain, namespace)
                 )
                 next_url: str | None = f"{lp_base}?$select={','.join(lp_pks)}&$top={page_size}"
                 if lp_order:
@@ -2640,7 +2796,9 @@ def register_lakeflow_source(spark):
             direction a genuinely mis-ordering server produces — clean
             evidence)."""
             full_chain = pchain + [lp_key]
-            leaf_base = join_url(self.service_url, self._build_contained_path(segments, full_chain))
+            leaf_base = join_url(
+                self.service_url, self._build_contained_path(segments, full_chain, namespace)
+            )
             # Trusted reference: direct-navigation ordering on the leaf collection.
             try:
                 direct_rows, _ = self._fetch_one_expand_page(
@@ -2654,11 +2812,15 @@ def register_lakeflow_source(spark):
             direct_max = vals[0]
             # The probe's own shape, targeted to this leaf-parent via an outer
             # key $filter (basic collection filtering, not an inner-$expand option).
-            lp_coll = join_url(self.service_url, self._build_contained_path(parent_segments, pchain))
-            pk_filter = " and ".join(f"{k} eq {odata_literal(v)}" for k, v in lp_key.items())
-            lp_pks = self._own_primary_keys_for_et(
-                self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
+            lp_coll = join_url(
+                self.service_url, self._build_contained_path(parent_segments, pchain, namespace)
             )
+            lp_et = self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
+            lp_types = self._edm_types_for_et(lp_et)
+            pk_filter = " and ".join(
+                f"{k} eq {odata_literal_typed(v, lp_types.get(k))}" for k, v in lp_key.items()
+            )
+            lp_pks = self._own_primary_keys_for_et(lp_et)
             expand_url = (
                 f"{lp_coll}?$select={','.join(lp_pks)}&$filter={pk_filter}"
                 f"&$expand={leaf_nav}($orderby={cursor_field} desc;$top=1;$select={cursor_field})"
@@ -2798,7 +2960,23 @@ def register_lakeflow_source(spark):
                 raise RuntimeError(
                     f"OData $batch POST to {batch_url!r} failed: " f"{resp.status_code} {body[:300]}"
                 )
-            data = resp.json()
+            try:
+                data = resp.json()
+            except ValueError:
+                # Corrupt 200: same failure mode ``_fetch_page_payload`` retries
+                # for — some servers (Hexagon) truncate LARGE bodies under load,
+                # and the $batch envelope is the largest response the connector
+                # ever receives. One re-POST is safe (GET-only sub-requests).
+                resp = self._http_get(session, batch_url, method="POST", json=payload)
+                try:
+                    data = resp.json()
+                except ValueError:
+                    raise RuntimeError(
+                        f"OData $batch response from {batch_url!r} returned "
+                        f"{resp.status_code} with a malformed JSON body twice "
+                        f"(likely truncated by the server). First 300 chars: "
+                        f"{(resp.text or '')[:300]!r}"
+                    ) from None
             by_id = {str(r.get("id")): r for r in data.get("responses", [])}
             out = []
             for i in range(len(urls)):
@@ -3281,7 +3459,12 @@ def register_lakeflow_source(spark):
                 segment_filters.get(lvl + 1),
                 (table_options or {}).get("filter") if is_leaf else None,
             )
-            base = join_url(self.service_url, self._build_contained_path(segments[: lvl + 2], chain))
+            base = join_url(
+                self.service_url,
+                self._build_contained_path(
+                    segments[: lvl + 2], chain, (table_options or {}).get("namespace")
+                ),
+            )
             url = f"{base}?$top=1"
             if level_filter:
                 url += f"&$filter={level_filter}"
@@ -3629,7 +3812,7 @@ def register_lakeflow_source(spark):
                     )
                 pks_per_level.append(pks)
             fk_columns = self._resolve_fk_columns(segments, namespace)
-            max_records = int((table_options or {}).get("max_records_per_batch", "10000"))
+            max_records = _parse_max_records(table_options)
             # Either resume from a parked work queue or seed it with the
             # top-level URL. Each queue item is self-contained (URL +
             # level + ancestor chain + captured cursor) so resume needs
@@ -3704,7 +3887,14 @@ def register_lakeflow_source(spark):
             )
             if not cursor_field:
                 return iter(emitted), end_offset
-            if not emitted and not resuming:
+            if not emitted and not resuming and not remaining_queue:
+                # Idle batch: nothing emitted, nothing resumed, nothing PARKED.
+                # The last guard is load-bearing — the queue ceiling
+                # (``_MAX_PENDING_FETCHES``) can park a non-empty queue before
+                # the first leaf row is emitted (servers that defer every inner
+                # collection behind ``<Nav>@odata.nextLink``), and echoing
+                # ``start_offset`` here would DROP that queue: every batch then
+                # re-does the same fetches and emits nothing, forever.
                 return iter([]), start_offset or {}
             records, out_offset = self._finalize_cursor_read(
                 start_offset, end_offset, emitted, table_name, cursor_field
@@ -4161,7 +4351,12 @@ def register_lakeflow_source(spark):
                     offset["running_max_cursor"] = new_running
                 return offset
             if new_running is not None:
-                return {"cursor": new_running}
+                # Floored at ``since``: the lookback overlap re-reads below the
+                # committed watermark, so after a deleted watermark row (or a
+                # stale ``running_max_cursor`` resumed from a mode flip) the
+                # running max alone can sit BELOW ``since`` — committing it
+                # as-is would regress the watermark.
+                return {"cursor": _max_or(new_running, since)}
             if since is not None:
                 return {"cursor": since}
             # Chain drained AND no watermark to park (no prior ``since``, no
@@ -4305,7 +4500,12 @@ def register_lakeflow_source(spark):
                 )
             inner_next = row.get(f"{next_seg}@odata.nextLink")
             if inner_next:
-                resolved = urljoin(base_url, inner_next)
+                # _resolve_next_link, NOT a plain urljoin: some servers (Hexagon
+                # SCApi, SAP Gateway) return per-property continuation links
+                # relative to the SERVICE ROOT — urljoin against this deep page
+                # URL would double the ancestor path (→ 404 and a full
+                # rebuild-from-keys re-read on every inner continuation).
+                resolved = self._resolve_next_link(base_url, inner_next)
                 if per_level_tops:
                     # Continuation pages the collection at ``level + 1``
                     # under one specific parent at ``level``. The original
@@ -4476,7 +4676,7 @@ def register_lakeflow_source(spark):
             # root the request at this parent's child collection.
             contained_base = join_url(
                 self.service_url,
-                self._build_contained_path(segments[: child_level + 1], chain),
+                self._build_contained_path(segments[: child_level + 1], chain, namespace),
             )
             # Budget the continuation's $top over only its own collection levels
             # (child_level..leaf); levels 0..level are now fixed keys in the path, so
@@ -4503,19 +4703,23 @@ def register_lakeflow_source(spark):
                 cont_tops,
             )
             order_keys = _pg_orderby_keys(url)
+            # $orderby names properties of the CHILD collection's entity type —
+            # its declared types steer seek-literal quoting (guid bare / string
+            # quoted); best-effort so a resolution gap degrades to the sniff.
+            child_types = self._edm_types_for_level(segments, child_level, namespace)
             # Skip the OR-across-columns keyset seek on servers that reject it
             # (preflight, cached) — fall through to $skip (mode B). Single-key
             # $orderby never builds an OR, so the probe short-circuits there.
             if (
                 mode in ("keyset", "auto")
                 and order_keys
-                and self._verify_or_filter_support(url, order_keys, last_child)
+                and self._verify_or_filter_support(url, order_keys, last_child, child_types)
             ):
-                seek = _pg_keyset_filter(order_keys, last_child)
+                seek = _pg_keyset_filter(order_keys, last_child, child_types)
                 if seek is not None:
                     # Stash the clean child-level $filter as the keyset base so a
                     # cross-batch resume REPLACES the seek instead of accumulating.
-                    return _pg_keyset_seek_url(url, _pg_get_query(url, "$filter"), seek)
+                    return _pg_keyset_seek_url(url, _pg_get_filter(url), seek)
             return _pg_set_query(url, "$skip", str(inline_count))
 
         def _leaf_cursor_order_by(
@@ -4542,7 +4746,7 @@ def register_lakeflow_source(spark):
             leaf_et = self._entity_type_for(CONTAINED_PATH_SEP.join(segments), namespace)
             return _ancestor_pk_order_by(self._own_primary_keys_for_et(leaf_et))
 
-        # pylint: disable=too-many-statements
+        # pylint: disable=too-many-statements,too-many-branches
         def _walk_contained_with_cursor(
             self,
             segments: list[str],
@@ -5165,6 +5369,21 @@ def register_lakeflow_source(spark):
                     use_batch=use_batch,
                     persist_batch_ok=persist_batch_ok,
                 )
+            if isinstance(self._cursor_lookback, int) and self._cursor_lookback > 0:
+                # Only resolvable HERE: option validation can't see $metadata, so
+                # it can't tell a leaf-level cursor_field from an ancestor-level
+                # one. The ancestor-cursor walk re-reads the whole subtree of any
+                # ancestor with cursor > since — there is no leaf read filter for
+                # a lookback window to floor, so an explicit window would
+                # silently do nothing. Refuse instead of no-op.
+                raise ValueError(
+                    f"cursor_lookback_seconds (an explicit value) has no effect "
+                    f"when cursor_field={cursor_field!r} lives on an ANCESTOR "
+                    f"level of {table_name!r} (the ancestor-cursor walk re-reads "
+                    f"each dirty ancestor's whole subtree; there is no leaf read "
+                    f"filter to floor). Use 'auto' (default) or 'off', or move "
+                    f"the cursor to a leaf-level field."
+                )
             return self._read_contained_incremental_ancestor_cursor(
                 table_name, segments, start_offset, table_options, cursor_field, cursor_level
             )
@@ -5284,7 +5503,7 @@ def register_lakeflow_source(spark):
             # Key-based resume position (churn-stable); legacy offsets carry only
             # ``parent_idx`` and fall back to the positional skip inside the walks.
             parked_chain_in = (start_offset or {}).get("parent_keys")
-            max_records = int((table_options or {}).get("max_records_per_batch", "10000"))
+            max_records = _parse_max_records(table_options)
             order_by = self._leaf_cursor_order_by(table_name, namespace, cursor_field)
             if chains_iter is None:
                 chains_iter = self._iter_parent_key_chains(segments, namespace, table_options)
@@ -5410,16 +5629,26 @@ def register_lakeflow_source(spark):
                     checkpoint_keys = (
                         "parent_idx",
                         "parent_keys",
+                        "parent_cursor",
                         "chain_next_link",
                         "truncated_chain_cursor",
                         "running_max",
+                        # Foreign park keys from an ``expand_contained`` read of
+                        # the same table (mode flipped off mid-park): a stale
+                        # queue / running max must not ride every future N+1
+                        # offset — its watermark is folded below like our own.
+                        "pending_fetches",
+                        "running_max_cursor",
                     )
                     if any(k in empty for k in checkpoint_keys):
                         # Fold the cycle's accumulated max into the committed
                         # cursor BEFORE clearing — the truncated batches' rows
                         # were emitted under it, and dropping it re-reads them
                         # forever (period-2 duplicate loop).
-                        committed = _max_or(empty.get("running_max"), empty.get("cursor"))
+                        committed = _max_or(
+                            _max_or(empty.get("running_max"), empty.get("running_max_cursor")),
+                            empty.get("cursor"),
+                        )
                         empty = {k: v for k, v in empty.items() if k not in checkpoint_keys}
                         if committed is not None:
                             empty["cursor"] = committed
@@ -5497,7 +5726,7 @@ def register_lakeflow_source(spark):
                 cursor_field,
                 int((start_offset or {}).get("parent_idx", 0)),
                 (start_offset or {}).get("chain_next_link"),
-                int((table_options or {}).get("max_records_per_batch", "10000")),
+                _parse_max_records(table_options),
                 self._resolve_fk_columns(segments, namespace),
                 leaf_segment_filter=segment_filters.get(len(segments) - 1),
                 parked_chain=(start_offset or {}).get("parent_keys"),
@@ -6768,6 +6997,7 @@ def register_lakeflow_source(spark):
         own_pks: dict = field(default_factory=dict)
         entity_type: dict = field(default_factory=dict)
         fk_columns: dict = field(default_factory=dict)
+        edm_types: dict = field(default_factory=dict)
 
         def __getstate__(self):
             """Drop the ``id(et)``-keyed memos at the pickle boundary.
@@ -6782,7 +7012,7 @@ def register_lakeflow_source(spark):
             process-portable. Fork-based workers (no pickle) preserve identity
             and never pass through here."""
             state = self.__dict__.copy()
-            for memo in ("base_chain", "own_fields", "own_pks"):
+            for memo in ("base_chain", "own_fields", "own_pks", "edm_types"):
                 state[memo] = {}
             return state
 
@@ -7099,10 +7329,13 @@ def register_lakeflow_source(spark):
             ):
                 raise ValueError(
                     "cursor_lookback_seconds (an explicit value) is supported "
-                    "only with a cursor_field on a contained path — it floors the "
-                    "read filter for the non-atomic expand_contained=true walk and "
-                    "the leaf-cursor N+1 / cursor_probe walk. Use 'auto' (default) "
-                    "or 'off' for other read configurations."
+                    "only with a LEAF-level cursor_field on a contained path — it "
+                    "floors the read filter for the non-atomic "
+                    "expand_contained=true walk and the leaf-cursor N+1 / "
+                    "cursor_probe walk. (An ancestor-level cursor_field is "
+                    "rejected at read time — that walk has no leaf read filter "
+                    "to floor.) Use 'auto' (default) or 'off' for other read "
+                    "configurations."
                 )
             # ``auto`` (the default) is a best-effort hint that no-ops where it can't
             # engage, so these conflict checks fire only on an EXPLICIT strategy
@@ -7430,7 +7663,7 @@ def register_lakeflow_source(spark):
                 extra_filter=segment_filters.get(0),
                 order_by=pk_order or None,
             )
-            return self._fetch_pages(url), {}
+            return self._fetch_pages(url, self._edm_types_for_table(table_name, namespace)), {}
 
         def _read_incremental(
             self,
@@ -7484,7 +7717,7 @@ def register_lakeflow_source(spark):
                 extra_filter=extra_filter,
                 order_by=",".join(order_terms),
             )
-            max_records = int(table_options.get("max_records_per_batch", "10000"))
+            max_records = _parse_max_records(table_options)
             # ``cursor_nulls`` policy: ``effective`` yields the value used for
             # filtering/trim/watermark (a synthetic floor for nulls under
             # ``coalesce``); ``skip_null`` drops null-cursor rows under
@@ -7496,7 +7729,7 @@ def register_lakeflow_source(spark):
 
             records: list[dict] = []
             truncated = False
-            for row in self._fetch_pages(url):
+            for row in self._fetch_pages(url, self._edm_types_for_table(table_name, namespace)):
                 if skip_null and row.get(cursor_field) is None:
                     continue
                 rec_cursor = effective(row)
@@ -7587,7 +7820,7 @@ def register_lakeflow_source(spark):
             skip_null, _effective = self._make_cursor_resolver(
                 table_name, namespace, cursor_field, table_options
             )
-            for row in self._fetch_pages(url):
+            for row in self._fetch_pages(url, self._edm_types_for_table(table_name, namespace)):
                 if skip_null and row.get(cursor_field) is None:
                     continue
                 yield row
@@ -7631,7 +7864,7 @@ def register_lakeflow_source(spark):
 
             namespace = (table_options or {}).get("namespace")
             primary_keys = self._primary_keys_for(table_name, namespace)
-            max_records = int((table_options or {}).get("max_records_per_batch", "10000"))
+            max_records = _parse_max_records(table_options)
 
             records, new_delta_link, carry_next_link, rebootstrap = self._delta_walk_pages(
                 url=url,
@@ -8153,7 +8386,7 @@ def register_lakeflow_source(spark):
                 params.append(f"$orderby={order_by}")
             return "&".join(params)
 
-        def _fetch_pages(self, url: str) -> Iterator[dict]:
+        def _fetch_pages(self, url: str, edm_types: dict[str, str] | None = None) -> Iterator[dict]:
             """Walk a collection's pages, yielding raw JSON dicts (no coercion).
 
             Thin row-flattening wrapper over :meth:`_fetch_pages_with_links`,
@@ -8161,8 +8394,10 @@ def register_lakeflow_source(spark):
             auto). The whole collection is drained within this call: under the
             default ``auto`` a server that page-limits below ``$top`` without a
             continuation link is still fully drained (keep seeking until empty).
+            ``edm_types`` (the collection's declared property types, when the
+            caller has them) types the keyset-seek boundary literals.
             """
-            for page_rows, _ in self._fetch_pages_with_links(url):
+            for page_rows, _ in self._fetch_pages_with_links(url, edm_types):
                 yield from page_rows
 
         def _parse_pagination(self, table_options: dict[str, str] | None) -> str:
@@ -8186,7 +8421,9 @@ def register_lakeflow_source(spark):
                 )
             return raw
 
-        def _fetch_pages_with_links(self, url: str) -> Iterator[tuple[list[dict], str | None]]:
+        def _fetch_pages_with_links(
+            self, url: str, edm_types: dict[str, str] | None = None
+        ) -> Iterator[tuple[list[dict], str | None]]:
             """Page-aware fetch: yields ``(page_rows, next_url)`` per response,
             where ``next_url`` resumes the next page (``None`` at the end).
 
@@ -8209,7 +8446,7 @@ def register_lakeflow_source(spark):
             """
             mode = getattr(self, "_pagination", "nextlink")
             if mode != "nextlink":
-                yield from self._client_paginate_pages(url, mode)
+                yield from self._client_paginate_pages(url, mode, edm_types)
                 return
             session = self._get_session()
             next_url: str | None = url
@@ -8251,7 +8488,11 @@ def register_lakeflow_source(spark):
                 next_url = new_next
 
         def _verify_or_filter_support(
-            self, base_url: str, order_keys: list[str], sample_row: dict
+            self,
+            base_url: str,
+            order_keys: list[str],
+            sample_row: dict,
+            edm_types: dict[str, str] | None = None,
         ) -> bool:
             """One-shot, per-instance probe: does the server accept an
             OR-across-**different-columns** ``$filter`` — the composite keyset-seek
@@ -8286,7 +8527,7 @@ def register_lakeflow_source(spark):
             if cached is not None:
                 self.__dict__["_or_filter_ok"] = cached
                 return cached
-            seek = _pg_keyset_filter(order_keys, sample_row)
+            seek = _pg_keyset_filter(order_keys, sample_row, edm_types)
             if seek is None or " or " not in seek:
                 return True  # no OR-across-columns built for this key set — nothing to probe
             probe = _pg_strip_query(
@@ -8314,7 +8555,7 @@ def register_lakeflow_source(spark):
             return ok
 
         def _client_paginate_pages(
-            self, url: str, mode: str
+            self, url: str, mode: str, edm_types: dict[str, str] | None = None
         ) -> Iterator[tuple[list[dict], str | None]]:
             """Client-driven pagination for servers that don't (always) emit
             ``@odata.nextLink``. Yields ``(page_rows, next_url)`` like
@@ -8468,7 +8709,9 @@ def register_lakeflow_source(spark):
                 # no-progress guard above bounds a server that ignores the
                 # seek/$skip — auto then stops with this page's rows, exactly as the
                 # old short-page default did, minus the dropped duplicate.
-                if can_keyset and not self._verify_or_filter_support(url, order_keys, page_rows[-1]):
+                if can_keyset and not self._verify_or_filter_support(
+                    url, order_keys, page_rows[-1], edm_types
+                ):
                     # Composite keyset seek would build an OR-across-columns filter
                     # the server rejects (Hexagon Smart API). Drop to $skip (mode B)
                     # for the rest of this collection — and, via the cached verdict,
@@ -8483,7 +8726,7 @@ def register_lakeflow_source(spark):
                     )
                     can_keyset = False
                 if can_keyset:
-                    seek = _pg_keyset_filter(order_keys, page_rows[-1])
+                    seek = _pg_keyset_filter(order_keys, page_rows[-1], edm_types)
                     if seek is not None:
                         nxt = _pg_keyset_seek_url(url, base_filter, seek)
                     else:
@@ -9060,7 +9303,17 @@ def register_lakeflow_source(spark):
                     f"'oauth2_client_secret', 'oauth2_token_url', and "
                     f"'oauth2_scope' on this connection. Server response: {hint}"
                 ) from None
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                # 403 / retry-exhausted 5xx / anything else: same actionable shape
+                # as the 400/401 branches instead of raise_for_status()'s terse
+                # one-liner. The hint extractor is safe here — OAuth ERROR bodies
+                # carry error codes/descriptions, never live tokens (only 2xx
+                # bodies do, and those are handled below with the body withheld).
+                hint = _extract_oauth_error_hint(resp)
+                raise ValueError(
+                    f"OAuth2 token endpoint {token_url!r} returned "
+                    f"{resp.status_code}. Server response: {hint}"
+                ) from None
             try:
                 payload = resp.json()
             except ValueError:
@@ -9463,6 +9716,40 @@ def register_lakeflow_source(spark):
             state.own_pks[cache_key] = result
             return result
 
+        def _edm_types_for_et(self, et: ET.Element) -> dict[str, str]:
+            """Declared property → Edm-type map over the base-type chain
+            (closest-to-leaf declaration wins, matching field resolution).
+
+            Feeds ``odata_literal_typed`` at the key-predicate / keyset-seek
+            render sites: the OData JSON payload delivers ``Edm.Guid`` (and, on
+            IEEE754Compatible servers, ``Edm.Int64``/``Edm.Decimal``) values as
+            JSON strings, so only the declared type can decide whether the wire
+            literal is quoted. Missing/undeclared properties simply aren't in the
+            map — the renderer falls back to the value sniff for those."""
+            state = self._metadata_state()
+            cache_key = id(et)
+            cached = state.edm_types.get(cache_key)
+            if cached is not None:
+                return cached
+            result: dict[str, str] = {}
+            for type_el in self._resolve_base_chain(et):
+                for prop in type_el.findall(f"{_NS_EDM}Property"):
+                    name = prop.get("Name")
+                    if name and name not in result:
+                        result[name] = prop.get("Type", "Edm.String")
+            state.edm_types[cache_key] = result
+            return result
+
+        def _edm_types_for_table(self, table_name: str, namespace: str | None) -> dict[str, str]:
+            """Best-effort :meth:`_edm_types_for_et` by table name / contained
+            path. Resolution failure returns ``{}`` (sniff-based literal
+            rendering) — typing seek literals must never break a read that
+            worked untyped."""
+            try:
+                return self._edm_types_for_et(self._entity_type_for(table_name, namespace))
+            except Exception:  # noqa: BLE001 — metadata gaps must not break reads
+                return {}
+
         # ------------------------------------------------------------------
         # Cursor filter formatting
         # ------------------------------------------------------------------
@@ -9493,9 +9780,14 @@ def register_lakeflow_source(spark):
             null-only batch yields ``since`` (if carried) or ``{}``. The max is
             CURSOR-ordered (chronological for ISO renderings — a lexical ``max``
             prefers ``…00Z`` over the later ``…00.5Z``, regressing the watermark
-            behind emitted rows)."""
+            behind emitted rows) and FLOORED at ``since``: with an active lookback
+            window the read filter sits below the committed watermark, and if the
+            watermark-defining row was deleted between batches the overlap's own
+            max lands below ``since`` — committing it would regress the watermark
+            (duplicate-safe, but the window re-reads grow and can repeat every
+            batch)."""
             if cursors:
-                return {"cursor": _cursor_max(cursors)}
+                return {"cursor": _max_or(_cursor_max(cursors), since)}
             if since is not None:
                 return {"cursor": since}
             return {}
@@ -9981,6 +10273,7 @@ def register_lakeflow_source(spark):
     _cursor_max = cursor_max
     _cursor_newer = cursor_newer
     _max_or = max_or
+    _parse_max_records = parse_max_records
     _trim_to_distinct_cursor_boundary = trim_to_distinct_cursor_boundary
     _cursor_le = cursor_le
     _jsonify_complex_values = jsonify_complex_values
@@ -9988,7 +10281,9 @@ def register_lakeflow_source(spark):
     _cursor_le = cursor_le
     _cursor_max = cursor_max
     _jsonify_complex_values = jsonify_complex_values
+    _max_or = max_or
     _parse_iso8601 = parse_iso8601
+    _parse_max_records = parse_max_records
     _trim_to_distinct_cursor_boundary = trim_to_distinct_cursor_boundary
     _CONTAINED_PATH_SEP = CONTAINED_PATH_SEP
     _DEFAULT_PAGE_SIZE = DEFAULT_PAGE_SIZE
