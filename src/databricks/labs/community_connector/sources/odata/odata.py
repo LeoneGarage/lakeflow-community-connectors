@@ -1089,7 +1089,7 @@ class ODataLakeflowConnect(
         offset = start_offset or {}
         # Seed per-instance capability verdicts from the resume offset so a
         # reader the framework recreates each microbatch skips re-probing.
-        self._seed_capability_caches(start_offset)
+        self._seed_capability_caches(table_name, start_offset)
         if _parse_contained_path(table_name) is not None:
             if self._delta_setting(opts) == "enabled":
                 raise ValueError(
@@ -1118,7 +1118,9 @@ class ODataLakeflowConnect(
                 if opts.get("cursor_field"):
                     opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
                     return self._with_capabilities(
-                        self._read_contained_expand(table_name, start_offset, opts), opts
+                        self._read_contained_expand(table_name, start_offset, opts),
+                        opts,
+                        table_name,
                     )
                 # Snapshot expand: same bare-``{}`` terminal-offset rule as
                 # the N+1 snapshot below (quiesce on ``end == start``); the
@@ -1135,6 +1137,7 @@ class ODataLakeflowConnect(
                         table_name, start_offset, opts, opts["cursor_field"]
                     ),
                     opts,
+                    table_name,
                 )
             # Snapshot: the terminal offset stays a bare ``{}`` — deliberately
             # NOT threaded with capability verdicts. A streaming snapshot
@@ -1161,11 +1164,13 @@ class ODataLakeflowConnect(
             # Snapshot (the branch below) leaves it unset → no $top.
             opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
             return self._with_capabilities(
-                self._read_incremental(table_name, start_offset, opts, opts["cursor_field"]), opts
+                self._read_incremental(table_name, start_offset, opts, opts["cursor_field"]),
+                opts,
+                table_name,
             )
         return self._read_snapshot(table_name, opts)
 
-    def _seed_capability_caches(self, start_offset: dict | None) -> None:
+    def _seed_capability_caches(self, table_name: str, start_offset: dict | None) -> None:
         """Seed per-instance capability verdicts from the resume offset so a
         reader the framework recreates each microbatch skips re-probing.
 
@@ -1174,9 +1179,12 @@ class ODataLakeflowConnect(
         **$batch** verdict (``batch_ok``, shared with the leaf-cursor path and
         the ``contained_fetch`` snapshot/stream walks), and the discovered
         **$batch chunk cap** (``batch_size_ok``, the working ops-per-request the
-        adaptive shrink settled on after a "too many parts" rejection). All are
-        server-wide, so a single cached value serves every table this instance
-        reads. Persisted back by :meth:`_merge_capability_caches`."""
+        adaptive shrink settled on after a "too many parts" rejection). Those
+        are server-wide, so a single cached value serves every table this
+        instance reads; ``expand_ok`` is PER TABLE (nesting depths verify
+        differently), so it seeds only under the offset's own ``table_name`` —
+        a scalar here would hand table A's verdict to table B and then bake it
+        into B's offset. Persisted back by :meth:`_merge_capability_caches`."""
         off = start_offset or {}
         if "or_filter_ok" in off:
             self.__dict__["_or_filter_ok"] = bool(off["or_filter_ok"])
@@ -1185,14 +1193,18 @@ class ODataLakeflowConnect(
         if "batch_size_ok" in off:
             self.__dict__["_batch_size_cap"] = int(off["batch_size_ok"])
         if "expand_ok" in off:
-            self.__dict__["_expand_supported"] = bool(off["expand_ok"])
+            memo = self.__dict__.setdefault("_expand_supported", {})
+            memo[table_name] = bool(off["expand_ok"])
 
-    def _merge_capability_caches(self, offset: dict) -> dict:
+    def _merge_capability_caches(self, offset: dict, table_name: str | None = None) -> dict:
         """Thread the per-instance OR / $batch / batch-size verdicts into the
         returned offset so they survive the framework recreating the reader each
         microbatch.
         Only adds a flag once actually **determined** this instance (the probe
-        ran), and never overwrites one a read path already wrote. Excluded from
+        ran), and never overwrites one a read path already wrote. ``expand_ok``
+        is per-table: only THIS table's own memoized verdict may ride its
+        offset (another table's verdict baked in here would persist in the
+        checkpoint and skip this table's preflight forever). Excluded from
         the no-progress comparison (see ``_finalize_cursor_read``), so baking in
         a verdict never reads as forward progress."""
         if not isinstance(offset, dict):
@@ -1204,8 +1216,9 @@ class ODataLakeflowConnect(
             add["batch_ok"] = self.__dict__["_batch_supported"]
         if "_batch_size_cap" in self.__dict__ and "batch_size_ok" not in offset:
             add["batch_size_ok"] = self.__dict__["_batch_size_cap"]
-        if "_expand_supported" in self.__dict__ and "expand_ok" not in offset:
-            add["expand_ok"] = self.__dict__["_expand_supported"]
+        expand_memo = self.__dict__.get("_expand_supported") or {}
+        if table_name in expand_memo and "expand_ok" not in offset:
+            add["expand_ok"] = expand_memo[table_name]
         return {**offset, **add} if add else offset
 
     def _cached_capability(self, key: str, table_name: str | None = None):
@@ -1298,13 +1311,18 @@ class ODataLakeflowConnect(
                 )
                 _capability_cache_drop(self.service_url, {"cursor_probe_ok"}, table_name=key)
 
-    def _with_capabilities(self, result: tuple, table_options: dict | None = None) -> tuple:
+    def _with_capabilities(
+        self,
+        result: tuple,
+        table_options: dict | None = None,
+        table_name: str | None = None,
+    ) -> tuple:
         """Wrap a ``(records, offset)`` read result, threading capability verdicts
-        into the offset (see :meth:`_merge_capability_caches`) and then scrubbing
-        any whose governing option is non-``auto`` (see
-        :meth:`_scrub_nonauto_verdicts`)."""
+        into the offset (see :meth:`_merge_capability_caches`; ``table_name``
+        scopes the per-table ``expand_ok`` merge) and then scrubbing any whose
+        governing option is non-``auto`` (see :meth:`_scrub_nonauto_verdicts`)."""
         records, offset = result
-        offset = self._merge_capability_caches(offset)
+        offset = self._merge_capability_caches(offset, table_name)
         return records, self._scrub_nonauto_verdicts(offset, table_options)
 
     # ------------------------------------------------------------------

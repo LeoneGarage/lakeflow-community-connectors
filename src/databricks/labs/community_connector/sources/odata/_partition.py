@@ -33,16 +33,22 @@ Per-call shape:
   holding a slice of top-level parents.
 * Streaming reads land via ``LakeflowPartitionedStreamReader`` when
   ``is_partitioned`` is True; ``get_partitions(table, options, start,
-  end)`` carries the cursor bounds into the descriptor so each
-  executor filters ``cursor gt start_cursor AND cursor le
-  end_cursor``. ``latest_offset`` probes the top-level entity for the
-  current max cursor — one extra HTTP per micro-batch.
+  end)`` seeds each descriptor with ``cursor_lower`` (= start's
+  cursor, floored by any configured ``cursor_lookback_seconds``) so
+  each executor filters ``cursor gt cursor_lower``. There is NO upper
+  fence filter: rows landing past ``end`` mid-batch are emitted now
+  and re-read next batch — duplicate-safe. ``latest_offset`` probes
+  the top-level entity for the current max cursor (over the same
+  ``filter_at_<top>``-restricted population the read walks) — one
+  extra HTTP per micro-batch.
 
 Each partition descriptor is JSON-serialisable (primitive keys
 only).
 """
 
 from typing import Iterator, Sequence
+
+import requests
 
 from databricks.labs.community_connector.interface.supports_partition import (
     SupportsPartitionedStream,
@@ -54,6 +60,10 @@ from databricks.labs.community_connector.sources.odata._contained import (
     parse_contained_path,
     resolve_segment_filters,
     validate_page_size,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
+    cursor_le as _cursor_le,
+    max_or as _max_or,
 )
 
 
@@ -95,6 +105,7 @@ class PartitionMixin(SupportsPartitionedStream):
         # Fail fast at stream setup: a partitionable table never routes
         # through read_table, so its option validation must run here.
         validate_page_size(opts)
+        _parse_num_partitions(opts)
         # Reset any per-table shared-cache verdict pinned non-``auto`` here too:
         # a partitionable table streams through the partition path (this →
         # get_partitions → read_partition), never read_table, so without this
@@ -147,13 +158,16 @@ class PartitionMixin(SupportsPartitionedStream):
             return {"snapshot_id": _wall_clock_ns()}
         segments = parse_contained_path(table_name) or [table_name]
         namespace = opts.get("namespace")
-        max_cursor = self._probe_top_level_max_cursor(segments[0], namespace, cursor_field)
+        max_cursor = self._probe_top_level_max_cursor(segments, namespace, cursor_field, opts)
         prior = (start_offset or {}).get("cursor")
         if max_cursor is None:
             # Empty top set or all-null cursor column. Keep the prior
             # value so Spark sees no progress and skips the batch.
             return {"cursor": prior} if prior is not None else {}
-        return {"cursor": max_cursor}
+        # Never regress the committed fence (replica lag, deletion of the
+        # max row): the docstring's monotonic-progression promise is what
+        # lets ``cursor gt fence`` be the sole dedup boundary.
+        return {"cursor": _max_or(prior, max_cursor)}
 
     def get_partitions(
         self,
@@ -183,6 +197,7 @@ class PartitionMixin(SupportsPartitionedStream):
             return [{}]
         opts = table_options or {}
         validate_page_size(opts)
+        num_partitions = _parse_num_partitions(opts)
         # Reset any per-table shared-cache verdict pinned non-``auto`` on the
         # partition path too (called every microbatch for a partitioned stream,
         # which never reaches read_table's reset). Table-scoped + idempotent;
@@ -223,12 +238,26 @@ class PartitionMixin(SupportsPartitionedStream):
         # the previously-probed fence; we stamp it onto each row's
         # cursor column so the next batch's ``cursor_lower`` matches.
         cursor_lower = (start_offset or {}).get("cursor")
+        if cursor_field:
+            # Mirror the serial reads: floor the READ boundary by the
+            # configured lookback so rows that land at-or-below the
+            # committed fence after the fence was probed (the fence is
+            # taken BEFORE discovery, so that race window is real) are
+            # re-scanned. Only the read floor moves — ``latest_offset``
+            # still commits the true probed max, and re-read rows are
+            # duplicate-safe. ``auto`` resolves to 0 on this path (no
+            # walk-duration history rides the partitioned offset), so
+            # overlap here requires an explicit ``cursor_lookback_seconds``.
+            self._cursor_lookback = self._parse_cursor_lookback(opts)
+            self._cursor_lookback_factor = self._parse_cursor_lookback_factor(opts)
+            self._cursor_lookback_max_seconds = self._parse_cursor_lookback_ceiling(opts)
+            self._active_lookback_seconds = self._resolve_active_lookback(start_offset)
+            cursor_lower = self._apply_cursor_lookback(cursor_lower)
         top_rows = self._discover_top_parent_rows(
             segments, namespace, opts, cursor_field, cursor_lower
         )
         if not top_rows:
             return []
-        num_partitions = max(1, int(opts.get(_OPT_NUM_PARTITIONS, _DEFAULT_NUM_PARTITIONS)))
         return _bin_pack(top_rows, num_partitions, cursor_lower)
 
     def read_partition(
@@ -272,16 +301,30 @@ class PartitionMixin(SupportsPartitionedStream):
 
     def _probe_top_level_max_cursor(
         self,
-        top_set: str,
+        segments: list[str],
         namespace: str | None,
         cursor_field: str,
+        table_options: dict[str, str],
     ):
         """One HTTP probe: ``$top=1&$orderby=<cursor> desc`` → max value.
 
-        Returns ``None`` when the top set is empty or every row has a
-        null cursor. The caller decides whether that means "no new
+        The probe ANDs in the level-0 segment filter (``filter_at_<top>``)
+        so the fence is the max over the SAME row population the discovery
+        fetch reads. An unfiltered probe can fence past the filtered
+        population's max (a fresher row OUTSIDE the filter); any filtered-in
+        row that later lands with a cursor at or below that fence would sit
+        behind the next batch's ``cursor gt fence`` forever. It also filters
+        ``<cursor> ne null`` so a backend that sorts nulls FIRST under
+        ``desc`` doesn't hand the ``$top=1`` probe a single null row and
+        silently stall the stream; a backend that rejects null comparisons
+        with a 400 gets one retry without that guard (keeping the
+        population-defining segment filter).
+
+        Returns ``None`` when the (filtered) top set is empty or the probed
+        row's cursor is null. The caller decides whether that means "no new
         data" or "first call against an empty source."
         """
+        top_set = segments[0]
         # Use the existing URL builder + page-fetch plumbing so OAuth,
         # extra_headers, retries, etc. all carry through unchanged.
         et = self._entity_type_for(top_set, namespace)
@@ -292,12 +335,23 @@ class PartitionMixin(SupportsPartitionedStream):
             "page_size": "1",
             "select": cursor_field,
         }
-        url = self._build_url(top_set, opts, order_by=f"{cursor_field} desc")
-        for row in self._fetch_pages(url):
-            value = row.get(cursor_field)
-            if value is not None:
-                return value
-        return None
+        order_by = f"{cursor_field} desc"
+        seg_filter = resolve_segment_filters(table_options or {}, segments).get(0)
+
+        def _first_value(extra_filter):
+            url = self._build_url(top_set, opts, extra_filter=extra_filter, order_by=order_by)
+            for row in self._fetch_pages(url):
+                value = row.get(cursor_field)
+                if value is not None:
+                    return value
+            return None
+
+        try:
+            return _first_value(combine_filters(seg_filter, f"{cursor_field} ne null"))
+        except requests.HTTPError as exc:
+            if exc.response is None or exc.response.status_code != 400:
+                raise
+            return _first_value(seg_filter)
 
     def _discover_top_parent_rows(
         self,
@@ -412,16 +466,43 @@ class PartitionMixin(SupportsPartitionedStream):
                 self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                 if cursor_level == len(segments) - 1:
                     # Leaf-cursor mode: filter per row by ``cursor gt
-                    # cursor_lower``. (Server-side filter would be
+                    # cursor_lower`` — chronological via ``_cursor_le``,
+                    # never lexical (``.5Z`` vs ``Z`` renderings invert
+                    # under string order). (Server-side filter would be
                     # cheaper, but partition activation gates this to
                     # cursor_level==0; this branch exists for
                     # completeness only.)
                     rec = row.get(cursor_field)
-                    if cursor_lower is not None and rec is not None and rec <= cursor_lower:
+                    if (
+                        cursor_lower is not None
+                        and rec is not None
+                        and _cursor_le(rec, cursor_lower)
+                    ):
                         continue
                 else:
                     row[cursor_field] = ancestor_cursor
                 yield row
+
+
+def _parse_num_partitions(opts: dict) -> int:
+    """Curated parse of ``num_partitions`` (default 4).
+
+    Mirrors ``validate_page_size``: garbage must fail fast with a clear
+    error instead of riding into a bare ``int()`` — on the batch path the
+    framework swallows planner exceptions and silently degrades to a
+    serial read, so an uncurated ``ValueError`` would cost the user their
+    parallelism with no hint why. Called from ``is_partitioned`` (stream
+    setup, where a raise still surfaces) and ``get_partitions``."""
+    raw = opts.get(_OPT_NUM_PARTITIONS)
+    if raw is None:
+        return _DEFAULT_NUM_PARTITIONS
+    text = str(raw).strip()
+    if not text.isdigit() or int(text) < 1:
+        raise ValueError(
+            f"num_partitions={raw!r} is not a positive integer. Use a value "
+            f">= 1, or unset it for the default ({_DEFAULT_NUM_PARTITIONS})."
+        )
+    return int(text)
 
 
 def _bin_pack(rows: list[dict], num_partitions: int, cursor_lower) -> list[dict]:

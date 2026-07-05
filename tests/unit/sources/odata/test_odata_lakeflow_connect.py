@@ -7622,6 +7622,161 @@ def test_partition_get_partitions_empty_when_offsets_equal():
     assert parts == []
 
 
+@responses.activate
+def test_partition_fence_probe_scopes_to_top_level_filter():
+    """The ``latest_offset`` fence must be the max over the SAME population
+    the read walks — ``filter_at_<top>`` rows only, non-null cursors first.
+    An unfiltered probe fences past the filtered population's max (a fresher
+    row OUTSIDE the filter), permanently skipping any filtered-in row that
+    later lands at-or-below that fence (``cursor gt fence`` excludes it on
+    every subsequent batch). The matcher below IS the assertion: a probe
+    without this exact ``$filter`` finds no registered response."""
+    _mock_nested_metadata()
+    responses.get(
+        f"{SERVICE_URL}Parents",
+        json={"value": [{"Id": 5, "Name": "2024-05-01T00:00:00Z"}]},
+        match=[
+            responses.matchers.query_param_matcher(
+                {
+                    "$top": "1",
+                    "$select": "Name",
+                    "$filter": "(Id eq 5) and (Name ne null)",
+                    "$orderby": "Name desc",
+                }
+            )
+        ],
+    )
+    c = _make()
+    offset = c.latest_offset(
+        "Parents__Children",
+        {"cursor_field": "Name", "filter_at_Parents": "Id eq 5"},
+        None,
+    )
+    assert offset == {"cursor": "2024-05-01T00:00:00Z"}
+
+
+@responses.activate
+def test_partition_fence_probe_retries_without_null_guard_on_400():
+    """A backend that rejects the ``ne null`` comparison (400) gets one
+    retry without the null guard, so the hardening never breaks a stream
+    that worked before it existed."""
+    _mock_nested_metadata()
+    responses.get(
+        f"{SERVICE_URL}Parents",
+        json={"error": {"message": "null comparison not supported"}},
+        status=400,
+        match=[
+            responses.matchers.query_param_matcher(
+                {
+                    "$top": "1",
+                    "$select": "Name",
+                    "$filter": "Name ne null",
+                    "$orderby": "Name desc",
+                }
+            )
+        ],
+    )
+    responses.get(
+        f"{SERVICE_URL}Parents",
+        json={"value": [{"Id": 9, "Name": "z"}]},
+        match=[
+            responses.matchers.query_param_matcher(
+                {"$top": "1", "$select": "Name", "$orderby": "Name desc"}
+            )
+        ],
+    )
+    c = _make()
+    offset = c.latest_offset("Parents__Children", {"cursor_field": "Name"}, None)
+    assert offset == {"cursor": "z"}
+
+
+@responses.activate
+def test_partition_latest_offset_never_regresses_fence():
+    """Replica lag / deletion of the max row must not move the committed
+    fence backwards: the docstring's monotonic-progression promise is what
+    makes ``cursor gt fence`` a safe dedup boundary."""
+    _mock_nested_metadata()
+    responses.get(
+        f"{SERVICE_URL}Parents",
+        json={"value": [{"Id": 1, "Name": "2024-01-01T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    offset = c.latest_offset(
+        "Parents__Children",
+        {"cursor_field": "Name"},
+        {"cursor": "2024-06-01T00:00:00Z"},
+    )
+    assert offset == {"cursor": "2024-06-01T00:00:00Z"}
+
+
+@responses.activate
+def test_partition_lookback_floors_read_boundary_not_fence():
+    """``cursor_lookback_seconds`` must floor the partitioned READ boundary
+    (discovery filter + descriptor ``cursor_lower``) — it was silently
+    ignored on this path, leaving the probe→discovery race with no overlap
+    protection. The committed fence itself is never floored."""
+    from urllib.parse import unquote
+
+    _mock_nested_metadata()
+    responses.get(
+        f"{SERVICE_URL}Parents",
+        json={"value": [{"Id": 1, "Name": "2024-05-01T00:05:00Z"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    parts = c.get_partitions(
+        "Parents__Children",
+        {"cursor_field": "Name", "cursor_lookback_seconds": "600"},
+        {"cursor": "2024-05-01T00:10:00Z"},
+        {"cursor": "2024-05-01T00:20:00Z"},
+    )
+    # Descriptors carry the FLOORED boundary so every executor re-scans
+    # the overlap window.
+    assert parts
+    assert all(p["cursor_lower"] == "2024-05-01T00:00:00Z" for p in parts)
+    # And the discovery fetch used the floored boundary on the wire.
+    urls = [unquote(call.request.url) for call in responses.calls]
+    assert any("Name gt 2024-05-01T00:00:00Z" in u for u in urls)
+
+
+@responses.activate
+def test_partition_num_partitions_garbage_rejected():
+    """Garbage ``num_partitions`` must fail fast with a curated error —
+    a bare ``int()`` crash is swallowed by the batch planner, which then
+    silently degrades to a serial read."""
+    _mock_nested_metadata()
+    c = _make({"num_partitions": "abc"})
+    with pytest.raises(ValueError, match="num_partitions"):
+        c.is_partitioned("Parents__Children")
+    c2 = _make()
+    with pytest.raises(ValueError, match="num_partitions"):
+        c2.get_partitions("Parents__Children", {"num_partitions": "0"})
+
+
+@responses.activate
+def test_partition_leaf_cursor_refilter_is_chronological_not_lexical():
+    """The leaf-level client-side re-filter must compare cursor text
+    chronologically: ``…00.5Z`` is NEWER than a ``…00Z`` boundary but
+    lexically smaller (``.`` < ``Z``), so the old raw ``<=`` silently
+    dropped exactly the newest rows."""
+    _mock_nested_metadata()
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={
+            "value": [
+                {"Id": 11, "Label": "new", "ModifiedAt": "2024-01-01T23:00:00.5Z"},
+                {"Id": 12, "Label": "old", "ModifiedAt": "2024-01-01T22:00:00Z"},
+            ]
+        },
+        match_querystring=False,
+    )
+    c = _make()
+    partition = {"top_parent_rows": [{"Id": 1}], "cursor_lower": "2024-01-01T23:00:00Z"}
+    rows = list(c.read_partition("Parents__Children", partition, {"cursor_field": "ModifiedAt"}))
+    assert [r["Id"] for r in rows] == [11]
+
+
 # ---------------------------------------------------------------------------
 # 429 / 503 retry with backoff
 # ---------------------------------------------------------------------------
@@ -10496,7 +10651,8 @@ def test_expand_contained_auto_transient_failure_not_persisted():
     recs, offset = c.read_table(PROBE_TABLE, {"cursor": since}, dict(_EXPAND_AUTO_OPTS))
     assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs] == [(1, 10, 1001)]
     assert "expand_ok" not in offset
-    assert "_expand_supported" not in c.__dict__
+    # Transient: the per-table memo dict may exist but must hold no verdict.
+    assert not c.__dict__.get("_expand_supported")
     assert c._cached_capability("expand_ok", table_name=PROBE_TABLE) is None
 
 
@@ -10531,6 +10687,59 @@ def test_expand_contained_default_is_auto():
     assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs] == [(1, 10, 1001)]
     assert offset.get("expand_ok") is True
     assert not any("Roots(" in call.request.url for call in responses.calls)  # no N+1 walk
+
+
+def test_expand_verdict_seed_and_merge_are_table_scoped():
+    """A resume offset's ``expand_ok`` belongs to ITS table only. Seeding
+    table A's verdict must not ride into table B's returned offset on a
+    multi-table instance — baked in there it persists in B's checkpoint and
+    skips B's own preflight forever, though B's (deeper) path may verify
+    differently. That's the silent-deep-row-loss direction the preflight
+    exists to prevent."""
+    c = _make()
+    c._seed_capability_caches("Roots__Mids__Leaves", {"cursor": "x", "expand_ok": True})
+    merged_other = c._merge_capability_caches({"cursor": "y"}, "Other__Deep__Path")
+    assert "expand_ok" not in merged_other
+    merged_own = c._merge_capability_caches({"cursor": "y"}, "Roots__Mids__Leaves")
+    assert merged_own.get("expand_ok") is True
+
+
+@responses.activate
+def test_expand_preflight_not_short_circuited_by_another_tables_verdict():
+    """A verdict memoized for one table must not answer for another: with
+    the instance memo pre-poisoned by a DIFFERENT table's ``False``, this
+    table's ``auto`` preflight still runs, verifies expand, and reads via
+    ``$expand`` (no N+1 walk) — and both tables' verdicts coexist in the
+    per-table memo."""
+    _mock_probe_metadata()
+    since = "2020-01-01T00:00:00Z"
+    tree = {
+        "value": [
+            {
+                "Id": 1,
+                "Mids": [
+                    {
+                        "Id": 10,
+                        "Leaves": [{"Id": 1001, "RecordLastModified": "2020-06-01T00:00:00Z"}],
+                    }
+                ],
+            }
+        ]
+    }
+    responses.add_callback(
+        responses.GET, f"{SERVICE_URL}Roots", callback=lambda request: (200, {}, json.dumps(tree))
+    )
+    c = _make()
+    c.__dict__["_expand_supported"] = {"Some__Other__Table": False}
+    recs, offset = c.read_table(
+        PROBE_TABLE,
+        {"cursor": since},
+        {"cursor_field": "RecordLastModified", "pagination": "nextlink"},
+    )
+    assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs] == [(1, 10, 1001)]
+    assert offset.get("expand_ok") is True
+    assert not any("Roots(" in call.request.url for call in responses.calls)  # no N+1 walk
+    assert c.__dict__["_expand_supported"] == {"Some__Other__Table": False, PROBE_TABLE: True}
 
 
 @responses.activate
@@ -10571,7 +10780,8 @@ def test_expand_contained_auto_inconclusive_falls_back_to_n1():
     assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs] == [(2, 20, 2001)]
     # Inconclusive: nothing recorded, nothing persisted — re-probed next batch.
     assert "expand_ok" not in offset
-    assert "_expand_supported" not in c.__dict__
+    # Transient: the per-table memo dict may exist but must hold no verdict.
+    assert not c.__dict__.get("_expand_supported")
     assert c._cached_capability("expand_ok", table_name=PROBE_TABLE) is None
 
 
@@ -11706,7 +11916,7 @@ def test_capability_verdicts_thread_through_offset():
     _mock_probe_metadata()
     c = _make()
     # Seed instance caches from a prior batch's offset.
-    c._seed_capability_caches({"cursor": "x", "or_filter_ok": False, "batch_ok": True})
+    c._seed_capability_caches(PROBE_TABLE, {"cursor": "x", "or_filter_ok": False, "batch_ok": True})
     assert c.__dict__["_or_filter_ok"] is False
     assert c.__dict__["_batch_supported"] is True
     # A seeded OR verdict is returned WITHOUT issuing a probe (cached short-circuit).

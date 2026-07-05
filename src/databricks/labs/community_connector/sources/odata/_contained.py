@@ -2159,7 +2159,11 @@ class ContainedNavMixin:
 
         Mirrors :meth:`_verify_batch_support`'s verdict discipline: a pass is
         persisted in the resume offset as ``expand_ok`` and cached per
-        instance, but only a **definitive** outcome is recorded —
+        instance **per table** (unlike the genuinely server-wide
+        ``_or_filter_ok`` / ``_batch_supported`` scalars — different nesting
+        depths can verify differently, so one table's verdict must never
+        answer for another on a multi-table instance), but only a
+        **definitive** outcome is recorded —
 
         * definitive pass — the real expand URL returns 2xx AND inline child
           collections are present at every level down to the leaf;
@@ -2181,7 +2185,8 @@ class ContainedNavMixin:
         inconclusive forever while losing data on every other branch."""
         if (start_offset or {}).get("expand_ok"):
             return True
-        cached = self.__dict__.get("_expand_supported")
+        memo = self.__dict__.setdefault("_expand_supported", {})
+        cached = memo.get(table_name)
         if cached is not None:
             return cached
         # Process/file cache (per-table — different nesting depths can
@@ -2190,13 +2195,13 @@ class ContainedNavMixin:
         # can't carry ``expand_ok`` across framework-recreated instances.
         cached = self._cached_capability("expand_ok", table_name=table_name)
         if cached is not None:
-            self.__dict__["_expand_supported"] = cached
+            memo[table_name] = cached
             return cached
         ok, definitive = self._run_expand_preflight(
             table_name, segments, table_options, start_offset
         )
         if definitive:
-            self.__dict__["_expand_supported"] = ok
+            memo[table_name] = ok
             self._store_capability("expand_ok", ok, table_name=table_name)
         return ok
 
