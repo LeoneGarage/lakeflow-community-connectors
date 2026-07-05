@@ -5352,6 +5352,15 @@ def register_lakeflow_source(spark):
     # bumps the mtime and is picked up on the next load.
     _CAPABILITY_DISK_MTIME: dict[str, float] = {}
 
+    # Serializes every read-modify-write-serialize of the shared cache. On the
+    # standard GIL interpreter the individual dict ops are already atomic (and all
+    # callers share one dict object, so there are no lost updates), but under a
+    # free-threaded build (PEP 703, available in 3.14) concurrent streaming queries
+    # on one driver — same ``service_url`` — would race the mutations against the
+    # ``json.dump`` / merge iterations. Cheap and uncontended in the common case;
+    # re-entrant because store/drop nest load and write under a single hold.
+    _CAPABILITY_LOCK = threading.RLock()
+
 
     def _capability_cache_path(service_url: str) -> str:
         """Tempdir path for the capability-verdict JSON of ``service_url``."""
@@ -5367,22 +5376,24 @@ def register_lakeflow_source(spark):
         don't clobber each other's temp mid-write. Best-effort — a read-only tempdir
         just leaves the process cache authoritative — and the temp file is cleaned up
         on failure. Updates the mtime memo so the writing process doesn't immediately
-        re-read its own write."""
+        re-read its own write. Caller must hold :data:`_CAPABILITY_LOCK` (``data`` is
+        the live shared dict this iterates)."""
         tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(data, fh)
-            os.replace(tmp, path)
-        except OSError:
+        with _CAPABILITY_LOCK:
             try:
-                os.remove(tmp)
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(data, fh)
+                os.replace(tmp, path)
+            except OSError:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                return
+            try:
+                _CAPABILITY_DISK_MTIME[path] = os.path.getmtime(path)
             except OSError:
                 pass
-            return
-        try:
-            _CAPABILITY_DISK_MTIME[path] = os.path.getmtime(path)
-        except OSError:
-            pass
 
 
     def _capability_cache_load(service_url: str) -> dict:
@@ -5390,42 +5401,48 @@ def register_lakeflow_source(spark):
         entry, hydrated from the on-disk JSON (when fresh) for keys the process
         hasn't determined itself. Returns the live process entry (mutable). The
         disk file is re-parsed only when its mtime changed since the last merge
-        (see :data:`_CAPABILITY_DISK_MTIME`); otherwise this is just a ``stat``."""
-        entry = _CAPABILITY_CACHE.setdefault(service_url, {})
-        path = _capability_cache_path(service_url)
-        try:
-            mtime = os.path.getmtime(path)
-        except OSError:
-            return entry  # no file yet — process entry stands alone
-        if mtime < time.time() - _CAPABILITY_FILE_CACHE_TTL_SECONDS:
-            return entry  # stale on disk — ignore it (process entry stands)
-        if _CAPABILITY_DISK_MTIME.get(path) == mtime:
-            return entry  # already merged this exact disk state
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                disk = json.load(fh)
-        except (OSError, ValueError):
-            return entry  # missing/corrupt file — the process entry stands alone
-        if isinstance(disk, dict):
-            for key, value in disk.items():
-                if key == "expand_ok" and isinstance(value, dict):
-                    entry["expand_ok"] = {**value, **entry.get("expand_ok", {})}
-                else:
-                    entry.setdefault(key, value)
-        _CAPABILITY_DISK_MTIME[path] = mtime
-        return entry
+        (see :data:`_CAPABILITY_DISK_MTIME`); otherwise this is just a ``stat``.
+        Holds :data:`_CAPABILITY_LOCK` for the merge (which iterates the shared
+        dict); the returned dict is only ever read via atomic ``.get`` afterwards."""
+        with _CAPABILITY_LOCK:
+            entry = _CAPABILITY_CACHE.setdefault(service_url, {})
+            path = _capability_cache_path(service_url)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                return entry  # no file yet — process entry stands alone
+            if mtime < time.time() - _CAPABILITY_FILE_CACHE_TTL_SECONDS:
+                return entry  # stale on disk — ignore it (process entry stands)
+            if _CAPABILITY_DISK_MTIME.get(path) == mtime:
+                return entry  # already merged this exact disk state
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    disk = json.load(fh)
+            except (OSError, ValueError):
+                return entry  # missing/corrupt file — the process entry stands alone
+            if isinstance(disk, dict):
+                for key, value in disk.items():
+                    if key == "expand_ok" and isinstance(value, dict):
+                        entry["expand_ok"] = {**value, **entry.get("expand_ok", {})}
+                    else:
+                        entry.setdefault(key, value)
+            _CAPABILITY_DISK_MTIME[path] = mtime
+            return entry
 
 
     def _capability_cache_store(service_url: str, key: str, value, table_name: str | None = None):
         """Record one capability verdict in the process cache and atomically
         rewrite the on-disk mirror. ``expand_ok`` verdicts are per-table
-        (``table_name`` required); everything else is server-wide."""
-        entry = _capability_cache_load(service_url)
-        if table_name is not None:
-            entry.setdefault(key, {})[table_name] = value
-        else:
-            entry[key] = value
-        _capability_cache_write(_capability_cache_path(service_url), entry)
+        (``table_name`` required); everything else is server-wide. The whole
+        load-mutate-write runs under :data:`_CAPABILITY_LOCK` (re-entrant) so a
+        concurrent reader/writer never sees the dict mid-mutation."""
+        with _CAPABILITY_LOCK:
+            entry = _capability_cache_load(service_url)
+            if table_name is not None:
+                entry.setdefault(key, {})[table_name] = value
+            else:
+                entry[key] = value
+            _capability_cache_write(_capability_cache_path(service_url), entry)
 
 
     def _cap_dict_has(container: dict, key: str, table_name: str | None) -> bool:
@@ -5462,21 +5479,24 @@ def register_lakeflow_source(spark):
         Goes through :func:`_capability_cache_load` for the authoritative merged
         view, so when nothing matches it returns without touching the file — and
         that check is a bare ``stat`` while the mtime is unchanged (the common
-        steady-state pinned read every microbatch), not a full JSON parse."""
-        entry = _capability_cache_load(service_url)
-        if not any(_cap_dict_has(entry, k, table_name) for k in keys):
-            return  # nothing recorded anywhere — no rewrite
-        for key in keys:
-            _cap_dict_drop(entry, key, table_name)
-        _capability_cache_write(_capability_cache_path(service_url), entry)
+        steady-state pinned read every microbatch), not a full JSON parse. Holds
+        :data:`_CAPABILITY_LOCK` (re-entrant) across the load-check-mutate-write."""
+        with _CAPABILITY_LOCK:
+            entry = _capability_cache_load(service_url)
+            if not any(_cap_dict_has(entry, k, table_name) for k in keys):
+                return  # nothing recorded anywhere — no rewrite
+            for key in keys:
+                _cap_dict_drop(entry, key, table_name)
+            _capability_cache_write(_capability_cache_path(service_url), entry)
 
 
     def _clear_capability_cache() -> None:
         """Clear the in-process capability cache and remove any on-disk JSON
         files. Tests use this between cases that reuse a ``service_url`` with
         different mocked server behaviours."""
-        _CAPABILITY_CACHE.clear()
-        _CAPABILITY_DISK_MTIME.clear()
+        with _CAPABILITY_LOCK:
+            _CAPABILITY_CACHE.clear()
+            _CAPABILITY_DISK_MTIME.clear()
         tmpdir = tempfile.gettempdir()
         try:
             for entry in os.listdir(tmpdir):

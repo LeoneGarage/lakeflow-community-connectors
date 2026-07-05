@@ -9941,6 +9941,57 @@ def test_capability_cache_definitive_false_survives_process_cache_clear():
     assert sum(1 for call in responses.calls if call.request.method == "POST") == 1
 
 
+def test_capability_cache_concurrent_access_is_thread_safe(monkeypatch):
+    """The shared process cache is read-modify-written and serialized from
+    multiple threads: concurrent streaming queries on one driver share
+    ``_CAPABILITY_CACHE`` by ``service_url``, and ``json.dump`` / the load-merge
+    iterate that live dict. Under ``_CAPABILITY_LOCK`` that's safe; without it a
+    mutation landing mid-iteration trips "dictionary changed size during
+    iteration".
+
+    On the standard GIL build the C JSON encoder holds the GIL across a dict
+    encode, so the race can't surface with default settings. To exercise the real
+    hazard here (and to stand in for a free-threaded interpreter, PEP 703), force
+    the *pure-Python* JSON encoder — whose ``for k, v in dct.items()`` yields the
+    GIL between elements — and drop the thread-switch interval so a switch lands
+    mid-encode. With the lock this stays green; remove the lock and it reliably
+    raises "dictionary changed size during iteration"."""
+    import json as _json
+    import sys
+    import threading
+
+    from databricks.labs.community_connector.sources.odata.odata import _capability_cache_drop
+
+    monkeypatch.setattr(_json.encoder, "c_make_encoder", None)  # force pure-Python dump
+
+    c = _make()
+    errors: list = []
+
+    def worker(base: int) -> None:
+        try:
+            for i in range(400):
+                tbl = f"T{base}_{i % 16}"
+                c._store_capability("expand_ok", True, table_name=tbl)
+                c._cached_capability("expand_ok", table_name=tbl)
+                c._store_capability("batch_ok", True)  # server-wide churn
+                if i % 4 == 0:
+                    _capability_cache_drop(c.service_url, {"expand_ok"}, table_name=tbl)
+        except Exception as exc:  # RuntimeError from an unlocked race, etc.
+            errors.append(exc)
+
+    prev_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # switch aggressively so a mutation lands mid-encode
+    try:
+        threads = [threading.Thread(target=worker, args=(b,)) for b in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        sys.setswitchinterval(prev_interval)
+    assert not errors, errors
+
+
 def test_scrub_nonauto_strips_offset_and_purges_server_wide_batch_cache():
     """The offset scrub owns two things: (1) strip every non-``auto`` verdict
     from the outgoing offset; (2) purge the SERVER-WIDE ``$batch`` verdicts from
