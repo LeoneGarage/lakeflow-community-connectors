@@ -778,6 +778,28 @@ def register_lakeflow_source(spark):
         return records[:trim_idx]
 
 
+    def jsonify_complex_values(row: dict) -> dict:
+        """Render structured (dict/list) property values in an emitted row as
+        JSON text.
+
+        The connector's schema maps complex-typed / ``Collection(...)`` /
+        enum / untyped CSDL properties to ``StringType``, and the framework's
+        string parser stringifies via ``str()`` — which for a dict/list
+        produces a Python **repr** (``{'City': 'X'}``, single quotes) that
+        downstream ``from_json`` can't parse. Every structured value still
+        present in a row at the emit boundary is by construction destined for
+        a string column (the connector never declares struct/array columns,
+        and nav-collection structures are consumed by the expand flattener
+        before emit), so serializing them here is schema-independent and
+        lossless. Rows with only scalar values pass through untouched."""
+        if any(isinstance(v, (dict, list)) for v in row.values()):
+            return {
+                k: json.dumps(v, separators=(",", ":")) if isinstance(v, (dict, list)) else v
+                for k, v in row.items()
+            }
+        return row
+
+
     def max_or(a: Any, b: Any) -> Any:
         """Max of two values in CURSOR order (see :func:`cursor_newer`) where
         either may be ``None``. Returns the other when one is ``None``; ``None``
@@ -2387,6 +2409,18 @@ def register_lakeflow_source(spark):
             path = CONTAINED_PATH_SEP.join(segments)
             return f"{namespace}:{path}" if namespace else path
 
+        @staticmethod
+        def _expand_shared_key(table_name: str, table_options: dict | None) -> str:
+            """Memo/shared-cache key for the per-table ``expand_ok`` verdict —
+            namespace-qualified like :meth:`_cursor_probe_shared_key`. The same
+            contained path string (``Customers__Addresses``) can resolve to
+            differently-shaped types in two namespaces of one service, so a
+            bare-table key would share one verdict across both — the exact
+            unverified-``$expand`` leak the per-table keying exists to
+            prevent, one level up."""
+            namespace = (table_options or {}).get("namespace")
+            return f"{namespace}:{table_name}" if namespace else table_name
+
         def _run_cursor_probe_preflight(
             self,
             segments: list[str],
@@ -2935,24 +2969,26 @@ def register_lakeflow_source(spark):
             inconclusive forever while losing data on every other branch."""
             if (start_offset or {}).get("expand_ok"):
                 return True
+            key = self._expand_shared_key(table_name, table_options)
             memo = self.__dict__.setdefault("_expand_supported", {})
-            cached = memo.get(table_name)
+            cached = memo.get(key)
             if cached is not None:
                 return cached
-            # Process/file cache (per-table — different nesting depths can
-            # verify differently): covers the contained snapshot stream (bare
-            # ``{}`` offsets) and the batch reader, where the offset channel
-            # can't carry ``expand_ok`` across framework-recreated instances.
-            cached = self._cached_capability("expand_ok", table_name=table_name)
+            # Process/file cache (per-table, namespace-qualified — different
+            # nesting depths / namespaces can verify differently): covers the
+            # contained snapshot stream (bare ``{}`` offsets) and the batch
+            # reader, where the offset channel can't carry ``expand_ok`` across
+            # framework-recreated instances.
+            cached = self._cached_capability("expand_ok", table_name=key)
             if cached is not None:
-                memo[table_name] = cached
+                memo[key] = cached
                 return cached
             ok, definitive = self._run_expand_preflight(
                 table_name, segments, table_options, start_offset
             )
             if definitive:
-                memo[table_name] = ok
-                self._store_capability("expand_ok", ok, table_name=table_name)
+                memo[key] = ok
+                self._store_capability("expand_ok", ok, table_name=key)
             return ok
 
         def _expand_preflight_url(
@@ -5344,6 +5380,12 @@ def register_lakeflow_source(spark):
             segments = parse_contained_path(table_name) or [table_name]
             cursor_field = opts.get("cursor_field")
             self._pagination = self._parse_pagination(opts)
+            # Parse THIS table's exclusion list before tagging rows — this entry
+            # point never routes through read_table's reset, so without it a
+            # stale exclusion from another table on a shared instance would
+            # drop this table's FK columns (declared non-nullable → hard parse
+            # failure downstream).
+            self._set_excluded_ancestor_columns(opts)
             if cursor_field or self._pagination != "nextlink":
                 # Cursor-based read, or client-driven pagination (needs a $top
                 # to size pages): default page_size so a $top is sent.
@@ -5351,8 +5393,11 @@ def register_lakeflow_source(spark):
                 opts = {**opts, "page_size": opts.get("page_size", DEFAULT_PAGE_SIZE)}
             top_parent_rows = partition["top_parent_rows"]
             cursor_lower = partition.get("cursor_lower")
-            return self._iter_partition_rows(
-                segments, opts, top_parent_rows, cursor_field, cursor_lower
+            # Same emit-boundary JSON rendering of structured values as
+            # read_table (see _helpers.jsonify_complex_values).
+            return map(
+                _jsonify_complex_values,
+                self._iter_partition_rows(segments, opts, top_parent_rows, cursor_field, cursor_lower),
             )
 
         # ------------------------------------------------------------------
@@ -6453,6 +6498,19 @@ def register_lakeflow_source(spark):
         def read_table(
             self, table_name: str, start_offset: dict, table_options: dict[str, str]
         ) -> tuple[Iterator[dict], dict]:
+            """Dispatch the read, then JSON-render structured values at the emit
+            boundary (see :func:`_jsonify_complex_values` — complex-typed /
+            collection values map to string columns, and ``str()`` of a dict is
+            an unparseable Python repr). List results stay lists (tests and any
+            len()-callers rely on that); iterators stay lazy."""
+            records, offset = self._read_table_dispatch(table_name, start_offset, table_options)
+            if isinstance(records, list):
+                return [_jsonify_complex_values(r) for r in records], offset
+            return map(_jsonify_complex_values, records), offset
+
+        def _read_table_dispatch(
+            self, table_name: str, start_offset: dict, table_options: dict[str, str]
+        ) -> tuple[Iterator[dict], dict]:
             # The Spark Python Data Source batch reader
             # (``LakeflowBatchReader``) passes ``start_offset=None`` and
             # discards the returned end-offset — so any continuation state
@@ -6563,7 +6621,7 @@ def register_lakeflow_source(spark):
             offset = start_offset or {}
             # Seed per-instance capability verdicts from the resume offset so a
             # reader the framework recreates each microbatch skips re-probing.
-            self._seed_capability_caches(table_name, start_offset)
+            self._seed_capability_caches(table_name, opts, start_offset)
             if _parse_contained_path(table_name) is not None:
                 if self._delta_setting(opts) == "enabled":
                     raise ValueError(
@@ -6644,7 +6702,12 @@ def register_lakeflow_source(spark):
                 )
             return self._read_snapshot(table_name, opts)
 
-        def _seed_capability_caches(self, table_name: str, start_offset: dict | None) -> None:
+        def _seed_capability_caches(
+            self,
+            table_name: str,
+            table_options: dict | None,
+            start_offset: dict | None,
+        ) -> None:
             """Seed per-instance capability verdicts from the resume offset so a
             reader the framework recreates each microbatch skips re-probing.
 
@@ -6655,10 +6718,11 @@ def register_lakeflow_source(spark):
             **$batch chunk cap** (``batch_size_ok``, the working ops-per-request the
             adaptive shrink settled on after a "too many parts" rejection). Those
             are server-wide, so a single cached value serves every table this
-            instance reads; ``expand_ok`` is PER TABLE (nesting depths verify
-            differently), so it seeds only under the offset's own ``table_name`` —
-            a scalar here would hand table A's verdict to table B and then bake it
-            into B's offset. Persisted back by :meth:`_merge_capability_caches`."""
+            instance reads; ``expand_ok`` is PER TABLE and namespace-qualified
+            (nesting depths and namespaces verify differently), so it seeds only
+            under the offset's own :meth:`_expand_shared_key` — a scalar here
+            would hand table A's verdict to table B and then bake it into B's
+            offset. Persisted back by :meth:`_merge_capability_caches`."""
             off = start_offset or {}
             if "or_filter_ok" in off:
                 self.__dict__["_or_filter_ok"] = bool(off["or_filter_ok"])
@@ -6668,7 +6732,7 @@ def register_lakeflow_source(spark):
                 self.__dict__["_batch_size_cap"] = int(off["batch_size_ok"])
             if "expand_ok" in off:
                 memo = self.__dict__.setdefault("_expand_supported", {})
-                memo[table_name] = bool(off["expand_ok"])
+                memo[self._expand_shared_key(table_name, table_options)] = bool(off["expand_ok"])
 
         def _merge_capability_caches(self, offset: dict, table_name: str | None = None) -> dict:
             """Thread the per-instance OR / $batch / batch-size verdicts into the
@@ -6676,9 +6740,10 @@ def register_lakeflow_source(spark):
             microbatch.
             Only adds a flag once actually **determined** this instance (the probe
             ran), and never overwrites one a read path already wrote. ``expand_ok``
-            is per-table: only THIS table's own memoized verdict may ride its
-            offset (another table's verdict baked in here would persist in the
-            checkpoint and skip this table's preflight forever). Excluded from
+            is per-table (``table_name`` here is the namespace-qualified
+            :meth:`_expand_shared_key`): only THIS table's own memoized verdict may
+            ride its offset (another table's verdict baked in here would persist in
+            the checkpoint and skip this table's preflight forever). Excluded from
             the no-progress comparison (see ``_finalize_cursor_read``), so baking in
             a verdict never reads as forward progress."""
             if not isinstance(offset, dict):
@@ -6776,7 +6841,11 @@ def register_lakeflow_source(spark):
             never disturbs a sibling's verdict) and idempotent (a no-op, no file
             rewrite, once the entry is gone)."""
             if self._expand_contained_mode(table_options) != "auto":
-                _capability_cache_drop(self.service_url, {"expand_ok"}, table_name=table_name)
+                _capability_cache_drop(
+                    self.service_url,
+                    {"expand_ok"},
+                    table_name=self._expand_shared_key(table_name, table_options),
+                )
             if self._cursor_probe_mode(table_options) != "auto":
                 segments = _parse_contained_path(table_name)
                 if segments is not None:
@@ -6793,10 +6862,12 @@ def register_lakeflow_source(spark):
         ) -> tuple:
             """Wrap a ``(records, offset)`` read result, threading capability verdicts
             into the offset (see :meth:`_merge_capability_caches`; ``table_name``
-            scopes the per-table ``expand_ok`` merge) and then scrubbing any whose
-            governing option is non-``auto`` (see :meth:`_scrub_nonauto_verdicts`)."""
+            scopes the per-table ``expand_ok`` merge via its namespace-qualified
+            key) and then scrubbing any whose governing option is non-``auto``
+            (see :meth:`_scrub_nonauto_verdicts`)."""
             records, offset = result
-            offset = self._merge_capability_caches(offset, table_name)
+            key = self._expand_shared_key(table_name, table_options) if table_name is not None else None
+            offset = self._merge_capability_caches(offset, key)
             return records, self._scrub_nonauto_verdicts(offset, table_options)
 
         # ------------------------------------------------------------------
@@ -7154,29 +7225,31 @@ def register_lakeflow_source(spark):
             carry_next_link: str | None = None
             page_index = 0
             bootstrap_verified = not is_bootstrap
-            sparse_checked = False
+            expected_fields = self._delta_expected_fields(table_name, table_options)
             current_url: str | None = url
 
             while current_url:
                 headers = initial_headers if (page_index == 0 and initial_headers) else None
                 kwargs: dict[str, Any] = {"headers": headers} if headers else {}
-                resp = self._http_get(session, current_url, **kwargs)
-                if resp.status_code == 410 and (prev_delta_link or prev_next_link):
+                resp, payload = self._delta_fetch_page(
+                    session,
+                    current_url,
+                    kwargs,
+                    allow_410=bool(prev_delta_link or prev_next_link),
+                )
+                if resp is None:
                     return [], None, None, True
-                _raise_for_status_with_body(resp, current_url)
 
                 if not bootstrap_verified:
                     self._verify_delta_bootstrap(resp, table_name)
                     bootstrap_verified = True
 
-                payload = _decode_json_with_body(resp, current_url)
-                sparse_checked = self._delta_collect_page_records(
+                self._delta_collect_page_records(
                     payload=payload,
                     records=records,
                     primary_keys=primary_keys,
                     table_name=table_name,
-                    table_options=table_options,
-                    sparse_checked=sparse_checked,
+                    expected_fields=expected_fields,
                 )
                 fetched_url = resp.url
                 current_url, new_delta_link, carry_next_link = self._delta_advance_links(
@@ -7202,6 +7275,46 @@ def register_lakeflow_source(spark):
 
             return records, new_delta_link, carry_next_link, False
 
+        def _delta_fetch_page(
+            self,
+            session: requests.Session,
+            url: str,
+            kwargs: dict,
+            allow_410: bool,
+        ) -> tuple[requests.Response | None, dict | None]:
+            """GET + decode one delta page, retrying corrupt-200 JSON bodies.
+
+            Mirrors :meth:`_fetch_page_payload`'s decode retry (some sources
+            emit 200s with truncated bodies under load — see there); the delta
+            walk can't reuse it directly because it needs per-page headers and
+            the 410 rebootstrap escape. Returns ``(None, None)`` when a 410
+            fired with a stored link to rebootstrap from.
+            """
+            for attempt in range(self.max_retries + 1):
+                resp = self._http_get(session, url, **kwargs)
+                if resp.status_code == 410 and allow_410:
+                    return None, None
+                _raise_for_status_with_body(resp, url)
+                try:
+                    return resp, _decode_json_with_body(resp, url)
+                except json.JSONDecodeError as exc:
+                    if attempt >= self.max_retries:
+                        _LOG.error(
+                            "OData delta JSON decode failed after %d attempts on GET %s — %s",
+                            attempt + 1,
+                            url,
+                            exc.msg,
+                        )
+                        raise
+                    _LOG.warning(
+                        "OData delta JSON decode failed on GET %s (%s) — retrying (%d/%d)",
+                        url,
+                        exc.msg,
+                        attempt + 1,
+                        self.max_retries,
+                    )
+            raise AssertionError("unreachable: retry loop returns or raises")
+
         def _verify_delta_bootstrap(self, resp: requests.Response, table_name: str) -> None:
             """Confirm the server actually honored ``Prefer: odata.track-changes``."""
             applied = resp.headers.get("Preference-Applied", "")
@@ -7222,9 +7335,8 @@ def register_lakeflow_source(spark):
             records: list[dict],
             primary_keys: list[str],
             table_name: str,
-            table_options: dict[str, str] | None,
-            sparse_checked: bool,
-        ) -> bool:
+            expected_fields: frozenset,
+        ) -> None:
             """Append every delta record from ``payload`` (one whole page).
 
             Deliberately NOT capped mid-page: ``max_records_per_batch`` is
@@ -7236,16 +7348,18 @@ def register_lakeflow_source(spark):
             loss during bootstrap). The cap may therefore overshoot by at
             most one server page; MERGE dedupes any overlap.
 
-            Returns the updated ``sparse_checked`` flag so the caller can
-            continue to skip the check on later pages once it's already
-            passed for this call.
+            The sparse-entity guard runs on EVERY non-tombstone entry, not
+            just the first: mixed payloads are the norm for real delta
+            services (full entities for creates, changed-properties-only for
+            updates), so one full-bodied create at the head of the batch must
+            not wave the sparse updates behind it through to a NULL-writing
+            MERGE. ``expected_fields`` is precomputed once per walk, so the
+            per-item cost is one set difference.
             """
             for item in payload.get("value", []):
-                if not sparse_checked and "@removed" not in item:
-                    self._check_no_sparse_entity(item, table_name, table_options)
-                    sparse_checked = True
+                if "@removed" not in item:
+                    self._check_no_sparse_entity(item, table_name, expected_fields)
                 records.append(self._build_delta_record(item, primary_keys))
-            return sparse_checked
 
         def _delta_advance_links(
             self,
@@ -7289,11 +7403,27 @@ def register_lakeflow_source(spark):
                 return urljoin(resp_url, raw_next), new_delta_link, carry_next_link
             return None, new_delta_link, carry_next_link
 
+        def _delta_expected_fields(
+            self, table_name: str, table_options: dict[str, str] | None
+        ) -> frozenset:
+            """The key set every non-tombstone delta entity must carry: the
+            declared schema for the table, less any selection imposed by
+            ``$select`` and less the synthetic ``_deleted`` / ``_lc_sequence``
+            columns we add ourselves. Computed once per delta walk and passed
+            into the per-item :meth:`_check_no_sparse_entity`."""
+            select = (table_options or {}).get("select")
+            if select:
+                expected = {c.strip() for c in select.split(",") if c.strip()}
+            else:
+                namespace = (table_options or {}).get("namespace")
+                expected = {f.name for f in self._fields_for(table_name, namespace)}
+            return frozenset(expected - {_DELETED_COL, _SEQUENCE_COL})
+
         def _check_no_sparse_entity(
             self,
             item: dict,
             table_name: str,
-            table_options: dict[str, str] | None,
+            expected: frozenset,
         ) -> None:
             """Refuse silently-corrupting sparse delta responses.
 
@@ -7305,20 +7435,10 @@ def register_lakeflow_source(spark):
             and not recoverable from the destination table alone.
 
             We can't safely apply partial updates in v1, so refuse them up
-            front with an actionable error. Run only on the first
-            non-tombstone entry per call.
-
-            The expected key set is the declared schema for the table, less
-            any selection imposed by ``$select`` and less the synthetic
-            ``_deleted`` / ``_lc_sequence`` columns we add ourselves.
+            front with an actionable error. Runs on EVERY non-tombstone
+            entry (see :meth:`_delta_collect_page_records` for why first-
+            entry-only sampling is unsafe on mixed create/update payloads).
             """
-            select = (table_options or {}).get("select")
-            if select:
-                expected = {c.strip() for c in select.split(",") if c.strip()}
-            else:
-                namespace = (table_options or {}).get("namespace")
-                expected = {f.name for f in self._fields_for(table_name, namespace)}
-            expected -= {_DELETED_COL, _SEQUENCE_COL}
             actual = {k for k in item.keys() if not k.startswith("@odata.")}
             missing = expected - actual
             if missing:
@@ -8400,7 +8520,24 @@ def register_lakeflow_source(spark):
                     f"'oauth2_scope' on this connection. Server response: {hint}"
                 ) from None
             resp.raise_for_status()
-            payload = _decode_json_with_body(resp, token_url)
+            try:
+                payload = resp.json()
+            except ValueError:
+                # NEVER route this through ``_decode_json_with_body``: it bakes
+                # the response body into the exception message, and a truncated
+                # token response is exactly ``{"access_token": "<live secret>``
+                # cut mid-document — echoing it would put a working credential
+                # into pipeline logs. Diagnose with metadata only; ``from None``
+                # severs the chained decoder error, whose ``.doc`` attribute
+                # carries the full body.
+                raise RuntimeError(
+                    f"OAuth2 token endpoint returned malformed JSON "
+                    f"(HTTP {resp.status_code}, {len(resp.text or '')} chars) "
+                    f"from {token_url}. Response body withheld from this "
+                    f"message because token responses carry live credentials; "
+                    f"retry, and escalate to the identity provider if it "
+                    f"persists."
+                ) from None
             token = payload.get("access_token")
             if not token:
                 raise RuntimeError("OAuth2 token endpoint did not return access_token.")
@@ -9305,9 +9442,11 @@ def register_lakeflow_source(spark):
     _max_or = max_or
     _trim_to_distinct_cursor_boundary = trim_to_distinct_cursor_boundary
     _cursor_le = cursor_le
+    _jsonify_complex_values = jsonify_complex_values
     _max_or = max_or
     _cursor_le = cursor_le
     _cursor_max = cursor_max
+    _jsonify_complex_values = jsonify_complex_values
     _parse_iso8601 = parse_iso8601
     _trim_to_distinct_cursor_boundary = trim_to_distinct_cursor_boundary
     _CONTAINED_PATH_SEP = CONTAINED_PATH_SEP

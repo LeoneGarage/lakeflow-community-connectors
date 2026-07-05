@@ -1637,6 +1637,18 @@ class ContainedNavMixin:
         path = CONTAINED_PATH_SEP.join(segments)
         return f"{namespace}:{path}" if namespace else path
 
+    @staticmethod
+    def _expand_shared_key(table_name: str, table_options: dict | None) -> str:
+        """Memo/shared-cache key for the per-table ``expand_ok`` verdict —
+        namespace-qualified like :meth:`_cursor_probe_shared_key`. The same
+        contained path string (``Customers__Addresses``) can resolve to
+        differently-shaped types in two namespaces of one service, so a
+        bare-table key would share one verdict across both — the exact
+        unverified-``$expand`` leak the per-table keying exists to
+        prevent, one level up."""
+        namespace = (table_options or {}).get("namespace")
+        return f"{namespace}:{table_name}" if namespace else table_name
+
     def _run_cursor_probe_preflight(
         self,
         segments: list[str],
@@ -2185,24 +2197,26 @@ class ContainedNavMixin:
         inconclusive forever while losing data on every other branch."""
         if (start_offset or {}).get("expand_ok"):
             return True
+        key = self._expand_shared_key(table_name, table_options)
         memo = self.__dict__.setdefault("_expand_supported", {})
-        cached = memo.get(table_name)
+        cached = memo.get(key)
         if cached is not None:
             return cached
-        # Process/file cache (per-table — different nesting depths can
-        # verify differently): covers the contained snapshot stream (bare
-        # ``{}`` offsets) and the batch reader, where the offset channel
-        # can't carry ``expand_ok`` across framework-recreated instances.
-        cached = self._cached_capability("expand_ok", table_name=table_name)
+        # Process/file cache (per-table, namespace-qualified — different
+        # nesting depths / namespaces can verify differently): covers the
+        # contained snapshot stream (bare ``{}`` offsets) and the batch
+        # reader, where the offset channel can't carry ``expand_ok`` across
+        # framework-recreated instances.
+        cached = self._cached_capability("expand_ok", table_name=key)
         if cached is not None:
-            memo[table_name] = cached
+            memo[key] = cached
             return cached
         ok, definitive = self._run_expand_preflight(
             table_name, segments, table_options, start_offset
         )
         if definitive:
-            memo[table_name] = ok
-            self._store_capability("expand_ok", ok, table_name=table_name)
+            memo[key] = ok
+            self._store_capability("expand_ok", ok, table_name=key)
         return ok
 
     def _expand_preflight_url(

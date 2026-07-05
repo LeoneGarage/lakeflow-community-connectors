@@ -385,6 +385,14 @@ detects this and falls back to whatever cursor/snapshot config is set.
   origin entity. The destination Delta table carries them; downstream
   transforms should filter on `_deleted=False` when materialising
   active rows.
+- **Don't flip `delta_tracking` off on a live stream without a full
+  refresh.** A resumed offset carrying a delta link deliberately keeps
+  the CDC read path even after the option changes (so the flip doesn't
+  silently restart the read), but the schema API only sees options —
+  it drops `_deleted`/`_lc_sequence` the moment the option is
+  non-active, so tombstones from the still-CDC read would parse as
+  PK-only upserts. Changing `delta_tracking` on an existing table
+  needs a full refresh of that flow.
 
 ### Configuration example
 

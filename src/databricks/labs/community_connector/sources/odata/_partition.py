@@ -63,6 +63,7 @@ from databricks.labs.community_connector.sources.odata._contained import (
 )
 from databricks.labs.community_connector.sources.odata._helpers import (
     cursor_le as _cursor_le,
+    jsonify_complex_values as _jsonify_complex_values,
     max_or as _max_or,
 )
 
@@ -284,6 +285,12 @@ class PartitionMixin(SupportsPartitionedStream):
         segments = parse_contained_path(table_name) or [table_name]
         cursor_field = opts.get("cursor_field")
         self._pagination = self._parse_pagination(opts)
+        # Parse THIS table's exclusion list before tagging rows — this entry
+        # point never routes through read_table's reset, so without it a
+        # stale exclusion from another table on a shared instance would
+        # drop this table's FK columns (declared non-nullable → hard parse
+        # failure downstream).
+        self._set_excluded_ancestor_columns(opts)
         if cursor_field or self._pagination != "nextlink":
             # Cursor-based read, or client-driven pagination (needs a $top
             # to size pages): default page_size so a $top is sent.
@@ -291,8 +298,11 @@ class PartitionMixin(SupportsPartitionedStream):
             opts = {**opts, "page_size": opts.get("page_size", DEFAULT_PAGE_SIZE)}
         top_parent_rows = partition["top_parent_rows"]
         cursor_lower = partition.get("cursor_lower")
-        return self._iter_partition_rows(
-            segments, opts, top_parent_rows, cursor_field, cursor_lower
+        # Same emit-boundary JSON rendering of structured values as
+        # read_table (see _helpers.jsonify_complex_values).
+        return map(
+            _jsonify_complex_values,
+            self._iter_partition_rows(segments, opts, top_parent_rows, cursor_field, cursor_lower),
         )
 
     # ------------------------------------------------------------------

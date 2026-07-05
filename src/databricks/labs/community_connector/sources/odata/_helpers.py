@@ -6,6 +6,7 @@ read code can share them without ``_contained`` having to import from
 ``ContainedNavMixin`` at class definition time).
 """
 
+import json
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -173,6 +174,28 @@ def trim_to_distinct_cursor_boundary(
     while trim_idx > 0 and records[trim_idx - 1].get(cursor_field) == boundary:
         trim_idx -= 1
     return records[:trim_idx]
+
+
+def jsonify_complex_values(row: dict) -> dict:
+    """Render structured (dict/list) property values in an emitted row as
+    JSON text.
+
+    The connector's schema maps complex-typed / ``Collection(...)`` /
+    enum / untyped CSDL properties to ``StringType``, and the framework's
+    string parser stringifies via ``str()`` — which for a dict/list
+    produces a Python **repr** (``{'City': 'X'}``, single quotes) that
+    downstream ``from_json`` can't parse. Every structured value still
+    present in a row at the emit boundary is by construction destined for
+    a string column (the connector never declares struct/array columns,
+    and nav-collection structures are consumed by the expand flattener
+    before emit), so serializing them here is schema-independent and
+    lossless. Rows with only scalar values pass through untouched."""
+    if any(isinstance(v, (dict, list)) for v in row.values()):
+        return {
+            k: json.dumps(v, separators=(",", ":")) if isinstance(v, (dict, list)) else v
+            for k, v in row.items()
+        }
+    return row
 
 
 def max_or(a: Any, b: Any) -> Any:

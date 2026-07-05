@@ -1345,6 +1345,37 @@ def test_oauth2_client_credentials_uses_client_credentials_grant():
 
 
 @responses.activate
+def test_oauth2_malformed_token_response_never_echoes_the_body():
+    """A truncated 200 from the token endpoint is exactly
+    ``{"access_token": "<live secret>`` cut mid-document. The raised error
+    must diagnose without echoing the body — the message lands in pipeline
+    logs, and echoing it would publish a working credential."""
+    responses.post(
+        "https://idp.example.com/token",
+        body='{"access_token": "SECRET-LIVE-TOKEN-XYZ", "expi',  # truncated
+        status=200,
+        content_type="application/json",
+    )
+    _mock_metadata()
+    c = _make(
+        {
+            "auth_type": "oauth2",
+            "oauth2_token_url": "https://idp.example.com/token",
+            "oauth2_client_id": "id",
+            "oauth2_client_secret": "secret",
+        }
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        c.list_tables()
+    message = str(excinfo.value)
+    assert "SECRET-LIVE-TOKEN-XYZ" not in message
+    assert "withheld" in message
+    # And nothing rides in via exception chaining either (__cause__ severed;
+    # the decoder error's .doc attribute carries the full body).
+    assert excinfo.value.__cause__ is None
+
+
+@responses.activate
 def test_oauth2_token_endpoint_retries_transient_errors():
     """The token endpoint gets the same transient tolerance as the source: a
     momentary 503 there (including mid-read via the 401-refresh path) must be
@@ -2594,6 +2625,69 @@ def test_delta_sparse_entity_raises_runtimeerror():
             {"delta_tracking": "enabled"},
         )
         list(records)
+
+
+@responses.activate
+def test_delta_sparse_check_runs_on_every_entity_not_just_the_first():
+    """Mixed payloads are the norm for real delta services: full entities
+    for creates, changed-properties-only for updates. A full-bodied create
+    at the head of the batch must not wave the sparse update behind it
+    through to a NULL-writing MERGE — the guard runs per entity."""
+    _mock_metadata()
+    responses.add(
+        responses.GET,
+        DELTA_LINK_V1,
+        json={
+            "value": [
+                # Full entity first (a create) — the old first-entry-only
+                # sampling stopped checking here.
+                {"Id": 5, "Name": "E", "ModifiedAt": "2024-01-01T00:00:00Z"},
+                # Sparse update behind it — missing ModifiedAt.
+                {"Id": 6, "Name": "F"},
+            ],
+            "@odata.deltaLink": DELTA_LINK_V2,
+        },
+    )
+    c = _make()
+    with pytest.raises(RuntimeError, match="sparse entity"):
+        records, _ = c.read_table(
+            "Customers",
+            {"delta_link": DELTA_LINK_V1},
+            {"delta_tracking": "enabled"},
+        )
+        list(records)
+
+
+@responses.activate
+def test_delta_page_decode_retries_corrupt_200_body():
+    """Delta pages get the same corrupt-200-body retry as cursor/snapshot
+    pages (``_fetch_page_payload``): a truncated JSON body under load is
+    retried with a fresh GET instead of hard-failing the stream."""
+    _mock_metadata()
+    responses.add(
+        responses.GET,
+        DELTA_LINK_V1,
+        body='{"value": [{"Id": 99, "Name": "trunc',  # cut mid-serialization
+        status=200,
+        content_type="application/json",
+    )
+    responses.add(
+        responses.GET,
+        DELTA_LINK_V1,
+        json={
+            "value": [{"Id": 99, "Name": "ok", "ModifiedAt": "2024-01-01T00:00:00Z"}],
+            "@odata.deltaLink": DELTA_LINK_V2,
+        },
+    )
+    c = _make()
+    records, offset = c.read_table(
+        "Customers",
+        {"delta_link": DELTA_LINK_V1},
+        {"delta_tracking": "enabled"},
+    )
+    rows = list(records)
+    assert [r["Id"] for r in rows] == [99]
+    assert _drop_lb(offset) == {"delta_link": DELTA_LINK_V2}
 
 
 @responses.activate
@@ -7777,6 +7871,79 @@ def test_partition_leaf_cursor_refilter_is_chronological_not_lexical():
     assert [r["Id"] for r in rows] == [11]
 
 
+@responses.activate
+def test_partition_read_partition_resets_stale_ancestor_exclusions():
+    """``read_partition`` never routes through ``read_table``'s
+    ``exclude_ancestor_columns`` reset, so a stale exclusion from another
+    table on a shared instance would silently strip this table's FK
+    columns (declared non-nullable → hard parse failure downstream)."""
+    _mock_nested_metadata()
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={"value": [{"Id": 11, "Label": "a", "ModifiedAt": "2024-01-01T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    c._excluded_ancestor_columns = frozenset({"Parents_Id"})  # stale, another table's
+    partition = {"top_parent_rows": [{"Id": 1}], "cursor_lower": None}
+    rows = list(c.read_partition("Parents__Children", partition, {}))
+    assert rows and rows[0]["Parents_Id"] == 1
+
+
+def test_expand_verdict_key_is_namespace_qualified():
+    """The same contained path string can resolve to differently-shaped
+    types in two namespaces of one service — mirroring
+    ``_cursor_probe_shared_key``, the ``expand_ok`` verdict key must be
+    namespace-qualified so one namespace's pass can't skip the other's
+    preflight (and get baked into its offset)."""
+    c = _make()
+    assert c._expand_shared_key("Customers__Addresses", {"namespace": "Sales"}) == (
+        "Sales:Customers__Addresses"
+    )
+    assert c._expand_shared_key("Customers__Addresses", {}) == "Customers__Addresses"
+    c._seed_capability_caches(
+        "Customers__Addresses", {"namespace": "Sales"}, {"cursor": "x", "expand_ok": True}
+    )
+    _, off_hr = c._with_capabilities(
+        ([], {"cursor": "y"}), {"namespace": "HR"}, "Customers__Addresses"
+    )
+    assert "expand_ok" not in off_hr
+    _, off_sales = c._with_capabilities(
+        ([], {"cursor": "y"}), {"namespace": "Sales"}, "Customers__Addresses"
+    )
+    assert off_sales.get("expand_ok") is True
+
+
+@responses.activate
+def test_structured_values_emitted_as_json_not_python_repr():
+    """Complex-typed / collection values map to string columns, and the
+    framework stringifies via ``str()`` — a Python repr downstream
+    ``from_json`` can't parse. The connector renders structured values as
+    JSON at the emit boundary instead."""
+    _mock_metadata()
+    responses.get(
+        f"{SERVICE_URL}Customers",
+        json={
+            "value": [
+                {
+                    "Id": 1,
+                    "Name": "x",
+                    "Address": {"City": "Y", "Zip": 10001},
+                    "Tags": ["a", "b"],
+                }
+            ]
+        },
+        match_querystring=False,
+    )
+    c = _make()
+    records, _ = c.read_table("Customers", None, {})
+    row = next(iter(records))
+    assert row["Address"] == '{"City":"Y","Zip":10001}'
+    assert row["Tags"] == '["a","b"]'
+    assert json.loads(row["Address"]) == {"City": "Y", "Zip": 10001}
+    assert row["Id"] == 1  # scalars untouched
+
+
 # ---------------------------------------------------------------------------
 # 429 / 503 retry with backoff
 # ---------------------------------------------------------------------------
@@ -10697,7 +10864,7 @@ def test_expand_verdict_seed_and_merge_are_table_scoped():
     differently. That's the silent-deep-row-loss direction the preflight
     exists to prevent."""
     c = _make()
-    c._seed_capability_caches("Roots__Mids__Leaves", {"cursor": "x", "expand_ok": True})
+    c._seed_capability_caches("Roots__Mids__Leaves", None, {"cursor": "x", "expand_ok": True})
     merged_other = c._merge_capability_caches({"cursor": "y"}, "Other__Deep__Path")
     assert "expand_ok" not in merged_other
     merged_own = c._merge_capability_caches({"cursor": "y"}, "Roots__Mids__Leaves")
@@ -11916,7 +12083,9 @@ def test_capability_verdicts_thread_through_offset():
     _mock_probe_metadata()
     c = _make()
     # Seed instance caches from a prior batch's offset.
-    c._seed_capability_caches(PROBE_TABLE, {"cursor": "x", "or_filter_ok": False, "batch_ok": True})
+    c._seed_capability_caches(
+        PROBE_TABLE, None, {"cursor": "x", "or_filter_ok": False, "batch_ok": True}
+    )
     assert c.__dict__["_or_filter_ok"] is False
     assert c.__dict__["_batch_supported"] is True
     # A seeded OR verdict is returned WITHOUT issuing a probe (cached short-circuit).
