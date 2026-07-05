@@ -3514,6 +3514,99 @@ def test_pagination_skip_drains_collection_without_nextlink():
     assert [r["Id"] for r in rows] == [1, 2, 3, 4, 5]
 
 
+def test_keyset_seek_url_strips_positional_params():
+    """A keyset seek positions absolutely via its $filter — any positional
+    param retained from the entry URL ($skip on a resumed parked checkpoint
+    or inner-expand continuation, a stray $skipToken in any casing) would
+    ALSO be applied by the server, skipping rows INSIDE the seek window on
+    every seek page."""
+    from databricks.labs.community_connector.sources.odata._contained import (
+        _pg_keyset_seek_url,
+    )
+
+    url = "https://svc/Coll?$top=100&$orderby=Id%20asc&$skip=40&%24skipToken=abc"
+    out = _pg_keyset_seek_url(url, None, "Id gt 140")
+    assert "$skip" not in out and "skipToken" not in out
+    assert "$filter=Id gt 140" in out
+    assert "$top=100" in out and "$orderby=Id%20asc" in out  # non-positional kept
+
+
+@responses.activate
+def test_keyset_seek_from_resumed_skip_checkpoint_drops_the_skip():
+    """A keyset walk that fell back to $skip (null boundary) parks $skip
+    continuation URLs in the offset. On cap-resume the drain re-derives
+    can_keyset from mode + $orderby alone; once a boundary row has non-null
+    keys the seek is built from the parked URL — retaining its $skip would
+    make the server skip N rows inside every seek window (silent, repeating
+    loss)."""
+    _mock_metadata()
+    data = [{"Id": i} for i in range(1, 7)]
+    seen_filters = []
+
+    def cb(req):
+        from urllib.parse import parse_qs, unquote, urlparse
+
+        q = parse_qs(urlparse(req.url).query)
+        top = int(q.get("$top", ["1000"])[0])
+        skip = int(q.get("$skip", ["0"])[0])
+        flt = unquote(q.get("$filter", [""])[0])
+        seen_filters.append((flt, skip))
+        rows = data
+        if "Id gt" in flt:
+            n = int(re.search(r"Id gt (\d+)", flt).group(1))
+            rows = [r for r in data if r["Id"] > n]
+        return (200, {}, json.dumps({"value": rows[skip : skip + top]}))  # NO nextLink
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Customers", callback=cb)
+    c = _make()
+    # Resumed parked checkpoint: rows 1-2 were emitted by a previous batch.
+    parked = f"{SERVICE_URL}Customers?$top=2&$orderby=Id%20asc&$skip=2"
+    got = [r["Id"] for page, _n in c._client_paginate_pages(parked, "keyset") for r in page]
+    assert got == [3, 4, 5, 6]
+    # The walk actually re-engaged keyset (not a silent skip-mode pass), and
+    # no seek request carried a residual $skip.
+    assert any("Id gt" in flt for flt, _ in seen_filters)
+    assert all(skip == 0 for flt, skip in seen_filters if "Id gt" in flt)
+
+
+def test_pg_is_continuation_recognizes_any_casing():
+    """Server continuations use arbitrary casing (Microsoft stacks emit
+    $skipToken). Missing one would let the $top injection append onto an
+    opaque token URL — the §11.2.5.7 hazard the guard exists to avoid."""
+    from databricks.labs.community_connector.sources.odata._contained import (
+        _pg_is_continuation,
+    )
+
+    assert _pg_is_continuation("https://svc/Coll?$skipToken=abc") is True
+    assert _pg_is_continuation("https://svc/Coll?%24skipToken=abc") is True
+    assert _pg_is_continuation("https://svc/Coll?$SKIP=5") is True
+    assert _pg_is_continuation("https://svc/Coll?$top=5") is False
+
+
+@responses.activate
+def test_no_progress_guard_ignores_identical_projected_pages():
+    """With a low-cardinality $select, two DISTINCT consecutive pages can be
+    identical after the @odata.* strip. The no-progress fingerprint must use
+    the RAW items (per-entity annotations disambiguate) or the guard stops
+    the walk with rows unread."""
+    _mock_metadata()
+
+    def cb(req):
+        from urllib.parse import parse_qs, urlparse
+
+        q = parse_qs(urlparse(req.url).query)
+        top = int(q.get("$top", ["1000"])[0])
+        skip = int(q.get("$skip", ["0"])[0])
+        data = [{"@odata.id": f"e{i}", "Status": "A"} for i in range(1, 5)]
+        return (200, {}, json.dumps({"value": data[skip : skip + top]}))  # NO nextLink
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Customers", callback=cb)
+    c = _make()
+    url = f"{SERVICE_URL}Customers?$top=2&$select=Status"
+    pages = [page for page, _n in c._client_paginate_pages(url, "skip")]
+    assert sum(len(p) for p in pages) == 4  # both identical-looking pages kept
+
+
 @responses.activate
 def test_pagination_auto_follows_nextlink_then_falls_back_to_keyset():
     """`auto`: trust @odata.nextLink while emitted; when a full page arrives

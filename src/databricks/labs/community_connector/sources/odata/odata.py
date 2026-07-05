@@ -2169,11 +2169,13 @@ class ODataLakeflowConnect(
         prev_fp: int | None = None
         while next_url:
             resp, payload = self._fetch_page_payload(session, next_url)
+            raw_items = payload.get("value", [])
             page_rows = [
-                {k: v for k, v in item.items() if not k.startswith("@odata.")}
-                for item in payload.get("value", [])
+                {k: v for k, v in item.items() if not k.startswith("@odata.")} for item in raw_items
             ]
-            fp = _pg_page_fingerprint(page_rows)
+            # Raw pre-strip fingerprint — see _client_paginate_pages for why
+            # (identical projected pages must not false-positive the guard).
+            fp = _pg_page_fingerprint(raw_items)
             if page_rows and prev_fp is not None and fp == prev_fp:
                 _LOG.warning(
                     "pagination=nextlink made no progress on %r: the server "
@@ -2328,11 +2330,17 @@ class ODataLakeflowConnect(
         saw_next_link = False
         while cur_url is not None:
             resp, payload = self._fetch_page_payload(session, cur_url)
+            raw_items = payload.get("value", [])
             page_rows = [
-                {k: v for k, v in item.items() if not k.startswith("@odata.")}
-                for item in payload.get("value", [])
+                {k: v for k, v in item.items() if not k.startswith("@odata.")} for item in raw_items
             ]
-            fp = _pg_page_fingerprint(page_rows)
+            # Fingerprint the RAW items (annotations included): with a
+            # low-cardinality $select two DISTINCT consecutive pages can be
+            # identical after the @odata.* strip, and stripping first would
+            # false-positive the guard and stop the walk with rows unread.
+            # Per-entity annotations (@odata.id / etag) disambiguate for free
+            # where the server emits them.
+            fp = _pg_page_fingerprint(raw_items)
             if page_rows and prev_fp is not None and fp == prev_fp:
                 _LOG.warning(
                     "pagination=%s made no progress on %r: an identical page "

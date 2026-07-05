@@ -383,16 +383,49 @@ def _pg_parse_top(url: str) -> int | None:
     return int(raw) if raw and raw.isdigit() else None
 
 
+def _pg_param_name(part: str) -> str:
+    """Normalized query-option name of one raw ``k=v`` query pair:
+    ``%24`` decoded to ``$`` and lowercased. Server-issued continuation
+    params use arbitrary casing (Microsoft stacks emit ``$skipToken``), so
+    name comparisons on foreign URLs must not be case-sensitive."""
+    name = part.split("=", 1)[0]
+    return name.replace("%24", "$").lower()
+
+
+_PG_POSITIONAL = ("$skiptoken", "$skip")
+
+
 def _pg_is_continuation(url: str) -> bool:
     """Whether ``url`` looks like a server-issued continuation link — it
-    carries a ``$skiptoken`` or ``$skip`` (the URLs the connector builds
-    itself carry neither; ``$skip`` paging rewrites via
+    carries a ``$skiptoken`` or ``$skip`` in any casing/encoding (the URLs
+    the connector builds itself carry neither; ``$skip`` paging rewrites via
     :func:`_pg_set_query` only on URLs that already went through the
-    client-driven drain)."""
+    client-driven drain). Case-insensitive: a camelCase ``$skipToken=``
+    continuation must not be mistaken for a plain collection URL, or the
+    ``$top`` injection would append onto an opaque token URL — the exact
+    §11.2.5.7 hazard the injection guard exists to avoid."""
+    _, _, query = url.partition("?")
     return any(
-        _pg_get_query(url, name) is not None
-        for name in ("$skiptoken", "%24skiptoken", "$skip", "%24skip")
+        _pg_param_name(part) in _PG_POSITIONAL for part in (query.split("&") if query else [])
     )
+
+
+def _pg_strip_positional(url: str) -> str:
+    """Remove every offset/token positional param (``$skip`` /
+    ``$skiptoken``, any casing or ``%24`` encoding) from ``url``.
+
+    A keyset seek positions **absolutely** via its ``$filter``, so a
+    residual positional param would ALSO be applied by the server —
+    ``$skip=N`` riding a seek URL skips N rows INSIDE the seek window on
+    every seek page (silent, repeating loss). Reachable whenever the drain
+    re-enables keyset on an entry URL that came from offset paging: a
+    cap-resumed parked ``$skip`` checkpoint, or an inner-expand ``$skip``
+    continuation whose later boundary rows have non-null keys."""
+    head, _sep, query = url.partition("?")
+    if not query:
+        return url
+    kept = [p for p in query.split("&") if _pg_param_name(p) not in _PG_POSITIONAL]
+    return f"{head}?{'&'.join(kept)}" if kept else head
 
 
 def _pg_orderby_keys(url: str) -> list[str]:
@@ -480,9 +513,15 @@ def _pg_keyset_seek_url(url: str, base_filter: str | None, seek: str) -> str:
     batch — otherwise the ``$filter`` grows one keyset clause per batch and
     eventually overflows the server's URL-length limit. The seeks are
     monotonic so the accumulated form is merely redundant, never wrong, but it
-    is unbounded. ``__pgbase`` is stripped before the request is sent."""
+    is unbounded. ``__pgbase`` is stripped before the request is sent.
+
+    Any positional param on the entry URL (``$skip`` from a resumed parked
+    checkpoint or an inner-expand continuation, a stray ``$skiptoken``) is
+    stripped: the seek is absolute, and a retained ``$skip=N`` would skip N
+    rows inside the seek window on every seek page — see
+    :func:`_pg_strip_positional`."""
     combined = f"({base_filter}) and ({seek})" if base_filter else seek
-    out = _pg_set_query(url, "$filter", combined)
+    out = _pg_set_query(_pg_strip_positional(url), "$filter", combined)
     return _pg_set_query(out, _PG_BASE, base_filter or "")
 
 
@@ -492,7 +531,11 @@ def _pg_page_fingerprint(page_rows: list[dict]) -> int:
     a single walk — and costs one page's worth of work. Two consecutive
     non-empty pages with the same fingerprint mean the server returned the
     same data twice (it ignored our seek/``$skip`` or handed back a cyclic
-    ``@odata.nextLink``), so the walk has stalled."""
+    ``@odata.nextLink``), so the walk has stalled. Callers pass the RAW
+    payload items (``@odata.*`` annotations included): with a
+    low-cardinality ``$select``, two distinct consecutive pages can be
+    identical after the annotation strip, and per-entity annotations
+    (id/etag) are what disambiguate them."""
     return hash(repr(page_rows))
 
 
