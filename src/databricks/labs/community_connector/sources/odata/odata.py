@@ -3365,11 +3365,10 @@ class ODataLakeflowConnect(
 
         Unchanged when the active window is 0 or ``since`` is ``None`` (the
         first read stays unfiltered). For a positive window the cursor must be
-        a timestamp — ISO-8601 string or ``datetime``; the result is a
-        tz-aware ``datetime`` that ``_odata_literal`` renders to an OData
-        timestamp literal, so the server compares datetimes regardless of the
-        rendered format. The committed watermark is never floored — only the
-        read filter is — so the offset still advances to the true max seen.
+        a timestamp — ISO-8601 string or ``datetime``; the result is a BARE
+        ISO-8601 string (same value space as the rows' own cursor text). The
+        committed watermark is never floored — only the read filter is — so
+        the offset still advances to the true max seen.
 
         A non-timestamp cursor under ``auto`` is a no-op (auto is the default
         and must not break such tables); under an explicit window it raises."""
@@ -3396,12 +3395,18 @@ class ODataLakeflowConnect(
                 f"cursor_lookback_seconds={seconds} requires a datetime/"
                 f"timestamp cursor; got {type(since).__name__} {since!r}."
             )
-        # Return the OData timestamp LITERAL (``...Z``), not a datetime: the
-        # leaf-cursor walk compares it client-side against the rows' own
-        # cursor strings (``rec_cursor <= chain_since``), which would raise on
-        # a str-vs-datetime mix. The string renders bare in the URL exactly as
-        # the datetime did, so the expand path's wire filter is unchanged.
-        return _odata_literal(dt - timedelta(seconds=seconds))
+        # Return the BARE ISO string (``...Z`` / ``...+10:00``), not a
+        # datetime and NOT ``_odata_literal(...)``: the leaf-cursor walk
+        # compares it client-side against the rows' own cursor strings
+        # (``rec_cursor <= chain_since``) — a datetime would raise on the
+        # str-vs-datetime mix, and a pre-escaped literal would compare
+        # escaped-vs-raw text AND get re-fed through ``_odata_literal`` at
+        # the ``_cursor_filter`` URL build, where a non-UTC ``%2B`` offset
+        # fails the ISO sniff and double-escapes into a quoted garbage
+        # string on the wire. Raw value space here; the single escape
+        # happens at literal generation.
+        floored = (dt - timedelta(seconds=seconds)).isoformat()
+        return floored.replace("+00:00", "Z")
 
     # ------------------------------------------------------------------
     # Null-cursor policy (``cursor_nulls``)

@@ -485,7 +485,7 @@ def test_incremental_non_utc_offset_watermark_is_percent_encoded():
 
     def _callback(request):
         captured_urls.append(request.url)
-        if "gt" in request.url:
+        if " gt " in request.url.replace("%20", " "):
             return (
                 200,
                 {},
@@ -3559,6 +3559,74 @@ def test_expand_cursor_lookback_floors_read_filter_not_offset():
     # Committed offset is the TRUE max emitted, NOT the floored read value.
     assert _drop_lb(offset) == {"cursor": "2024-01-03T00:00:00Z"}
     assert [r["Id"] for r in rows] == [11, 12]
+
+
+@responses.activate
+def test_cursor_lookback_non_utc_watermark_single_escape_on_wire():
+    """The lookback floor returns a BARE ISO string; the single percent-escape
+    happens at literal generation (``_cursor_filter`` → ``odata_literal``). A
+    pre-escaped floor would be re-fed through ``odata_literal``, where the
+    ``%2B`` fails the ISO sniff and double-escapes into a QUOTED garbage
+    string (``'…%252B10:00'``) — a wrong-type comparison or 400 on every
+    lookback-floored batch against a non-UTC source."""
+    _mock_nested_metadata()
+    captured: list[str] = []
+
+    def _parents(req):
+        captured.append(req.url)  # RAW url — escape fidelity is the point here
+        if "Id%20gt" in req.url or "Id gt" in req.url:  # top-level drain probe
+            return (200, {}, json.dumps({"value": []}))
+        return (
+            200,
+            {},
+            json.dumps(
+                {
+                    "value": [
+                        {
+                            "Id": 1,
+                            "Children": [
+                                {"Id": 11, "Label": "a", "ModifiedAt": "2024-01-02T12:00:00+10:00"}
+                            ],
+                        }
+                    ]
+                }
+            ),
+        )
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents)
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children",
+        callback=lambda r: (200, {}, json.dumps({"value": []})),
+    )
+    c = _make()
+    records, offset = c.read_table(
+        "Parents__Children",
+        {"cursor": "2024-01-02T00:00:00+10:00"},
+        {
+            "expand_contained": "true",
+            "cursor_field": "ModifiedAt",
+            "cursor_lookback_seconds": "3600",
+        },
+    )
+    rows = list(records)
+    assert [r["Id"] for r in rows] == [11]
+    assert _drop_lb(offset) == {"cursor": "2024-01-02T12:00:00+10:00"}
+    filtered = [u for u in captured if "ModifiedAt" in u]
+    # The floored filter reached the wire ONCE-escaped and unquoted.
+    assert any("2024-01-01T23:00:00%2B10:00" in u for u in filtered), captured
+    assert all("%252B" not in u for u in captured)  # never double-escaped
+    assert all("'2024" not in u for u in captured)  # never a quoted string literal
+
+
+def test_apply_cursor_lookback_returns_bare_iso_string():
+    """The floor stays in raw cursor value space — bare ISO text, not an
+    escaped OData literal — so client-side row comparisons and the single
+    escape at URL build both see consistent input."""
+    c = _make()
+    c.__dict__["_active_lookback_seconds"] = 3600
+    assert c._apply_cursor_lookback("2024-01-02T00:00:00+10:00") == "2024-01-01T23:00:00+10:00"
+    assert c._apply_cursor_lookback("2024-01-02T00:00:00Z") == "2024-01-01T23:00:00Z"
 
 
 @responses.activate
