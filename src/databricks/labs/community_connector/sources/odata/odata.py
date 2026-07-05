@@ -336,32 +336,33 @@ def _capability_cache_path(service_url: str) -> str:
     return os.path.join(tempfile.gettempdir(), f"odata_caps_{digest}.json")
 
 
-def _capability_cache_write(path: str, data: dict) -> None:
-    """Atomically rewrite the on-disk mirror: write a temp file then
-    ``os.replace`` it into place, so a concurrent worker never observes a
-    half-written file (the naive truncate-in-place did). The temp name is unique
-    per process AND per thread, so two concurrent streaming queries on one driver
-    don't clobber each other's temp mid-write. Best-effort — a read-only tempdir
-    just leaves the process cache authoritative — and the temp file is cleaned up
-    on failure. Updates the mtime memo so the writing process doesn't immediately
-    re-read its own write. Caller must hold :data:`_CAPABILITY_LOCK` (``data`` is
-    the live shared dict this iterates)."""
+def _capability_cache_flush(service_url: str, payload: str) -> None:
+    """Write an already-serialized ``payload`` string to the on-disk mirror:
+    temp file (unique per process AND per thread) then ``os.replace``, so a
+    concurrent worker never observes a half-written file. Takes a **string**, not
+    the live dict, so the caller serializes under :data:`_CAPABILITY_LOCK` and
+    the blocking disk I/O here runs lock-free — concurrent cache ops don't
+    serialize on each other's I/O. Best-effort: like the cross-process case, a
+    concurrent writer's swap can win (last-writer-wins on the mirror); the
+    in-memory cache stays authoritative and a re-probe/TTL recovers any lag.
+    The temp file is cleaned up on failure; the mtime memo is refreshed so the
+    writing process doesn't immediately re-read its own write."""
+    path = _capability_cache_path(service_url)
     tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
-    with _CAPABILITY_LOCK:
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+        os.replace(tmp, path)
+    except OSError:
         try:
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(data, fh)
-            os.replace(tmp, path)
-        except OSError:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-            return
-        try:
-            _CAPABILITY_DISK_MTIME[path] = os.path.getmtime(path)
+            os.remove(tmp)
         except OSError:
             pass
+        return
+    try:
+        _CAPABILITY_DISK_MTIME[path] = os.path.getmtime(path)
+    except OSError:
+        pass
 
 
 def _capability_cache_load(service_url: str) -> dict:
@@ -370,24 +371,25 @@ def _capability_cache_load(service_url: str) -> dict:
     hasn't determined itself. Returns the live process entry (mutable). The
     disk file is re-parsed only when its mtime changed since the last merge
     (see :data:`_CAPABILITY_DISK_MTIME`); otherwise this is just a ``stat``.
-    Holds :data:`_CAPABILITY_LOCK` for the merge (which iterates the shared
-    dict); the returned dict is only ever read via atomic ``.get`` afterwards."""
-    with _CAPABILITY_LOCK:
-        entry = _CAPABILITY_CACHE.setdefault(service_url, {})
-        path = _capability_cache_path(service_url)
-        try:
-            mtime = os.path.getmtime(path)
-        except OSError:
-            return entry  # no file yet — process entry stands alone
-        if mtime < time.time() - _CAPABILITY_FILE_CACHE_TTL_SECONDS:
-            return entry  # stale on disk — ignore it (process entry stands)
-        if _CAPABILITY_DISK_MTIME.get(path) == mtime:
-            return entry  # already merged this exact disk state
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                disk = json.load(fh)
-        except (OSError, ValueError):
-            return entry  # missing/corrupt file — the process entry stands alone
+    The blocking file read runs lock-free; only the merge (which iterates the
+    shared dict) is under :data:`_CAPABILITY_LOCK`. The returned dict is a live
+    reference read afterwards via atomic ``.get`` only."""
+    entry = _CAPABILITY_CACHE.setdefault(service_url, {})  # atomic; no iteration
+    path = _capability_cache_path(service_url)
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return entry  # no file yet — process entry stands alone
+    if mtime < time.time() - _CAPABILITY_FILE_CACHE_TTL_SECONDS:
+        return entry  # stale on disk — ignore it (process entry stands)
+    if _CAPABILITY_DISK_MTIME.get(path) == mtime:
+        return entry  # already merged this exact disk state
+    try:
+        with open(path, "r", encoding="utf-8") as fh:  # blocking read, lock-free
+            disk = json.load(fh)
+    except (OSError, ValueError):
+        return entry  # missing/corrupt file — the process entry stands alone
+    with _CAPABILITY_LOCK:  # only the shared-dict merge needs the lock
         if isinstance(disk, dict):
             for key, value in disk.items():
                 if key == "expand_ok" and isinstance(value, dict):
@@ -395,22 +397,24 @@ def _capability_cache_load(service_url: str) -> dict:
                 else:
                     entry.setdefault(key, value)
         _CAPABILITY_DISK_MTIME[path] = mtime
-        return entry
+    return entry
 
 
 def _capability_cache_store(service_url: str, key: str, value, table_name: str | None = None):
-    """Record one capability verdict in the process cache and atomically
-    rewrite the on-disk mirror. ``expand_ok`` verdicts are per-table
-    (``table_name`` required); everything else is server-wide. The whole
-    load-mutate-write runs under :data:`_CAPABILITY_LOCK` (re-entrant) so a
-    concurrent reader/writer never sees the dict mid-mutation."""
+    """Record one capability verdict in the process cache and rewrite the on-disk
+    mirror. ``expand_ok`` verdicts are per-table (``table_name`` required);
+    everything else is server-wide. The mutation + serialization run under
+    :data:`_CAPABILITY_LOCK` (so a concurrent reader/writer never sees the dict
+    mid-mutation); the load's file read and the flush's disk write run lock-free
+    (see :func:`_capability_cache_flush`)."""
+    entry = _capability_cache_load(service_url)
     with _CAPABILITY_LOCK:
-        entry = _capability_cache_load(service_url)
         if table_name is not None:
             entry.setdefault(key, {})[table_name] = value
         else:
             entry[key] = value
-        _capability_cache_write(_capability_cache_path(service_url), entry)
+        payload = json.dumps(entry)
+    _capability_cache_flush(service_url, payload)
 
 
 def _cap_dict_has(container: dict, key: str, table_name: str | None) -> bool:
@@ -447,15 +451,17 @@ def _capability_cache_drop(service_url: str, keys: set[str], table_name: str | N
     Goes through :func:`_capability_cache_load` for the authoritative merged
     view, so when nothing matches it returns without touching the file — and
     that check is a bare ``stat`` while the mtime is unchanged (the common
-    steady-state pinned read every microbatch), not a full JSON parse. Holds
-    :data:`_CAPABILITY_LOCK` (re-entrant) across the load-check-mutate-write."""
+    steady-state pinned read every microbatch), not a full JSON parse. The
+    check-mutate-serialize runs under :data:`_CAPABILITY_LOCK`; the load's file
+    read and the flush's disk write run lock-free."""
+    entry = _capability_cache_load(service_url)
     with _CAPABILITY_LOCK:
-        entry = _capability_cache_load(service_url)
         if not any(_cap_dict_has(entry, k, table_name) for k in keys):
             return  # nothing recorded anywhere — no rewrite
         for key in keys:
             _cap_dict_drop(entry, key, table_name)
-        _capability_cache_write(_capability_cache_path(service_url), entry)
+        payload = json.dumps(entry)
+    _capability_cache_flush(service_url, payload)
 
 
 def _clear_capability_cache() -> None:
