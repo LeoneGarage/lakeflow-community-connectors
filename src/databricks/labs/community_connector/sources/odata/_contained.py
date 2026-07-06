@@ -5355,6 +5355,18 @@ class ContainedNavMixin:
                     # offset — its watermark is folded below like our own.
                     "pending_fetches",
                     "running_max_cursor",
+                    # The capped cycle is OVER (this completion ends it), so
+                    # the auto-lookback span anchor must not survive: this
+                    # early return bypasses _attach_lookback_state, and a
+                    # leaked anchor makes the NEXT progressing walk record
+                    # the whole idle gap as a "cycle span" — lb_history then
+                    # carries a bogus multi-hour entry and the window pins
+                    # at the ceiling for the next 5 walks (an hour of
+                    # overlap re-read per batch; duplicates, never loss).
+                    # The measurement itself is deliberately dropped —
+                    # a vanished-checkpoint completion is idle-shaped, not
+                    # a real walk worth sizing the window from.
+                    "lb_cycle_started",
                 )
                 if any(k in empty for k in checkpoint_keys):
                     # Fold the cycle's accumulated max into the committed

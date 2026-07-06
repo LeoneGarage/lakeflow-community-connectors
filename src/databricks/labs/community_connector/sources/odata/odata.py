@@ -397,14 +397,24 @@ def _metadata_cache_put(
     re-parse its pickle on every fresh instance while 16 idle services
     stay cached, the exact thrash this cache exists to avoid. Same
     lock-free discipline as the cache itself — a racing double-evict just
-    costs the loser a re-fetch."""
+    costs the loser a re-fetch.
+
+    The eviction candidates are SNAPSHOTTED before choosing: iterating the
+    live dict while sibling threads insert/pop (a driver streaming from
+    more than the cap's worth of distinct services) raises "dictionary
+    changed size during iteration" — iteration+mutation is not one of the
+    GIL-atomic dict operations the lock-free discipline relies on, unlike
+    the single-shot ``list(...)`` copy and the ``pop(..., None)``."""
     _METADATA_CACHE[service_url] = entry
     while len(_METADATA_CACHE) > _METADATA_CACHE_MAX_SERVICES:
-        oldest = min(
-            (k for k in _METADATA_CACHE if k != service_url),
-            key=lambda k: _METADATA_CACHE[k][3],
-        )
-        _METADATA_CACHE.pop(oldest, None)
+        candidates = [
+            (stamp, key)
+            for key, (_, _, _, stamp) in list(_METADATA_CACHE.items())
+            if key != service_url
+        ]
+        if not candidates:
+            break
+        _METADATA_CACHE.pop(min(candidates)[1], None)
 
 
 # On-disk CSDL cache. PySpark's Python Data Source forks a fresh
@@ -814,7 +824,10 @@ def _clear_capability_cache() -> None:
     tmpdir = tempfile.gettempdir()
     try:
         for entry in os.listdir(tmpdir):
-            if entry.startswith("odata_caps_") and entry.endswith(".json"):
+            # Also sweep orphaned atomic-write temps (a process killed
+            # between creating its private ``…json.<pid>.<rand>.tmp`` file
+            # and the rename leaves it behind forever otherwise).
+            if entry.startswith("odata_caps_") and (".json" in entry):
                 try:
                     os.remove(os.path.join(tmpdir, entry))
                 except OSError:
@@ -2481,6 +2494,10 @@ class ODataLakeflowConnect(
                 current_url,
                 kwargs,
                 allow_410=bool(prev_delta_link or prev_next_link),
+                # Only the walk's FIRST fetch hits the checkpoint-stored URL;
+                # deeper pages follow links minted by THIS walk's responses,
+                # so the expired-stored-token curation must not claim them.
+                stored_link=bool(prev_delta_link or prev_next_link) and page_index == 0,
             )
             if resp is None:
                 return [], None, None, True
@@ -2527,6 +2544,7 @@ class ODataLakeflowConnect(
         url: str,
         kwargs: dict,
         allow_410: bool,
+        stored_link: bool = False,
     ) -> tuple[requests.Response | None, dict | None]:
         """GET + decode one delta page, retrying corrupt-200 JSON bodies.
 
@@ -2540,15 +2558,18 @@ class ODataLakeflowConnect(
             resp = self._http_get(session, url, **kwargs)
             if resp.status_code == 410 and allow_410:
                 return None, None
-            if allow_410 and 400 <= resp.status_code < 500:
-                # A non-410 4xx on a STORED delta/next link (the spec
-                # prescribes 410 for an expired token, but real gateways
-                # answer 404/400 too). The checkpoint pins this link, so a
-                # bare HTTPError would re-raise unexplained every trigger
-                # forever — curate it instead. Deliberately NOT an
-                # auto-rebootstrap: silently full-re-reading on any 4xx
-                # would mask genuine config/auth errors; 410 stays the only
-                # auto-recovery trigger.
+            if stored_link and 400 <= resp.status_code < 500:
+                # A non-410 4xx on the STORED delta/next link itself (the
+                # spec prescribes 410 for an expired token, but real
+                # gateways answer 404/400 too). The checkpoint pins this
+                # link, so a bare HTTPError would re-raise unexplained
+                # every trigger forever — curate it instead. Deliberately
+                # NOT an auto-rebootstrap: silently full-re-reading on any
+                # 4xx would mask genuine config/auth errors; 410 stays the
+                # only auto-recovery trigger. Fresh links minted mid-walk
+                # keep the bare raise below — they aren't persisted
+                # anywhere, so "run a full refresh" would be the wrong
+                # remedy for what is a transient server anomaly.
                 try:
                     _raise_for_status_with_body(resp, url)
                 except requests.HTTPError as exc:
@@ -4850,7 +4871,22 @@ class ODataLakeflowConnect(
         mode = getattr(self, "_cursor_lookback", "auto")
         if mode != "auto":
             return int(mode)
-        history = (start_offset or {}).get("lb_history") or []
+        raw_history = (start_offset or {}).get("lb_history") or []
+        # Connector-written entries are always positive finite floats (the
+        # append guards ``measured > 0`` and the clock-skew max), but the
+        # checkpoint is user-visible state: a hand-edited/corrupt entry
+        # ("abc", NaN, a negative) would otherwise crash the multiply /
+        # timedelta uncurated — or, worse for a negative, float the read
+        # filter ABOVE the watermark (a silent exclusion band). Same
+        # non-finite discipline as the cursor_lookback_factor parser.
+        history = [
+            v
+            for v in raw_history
+            if isinstance(v, (int, float))
+            and not isinstance(v, bool)
+            and math.isfinite(v)
+            and v > 0
+        ]
         if not history:
             return 0
         factor = getattr(self, "_cursor_lookback_factor", _LOOKBACK_AUTO_DEFAULT_FACTOR)

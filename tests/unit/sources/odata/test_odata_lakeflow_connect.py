@@ -17182,10 +17182,7 @@ def test_chain_seek_order_distinct_digit_string_pks_are_unknown():
     assert _chain_seek_order([5000, 1], ["5000", 2]) == "before"
     # Chronological rendering flips still conflate (round-43 semantics).
     assert (
-        _chain_seek_order(
-            ["2024-01-01T00:00:00Z", 1], ["2024-01-01T00:00:00.000Z", 2]
-        )
-        == "before"
+        _chain_seek_order(["2024-01-01T00:00:00Z", 1], ["2024-01-01T00:00:00.000Z", 2]) == "before"
     )
     # The predicate itself.
     assert cursor_same_rendering("007", "7") is False
@@ -17272,6 +17269,7 @@ def test_fence_probe_self_checks_orderby_desc():
     probe now self-checks (`cursor gt <probed max>` must be empty) and
     raises actionably instead."""
     _mock_nested_metadata()
+
     # Orderby-ignoring server: always default order — probe gets the OLD
     # row; the self-check (gt) finds the newer one.
     def _parents(request):
@@ -17355,3 +17353,166 @@ def test_keyless_delta_enabled_raises_auto_falls_back():
     assert prefer_seen["n"] == 0  # never probed
     assert rows and all("_deleted" not in r for r in rows)
     assert offset.get("snapshot_done") is True
+
+
+# ---------------------------------------------------------------------------
+# Round 46 — metadata-cache eviction race, fence self-check insert-race
+# re-probe, delta fresh-link attribution, lb_cycle_started leak, lb_history
+# sanitization
+# ---------------------------------------------------------------------------
+
+
+def test_metadata_cache_eviction_survives_concurrent_puts():
+    """The lock-free eviction used to iterate the live dict while sibling
+    threads insert/pop (> cap distinct service_urls on one driver) —
+    "dictionary changed size during iteration" / KeyError escaped into the
+    caller's metadata fetch. Candidates are now snapshotted first."""
+    import sys
+    import threading
+
+    from databricks.labs.community_connector.sources.odata.odata import (
+        _METADATA_CACHE,
+        _metadata_cache_put,
+    )
+
+    _METADATA_CACHE.clear()
+    errors = []
+    # Shrink the GIL switch interval so the eviction loop's iterate-vs-pop
+    # interleavings actually occur within the test's budget — at the 5ms
+    # default the pre-fix race fires only sporadically.
+    prev_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+
+        def _hammer(tid):
+            try:
+                for i in range(600):
+                    _metadata_cache_put(f"https://svc-{tid}-{i}.x/", ("x", None, None, float(i)))
+            except Exception as exc:  # pragma: no cover - the pre-fix failure
+                errors.append(repr(exc))
+
+        threads = [threading.Thread(target=_hammer, args=(t,)) for t in range(12)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        sys.setswitchinterval(prev_interval)
+        _METADATA_CACHE.clear()
+    assert errors == []
+
+
+@responses.activate
+def test_fence_self_check_survives_probe_race_insert():
+    """A row inserted in the one-RTT window between the fence probe and the
+    gt self-check made the check accuse a COMPLIANT server of ignoring
+    $orderby — a spurious hard trigger failure scaling with write rate. On
+    contradiction the check now re-probes with desc: at-or-above the
+    check-found row proves desc works (PASS cached); the fence stays at the
+    original probed max."""
+    _mock_nested_metadata()
+    state = {"rows": [{"Id": 1, "Name": "2024-01-01T00:00:00Z"}], "probes": 0}
+
+    def _parents(request):
+        from urllib.parse import parse_qs, unquote, urlparse
+
+        q = parse_qs(urlparse(request.url).query)
+        flt = unquote(q.get("$filter", [""])[0])
+        rows = list(state["rows"])
+        m = re.search(r"Name gt (\S+)", flt)
+        if m:
+            # The gt self-check: a fresh row landed after the first probe.
+            state["rows"].append({"Id": 2, "Name": "2024-06-01T00:00:00Z"})
+            rows = [r for r in state["rows"] if r["Name"] > m.group(1).strip("'")]
+        elif "desc" in unquote(q.get("$orderby", [""])[0]):
+            state["probes"] += 1
+            rows = sorted(rows, key=lambda r: r["Name"], reverse=True)
+        return (200, {}, json.dumps({"value": rows[:1]}))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents)
+    c = _make()
+    offset = c.latest_offset("Parents__Children", {"cursor_field": "Name"}, None)
+    # No spurious raise; fence stays at the original probed max.
+    assert offset == {"cursor": "2024-01-01T00:00:00Z"}
+    assert state["probes"] == 2  # initial probe + disambiguating re-probe
+    # PASS verdict cached — the next trigger skips the self-check entirely.
+    assert c._cached_capability("fence_desc_ok", table_name="Parents") is True
+    n_before = len(responses.calls)
+    c2 = _make()
+    c2.latest_offset("Parents__Children", {"cursor_field": "Name"}, None)
+    assert len(responses.calls) == n_before + 1  # one probe, no gt check
+
+
+@responses.activate
+def test_delta_fresh_midwalk_link_404_not_blamed_on_stored_token():
+    """A fresh @odata.nextLink minted by THIS walk's response that 404s must
+    keep the bare HTTPError — the round-45 curation claimed the STORED
+    token expired and prescribed a full refresh, the wrong remedy for a
+    link that isn't persisted anywhere."""
+    _mock_metadata()
+
+    def _customers(request):
+        if "$deltatoken=stored" in request.url:
+            return (
+                200,
+                {},
+                json.dumps(
+                    {
+                        "value": [{"Id": 1, "Name": "A", "ModifiedAt": "x"}],
+                        "@odata.nextLink": f"{SERVICE_URL}Customers?$skiptoken=fresh2",
+                    }
+                ),
+            )
+        return (404, {}, '{"error": {"message": "page gone"}}')
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Customers", callback=_customers)
+    c = _make()
+    with pytest.raises(requests.HTTPError):
+        records, _ = c.read_table(
+            "Customers",
+            {"delta_link": f"{SERVICE_URL}Customers?$deltatoken=stored"},
+            {"delta_tracking": "enabled"},
+        )
+        list(records)
+
+
+@responses.activate
+def test_empty_completion_strips_lb_cycle_started():
+    """The leaf-cursor walk's vanished-checkpoint empty completion bypasses
+    _attach_lookback_state; the anchor used to leak, so the NEXT progressing
+    walk recorded the whole idle gap as a "cycle span" — lb_history then
+    carried a bogus multi-hour entry and the auto window pinned at the
+    ceiling for 5 walks."""
+    _mock_nested_metadata()
+    # The parked ANCHOR is still enumerable (so the round-43 reset does NOT
+    # fire) but its checkpointed rows vanished — the resume completes empty
+    # through the `if not emitted:` early return.
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}]}, match_querystring=False)
+    responses.get(f"{SERVICE_URL}Parents(1)/Children", json={"value": []}, match_querystring=False)
+    c = _make()
+    records, offset = c.read_table(
+        "Parents__Children",
+        {
+            "parent_idx": 0,
+            "parent_keys": [{"Id": 1}],
+            "truncated_chain_cursor": "2024-01-01T00:00:00Z",
+            "running_max": "2024-01-01T00:00:00Z",
+            "lb_cycle_started": 1000.0,
+        },
+        {"cursor_field": "ModifiedAt", "pagination": "nextlink", "cursor_probe": "false"},
+    )
+    assert list(records) == []
+    assert "lb_cycle_started" not in offset
+    assert offset.get("cursor") == "2024-01-01T00:00:00Z"
+
+
+def test_lb_history_garbage_sanitized():
+    """lb_history rides the user-visible checkpoint: a hand-edited entry
+    ("abc", NaN, a negative) used to crash the window resolve uncurated —
+    or float the read filter ABOVE the watermark (negative window = silent
+    exclusion band). Non-finite/non-positive/non-numeric entries are now
+    filtered before sizing."""
+    c = _make()
+    c._cursor_lookback = "auto"
+    assert c._resolve_active_lookback({"lb_history": ["abc", -5.0, float("nan"), True]}) == 0
+    assert c._resolve_active_lookback({"lb_history": ["abc", 2.0]}) == 3.0  # 2.0 × 1.5
