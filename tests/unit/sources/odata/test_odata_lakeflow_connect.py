@@ -16786,3 +16786,214 @@ def test_no_progress_guard_ignores_delta_ok_flag():
             "T",
             "M",
         )
+
+
+# ---------------------------------------------------------------------------
+# Round 43 — collation-honest park-resume seeks (identity anchors, three-way
+# order, vanished-anchor reset), NaN lookback factor, alias-aware namespace
+# listing, $batch probe duplicate-id consistency, discovery warning
+# ---------------------------------------------------------------------------
+
+R43_CI_COLLATION_METADATA = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="cq" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Parent">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.String" Nullable="false"/>
+        <NavigationProperty Name="Children" Type="Collection(cq.Child)" ContainsTarget="true"/>
+      </EntityType>
+      <EntityType Name="Child">
+        <Key><PropertyRef Name="Cid"/></Key>
+        <Property Name="Cid" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="ModifiedAt" Type="Edm.DateTimeOffset"/>
+      </EntityType>
+      <EntityContainer Name="C"><EntitySet Name="Parents" EntityType="cq.Parent"/></EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+
+@responses.activate
+def test_expand_park_boundary_survives_ci_collation():
+    """A case-insensitive server orders parents 'a1' < 'B2'; Python ordinal
+    order says the opposite. The expand drainer's park-boundary skip used to
+    trust ordinal order, classifying the unwalked 'B2' as "already walked"
+    on resume and silently dropping its whole subtree. The resume now
+    anchors on the parked row's identity (exact for every key type) and
+    only trusts client-side order where it's provable."""
+    responses.get(f"{SERVICE_URL}$metadata", body=R43_CI_COLLATION_METADATA, status=200)
+    page = {
+        "value": [
+            {"Id": "a1", "Children": [{"Cid": 1}]},
+            {"Id": "B2", "Children": [{"Cid": 2}]},
+        ]
+    }
+    responses.add_callback(
+        responses.GET, f"{SERVICE_URL}Parents", callback=lambda _r: (200, {}, json.dumps(page))
+    )
+    opts = {"expand_contained": "true", "max_records_per_batch": "1", "pagination": "nextlink"}
+    emitted = []
+    offset = {}
+    for _ in range(6):
+        recs, offset = _make().read_table("Parents__Children", offset, opts)
+        emitted.extend(list(recs))
+        if not offset or offset.get("snapshot_done"):
+            break
+    assert sorted(r["Cid"] for r in emitted) == [1, 2]
+
+
+@responses.activate
+def test_capped_walk_vanished_string_key_park_resets_and_recovers(caplog):
+    """String parent keys + the parked parent deleted between batches: the
+    resume seek can no longer trust ordinal order to prove the remaining
+    parents already-walked, and completing the batch would fold running_max
+    past them (permanent sub-max loss — the pre-fix behavior). The seek now
+    exhausts, resets the walk via a truncated no-park offset (positional
+    restart, floor kept), and the next batch recovers the unwalked subtree."""
+    responses.get(f"{SERVICE_URL}$metadata", body=R43_CI_COLLATION_METADATA, status=200)
+    parents = {"n": 0}
+
+    def _parents_cb(_req):
+        parents["n"] += 1
+        if parents["n"] == 1:  # batch 1: both parents, server CI order
+            return (200, {}, json.dumps({"value": [{"Id": "a1"}, {"Id": "B2"}]}))
+        return (200, {}, json.dumps({"value": [{"Id": "B2"}]}))  # a1 deleted
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents_cb)
+    responses.get(
+        f"{SERVICE_URL}Parents('a1')/Children",
+        json={
+            "value": [
+                {"Cid": 1, "ModifiedAt": "2024-06-01T00:00:00Z"},
+                {"Cid": 2, "ModifiedAt": "2024-06-02T00:00:00Z"},
+            ]
+        },
+        match_querystring=False,
+    )
+    responses.get(
+        f"{SERVICE_URL}Parents('B2')/Children",
+        json={"value": [{"Cid": 3, "ModifiedAt": "2024-03-01T00:00:00Z"}]},
+        match_querystring=False,
+    )
+    opts = {
+        "cursor_field": "ModifiedAt",
+        "max_records_per_batch": "1",
+        "pagination": "nextlink",
+        "cursor_probe": "false",
+        # Pin the N+1 walk (no expand preflight — its probe request would
+        # advance the parents callback's batch counter).
+        "expand_contained": "false",
+    }
+    # Batch 1: cap parks parent 'a1' (boundary-trimmed, key chain parked).
+    recs, off1 = _make().read_table("Parents__Children", {}, opts)
+    assert [r["Cid"] for r in recs] == [1]
+    assert off1.get("parent_keys") == [{"Id": "a1"}]
+    # Batch 2: 'a1' vanished. The seek exhausts and RESETS (no cursor fold,
+    # no park) instead of completing past the unwalked 'B2'.
+    with caplog.at_level(logging.WARNING):
+        recs, off2 = _make().read_table("Parents__Children", off1, opts)
+    assert list(recs) == []
+    assert "was not re-found" in caplog.text
+    assert "parent_keys" not in off2
+    assert "cursor" not in off2  # floor (None) kept — running_max NOT folded
+    # Batch 3: full re-walk recovers B2's sub-max child.
+    recs, off3 = _make().read_table("Parents__Children", off2, opts)
+    assert [r["Cid"] for r in recs] == [3]
+    # Completion folds the accumulated running_max (>= batch 1's rows).
+    assert _drop_lb(off3)["cursor"] == "2024-06-01T00:00:00Z"
+
+
+def test_chain_seek_order_collation_honest_units():
+    """Plain-text keys are ordered by the SERVER's collation, which ordinal
+    Python comparison can't reproduce — they must compare as "unknown"
+    (never a skip). Numbers, ISO instants, and numeric rendering flips stay
+    decidable; same-instant renderings fall through to the next element."""
+    from databricks.labs.community_connector.sources.odata._contained import (
+        _chain_seek_order,
+        _chain_strictly_before,
+    )
+
+    # The round-43 loss shape: ordinal says "B2" < "a1"; a CI server says after.
+    assert _chain_strictly_before(["B2"], ["a1"]) is False
+    assert _chain_seek_order(["B2"], ["a1"]) == "unknown"
+    assert _chain_seek_order(["a1"], ["B2"]) == "unknown"
+    # Provable orders still decide.
+    assert _chain_strictly_before([1], [2]) is True
+    assert _chain_seek_order([2], [1]) == "after"
+    assert _chain_strictly_before(["2024-01-01T00:00:00Z"], ["2024-02-01T00:00:00Z"]) is True
+    assert _chain_seek_order([9], ["10"]) == "before"  # numeric rendering flip
+    # Same-instant renderings are EQUAL at their position, not an order signal.
+    assert _chain_seek_order(["2024-01-01T00:00:00Z", 1], ["2024-01-01T00:00:00.000Z", 2]) == (
+        "before"
+    )
+    assert _chain_seek_order([True], [False]) == "unknown"  # bools never decide
+
+
+def test_cursor_lookback_factor_rejects_nan():
+    """NaN passes every ``<=`` comparison (all False) and used to sail
+    through the validator, then kill the read with an uncurated
+    ``cannot convert float NaN to integer`` deep in the lookback resolve."""
+    c = _make()
+    with pytest.raises(ValueError, match="cursor_lookback_factor"):
+        c._parse_cursor_lookback_factor({"cursor_lookback_factor": "nan"})
+
+
+R43_ALIAS_METADATA = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="com.example.model" Alias="m" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Order">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+      </EntityType>
+      <EntityContainer Name="C">
+        <EntitySet Name="Orders" EntityType="m.Order"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+
+@responses.activate
+def test_list_tables_in_namespace_accepts_alias():
+    """The ``namespace`` table option resolves schema aliases; the namespace
+    LISTING used to compare raw and silently return ``[]`` for the same
+    alias string — the connector's own alias contract, applied to both."""
+    responses.get(f"{SERVICE_URL}$metadata", body=R43_ALIAS_METADATA, status=200)
+    c = _make({"token": "t"})
+    assert c.list_tables_in_namespace(["com.example.model"]) == ["Orders"]
+    assert c.list_tables_in_namespace(["m"]) == ["Orders"]
+
+
+@responses.activate
+def test_batch_probe_duplicate_ids_last_wins():
+    """Duplicate ``id`` echoes resolve LAST-wins in ``_post_batch``'s by-id
+    dict; the probe must judge the same sub-response the hydrate would
+    consume, not pass on the first one."""
+    responses.post(
+        f"{SERVICE_URL}$batch",
+        json={
+            "responses": [
+                {"id": "0", "status": 200, "body": {"value": []}},
+                {"id": "0", "status": 404},
+            ]
+        },
+    )
+    assert _make()._verify_batch_support(["Roots"], {}) is False
+
+
+@responses.activate
+def test_enumerate_contained_paths_warns_on_unresolvable_root(caplog):
+    """An entity set whose EntityType reference resolves to nothing still
+    lists (its read fails loudly), but its contained children silently
+    didn't enumerate — now it says so."""
+    broken = R43_ALIAS_METADATA.replace('EntityType="m.Order"', 'EntityType="m.Missing"')
+    responses.get(f"{SERVICE_URL}$metadata", body=broken, status=200)
+    c = _make({"token": "t"})
+    with caplog.at_level(logging.WARNING):
+        tables = c.list_tables()
+    assert "Orders" in tables
+    assert "Cannot enumerate contained paths" in caplog.text

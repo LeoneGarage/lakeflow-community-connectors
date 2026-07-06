@@ -47,6 +47,7 @@ import hashlib
 import itertools
 import json
 import logging
+import math
 import os
 import pickle
 import random
@@ -1194,7 +1195,13 @@ class ODataLakeflowConnect(
             # nothing (returning segment[0]'s tables would fabricate
             # rows under a nonexistent namespace path).
             return []
+        # Accept the schema's ``Alias`` as well as its canonical
+        # ``Namespace`` — the same contract as the ``namespace`` table
+        # option (CSDL lets references use either, and the read path
+        # already resolves both; an alias-spelled listing used to return
+        # a silent ``[]``).
         target = namespace[0]
+        target = self._metadata_state().index.alias_to_namespace.get(target, target)
         flat = sorted({es for ns, es in index if ns == target})
         contained: set[str] = set()
         for es_name in flat:
@@ -1348,6 +1355,43 @@ class ODataLakeflowConnect(
             return [_emit(r) for r in records], offset
         return map(_emit, records), offset
 
+    def _validate_select_columns(self, table_name: str, opts: dict[str, str]) -> None:
+        """A user ``select`` must keep the columns the machinery depends on.
+        Omitting a PK desyncs the schema (drops the column) from
+        read_table_metadata (still lists it) — apply_changes then MERGEs on
+        an undeclared column. Omitting the cursor_field is worse and
+        SILENT: every row's cursor reads None, so under the default
+        cursor_nulls=coalesce each batch re-reads the whole table forever
+        behind a synthetic-floor watermark, and under ``ignore`` the read
+        emits nothing. Both misconfigurations raise here instead."""
+        select_raw = (opts.get("select") or "").strip()
+        if not select_raw:
+            return
+        select_cols = {c.strip() for c in select_raw.split(",") if c.strip()}
+        if "*" in select_cols:
+            return
+        leaf_et = self._entity_type_for(table_name, opts.get("namespace"))
+        missing_pks = [pk for pk in self._own_primary_keys_for_et(leaf_et) if pk not in select_cols]
+        if missing_pks:
+            raise ValueError(
+                f"select={select_raw!r} omits primary-key column(s) "
+                f"{missing_pks} of {table_name!r}. The destination MERGE "
+                f"keys on them; add them to select (or drop select)."
+            )
+        cf = opts.get("cursor_field")
+        if (
+            cf
+            and cf not in select_cols
+            and any(f.name == cf for f in self._own_fields_for_et(leaf_et))
+        ):
+            raise ValueError(
+                f"select={select_raw!r} omits cursor_field={cf!r}. The "
+                f"incremental read filters and watermarks on that column; "
+                f"without it every row's cursor reads null (silent "
+                f"full-table re-reads under cursor_nulls=coalesce, zero "
+                f"rows under ignore). Add {cf!r} to select."
+            )
+
     def _read_table_dispatch(
         self, table_name: str, start_offset: dict, table_options: dict[str, str]
     ) -> tuple[Iterator[dict], dict]:
@@ -1425,41 +1469,7 @@ class ODataLakeflowConnect(
                 "Use 'auto' (default) or 'off' for other read "
                 "configurations."
             )
-        # A user ``select`` must keep the columns the machinery depends on.
-        # Omitting a PK desyncs the schema (drops the column) from
-        # read_table_metadata (still lists it) — apply_changes then MERGEs on
-        # an undeclared column. Omitting the cursor_field is worse and
-        # SILENT: every row's cursor reads None, so under the default
-        # cursor_nulls=coalesce each batch re-reads the whole table forever
-        # behind a synthetic-floor watermark, and under ``ignore`` the read
-        # emits nothing. Both misconfigurations raise here instead.
-        select_raw = (opts.get("select") or "").strip()
-        if select_raw:
-            select_cols = {c.strip() for c in select_raw.split(",") if c.strip()}
-            if "*" not in select_cols:
-                leaf_et = self._entity_type_for(table_name, opts.get("namespace"))
-                missing_pks = [
-                    pk for pk in self._own_primary_keys_for_et(leaf_et) if pk not in select_cols
-                ]
-                if missing_pks:
-                    raise ValueError(
-                        f"select={select_raw!r} omits primary-key column(s) "
-                        f"{missing_pks} of {table_name!r}. The destination MERGE "
-                        f"keys on them; add them to select (or drop select)."
-                    )
-                cf = opts.get("cursor_field")
-                if (
-                    cf
-                    and cf not in select_cols
-                    and any(f.name == cf for f in self._own_fields_for_et(leaf_et))
-                ):
-                    raise ValueError(
-                        f"select={select_raw!r} omits cursor_field={cf!r}. The "
-                        f"incremental read filters and watermarks on that column; "
-                        f"without it every row's cursor reads null (silent "
-                        f"full-table re-reads under cursor_nulls=coalesce, zero "
-                        f"rows under ignore). Add {cf!r} to select."
-                    )
+        self._validate_select_columns(table_name, opts)
         # ``auto`` (the default) is a best-effort hint that no-ops where it can't
         # engage, so these conflict checks fire only on an EXPLICIT strategy
         # opt-in (``cursor_probe=nested-expand`` or ``cursor_probe=batch``) — otherwise
@@ -4720,7 +4730,12 @@ class ODataLakeflowConnect(
             raise ValueError(
                 f"Invalid cursor_lookback_factor={raw!r}; expected a positive number."
             ) from exc
-        if val <= 0:
+        # NaN slips past every ``<=`` comparison (all NaN comparisons are
+        # False) and then poisons the resolved window — min/max keep it and
+        # the read dies at ``timedelta(seconds=nan)`` with an uncurated
+        # ValueError. The only ``float()``-based option parser, so the only
+        # place this check is needed (the int parsers reject "nan" upfront).
+        if val <= 0 or math.isnan(val):
             raise ValueError(f"cursor_lookback_factor must be > 0; got {val}.")
         return val
 

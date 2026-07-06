@@ -35,6 +35,7 @@ from pyspark.sql.types import StructField
 from requests.utils import requote_uri
 
 from databricks.labs.community_connector.sources.odata._helpers import (
+    _as_exact_number,
     cursor_le as _cursor_le,
     cursor_max as _cursor_max,
     cursor_newer as _cursor_newer,
@@ -729,8 +730,80 @@ def _chain_resume_key(
     return key
 
 
+def _order_reproducible(a: Any, b: Any) -> bool:
+    """Whether the client can reproduce the server's relative ORDER for a
+    differing pair of enumeration-key elements. JSON numbers order
+    numerically on every server; ISO-rendered instants order chronologically
+    under every collation; and a real number paired with a numeric string
+    proves the property is numeric (a rendering flip), so the exact-Decimal
+    bridge holds. Anything else — plain text, GUID strings, digits-only
+    ``Edm.String`` values — is ordered by the SERVER's collation
+    (case-insensitive SQL Server defaults, ``uniqueidentifier`` byte-group
+    order, ICU locales…), which Python's ordinal comparison cannot
+    reproduce: trusting it turns "not yet walked" into "already walked" and
+    silently drops whole subtrees at a park boundary."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return False
+    a_num = isinstance(a, (int, float))
+    b_num = isinstance(b, (int, float))
+    if a_num and b_num:
+        return True
+    if (a_num or b_num) and _as_exact_number(a) is not None and _as_exact_number(b) is not None:
+        return True
+
+    def _chrono(v: Any) -> bool:
+        return isinstance(v, datetime) or (isinstance(v, str) and looks_like_iso8601(v))
+
+    return _chrono(a) and _chrono(b)
+
+
+def _chain_seek_order(key_a: list, key_b: list) -> str:
+    """Collation-honest three-way order of enumeration position ``key_a``
+    vs ``key_b`` (both from :func:`_chain_resume_key`, raw values):
+    ``"before"`` / ``"after"`` only when the first differing element's order
+    is provable client-side (:func:`_order_reproducible`), else
+    ``"unknown"`` — the seek loops keep seeking on their identity anchor
+    for unknowns instead of guessing (see the call sites)."""
+    try:
+        for a, b in zip(key_a, key_b):
+            # Same-instant equality (raw, chronological-key, or exact
+            # numeric) — a rendering flip of an EQUAL element must fall
+            # through to the next element, not decide the order.
+            if _cursor_same_instant(a, b):
+                continue
+            if not _order_reproducible(a, b):
+                return "unknown"
+            # First differing element decides: a sorts before b iff b is
+            # strictly newer/greater. cursor_newer is a strict total order
+            # over comparable values, so this is well-defined.
+            return "before" if _cursor_newer(b, a) else "after"
+        if len(key_a) < len(key_b):
+            return "before"
+        return "after"
+    except TypeError:
+        return "unknown"
+
+
+def _expand_resume_start(page_rows: list, boundary: list | None, skip: int, order_key) -> tuple:
+    """Resume position for a re-fetched parked expand page: identity-anchor
+    on the parked row itself (``order_key(row) == boundary``) and resume
+    right after it — exact for EVERY key type with zero reliance on
+    reproducing the server's collation client-side. Returns
+    ``(start_idx, boundary)``: the anchor consumes the boundary (``None``);
+    an anchor row that's gone (deleted / churned out of the page) keeps the
+    boundary so the caller's per-row PROVABLE-order skip takes over
+    (duplicate-safe). ``skip`` is the legacy positional fallback used only
+    when no boundary was parked at all."""
+    if boundary is None:
+        return skip, None
+    for anchor_idx, anchor_row in enumerate(page_rows):
+        if order_key(anchor_row) == boundary:
+            return anchor_idx + 1, None
+    return 0, boundary
+
+
 def _chain_strictly_before(key_a: list, key_b: list) -> bool:
-    """Whether enumeration position ``key_a`` sorts strictly before
+    """Whether enumeration position ``key_a`` PROVABLY sorts strictly before
     ``key_b`` (both from :func:`_chain_resume_key`, raw values).
 
     This drives the "already walked in a prior capped batch" skip. The
@@ -749,22 +822,12 @@ def _chain_strictly_before(key_a: list, key_b: list) -> bool:
     ``datetime2(7)``) tie, the seek loop stops one chain early, the
     parked continuation is silently dropped, and the walk re-parks a
     byte-identical offset — a permanently failing (no-progress) or
-    silently starved stream. Incomparable pairs (cross-type values after
-    a metadata change, or server collation the client can't reproduce)
+    silently starved stream. Pairs whose order isn't provable client-side
+    (cross-type values after a metadata change, or plain-text/GUID keys
+    the SERVER orders by ITS collation — see :func:`_order_reproducible`)
     return ``False`` — the chain is NOT skipped, degrading to a
     duplicate-safe re-read instead of a silent skip."""
-    try:
-        for a, b in zip(key_a, key_b):
-            if a == b:
-                continue
-            # First differing element decides: a sorts before b iff b is
-            # strictly newer/greater. cursor_newer is a strict total order
-            # over comparable values, so this is well-defined; it raises
-            # TypeError only for genuinely incomparable pairs.
-            return _cursor_newer(b, a)
-        return len(key_a) < len(key_b)
-    except TypeError:
-        return False
+    return _chain_seek_order(key_a, key_b) == "before"
 
 
 # Re-export of the EDM namespace prefix used by the main module.
@@ -972,7 +1035,16 @@ class ContainedNavMixin:
         break cycles via target-type set."""
         try:
             root_et = self._flat_entity_type_for(top_level_set, namespace)
-        except ValueError:
+        except ValueError as exc:
+            # The flat set still lists (its own read fails loudly), but its
+            # contained children can't be enumerated — say so instead of
+            # silently listing it childless.
+            _LOG.warning(
+                "Cannot enumerate contained paths under %r: %s. The set is "
+                "listed without contained children.",
+                top_level_set,
+                exc,
+            )
             return []
         paths: list[str] = []
         # Cycle detection: start with an empty ``seen`` so the very first
@@ -2647,7 +2719,11 @@ class ContainedNavMixin:
                     # for an id-less server would pin ``batch_ok: true`` and
                     # then fail EVERY hydrate with "missing sub-response id"
                     # instead of degrading to plain GETs.
-                    sub = next((r for r in subs if str(r.get("id")) == "0"), None)
+                    # Last-wins on duplicate ids, matching how _post_batch's
+                    # by_id dict resolves them — probe and hydrate must judge
+                    # the same sub-response.
+                    by_id = {str(r.get("id")): r for r in subs if isinstance(r, dict)}
+                    sub = by_id.get("0")
                     sub_status = int(sub.get("status", 0) or 0) if sub else None
                 except Exception:
                     sub_status = None
@@ -3533,12 +3609,16 @@ class ContainedNavMixin:
                     )
                 continue
             truncated = False
-            for row_idx in range(0 if boundary is not None else skip, len(page_rows)):
+            start_idx, boundary = _expand_resume_start(
+                page_rows, boundary, skip, lambda r: _row_order_key(r, level)
+            )
+            for row_idx in range(start_idx, len(page_rows)):
                 row = page_rows[row_idx]
                 if boundary is not None:
                     row_key = _row_order_key(row, level)
-                    # Skip only rows PROVABLY at-or-below the parked
-                    # boundary; incomparable rows are processed
+                    # Anchor row missing: skip only rows PROVABLY at-or-below
+                    # the parked boundary (collation-honest — see
+                    # _chain_strictly_before); anything else is processed
                     # (duplicate-safe, never silent loss).
                     if row_key == boundary or _chain_strictly_before(row_key, boundary):
                         continue
@@ -4148,13 +4228,16 @@ class ContainedNavMixin:
         per_level_tops: list[int] | None,
     ) -> str | None:
         """Synthesize a client-driven continuation for a parent's inner
-        collection when the server returned a *full* inline page but omitted
-        its ``<NavProp>@odata.nextLink``.
+        collection when the server returned a NON-EMPTY inline page but
+        omitted its ``<NavProp>@odata.nextLink``.
 
-        Returns ``None`` unless ``pagination`` is keyset/skip/auto, ``$top``
-        is in force (``per_level_tops`` set), and the inline child page is
-        exactly ``$top`` rows (so it's plausibly truncated). A short page is
-        proof the collection is complete, so it's taken at face value.
+        Returns ``None`` only when ``pagination`` is ``nextlink``, ``$top``
+        isn't in force (``per_level_tops`` unset), or the inline collection
+        is empty. Any non-empty inline page gets a continuation — a short
+        page is NOT taken as proof of completeness (a server may page-limit
+        a nested ``$expand`` below the requested per-level ``$top``); see
+        the inline comment below for the full rationale and the one-empty-
+        request cost this trades for closing that silent-truncation hole.
         """
         mode = getattr(self, "_pagination", "nextlink")
         if mode == "nextlink" or per_level_tops is None:
@@ -4422,9 +4505,20 @@ class ContainedNavMixin:
             if parked_key is not None:
                 if seeking:
                     at_parked = chain == parked_chain
-                    if not at_parked and _chain_strictly_before(
-                        _chain_resume_key(chain), parked_key
+                    if (
+                        not at_parked
+                        and _chain_seek_order(_chain_resume_key(chain), parked_key) != "after"
                     ):
+                        # "before": provably drained by a prior batch.
+                        # "unknown" (server-collated text keys whose order
+                        # isn't reproducible client-side): keep seeking on
+                        # the identity anchor rather than trusting ordinal
+                        # comparison, which silently skips unwalked subtrees
+                        # on CI-collation servers. If the parked chain
+                        # vanished, the seek runs out, this batch emits
+                        # nothing, and the cleared park re-walks everything
+                        # next batch (duplicate-safe, never loss — see the
+                        # post-loop warning).
                         parent_idx += 1
                         continue
                     seeking = False
@@ -4541,6 +4635,29 @@ class ContainedNavMixin:
                 parent_idx += 1
                 continue
             parent_idx += 1
+        if seeking:
+            # The anchor was never re-found (parent deleted, or its key
+            # rendering changed between batches) and the remaining chains
+            # couldn't be PROVEN already-walked. Completing here would let
+            # the caller fold ``running_max`` into the committed cursor —
+            # locking every unwalked subtree's sub-max rows out forever —
+            # so return a TRUNCATED reset instead: no park, positional
+            # restart at 0, cursor floor kept. The next batch re-walks
+            # everything above ``since`` (duplicate-safe, deduplicated by
+            # the destination MERGE), never loss.
+            _LOG.warning(
+                "Parked resume position %r was not re-found while enumerating "
+                "%r; this batch emitted nothing and reset the walk — the next "
+                "batch re-walks from the committed cursor floor "
+                "(duplicate-safe).",
+                parked_chain,
+                segments,
+            )
+            truncated = True
+            parent_idx = 0
+            parked_chain_out = None
+            chain_next_link_out = None
+            truncated_chain_cursor_out = None
         return (
             emitted,
             truncated,
@@ -4682,9 +4799,14 @@ class ContainedNavMixin:
             if parked_key is not None:
                 if seeking:
                     at_parked = chain == parked_chain
-                    if not at_parked and _chain_strictly_before(
-                        _chain_resume_key(chain), parked_key
+                    if (
+                        not at_parked
+                        and _chain_seek_order(_chain_resume_key(chain), parked_key) != "after"
                     ):
+                        # Same seek contract as the plain leaf-cursor walk
+                        # above: "before" is provably drained; "unknown"
+                        # keeps seeking on the identity anchor (never trust
+                        # ordinal order of server-collated text keys).
                         parent_idx += 1
                         continue
                     seeking = False
@@ -4708,6 +4830,21 @@ class ContainedNavMixin:
         else:
             if group:
                 _drain_group(group)
+        if seeking:
+            # See the plain walk above: a never-found anchor must reset via a
+            # TRUNCATED no-park offset (positional restart, floor kept) — a
+            # clean completion would fold running_max past unwalked subtrees.
+            _LOG.warning(
+                "Parked resume position %r was not re-found while enumerating "
+                "%r; this batch emitted nothing and reset the walk — the next "
+                "batch re-walks from the committed cursor floor "
+                "(duplicate-safe).",
+                parked_chain,
+                segments,
+            )
+            truncated = True
+            parent_idx = 0
+            parked_chain_out = None
         return (emitted, truncated, parent_idx, parked_chain_out, None, None)
 
     def _no_progress_cursor_error(
@@ -5425,9 +5562,17 @@ class ContainedNavMixin:
                     # collection's undrained remainder while running_max
                     # commits past it. Ending the seek here re-walks it in
                     # full instead: duplicate-safe in BOTH mismatch
-                    # directions, as promised above.
-                    if not pk_match and _chain_strictly_before(
-                        _chain_resume_key(chain, ancestor_cursor, cursor_level), parked_key
+                    # directions, as promised above. Non-matched chains take
+                    # the three-way seek: "before" is provably drained;
+                    # "unknown" (server-collated text keys) keeps seeking on
+                    # the PK anchor rather than trusting ordinal order,
+                    # which silently skips unwalked subtrees on
+                    # CI-collation servers.
+                    if not pk_match and (
+                        _chain_seek_order(
+                            _chain_resume_key(chain, ancestor_cursor, cursor_level), parked_key
+                        )
+                        != "after"
                     ):
                         parent_idx += 1
                         continue
@@ -5478,6 +5623,24 @@ class ContainedNavMixin:
                 parked_cursor_out = ancestor_cursor
                 break
             parent_idx += 1
+        if seeking:
+            # See _walk_contained_with_cursor: a never-found anchor must
+            # reset via a TRUNCATED no-park offset (positional restart,
+            # floor kept) — a clean completion would fold running_max past
+            # unwalked subtrees, locking their sub-max rows out forever.
+            _LOG.warning(
+                "Parked resume position %r was not re-found while enumerating "
+                "%r; this batch emitted nothing and reset the walk — the next "
+                "batch re-walks from the committed cursor floor "
+                "(duplicate-safe).",
+                parked_chain,
+                segments,
+            )
+            truncated = True
+            parent_idx = 0
+            parked_chain_out = None
+            parked_cursor_out = None
+            chain_next_link_out = None
         return {
             "emitted": emitted,
             "truncated": truncated,
