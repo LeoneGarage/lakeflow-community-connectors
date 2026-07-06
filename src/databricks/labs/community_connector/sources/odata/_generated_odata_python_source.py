@@ -1063,7 +1063,7 @@ def register_lakeflow_source(spark):
     # reaches this length the drainer parks early (clean boundary item for the
     # current page, then stop dequeuing); the parked queue drains across later
     # batches. Soft: one in-flight page can still overshoot by its own fan-out.
-    _MAX_PENDING_FETCHES = 500
+    _MAX_PENDING_FETCHES = 2000
 
     # Default ``page_size`` applied to **cursor-based** reads (cursor_field
     # or delta) when the user didn't set one, so a ``$top`` is still sent.
