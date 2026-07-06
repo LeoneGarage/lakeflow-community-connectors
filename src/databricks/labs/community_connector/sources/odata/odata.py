@@ -87,6 +87,8 @@ from databricks.labs.community_connector.interface.supports_namespaces import (
 # this module under its line-count budget. Re-exported under the original
 # private names so the rest of this file can keep using them as before.
 from databricks.labs.community_connector.sources.odata._helpers import (
+    DELETED_COL as _DELETED_COL,
+    SEQUENCE_COL as _SEQUENCE_COL,
     cursor_le as _cursor_le,
     cursor_max as _cursor_max,
     jsonify_complex_values as _jsonify_complex_values,
@@ -95,6 +97,7 @@ from databricks.labs.community_connector.sources.odata._helpers import (
     parse_iso8601 as _parse_iso8601,
     parse_max_records as _parse_max_records,
     trim_to_distinct_cursor_boundary as _trim_to_distinct_cursor_boundary,
+    url_origin as _url_origin,
 )
 
 # Note: the ``_pg_*`` client-side pagination URL helpers live in ``_contained``
@@ -209,14 +212,12 @@ def _spark_type_for_property(prop, edm_type: str | None = None):
 
 # Delta tracking constants.
 #
-# Synthetic columns appended to the schema when delta is active so the
-# destination MERGE (apply_changes) has a sequence column and a tombstone
-# flag. Their names are namespaced so they can't collide with any real
-# OData property — OData property names start with a letter, never an
-# underscore.
+# The synthetic MERGE columns appended to the schema when delta is active
+# (``_DELETED_COL`` tombstone flag / ``_SEQUENCE_COL`` sequence) are imported
+# from ``_helpers`` above — they live there so the partition mixin can share
+# them. Their names are namespaced so they can't collide with any real OData
+# property — OData property names start with a letter, never an underscore.
 _DELTA_PREFER = "odata.track-changes"
-_DELETED_COL = "_deleted"
-_SEQUENCE_COL = "_lc_sequence"
 
 # ``Name=value`` (named-key) form inside a key predicate — the name is a
 # simple identifier, so a ``=`` inside a quoted VALUE can't false-match.
@@ -477,17 +478,6 @@ _MAX_SAME_ORIGIN_REDIRECTS = 5
 #     default. Body snippet length is bounded by
 #     ``verbose_http_log_body_chars`` (default 500).
 _LOG = logging.getLogger(__name__)
-
-
-def _url_origin(url: str) -> tuple[str, str, int | None]:
-    """``(scheme, host, port)`` for same-origin comparison, host lower-cased
-    and the default port for the scheme filled in so ``https://h`` and
-    ``https://h:443`` compare equal."""
-    p = urlparse(url)
-    scheme = (p.scheme or "").lower()
-    host = (p.hostname or "").lower()
-    port = p.port if p.port is not None else {"http": 80, "https": 443}.get(scheme)
-    return (scheme, host, port)
 
 
 def _cache_owner_tag() -> str:
@@ -1591,13 +1581,8 @@ class ODataLakeflowConnect(
             return self._snapshot_stream_result(
                 start_offset, lambda: self._read_contained_snapshot(table_name, opts)
             )
-        # Offset-shape check ahead of the delta predicate so a resumed
-        # delta stream (offset carries delta_link / next_link) takes the
-        # delta path even if delta_tracking is no longer set in options.
-        if (
-            "delta_link" in offset
-            or "next_link" in offset
-            or self._delta_active_for(table_name, opts)
+        if self._delta_offset_shape_gate(table_name, opts, offset) or self._delta_active_for(
+            table_name, opts
         ):
             # NEVER send $top on the delta path. OData §11.2.5.3 makes $top a
             # TOTAL-RESULT limit — the exact trap the pagination docs call out
@@ -1668,6 +1653,42 @@ class ODataLakeflowConnect(
         if offset:
             return records, offset
         return records, {**offset, "snapshot_done": True}
+
+    def _delta_offset_shape_gate(
+        self, table_name: str, table_options: dict | None, offset: dict
+    ) -> bool:
+        """The offset-shape check ahead of the delta predicate, both ways.
+
+        Returns True when the offset is delta-shaped (carries a
+        ``delta_link``/``next_link``), so a resumed delta stream takes the
+        delta path even if ``delta_tracking`` is no longer set in options.
+
+        The REVERSE shape check runs as a side effect: under ``auto``, a
+        non-empty fallback-shaped offset (``snapshot_done`` / ``cursor``, no
+        delta link) proves earlier batches of THIS stream ran the
+        cursor/snapshot shape against the setup-frozen schema. If the first
+        batch's probe was transient, nothing was stamped (``delta_ok`` rides
+        definitive verdicts only) and a later re-probe coming back TRUE would
+        flip the stream ONTO the delta path mid-stream — emitting
+        ``_deleted``/``_lc_sequence`` columns the frozen schema never
+        declared; the framework parser drops undeclared columns silently, so
+        a delta tombstone MERGEs as a live row. So the fallback is pinned for
+        the checkpoint's lifetime: the instance verdict makes
+        ``_delta_active_for`` skip the re-probe, and ``_stamp_delta_verdict``
+        persists ``delta_ok: false`` into the outgoing offset. Deliberately
+        NOT written to the shared process/file cache — the pin is evidence
+        about this checkpoint's frozen schema, not about the server.
+        Cursor-configured tables are exempt (cursor wins deterministically —
+        they never probe, so there is no flip to pin against)."""
+        if "delta_link" in offset or "next_link" in offset:
+            return True
+        if (
+            offset
+            and not (table_options or {}).get("cursor_field")
+            and self._delta_setting(table_options) == "auto"
+        ):
+            self._delta_capable[self._delta_cache_key(table_name, table_options)] = False
+        return False
 
     def _stamp_delta_verdict(
         self, result: tuple, table_name: str, table_options: dict | None
@@ -3258,9 +3279,7 @@ class ODataLakeflowConnect(
                         _pg_strip_positional(url), "$skip", str(base_skip + fetched)
                     )
             else:
-                nxt = _pg_set_query(
-                    _pg_strip_positional(url), "$skip", str(base_skip + fetched)
-                )
+                nxt = _pg_set_query(_pg_strip_positional(url), "$skip", str(base_skip + fetched))
             yield page_rows, nxt
             cur_url = nxt
 
@@ -3803,7 +3822,19 @@ class ODataLakeflowConnect(
             for pair in extra_headers.split(","):
                 if ":" in pair:
                     k, v = pair.split(":", 1)
-                    session.headers[k.strip()] = v.strip()
+                    k = k.strip()
+                    # Same RFC 7230 token check as ``api_key_header`` below:
+                    # http.client's send-time regex tolerates interior spaces,
+                    # so a malformed name would otherwise go out on the wire
+                    # as-is and fail at a strict server/proxy with nothing
+                    # pointing at this option.
+                    if not re.fullmatch(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+", k):
+                        raise ValueError(
+                            f"Invalid header name {k!r} in extra_headers: not "
+                            f"a valid HTTP header name (letters, digits, and "
+                            f"!#$%&'*+-.^_`|~ only, no spaces)."
+                        )
+                    session.headers[k] = v.strip()
 
         auth_type = (self.options.get("auth_type") or "").lower().strip()
         if not auth_type and self.options.get("token"):

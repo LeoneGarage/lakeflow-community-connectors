@@ -16627,3 +16627,162 @@ def test_delta_removed_with_link_context_still_tombstones():
     records, _ = c.read_table("Customers", {}, {"delta_tracking": "enabled"})
     (row,) = list(records)
     assert row["Id"] == 5 and row["_deleted"] is True
+
+
+# ---------------------------------------------------------------------------
+# Round 42 — fallback-shape delta pin, keyless-parent preflight 3-tuple,
+# $batch probe id echo, _batch_relative origin normalization, header-name
+# validation, curated origin errors, delta_ok in the no-progress strip
+# ---------------------------------------------------------------------------
+
+
+@responses.activate
+def test_delta_auto_snapshot_shaped_offset_pins_fallback_without_stamp():
+    """A NON-empty fallback-shaped offset (``snapshot_done``, no ``delta_ok``
+    — the first batch's probe was transient, so nothing was stamped) must pin
+    the fallback by SHAPE: it proves earlier batches ran the cursor/snapshot
+    shape against the setup-frozen schema. Without the pin, a later batch's
+    re-probe (recovered transient / Preference-Applied flap) flips the stream
+    ONTO the delta path mid-stream — emitting ``_deleted``/``_lc_sequence``
+    columns the frozen schema never declared (a tombstone then MERGEs as a
+    live row) and committing a sticky ``delta_link`` offset."""
+    _mock_metadata()
+    prefer_seen = {"n": 0}
+
+    def _cb(request):
+        if request.headers.get("Prefer"):
+            prefer_seen["n"] += 1
+            return (
+                200,
+                {"Preference-Applied": "odata.track-changes"},
+                json.dumps(_delta_bootstrap_body([{"Id": 9, "Name": "Z", "ModifiedAt": "y"}])),
+            )
+        return (200, {}, '{"value": [{"Id": 1, "Name": "A", "ModifiedAt": "x"}]}')
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Customers", callback=_cb)
+    c = _make()
+    records, offset = c.read_table("Customers", {"snapshot_done": True}, {"delta_tracking": "auto"})
+    rows = list(records)
+    assert prefer_seen["n"] == 0  # no delta probe ran at all
+    assert rows == []  # the quiesced snapshot stays quiesced
+    assert "delta_link" not in offset and "next_link" not in offset
+    assert offset.get("snapshot_done") is True
+    # The pin is persisted so framework-recreated instances inherit it.
+    assert offset.get("delta_ok") is False
+
+
+R42_KEYLESS_MID_METADATA = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="kq" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Root">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <NavigationProperty Name="Mids" Type="Collection(kq.Mid)" ContainsTarget="true"/>
+      </EntityType>
+      <EntityType Name="Mid">
+        <Property Name="Code" Type="Edm.String"/>
+        <NavigationProperty Name="Leaves" Type="Collection(kq.Leaf)" ContainsTarget="true"/>
+      </EntityType>
+      <EntityType Name="Leaf">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="RecordLastModified" Type="Edm.DateTimeOffset"/>
+      </EntityType>
+      <EntityContainer Name="C"><EntitySet Name="Roots" EntityType="kq.Root"/></EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+
+@responses.activate
+def test_probe_preflight_keyless_parent_returns_three_tuple():
+    """The keyless-leaf-parent early return was the one preflight exit the
+    round-39 3-tuple migration missed: both consumers unpack
+    ``problem, conclusive, race`` from the cached result, so the stale
+    2-tuple crashed a probe-engaged read over a keyless parent with an
+    undiagnosable unpack ValueError instead of reaching the walk's
+    actionable "no primary key declared in $metadata" error."""
+    responses.get(f"{SERVICE_URL}$metadata", body=R42_KEYLESS_MID_METADATA, status=200)
+    c = _make({"token": "t"})
+    result = c._run_cursor_probe_preflight(
+        ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified"
+    )
+    assert result == (None, False, False)
+    # The consumer path must survive it too: inconclusive, race-free →
+    # engage-unverified semantics, same as any non-discriminating scan.
+    supported, conclusive = c._verify_cursor_probe_support(
+        ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified", None, strict=False
+    )
+    assert (supported, conclusive) == (True, False)
+
+
+@responses.activate
+def test_batch_probe_requires_id_echo():
+    """A 2xx $batch envelope whose sub-response lacks the echoed ``id`` is a
+    server ``_post_batch`` can never consume (it keys sub-responses by id and
+    hard-raises without one, and that raise is not _BatchTooManyParts — so
+    nothing would ever degrade to plain GETs). The probe used to pass it on
+    status alone, pinning a definitive-but-unusable ``batch_ok: true``."""
+    responses.post(
+        f"{SERVICE_URL}$batch",
+        json={"responses": [{"status": 200, "body": {"value": []}}]},
+    )
+    c = _make()
+    assert c._verify_batch_support(["Roots"], {}) is False
+    # Definitive fail — recorded, not retried every batch.
+    assert c._cached_capability("batch_ok") is False
+
+
+def test_batch_relative_normalizes_same_origin_spelling():
+    """An absolute same-origin continuation spelled with the default port or
+    a different host case must still resolve service-relative — the raw
+    prefix match missed it and kept the service root's own path segments,
+    404ing the sub-request (self-healing via the plain-GET re-issue, but one
+    wasted round-trip plus an alarming warning per continuation)."""
+    c = _make()
+    assert (
+        c._batch_relative("https://example.com:443/odata/Orders?$skiptoken=5")
+        == "Orders?$skiptoken=5"
+    )
+    assert c._batch_relative("https://EXAMPLE.com/odata/Orders") == "Orders"
+    # Off-origin (or unparseable-port) absolute URLs keep the legacy
+    # path-only fallback; the same-origin guard upstream handles policy.
+    assert c._batch_relative("https://other.example.com/odata/Orders") == "odata/Orders"
+    assert c._batch_relative("https://example.com:banana/odata/Orders") == "odata/Orders"
+
+
+def test_extra_headers_invalid_name_fails_eagerly():
+    """Header NAMES in extra_headers get the same eager RFC 7230 token check
+    as api_key_header — http.client's send-time regex tolerates interior
+    spaces, so a malformed name used to go out on the wire as-is and fail at
+    a strict server with nothing pointing at the option."""
+    c = _make({"extra_headers": "bad name: 1", "token": "t"})
+    with pytest.raises(ValueError, match="extra_headers"):
+        c._get_session()
+    ok = _make({"extra_headers": "sap-client: 100", "token": "t"})
+    assert ok._get_session().headers["sap-client"] == "100"
+
+
+def test_service_url_malformed_port_curated_error():
+    """urlparse defers port validation to the ``.port`` accessor, so a
+    malformed port used to escape as a bare "Port could not be cast to
+    integer value" with no hint of which URL carried it."""
+    with pytest.raises(ValueError, match="Invalid port in URL"):
+        _make({"service_url": "https://example.com:banana/odata"})
+
+
+def test_no_progress_guard_ignores_delta_ok_flag():
+    """``delta_ok`` was the one persisted verdict missing from the
+    no-progress comparison's strip list: an offset differing only by the
+    flag would read as forward progress and bypass the guard."""
+    c = _make()
+    with pytest.raises(RuntimeError, match="did not advance"):
+        c._finalize_cursor_read(
+            {"cursor": "5", "delta_ok": False},
+            {"cursor": "5"},
+            [{"Id": 1}],
+            "T",
+            "M",
+        )

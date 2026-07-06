@@ -12,8 +12,38 @@ import re
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
+from urllib.parse import urlparse
+
+# Synthetic columns appended to a table's declared schema when the
+# server-driven delta-tracking read shape is active. Defined here (not in
+# ``odata``) so the partition mixin can exempt them from emit padding
+# without importing from ``odata`` (which would close a cycle).
+DELETED_COL = "_deleted"
+SEQUENCE_COL = "_lc_sequence"
 
 _ISO_FRACTION_RE = re.compile(r"\.(\d+)")
+
+
+def url_origin(url: str) -> tuple[str, str, int | None]:
+    """``(scheme, host, port)`` for same-origin comparison, host lower-cased
+    and the default port for the scheme filled in so ``https://h`` and
+    ``https://h:443`` compare equal.
+
+    A malformed port raises ``ValueError`` naming the URL — ``urlparse``
+    defers port validation to the ``.port`` accessor, so without the wrap
+    the bare "Port could not be cast to integer value" message escapes with
+    no hint of WHICH url (service_url, a server-supplied @odata.nextLink, a
+    $batch sub-response continuation) carried the garbage."""
+    p = urlparse(url)
+    scheme = (p.scheme or "").lower()
+    host = (p.hostname or "").lower()
+    try:
+        port = p.port
+    except ValueError as exc:
+        raise ValueError(f"Invalid port in URL {url!r}: {exc}") from None
+    if port is None:
+        port = {"http": 80, "https": 443}.get(scheme)
+    return (scheme, host, port)
 
 
 def _fraction_digits(value: Any) -> str:

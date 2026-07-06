@@ -43,6 +43,7 @@ from databricks.labs.community_connector.sources.odata._helpers import (
     parse_iso8601,
     parse_max_records as _parse_max_records,
     trim_to_distinct_cursor_boundary as _trim_to_distinct_cursor_boundary,
+    url_origin as _url_origin,
 )
 
 
@@ -439,8 +440,10 @@ def odata_literal_typed(value: Any, edm_type: str | None) -> str:
     already indexed — that type wins. Falls back to :func:`odata_literal` for
     non-string values, unknown/missing types, and types with wrapped literal
     forms this connector never generates (``Edm.Duration``, ``Edm.Binary``,
-    enums). The untyped cursor-watermark path keeps the ISO sniff — watermarks
-    round-trip through offsets and may be synthetic floors, not properties."""
+    enums). Cursor-watermark filters (``_cursor_filter``) pass the declared
+    type too — watermarks round-trip through offsets as strings, so the
+    declared type is the only reliable quote signal; the sniff remains the
+    fallback when the CSDL lookup misses."""
     if isinstance(value, str) and edm_type:
         if edm_type in _EDM_BARE_TYPES:
             return _escape_literal_text(value)
@@ -2097,7 +2100,10 @@ class ContainedNavMixin:
         lp_et = self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
         lp_pks = self._own_primary_keys_for_et(lp_et)
         if not lp_pks:
-            return (None, False)
+            # Inconclusive, not race-tainted — the 3-tuple contract every
+            # consumer unpacks. The walk itself then raises the actionable
+            # "segment X has no primary key declared in $metadata" error.
+            return (None, False, False)
         lp_types = self._edm_types_for_et(lp_et)
         page_size = (table_options or {}).get("page_size") or DEFAULT_PAGE_SIZE
         lp_order = _ancestor_pk_order_by(lp_pks)
@@ -2310,9 +2316,22 @@ class ContainedNavMixin:
             return requote_uri(url[len(root) :])
         parsed = urlparse(url)
         if parsed.scheme:
-            return requote_uri(
-                parsed.path.lstrip("/") + (f"?{parsed.query}" if parsed.query else "")
-            )
+            query = f"?{parsed.query}" if parsed.query else ""
+            # Same origin under normalization (default port spelled out,
+            # host-case difference) but a raw prefix miss: strip the service
+            # root's PATH so the sub-request stays service-relative. Without
+            # this the fallback below keeps the root's own path segments and
+            # the sub-request 404s — self-healing via the plain-GET re-issue
+            # in ``_checked_batch_subresponse``, but one wasted round-trip
+            # plus an alarming warning per continuation.
+            try:
+                same_origin = _url_origin(url) == _url_origin(root)
+            except ValueError:
+                same_origin = False
+            root_path = urlparse(root).path
+            if same_origin and parsed.path.startswith(root_path):
+                return requote_uri(parsed.path[len(root_path) :] + query)
+            return requote_uri(parsed.path.lstrip("/") + query)
         return requote_uri(url.lstrip("/"))
 
     def _post_batch(self, urls: list[str]) -> list[dict]:
@@ -2621,11 +2640,19 @@ class ContainedNavMixin:
             if resp.status_code < 400:
                 try:
                     subs = resp.json().get("responses") or []
-                    sub_status = int(subs[0].get("status", 0) or 0) if subs else None
+                    # Require the ``id`` echo, not just a sub-response: the
+                    # real hydrate (``_post_batch``) keys sub-responses by the
+                    # echoed id and hard-raises when it's missing, and that
+                    # raise is not ``_BatchTooManyParts`` — so a pass verdict
+                    # for an id-less server would pin ``batch_ok: true`` and
+                    # then fail EVERY hydrate with "missing sub-response id"
+                    # instead of degrading to plain GETs.
+                    sub = next((r for r in subs if str(r.get("id")) == "0"), None)
+                    sub_status = int(sub.get("status", 0) or 0) if sub else None
                 except Exception:
                     sub_status = None
                 if sub_status is None:
-                    definitive = True  # 2xx, but not a $batch envelope
+                    definitive = True  # 2xx, but not a consumable $batch envelope
                 elif sub_status < 400:
                     ok = definitive = True
                 elif sub_status not in _TRANSIENT_HTTP_STATUSES:
@@ -4743,7 +4770,14 @@ class ContainedNavMixin:
                 for k, v in (off or {}).items()
                 if not k.startswith("lb_")
                 and k
-                not in ("cursor_probe_ok", "batch_ok", "batch_size_ok", "or_filter_ok", "expand_ok")
+                not in (
+                    "cursor_probe_ok",
+                    "batch_ok",
+                    "batch_size_ok",
+                    "or_filter_ok",
+                    "expand_ok",
+                    "delta_ok",
+                )
             }
 
         if _progress_view(start_offset) == _progress_view(end_offset):

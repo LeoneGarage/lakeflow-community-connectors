@@ -614,7 +614,32 @@ def register_lakeflow_source(spark):
     # src/databricks/labs/community_connector/sources/odata/_helpers.py
     ########################################################
 
+    DELETED_COL = "_deleted"
+    SEQUENCE_COL = "_lc_sequence"
+
     _ISO_FRACTION_RE = re.compile(r"\.(\d+)")
+
+
+    def url_origin(url: str) -> tuple[str, str, int | None]:
+        """``(scheme, host, port)`` for same-origin comparison, host lower-cased
+        and the default port for the scheme filled in so ``https://h`` and
+        ``https://h:443`` compare equal.
+
+        A malformed port raises ``ValueError`` naming the URL — ``urlparse``
+        defers port validation to the ``.port`` accessor, so without the wrap
+        the bare "Port could not be cast to integer value" message escapes with
+        no hint of WHICH url (service_url, a server-supplied @odata.nextLink, a
+        $batch sub-response continuation) carried the garbage."""
+        p = urlparse(url)
+        scheme = (p.scheme or "").lower()
+        host = (p.hostname or "").lower()
+        try:
+            port = p.port
+        except ValueError as exc:
+            raise ValueError(f"Invalid port in URL {url!r}: {exc}") from None
+        if port is None:
+            port = {"http": 80, "https": 443}.get(scheme)
+        return (scheme, host, port)
 
 
     def _fraction_digits(value: Any) -> str:
@@ -1342,8 +1367,10 @@ def register_lakeflow_source(spark):
         already indexed — that type wins. Falls back to :func:`odata_literal` for
         non-string values, unknown/missing types, and types with wrapped literal
         forms this connector never generates (``Edm.Duration``, ``Edm.Binary``,
-        enums). The untyped cursor-watermark path keeps the ISO sniff — watermarks
-        round-trip through offsets and may be synthetic floors, not properties."""
+        enums). Cursor-watermark filters (``_cursor_filter``) pass the declared
+        type too — watermarks round-trip through offsets as strings, so the
+        declared type is the only reliable quote signal; the sniff remains the
+        fallback when the CSDL lookup misses."""
         if isinstance(value, str) and edm_type:
             if edm_type in _EDM_BARE_TYPES:
                 return _escape_literal_text(value)
@@ -3000,7 +3027,10 @@ def register_lakeflow_source(spark):
             lp_et = self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
             lp_pks = self._own_primary_keys_for_et(lp_et)
             if not lp_pks:
-                return (None, False)
+                # Inconclusive, not race-tainted — the 3-tuple contract every
+                # consumer unpacks. The walk itself then raises the actionable
+                # "segment X has no primary key declared in $metadata" error.
+                return (None, False, False)
             lp_types = self._edm_types_for_et(lp_et)
             page_size = (table_options or {}).get("page_size") or DEFAULT_PAGE_SIZE
             lp_order = _ancestor_pk_order_by(lp_pks)
@@ -3213,9 +3243,22 @@ def register_lakeflow_source(spark):
                 return requote_uri(url[len(root) :])
             parsed = urlparse(url)
             if parsed.scheme:
-                return requote_uri(
-                    parsed.path.lstrip("/") + (f"?{parsed.query}" if parsed.query else "")
-                )
+                query = f"?{parsed.query}" if parsed.query else ""
+                # Same origin under normalization (default port spelled out,
+                # host-case difference) but a raw prefix miss: strip the service
+                # root's PATH so the sub-request stays service-relative. Without
+                # this the fallback below keeps the root's own path segments and
+                # the sub-request 404s — self-healing via the plain-GET re-issue
+                # in ``_checked_batch_subresponse``, but one wasted round-trip
+                # plus an alarming warning per continuation.
+                try:
+                    same_origin = _url_origin(url) == _url_origin(root)
+                except ValueError:
+                    same_origin = False
+                root_path = urlparse(root).path
+                if same_origin and parsed.path.startswith(root_path):
+                    return requote_uri(parsed.path[len(root_path) :] + query)
+                return requote_uri(parsed.path.lstrip("/") + query)
             return requote_uri(url.lstrip("/"))
 
         def _post_batch(self, urls: list[str]) -> list[dict]:
@@ -3524,11 +3567,19 @@ def register_lakeflow_source(spark):
                 if resp.status_code < 400:
                     try:
                         subs = resp.json().get("responses") or []
-                        sub_status = int(subs[0].get("status", 0) or 0) if subs else None
+                        # Require the ``id`` echo, not just a sub-response: the
+                        # real hydrate (``_post_batch``) keys sub-responses by the
+                        # echoed id and hard-raises when it's missing, and that
+                        # raise is not ``_BatchTooManyParts`` — so a pass verdict
+                        # for an id-less server would pin ``batch_ok: true`` and
+                        # then fail EVERY hydrate with "missing sub-response id"
+                        # instead of degrading to plain GETs.
+                        sub = next((r for r in subs if str(r.get("id")) == "0"), None)
+                        sub_status = int(sub.get("status", 0) or 0) if sub else None
                     except Exception:
                         sub_status = None
                     if sub_status is None:
-                        definitive = True  # 2xx, but not a $batch envelope
+                        definitive = True  # 2xx, but not a consumable $batch envelope
                     elif sub_status < 400:
                         ok = definitive = True
                     elif sub_status not in _TRANSIENT_HTTP_STATUSES:
@@ -5646,7 +5697,14 @@ def register_lakeflow_source(spark):
                     for k, v in (off or {}).items()
                     if not k.startswith("lb_")
                     and k
-                    not in ("cursor_probe_ok", "batch_ok", "batch_size_ok", "or_filter_ok", "expand_ok")
+                    not in (
+                        "cursor_probe_ok",
+                        "batch_ok",
+                        "batch_size_ok",
+                        "or_filter_ok",
+                        "expand_ok",
+                        "delta_ok",
+                    )
                 }
 
             if _progress_view(start_offset) == _progress_view(end_offset):
@@ -6692,7 +6750,13 @@ def register_lakeflow_source(spark):
             # ``get_table_schema`` rebuilds from memoized parts — no I/O after
             # the first call.
             field_names = tuple(f.name for f in self.get_table_schema(table_name, opts).fields)
-            never_pad = frozenset(self._primary_keys_for(table_name, opts.get("namespace")) or ())
+            # The delta synthetics are exempt too, mirroring read_table — today a
+            # partitioned schema never declares them (delta != disabled forces the
+            # serial fallback), so this only keeps the emit-boundary rule uniform.
+            never_pad = frozenset(self._primary_keys_for(table_name, opts.get("namespace")) or ()) | {
+                _DELETED_COL,
+                _SEQUENCE_COL,
+            }
 
             def _emit(row):
                 return _jsonify_complex_values(pad_row_to_fields(row, field_names, never_pad))
@@ -7102,14 +7166,12 @@ def register_lakeflow_source(spark):
 
     # Delta tracking constants.
     #
-    # Synthetic columns appended to the schema when delta is active so the
-    # destination MERGE (apply_changes) has a sequence column and a tombstone
-    # flag. Their names are namespaced so they can't collide with any real
-    # OData property — OData property names start with a letter, never an
-    # underscore.
+    # The synthetic MERGE columns appended to the schema when delta is active
+    # (``_DELETED_COL`` tombstone flag / ``_SEQUENCE_COL`` sequence) are imported
+    # from ``_helpers`` above — they live there so the partition mixin can share
+    # them. Their names are namespaced so they can't collide with any real OData
+    # property — OData property names start with a letter, never an underscore.
     _DELTA_PREFER = "odata.track-changes"
-    _DELETED_COL = "_deleted"
-    _SEQUENCE_COL = "_lc_sequence"
 
     # ``Name=value`` (named-key) form inside a key predicate — the name is a
     # simple identifier, so a ``=`` inside a quoted VALUE can't false-match.
@@ -7370,17 +7432,6 @@ def register_lakeflow_source(spark):
     #     default. Body snippet length is bounded by
     #     ``verbose_http_log_body_chars`` (default 500).
     _LOG = logging.getLogger(__name__)
-
-
-    def _url_origin(url: str) -> tuple[str, str, int | None]:
-        """``(scheme, host, port)`` for same-origin comparison, host lower-cased
-        and the default port for the scheme filled in so ``https://h`` and
-        ``https://h:443`` compare equal."""
-        p = urlparse(url)
-        scheme = (p.scheme or "").lower()
-        host = (p.hostname or "").lower()
-        port = p.port if p.port is not None else {"http": 80, "https": 443}.get(scheme)
-        return (scheme, host, port)
 
 
     def _cache_owner_tag() -> str:
@@ -8484,13 +8535,8 @@ def register_lakeflow_source(spark):
                 return self._snapshot_stream_result(
                     start_offset, lambda: self._read_contained_snapshot(table_name, opts)
                 )
-            # Offset-shape check ahead of the delta predicate so a resumed
-            # delta stream (offset carries delta_link / next_link) takes the
-            # delta path even if delta_tracking is no longer set in options.
-            if (
-                "delta_link" in offset
-                or "next_link" in offset
-                or self._delta_active_for(table_name, opts)
+            if self._delta_offset_shape_gate(table_name, opts, offset) or self._delta_active_for(
+                table_name, opts
             ):
                 # NEVER send $top on the delta path. OData §11.2.5.3 makes $top a
                 # TOTAL-RESULT limit — the exact trap the pagination docs call out
@@ -8561,6 +8607,42 @@ def register_lakeflow_source(spark):
             if offset:
                 return records, offset
             return records, {**offset, "snapshot_done": True}
+
+        def _delta_offset_shape_gate(
+            self, table_name: str, table_options: dict | None, offset: dict
+        ) -> bool:
+            """The offset-shape check ahead of the delta predicate, both ways.
+
+            Returns True when the offset is delta-shaped (carries a
+            ``delta_link``/``next_link``), so a resumed delta stream takes the
+            delta path even if ``delta_tracking`` is no longer set in options.
+
+            The REVERSE shape check runs as a side effect: under ``auto``, a
+            non-empty fallback-shaped offset (``snapshot_done`` / ``cursor``, no
+            delta link) proves earlier batches of THIS stream ran the
+            cursor/snapshot shape against the setup-frozen schema. If the first
+            batch's probe was transient, nothing was stamped (``delta_ok`` rides
+            definitive verdicts only) and a later re-probe coming back TRUE would
+            flip the stream ONTO the delta path mid-stream — emitting
+            ``_deleted``/``_lc_sequence`` columns the frozen schema never
+            declared; the framework parser drops undeclared columns silently, so
+            a delta tombstone MERGEs as a live row. So the fallback is pinned for
+            the checkpoint's lifetime: the instance verdict makes
+            ``_delta_active_for`` skip the re-probe, and ``_stamp_delta_verdict``
+            persists ``delta_ok: false`` into the outgoing offset. Deliberately
+            NOT written to the shared process/file cache — the pin is evidence
+            about this checkpoint's frozen schema, not about the server.
+            Cursor-configured tables are exempt (cursor wins deterministically —
+            they never probe, so there is no flip to pin against)."""
+            if "delta_link" in offset or "next_link" in offset:
+                return True
+            if (
+                offset
+                and not (table_options or {}).get("cursor_field")
+                and self._delta_setting(table_options) == "auto"
+            ):
+                self._delta_capable[self._delta_cache_key(table_name, table_options)] = False
+            return False
 
         def _stamp_delta_verdict(
             self, result: tuple, table_name: str, table_options: dict | None
@@ -10151,9 +10233,7 @@ def register_lakeflow_source(spark):
                             _pg_strip_positional(url), "$skip", str(base_skip + fetched)
                         )
                 else:
-                    nxt = _pg_set_query(
-                        _pg_strip_positional(url), "$skip", str(base_skip + fetched)
-                    )
+                    nxt = _pg_set_query(_pg_strip_positional(url), "$skip", str(base_skip + fetched))
                 yield page_rows, nxt
                 cur_url = nxt
 
@@ -10696,7 +10776,19 @@ def register_lakeflow_source(spark):
                 for pair in extra_headers.split(","):
                     if ":" in pair:
                         k, v = pair.split(":", 1)
-                        session.headers[k.strip()] = v.strip()
+                        k = k.strip()
+                        # Same RFC 7230 token check as ``api_key_header`` below:
+                        # http.client's send-time regex tolerates interior spaces,
+                        # so a malformed name would otherwise go out on the wire
+                        # as-is and fail at a strict server/proxy with nothing
+                        # pointing at this option.
+                        if not re.fullmatch(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+", k):
+                            raise ValueError(
+                                f"Invalid header name {k!r} in extra_headers: not "
+                                f"a valid HTTP header name (letters, digits, and "
+                                f"!#$%&'*+-.^_`|~ only, no spaces)."
+                            )
+                        session.headers[k] = v.strip()
 
             auth_type = (self.options.get("auth_type") or "").lower().strip()
             if not auth_type and self.options.get("token"):
@@ -12042,9 +12134,14 @@ def register_lakeflow_source(spark):
     _max_or = max_or
     _parse_max_records = parse_max_records
     _trim_to_distinct_cursor_boundary = trim_to_distinct_cursor_boundary
+    _url_origin = url_origin
+    _DELETED_COL = DELETED_COL
+    _SEQUENCE_COL = SEQUENCE_COL
     _cursor_le = cursor_le
     _jsonify_complex_values = jsonify_complex_values
     _max_or = max_or
+    _DELETED_COL = DELETED_COL
+    _SEQUENCE_COL = SEQUENCE_COL
     _cursor_le = cursor_le
     _cursor_max = cursor_max
     _jsonify_complex_values = jsonify_complex_values
@@ -12053,6 +12150,7 @@ def register_lakeflow_source(spark):
     _parse_iso8601 = parse_iso8601
     _parse_max_records = parse_max_records
     _trim_to_distinct_cursor_boundary = trim_to_distinct_cursor_boundary
+    _url_origin = url_origin
     _CONTAINED_PATH_SEP = CONTAINED_PATH_SEP
     _DEFAULT_PAGE_SIZE = DEFAULT_PAGE_SIZE
     _combine_filters = combine_filters

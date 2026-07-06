@@ -64,6 +64,8 @@ from databricks.labs.community_connector.sources.odata._contained import (
     validate_page_size,
 )
 from databricks.labs.community_connector.sources.odata._helpers import (
+    DELETED_COL as _DELETED_COL,
+    SEQUENCE_COL as _SEQUENCE_COL,
     cursor_le as _cursor_le,
     jsonify_complex_values as _jsonify_complex_values,
     max_or as _max_or,
@@ -357,7 +359,13 @@ class PartitionMixin(SupportsPartitionedStream):
         # ``get_table_schema`` rebuilds from memoized parts — no I/O after
         # the first call.
         field_names = tuple(f.name for f in self.get_table_schema(table_name, opts).fields)
-        never_pad = frozenset(self._primary_keys_for(table_name, opts.get("namespace")) or ())
+        # The delta synthetics are exempt too, mirroring read_table — today a
+        # partitioned schema never declares them (delta != disabled forces the
+        # serial fallback), so this only keeps the emit-boundary rule uniform.
+        never_pad = frozenset(self._primary_keys_for(table_name, opts.get("namespace")) or ()) | {
+            _DELETED_COL,
+            _SEQUENCE_COL,
+        }
 
         def _emit(row):
             return _jsonify_complex_values(pad_row_to_fields(row, field_names, never_pad))
