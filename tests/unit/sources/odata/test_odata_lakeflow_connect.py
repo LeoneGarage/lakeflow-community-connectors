@@ -17602,3 +17602,116 @@ def test_capability_cache_cap_survives_concurrent_first_touch():
     assert errors == []
     assert len(_CAPABILITY_CACHE) == _CAPABILITY_CACHE_MAX_SERVICES
     _clear_capability_cache()
+
+
+# ---------------------------------------------------------------------------
+# Round 48 — period-N pagination cycle guard, capability memo-race gate
+# ---------------------------------------------------------------------------
+
+
+@responses.activate
+def test_pagination_period2_nextlink_cycle_stops(caplog):
+    """A server/proxy alternating skiptokens (tokA->tokB->tokA...) yields
+    pages whose consecutive fingerprints AND links both differ, so the
+    period-1 guards (prev_fp / self-referential link) never fire and the
+    walk loops forever (OOM in batch mode, non-advancing stream otherwise).
+    The bounded URL-repeat guard now stops it. Covers both the default
+    `auto` and explicit `nextlink` modes."""
+    calls = {"n": 0}
+
+    def _cb(request):
+        calls["n"] += 1
+        from urllib.parse import parse_qs, unquote, urlparse
+
+        tok = unquote(parse_qs(urlparse(request.url).query).get("$skiptoken", ["start"])[0])
+        nxt = {"start": "tokA", "tokA": "tokB", "tokB": "tokA"}[tok]
+        row = {"start": 1, "tokA": 2, "tokB": 3}[tok]
+        return (
+            200,
+            {},
+            json.dumps(
+                {"value": [{"Id": row}], "@odata.nextLink": f"{SERVICE_URL}T?$top=1&$skiptoken={nxt}"}
+            ),
+        )
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}T", callback=_cb)
+    for mode in ("auto", "nextlink"):
+        calls["n"] = 0
+        c = _make()
+        c._pagination = mode
+        with caplog.at_level(logging.WARNING):
+            rows = []
+            for page_rows, _nxt in c._fetch_pages_with_links(f"{SERVICE_URL}T?$top=1&$orderby=Id asc"):
+                rows.extend(page_rows)
+                assert len(rows) < 50, f"{mode}: cycle guard did not stop the walk"
+        assert "continuation URL repeated" in caplog.text
+        # The guard fires within the bounded window, not after 50+ fetches.
+        assert calls["n"] < 20
+
+
+@responses.activate
+def test_pagination_long_distinct_walk_not_false_flagged():
+    """A legitimate long walk (all-distinct continuation URLs) must not
+    trip the cycle guard — the window slides, never false-positives."""
+    def _cb(request):
+        from urllib.parse import parse_qs, unquote, urlparse
+
+        i = int(unquote(parse_qs(urlparse(request.url).query).get("$skiptoken", ["0"])[0]))
+        if i >= 30:
+            return (200, {}, json.dumps({"value": [{"Id": i}]}))  # no next link — done
+        return (
+            200,
+            {},
+            json.dumps(
+                {"value": [{"Id": i}], "@odata.nextLink": f"{SERVICE_URL}T?$top=1&$skiptoken={i + 1}"}
+            ),
+        )
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}T", callback=_cb)
+    c = _make()
+    c._pagination = "nextlink"
+    rows = []
+    for page_rows, _nxt in c._fetch_pages_with_links(f"{SERVICE_URL}T?$top=1&$skiptoken=0"):
+        rows.extend(page_rows)
+    assert [r["Id"] for r in rows] == list(range(31))  # 0..30, no premature stop
+
+
+def test_page_cycle_guard_bounded_window():
+    """The guard's memory is bounded: a cycle whose period exceeds the
+    window escapes (documented trade), but distinct URLs past the window
+    are forgotten so a legit walk never grows unboundedly."""
+    from databricks.labs.community_connector.sources.odata.odata import _PageCycleGuard
+
+    g = _PageCycleGuard()
+    assert g.seen_before("u0") is False
+    assert g.seen_before("u0") is True  # immediate repeat caught
+    g2 = _PageCycleGuard()
+    for i in range(_PageCycleGuard._WINDOW + 10):
+        assert g2.seen_before(f"u{i}") is False  # all distinct — never flagged
+    assert len(g2._seen) == _PageCycleGuard._WINDOW  # bounded
+    assert g2.seen_before("u0") is False  # evicted from the window — forgotten
+
+
+def test_capability_flush_skips_memo_for_evicted_service():
+    """A store whose service was concurrently evicted must NOT re-plant an
+    orphaned mtime memo: that would leak the memo AND make the next load
+    short-circuit past the on-disk verdict (a redundant re-probe). The memo
+    write is now gated on live cache membership."""
+    from databricks.labs.community_connector.sources.odata.odata import (
+        _CAPABILITY_CACHE,
+        _CAPABILITY_DISK_MTIME,
+        _capability_cache_flush,
+        _capability_cache_path,
+        _clear_capability_cache,
+    )
+
+    _clear_capability_cache()
+    svc = "https://flush-r48.example.com/odata/"
+    path = _capability_cache_path(svc)
+    # Service NOT in the cache (simulating an eviction between load and flush).
+    _capability_cache_flush(svc, json.dumps({"batch_ok": True}))
+    try:
+        assert os.path.exists(path)  # the file is still written (disk authoritative)
+        assert path not in _CAPABILITY_DISK_MTIME  # but no orphaned memo planted
+    finally:
+        _clear_capability_cache()

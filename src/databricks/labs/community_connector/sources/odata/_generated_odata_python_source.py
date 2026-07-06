@@ -15,6 +15,7 @@ from datetime import (
 )
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterator, Sequence
+import collections
 import itertools
 import json
 import os
@@ -7754,6 +7755,39 @@ def register_lakeflow_source(spark):
     _LOG = logging.getLogger(__name__)
 
 
+    class _PageCycleGuard:
+        """Bounded-window repeat detector for pagination continuation URLs.
+
+        The per-page guards (identical consecutive fingerprint, self-referential
+        link) catch only a PERIOD-1 cycle. A server or caching proxy that
+        ALTERNATES skiptokens (``tokA → tokB → tokA → …``) yields pages whose
+        consecutive fingerprints AND links both differ every step, so only
+        revisiting a URL reveals the loop — otherwise the walk runs forever
+        (OOM under the uncapped batch reader; a never-advancing stream under the
+        microbatch reader). Continuation URLs are strictly forward (each
+        skiptoken/seek advances), so ANY repeat is a spurious cycle. Tracks the
+        last ``_WINDOW`` fetched URLs — bounded so a legitimate long walk (all
+        distinct URLs) never grows unboundedly or false-positives; a real cyclic
+        server alternates only a handful of tokens, caught well within the
+        window."""
+
+        _WINDOW = 512
+
+        def __init__(self):
+            self._seen: set[str] = set()
+            self._order: "collections.deque[str]" = collections.deque()
+
+        def seen_before(self, url: str) -> bool:
+            """Record ``url`` and return whether it was already in the window."""
+            if url in self._seen:
+                return True
+            self._seen.add(url)
+            self._order.append(url)
+            if len(self._order) > self._WINDOW:
+                self._seen.discard(self._order.popleft())
+            return False
+
+
     def _cache_owner_tag() -> str:
         """Per-user tag baked into every tempdir cache filename. The system
         tempdir is world-writable on multi-user hosts and both cache paths are
@@ -7977,9 +8011,20 @@ def register_lakeflow_source(spark):
         if not _replace_with_private_tmp(path, payload.encode("utf-8")):
             return
         try:
-            _CAPABILITY_DISK_MTIME[path] = os.path.getmtime(path)
+            mtime = os.path.getmtime(path)
         except OSError:
-            pass
+            return
+        # Plant the "already merged" memo ONLY while the service is still live in
+        # the cache — under the lock so a concurrent eviction can't interleave.
+        # If the service was evicted in the load->flush window, skip the memo: an
+        # orphaned memo would leak (eviction only reclaims memos it pops) AND make
+        # the next load short-circuit past this on-disk verdict (a redundant
+        # re-probe). Skipping it lets that next load re-read + merge the file
+        # instead. The in-memory copy — when present — is authoritative, so not
+        # re-reading our own write stays the fast path.
+        with _CAPABILITY_LOCK:
+            if service_url in _CAPABILITY_CACHE:
+                _CAPABILITY_DISK_MTIME[path] = mtime
 
 
     def _capability_cache_evict_locked(keep_url: str) -> None:
@@ -10376,6 +10421,44 @@ def register_lakeflow_source(spark):
                 )
             return raw
 
+        @staticmethod
+        def _page_fp_repeated(prev_fp, fp, page_rows: list, url: str, mode: str) -> bool:
+            """Period-1 no-progress check shared by both pagination loops: a
+            non-empty page whose raw-item fingerprint equals the previous page's
+            (server ignoring the seek/$skip, or a cyclic link handing back the
+            same rows). Logs the actionable warning and returns True to stop.
+            Complements :meth:`_page_url_cycled` — this catches SAME-page /
+            advancing-token, that catches REPEATED-url / alternating-token."""
+            if page_rows and prev_fp is not None and fp == prev_fp:
+                _LOG.warning(
+                    "pagination=%s made no progress on %r: an identical page came back "
+                    "(server ignoring the seek/$skip, or a cyclic @odata.nextLink). "
+                    "Stopping to avoid an infinite loop; some rows may be unread. Use "
+                    "pagination=nextlink if the server pages correctly.",
+                    mode,
+                    url,
+                )
+                return True
+            return False
+
+        @staticmethod
+        def _page_url_cycled(guard: "_PageCycleGuard", url: str, mode: str) -> bool:
+            """Bounded-window continuation-URL repeat check shared by both
+            pagination loops: logs the actionable warning and returns True when
+            ``url`` has already been fetched this drain (a period-N token cycle
+            the per-page fingerprint / self-reference guards miss). See
+            :class:`_PageCycleGuard`."""
+            if guard.seen_before(url):
+                _LOG.warning(
+                    "pagination=%s made no progress on %r: a continuation URL repeated "
+                    "(the server is cycling @odata.nextLink/seek tokens). Stopping to "
+                    "avoid an infinite loop; some rows may be unread.",
+                    mode,
+                    url,
+                )
+                return True
+            return False
+
         def _fetch_pages_with_links(
             self, url: str, edm_types: dict[str, str] | None = None
         ) -> Iterator[tuple[list[dict], str | None]]:
@@ -10405,12 +10488,17 @@ def register_lakeflow_source(spark):
                 return
             session = self._get_session()
             next_url: str | None = url
-            # No-progress guard: a server that hands back a self-referential or
+            # No-progress guards: a server that hands back a self-referential or
             # cyclic ``@odata.nextLink`` would loop forever. Stop if the resolved
             # link points back at the URL we just fetched, or if a non-empty page
-            # repeats the one before it.
+            # repeats the one before it (period-1) — or if ANY continuation URL
+            # repeats within a bounded window (period-N alternation, which the
+            # per-page checks miss). See :class:`_PageCycleGuard`.
             prev_fp: int | None = None
+            cycle = _PageCycleGuard()
             while next_url:
+                if self._page_url_cycled(cycle, next_url, "nextlink"):
+                    return
                 resp, payload = self._fetch_page_payload(session, next_url)
                 raw_items = payload.get("value") or []  # `or`: tolerate a spec-invalid null
                 page_rows = [
@@ -10419,14 +10507,7 @@ def register_lakeflow_source(spark):
                 # Raw pre-strip fingerprint — see _client_paginate_pages for why
                 # (identical projected pages must not false-positive the guard).
                 fp = _pg_page_fingerprint(raw_items)
-                if page_rows and prev_fp is not None and fp == prev_fp:
-                    _LOG.warning(
-                        "pagination=nextlink made no progress on %r: the server "
-                        "returned an identical page (cyclic @odata.nextLink). "
-                        "Stopping to avoid an infinite loop; some rows may be "
-                        "unread.",
-                        next_url,
-                    )
+                if self._page_fp_repeated(prev_fp, fp, page_rows, next_url, "nextlink"):
                     return
                 prev_fp = fp
                 raw_next = payload.get("@odata.nextLink")
@@ -10565,6 +10646,11 @@ def register_lakeflow_source(spark):
             # repeats the previous one — those rows were already emitted, so the
             # duplicate is dropped rather than re-yielded.
             prev_fp: int | None = None
+            # Period-N backstop (see _PageCycleGuard): the fingerprint guard below
+            # catches a server ignoring the seek (same page, advancing token); this
+            # catches a server CYCLING continuation URLs (alternating tokens), which
+            # the fingerprint misses because the alternating pages differ.
+            cycle = _PageCycleGuard()
             # ``auto`` only: did the server emit an @odata.nextLink at any point in
             # this walk? A server either drives pagination via the link or it
             # doesn't — mixing isn't a real pattern. So once we've seen a link, a
@@ -10576,6 +10662,8 @@ def register_lakeflow_source(spark):
             # request while still draining link-omitting servers fully.
             saw_next_link = False
             while cur_url is not None:
+                if self._page_url_cycled(cycle, cur_url, mode):
+                    return
                 resp, payload = self._fetch_page_payload(session, cur_url)
                 raw_items = payload.get("value") or []  # `or`: tolerate a spec-invalid null
                 page_rows = [
@@ -10588,16 +10676,7 @@ def register_lakeflow_source(spark):
                 # Per-entity annotations (@odata.id / etag) disambiguate for free
                 # where the server emits them.
                 fp = _pg_page_fingerprint(raw_items)
-                if page_rows and prev_fp is not None and fp == prev_fp:
-                    _LOG.warning(
-                        "pagination=%s made no progress on %r: an identical page "
-                        "came back (server ignoring the seek/$skip, or a cyclic "
-                        "@odata.nextLink). Stopping this collection to avoid an "
-                        "infinite loop; some rows may be unread. Use "
-                        "pagination=nextlink if the server pages correctly.",
-                        mode,
-                        cur_url,
-                    )
+                if self._page_fp_repeated(prev_fp, fp, page_rows, cur_url, mode):
                     return
                 prev_fp = fp
                 fetched += len(page_rows)
