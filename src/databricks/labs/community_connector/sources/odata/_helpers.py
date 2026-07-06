@@ -107,14 +107,22 @@ def cursor_newer(a: Any, b: Any) -> bool:
         try:
             return a > b
         except TypeError:
-            # Truly incomparable pair (str vs int — an IEEE754Compatible
-            # server rendering one Int64 value as 5000 and "5000" across
-            # requests). Arbitrary-but-consistent False, matching
-            # ``_chain_strictly_before``'s documented incomparable-pairs
-            # posture: degrade duplicate-safe, never raise out of a
-            # watermark fold. (``cursor_same_instant`` recognizes the
-            # numeric-string ≡ number case so park resume still makes
-            # progress.)
+            # Incomparable raw pair (str vs int — an IEEE754Compatible
+            # server rendering one Int64 cursor as 5000 and "5000"). A
+            # NUMERIC pair still orders truly via exact Decimal: without
+            # this bridge, a server that PERMANENTLY switches int→string
+            # rendering (gateway upgrade) against an int-typed checkpoint
+            # makes cursor_le(new_row, since) read True for genuinely
+            # NEWER rows — the client-side re-filter then drops every
+            # returned row and the stream silently stalls forever with
+            # data pending (a flat False here is duplicate-safe for the
+            # watermark fold but NOT for the re-filter). Non-numeric
+            # incomparable pairs keep the arbitrary-but-consistent False,
+            # matching ``_chain_strictly_before``'s documented posture:
+            # degrade duplicate-safe, never raise out of a fold.
+            num_a, num_b = _as_exact_number(a), _as_exact_number(b)
+            if num_a is not None and num_b is not None:
+                return num_a > num_b
             return False
     if a == b:
         return False

@@ -164,7 +164,7 @@ _NS_EDMX = "{http://docs.oasis-open.org/odata/ns/edmx}"
 _NS_EDM = "{http://docs.oasis-open.org/odata/ns/edm}"
 
 
-def _spark_type_for_property(prop):
+def _spark_type_for_property(prop, edm_type: str | None = None):
     """Spark type for one CSDL ``<Property>`` element: the static EDM map,
     except ``Edm.Decimal``, which honours the declared ``Precision`` /
     ``Scale`` facets (a hardcoded ``DecimalType(38, 18)`` leaves only 20
@@ -178,8 +178,16 @@ def _spark_type_for_property(prop):
     * ``Scale`` absent with ``Precision`` declared — scale 0 (the CSDL
       default);
     * values clamped to Spark's 38-digit maximum with
-      ``scale <= precision``."""
-    edm_type = prop.get("Type", "Edm.String")
+      ``scale <= precision``.
+
+    ``edm_type`` (when given) overrides the element's raw ``Type`` — the
+    caller passes the ``TypeDefinition``-resolved underlying primitive so a
+    property typed ``ta.Qty`` (UnderlyingType ``Edm.Int64``) maps to
+    ``LongType`` instead of falling to the ``StringType`` default while the
+    literal-rendering map correctly knows it's numeric. A Decimal-backed
+    definition still gets the wide ``(38, 18)`` default (its facets live on
+    the TypeDefinition element, which isn't threaded here)."""
+    edm_type = edm_type or prop.get("Type", "Edm.String")
     if edm_type != "Edm.Decimal":
         return _EDM_TO_SPARK.get(edm_type, StringType())
     raw_precision = prop.get("Precision")
@@ -1639,8 +1647,9 @@ class ODataLakeflowConnect(
         quiesce shape the wrapper accepts. The marker check runs BEFORE the
         read, so idle triggers cost zero HTTP. Batch mode (``start_offset is
         None`` — offset discarded) passes through untouched. Restart
-        semantics keep the documented intent: a fresh checkpoint re-reads
-        once, then quiesces until restarted. Compat-safe: this shape
+        semantics: a FRESH checkpoint re-reads once, then quiesces; a
+        checkpoint-preserving restart stays quiesced (the marker persists
+        in the checkpoint — a full refresh re-snapshots). Compat-safe: this shape
         previously CRASHED on its first or second trigger, so no working
         checkpoint carries a bare ``{}``.
 
@@ -2214,6 +2223,7 @@ class ODataLakeflowConnect(
         tombstone: bool | None = None,
         key_types: dict[str, str] | None = None,
         pad_fields: frozenset | None = None,
+        entity_set: str | None = None,
     ) -> dict:
         """Translate one delta payload entry into the emitted record shape.
 
@@ -2243,7 +2253,9 @@ class ODataLakeflowConnect(
             if any(v is None for v in record.values()):
                 id_text = item.get("@odata.id") or item.get("id")
                 from_id = (
-                    self._tombstone_keys_from_id(id_text, primary_keys, key_types)
+                    self._tombstone_keys_from_id(
+                        id_text, primary_keys, key_types, entity_set=entity_set
+                    )
                     if isinstance(id_text, str)
                     else None
                 )
@@ -2266,7 +2278,11 @@ class ODataLakeflowConnect(
                 record.setdefault(name, None)
             record[_DELETED_COL] = True
         else:
-            record = {k: v for k, v in item.items() if not k.startswith("@odata.")}
+            # Strip control information: bare annotations (``@odata.type``)
+            # AND property-scoped ones (``Prop@odata.type``) — the OData JSON
+            # format spells all control info with ``@``, and property names
+            # (CSDL SimpleIdentifiers) can never contain it.
+            record = {k: v for k, v in item.items() if "@" not in k}
             record[_DELETED_COL] = False
         record[_SEQUENCE_COL] = _next_sequence()
         return record
@@ -2276,6 +2292,7 @@ class ODataLakeflowConnect(
         id_text: str,
         primary_keys: list[str],
         key_types: dict[str, str] | None,
+        entity_set: str | None = None,
     ) -> dict | None:
         """Parse PK values out of a tombstone's entity reference — the
         inverse of ``_format_key_predicate``, for ids like
@@ -2283,7 +2300,15 @@ class ODataLakeflowConnect(
         absolute URL. Returns ``None`` when no key predicate is found or the
         shape doesn't match the PK list; values are coerced by declared Edm
         type (quoted strings un-escaped, numerics parsed) so the emitted
-        tombstone MERGE-matches the upserts' JSON-decoded values."""
+        tombstone MERGE-matches the upserts' JSON-decoded values.
+
+        When ``entity_set`` is given, the reference's collection segment must
+        NAME that set (exact, or as a dotted suffix for container-qualified
+        forms): a cross-set reference (``…/Suppliers(77)`` in a ``Customers``
+        feed — spec-unreachable, but the failure mode is a DELETE applied to
+        the wrong key, the worst destination-corruption class) is treated as
+        unresolvable, so the caller's loud keyless-tombstone raise fires
+        instead of a silent misapplied delete."""
         path = id_text.split("?", 1)[0].split("#", 1)[0].rstrip("/")
         seg = path.rsplit("/", 1)[-1]
         if "%" in seg:
@@ -2291,6 +2316,10 @@ class ODataLakeflowConnect(
         open_idx = seg.find("(")
         if open_idx < 0 or not seg.endswith(")"):
             return None
+        if entity_set:
+            coll = seg[:open_idx]
+            if coll != entity_set and not coll.endswith(f".{entity_set}"):
+                return None
         parts = _split_key_predicate(seg[open_idx + 1 : -1])
         if not parts:
             return None
@@ -2472,9 +2501,11 @@ class ODataLakeflowConnect(
             raise RuntimeError(
                 f"OData server did not honor 'Prefer: odata.track-changes' "
                 f"for {table_name!r} (response missing 'Preference-Applied' "
-                f"header). The probe in delta_tracking=auto should have "
-                f"caught this — your service may have inconsistent support. "
-                f"Set delta_tracking=disabled and use cursor-based "
+                f"header). Under delta_tracking=auto this means the probe's "
+                f"acknowledgement was inconsistent (a flapping load "
+                f"balancer?); under delta_tracking=enabled the server simply "
+                f"doesn't support change tracking for this entity set. Set "
+                f"delta_tracking=disabled (or auto) and use cursor-based "
                 f"incremental instead."
             )
 
@@ -2526,6 +2557,22 @@ class ODataLakeflowConnect(
                     f"{item!r}."
                 )
             context = str(item.get("@odata.context", "")).lower()
+            if context.endswith("/$link") or context.endswith("/$deletedlink"):
+                # v4.01 relationship-change entries (added/deleted LINKS,
+                # carrying source/relationship/target — not entity rows).
+                # This connector never ingests navigation properties on the
+                # delta path, so relationship changes can't affect emitted
+                # rows — skip them. Without this they fell into the regular-
+                # entity branch and died in the sparse-entity guard with a
+                # misleading "missing properties" diagnosis, blocking delta
+                # entirely against servers that report link changes.
+                _LOG.debug(
+                    "OData delta for %r: skipping relationship-change entry "
+                    "(context %r) — navigation properties are not ingested.",
+                    table_name,
+                    item.get("@odata.context"),
+                )
+                continue
             is_tombstone = "@removed" in item or "$deletedentity" in context
             if not is_tombstone:
                 self._check_no_sparse_entity(item, table_name, expected_fields)
@@ -2536,6 +2583,7 @@ class ODataLakeflowConnect(
                     tombstone=is_tombstone,
                     key_types=key_types,
                     pad_fields=expected_fields,
+                    entity_set=table_name,
                 )
             )
 
@@ -2576,6 +2624,14 @@ class ODataLakeflowConnect(
 
         if raw_delta:
             new_delta_link = urljoin(resp_url, raw_delta)
+            if raw_next:
+                # Spec-violating page carrying BOTH links (they're mutually
+                # exclusive per page). Prefer the continuation — stopping at
+                # the deltaLink would silently drop every trailing page's
+                # rows (absent until they next change, which the committed
+                # delta cursor may consider already delivered) — and retain
+                # the deltaLink like the cap-hit branch above does.
+                return urljoin(resp_url, raw_next), new_delta_link, carry_next_link
             return None, new_delta_link, carry_next_link
         if raw_next:
             return urljoin(resp_url, raw_next), new_delta_link, carry_next_link
@@ -4369,7 +4425,17 @@ class ODataLakeflowConnect(
                 fields.append(
                     StructField(
                         name,
-                        _spark_type_for_property(prop),
+                        # TypeDefinition-resolved: a property typed ``ta.Qty``
+                        # (UnderlyingType Edm.Int64) must map to LongType, not
+                        # the StringType fallback — the literal-rendering map
+                        # already resolves the same way, and a split verdict
+                        # silently degrades every TypeDefinition-backed column
+                        # (SAP uses them in production) to a string at the
+                        # destination.
+                        _spark_type_for_property(
+                            prop,
+                            self._resolve_underlying_type(prop.get("Type", "Edm.String")),
+                        ),
                         nullable,
                     )
                 )
@@ -4418,6 +4484,22 @@ class ODataLakeflowConnect(
             key = type_el.find(f"{_NS_EDM}Key")
             if key is not None:
                 result = [ref.get("Name") for ref in key.findall(f"{_NS_EDM}PropertyRef")]
+                if any("/" in (name or "") for name in result):
+                    # Complex-path key (<PropertyRef Name="Info/Code"
+                    # Alias="IC"/>). Neither the raw path NOR the alias is a
+                    # column the emitted rows carry (the value sits nested
+                    # inside the complex property's JSON), so reporting
+                    # either hands the destination a MERGE key no column
+                    # matches — a silent contract desync. No mainstream
+                    # service uses this key form; fail loudly and honestly.
+                    raise ValueError(
+                        f"Entity type {et.get('Name')!r} keys on a property "
+                        f"inside a complex type ({[n for n in result if '/' in (n or '')]}); "
+                        f"this connector maps complex properties to JSON "
+                        f"strings and cannot address or MERGE on nested "
+                        f"keys. Ingest a different entity set, or expose a "
+                        f"flattened key on the server."
+                    )
                 break
         state.own_pks[cache_key] = result
         return result

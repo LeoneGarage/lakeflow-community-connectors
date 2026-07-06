@@ -978,6 +978,23 @@ class ContainedNavMixin:
             for nav_name, target_ref in self._all_contained_nav_props(et):
                 if target_ref in seen:
                     continue
+                if CONTAINED_PATH_SEP in nav_name:
+                    # A nav property whose NAME contains the path separator
+                    # ("My__Kids" — CSDL SimpleIdentifiers legally allow
+                    # consecutive underscores) would list as a table name
+                    # the read path's ``__``-splitting can never resolve
+                    # back (declared-flat-set longest-prefix matching covers
+                    # entity SETS only, not nav-prop names). Emitting it
+                    # breaks the discovery→read round trip: skip with a
+                    # warning instead of listing an unreadable table.
+                    _LOG.warning(
+                        "Skipping contained collection %r under %r: navigation-"
+                        "property names containing '__' cannot be addressed by "
+                        "this connector's path syntax.",
+                        nav_name,
+                        CONTAINED_PATH_SEP.join(segments),
+                    )
+                    continue
                 target_et = self._resolve_type_ref(target_ref)
                 if target_et is None:
                     continue

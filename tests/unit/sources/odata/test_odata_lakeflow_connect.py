@@ -16204,3 +16204,270 @@ def test_select_strips_to_empty_omits_param():
     # Defense-in-depth at the URL builder (other callers bypass validation).
     assert "$select" not in c._format_query_params({"select": ", ,"})
     assert "$select=Id" in c._format_query_params({"select": " Id ,"})
+
+
+# ---------------------------------------------------------------------------
+# Round 40 — mixed-type cursor ordering bridge, delta wire-shape hardening,
+# CSDL TypeDefinition/complex-key/__-nav resolution
+# ---------------------------------------------------------------------------
+
+R40_TYPEDEF_METADATA = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="ta" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <TypeDefinition Name="Qty64" UnderlyingType="Edm.Int64"/>
+      <TypeDefinition Name="When" UnderlyingType="Edm.DateTimeOffset"/>
+      <EntityType Name="Item">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="Qty" Type="ta.Qty64"/>
+        <Property Name="At" Type="ta.When"/>
+      </EntityType>
+      <EntityContainer Name="C"><EntitySet Name="Items" EntityType="ta.Item"/></EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+R40_PATHKEY_METADATA = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="pk" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <ComplexType Name="Info"><Property Name="Code" Type="Edm.String"/></ComplexType>
+      <EntityType Name="Thing">
+        <Key><PropertyRef Name="Info/Code" Alias="IC"/></Key>
+        <Property Name="Info" Type="pk.Info"/>
+        <Property Name="Label" Type="Edm.String"/>
+      </EntityType>
+      <EntityContainer Name="C"><EntitySet Name="Things" EntityType="pk.Thing"/></EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+R40_DUNDER_NAV_METADATA = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="dn" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Parent">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <NavigationProperty Name="My__Kids" Type="Collection(dn.Kid)" ContainsTarget="true"/>
+        <NavigationProperty Name="Pets" Type="Collection(dn.Kid)" ContainsTarget="true"/>
+      </EntityType>
+      <EntityType Name="Kid">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+      </EntityType>
+      <EntityContainer Name="C"><EntitySet Name="Parents" EntityType="dn.Parent"/></EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+
+def test_cursor_ordering_numeric_string_bridge():
+    """Mixed numeric renderings order TRULY (exact Decimal), not as a flat
+    tie: a server that permanently switches an Int64 cursor to string
+    rendering against an int checkpoint made cursor_le(new_row, since) read
+    True for genuinely newer rows — the client re-filter dropped every
+    returned row and the stream silently stalled with data pending."""
+    from databricks.labs.community_connector.sources.odata._helpers import (
+        cursor_le,
+        cursor_max,
+        cursor_newer,
+    )
+
+    assert cursor_newer("6000", 5000) is True
+    assert cursor_newer(5000, "6000") is False
+    assert cursor_le("6000", 5000) is False  # the stall's exact predicate
+    assert cursor_le("4000", 5000) is True
+    assert cursor_max([5000, "6000", 4000]) == "6000"
+    # Non-numeric incomparable pairs keep the consistent-False posture.
+    assert cursor_newer("abc", 5000) is False and cursor_newer(5000, "abc") is False
+
+
+@responses.activate
+def test_flat_cursor_survives_permanent_int_to_string_rendering_switch():
+    """End-to-end: int checkpoint {"cursor": 5000} + a server now rendering
+    the cursor as strings — rows must emit and the watermark must advance
+    (pre-fix: every batch dropped all rows client-side, offset frozen)."""
+    _mock_metadata()
+    responses.get(
+        f"{SERVICE_URL}Customers",
+        json={
+            "value": [
+                {"Id": 7, "Name": "N", "ModifiedAt": "6000"},
+                {"Id": 8, "Name": "M", "ModifiedAt": "7000"},
+            ]
+        },
+        match_querystring=False,
+    )
+    c = _make({"token": "t"})
+    rows, offset = c.read_table(
+        "Customers", {"cursor": 5000}, {"cursor_field": "ModifiedAt", "pagination": "nextlink"}
+    )
+    # Row 8 is the designed same-cursor boundary trim (re-fetched next batch
+    # via gt "6000"); the stall signature was ZERO rows and a frozen cursor.
+    assert [r["Id"] for r in rows] == [7]
+    assert offset["cursor"] == "6000"
+
+
+@responses.activate
+def test_delta_page_with_both_links_continues_to_next_page():
+    """A spec-violating page carrying BOTH @odata.nextLink and
+    @odata.deltaLink must follow the continuation (stopping at the deltaLink
+    silently dropped every trailing page) while retaining the deltaLink."""
+    _mock_metadata()
+    page2_url = f"{SERVICE_URL}Customers?$skiptoken=p2"
+    call_n = {"n": 0}
+
+    def _cb(request):
+        call_n["n"] += 1
+        if "skiptoken=p2" in request.url:
+            return (
+                200,
+                {"Preference-Applied": "odata.track-changes"},
+                json.dumps(
+                    _delta_bootstrap_body(
+                        [{"Id": 2, "Name": "B", "ModifiedAt": "y"}],
+                        delta_link=f"{SERVICE_URL}Customers?$deltatoken=tok-final",
+                    )
+                ),
+            )
+        body = _delta_bootstrap_body(
+            [{"Id": 1, "Name": "A", "ModifiedAt": "x"}], next_link=page2_url
+        )
+        # Both links on page 1 (delta_link default + explicit next_link).
+        return (200, {"Preference-Applied": "odata.track-changes"}, json.dumps(body))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Customers", callback=_cb)
+    c = _make()
+    records, offset = c.read_table("Customers", {}, {"delta_tracking": "enabled"})
+    rows = list(records)
+    assert [r["Id"] for r in rows] == [1, 2]  # page 2 delivered
+    # The terminal page's deltaLink wins.
+    assert offset["delta_link"].endswith("tok-final")
+
+
+@responses.activate
+def test_delta_relationship_link_entries_skipped_not_sparse_error():
+    """v4.01 relationship-change entries ($link / $deletedLink contexts,
+    carrying source/relationship/target) are valid delta shapes — they used
+    to fall into the regular-entity branch and die in the sparse-entity
+    guard with a misleading diagnosis. They're skipped (nav properties are
+    never ingested on this path)."""
+    _mock_metadata()
+    body = _delta_bootstrap_body(
+        [
+            {"Id": 1, "Name": "A", "ModifiedAt": "x"},
+            {
+                "@odata.context": f"{SERVICE_URL}$metadata#Customers/$deletedLink",
+                "source": "Customers(1)",
+                "relationship": "Orders",
+                "target": "Orders(9)",
+            },
+            {
+                "@odata.context": f"{SERVICE_URL}$metadata#Customers/$link",
+                "source": "Customers(1)",
+                "relationship": "Orders",
+                "target": "Orders(10)",
+            },
+        ]
+    )
+    responses.get(
+        f"{SERVICE_URL}Customers",
+        json=body,
+        headers={"Preference-Applied": "odata.track-changes"},
+        match_querystring=False,
+    )
+    c = _make()
+    records, _ = c.read_table("Customers", {}, {"delta_tracking": "enabled"})
+    rows = list(records)
+    assert [r["Id"] for r in rows] == [1]  # link entries skipped, no raise
+
+
+@responses.activate
+def test_delta_cross_set_tombstone_refuses_wrong_key():
+    """A tombstone whose entity reference names a DIFFERENT entity set
+    (…/Suppliers(77) in a Customers feed) must not delete Customers 77 —
+    the reference is treated as unresolvable and the loud keyless-tombstone
+    raise fires. A container-qualified same-set reference still resolves."""
+    _mock_metadata()
+    body = _delta_bootstrap_body(
+        [{"@removed": {"reason": "deleted"}, "@odata.id": f"{SERVICE_URL}Suppliers(77)"}]
+    )
+    responses.get(
+        f"{SERVICE_URL}Customers",
+        json=body,
+        headers={"Preference-Applied": "odata.track-changes"},
+        match_querystring=False,
+    )
+    c = _make()
+    with pytest.raises(RuntimeError, match="no resolvable primary key"):
+        records, _ = c.read_table("Customers", {}, {"delta_tracking": "enabled"})
+        list(records)
+    # Dotted (container-qualified) same-set form still resolves.
+    keys = c._tombstone_keys_from_id(
+        "Container.Customers(5)", ["Id"], {"Id": "Edm.Int32"}, entity_set="Customers"
+    )
+    assert keys == {"Id": 5}
+
+
+@responses.activate
+def test_delta_property_scoped_annotations_stripped():
+    """Prop@odata.type-style property-scoped control info must not survive
+    into emitted records."""
+    _mock_metadata()
+    body = _delta_bootstrap_body(
+        [{"Id": 1, "Name": "A", "Name@odata.type": "#String", "ModifiedAt": "x"}]
+    )
+    responses.get(
+        f"{SERVICE_URL}Customers",
+        json=body,
+        headers={"Preference-Applied": "odata.track-changes"},
+        match_querystring=False,
+    )
+    c = _make()
+    records, _ = c.read_table("Customers", {}, {"delta_tracking": "enabled"})
+    (row,) = list(records)
+    assert "Name@odata.type" not in row and row["Name"] == "A"
+
+
+@responses.activate
+def test_typedef_property_gets_underlying_spark_type():
+    """A TypeDefinition-typed property maps to its underlying primitive's
+    Spark type — it used to fall to StringType while the literal-rendering
+    map correctly resolved Edm.Int64, silently degrading every
+    TypeDefinition-backed column (SAP production shape) to a string."""
+    from pyspark.sql.types import LongType, TimestampType
+
+    responses.get(f"{SERVICE_URL}$metadata", body=R40_TYPEDEF_METADATA, status=200)
+    c = _make({"token": "t"})
+    schema = {f.name: f.dataType for f in c.get_table_schema("Items", {}).fields}
+    assert isinstance(schema["Qty"], LongType)
+    assert isinstance(schema["At"], TimestampType)
+
+
+@responses.activate
+def test_complex_path_key_raises_loudly():
+    """A complex-path key (<PropertyRef Name="Info/Code" Alias="IC"/>) can't
+    be addressed or MERGEd on (neither the path nor the alias is an emitted
+    column) — it used to silently report primary_keys=['Info/Code'], a MERGE
+    key matching no schema column. It now fails loudly and honestly."""
+    responses.get(f"{SERVICE_URL}$metadata", body=R40_PATHKEY_METADATA, status=200)
+    c = _make({"token": "t"})
+    with pytest.raises(ValueError, match="complex type"):
+        c.read_table_metadata("Things", {})
+
+
+@responses.activate
+def test_dunder_nav_property_skipped_in_discovery():
+    """A nav property named with '__' would list as a table the read path
+    can never resolve back (discovery→read round-trip failure). Discovery
+    now skips it with a warning; normal siblings still list."""
+    responses.get(f"{SERVICE_URL}$metadata", body=R40_DUNDER_NAV_METADATA, status=200)
+    c = _make({"token": "t"})
+    tables = c.list_tables()
+    assert "Parents" in tables and "Parents__Pets" in tables
+    assert not any("My__Kids" in t for t in tables)
