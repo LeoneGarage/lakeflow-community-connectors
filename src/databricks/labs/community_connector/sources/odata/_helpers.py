@@ -10,6 +10,7 @@ already mixes both mixins in at class definition time).
 import json
 import re
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 _ISO_FRACTION_RE = re.compile(r"\.(\d+)")
@@ -103,7 +104,18 @@ def cursor_newer(a: Any, b: Any) -> bool:
         if key_b > key_a:
             return False
     except TypeError:
-        return a > b
+        try:
+            return a > b
+        except TypeError:
+            # Truly incomparable pair (str vs int — an IEEE754Compatible
+            # server rendering one Int64 value as 5000 and "5000" across
+            # requests). Arbitrary-but-consistent False, matching
+            # ``_chain_strictly_before``'s documented incomparable-pairs
+            # posture: degrade duplicate-safe, never raise out of a
+            # watermark fold. (``cursor_same_instant`` recognizes the
+            # numeric-string ≡ number case so park resume still makes
+            # progress.)
+            return False
     if a == b:
         return False
     # Exact-key tie with different texts: sub-microsecond digits (or two
@@ -119,17 +131,40 @@ def cursor_newer(a: Any, b: Any) -> bool:
         return False
 
 
-def cursor_same_instant(a: Any, b: Any) -> bool:
-    """Whether ``a`` and ``b`` denote the SAME instant, tolerating rendering
-    differences (``…00Z`` vs ``…00.000Z`` vs ``…00+00:00``).
+def _as_exact_number(value: Any) -> Decimal | None:
+    """``value`` as an exact :class:`Decimal`, or ``None`` when it isn't a
+    number (or a numeric string). Exactness matters: a float round-trip
+    would collapse Int64 cursors beyond 2^53 (``9007199254740993`` vs
+    ``…92``) into one value and mis-report distinct instants as equal."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return Decimal(value)
+    if isinstance(value, float):
+        return Decimal(str(value))
+    if isinstance(value, str):
+        try:
+            dec = Decimal(value.strip())
+        except InvalidOperation:
+            return None
+        return dec if dec.is_finite() else None
+    return None
 
-    Identical values are trivially the same instant. Otherwise both must
-    parse as ISO-8601 (via :func:`cursor_sort_key`) to equal datetimes AND
-    carry equal zero-padded fraction digits — the fraction check restores
-    the sub-microsecond precision ``cursor_sort_key`` truncates, so two
+
+def cursor_same_instant(a: Any, b: Any) -> bool:
+    """Whether ``a`` and ``b`` denote the SAME instant/value, tolerating
+    rendering differences — timestamp forms (``…00Z`` vs ``…00.000Z`` vs
+    ``…00+00:00``) and numeric forms (``5000`` vs ``"5000"``, the
+    IEEE754Compatible string rendering of an Int64/Decimal).
+
+    Identical values are trivially the same instant. ISO-8601-parsing pairs
+    (via :func:`cursor_sort_key`) must reach equal datetimes AND carry equal
+    zero-padded fraction digits — the fraction check restores the
+    sub-microsecond precision ``cursor_sort_key`` truncates, so two
     chronologically distinct 100ns cursors (SQL Server ``datetime2(7)``)
-    never count as the same instant. Anything non-ISO (or mixed-shape)
-    is the same instant only if raw-equal.
+    never count as the same instant. Otherwise a numeric pair compares as
+    exact :class:`Decimal` (see :func:`_as_exact_number`). Anything else is
+    the same instant only if raw-equal.
 
     Used by the ancestor-walk park identity: a parked parent whose cursor
     TEXT changed but instant didn't (a mixed-version load balancer
@@ -140,13 +175,16 @@ def cursor_same_instant(a: Any, b: Any) -> bool:
     if a == b:
         return True
     key_a, key_b = cursor_sort_key(a), cursor_sort_key(b)
-    if not isinstance(key_a, datetime) or not isinstance(key_b, datetime):
-        return False
-    if key_a != key_b:
-        return False
-    frac_a, frac_b = _fraction_digits(a), _fraction_digits(b)
-    width = max(len(frac_a), len(frac_b))
-    return frac_a.ljust(width, "0") == frac_b.ljust(width, "0")
+    if isinstance(key_a, datetime) and isinstance(key_b, datetime):
+        if key_a != key_b:
+            return False
+        frac_a, frac_b = _fraction_digits(a), _fraction_digits(b)
+        width = max(len(frac_a), len(frac_b))
+        return frac_a.ljust(width, "0") == frac_b.ljust(width, "0")
+    num_a, num_b = _as_exact_number(a), _as_exact_number(b)
+    if num_a is not None and num_b is not None:
+        return num_a == num_b
+    return False
 
 
 def cursor_le(a: Any, b: Any) -> bool:

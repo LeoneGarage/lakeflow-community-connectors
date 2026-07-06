@@ -3768,7 +3768,9 @@ def test_pagination_keyset_continues_inner_expand_when_nextlink_omitted():
     )
     rows = list(records)
     assert [r["Id"] for r in rows] == list(range(11, 26))  # all 15, none dropped
-    assert _drop_lb(offset) == {}
+    # Terminal streaming-snapshot offset carries the quiesce marker
+    # (a bare {} crashed the pyspark wrapper on non-empty batches).
+    assert _drop_lb(offset) == {"snapshot_done": True}
     # First continuation seeks past the last inline child (Id 20), NOT a $skip;
     # a second (empty) request terminates the drain (keyset stops on empty).
     assert "Parents(1)/Children" in cont_urls[0]
@@ -5392,7 +5394,9 @@ def test_contained_expand_resumes_from_pending_fetches_skip():
     rows = list(records)
     assert [r["Id"] for r in rows] == [33]
     # Page exhausted, no next_url → terminal snapshot offset.
-    assert _drop_lb(offset) == {}
+    # Terminal streaming-snapshot offset carries the quiesce marker
+    # (a bare {} crashed the pyspark wrapper on non-empty batches).
+    assert _drop_lb(offset) == {"snapshot_done": True}
 
 
 @responses.activate
@@ -5430,7 +5434,9 @@ def test_contained_expand_resumes_from_pending_fetches_url():
     rows = list(records)
     assert len(rows) == 1 and rows[0]["Id"] == 33
     assert captured == [resume_url]
-    assert _drop_lb(offset) == {}
+    # Terminal streaming-snapshot offset carries the quiesce marker
+    # (a bare {} crashed the pyspark wrapper on non-empty batches).
+    assert _drop_lb(offset) == {"snapshot_done": True}
 
 
 @responses.activate
@@ -9367,8 +9373,9 @@ def _skip_probe_preflight(c, table=PROBE_TABLE):
     exercise probe READ behaviour without also mocking the preflight requests.
     The preflight itself is covered by dedicated tests."""
     segs = tuple(table.split("__"))
-    # Cache value is ``(problem, conclusive)``: no problem, conclusively verified.
-    c.__dict__.setdefault("_cursor_probe_verified", {})[(segs, None)] = (None, True)
+    # Cache value is ``(problem, conclusive, race_tainted)``: no problem,
+    # conclusively verified, no race contamination.
+    c.__dict__.setdefault("_cursor_probe_verified", {})[(segs, None)] = (None, True, False)
 
 
 def _probe_filter_floor(request):
@@ -9862,7 +9869,11 @@ def test_cursor_probe_preflight_passes_when_inner_orderby_honored():
     # trusted direct-nav max, so the caller may persist the verdict.
     assert supported is True
     assert conclusive is True
-    assert c.__dict__["_cursor_probe_verified"][(("Roots", "Mids", "Leaves"), None)] == (None, True)
+    assert c.__dict__["_cursor_probe_verified"][(("Roots", "Mids", "Leaves"), None)] == (
+        None,
+        True,
+        False,
+    )
 
 
 @responses.activate
@@ -10088,11 +10099,13 @@ def test_cursor_probe_auto_read_succeeds_when_server_rejects_expand_probe():
 def test_cursor_probe_race_newer_leaf_is_skipped_not_failed():
     """A probe-shaped ``$expand`` newest NEWER than the direct-nav reference is
     a concurrent-write race (the two fetches aren't atomic), not mis-ordering
-    evidence — a genuinely mis-ordering server returns an OLDER leaf. So the
-    sample is skipped like a non-discriminating one: the scan finds nothing
-    conclusive → inconclusive ``(True, False)`` (probe engages this batch, the
-    established safe default), and NOTHING is persisted (no false fail can be
-    pinned). One unlucky write must never abort the whole preflight or raise."""
+    evidence — a genuinely mis-ordering server returns an OLDER leaf. The
+    sample is skipped (never a definitive fail, never a raise) and NOTHING is
+    persisted. But unlike a genuinely non-discriminating scan, a verdict-less
+    scan that contained a RACE skip DECLINES the probe for this batch
+    (``(False, False)`` — cascade to $batch / the plain walk): the race may be
+    hiding a mis-ordering server, and engaging unverified could drop rows
+    behind the advancing watermark. The next batch re-checks."""
     _mock_probe_metadata()
     responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
     responses.add_callback(
@@ -10110,14 +10123,15 @@ def test_cursor_probe_race_newer_leaf_is_skipped_not_failed():
         },
     )
     c = _make()
-    # Inconclusive, not a fail: supported (engage), non-conclusive (re-check).
+    # Race-tainted inconclusive: declined this batch, nothing persisted.
     assert c._verify_cursor_probe_support(
         ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified", strict=False
-    ) == (True, False)
+    ) == (False, False)
     assert c._cached_capability("cursor_probe_ok", table_name="Roots__Mids__Leaves") is None
     assert c.__dict__["_cursor_probe_verified"][(("Roots", "Mids", "Leaves"), None)] == (
         None,
         False,
+        True,
     )
 
 
@@ -10169,8 +10183,10 @@ def test_cursor_probe_race_does_not_abort_scan_to_clean_sample():
 @responses.activate
 def test_cursor_probe_strict_does_not_raise_on_race():
     """Strict mode must not raise the pipeline on a transient concurrent-write
-    race: a newer-than-reference sample is skipped, and with no other sample the
-    scan is inconclusive → ``(True, False)``, not a raise."""
+    race: a newer-than-reference sample is skipped, and with no other sample
+    the race-tainted scan DECLINES the probe for this batch
+    (``(False, False)`` — the read degrades to the $batch/plain cascade for
+    one batch, rows identical) rather than raising OR engaging unverified."""
     _mock_probe_metadata()
     responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]})
     responses.add_callback(
@@ -10190,7 +10206,7 @@ def test_cursor_probe_strict_does_not_raise_on_race():
     c = _make()
     assert c._verify_cursor_probe_support(
         ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified", strict=True
-    ) == (True, False)
+    ) == (False, False)
 
 
 @responses.activate
@@ -10802,7 +10818,7 @@ def test_contained_fetch_batch_snapshot_hydrates_via_batch():
     # The snapshot's terminal offset stays a bare {} — capability flags are NOT
     # merged in (a streaming snapshot quiesces on end == start; {} → {batch_ok}
     # would buy one extra full snapshot re-read).
-    assert offset == {}
+    assert offset == {"snapshot_done": True}  # terminal snapshot marker (quiesce)
     # Both leaf collections hydrated via $batch; NO per-parent GET to /Children.
     assert any("Parents(1)/Children" in u for u in responder.seen)
     assert any("Parents(2)/Children" in u for u in responder.seen)
@@ -11791,7 +11807,7 @@ def test_snapshot_contained_stream_preflight_cached_across_microbatches():
     c1 = _make()
     recs1, offset1 = c1.read_table(PROBE_TABLE, {}, dict(opts))
     assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs1] == [(1, 10, 1001)]
-    assert offset1 == {}
+    assert offset1 == {"snapshot_done": True}  # terminal snapshot marker (quiesce)
     n_expand_1 = sum(1 for call in responses.calls if "$expand" in unquote(call.request.url))
     assert n_expand_1 == 2
 
@@ -11800,7 +11816,7 @@ def test_snapshot_contained_stream_preflight_cached_across_microbatches():
     c2 = _make()
     recs2, offset2 = c2.read_table(PROBE_TABLE, {}, dict(opts))
     assert [(r["Roots_Id"], r["Mids_Id"], r["Id"]) for r in recs2] == [(1, 10, 1001)]
-    assert offset2 == {}
+    assert offset2 == {"snapshot_done": True}  # terminal snapshot marker (quiesce)
     n_expand_2 = sum(1 for call in responses.calls if "$expand" in unquote(call.request.url))
     assert n_expand_2 == n_expand_1 + 1
 
@@ -15825,3 +15841,366 @@ def test_decimal_literal_never_carries_exponent():
     assert odata_literal(Decimal("-2.5")) == "-2.5"
     # Floats (Edm.Double) legitimately keep exponents; '+' stays escaped.
     assert "e" in odata_literal(1e20).lower()
+
+
+# ---------------------------------------------------------------------------
+# Round 39 — incomparable cursor pairs, numeric same-instant, preflight
+# verdict hygiene (rendering flip / annotation deferral / race taint),
+# absent expanded property, streaming-snapshot quiesce marker
+# ---------------------------------------------------------------------------
+
+R39_FLIP_METADATA = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="P" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Root">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="RecordLastModified" Type="Edm.DateTimeOffset"/>
+        <NavigationProperty Name="Mids" Type="Collection(P.Mid)" ContainsTarget="true"/>
+      </EntityType>
+      <EntityType Name="Mid">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="RecordLastModified" Type="Edm.DateTimeOffset"/>
+        <NavigationProperty Name="Leaves" Type="Collection(P.Leaf)" ContainsTarget="true"/>
+      </EntityType>
+      <EntityType Name="Leaf">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="RecordLastModified" Type="Edm.DateTimeOffset"/>
+      </EntityType>
+      <EntityContainer Name="C"><EntitySet Name="Roots" EntityType="P.Root"/></EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+
+def test_cursor_newer_incomparable_pair_never_raises():
+    """cursor_newer's TypeError fallback used to re-raise for str-vs-int
+    (an IEEE754Compatible server alternating 5000 and "5000" across
+    requests) and propagate through cursor_max/max_or — killing the batch
+    from a watermark fold. Incomparable pairs now degrade to a consistent
+    False, matching _chain_strictly_before's documented posture."""
+    from databricks.labs.community_connector.sources.odata._helpers import (
+        cursor_max,
+        cursor_newer,
+        max_or,
+    )
+
+    assert cursor_newer(5000, "5000") is False
+    assert cursor_newer("5000", 5000) is False
+    assert cursor_max([5000, "5000", 4999]) is not None  # no raise
+    assert max_or(5000, "5000") is not None  # no raise
+
+
+def test_cursor_same_instant_numeric_strings():
+    """IEEE754Compatible numeric-string renderings of one value are the same
+    instant; sub-float-precision Int64 pairs stay distinct (exact Decimal
+    compare, no float collapse)."""
+    from databricks.labs.community_connector.sources.odata._helpers import cursor_same_instant
+
+    assert cursor_same_instant(5000, "5000")
+    assert cursor_same_instant("5000", 5000)
+    assert cursor_same_instant("5000.0", 5000)
+    assert cursor_same_instant("9007199254740993", 9007199254740993)
+    assert not cursor_same_instant("9007199254740992", 9007199254740993)
+    assert not cursor_same_instant("5001", 5000)
+    assert not cursor_same_instant("abc", 5000)
+
+
+@responses.activate
+def test_ancestor_walk_int_str_rendering_alternation_progresses():
+    """An ancestor cursor whose JSON rendering alternates 5000 ↔ "5000" per
+    request (IEEE754Compatible flip) used to crash batch 2 with an uncaught
+    TypeError from the running_max fold; with the incomparable-pair guard
+    alone it would livelock like round 37. Same-instant numeric matching
+    resumes the park and the walk completes."""
+    _mock_nested_metadata()
+    renders = [5000, "5000"]
+    call_n = {"n": 0}
+
+    def _parents_cb(_req):
+        call_n["n"] += 1
+        rows = [
+            {"Id": 10, "Name": renders[call_n["n"] % 2]},
+            {"Id": 20, "Name": 6000},
+        ]
+        return (200, {}, json.dumps({"value": rows}))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents_cb)
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(10)/Children",
+        callback=lambda _r: (
+            200,
+            {},
+            json.dumps({"value": [{"Id": 101, "Label": "a"}, {"Id": 102, "Label": "b"}]}),
+        ),
+    )
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(20)/Children",
+        callback=lambda _r: (200, {}, json.dumps({"value": [{"Id": 201, "Label": "e"}]})),
+    )
+    c = _make()
+    opts = {
+        "cursor_field": "Name",
+        "max_records_per_batch": "2",
+        "pagination": "nextlink",
+        "expand_contained": "false",
+    }
+    emitted = []
+    offset = {}
+    completed = False
+    for _ in range(6):
+        recs, offset = c.read_table("Parents__Children", offset, opts)
+        emitted.extend(recs)
+        if set(offset) - {"lb_history", "lb_cycle_started"} == {"cursor"}:
+            completed = True
+            break
+    assert completed, f"walk never completed; last offset {offset}"
+    assert {101, 102, 201} <= {r["Id"] for r in emitted}
+
+
+def _run_flip_preflight(direct_suffix, expand_suffix):
+    """Run the cursor_probe preflight against a server whose direct-nav and
+    probe-shaped fetches render the same instant with different suffixes."""
+    responses.get(f"{SERVICE_URL}$metadata", body=R39_FLIP_METADATA, status=200)
+    responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]}, match_querystring=False)
+    newest, older = "2024-05-02T00:00:00", "2024-05-01T00:00:00"
+
+    def _mids_cb(req):
+        from urllib.parse import unquote
+
+        if "$expand=" in unquote(req.url):
+            return (
+                200,
+                {},
+                json.dumps(
+                    {
+                        "value": [
+                            {
+                                "Id": 7,
+                                "Leaves": [
+                                    {"Id": 71, "RecordLastModified": newest + expand_suffix}
+                                ],
+                            }
+                        ]
+                    }
+                ),
+            )
+        return (200, {}, json.dumps({"value": [{"Id": 7}]}))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Roots(1)/Mids", callback=_mids_cb)
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Roots(1)/Mids(7)/Leaves",
+        callback=lambda _r: (
+            200,
+            {},
+            json.dumps(
+                {
+                    "value": [
+                        {"RecordLastModified": newest + direct_suffix},
+                        {"RecordLastModified": older + direct_suffix},
+                    ]
+                }
+            ),
+        ),
+    )
+    c = _make()
+    return c._run_cursor_probe_preflight(
+        ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified"
+    )
+
+
+@responses.activate
+def test_probe_preflight_rendering_flip_is_a_pass_not_condemnation():
+    """The preflight's final newest-leaf comparison is SAME-INSTANT, not raw
+    text: a load balancer rendering one instant as …00Z on one backend and
+    …00.000Z on the other must not produce definitive mis-ordering evidence
+    (false cursor_probe_ok=false under auto; a spurious raise under strict
+    nested-expand). Both flip directions now verify as a conclusive pass."""
+    problem, conclusive, race = _run_flip_preflight("Z", ".000Z")
+    assert problem is None and conclusive and not race
+    responses.reset()
+    problem, conclusive, race = _run_flip_preflight(".000Z", "Z")
+    assert problem is None and conclusive and not race
+
+
+def test_probe_preflight_all_race_scan_declines_probe(monkeypatch):
+    """A verdict-less scan containing RACE skips (discriminating samples that
+    returned newer-than-reference) must decline the probe for the batch —
+    engaging it unverified could hide a mis-ordering server behind concurrent
+    writes — while still recording nothing."""
+    c = _make()
+    monkeypatch.setattr(
+        ODataLakeflowConnect,
+        "_run_cursor_probe_preflight",
+        lambda self, *a, **k: (None, False, True),
+    )
+    supported, conclusive = c._verify_cursor_probe_support(
+        ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified", None, strict=False
+    )
+    assert (supported, conclusive) == (False, False)
+    # A genuinely non-discriminating scan (no races) still engages unverified.
+    c2 = _make()
+    monkeypatch.setattr(
+        ODataLakeflowConnect,
+        "_run_cursor_probe_preflight",
+        lambda self, *a, **k: (None, False, False),
+    )
+    supported, conclusive = c2._verify_cursor_probe_support(
+        ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified", None, strict=False
+    )
+    assert (supported, conclusive) == (True, False)
+
+
+@responses.activate
+def test_expand_preflight_annotation_deferral_verified_not_condemned():
+    """A server that defers inner collections behind <Nav>@odata.nextLink
+    (inline [] + annotation) used to read as 'children exist but $expand
+    omitted them' — a definitive expand_ok=false pinning N+1 forever on a
+    server the read fully supports. Annotation presence is containment
+    evidence: the preflight now verifies through it and passes."""
+    _mock_nested_metadata()
+
+    def _parents_cb(req):
+        from urllib.parse import unquote
+
+        if "$expand=" in unquote(req.url):
+            return (
+                200,
+                {},
+                json.dumps(
+                    {
+                        "value": [
+                            {
+                                "Id": 1,
+                                "Name": "p",
+                                "Children": [],
+                                "Children@odata.nextLink": (f"{SERVICE_URL}Parents(1)/Children"),
+                            }
+                        ]
+                    }
+                ),
+            )
+        return (200, {}, json.dumps({"value": [{"Id": 1, "Name": "p"}]}))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents_cb)
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children",
+        callback=lambda _r: (200, {}, json.dumps({"value": [{"Id": 11, "Label": "x"}]})),
+    )
+    c = _make()
+    ok, definitive = c._run_expand_preflight("Parents__Children", ["Parents", "Children"], {}, None)
+    assert (ok, definitive) == (True, True)
+
+
+@responses.activate
+def test_expand_flatten_absent_child_property_fetched_directly():
+    """A spec-violating partial-expansion server that wholly OMITS the
+    expanded property for some parents (no inline list, no annotation) used
+    to have those subtrees silently dropped — absent is NOT verified-empty.
+    The flatten now fetches the collection directly for such parents."""
+    _mock_nested_metadata()
+
+    def _parents_cb(req):
+        from urllib.parse import unquote
+
+        if "$expand=" in unquote(req.url):
+            return (
+                200,
+                {},
+                json.dumps(
+                    {
+                        "value": [
+                            {"Id": 1, "Name": "a", "Children": [{"Id": 11, "Label": "x"}]},
+                            {"Id": 2, "Name": "b"},  # property wholly absent
+                        ]
+                    }
+                ),
+            )
+        return (200, {}, json.dumps({"value": [{"Id": 1}, {"Id": 2}]}))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents_cb)
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(2)/Children",
+        callback=lambda _r: (200, {}, json.dumps({"value": [{"Id": 22, "Label": "y"}]})),
+    )
+    c = _make()
+    rows, _ = c.read_table(
+        "Parents__Children", None, {"expand_contained": "true", "pagination": "nextlink"}
+    )
+    assert {r["Id"] for r in rows} == {11, 22}
+
+
+@responses.activate
+def test_snapshot_stream_marker_quiesces_flat():
+    """Streaming snapshots mark the first pass done and quiesce with an EMPTY
+    batch + unchanged offset — the only quiesce shape pyspark's simple-reader
+    wrapper accepts (a non-empty batch with end==start raises
+    SIMPLE_STREAM_READER_OFFSET_DID_NOT_ADVANCE; the old bare-{} contract
+    crashed on trigger 1). Idle triggers cost zero HTTP."""
+    _mock_metadata()
+    responses.get(
+        f"{SERVICE_URL}Customers",
+        json={"value": [{"Id": 1, "Name": "A", "ModifiedAt": "x"}]},
+        match_querystring=False,
+    )
+    c = _make({"token": "t"})
+    rows1, off1 = c.read_table("Customers", {}, {})
+    assert [r["Id"] for r in rows1] == [1]
+    assert off1.get("snapshot_done") is True
+    data_calls_before = sum(1 for call in responses.calls if "Customers" in call.request.url)
+    rows2, off2 = c.read_table("Customers", off1, {})
+    assert list(rows2) == [] and off2 == off1
+    data_calls_after = sum(1 for call in responses.calls if "Customers" in call.request.url)
+    assert data_calls_after == data_calls_before  # idle trigger: zero HTTP
+
+
+@responses.activate
+def test_snapshot_stream_marker_quiesces_contained():
+    """Same marker rule for contained snapshot streams (N+1 shape)."""
+    _mock_nested_metadata()
+    responses.get(f"{SERVICE_URL}Parents", json={"value": [{"Id": 1}]}, match_querystring=False)
+    responses.get(
+        f"{SERVICE_URL}Parents(1)/Children",
+        json={"value": [{"Id": 11, "Label": "x"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    opts = {"expand_contained": "false", "contained_fetch": "single"}
+    rows1, off1 = c.read_table("Parents__Children", {}, opts)
+    assert [r["Id"] for r in rows1] == [11]
+    assert off1.get("snapshot_done") is True
+    n_before = len(responses.calls)
+    rows2, off2 = c.read_table("Parents__Children", off1, opts)
+    assert list(rows2) == [] and off2 == off1
+    assert len(responses.calls) == n_before
+
+
+def test_service_url_bare_trailing_question_rejected():
+    """A bare trailing '?' has an EMPTY urlparse query but still corrupts
+    every built URL (svc?/Customers) — the raw-char check catches it."""
+    with pytest.raises(ValueError, match="query string or fragment"):
+        _make({"service_url": "https://example.com/odata?"})
+
+
+@responses.activate
+def test_select_strips_to_empty_omits_param():
+    """select=',' is rejected upstream by the PK validation (it strips to no
+    columns, so the PKs are 'omitted') — and the wire builder independently
+    guards the empty case: a select that strips to nothing emits no $select
+    param at all rather than an empty '$select='."""
+    _mock_metadata()
+    c = _make({"token": "t"})
+    with pytest.raises(ValueError, match="omits primary-key"):
+        c.read_table("Customers", None, {"select": ","})
+    # Defense-in-depth at the URL builder (other callers bypass validation).
+    assert "$select" not in c._format_query_params({"select": ", ,"})
+    assert "$select=Id" in c._format_query_params({"select": " Id ,"})

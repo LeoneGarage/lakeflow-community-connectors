@@ -1941,9 +1941,9 @@ class ContainedNavMixin:
                 else self._cached_capability("cursor_probe_ok", table_name=shared_key)
             )
             if shared is True:
-                cache[cache_key] = (None, True)
+                cache[cache_key] = (None, True, False)
             elif shared is False:
-                cache[cache_key] = (_CURSOR_PROBE_SHARED_FAIL, False)
+                cache[cache_key] = (_CURSOR_PROBE_SHARED_FAIL, False, False)
             else:
                 try:
                     cache[cache_key] = self._run_cursor_probe_preflight(
@@ -1975,7 +1975,7 @@ class ContainedNavMixin:
                         raise ValueError(msg) from exc
                     _LOG.warning("%s Falling back to $batch / the plain N+1 walk.", msg)
                     return (False, False)
-                problem, conclusive = cache[cache_key]
+                problem, conclusive, _race = cache[cache_key]
                 if not strict:
                     if problem:  # clean mis-ordering evidence — a definitive fail
                         self._store_capability("cursor_probe_ok", False, table_name=shared_key)
@@ -1985,10 +1985,28 @@ class ContainedNavMixin:
                     # concurrent-write races) record nothing and re-check next
                     # batch, so a server that starts mis-ordering once its data
                     # grows discriminating is still caught.
-        problem, conclusive = cache[cache_key]
+        problem, conclusive, race_tainted = cache[cache_key]
         if problem:
             if strict:
                 raise ValueError(problem)
+            return (False, False)
+        if race_tainted and not conclusive:
+            # The verdict-less scan contained a RACE skip — a sample that HAD
+            # discriminating cursors but returned newer-than-reference. Unlike
+            # a genuinely non-discriminating scan (where engaging the probe
+            # unverified is safe — ordering can't cause a miss), this may be a
+            # mis-ordering server hiding behind concurrent writes. Decline the
+            # probe for this batch (the caller cascades to $batch / the plain
+            # walk — rows stay correct; under strict mode this degrades the
+            # REQUEST SHAPE for one batch rather than raising on a transient)
+            # and record nothing; the next batch re-checks.
+            _LOG.warning(
+                "cursor_probe preflight for %r was race-contaminated (concurrent "
+                "writes during every discriminating sample); declining the probe "
+                "for this batch and reading via $batch / the plain walk. The next "
+                "batch re-checks.",
+                CONTAINED_PATH_SEP.join(segments),
+            )
             return (False, False)
         return (True, conclusive)
 
@@ -2021,16 +2039,24 @@ class ContainedNavMixin:
     ) -> tuple[str | None, bool]:
         """Behavioural capability check for :meth:`_iter_dirty_leaf_parent_chains`.
 
-        Returns ``(problem, conclusive)``: ``problem`` is an actionable error
-        message on clean mis-ordering evidence (inner leaf OLDER than / missing
-        from the trusted reference — the direction a genuinely mis-ordering
-        server produces), else ``None``. A ``problem`` is always a *definitive*
-        fail the caller may persist as ``cursor_probe_ok=false`` (and, in strict
-        mode, raise on). ``conclusive`` is ``True`` only when a discriminating
-        sample was found AND the probe shape returned the true newest leaf — the
-        verdict the caller may persist as ``cursor_probe_ok=true``; ``False`` on
-        an inconclusive scan (``problem`` ``None``), which must be re-checked
-        rather than trusted.
+        Returns ``(problem, conclusive, race_tainted)``: ``problem`` is an
+        actionable error message on clean mis-ordering evidence (inner leaf
+        OLDER than / missing from the trusted reference — the direction a
+        genuinely mis-ordering server produces), else ``None``. A ``problem``
+        is always a *definitive* fail the caller may persist as
+        ``cursor_probe_ok=false`` (and, in strict mode, raise on).
+        ``conclusive`` is ``True`` only when a discriminating sample was found
+        AND the probe shape returned the true newest leaf — the verdict the
+        caller may persist as ``cursor_probe_ok=true``; ``False`` on an
+        inconclusive scan (``problem`` ``None``), which must be re-checked
+        rather than trusted. ``race_tainted`` is ``True`` when an inconclusive
+        scan contained at least one RACE skip (a sample that HAD
+        discriminating cursors but returned newer-than-reference): unlike a
+        genuinely non-discriminating scan — where ordering can't cause a
+        miss, so engaging the probe unverified is safe — a race-tainted scan
+        may be hiding a mis-ordering server behind concurrent writes, so the
+        caller must decline the probe for this batch (cascade to ``$batch`` /
+        the plain walk) while still recording nothing.
 
         Finds a sample leaf-parent with ≥2 distinct leaf cursors and verifies
         that the probe's own ``$expand($orderby cursor desc;$top=1)`` returns
@@ -2039,10 +2065,7 @@ class ContainedNavMixin:
         honoured than inner-``$expand`` ordering). A sample that can't
         discriminate (≤1 distinct leaf cursor) or that races a concurrent write
         (inner leaf NEWER than the reference — see
-        :meth:`_cursor_probe_check_sample`) is skipped and the scan moves on;
-        an all-skip scan within :data:`_CURSOR_PROBE_PREFLIGHT_SCAN` returns
-        ``(None, False)`` (inconclusive), since with no discriminating sample
-        ordering can't cause a miss."""
+        :meth:`_cursor_probe_check_sample`) is skipped and the scan moves on."""
         parent_segments = segments[:-1]
         leaf_nav = segments[-1]
         lp_et = self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
@@ -2053,6 +2076,7 @@ class ContainedNavMixin:
         page_size = (table_options or {}).get("page_size") or DEFAULT_PAGE_SIZE
         lp_order = _ancestor_pk_order_by(lp_pks)
         scanned = 0
+        saw_race = False
         for pchain in self._iter_parent_key_chains(parent_segments, namespace, table_options):
             lp_base = join_url(
                 self.service_url, self._build_contained_path(parent_segments, pchain, namespace)
@@ -2072,12 +2096,14 @@ class ContainedNavMixin:
                         parent_segments, pchain, segments, namespace, lp_key, leaf_nav, cursor_field
                     )
                     if status == "ok":
-                        return (None, True)
+                        return (None, True, False)
                     if status == "error":
-                        return (message, False)
+                        return (message, False, False)
+                    if status == "race":
+                        saw_race = True
                     if scanned >= _CURSOR_PROBE_PREFLIGHT_SCAN:
-                        return (None, False)
-        return (None, False)
+                        return (None, False, saw_race)
+        return (None, False, saw_race)
 
     # pylint: disable=too-many-arguments,too-many-positional-arguments
     def _cursor_probe_check_sample(
@@ -2159,7 +2185,15 @@ class ContainedNavMixin:
         # verdict against an honest server.
         inner_vals = [c.get(cursor_field) for c in children if c.get(cursor_field) is not None]
         inner_max = _cursor_max(inner_vals) if inner_vals else None
-        if inner_max == direct_max:
+        # SAME-INSTANT equality, not raw text: the two fetches can hit
+        # different LB backends rendering one instant differently
+        # (…00Z vs …00.000Z). Raw equality would fall through, and the
+        # direction whose raw tie-break reads as "older" would land in the
+        # error branch below — fabricating definitive mis-ordering evidence
+        # against an honest server (false cursor_probe_ok=false under
+        # ``auto``; a spurious raise under strict ``nested-expand``). Same
+        # hazard class the ``_cursor_max`` comment above guards against.
+        if _cursor_same_instant(inner_max, direct_max):
             return ("ok", None)
         # Direction matters, because a fail verdict now outlives the instance
         # (shared capability cache) and can raise in strict mode. A newest-leaf
@@ -2172,7 +2206,11 @@ class ContainedNavMixin:
         # aborting the whole preflight or spuriously raising strict mode.
         try:
             if inner_max is not None and _cursor_newer(inner_max, direct_max):
-                return ("skip", None)
+                # Distinct status from the non-discriminating "skip": a race
+                # skip means this sample HAD discriminating cursors — an
+                # all-race scan must decline the probe for this batch rather
+                # than engage it unverified (see _run_cursor_probe_preflight).
+                return ("race", None)
         except TypeError:
             pass  # incomparable cursor values — keep the mismatch as evidence
         return (
@@ -2777,6 +2815,44 @@ class ContainedNavMixin:
             if direct is None:
                 return (False, False)  # couldn't verify — N+1, re-probe next batch
             if direct:
+                if any(f"{child_key}@odata.nextLink" in r for r, _ in pending):
+                    # ANNOTATION-DEFERRING server: it acknowledged the expanded
+                    # property with a ``<Nav>@odata.nextLink`` instead of
+                    # inlining rows — the READ path follows exactly that
+                    # annotation (see ``_flatten_expand_response``), so this
+                    # level's containment IS honored; a definitive fail here
+                    # would permanently pin N+1 on a server where
+                    # ``expand_contained=true`` works end-to-end. Verify the
+                    # DEEPER levels with a sub-rooted expand probe (the direct
+                    # check's children were fetched WITHOUT ``$expand``, so
+                    # descending through them raw would false-fail one level
+                    # down).
+                    if lvl + 2 >= len(segments):
+                        return (True, True)  # deferring level's children ARE leaves
+                    sub_url = self._assemble_expand_url(
+                        join_url(
+                            self.service_url,
+                            self._build_contained_path(segments[: lvl + 2], full_chain, namespace),
+                        ),
+                        segments,
+                        lvl + 1,
+                        {**(table_options or {}), "page_size": _EXPAND_PREFLIGHT_PAGE},
+                        resolve_segment_filters(table_options, segments),
+                        cursor_level,
+                        cursor_filter,
+                        None,
+                        None,
+                        None,
+                    )
+                    try:
+                        r3 = self._http_get_once(self._get_session(), sub_url)
+                        sub_rows = (r3.json().get("value") or []) if r3.status_code < 400 else None
+                    except Exception:
+                        sub_rows = None
+                    if not sub_rows:
+                        return (False, False)  # deeper levels unverifiable — re-probe
+                    pending = [(r, full_chain) for r in sub_rows]
+                    continue
                 return (False, True)  # children exist but $expand omitted them
             return (False, False)  # sampled branch genuinely childless — N+1, re-probe
         return (True, True)
@@ -3917,7 +3993,7 @@ class ContainedNavMixin:
                 # truthy when page_size was set, so page_size is present here.)
                 new_top = max(MIN_DYNAMIC_TOP, (page_size or 0) // max(1, inner_product))
                 resolved = rewrite_top_in_url(resolved, new_top)
-        else:
+        elif next_seg in row and row[next_seg] is not None:
             # No ``<NavProp>@odata.nextLink``. In a client-driven pagination
             # mode (keyset/skip/auto), synthesize a direct-navigation
             # continuation when the inline page is a FULL page (== $top) and
@@ -3927,6 +4003,27 @@ class ContainedNavMixin:
             # response but never emit the continuation link.
             resolved = self._inner_expand_continuation_url(
                 level, row, segments, chain, next_ctx, per_level_tops
+            )
+        else:
+            # The expanded property is wholly ABSENT (or null) — spec-
+            # violating: OData v4 requires every ``$expand``-ed property be
+            # PRESENT on each row (a genuinely empty collection comes back
+            # as ``[]``, which the branch above trusts). A partial-expansion
+            # server that inlines children for some parents and omits the
+            # property for others would otherwise have those subtrees
+            # silently dropped — absent is NOT verified-empty. Fetch the
+            # collection directly from the start: mode "skip" + count 0
+            # yields a plain ``$skip=0`` from-the-beginning URL with the
+            # deeper ``$expand`` chain intact, without engaging the keyset
+            # OR-support probe an empty boundary couldn't use anyway.
+            resolved = self._build_expand_continuation_url(
+                segments,
+                level,
+                chain,
+                next_ctx[0] if next_ctx else None,
+                "skip",
+                {},
+                0,
             )
         if resolved is not None:
             if pending_fetches is not None:

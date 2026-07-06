@@ -1077,14 +1077,18 @@ class ODataLakeflowConnect(
                 "auth_type=basic with the 'username' / 'password' "
                 "connection options instead."
             )
-        if parsed_root.query or parsed_root.fragment:
+        if parsed_root.query or parsed_root.fragment or set(self.service_url) & {"?", "#"}:
+            # The raw-char check catches a bare trailing "?"/"#"
+            # (urlparse reports an EMPTY query/fragment for those, but
+            # join_url would still produce "svc?/Customers").
             # Every URL builder appends '/<path>' to the root, so a query-
             # carrying root (the SAP Gateway '?sap-client=100' form) would
             # put the entity path INSIDE the query string on every request
             # — the first symptom is the $metadata fetch dying in the XML
             # parser with no hint the URL was malformed. Fail at
             # construction with the working alternative instead.
-            trailing = f"?{parsed_root.query}" if parsed_root.query else f"#{parsed_root.fragment}"
+            cut = min(i for i in (self.service_url.find("?"), self.service_url.find("#")) if i >= 0)
+            trailing = self.service_url[cut:]
             raise ValueError(
                 f"service_url must not carry a query string or fragment "
                 f"(got {trailing!r}); the connector appends entity paths "
@@ -1545,11 +1549,14 @@ class ODataLakeflowConnect(
                         opts,
                         table_name,
                     )
-                # Snapshot expand: same bare-``{}`` terminal-offset rule as
-                # the N+1 snapshot below (quiesce on ``end == start``); the
+                # Snapshot expand: same streaming-snapshot marker rule as the
+                # N+1 snapshot below (see ``_snapshot_stream_result``); the
                 # preflight verdict rides the process/file capability cache
                 # instead of the offset.
-                return self._read_contained_expand(table_name, start_offset, opts)
+                return self._snapshot_stream_result(
+                    start_offset,
+                    lambda: self._read_contained_expand(table_name, start_offset, opts),
+                )
             if opts.get("cursor_field"):
                 # Cursor-based read: default page_size so a $top is sent.
                 # Snapshot (the branch below) leaves it unset — no $top only
@@ -1562,15 +1569,18 @@ class ODataLakeflowConnect(
                     opts,
                     table_name,
                 )
-            # Snapshot: the terminal offset stays a bare ``{}`` — deliberately
-            # NOT threaded with capability verdicts. A streaming snapshot
-            # quiesces on ``end == start``; merging flags would turn the first
-            # trigger's ``{}`` into ``{"batch_ok": …}`` and buy one extra full
-            # snapshot re-read before settling. The batch reader discards the
+            # Snapshot: the streaming offset carries only the
+            # ``snapshot_done`` marker (see ``_snapshot_stream_result``) —
+            # still deliberately NOT threaded with capability verdicts, so
+            # the marker offset stays byte-stable across triggers (the
+            # quiesce shape the pyspark wrapper accepts is an EMPTY batch
+            # with an unchanged offset). The batch reader discards the
             # offset anyway. Preflight dedup across framework-recreated
             # instances comes from the process/file capability cache instead
             # (see ``_CAPABILITY_CACHE``), which needs no offset channel.
-            return self._read_contained_snapshot(table_name, opts)
+            return self._snapshot_stream_result(
+                start_offset, lambda: self._read_contained_snapshot(table_name, opts)
+            )
         # Offset-shape check ahead of the delta predicate so a resumed
         # delta stream (offset carries delta_link / next_link) takes the
         # delta path even if delta_tracking is no longer set in options.
@@ -1607,7 +1617,46 @@ class ODataLakeflowConnect(
                 table_name,
                 opts,
             )
-        return self._stamp_delta_verdict(self._read_snapshot(table_name, opts), table_name, opts)
+        return self._stamp_delta_verdict(
+            self._snapshot_stream_result(
+                start_offset, lambda: self._read_snapshot(table_name, opts)
+            ),
+            table_name,
+            opts,
+        )
+
+    def _snapshot_stream_result(self, start_offset: dict | None, read) -> tuple:
+        """Streaming-snapshot semantics under pyspark's simple-reader wrapper.
+
+        The wrapper (``_SimpleStreamReaderWrapper.add_result_to_cache``)
+        raises ``SIMPLE_STREAM_READER_OFFSET_DID_NOT_ADVANCE`` for a
+        NON-EMPTY batch whose end offset equals its start — so a bare-``{}``
+        "quiesce on end == start" contract only ever worked for empty
+        batches, and a snapshot read is never empty. Streaming snapshots
+        therefore mark the first pass done (``{"snapshot_done": True}`` —
+        the offset advances, satisfying the wrapper) and every later trigger
+        returns an EMPTY batch with the unchanged marker offset — the one
+        quiesce shape the wrapper accepts. The marker check runs BEFORE the
+        read, so idle triggers cost zero HTTP. Batch mode (``start_offset is
+        None`` — offset discarded) passes through untouched. Restart
+        semantics keep the documented intent: a fresh checkpoint re-reads
+        once, then quiesces until restarted. Compat-safe: this shape
+        previously CRASHED on its first or second trigger, so no working
+        checkpoint carries a bare ``{}``.
+
+        The marker stamps only a TERMINAL (``{}``) offset: a capped expand
+        snapshot parks ``pending_fetches`` mid-drain, and stamping that
+        pass would strand the queue forever behind the marker's early
+        return — a parked offset already differs from its start, so the
+        wrapper needs no marker until the drain completes."""
+        if start_offset is None:
+            return read()
+        if start_offset.get("snapshot_done"):
+            return iter([]), start_offset
+        records, offset = read()
+        if offset:
+            return records, offset
+        return records, {**offset, "snapshot_done": True}
 
     def _stamp_delta_verdict(
         self, result: tuple, table_name: str, table_options: dict | None
@@ -2763,8 +2812,11 @@ class ODataLakeflowConnect(
             # Strip per-column whitespace ("Id, Label" → "Id,Label") — the
             # validation set and the expand-leaf merge both strip, and a
             # strict server may 400 the padded wire form ($select=Id,%20Label).
+            # A select that strips to NOTHING (","," ") emits no $select at
+            # all rather than an empty param.
             cols = ",".join(c.strip() for c in opts["select"].split(",") if c.strip())
-            params.append(f"$select={cols}")
+            if cols:
+                params.append(f"$select={cols}")
         filters = [f for f in (opts.get("filter"), extra_filter) if f]
         if filters:
             if len(filters) == 1:
