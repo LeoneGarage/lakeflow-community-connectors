@@ -844,12 +844,22 @@ def register_lakeflow_source(spark):
         Returns an empty list when every record shares one cursor value;
         the caller decides whether that's recoverable (natural exhaustion)
         or a hard failure (truncated batch with too-small cap).
+
+        Cohort membership is SAME-INSTANT (:func:`cursor_same_instant`), not
+        raw equality: a mixed-rendering batch (page 1 renders an Int64 cursor
+        as ints, page 2 as strings — a mixed-version LB) would otherwise
+        split one value's cohort at the rendering seam, trim only the
+        differently-rendered tail, and leave the watermark EQUAL to the
+        trimmed rows' value — ``cursor gt <watermark>`` then never re-fetches
+        them (permanent loss). Same-instant grouping trims the whole cohort
+        as one, restoring the watermark-strictly-below-boundary invariant
+        regardless of rendering.
         """
         if not records:
             return records
         boundary = records[-1].get(cursor_field)
         trim_idx = len(records)
-        while trim_idx > 0 and records[trim_idx - 1].get(cursor_field) == boundary:
+        while trim_idx > 0 and cursor_same_instant(records[trim_idx - 1].get(cursor_field), boundary):
             trim_idx -= 1
         return records[:trim_idx]
 
@@ -1405,14 +1415,16 @@ def register_lakeflow_source(spark):
 
 
     def _pg_is_continuation(url: str) -> bool:
-        """Whether ``url`` looks like a server-issued continuation link — it
-        carries a ``$skiptoken`` or ``$skip`` in any casing/encoding (the URLs
-        the connector builds itself carry neither; ``$skip`` paging rewrites via
-        :func:`_pg_set_query` only on URLs that already went through the
-        client-driven drain). Case-insensitive: a camelCase ``$skipToken=``
-        continuation must not be mistaken for a plain collection URL, or the
-        ``$top`` injection would append onto an opaque token URL — the exact
-        §11.2.5.7 hazard the injection guard exists to avoid."""
+        """Whether ``url`` carries a positional param (``$skiptoken`` or
+        ``$skip``, any casing/encoding) — i.e. it points mid-collection.
+        NOTE this matches the connector's OWN synthesized ``$skip``
+        continuations too, not just server-issued token links: the sole
+        consumer today (the ``$batch`` re-issue's ``$top`` injection guard)
+        wants exactly that — never append ``$top`` onto anything positioned
+        mid-walk (the §11.2.5.7 hazard) — but a future consumer needing
+        "server-issued token specifically" must test for ``$skiptoken``
+        alone. Case-insensitive: a camelCase ``$skipToken=`` continuation
+        must not be mistaken for a plain collection URL."""
         _, _, query = url.partition("?")
         return any(
             _pg_param_name(part) in _PG_POSITIONAL for part in (query.split("&") if query else [])
@@ -1445,7 +1457,11 @@ def register_lakeflow_source(spark):
         if not raw:
             return []
         keys = []
-        for term in raw.replace("%20", " ").split(","):
+        # ``+`` is a legal space encoding in query strings and server-issued
+        # continuation links may use it ("Id+asc") — without decoding it the
+        # desc guard misses and the "key" keeps its suffix, seeking on a
+        # nonexistent column (null boundary → $skip, or a server 400).
+        for term in raw.replace("%20", " ").replace("+", " ").split(","):
             term = term.strip()
             if term.endswith(" desc"):
                 return []
@@ -2536,7 +2552,11 @@ def register_lakeflow_source(spark):
                     if level == cursor_level:
                         if cursor_field not in select_cols:
                             select_cols.append(cursor_field)
-                        extra_filter = self._cursor_filter(cursor_field, since)
+                        extra_filter = self._cursor_filter(
+                            cursor_field,
+                            since,
+                            edm_type=self._edm_types_for_et(ancestor_et).get(cursor_field),
+                        )
                         terms = [f"{cursor_field} asc"]
                         terms.extend(f"{pk} asc" for pk in ancestor_pks if pk != cursor_field)
                         order_by = ",".join(terms)
@@ -2860,20 +2880,19 @@ def register_lakeflow_source(spark):
                             segments, namespace, table_options, cursor_field
                         )
                     except _CursorProbePreflightUnavailable as exc:
-                        # The preflight's enumeration or trusted-reference fetch
-                        # failed before reaching a verdict (only those two fetch
-                        # sites raise this type — a programming error in the
-                        # preflight's own logic still propagates). Unlike the
-                        # probe-shape rejection handled inside
-                        # ``_cursor_probe_check_sample`` (whose sibling fetches
-                        # just succeeded, making it definitive), there is no
-                        # evidence here to distinguish a capability shortfall
-                        # ($orderby desc / $select rejected on direct navigation)
-                        # from a transient blip — so treat it like the other
-                        # verifiers treat transients: degrade THIS read to the
-                        # $batch/plain cascade, cache and record NOTHING (the
-                        # next batch re-probes), and never let the raw HTTP
-                        # error escape a ``cursor_probe=auto`` read.
+                        # A preflight fetch failed before reaching a verdict —
+                        # the enumeration, the trusted-reference fetch, or (since
+                        # round 41) a TRANSIENT failure of the probe-shaped fetch
+                        # itself (only an immediate non-retryable HTTPError there
+                        # is a definitive shape rejection; retry-exhausted
+                        # throttling and network exhaustion land here — a
+                        # programming error in the preflight's own logic still
+                        # propagates). There is no evidence to distinguish a
+                        # capability shortfall from a transient blip — so treat
+                        # it like the other verifiers treat transients: degrade
+                        # THIS read to the $batch/plain cascade, cache and record
+                        # NOTHING (the next batch re-probes), and never let the
+                        # raw HTTP error escape a ``cursor_probe=auto`` read.
                         msg = (
                             f"cursor_probe preflight against "
                             f"{CONTAINED_PATH_SEP.join(segments)!r} failed before reaching "
@@ -3069,16 +3088,18 @@ def register_lakeflow_source(spark):
             )
             try:
                 exp_rows, _ = self._fetch_one_expand_page(expand_url)
-            except Exception:  # server REJECTED the nested-$expand probe shape
+            except requests.HTTPError:  # server REJECTED the nested-$expand probe shape
                 # e.g. Hexagon Smart API 400s on inner $orderby/$top/$select rather
-                # than accepting it (or silently mis-ordering). The enumeration and
-                # direct-navigation fetches for this sample just succeeded, so this
-                # is a definitive capability rejection, not a transient blip. Report
-                # it like the mis-order case ("error") so ``auto`` cascades to
-                # $batch / the plain walk (persisting cursor_probe_ok=False) and
-                # ``nested-expand`` raises an actionable error — instead of the raw
-                # HTTP error escaping and failing the read, which would break the
-                # "auto never raises on a capability shortfall" contract.
+                # than accepting it (or silently mis-ordering). An immediate
+                # HTTPError is a NON-RETRYABLE 4xx (the retryable statuses exhaust
+                # the retry budget into RuntimeError, and network failures re-raise
+                # their own types — neither reaches this clause), so this is a
+                # definitive capability rejection. Report it like the mis-order
+                # case ("error") so ``auto`` cascades to $batch / the plain walk
+                # (persisting cursor_probe_ok=False) and ``nested-expand`` raises
+                # an actionable error — instead of the raw HTTP error escaping and
+                # failing the read, which would break the "auto never raises on a
+                # capability shortfall" contract.
                 return (
                     "error",
                     "cursor_probe=nested-expand needs the source to accept "
@@ -3088,6 +3109,18 @@ def register_lakeflow_source(spark):
                     "options). Use cursor_probe=batch or cursor_probe=auto (which falls back "
                     "to $batch / the plain N+1 walk), or cursor_probe=false for the plain walk.",
                 )
+            except Exception as exc:  # noqa: BLE001 — transient, NOT a capability verdict
+                # Retry-exhausted throttling (RuntimeError after the 429/503
+                # budget), network exhaustion (ConnectionError/Timeout), auth —
+                # a throttle window can open BETWEEN the sibling fetches, so
+                # "the reference fetch just succeeded" is not evidence of a
+                # capability rejection. Treating these as definitive pinned a
+                # false cursor_probe_ok=False for the cache TTL under ``auto``
+                # and raised a misleading capability error under strict mode.
+                # Route to the same no-verdict path as the enumeration and
+                # reference fetch sites: degrade this batch, record nothing,
+                # re-probe next batch.
+                raise _CursorProbePreflightUnavailable(str(exc)) from exc
             children = (exp_rows[0].get(leaf_nav) if exp_rows else None) or []
             # Chronological max (``_cursor_max``, not ``max``): a lexical max over
             # mixed fractional renderings can pick the wrong CHILD's value,
@@ -4782,7 +4815,11 @@ def register_lakeflow_source(spark):
             read_since = self._apply_cursor_lookback(since)
             return (
                 cursor_level,
-                self._cursor_filter(cursor_field, read_since),
+                self._cursor_filter(
+                    cursor_field,
+                    read_since,
+                    edm_type=self._edm_types_for_et(level_et).get(cursor_field),
+                ),
                 ",".join(order_terms),
                 None,
             )
@@ -5297,7 +5334,11 @@ def register_lakeflow_source(spark):
                         chain,
                         table_options,
                         extra_filter=combine_filters(
-                            self._cursor_filter(cursor_field, chain_since),
+                            self._cursor_filter(
+                                cursor_field,
+                                chain_since,
+                                edm_type=leaf_types.get(cursor_field),
+                            ),
                             leaf_segment_filter,
                         ),
                         order_by=order_by,
@@ -5465,7 +5506,12 @@ def register_lakeflow_source(spark):
                                 chain,
                                 leaf_opts,
                                 extra_filter=combine_filters(
-                                    self._cursor_filter(cursor_field, since), leaf_segment_filter
+                                    self._cursor_filter(
+                                        cursor_field,
+                                        since,
+                                        edm_type=leaf_types.get(cursor_field),
+                                    ),
+                                    leaf_segment_filter,
                                 ),
                                 order_by=order_by,
                             ),
@@ -5559,7 +5605,8 @@ def register_lakeflow_source(spark):
                 f"whose {cursor_field} equals the prior offset (server did not "
                 f"honor `{cursor_field} gt <since>`). Fix the cursor at the "
                 f"source (non-nullable, strictly monotonic), exclude offending "
-                f"rows with `filter`/`filter_at_<segment>`, or pick a different "
+                f"rows with `filter`/`filter_at_<segment>` (or drop null-cursor "
+                f"rows entirely with cursor_nulls=ignore), or pick a different "
                 f"cursor."
             )
 
@@ -6787,7 +6834,11 @@ def register_lakeflow_source(spark):
                     if cursor_field not in select_cols:
                         select_cols.append(cursor_field)
                     if cursor_lower is not None:
-                        cursor_extra = self._cursor_filter(cursor_field, cursor_lower)
+                        cursor_extra = self._cursor_filter(
+                            cursor_field,
+                            cursor_lower,
+                            edm_type=self._edm_types_for_et(ancestor_et).get(cursor_field),
+                        )
                     terms = [f"{cursor_field} asc"]
                     terms.extend(f"{pk} asc" for pk in ancestor_pks if pk != cursor_field)
                     order_by = ",".join(terms)
@@ -8813,7 +8864,13 @@ def register_lakeflow_source(spark):
             since = start_offset.get("cursor") if start_offset else None
             segment_filters = _resolve_segment_filters(table_options, [table_name])
             extra_filter = _combine_filters(
-                self._cursor_filter(cursor_field, since),
+                self._cursor_filter(
+                    cursor_field,
+                    since,
+                    edm_type=self._edm_types_for_table(
+                        table_name, (table_options or {}).get("namespace")
+                    ).get(cursor_field),
+                ),
                 segment_filters.get(0),
             )
             # Append primary-key columns as $orderby tie-breakers. Without a
@@ -9401,7 +9458,10 @@ def register_lakeflow_source(spark):
                         f"{item!r}."
                     )
                 context = str(item.get("@odata.context", "")).lower()
-                if context.endswith("/$link") or context.endswith("/$deletedlink"):
+                is_tombstone = "@removed" in item or "$deletedentity" in context
+                if not is_tombstone and (
+                    context.endswith("/$link") or context.endswith("/$deletedlink")
+                ):
                     # v4.01 relationship-change entries (added/deleted LINKS,
                     # carrying source/relationship/target — not entity rows).
                     # This connector never ingests navigation properties on the
@@ -9409,7 +9469,10 @@ def register_lakeflow_source(spark):
                     # rows — skip them. Without this they fell into the regular-
                     # entity branch and died in the sparse-entity guard with a
                     # misleading "missing properties" diagnosis, blocking delta
-                    # entirely against servers that report link changes.
+                    # entirely against servers that report link changes. A
+                    # contradictory entry carrying BOTH @removed and a link
+                    # context takes the tombstone branch instead (its keys
+                    # resolve-or-raise — loud, never a silently dropped delete).
                     _LOG.debug(
                         "OData delta for %r: skipping relationship-change entry "
                         "(context %r) — navigation properties are not ingested.",
@@ -9417,7 +9480,6 @@ def register_lakeflow_source(spark):
                         item.get("@odata.context"),
                     )
                     continue
-                is_tombstone = "@removed" in item or "$deletedentity" in context
                 if not is_tombstone:
                     self._check_no_sparse_entity(item, table_name, expected_fields)
                 records.append(
@@ -10081,9 +10143,17 @@ def register_lakeflow_source(spark):
                         # commit to offset paging for the rest of this walk so
                         # keyset and skip positions can't interleave.
                         can_keyset = False
-                        nxt = _pg_set_query(url, "$skip", str(base_skip + fetched))
+                        # Strip any residual opaque token (a resumed foreign
+                        # continuation) like the keyset path does — a URL
+                        # carrying BOTH $skiptoken and $skip double-positions
+                        # on servers that apply both.
+                        nxt = _pg_set_query(
+                            _pg_strip_positional(url), "$skip", str(base_skip + fetched)
+                        )
                 else:
-                    nxt = _pg_set_query(url, "$skip", str(base_skip + fetched))
+                    nxt = _pg_set_query(
+                        _pg_strip_positional(url), "$skip", str(base_skip + fetched)
+                    )
                 yield page_rows, nxt
                 cur_url = nxt
 
@@ -10337,7 +10407,8 @@ def register_lakeflow_source(spark):
                     f"{'' if self._service_origin[2] is None else ':' + str(self._service_origin[2])}"
                     f", but was asked to reach {origin[0]}://{origin[1]}"
                     f"{'' if origin[2] is None else ':' + str(origin[2])} "
-                    f"(likely a server-supplied @odata.nextLink pointing off-host). "
+                    f"(a server-supplied @odata.nextLink pointing off-host, or an "
+                    f"HTTP redirect Location). "
                     f"Following it would send the Authorization header to that "
                     f"host. If the service legitimately paginates across hosts, "
                     f"this connector does not support it."
@@ -11409,7 +11480,9 @@ def register_lakeflow_source(spark):
         # Cursor filter formatting
         # ------------------------------------------------------------------
 
-        def _cursor_filter(self, cursor_field: str, since: Any) -> str | None:
+        def _cursor_filter(
+            self, cursor_field: str, since: Any, edm_type: str | None = None
+        ) -> str | None:
             """Build the `$filter` clause for an incremental fetch.
 
             Strict `cursor gt since` once the offset has advanced; `None` on
@@ -11418,10 +11491,18 @@ def register_lakeflow_source(spark):
             is no wall-clock ceiling, which is what makes continuous polling
             work and what keeps the connector type-agnostic over the cursor
             column.
+
+            ``edm_type`` (the cursor column's declared Edm type, when the
+            caller has it) steers literal quoting via ``odata_literal_typed``
+            — an IEEE754Compatible server renders an Edm.Int64 watermark as a
+            STRING, and the untyped sniff would quote it (``Seq gt '7000'``:
+            strict servers 400). Callers without CSDL in reach fall back to
+            the sniff, exactly as before.
             """
             if since is None:
                 return None
-            return f"{cursor_field} gt {_odata_literal(since)}"
+            literal = _odata_literal_typed(since, edm_type) if edm_type else _odata_literal(since)
+            return f"{cursor_field} gt {literal}"
 
         def _cursor_max_end_offset(self, cursors: list, since: Any) -> dict:
             """End offset for a natural-completion cursor batch: ``{"cursor": max}``
@@ -11977,6 +12058,7 @@ def register_lakeflow_source(spark):
     _combine_filters = combine_filters
     _join_url = join_url
     _odata_literal = odata_literal
+    _odata_literal_typed = odata_literal_typed
     _parse_contained_path = parse_contained_path
     _resolve_segment_filters = resolve_segment_filters
     _validate_page_size = validate_page_size

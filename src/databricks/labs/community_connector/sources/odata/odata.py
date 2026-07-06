@@ -114,6 +114,7 @@ from databricks.labs.community_connector.sources.odata._contained import (
     _pg_page_fingerprint,
     _pg_parse_top,
     _pg_set_query,
+    _pg_strip_positional,
     _pg_strip_query,
     _pg_with_extra_filter,
     combine_filters as _combine_filters,
@@ -122,6 +123,7 @@ from databricks.labs.community_connector.sources.odata._contained import (
     join_url as _join_url,
     looks_like_iso8601 as _looks_like_iso8601,
     odata_literal as _odata_literal,
+    odata_literal_typed as _odata_literal_typed,
     parse_contained_path as _parse_contained_path,
     resolve_segment_filters as _resolve_segment_filters,
     validate_page_size as _validate_page_size,
@@ -1969,7 +1971,13 @@ class ODataLakeflowConnect(
         since = start_offset.get("cursor") if start_offset else None
         segment_filters = _resolve_segment_filters(table_options, [table_name])
         extra_filter = _combine_filters(
-            self._cursor_filter(cursor_field, since),
+            self._cursor_filter(
+                cursor_field,
+                since,
+                edm_type=self._edm_types_for_table(
+                    table_name, (table_options or {}).get("namespace")
+                ).get(cursor_field),
+            ),
             segment_filters.get(0),
         )
         # Append primary-key columns as $orderby tie-breakers. Without a
@@ -2557,7 +2565,10 @@ class ODataLakeflowConnect(
                     f"{item!r}."
                 )
             context = str(item.get("@odata.context", "")).lower()
-            if context.endswith("/$link") or context.endswith("/$deletedlink"):
+            is_tombstone = "@removed" in item or "$deletedentity" in context
+            if not is_tombstone and (
+                context.endswith("/$link") or context.endswith("/$deletedlink")
+            ):
                 # v4.01 relationship-change entries (added/deleted LINKS,
                 # carrying source/relationship/target — not entity rows).
                 # This connector never ingests navigation properties on the
@@ -2565,7 +2576,10 @@ class ODataLakeflowConnect(
                 # rows — skip them. Without this they fell into the regular-
                 # entity branch and died in the sparse-entity guard with a
                 # misleading "missing properties" diagnosis, blocking delta
-                # entirely against servers that report link changes.
+                # entirely against servers that report link changes. A
+                # contradictory entry carrying BOTH @removed and a link
+                # context takes the tombstone branch instead (its keys
+                # resolve-or-raise — loud, never a silently dropped delete).
                 _LOG.debug(
                     "OData delta for %r: skipping relationship-change entry "
                     "(context %r) — navigation properties are not ingested.",
@@ -2573,7 +2587,6 @@ class ODataLakeflowConnect(
                     item.get("@odata.context"),
                 )
                 continue
-            is_tombstone = "@removed" in item or "$deletedentity" in context
             if not is_tombstone:
                 self._check_no_sparse_entity(item, table_name, expected_fields)
             records.append(
@@ -3237,9 +3250,17 @@ class ODataLakeflowConnect(
                     # commit to offset paging for the rest of this walk so
                     # keyset and skip positions can't interleave.
                     can_keyset = False
-                    nxt = _pg_set_query(url, "$skip", str(base_skip + fetched))
+                    # Strip any residual opaque token (a resumed foreign
+                    # continuation) like the keyset path does — a URL
+                    # carrying BOTH $skiptoken and $skip double-positions
+                    # on servers that apply both.
+                    nxt = _pg_set_query(
+                        _pg_strip_positional(url), "$skip", str(base_skip + fetched)
+                    )
             else:
-                nxt = _pg_set_query(url, "$skip", str(base_skip + fetched))
+                nxt = _pg_set_query(
+                    _pg_strip_positional(url), "$skip", str(base_skip + fetched)
+                )
             yield page_rows, nxt
             cur_url = nxt
 
@@ -3493,7 +3514,8 @@ class ODataLakeflowConnect(
                 f"{'' if self._service_origin[2] is None else ':' + str(self._service_origin[2])}"
                 f", but was asked to reach {origin[0]}://{origin[1]}"
                 f"{'' if origin[2] is None else ':' + str(origin[2])} "
-                f"(likely a server-supplied @odata.nextLink pointing off-host). "
+                f"(a server-supplied @odata.nextLink pointing off-host, or an "
+                f"HTTP redirect Location). "
                 f"Following it would send the Authorization header to that "
                 f"host. If the service legitimately paginates across hosts, "
                 f"this connector does not support it."
@@ -4565,7 +4587,9 @@ class ODataLakeflowConnect(
     # Cursor filter formatting
     # ------------------------------------------------------------------
 
-    def _cursor_filter(self, cursor_field: str, since: Any) -> str | None:
+    def _cursor_filter(
+        self, cursor_field: str, since: Any, edm_type: str | None = None
+    ) -> str | None:
         """Build the `$filter` clause for an incremental fetch.
 
         Strict `cursor gt since` once the offset has advanced; `None` on
@@ -4574,10 +4598,18 @@ class ODataLakeflowConnect(
         is no wall-clock ceiling, which is what makes continuous polling
         work and what keeps the connector type-agnostic over the cursor
         column.
+
+        ``edm_type`` (the cursor column's declared Edm type, when the
+        caller has it) steers literal quoting via ``odata_literal_typed``
+        — an IEEE754Compatible server renders an Edm.Int64 watermark as a
+        STRING, and the untyped sniff would quote it (``Seq gt '7000'``:
+        strict servers 400). Callers without CSDL in reach fall back to
+        the sniff, exactly as before.
         """
         if since is None:
             return None
-        return f"{cursor_field} gt {_odata_literal(since)}"
+        literal = _odata_literal_typed(since, edm_type) if edm_type else _odata_literal(since)
+        return f"{cursor_field} gt {literal}"
 
     def _cursor_max_end_offset(self, cursors: list, since: Any) -> dict:
         """End offset for a natural-completion cursor batch: ``{"cursor": max}``

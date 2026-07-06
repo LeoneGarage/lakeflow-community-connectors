@@ -499,7 +499,11 @@ class PartitionMixin(SupportsPartitionedStream):
                 if cursor_field not in select_cols:
                     select_cols.append(cursor_field)
                 if cursor_lower is not None:
-                    cursor_extra = self._cursor_filter(cursor_field, cursor_lower)
+                    cursor_extra = self._cursor_filter(
+                        cursor_field,
+                        cursor_lower,
+                        edm_type=self._edm_types_for_et(ancestor_et).get(cursor_field),
+                    )
                 terms = [f"{cursor_field} asc"]
                 terms.extend(f"{pk} asc" for pk in ancestor_pks if pk != cursor_field)
                 order_by = ",".join(terms)

@@ -243,12 +243,22 @@ def trim_to_distinct_cursor_boundary(
     Returns an empty list when every record shares one cursor value;
     the caller decides whether that's recoverable (natural exhaustion)
     or a hard failure (truncated batch with too-small cap).
+
+    Cohort membership is SAME-INSTANT (:func:`cursor_same_instant`), not
+    raw equality: a mixed-rendering batch (page 1 renders an Int64 cursor
+    as ints, page 2 as strings — a mixed-version LB) would otherwise
+    split one value's cohort at the rendering seam, trim only the
+    differently-rendered tail, and leave the watermark EQUAL to the
+    trimmed rows' value — ``cursor gt <watermark>`` then never re-fetches
+    them (permanent loss). Same-instant grouping trims the whole cohort
+    as one, restoring the watermark-strictly-below-boundary invariant
+    regardless of rendering.
     """
     if not records:
         return records
     boundary = records[-1].get(cursor_field)
     trim_idx = len(records)
-    while trim_idx > 0 and records[trim_idx - 1].get(cursor_field) == boundary:
+    while trim_idx > 0 and cursor_same_instant(records[trim_idx - 1].get(cursor_field), boundary):
         trim_idx -= 1
     return records[:trim_idx]
 

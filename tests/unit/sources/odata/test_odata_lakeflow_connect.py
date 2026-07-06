@@ -8622,9 +8622,12 @@ def test_partition_lookback_floors_read_boundary_not_fence():
     # the overlap window.
     assert parts
     assert all(p["cursor_lower"] == "2024-05-01T00:00:00Z" for p in parts)
-    # And the discovery fetch used the floored boundary on the wire.
+    # And the discovery fetch used the floored boundary on the wire —
+    # QUOTED: the cursor is declared Edm.String, and typed rendering
+    # (round 41) quotes string literals even when they look like ISO
+    # timestamps (the bare sniff form 400s strict servers).
     urls = [unquote(call.request.url) for call in responses.calls]
-    assert any("Name gt 2024-05-01T00:00:00Z" in u for u in urls)
+    assert any("Name gt '2024-05-01T00:00:00Z'" in u for u in urls)
 
 
 @responses.activate
@@ -16471,3 +16474,156 @@ def test_dunder_nav_property_skipped_in_discovery():
     tables = c.list_tables()
     assert "Parents" in tables and "Parents__Pets" in tables
     assert not any("My__Kids" in t for t in tables)
+
+
+# ---------------------------------------------------------------------------
+# Round 41 — same-instant boundary trim, typed cursor-filter rendering,
+# probe-fetch transient classification, +-encoded orderby
+# ---------------------------------------------------------------------------
+
+R41_INT64_METADATA = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="sq" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Event">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="Seq" Type="Edm.Int64"/>
+      </EntityType>
+      <EntityContainer Name="C"><EntitySet Name="Events" EntityType="sq.Event"/></EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+
+def test_trim_boundary_groups_mixed_renderings():
+    """The boundary trim groups the cohort by SAME-INSTANT, not raw
+    equality: a same-value cohort spanning a page-rendering seam (ints on
+    page 1, strings on page 2) used to trim only the differently-rendered
+    tail while the watermark landed EQUAL to the trimmed rows' value — gt
+    never re-fetched them (permanent loss)."""
+    from databricks.labs.community_connector.sources.odata._helpers import (
+        trim_to_distinct_cursor_boundary,
+    )
+
+    records = [{"Id": 1, "Seq": 5000}, {"Id": 2, "Seq": 6000}, {"Id": 3, "Seq": "6000"}]
+    trimmed = trim_to_distinct_cursor_boundary(records, "Seq")
+    assert [r["Id"] for r in trimmed] == [1]  # whole 6000-cohort trimmed as one
+    # Timestamp rendering variants group too.
+    records = [
+        {"Id": 1, "T": "2024-01-01T00:00:00Z"},
+        {"Id": 2, "T": "2024-02-01T00:00:00Z"},
+        {"Id": 3, "T": "2024-02-01T00:00:00.000Z"},
+    ]
+    assert [r["Id"] for r in trim_to_distinct_cursor_boundary(records, "T")] == [1]
+    # Null-cohort behavior preserved: all-null trims to empty.
+    assert trim_to_distinct_cursor_boundary([{"T": None}, {"T": None}], "T") == []
+
+
+@responses.activate
+def test_flat_cursor_filter_typed_rendering_numeric_string_watermark():
+    """A numeric-string watermark against an Edm.Int64-declared cursor
+    renders BARE on the wire (Seq gt 7000) — the untyped sniff quoted it
+    (Seq gt '7000'), which strict servers 400. This is batch 2 of the
+    round-40 rendering-switch scenario."""
+    from urllib.parse import unquote
+
+    responses.get(f"{SERVICE_URL}$metadata", body=R41_INT64_METADATA, status=200)
+    responses.get(f"{SERVICE_URL}Events", json={"value": []}, match_querystring=False)
+    c = _make({"token": "t"})
+    rows, _ = c.read_table(
+        "Events", {"cursor": "7000"}, {"cursor_field": "Seq", "pagination": "nextlink"}
+    )
+    list(rows)
+    data_urls = [
+        unquote(call.request.url) for call in responses.calls if "Events" in call.request.url
+    ]
+    assert data_urls and all("Seq gt 7000" in u for u in data_urls)
+    assert not any("'7000'" in u for u in data_urls)
+
+
+@responses.activate
+def test_probe_preflight_transient_fetch_is_no_verdict_not_definitive():
+    """A retry-exhausted transient (503) on the probe-shaped $expand fetch
+    is NOT capability evidence — it used to return the definitive 'error'
+    status, pinning a false cursor_probe_ok=false for the cache TTL under
+    auto and raising a misleading capability error under strict. It now
+    routes to the no-verdict path: auto degrades this batch and records
+    NOTHING; strict raises the accurate 'before reaching a verdict'."""
+    from urllib.parse import unquote
+
+    def _mock_all():
+        responses.get(f"{SERVICE_URL}$metadata", body=R39_FLIP_METADATA, status=200)
+        responses.get(f"{SERVICE_URL}Roots", json={"value": [{"Id": 1}]}, match_querystring=False)
+
+        def _mids_cb(req):
+            if "$expand=" in unquote(req.url):
+                return (503, {}, "busy")  # probe-shaped fetch: throttled
+            return (200, {}, json.dumps({"value": [{"Id": 7}]}))
+
+        responses.add_callback(responses.GET, f"{SERVICE_URL}Roots(1)/Mids", callback=_mids_cb)
+        responses.get(
+            f"{SERVICE_URL}Roots(1)/Mids(7)/Leaves",
+            json={
+                "value": [
+                    {"RecordLastModified": "2024-05-02T00:00:00Z"},
+                    {"RecordLastModified": "2024-05-01T00:00:00Z"},
+                ]
+            },
+            match_querystring=False,
+        )
+
+    _mock_all()
+    c = _make({"max_retries": "0"})
+    supported, conclusive = c._verify_cursor_probe_support(
+        ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified", None, strict=False
+    )
+    assert (supported, conclusive) == (False, False)
+    # Nothing recorded anywhere — the next batch re-probes.
+    assert c._cached_capability("cursor_probe_ok", table_name="Roots__Mids__Leaves") is None
+    responses.reset()
+    _mock_all()
+    c2 = _make({"max_retries": "0"})
+    with pytest.raises(ValueError, match="before reaching a verdict"):
+        c2._verify_cursor_probe_support(
+            ["Roots", "Mids", "Leaves"], None, {}, "RecordLastModified", None, strict=True
+        )
+
+
+def test_pg_orderby_keys_plus_encoded_spaces():
+    """'+' is a legal space encoding in query strings: 'Id+asc' must parse
+    to key 'Id' and 'Name+desc' must trip the desc guard — not produce the
+    bogus key 'Id+asc' that seeks on a nonexistent column."""
+    from databricks.labs.community_connector.sources.odata._contained import _pg_orderby_keys
+
+    assert _pg_orderby_keys("https://x/S?$orderby=Id+asc") == ["Id"]
+    assert _pg_orderby_keys("https://x/S?$orderby=Name+desc") == []
+    assert _pg_orderby_keys("https://x/S?$orderby=A+asc,B+asc") == ["A", "B"]
+
+
+@responses.activate
+def test_delta_removed_with_link_context_still_tombstones():
+    """A contradictory entry carrying BOTH @removed and a $deletedLink
+    context takes the TOMBSTONE branch (keys resolve-or-raise — loud, never
+    a silently dropped delete)."""
+    _mock_metadata()
+    body = _delta_bootstrap_body(
+        [
+            {
+                "@removed": {"reason": "deleted"},
+                "@odata.context": f"{SERVICE_URL}$metadata#Customers/$deletedLink",
+                "@odata.id": f"{SERVICE_URL}Customers(5)",
+            }
+        ]
+    )
+    responses.get(
+        f"{SERVICE_URL}Customers",
+        json=body,
+        headers={"Preference-Applied": "odata.track-changes"},
+        match_querystring=False,
+    )
+    c = _make()
+    records, _ = c.read_table("Customers", {}, {"delta_tracking": "enabled"})
+    (row,) = list(records)
+    assert row["Id"] == 5 and row["_deleted"] is True

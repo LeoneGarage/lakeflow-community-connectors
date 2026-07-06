@@ -512,14 +512,16 @@ _PG_POSITIONAL = ("$skiptoken", "$skip")
 
 
 def _pg_is_continuation(url: str) -> bool:
-    """Whether ``url`` looks like a server-issued continuation link — it
-    carries a ``$skiptoken`` or ``$skip`` in any casing/encoding (the URLs
-    the connector builds itself carry neither; ``$skip`` paging rewrites via
-    :func:`_pg_set_query` only on URLs that already went through the
-    client-driven drain). Case-insensitive: a camelCase ``$skipToken=``
-    continuation must not be mistaken for a plain collection URL, or the
-    ``$top`` injection would append onto an opaque token URL — the exact
-    §11.2.5.7 hazard the injection guard exists to avoid."""
+    """Whether ``url`` carries a positional param (``$skiptoken`` or
+    ``$skip``, any casing/encoding) — i.e. it points mid-collection.
+    NOTE this matches the connector's OWN synthesized ``$skip``
+    continuations too, not just server-issued token links: the sole
+    consumer today (the ``$batch`` re-issue's ``$top`` injection guard)
+    wants exactly that — never append ``$top`` onto anything positioned
+    mid-walk (the §11.2.5.7 hazard) — but a future consumer needing
+    "server-issued token specifically" must test for ``$skiptoken``
+    alone. Case-insensitive: a camelCase ``$skipToken=`` continuation
+    must not be mistaken for a plain collection URL."""
     _, _, query = url.partition("?")
     return any(
         _pg_param_name(part) in _PG_POSITIONAL for part in (query.split("&") if query else [])
@@ -552,7 +554,11 @@ def _pg_orderby_keys(url: str) -> list[str]:
     if not raw:
         return []
     keys = []
-    for term in raw.replace("%20", " ").split(","):
+    # ``+`` is a legal space encoding in query strings and server-issued
+    # continuation links may use it ("Id+asc") — without decoding it the
+    # desc guard misses and the "key" keeps its suffix, seeking on a
+    # nonexistent column (null boundary → $skip, or a server 400).
+    for term in raw.replace("%20", " ").replace("+", " ").split(","):
         term = term.strip()
         if term.endswith(" desc"):
             return []
@@ -1643,7 +1649,11 @@ class ContainedNavMixin:
                 if level == cursor_level:
                     if cursor_field not in select_cols:
                         select_cols.append(cursor_field)
-                    extra_filter = self._cursor_filter(cursor_field, since)
+                    extra_filter = self._cursor_filter(
+                        cursor_field,
+                        since,
+                        edm_type=self._edm_types_for_et(ancestor_et).get(cursor_field),
+                    )
                     terms = [f"{cursor_field} asc"]
                     terms.extend(f"{pk} asc" for pk in ancestor_pks if pk != cursor_field)
                     order_by = ",".join(terms)
@@ -1967,20 +1977,19 @@ class ContainedNavMixin:
                         segments, namespace, table_options, cursor_field
                     )
                 except _CursorProbePreflightUnavailable as exc:
-                    # The preflight's enumeration or trusted-reference fetch
-                    # failed before reaching a verdict (only those two fetch
-                    # sites raise this type — a programming error in the
-                    # preflight's own logic still propagates). Unlike the
-                    # probe-shape rejection handled inside
-                    # ``_cursor_probe_check_sample`` (whose sibling fetches
-                    # just succeeded, making it definitive), there is no
-                    # evidence here to distinguish a capability shortfall
-                    # ($orderby desc / $select rejected on direct navigation)
-                    # from a transient blip — so treat it like the other
-                    # verifiers treat transients: degrade THIS read to the
-                    # $batch/plain cascade, cache and record NOTHING (the
-                    # next batch re-probes), and never let the raw HTTP
-                    # error escape a ``cursor_probe=auto`` read.
+                    # A preflight fetch failed before reaching a verdict —
+                    # the enumeration, the trusted-reference fetch, or (since
+                    # round 41) a TRANSIENT failure of the probe-shaped fetch
+                    # itself (only an immediate non-retryable HTTPError there
+                    # is a definitive shape rejection; retry-exhausted
+                    # throttling and network exhaustion land here — a
+                    # programming error in the preflight's own logic still
+                    # propagates). There is no evidence to distinguish a
+                    # capability shortfall from a transient blip — so treat
+                    # it like the other verifiers treat transients: degrade
+                    # THIS read to the $batch/plain cascade, cache and record
+                    # NOTHING (the next batch re-probes), and never let the
+                    # raw HTTP error escape a ``cursor_probe=auto`` read.
                     msg = (
                         f"cursor_probe preflight against "
                         f"{CONTAINED_PATH_SEP.join(segments)!r} failed before reaching "
@@ -2176,16 +2185,18 @@ class ContainedNavMixin:
         )
         try:
             exp_rows, _ = self._fetch_one_expand_page(expand_url)
-        except Exception:  # server REJECTED the nested-$expand probe shape
+        except requests.HTTPError:  # server REJECTED the nested-$expand probe shape
             # e.g. Hexagon Smart API 400s on inner $orderby/$top/$select rather
-            # than accepting it (or silently mis-ordering). The enumeration and
-            # direct-navigation fetches for this sample just succeeded, so this
-            # is a definitive capability rejection, not a transient blip. Report
-            # it like the mis-order case ("error") so ``auto`` cascades to
-            # $batch / the plain walk (persisting cursor_probe_ok=False) and
-            # ``nested-expand`` raises an actionable error — instead of the raw
-            # HTTP error escaping and failing the read, which would break the
-            # "auto never raises on a capability shortfall" contract.
+            # than accepting it (or silently mis-ordering). An immediate
+            # HTTPError is a NON-RETRYABLE 4xx (the retryable statuses exhaust
+            # the retry budget into RuntimeError, and network failures re-raise
+            # their own types — neither reaches this clause), so this is a
+            # definitive capability rejection. Report it like the mis-order
+            # case ("error") so ``auto`` cascades to $batch / the plain walk
+            # (persisting cursor_probe_ok=False) and ``nested-expand`` raises
+            # an actionable error — instead of the raw HTTP error escaping and
+            # failing the read, which would break the "auto never raises on a
+            # capability shortfall" contract.
             return (
                 "error",
                 "cursor_probe=nested-expand needs the source to accept "
@@ -2195,6 +2206,18 @@ class ContainedNavMixin:
                 "options). Use cursor_probe=batch or cursor_probe=auto (which falls back "
                 "to $batch / the plain N+1 walk), or cursor_probe=false for the plain walk.",
             )
+        except Exception as exc:  # noqa: BLE001 — transient, NOT a capability verdict
+            # Retry-exhausted throttling (RuntimeError after the 429/503
+            # budget), network exhaustion (ConnectionError/Timeout), auth —
+            # a throttle window can open BETWEEN the sibling fetches, so
+            # "the reference fetch just succeeded" is not evidence of a
+            # capability rejection. Treating these as definitive pinned a
+            # false cursor_probe_ok=False for the cache TTL under ``auto``
+            # and raised a misleading capability error under strict mode.
+            # Route to the same no-verdict path as the enumeration and
+            # reference fetch sites: degrade this batch, record nothing,
+            # re-probe next batch.
+            raise _CursorProbePreflightUnavailable(str(exc)) from exc
         children = (exp_rows[0].get(leaf_nav) if exp_rows else None) or []
         # Chronological max (``_cursor_max``, not ``max``): a lexical max over
         # mixed fractional renderings can pick the wrong CHILD's value,
@@ -3889,7 +3912,11 @@ class ContainedNavMixin:
         read_since = self._apply_cursor_lookback(since)
         return (
             cursor_level,
-            self._cursor_filter(cursor_field, read_since),
+            self._cursor_filter(
+                cursor_field,
+                read_since,
+                edm_type=self._edm_types_for_et(level_et).get(cursor_field),
+            ),
             ",".join(order_terms),
             None,
         )
@@ -4404,7 +4431,11 @@ class ContainedNavMixin:
                     chain,
                     table_options,
                     extra_filter=combine_filters(
-                        self._cursor_filter(cursor_field, chain_since),
+                        self._cursor_filter(
+                            cursor_field,
+                            chain_since,
+                            edm_type=leaf_types.get(cursor_field),
+                        ),
                         leaf_segment_filter,
                     ),
                     order_by=order_by,
@@ -4572,7 +4603,12 @@ class ContainedNavMixin:
                             chain,
                             leaf_opts,
                             extra_filter=combine_filters(
-                                self._cursor_filter(cursor_field, since), leaf_segment_filter
+                                self._cursor_filter(
+                                    cursor_field,
+                                    since,
+                                    edm_type=leaf_types.get(cursor_field),
+                                ),
+                                leaf_segment_filter,
                             ),
                             order_by=order_by,
                         ),
@@ -4666,7 +4702,8 @@ class ContainedNavMixin:
             f"whose {cursor_field} equals the prior offset (server did not "
             f"honor `{cursor_field} gt <since>`). Fix the cursor at the "
             f"source (non-nullable, strictly monotonic), exclude offending "
-            f"rows with `filter`/`filter_at_<segment>`, or pick a different "
+            f"rows with `filter`/`filter_at_<segment>` (or drop null-cursor "
+            f"rows entirely with cursor_nulls=ignore), or pick a different "
             f"cursor."
         )
 
