@@ -418,8 +418,8 @@ class PartitionMixin(SupportsPartitionedStream):
         order_by = f"{cursor_field} desc"
         seg_filter = resolve_segment_filters(table_options or {}, segments).get(0)
 
-        def _first_value(extra_filter):
-            url = self._build_url(top_set, opts, extra_filter=extra_filter, order_by=order_by)
+        def _first_value(extra_filter, use_order_by=order_by):
+            url = self._build_url(top_set, opts, extra_filter=extra_filter, order_by=use_order_by)
             for row in self._fetch_pages(url):
                 value = row.get(cursor_field)
                 if value is not None:
@@ -427,11 +427,54 @@ class PartitionMixin(SupportsPartitionedStream):
             return None
 
         try:
-            return _first_value(combine_filters(seg_filter, f"{cursor_field} ne null"))
+            value = _first_value(combine_filters(seg_filter, f"{cursor_field} ne null"))
         except requests.HTTPError as exc:
             if exc.response is None or exc.response.status_code != 400:
                 raise
-            return _first_value(seg_filter)
+            value = _first_value(seg_filter)
+        if value is not None:
+            self._verify_fence_orderby_desc(
+                top_set, namespace, cursor_field, seg_filter, value, _first_value
+            )
+        return value
+
+    def _verify_fence_orderby_desc(
+        self, top_set, namespace, cursor_field, seg_filter, probed_max, first_value
+    ) -> None:
+        """One-time behavioural check that the fence probe's ``$orderby …
+        desc`` is actually honoured: ask for any row with ``cursor gt
+        <probed max>`` — a row coming back proves the probe returned a
+        NON-max row (the server ignored ``desc``), which would pin the fence
+        at a stale value and silently stall the stream forever
+        (``latest_offset`` returns ``end == start``, every trigger skipped,
+        data accumulating unread). The adjacent nulls-first quirk already
+        has its ``ne null`` guard; this closes the other way the ``$top=1``
+        probe can lie. The PASS verdict rides the shared process/file
+        capability cache (15-min TTL, same layer as ``batch_ok``) so the
+        extra request is paid once per table per TTL, not per trigger; a
+        FAIL raises actionably every time — a desc-ignoring server cannot
+        stream partitioned, and silence here is the stall."""
+        shared_key = f"{namespace}:{top_set}" if namespace else top_set
+        if self._cached_capability("fence_desc_ok", table_name=shared_key):
+            return
+        edm_type = self._edm_types_for_et(self._entity_type_for(top_set, namespace)).get(
+            cursor_field
+        )
+        above = first_value(
+            combine_filters(seg_filter, self._cursor_filter(cursor_field, probed_max, edm_type)),
+            use_order_by=None,
+        )
+        if above is not None:
+            raise ValueError(
+                f"The partitioned-stream fence probe on {top_set!r} is unreliable: "
+                f"$orderby={cursor_field} desc&$top=1 returned {probed_max!r}, but the "
+                f"server also has rows with {cursor_field} gt {probed_max!r} (e.g. "
+                f"{above!r}) — it is ignoring $orderby. A mis-probed fence pins the "
+                f"stream's watermark and silently stalls it with data pending. Fix the "
+                f"server's ordering support, or read this table serially (drop "
+                f"num_partitions / use a non-partitioned configuration)."
+            )
+        self._store_capability("fence_desc_ok", True, table_name=shared_key)
 
     def _raise_null_cursor_parents(
         self, table_name: str, segments: list[str], cursor_field: str, count: int | None

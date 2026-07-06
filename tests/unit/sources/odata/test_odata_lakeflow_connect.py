@@ -8460,15 +8460,17 @@ def test_partition_latest_offset_probes_top_level_max_cursor():
     """In streaming mode the fence comes from a single
     ``?$top=1&$orderby=<cursor> desc`` probe against the top set."""
     _mock_nested_metadata()
-    # Probe response: the max cursor row.
-    responses.add(
-        responses.GET,
-        f"{SERVICE_URL}Parents",
-        json={"value": [{"Id": 9, "Name": "z"}]},
-        match_querystring=False,
-    )
-    # Add a Name property to the metadata-mocked Parent so the probe
-    # finds a column. The nested metadata declares Parent.Name already.
+
+    # Filter-aware: the round-45 desc self-check asks for ``Name gt 'z'``
+    # and must see an empty set on this compliant server.
+    def _parents(request):
+        from urllib.parse import unquote as _unq
+
+        if "gt" in _unq(request.url):
+            return (200, {}, '{"value": []}')
+        return (200, {}, '{"value": [{"Id": 9, "Name": "z"}]}')
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents)
     c = _make()
     offset = c.latest_offset(
         "Parents__Children",
@@ -8528,6 +8530,21 @@ def test_partition_fence_probe_scopes_to_top_level_filter():
             )
         ],
     )
+    # The round-45 desc self-check keeps the population filter and asks for
+    # anything above the probed max (typed literal — Edm.String quotes).
+    responses.get(
+        f"{SERVICE_URL}Parents",
+        json={"value": []},
+        match=[
+            responses.matchers.query_param_matcher(
+                {
+                    "$top": "1",
+                    "$select": "Name",
+                    "$filter": "(Id eq 5) and (Name gt '2024-05-01T00:00:00Z')",
+                }
+            )
+        ],
+    )
     c = _make()
     offset = c.latest_offset(
         "Parents__Children",
@@ -8567,6 +8584,16 @@ def test_partition_fence_probe_retries_without_null_guard_on_400():
             )
         ],
     )
+    # Round-45 desc self-check: nothing above the probed max.
+    responses.get(
+        f"{SERVICE_URL}Parents",
+        json={"value": []},
+        match=[
+            responses.matchers.query_param_matcher(
+                {"$top": "1", "$select": "Name", "$filter": "Name gt 'z'"}
+            )
+        ],
+    )
     c = _make()
     offset = c.latest_offset("Parents__Children", {"cursor_field": "Name"}, None)
     assert offset == {"cursor": "z"}
@@ -8578,11 +8605,16 @@ def test_partition_latest_offset_never_regresses_fence():
     fence backwards: the docstring's monotonic-progression promise is what
     makes ``cursor gt fence`` a safe dedup boundary."""
     _mock_nested_metadata()
-    responses.get(
-        f"{SERVICE_URL}Parents",
-        json={"value": [{"Id": 1, "Name": "2024-01-01T00:00:00Z"}]},
-        match_querystring=False,
-    )
+
+    def _parents(request):
+        from urllib.parse import unquote as _unq
+
+        # Round-45 desc self-check: nothing above the probed max.
+        if "gt" in _unq(request.url):
+            return (200, {}, '{"value": []}')
+        return (200, {}, '{"value": [{"Id": 1, "Name": "2024-01-01T00:00:00Z"}]}')
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents)
     c = _make()
     offset = c.latest_offset(
         "Parents__Children",
@@ -13633,11 +13665,16 @@ def test_latest_offset_honours_pagination_option():
     under a stale or default mode (and an invalid value must raise the same
     curated error)."""
     responses.get(f"{SERVICE_URL}$metadata", body=GUID_CURSOR_METADATA_XML, status=200)
-    responses.get(
-        f"{SERVICE_URL}Accounts",
-        json={"value": [{"Name": "2020-06-01T00:00:00Z"}]},
-        match_querystring=False,
-    )
+
+    def _accounts(request):
+        from urllib.parse import unquote as _unq
+
+        # Round-45 desc self-check: nothing above the probed max.
+        if "gt" in _unq(request.url):
+            return (200, {}, '{"value": []}')
+        return (200, {}, '{"value": [{"Name": "2020-06-01T00:00:00Z"}]}')
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Accounts", callback=_accounts)
     c = _make()
     with pytest.raises(ValueError, match="pagination"):
         c.latest_offset("Accounts__Contacts", {"cursor_field": "Name", "pagination": "bogus"})
@@ -17093,3 +17130,228 @@ def test_streaming_snapshot_warns_ignored_cap(caplog):
     assert offset.get("snapshot_done") is True
     assert "max_records_per_batch=1 ignored" in caplog.text
     assert "snapshot" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Round 45 — same-rendering (not same-instant) chain-element conflation,
+# fence desc self-check, delta stored-link 4xx curation, keyless-delta gate
+# ---------------------------------------------------------------------------
+
+R45_DIGIT_PK_METADATA = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="q" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Root">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.String" Nullable="false"/>
+        <NavigationProperty Name="Mids" Type="Collection(q.Mid)" ContainsTarget="true"/>
+      </EntityType>
+      <EntityType Name="Mid">
+        <Key><PropertyRef Name="MId"/></Key>
+        <Property Name="MId" Type="Edm.Int32" Nullable="false"/>
+        <NavigationProperty Name="Leaves" Type="Collection(q.Leaf)" ContainsTarget="true"/>
+      </EntityType>
+      <EntityType Name="Leaf">
+        <Key><PropertyRef Name="LId"/></Key>
+        <Property Name="LId" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="ModifiedAt" Type="Edm.DateTimeOffset"/>
+      </EntityType>
+      <EntityContainer Name="C"><EntitySet Name="Roots" EntityType="q.Root"/></EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+
+def test_chain_seek_order_distinct_digit_string_pks_are_unknown():
+    """`cursor_same_instant` calls "007"/"7" equal (right for watermarks);
+    conflating them as one chain POSITION lets a later element decide order
+    across two DIFFERENT parents — a false "before" skips an unwalked
+    subtree past the vanished-anchor reset. Chain elements now conflate
+    only same-RENDERING pairs."""
+    from databricks.labs.community_connector.sources.odata._contained import _chain_seek_order
+    from databricks.labs.community_connector.sources.odata._helpers import (
+        cursor_same_rendering,
+    )
+
+    # The round-45 loss shape: distinct parents, later element decided.
+    assert _chain_seek_order(["7", 5], ["007", 9]) == "unknown"
+    assert _chain_seek_order(["7", 9], ["007", 9]) == "unknown"
+    # A number/numeric-string TYPE flip is one value's two renderings —
+    # still conflates, later element still decides.
+    assert _chain_seek_order([5000, 1], ["5000", 2]) == "before"
+    # Chronological rendering flips still conflate (round-43 semantics).
+    assert (
+        _chain_seek_order(
+            ["2024-01-01T00:00:00Z", 1], ["2024-01-01T00:00:00.000Z", 2]
+        )
+        == "before"
+    )
+    # The predicate itself.
+    assert cursor_same_rendering("007", "7") is False
+    assert cursor_same_rendering("1.0", "1") is False
+    assert cursor_same_rendering("0", "-0") is False
+    assert cursor_same_rendering("5000", 5000) is True
+    assert cursor_same_rendering("2024-01-01T00:00:00Z", "2024-01-01T00:00:00.000Z") is True
+
+
+@responses.activate
+def test_vanished_anchor_with_digit_string_pks_resets_not_skips():
+    """E2E pin of the round-45 loss: 3-level walk parks at parent '007';
+    the parent vanishes; the resume seek used to conflate '007'/'7'
+    numerically and let the child PK decide order ACROSS parents — ending
+    the seek without the reset and folding running_max past parent '7's
+    unwalked subtree (LId 3 permanently lost). Now all-unknown → reset →
+    full recovery."""
+    responses.get(f"{SERVICE_URL}$metadata", body=R45_DIGIT_PK_METADATA, status=200)
+    state = {"batch": 0}
+    leaves = {
+        ("007", 9): [
+            {"LId": 1, "ModifiedAt": "2024-06-01T00:00:00Z"},
+            {"LId": 2, "ModifiedAt": "2024-06-02T00:00:00Z"},
+        ],
+        ("7", 5): [{"LId": 3, "ModifiedAt": "2024-03-01T00:00:00Z"}],
+        ("7", 9): [{"LId": 4, "ModifiedAt": "2024-04-01T00:00:00Z"}],
+    }
+
+    def _leaf_cb(request, key):
+        from urllib.parse import parse_qs, unquote, urlparse
+
+        flt = unquote(parse_qs(urlparse(request.url).query).get("$filter", [""])[0])
+        m = re.search(r"ModifiedAt gt (\S+)", flt)
+        rows = [r for r in leaves.get(key, []) if not m or r["ModifiedAt"] > m.group(1)]
+        return (200, {}, json.dumps({"value": rows}))
+
+    def _roots_cb(_req):
+        live = ["007", "7"] if state["batch"] == 0 else ["7"]
+        return (200, {}, json.dumps({"value": [{"Id": i} for i in sorted(live)]}))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Roots", callback=_roots_cb)
+    for p in ("007", "7"):
+        responses.add_callback(
+            responses.GET,
+            f"{SERVICE_URL}Roots('{p}')/Mids",
+            callback=lambda _r, p=p: (
+                200,
+                {},
+                json.dumps({"value": [{"MId": 9}] if p == "007" else [{"MId": 5}, {"MId": 9}]}),
+            ),
+        )
+        for mid in (5, 9):
+            responses.add_callback(
+                responses.GET,
+                f"{SERVICE_URL}Roots('{p}')/Mids({mid})/Leaves",
+                callback=lambda r, k=(p, mid): _leaf_cb(r, k),
+            )
+    opts = {
+        "cursor_field": "ModifiedAt",
+        "max_records_per_batch": "2",
+        "pagination": "nextlink",
+        "cursor_probe": "false",
+        "expand_contained": "false",
+        "cursor_lookback_seconds": "off",
+    }
+    emitted, offset = [], {}
+    for _ in range(6):
+        recs, offset = _make().read_table("Roots__Mids__Leaves", offset, opts)
+        rows = list(recs)
+        emitted.extend(rows)
+        state["batch"] += 1
+        if emitted and not rows and "parent_keys" not in offset and "parent_idx" not in offset:
+            break
+    got = sorted({r["LId"] for r in emitted})
+    # LId 2 was cap-trimmed in batch 1 and its parent vanished — not owed.
+    assert {1, 3, 4} <= set(got)
+
+
+@responses.activate
+def test_fence_probe_self_checks_orderby_desc():
+    """A server that silently ignores `$orderby ... desc` hands the fence
+    probe a stale first row — the fence pins, get_partitions returns []
+    every trigger, and the stream stalls silently with data pending. The
+    probe now self-checks (`cursor gt <probed max>` must be empty) and
+    raises actionably instead."""
+    _mock_nested_metadata()
+    # Orderby-ignoring server: always default order — probe gets the OLD
+    # row; the self-check (gt) finds the newer one.
+    def _parents(request):
+        from urllib.parse import parse_qs, unquote, urlparse
+
+        flt = unquote(parse_qs(urlparse(request.url).query).get("$filter", [""])[0])
+        rows = [
+            {"Id": 1, "Name": "2024-01-01T00:00:00Z"},
+            {"Id": 2, "Name": "2024-06-01T00:00:00Z"},
+        ]
+        m = re.search(r"Name gt (\S+)", flt)
+        if m:
+            rows = [r for r in rows if r["Name"] > m.group(1).strip("'")]
+        return (200, {}, json.dumps({"value": rows[:1]}))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents)
+    c = _make()
+    with pytest.raises(ValueError, match="ignoring \\$orderby"):
+        c.latest_offset("Parents__Children", {"cursor_field": "Name"}, None)
+
+
+@responses.activate
+def test_delta_stored_link_non_410_4xx_curated():
+    """Real gateways answer 404/400 (not the spec's 410) for an expired
+    delta token; the checkpoint pins the link, so a bare HTTPError re-raised
+    forever was an undiagnosable dead-end. Now a curated error names the
+    cause and the full-refresh remedy — and does NOT auto-rebootstrap."""
+    _mock_metadata()
+    responses.get(
+        f"{SERVICE_URL}Customers",
+        json={"error": {"message": "token not found"}},
+        status=404,
+        match_querystring=False,
+    )
+    c = _make()
+    with pytest.raises(RuntimeError, match="full refresh"):
+        records, _ = c.read_table(
+            "Customers",
+            {"delta_link": f"{SERVICE_URL}Customers?$deltatoken=expired"},
+            {"delta_tracking": "enabled"},
+        )
+        list(records)
+
+
+R45_KEYLESS_METADATA = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="k" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Log">
+        <Property Name="At" Type="Edm.DateTimeOffset"/>
+        <Property Name="Msg" Type="Edm.String"/>
+      </EntityType>
+      <EntityContainer Name="C"><EntitySet Name="Logs" EntityType="k.Log"/></EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"""
+
+
+@responses.activate
+def test_keyless_delta_enabled_raises_auto_falls_back():
+    """Delta rows MERGE on the primary key; a keyless tombstone MERGEs
+    against nothing and the deletion is silently lost — and the
+    per-tombstone raise is gated on a non-empty key list, so it can never
+    fire. Enabled → eager curated error; auto → snapshot fallback with no
+    probe (no Prefer request, no synthetics)."""
+    responses.get(f"{SERVICE_URL}$metadata", body=R45_KEYLESS_METADATA, status=200)
+    prefer_seen = {"n": 0}
+
+    def _logs(request):
+        if request.headers.get("Prefer"):
+            prefer_seen["n"] += 1
+        return (200, {}, '{"value": [{"At": "2024-01-01T00:00:00Z", "Msg": "m"}]}')
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Logs", callback=_logs)
+    c = _make()
+    with pytest.raises(ValueError, match="primary key"):
+        c.read_table("Logs", {}, {"delta_tracking": "enabled"})
+    records, offset = _make().read_table("Logs", {}, {"delta_tracking": "auto"})
+    rows = list(records)
+    assert prefer_seen["n"] == 0  # never probed
+    assert rows and all("_deleted" not in r for r in rows)
+    assert offset.get("snapshot_done") is True

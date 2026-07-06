@@ -2540,6 +2540,30 @@ class ODataLakeflowConnect(
             resp = self._http_get(session, url, **kwargs)
             if resp.status_code == 410 and allow_410:
                 return None, None
+            if allow_410 and 400 <= resp.status_code < 500:
+                # A non-410 4xx on a STORED delta/next link (the spec
+                # prescribes 410 for an expired token, but real gateways
+                # answer 404/400 too). The checkpoint pins this link, so a
+                # bare HTTPError would re-raise unexplained every trigger
+                # forever — curate it instead. Deliberately NOT an
+                # auto-rebootstrap: silently full-re-reading on any 4xx
+                # would mask genuine config/auth errors; 410 stays the only
+                # auto-recovery trigger.
+                try:
+                    _raise_for_status_with_body(resp, url)
+                except requests.HTTPError as exc:
+                    raise RuntimeError(
+                        f"The stored OData change-tracking link for this stream was "
+                        f"rejected with HTTP {resp.status_code} ({exc}). The delta "
+                        f"token has likely expired or been invalidated (the spec "
+                        f"prescribes 410 for this; some gateways answer "
+                        f"{resp.status_code}). The checkpoint pins this link, so the "
+                        f"stream cannot recover on its own: run a full refresh to "
+                        f"restart change tracking from a fresh bootstrap, or set "
+                        f"delta_tracking=disabled and use cursor/snapshot reads. "
+                        f"Note a re-bootstrap cannot recover deletions that happened "
+                        f"while the token was expired — see the delta docs."
+                    ) from exc
             _raise_for_status_with_body(resp, url)
             try:
                 return resp, _decode_json_with_body(resp, url)
@@ -2805,9 +2829,15 @@ class ODataLakeflowConnect(
              its own sequencing).
           3. ``cursor_field`` set + ``delta_tracking=auto`` → cursor wins;
              delta is left dormant, no probe.
-          4. ``delta_tracking=enabled`` → assume support; a probe failure
+          4. no declared primary key → ``enabled`` raises, ``auto`` falls
+             back without probing (delta rows MERGE on the key: a keyless
+             tombstone would MERGE against nothing and the deletion would
+             be silently lost — the per-tombstone raise in
+             ``_build_delta_record`` can't fire with an empty key list, so
+             the gate lives here, eagerly and curated).
+          5. ``delta_tracking=enabled`` → assume support; a probe failure
              surfaces at read time rather than here.
-          5. ``delta_tracking=auto`` → probe once, cache, decide.
+          6. ``delta_tracking=auto`` → probe once, cache, decide.
         """
         setting = self._delta_setting(table_options)
         if setting != "auto":
@@ -2829,6 +2859,23 @@ class ODataLakeflowConnect(
                     "cursor_field; the server-driven delta stream provides "
                     "its own sequencing. Remove cursor_field, or switch to "
                     "delta_tracking=disabled to use cursor-based incremental."
+                )
+            return False
+        if not self._primary_keys_for(table_name, (table_options or {}).get("namespace")):
+            # Keyless entity type: every delta row (upsert or tombstone)
+            # MERGEs on the primary key, so keyless delta is silent loss by
+            # construction — and the per-tombstone raise is gated on a
+            # non-empty key list, so it can never fire here. Enabled →
+            # curated config error; auto → snapshot/cursor fallback with
+            # no probe (the read shape must be decided identically at
+            # schema-freeze and read time, and this decision is static).
+            if setting == "enabled":
+                raise ValueError(
+                    f"delta_tracking=enabled requires a declared primary key on "
+                    f"{table_name!r}: delta upserts and tombstones MERGE on the "
+                    f"key, and the entity type declares none in $metadata — "
+                    f"deletions would be silently lost. Use "
+                    f"delta_tracking=disabled with cursor/snapshot reads."
                 )
             return False
         if setting == "enabled":

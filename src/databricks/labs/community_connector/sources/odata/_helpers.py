@@ -255,6 +255,31 @@ def cursor_same_instant(a: Any, b: Any) -> bool:
     return False
 
 
+def cursor_same_rendering(a: Any, b: Any) -> bool:
+    """Whether ``a`` and ``b`` can plausibly be ONE value's two renderings —
+    the narrower cousin of :func:`cursor_same_instant` for comparing
+    IDENTITY key elements (chain positions), not cursor watermarks.
+
+    The difference is the both-strings numeric case: a server renders one
+    numeric VALUE as ``5000`` (JSON number) or ``"5000"`` (IEEE754Compatible
+    string) — a type flip — but it never re-renders one string key's TEXT
+    (``"007"`` stays ``"007"``). Two numeric STRINGS with different text
+    (``"007"`` vs ``"7"``, ``"1.0"`` vs ``"1"``, ``"0"`` vs ``"-0"``) are
+    therefore two DISTINCT identities that merely alias numerically —
+    ``cursor_same_instant`` calls them equal (right for watermarks, where
+    only the instant matters), but conflating them as one chain POSITION
+    lets a later element decide order across two different parents,
+    defeating the vanished-anchor reset and silently dropping a subtree.
+    Chronological renderings (``…00Z`` vs ``…00.000Z``) still conflate:
+    real servers do re-render one instant's text per request."""
+    if isinstance(a, str) and isinstance(b, str):
+        key_a, key_b = cursor_sort_key(a), cursor_sort_key(b)
+        if isinstance(key_a, datetime) and isinstance(key_b, datetime):
+            return cursor_same_instant(a, b)
+        return a == b
+    return cursor_same_instant(a, b)
+
+
 def cursor_le(a: Any, b: Any) -> bool:
     """Whether ``a <= b`` in cursor order — the exact complement of
     :func:`cursor_newer` under its strict total order (including the

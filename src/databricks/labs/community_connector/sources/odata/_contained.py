@@ -40,6 +40,7 @@ from databricks.labs.community_connector.sources.odata._helpers import (
     cursor_max as _cursor_max,
     cursor_newer as _cursor_newer,
     cursor_same_instant as _cursor_same_instant,
+    cursor_same_rendering as _cursor_same_rendering,
     max_or as _max_or,
     parse_iso8601,
     parse_max_records as _parse_max_records,
@@ -766,10 +767,16 @@ def _chain_seek_order(key_a: list, key_b: list) -> str:
     for unknowns instead of guessing (see the call sites)."""
     try:
         for a, b in zip(key_a, key_b):
-            # Same-instant equality (raw, chronological-key, or exact
-            # numeric) — a rendering flip of an EQUAL element must fall
-            # through to the next element, not decide the order.
-            if _cursor_same_instant(a, b):
+            # Same-RENDERING equality (raw, chronological-key, or a
+            # number/numeric-string type flip) — two renderings of an
+            # EQUAL element must fall through to the next element, not
+            # decide the order. Deliberately NOT cursor_same_instant:
+            # its numeric branch calls two numeric STRINGS with different
+            # text ("007" vs "7") equal, which conflates two DISTINCT
+            # parents into one position and lets a later element decide
+            # order ACROSS parents — a false "before" skips an unwalked
+            # subtree past the vanished-anchor reset (silent loss).
+            if _cursor_same_rendering(a, b):
                 continue
             if not _order_reproducible(a, b):
                 return "unknown"

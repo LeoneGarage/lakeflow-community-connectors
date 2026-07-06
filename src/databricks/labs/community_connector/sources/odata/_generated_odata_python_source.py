@@ -851,6 +851,31 @@ def register_lakeflow_source(spark):
         return False
 
 
+    def cursor_same_rendering(a: Any, b: Any) -> bool:
+        """Whether ``a`` and ``b`` can plausibly be ONE value's two renderings —
+        the narrower cousin of :func:`cursor_same_instant` for comparing
+        IDENTITY key elements (chain positions), not cursor watermarks.
+
+        The difference is the both-strings numeric case: a server renders one
+        numeric VALUE as ``5000`` (JSON number) or ``"5000"`` (IEEE754Compatible
+        string) — a type flip — but it never re-renders one string key's TEXT
+        (``"007"`` stays ``"007"``). Two numeric STRINGS with different text
+        (``"007"`` vs ``"7"``, ``"1.0"`` vs ``"1"``, ``"0"`` vs ``"-0"``) are
+        therefore two DISTINCT identities that merely alias numerically —
+        ``cursor_same_instant`` calls them equal (right for watermarks, where
+        only the instant matters), but conflating them as one chain POSITION
+        lets a later element decide order across two different parents,
+        defeating the vanished-anchor reset and silently dropping a subtree.
+        Chronological renderings (``…00Z`` vs ``…00.000Z``) still conflate:
+        real servers do re-render one instant's text per request."""
+        if isinstance(a, str) and isinstance(b, str):
+            key_a, key_b = cursor_sort_key(a), cursor_sort_key(b)
+            if isinstance(key_a, datetime) and isinstance(key_b, datetime):
+                return cursor_same_instant(a, b)
+            return a == b
+        return cursor_same_instant(a, b)
+
+
     def cursor_le(a: Any, b: Any) -> bool:
         """Whether ``a <= b`` in cursor order — the exact complement of
         :func:`cursor_newer` under its strict total order (including the
@@ -1722,10 +1747,16 @@ def register_lakeflow_source(spark):
         for unknowns instead of guessing (see the call sites)."""
         try:
             for a, b in zip(key_a, key_b):
-                # Same-instant equality (raw, chronological-key, or exact
-                # numeric) — a rendering flip of an EQUAL element must fall
-                # through to the next element, not decide the order.
-                if _cursor_same_instant(a, b):
+                # Same-RENDERING equality (raw, chronological-key, or a
+                # number/numeric-string type flip) — two renderings of an
+                # EQUAL element must fall through to the next element, not
+                # decide the order. Deliberately NOT cursor_same_instant:
+                # its numeric branch calls two numeric STRINGS with different
+                # text ("007" vs "7") equal, which conflates two DISTINCT
+                # parents into one position and lets a later element decide
+                # order ACROSS parents — a false "before" skips an unwalked
+                # subtree past the vanished-anchor reset (silent loss).
+                if _cursor_same_rendering(a, b):
                     continue
                 if not _order_reproducible(a, b):
                     return "unknown"
@@ -7004,8 +7035,8 @@ def register_lakeflow_source(spark):
             order_by = f"{cursor_field} desc"
             seg_filter = resolve_segment_filters(table_options or {}, segments).get(0)
 
-            def _first_value(extra_filter):
-                url = self._build_url(top_set, opts, extra_filter=extra_filter, order_by=order_by)
+            def _first_value(extra_filter, use_order_by=order_by):
+                url = self._build_url(top_set, opts, extra_filter=extra_filter, order_by=use_order_by)
                 for row in self._fetch_pages(url):
                     value = row.get(cursor_field)
                     if value is not None:
@@ -7013,11 +7044,54 @@ def register_lakeflow_source(spark):
                 return None
 
             try:
-                return _first_value(combine_filters(seg_filter, f"{cursor_field} ne null"))
+                value = _first_value(combine_filters(seg_filter, f"{cursor_field} ne null"))
             except requests.HTTPError as exc:
                 if exc.response is None or exc.response.status_code != 400:
                     raise
-                return _first_value(seg_filter)
+                value = _first_value(seg_filter)
+            if value is not None:
+                self._verify_fence_orderby_desc(
+                    top_set, namespace, cursor_field, seg_filter, value, _first_value
+                )
+            return value
+
+        def _verify_fence_orderby_desc(
+            self, top_set, namespace, cursor_field, seg_filter, probed_max, first_value
+        ) -> None:
+            """One-time behavioural check that the fence probe's ``$orderby …
+            desc`` is actually honoured: ask for any row with ``cursor gt
+            <probed max>`` — a row coming back proves the probe returned a
+            NON-max row (the server ignored ``desc``), which would pin the fence
+            at a stale value and silently stall the stream forever
+            (``latest_offset`` returns ``end == start``, every trigger skipped,
+            data accumulating unread). The adjacent nulls-first quirk already
+            has its ``ne null`` guard; this closes the other way the ``$top=1``
+            probe can lie. The PASS verdict rides the shared process/file
+            capability cache (15-min TTL, same layer as ``batch_ok``) so the
+            extra request is paid once per table per TTL, not per trigger; a
+            FAIL raises actionably every time — a desc-ignoring server cannot
+            stream partitioned, and silence here is the stall."""
+            shared_key = f"{namespace}:{top_set}" if namespace else top_set
+            if self._cached_capability("fence_desc_ok", table_name=shared_key):
+                return
+            edm_type = self._edm_types_for_et(self._entity_type_for(top_set, namespace)).get(
+                cursor_field
+            )
+            above = first_value(
+                combine_filters(seg_filter, self._cursor_filter(cursor_field, probed_max, edm_type)),
+                use_order_by=None,
+            )
+            if above is not None:
+                raise ValueError(
+                    f"The partitioned-stream fence probe on {top_set!r} is unreliable: "
+                    f"$orderby={cursor_field} desc&$top=1 returned {probed_max!r}, but the "
+                    f"server also has rows with {cursor_field} gt {probed_max!r} (e.g. "
+                    f"{above!r}) — it is ignoring $orderby. A mis-probed fence pins the "
+                    f"stream's watermark and silently stalls it with data pending. Fix the "
+                    f"server's ordering support, or read this table serially (drop "
+                    f"num_partitions / use a non-partitioned configuration)."
+                )
+            self._store_capability("fence_desc_ok", True, table_name=shared_key)
 
         def _raise_null_cursor_parents(
             self, table_name: str, segments: list[str], cursor_field: str, count: int | None
@@ -9688,6 +9762,30 @@ def register_lakeflow_source(spark):
                 resp = self._http_get(session, url, **kwargs)
                 if resp.status_code == 410 and allow_410:
                     return None, None
+                if allow_410 and 400 <= resp.status_code < 500:
+                    # A non-410 4xx on a STORED delta/next link (the spec
+                    # prescribes 410 for an expired token, but real gateways
+                    # answer 404/400 too). The checkpoint pins this link, so a
+                    # bare HTTPError would re-raise unexplained every trigger
+                    # forever — curate it instead. Deliberately NOT an
+                    # auto-rebootstrap: silently full-re-reading on any 4xx
+                    # would mask genuine config/auth errors; 410 stays the only
+                    # auto-recovery trigger.
+                    try:
+                        _raise_for_status_with_body(resp, url)
+                    except requests.HTTPError as exc:
+                        raise RuntimeError(
+                            f"The stored OData change-tracking link for this stream was "
+                            f"rejected with HTTP {resp.status_code} ({exc}). The delta "
+                            f"token has likely expired or been invalidated (the spec "
+                            f"prescribes 410 for this; some gateways answer "
+                            f"{resp.status_code}). The checkpoint pins this link, so the "
+                            f"stream cannot recover on its own: run a full refresh to "
+                            f"restart change tracking from a fresh bootstrap, or set "
+                            f"delta_tracking=disabled and use cursor/snapshot reads. "
+                            f"Note a re-bootstrap cannot recover deletions that happened "
+                            f"while the token was expired — see the delta docs."
+                        ) from exc
                 _raise_for_status_with_body(resp, url)
                 try:
                     return resp, _decode_json_with_body(resp, url)
@@ -9953,9 +10051,15 @@ def register_lakeflow_source(spark):
                  its own sequencing).
               3. ``cursor_field`` set + ``delta_tracking=auto`` → cursor wins;
                  delta is left dormant, no probe.
-              4. ``delta_tracking=enabled`` → assume support; a probe failure
+              4. no declared primary key → ``enabled`` raises, ``auto`` falls
+                 back without probing (delta rows MERGE on the key: a keyless
+                 tombstone would MERGE against nothing and the deletion would
+                 be silently lost — the per-tombstone raise in
+                 ``_build_delta_record`` can't fire with an empty key list, so
+                 the gate lives here, eagerly and curated).
+              5. ``delta_tracking=enabled`` → assume support; a probe failure
                  surfaces at read time rather than here.
-              5. ``delta_tracking=auto`` → probe once, cache, decide.
+              6. ``delta_tracking=auto`` → probe once, cache, decide.
             """
             setting = self._delta_setting(table_options)
             if setting != "auto":
@@ -9977,6 +10081,23 @@ def register_lakeflow_source(spark):
                         "cursor_field; the server-driven delta stream provides "
                         "its own sequencing. Remove cursor_field, or switch to "
                         "delta_tracking=disabled to use cursor-based incremental."
+                    )
+                return False
+            if not self._primary_keys_for(table_name, (table_options or {}).get("namespace")):
+                # Keyless entity type: every delta row (upsert or tombstone)
+                # MERGEs on the primary key, so keyless delta is silent loss by
+                # construction — and the per-tombstone raise is gated on a
+                # non-empty key list, so it can never fire here. Enabled →
+                # curated config error; auto → snapshot/cursor fallback with
+                # no probe (the read shape must be decided identically at
+                # schema-freeze and read time, and this decision is static).
+                if setting == "enabled":
+                    raise ValueError(
+                        f"delta_tracking=enabled requires a declared primary key on "
+                        f"{table_name!r}: delta upserts and tombstones MERGE on the "
+                        f"key, and the entity type declares none in $metadata — "
+                        f"deletions would be silently lost. Use "
+                        f"delta_tracking=disabled with cursor/snapshot reads."
                     )
                 return False
             if setting == "enabled":
@@ -12368,6 +12489,7 @@ def register_lakeflow_source(spark):
     _cursor_max = cursor_max
     _cursor_newer = cursor_newer
     _cursor_same_instant = cursor_same_instant
+    _cursor_same_rendering = cursor_same_rendering
     _max_or = max_or
     _parse_max_records = parse_max_records
     _trim_to_distinct_cursor_boundary = trim_to_distinct_cursor_boundary
