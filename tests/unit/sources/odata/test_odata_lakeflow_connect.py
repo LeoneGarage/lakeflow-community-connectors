@@ -17715,3 +17715,181 @@ def test_capability_flush_skips_memo_for_evicted_service():
         assert path not in _CAPABILITY_DISK_MTIME  # but no orphaned memo planted
     finally:
         _clear_capability_cache()
+
+
+# ---------------------------------------------------------------------------
+# Round 49 — Edm.Binary base64url decode, delta reserved-column collision,
+# capability_cache_load symmetric memo-race gate, mode-aware no-progress log
+# ---------------------------------------------------------------------------
+
+
+_BINARY_MD = """<?xml version="1.0"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+ <edmx:DataServices><Schema Namespace="NS" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+  <EntityType Name="F"><Key><PropertyRef Name="Id"/></Key>
+   <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+   <Property Name="Blob" Type="Edm.Binary"/></EntityType>
+  <EntityContainer Name="C"><EntitySet Name="Fs" EntityType="NS.F"/></EntityContainer>
+ </Schema></edmx:DataServices></edmx:Edmx>"""
+
+
+@responses.activate
+def test_edm_binary_base64url_decoded_to_bytes():
+    """OData v4.01 JSON encodes Edm.Binary as base64url (- / _ alphabet).
+    The framework row parser only understands standard base64, so without an
+    in-connector decode the payload is silently corrupted. read_table must
+    emit raw bytes (which the parser then passes through untouched)."""
+    import base64 as _b64
+
+    from databricks.labs.community_connector.libs.utils import parse_value
+    from pyspark.sql.types import BinaryType
+
+    raw = bytes([0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF])  # -> base64url contains - and _
+    wire = _b64.urlsafe_b64encode(raw).decode()
+    assert "-" in wire or "_" in wire  # this payload actually exercises base64url
+    responses.get(f"{SERVICE_URL}$metadata", body=_BINARY_MD, status=200)
+    responses.get(f"{SERVICE_URL}Fs", json={"value": [{"Id": 1, "Blob": wire}]})
+    c = _make()
+    schema = c.get_table_schema("Fs", {})
+    rows, _ = c.read_table("Fs", None, {})
+    emitted = list(rows)[0]["Blob"]
+    assert emitted == raw, f"binary not decoded to bytes at emit: {emitted!r}"
+    blob_type = [f.dataType for f in schema.fields if f.name == "Blob"][0]
+    assert isinstance(blob_type, BinaryType)
+    assert parse_value(emitted, blob_type) == raw  # survives the framework parser
+
+
+@responses.activate
+def test_edm_binary_standard_base64_still_decoded():
+    """A server that (non-spec) sends standard base64 for Edm.Binary must
+    still decode — urlsafe_b64decode leaves +/ untouched, so both alphabets
+    round-trip through the same path."""
+    import base64 as _b64
+
+    raw = bytes([0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF])
+    wire = _b64.b64encode(raw).decode()  # standard alphabet: contains + and /
+    assert "+" in wire or "/" in wire
+    responses.get(f"{SERVICE_URL}$metadata", body=_BINARY_MD, status=200)
+    responses.get(f"{SERVICE_URL}Fs", json={"value": [{"Id": 1, "Blob": wire}]})
+    c = _make()
+    emitted = list(c.read_table("Fs", None, {})[0])[0]["Blob"]
+    assert emitted == raw
+
+
+@responses.activate
+def test_edm_binary_null_and_undecodable_preserved():
+    """A null binary stays None; a value that is not decodable keeps its
+    original form (no crash — the framework fallback then runs)."""
+    responses.get(f"{SERVICE_URL}$metadata", body=_BINARY_MD, status=200)
+    responses.get(
+        f"{SERVICE_URL}Fs",
+        json={"value": [{"Id": 1, "Blob": None}, {"Id": 2, "Blob": "!!not base64!!"}]},
+    )
+    c = _make()
+    rows = list(c.read_table("Fs", None, {})[0])
+    assert rows[0]["Blob"] is None
+    assert rows[1]["Blob"] == "!!not base64!!"  # undecodable — left as-is, no raise
+
+
+_COLLISION_MD = """<?xml version="1.0"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+ <edmx:DataServices><Schema Namespace="NS" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+  <EntityType Name="W"><Key><PropertyRef Name="Id"/></Key>
+   <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+   <Property Name="_deleted" Type="Edm.String"/>
+   <Property Name="_lc_sequence" Type="Edm.String"/></EntityType>
+  <EntityContainer Name="C"><EntitySet Name="Widgets" EntityType="NS.W"/></EntityContainer>
+ </Schema></edmx:DataServices></edmx:Edmx>"""
+
+
+@responses.activate
+def test_delta_synthetic_column_collision_raises():
+    """A source column literally named _deleted / _lc_sequence (legal: the
+    OData v4 ABNF allows a leading underscore) collides with the delta
+    synthetics. Under delta_tracking the schema must NOT silently emit
+    duplicate columns / overwrite the source value — it raises a curated
+    reserved-name error instead."""
+    responses.get(f"{SERVICE_URL}$metadata", body=_COLLISION_MD, status=200)
+    c = _make()
+    with pytest.raises(ValueError, match="reserved delta synthetic"):
+        c.get_table_schema("Widgets", {"delta_tracking": "enabled"})
+
+
+@responses.activate
+def test_delta_collision_table_still_readable_without_delta():
+    """The same table without delta tracking must schema/read fine — the
+    guard only fires when the synthetics would actually be stamped."""
+    responses.get(f"{SERVICE_URL}$metadata", body=_COLLISION_MD, status=200)
+    c = _make()
+    schema = c.get_table_schema("Widgets", {})
+    names = [f.name for f in schema.fields]
+    assert names.count("_deleted") == 1 and names.count("_lc_sequence") == 1
+
+
+def test_capability_load_skips_memo_for_evicted_service():
+    """Symmetric to the round-48 flush gate: if a sibling load evicts this
+    service during load()'s lock-free file read, the merge must NOT re-plant
+    an orphaned mtime memo — otherwise the next load short-circuits past the
+    on-disk verdicts and returns an empty entry (silent verdict loss)."""
+    from databricks.labs.community_connector.sources.odata import odata as _od
+
+    _od._clear_capability_cache()
+    _od._CAPABILITY_CACHE.clear()
+    _od._CAPABILITY_DISK_MTIME.clear()
+    svc = "https://memo-load-r49.example.com/odata/"
+    path = _od._capability_cache_path(svc)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"batch_ok": True, "expand_ok": {"Orders": True}}))
+
+    real_json_load = json.load
+    fired = {"done": False}
+
+    def _racing_load(fh, *a, **k):
+        # Runs inside load()'s lock-free read window: simulate a sibling
+        # load(other) that trips cap-eviction and pops THIS service + its memo.
+        if not fired["done"]:
+            fired["done"] = True
+            with _od._CAPABILITY_LOCK:
+                _od._CAPABILITY_CACHE.pop(svc, None)
+                _od._CAPABILITY_DISK_MTIME.pop(path, None)
+        return real_json_load(fh, *a, **k)
+
+    json.load = _racing_load
+    try:
+        _od._capability_cache_load(svc)
+    finally:
+        json.load = real_json_load
+    # No orphaned memo left behind for the evicted service...
+    assert path not in _od._CAPABILITY_DISK_MTIME
+    # ...so a fresh load re-reads and merges the persisted verdicts.
+    entry2 = _od._capability_cache_load(svc)
+    assert entry2.get("batch_ok") is True
+    assert entry2.get("expand_ok") == {"Orders": True}
+    _od._clear_capability_cache()
+
+
+@responses.activate
+def test_nextlink_no_progress_message_omits_switch_advice(caplog):
+    """The period-1 no-progress warning shared by both loops must not advise
+    'Use pagination=nextlink' when the nextlink loop itself emits it (that
+    mode is already in use). The connector-driven modes still carry the tip."""
+    responses.get(
+        f"{SERVICE_URL}T",
+        json={"value": [{"Id": 1}], "@odata.nextLink": f"{SERVICE_URL}T?$skiptoken=same"},
+    )
+    responses.get(
+        f"{SERVICE_URL}T?$skiptoken=same",
+        json={"value": [{"Id": 1}], "@odata.nextLink": f"{SERVICE_URL}T?$skiptoken=same2"},
+    )
+    responses.get(
+        f"{SERVICE_URL}T?$skiptoken=same2",
+        json={"value": [{"Id": 1}]},
+    )
+    c = _make()
+    c._pagination = "nextlink"
+    with caplog.at_level(logging.WARNING):
+        for _pr, _nxt in c._fetch_pages_with_links(f"{SERVICE_URL}T?$top=1&$orderby=Id asc"):
+            pass
+    if "made no progress" in caplog.text:
+        assert "Use pagination=nextlink" not in caplog.text

@@ -7480,8 +7480,11 @@ def register_lakeflow_source(spark):
     # The synthetic MERGE columns appended to the schema when delta is active
     # (``_DELETED_COL`` tombstone flag / ``_SEQUENCE_COL`` sequence) are imported
     # from ``_helpers`` above — they live there so the partition mixin can share
-    # them. Their names are namespaced so they can't collide with any real OData
-    # property — OData property names start with a letter, never an underscore.
+    # them. The OData v4 ABNF permits a leading underscore in a property name, so a
+    # real source column CAN collide with these; ``get_table_schema`` detects the
+    # collision and raises a curated reserved-name error rather than emitting a
+    # schema with duplicate columns (Spark rejects those) and silently overwriting
+    # the source value at stamp time.
     _DELTA_PREFER = "odata.track-changes"
 
     # ``Name=value`` (named-key) form inside a key predicate — the name is a
@@ -8103,7 +8106,14 @@ def register_lakeflow_source(spark):
                         entry[key] = {**value, **current} if isinstance(current, dict) else dict(value)
                     else:
                         entry.setdefault(key, value)
-            _CAPABILITY_DISK_MTIME[path] = mtime
+            # Only memo the merged mtime while this service is still the live
+            # cache entry. A sibling ``load(other)`` can trip cap-eviction and pop
+            # THIS service during the lock-free file read above; planting the memo
+            # unconditionally would then orphan it against an evicted entry, and
+            # the next load would short-circuit past the on-disk verdicts (return
+            # ``{}``). Symmetric to the guard in ``_capability_cache_flush``.
+            if service_url in _CAPABILITY_CACHE:
+                _CAPABILITY_DISK_MTIME[path] = mtime
         return entry
 
 
@@ -8661,11 +8671,31 @@ def register_lakeflow_source(spark):
             if self._table_segments(table_name) is None and self._delta_active_for(
                 table_name, table_options
             ):
+                self._assert_no_reserved_delta_columns(table_name, (f.name for f in fields))
                 fields = list(fields) + [
                     StructField(_DELETED_COL, BooleanType(), False),
                     StructField(_SEQUENCE_COL, StringType(), False),
                 ]
             return StructType(fields)
+
+        @staticmethod
+        def _assert_no_reserved_delta_columns(table_name: str, field_names) -> None:
+            """Delta stamps ``_deleted`` / ``_lc_sequence``; the OData v4 ABNF
+            allows a leading underscore in a property name, so a source column can
+            legally carry one of those names. Emitting the synthetic anyway would
+            produce a schema with duplicate columns (Spark rejects those) and
+            silently overwrite the source value at stamp time — raise a curated
+            error instead."""
+            clash = set(field_names) & {_DELETED_COL, _SEQUENCE_COL}
+            if clash:
+                raise ValueError(
+                    f"Table {table_name!r} has source column(s) {sorted(clash)} "
+                    f"that collide with the reserved delta synthetic column(s) "
+                    f"{sorted({_DELETED_COL, _SEQUENCE_COL})}. Delta tracking stamps "
+                    f"those names, which would produce a schema with duplicate "
+                    f"columns and overwrite the source value. Rename the source "
+                    f"column(s) or disable delta_tracking for this table."
+                )
 
         def read_table_metadata(self, table_name: str, table_options: dict[str, str]) -> dict:
             namespace = (table_options or {}).get("namespace")
@@ -8713,13 +8743,26 @@ def register_lakeflow_source(spark):
             # missing one is a broken response that must fail loudly, not MERGE a
             # null-key row), and the synthetics are stamped by the connector
             # itself (absence = stamping bug).
-            field_names = tuple(f.name for f in self.get_table_schema(table_name, table_options).fields)
+            schema = self.get_table_schema(table_name, table_options)
+            field_names = tuple(f.name for f in schema.fields)
+            # ``Edm.Binary`` arrives as base64url TEXT on the wire (OData v4.01
+            # JSON); the framework's row parser only understands standard base64,
+            # so it corrupts the base64url alphabet (``-``/``_``). Decode
+            # Binary-typed columns to raw ``bytes`` here — the parser passes bytes
+            # through untouched. Empty set (the common case) short-circuits.
+            binary_fields = frozenset(
+                f.name for f in schema.fields if isinstance(f.dataType, BinaryType)
+            )
             never_pad = frozenset(
                 self._primary_keys_for(table_name, (table_options or {}).get("namespace")) or ()
             ) | {_DELETED_COL, _SEQUENCE_COL}
 
             def _emit(row: dict) -> dict:
-                return _jsonify_complex_values(_pad_row_to_fields(row, field_names, never_pad))
+                return _jsonify_complex_values(
+                    _decode_binary_fields(
+                        _pad_row_to_fields(row, field_names, never_pad), binary_fields
+                    )
+                )
 
             if isinstance(records, list):
                 return [_emit(r) for r in records], offset
@@ -10430,13 +10473,20 @@ def register_lakeflow_source(spark):
             Complements :meth:`_page_url_cycled` — this catches SAME-page /
             advancing-token, that catches REPEATED-url / alternating-token."""
             if page_rows and prev_fp is not None and fp == prev_fp:
+                # The "switch to nextlink" advice only makes sense from the
+                # connector-driven modes; the nextlink loop is already on nextlink.
+                advice = (
+                    ""
+                    if mode == "nextlink"
+                    else " Use pagination=nextlink if the server pages correctly."
+                )
                 _LOG.warning(
                     "pagination=%s made no progress on %r: an identical page came back "
                     "(server ignoring the seek/$skip, or a cyclic @odata.nextLink). "
-                    "Stopping to avoid an infinite loop; some rows may be unread. Use "
-                    "pagination=nextlink if the server pages correctly.",
+                    "Stopping to avoid an infinite loop; some rows may be unread.%s",
                     mode,
                     url,
+                    advice,
                 )
                 return True
             return False
@@ -12684,10 +12734,38 @@ def register_lakeflow_source(spark):
         return val
 
 
-    # Re-export base64/binary helper for any downstream caller that wants
-    # to materialize Edm.Binary fields into Python bytes prior to Spark.
+    # Materialize an OData JSON ``Edm.Binary`` value into Python ``bytes``. The
+    # wire form is base64url (OData v4.01 JSON, ``-``/``_`` alphabet, padding
+    # optional); ``urlsafe_b64decode`` also accepts a standard-base64 string (its
+    # ``-_``→``+/`` translate leaves ``+/`` untouched), so both encodings decode.
+    # The framework's own parser only understands standard base64, so without this
+    # a base64url payload is silently corrupted.
     def _decode_binary(value: str) -> bytes:
-        return base64.b64decode(value)
+        return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+    def _decode_binary_fields(row: dict, binary_fields: frozenset) -> dict:
+        """Decode base64url ``Edm.Binary`` string values in ``row`` to raw bytes.
+
+        Returns ``row`` unchanged when there are no binary columns or none carry a
+        string value (the common case — no copy). An undecodable value keeps its
+        original form (the framework's lossy fallback then runs, no worse than
+        before). Never mutates the caller's row — lookback re-emits the same
+        object, so an in-place edit would double-decode on the second pass."""
+        if not binary_fields:
+            return row
+        out = None
+        for name in binary_fields:
+            value = row.get(name)
+            if isinstance(value, str):
+                try:
+                    decoded = _decode_binary(value)
+                except Exception:  # pylint: disable=broad-except
+                    continue
+                if out is None:
+                    out = dict(row)
+                out[name] = decoded
+        return out if out is not None else row
 
 
     _cursor_le = cursor_le
