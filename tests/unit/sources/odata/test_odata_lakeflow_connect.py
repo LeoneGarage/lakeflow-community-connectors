@@ -18040,3 +18040,101 @@ def test_keyless_snapshot_still_ok():
     c = _make()
     meta = c.read_table_metadata("Views", {})
     assert meta == {"primary_keys": [], "cursor_field": None, "ingestion_type": "snapshot"}
+
+
+# ---------------------------------------------------------------------------
+# Round 52 — read_table_metadata mirrors _validate_select_columns; fence
+# self-check tolerates the insert-then-delete race (still raises genuine
+# desc-ignore)
+# ---------------------------------------------------------------------------
+
+
+@responses.activate
+def test_metadata_validates_select_drops_cursor():
+    """read_table_metadata must fail in the same place as the read when a
+    select drops the cursor_field (dispatch runs _validate_select_columns for
+    every read; metadata used to skip it and report a valid CDC source)."""
+    _mock_metadata()
+    c = _make()
+    with pytest.raises(ValueError, match="omits cursor_field"):
+        c.read_table_metadata("Customers", {"cursor_field": "ModifiedAt", "select": "Id"})
+
+
+@responses.activate
+def test_metadata_validates_select_drops_pk():
+    """Same, for a select that drops a primary key."""
+    _mock_metadata()
+    c = _make()
+    with pytest.raises(ValueError, match="omits primary-key"):
+        c.read_table_metadata(
+            "Customers", {"cursor_field": "ModifiedAt", "select": "Name,ModifiedAt"}
+        )
+
+
+_FENCE_MD = """<?xml version="1.0"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+ <edmx:DataServices><Schema Namespace="N" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+  <EntityType Name="Parent"><Key><PropertyRef Name="Id"/></Key>
+   <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+   <Property Name="Seq" Type="Edm.Int32"/>
+   <NavigationProperty Name="Children" Type="Collection(N.Child)" ContainsTarget="true"/></EntityType>
+  <EntityType Name="Child"><Key><PropertyRef Name="Id"/></Key>
+   <Property Name="Id" Type="Edm.Int32" Nullable="false"/></EntityType>
+  <EntityContainer Name="C"><EntitySet Name="Parents" EntityType="N.Parent"/></EntityContainer>
+ </Schema></edmx:DataServices></edmx:Edmx>"""
+
+
+@responses.activate
+def test_fence_check_tolerates_insert_then_delete_race():
+    """A desc-COMPLIANT server where a row inserted after the max-probe is
+    deleted before the re-probe must NOT raise: the desc re-probe surfaces the
+    true (post-delete) max and no row persists above it. Round-46 handled the
+    plain-insert race; this covers insert-then-delete."""
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    responses.get(f"{SERVICE_URL}$metadata", body=_FENCE_MD, status=200)
+    gt_calls = {"n": 0}
+
+    def _cb(req):
+        q = parse_qs(urlparse(req.url).query)
+        flt = unquote(q.get("$filter", [""])[0])
+        orderby = unquote(q.get("$orderby", [""])[0])
+        if "Seq desc" in orderby:  # both desc probes return the compliant max
+            return (200, {}, json.dumps({"value": [{"Seq": 10}]}))
+        if "Seq gt" in flt:
+            gt_calls["n"] += 1
+            # self-check sees the raced insert; still_above sees it deleted.
+            body = {"value": [{"Seq": 11}]} if gt_calls["n"] == 1 else {"value": []}
+            return (200, {}, json.dumps(body))
+        return (200, {}, json.dumps({"value": []}))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_cb)
+    c = _make()
+    # Must not raise — the compliant server is not accused of ignoring $orderby.
+    off = c.latest_offset("Parents__Children", {"cursor_field": "Seq"}, None)
+    assert off is not None
+
+
+@responses.activate
+def test_fence_check_still_raises_on_genuine_desc_ignore():
+    """A server that genuinely ignores $orderby (desc probe returns a non-max
+    while rows persist above it) must still raise — the fix must not mask the
+    real failure."""
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    responses.get(f"{SERVICE_URL}$metadata", body=_FENCE_MD, status=200)
+
+    def _cb(req):
+        q = parse_qs(urlparse(req.url).query)
+        flt = unquote(q.get("$filter", [""])[0])
+        orderby = unquote(q.get("$orderby", [""])[0])
+        if "Seq desc" in orderby:  # ignores desc: returns a stale non-max
+            return (200, {}, json.dumps({"value": [{"Seq": 5}]}))
+        if "Seq gt" in flt:  # a row genuinely persists above the probed value
+            return (200, {}, json.dumps({"value": [{"Seq": 10}]}))
+        return (200, {}, json.dumps({"value": []}))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_cb)
+    c = _make()
+    with pytest.raises(ValueError, match="ignoring .orderby"):
+        c.latest_offset("Parents__Children", {"cursor_field": "Seq"}, None)

@@ -1437,6 +1437,11 @@ class ODataLakeflowConnect(
     def read_table_metadata(self, table_name: str, table_options: dict[str, str]) -> dict:
         namespace = (table_options or {}).get("namespace")
         self._set_excluded_ancestor_columns(table_options)
+        # Mirror the read's own select validation (dispatch runs it for every
+        # read shape) so metadata fails in the same place rather than
+        # reporting a valid source the read then rejects (a select that drops
+        # the cursor_field or a PK).
+        self._validate_select_columns(table_name, table_options or {})
         primary_keys = self._primary_keys_for(table_name, namespace)
         user_cursor = (table_options or {}).get("cursor_field")
         # Contained paths skip the delta probe (server delta is for

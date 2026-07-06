@@ -7141,15 +7141,30 @@ def register_lakeflow_source(spark):
                 return
             if reprobed is None:
                 return  # rows vanished mid-check — inconclusive, re-check next trigger
+            # ``above`` was read BEFORE the re-probe. On a fully compliant server
+            # the row that exceeded ``probed_max`` can be DELETED in the interim
+            # (an insert-then-delete race, not just an insert), leaving
+            # ``reprobed < above`` with no desc-ignore at all — the re-probe simply
+            # surfaces the true post-delete max. The genuine desc-ignore signature
+            # is a row that STILL persists strictly above what desc surfaces NOW;
+            # re-check that against ``reprobed`` before accusing the server. If it
+            # has vanished, treat as inconclusive (like the empty-re-probe case)
+            # and re-check next trigger — collapsing the single insert-then-delete
+            # race into no-verdict rather than a fatal, misleading raise.
+            still_above = first_value(
+                combine_filters(seg_filter, self._cursor_filter(cursor_field, reprobed, edm_type)),
+                use_order_by=None,
+            )
+            if still_above is None:
+                return
             raise ValueError(
                 f"The partitioned-stream fence probe on {top_set!r} is unreliable: "
-                f"$orderby={cursor_field} desc&$top=1 returned {probed_max!r}, the server "
-                f"also has rows with {cursor_field} gt {probed_max!r} (e.g. {above!r}), and "
-                f"a re-probe with $orderby still returned {reprobed!r} — it is ignoring "
-                f"$orderby. A mis-probed fence pins the stream's watermark and silently "
-                f"stalls it with data pending. Fix the server's ordering support, or read "
-                f"this table serially (drop num_partitions / use a non-partitioned "
-                f"configuration)."
+                f"$orderby={cursor_field} desc&$top=1 returned {reprobed!r}, the server "
+                f"still has rows with {cursor_field} gt {reprobed!r} (e.g. {still_above!r}) — "
+                f"it is ignoring $orderby. A mis-probed fence pins the stream's watermark "
+                f"and silently stalls it with data pending. Fix the server's ordering "
+                f"support, or read this table serially (drop num_partitions / use a "
+                f"non-partitioned configuration)."
             )
 
         def _raise_null_cursor_parents(
@@ -8717,6 +8732,11 @@ def register_lakeflow_source(spark):
         def read_table_metadata(self, table_name: str, table_options: dict[str, str]) -> dict:
             namespace = (table_options or {}).get("namespace")
             self._set_excluded_ancestor_columns(table_options)
+            # Mirror the read's own select validation (dispatch runs it for every
+            # read shape) so metadata fails in the same place rather than
+            # reporting a valid source the read then rejects (a select that drops
+            # the cursor_field or a PK).
+            self._validate_select_columns(table_name, table_options or {})
             primary_keys = self._primary_keys_for(table_name, namespace)
             user_cursor = (table_options or {}).get("cursor_field")
             # Contained paths skip the delta probe (server delta is for
