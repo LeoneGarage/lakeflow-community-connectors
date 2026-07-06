@@ -322,27 +322,27 @@ Passed to the connector via the pipeline's `table_configuration` block.
 Every key must appear in the connection's `external_options_allowlist`
 (the connector spec already lists all of them).
 
-The table below is the quick reference; every non-trivial option has a
-detail subsection following it.
+The table below is the quick reference; every non-trivial option name
+links to its detail subsection.
 
 | Option | Default | What it does |
 | --- | --- | --- |
 | `namespace` | — | Selects the OData schema (e.g. `Sales`, `HR`) when two schemas declare an entity set with the same name. The schema's `Alias` is accepted interchangeably. |
 | `cursor_field` | — | Drives incremental reads (`cursor gt <last>` per batch). Omit for snapshot. On contained paths the column may live on the leaf or an ancestor — see [Cursor-based incremental on contained tables](#cursor-based-incremental-on-contained-tables). |
-| `select` | all | `$select` projection, leaf-scoped on contained paths. |
-| `filter` | — | Extra `$filter` expression, applied to the leaf segment. |
-| `filter_at_<segment>` / `filter_at_<idx>` | — | Per-segment `$filter` for contained paths. |
-| `page_size` | `1000` | Per-response row budget (`$top`), distributed across `$expand` levels. |
-| `max_records_per_batch` | `10000` | Per-batch cap on emitted rows, with resumable park state. |
-| `cursor_nulls` | `coalesce` | How cursor reads handle rows whose `cursor_field` is null. |
-| `pagination` | `auto` | How collection pages are walked: `auto` / `nextlink` / `keyset` / `skip`. |
-| `delta_tracking` | `disabled` | Opt-in OData v4 delta queries — see [Delta tracking](#delta-tracking). |
-| `expand_contained` | `auto` | Nested-`$expand` vs N+1 read for contained paths. |
-| `contained_fetch` | `auto` | `$batch`-packing of the un-cursored contained walks' per-parent fetches. |
-| `cursor_probe` | `auto` | Change-probe acceleration for deep leaf-cursor N+1 reads. |
-| `num_partitions` | `4` | Spark-parallel reads of contained N+1 paths. |
-| `cursor_lookback_seconds` | `auto` | Overlap window re-scanning rows that landed mid-walk (with `cursor_lookback_factor`, `cursor_lookback_max_seconds`). |
-| `exclude_ancestor_columns` | — | Drop synthetic ancestor-FK columns from a contained table. |
+| [`select`](#select) | all | `$select` projection, leaf-scoped on contained paths. |
+| [`filter`](#filter-and-filter_at_segment) | — | Extra `$filter` expression, applied to the leaf segment. |
+| [`filter_at_<segment>` / `filter_at_<idx>`](#filter-and-filter_at_segment) | — | Per-segment `$filter` for contained paths. |
+| [`page_size`](#page_size) | `1000` | Per-response row budget (`$top`), distributed across `$expand` levels. |
+| [`max_records_per_batch`](#max_records_per_batch) | `10000` | Per-batch cap on emitted rows, with resumable park state. |
+| [`cursor_nulls`](#cursor_nulls) | `coalesce` | How cursor reads handle rows whose `cursor_field` is null. |
+| [`pagination`](#pagination) | `auto` | How collection pages are walked: `auto` / `nextlink` / `keyset` / `skip`. |
+| [`delta_tracking`](#delta_tracking) | `disabled` | Opt-in OData v4 delta queries — see [Delta tracking](#delta-tracking). |
+| [`expand_contained`](#expand_contained) | `auto` | Nested-`$expand` vs N+1 read for contained paths. |
+| [`contained_fetch`](#contained_fetch) | `auto` | `$batch`-packing of the un-cursored contained walks' per-parent fetches. |
+| [`cursor_probe`](#cursor_probe) | `auto` | Change-probe acceleration for deep leaf-cursor N+1 reads. |
+| [`num_partitions`](#num_partitions) | `4` | Spark-parallel reads of contained N+1 paths. |
+| [`cursor_lookback_seconds`](#cursor_lookback_seconds-cursor_lookback_factor-cursor_lookback_max_seconds) | `auto` | Overlap window re-scanning rows that landed mid-walk (with `cursor_lookback_factor`, `cursor_lookback_max_seconds`). |
+| [`exclude_ancestor_columns`](#exclude_ancestor_columns) | — | Drop synthetic ancestor-FK columns from a contained table. |
 
 ### select
 
