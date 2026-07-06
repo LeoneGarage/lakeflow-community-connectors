@@ -2615,8 +2615,25 @@ def register_lakeflow_source(spark):
             for idx, ancestor_keys in enumerate(chain):
                 for pk_name, pk_val in ancestor_keys.items():
                     col = fk_columns.get((idx, pk_name))
-                    if col is not None:
-                        row[col] = pk_val
+                    if col is None:
+                        continue
+                    if pk_val is None:
+                        # A parent entity omitted or nulled its own primary key
+                        # (non-conformant — OData keys are never null). Stamping
+                        # ``None`` onto the non-nullable FK column would send a
+                        # null MERGE key into ``apply_changes`` — the same silent
+                        # null-key row the leaf-PK ``never_pad`` guard rejects
+                        # loudly. Fail here rather than emit it (or build a
+                        # malformed ``Parent('None')/child`` continuation URL).
+                        raise ValueError(
+                            f"Ancestor entity at path level {idx} is missing its key "
+                            f"{pk_name!r} (got null); cannot form foreign-key column "
+                            f"{col!r}. A parent omitted/nulled its primary key (a "
+                            f"non-conformant response) — its child rows would carry a "
+                            f"null MERGE key. Fix the source response, or exclude this "
+                            f"path."
+                        )
+                    row[col] = pk_val
 
         def _find_cursor_level(
             self,
@@ -8707,6 +8724,12 @@ def register_lakeflow_source(spark):
             if self._table_segments(table_name) is None and self._delta_active_for(
                 table_name, table_options
             ):
+                # Same reserved-column guard get_table_schema applies, so metadata
+                # fails as loudly (and in the same place) as the later read rather
+                # than reporting cdc success for a table read_table would reject.
+                self._assert_no_reserved_delta_columns(
+                    table_name, (f.name for f in self._fields_for(table_name, namespace))
+                )
                 return {
                     "primary_keys": primary_keys,
                     "cursor_field": _SEQUENCE_COL,
@@ -12748,10 +12771,16 @@ def register_lakeflow_source(spark):
         """Decode base64url ``Edm.Binary`` string values in ``row`` to raw bytes.
 
         Returns ``row`` unchanged when there are no binary columns or none carry a
-        string value (the common case — no copy). An undecodable value keeps its
-        original form (the framework's lossy fallback then runs, no worse than
-        before). Never mutates the caller's row — lookback re-emits the same
-        object, so an in-place edit would double-decode on the second pass."""
+        string value (the common case — no copy). A clean base64url or standard
+        base64 payload always decodes correctly; a value that *raises* (e.g. an
+        invalid length) keeps its original form (the framework's lossy fallback
+        then runs, no worse than before). Note ``urlsafe_b64decode`` silently
+        drops stray non-alphabet characters rather than raising, so a garbage
+        payload that survives to a valid length decodes to whatever its valid
+        characters spell — but such inputs are already non-conformant and were
+        corrupted before this decode existed. Never mutates the caller's row —
+        lookback re-emits the same object, so an in-place edit would double-decode
+        on the second pass."""
         if not binary_fields:
             return row
         out = None

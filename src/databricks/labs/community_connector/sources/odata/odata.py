@@ -1444,6 +1444,12 @@ class ODataLakeflowConnect(
         if self._table_segments(table_name) is None and self._delta_active_for(
             table_name, table_options
         ):
+            # Same reserved-column guard get_table_schema applies, so metadata
+            # fails as loudly (and in the same place) as the later read rather
+            # than reporting cdc success for a table read_table would reject.
+            self._assert_no_reserved_delta_columns(
+                table_name, (f.name for f in self._fields_for(table_name, namespace))
+            )
             return {
                 "primary_keys": primary_keys,
                 "cursor_field": _SEQUENCE_COL,
@@ -5485,10 +5491,16 @@ def _decode_binary_fields(row: dict, binary_fields: frozenset) -> dict:
     """Decode base64url ``Edm.Binary`` string values in ``row`` to raw bytes.
 
     Returns ``row`` unchanged when there are no binary columns or none carry a
-    string value (the common case — no copy). An undecodable value keeps its
-    original form (the framework's lossy fallback then runs, no worse than
-    before). Never mutates the caller's row — lookback re-emits the same
-    object, so an in-place edit would double-decode on the second pass."""
+    string value (the common case — no copy). A clean base64url or standard
+    base64 payload always decodes correctly; a value that *raises* (e.g. an
+    invalid length) keeps its original form (the framework's lossy fallback
+    then runs, no worse than before). Note ``urlsafe_b64decode`` silently
+    drops stray non-alphabet characters rather than raising, so a garbage
+    payload that survives to a valid length decodes to whatever its valid
+    characters spell — but such inputs are already non-conformant and were
+    corrupted before this decode existed. Never mutates the caller's row —
+    lookback re-emits the same object, so an in-place edit would double-decode
+    on the second pass."""
     if not binary_fields:
         return row
     out = None

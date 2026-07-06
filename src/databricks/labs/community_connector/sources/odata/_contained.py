@@ -1634,8 +1634,25 @@ class ContainedNavMixin:
         for idx, ancestor_keys in enumerate(chain):
             for pk_name, pk_val in ancestor_keys.items():
                 col = fk_columns.get((idx, pk_name))
-                if col is not None:
-                    row[col] = pk_val
+                if col is None:
+                    continue
+                if pk_val is None:
+                    # A parent entity omitted or nulled its own primary key
+                    # (non-conformant — OData keys are never null). Stamping
+                    # ``None`` onto the non-nullable FK column would send a
+                    # null MERGE key into ``apply_changes`` — the same silent
+                    # null-key row the leaf-PK ``never_pad`` guard rejects
+                    # loudly. Fail here rather than emit it (or build a
+                    # malformed ``Parent('None')/child`` continuation URL).
+                    raise ValueError(
+                        f"Ancestor entity at path level {idx} is missing its key "
+                        f"{pk_name!r} (got null); cannot form foreign-key column "
+                        f"{col!r}. A parent omitted/nulled its primary key (a "
+                        f"non-conformant response) — its child rows would carry a "
+                        f"null MERGE key. Fix the source response, or exclude this "
+                        f"path."
+                    )
+                row[col] = pk_val
 
     def _find_cursor_level(
         self,

@@ -17893,3 +17893,83 @@ def test_nextlink_no_progress_message_omits_switch_advice(caplog):
             pass
     if "made no progress" in caplog.text:
         assert "Use pagination=nextlink" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Round 50 — null ancestor FK fail-loud guard, reserved-column guard mirrored
+# into read_table_metadata
+# ---------------------------------------------------------------------------
+
+
+_FK_NULL_MD = """<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices><Schema Namespace="Nested" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+    <EntityType Name="Parent"><Key><PropertyRef Name="Id"/></Key>
+      <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+      <Property Name="Name" Type="Edm.String"/>
+      <NavigationProperty Name="Children" Type="Collection(Nested.Child)" ContainsTarget="true"/></EntityType>
+    <EntityType Name="Child"><Key><PropertyRef Name="Id"/></Key>
+      <Property Name="Id" Type="Edm.Int32" Nullable="false"/>
+      <Property Name="Label" Type="Edm.String"/></EntityType>
+    <EntityContainer Name="C"><EntitySet Name="Parents" EntityType="Nested.Parent"/></EntityContainer>
+  </Schema></edmx:DataServices></edmx:Edmx>"""
+
+
+@responses.activate
+def test_null_ancestor_fk_fails_loudly_expand_path():
+    """A parent entity that omits/nulls its own primary key (non-conformant —
+    OData keys are never null) would stamp a null onto the NON-nullable FK
+    column, sending a null MERGE key into apply_changes. Mirrors the leaf-PK
+    never_pad protection onto the ancestor-FK side: fail loudly, don't emit."""
+    import re as _re
+
+    responses.get(f"{SERVICE_URL}$metadata", body=_FK_NULL_MD, status=200)
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Parents",
+        json={"value": [{"Name": "P1", "Children": [{"Id": 11, "Label": "a"}]}]},
+        match_querystring=False,
+    )
+    responses.get(f"{SERVICE_URL}Parents", json={"value": []})
+    # Absorb any (malformed) continuation drain so the ONLY failure is the guard.
+    responses.add_callback(
+        responses.GET,
+        _re.compile(rf"{_re.escape(SERVICE_URL)}Parents\(.*\)/Children.*"),
+        callback=lambda req: (200, {}, '{"value": []}'),
+    )
+    c = _make()
+    # Non-nullable FK column, by construction.
+    schema = c.get_table_schema("Parents__Children", {"expand_contained": "true"})
+    fk = [f for f in schema.fields if f.name == "Parents_Id"][0]
+    assert fk.nullable is False
+    with pytest.raises(ValueError, match="missing its key"):
+        list(c.read_table("Parents__Children", None, {"expand_contained": "true"})[0])
+
+
+@responses.activate
+def test_valid_ancestor_fk_still_stamped():
+    """A well-formed parent (key present) still stamps the FK — the guard
+    only fires on a null ancestor key."""
+    responses.get(f"{SERVICE_URL}$metadata", body=_FK_NULL_MD, status=200)
+    responses.add(
+        responses.GET,
+        f"{SERVICE_URL}Parents",
+        json={"value": [{"Id": 7, "Name": "P1", "Children": [{"Id": 11, "Label": "a"}]}]},
+        match_querystring=False,
+    )
+    responses.get(f"{SERVICE_URL}Parents", json={"value": []})
+    responses.get(f"{SERVICE_URL}Parents(7)/Children", json={"value": []})
+    c = _make()
+    rows = list(c.read_table("Parents__Children", None, {"expand_contained": "true"})[0])
+    assert rows == [{"Id": 11, "Label": "a", "Parents_Id": 7}]
+
+
+@responses.activate
+def test_reserved_column_guard_also_in_read_table_metadata():
+    """The reserved delta-synthetic collision must fail as loudly from
+    read_table_metadata as from read_table (consistent ordering), not report
+    cdc success for a table the later read would reject."""
+    responses.get(f"{SERVICE_URL}$metadata", body=_COLLISION_MD, status=200)
+    c = _make()
+    with pytest.raises(ValueError, match="reserved delta synthetic"):
+        c.read_table_metadata("Widgets", {"delta_tracking": "enabled"})
