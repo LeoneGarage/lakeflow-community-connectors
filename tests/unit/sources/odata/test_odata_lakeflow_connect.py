@@ -7534,17 +7534,73 @@ def test_expand_parked_queue_is_depth_bounded_not_width():
 
 
 @responses.activate
+def test_expand_nextlink_parks_mid_inline_from_start_with_boundary():
+    """``pagination=nextlink`` has no churn-safe client seek, so a mid-way
+    INLINE collection parks as a FROM-START refetch (``$skip=0``, never a
+    positional seek into the page) plus the chronological ``boundary`` of the
+    last processed row; resume elides the already-emitted prefix client-side.
+    Two properties are load-bearing: (1) the cap parks IMMEDIATELY — batch 1
+    emits cap rows, not the whole in-flight inline collection's subtree; and
+    (2) deleting an already-emitted row between batches cannot shift an
+    unread row out of the refetch (a server-honoured ``$skip=2`` would drop
+    it silently — the boundary resume must not)."""
+    _mock_nested_metadata()
+    children = [{"Id": 100 + i, "Label": f"c{i}"} for i in range(1, 7)]
+    responses.get(
+        f"{SERVICE_URL}Parents",
+        json={"value": [{"Id": 1, "Name": "2024-01-01T00:00:00Z", "Children": children}]},
+        match_querystring=False,
+    )
+    # The from-start refetch of the parked inline collection. Mutable so a
+    # later batch observes between-batch churn (c1 deleted).
+    live: list[dict] = list(children)
+    responses.add_callback(
+        responses.GET,
+        re.compile(rf"{re.escape(SERVICE_URL)}Parents\(1\)/Children.*"),
+        callback=lambda req: (200, {}, json.dumps({"value": list(live)})),
+    )
+    c = _make()
+    opts = {
+        "expand_contained": "true",
+        "cursor_field": "Name",
+        "max_records_per_batch": "2",
+        "pagination": "nextlink",
+    }
+    records, offset = c.read_table("Parents__Children", {}, opts)
+    got = [r["Id"] for r in records]
+    # (1) Immediate park at the cap: 2 rows, not all 6 inline children.
+    assert got == [101, 102]
+    pending = offset.get("pending_fetches")
+    assert pending
+    inline_item = next(p for p in pending if p["level"] == 1)
+    plain_url = inline_item["url"].replace("%24", "$")
+    assert "$skip=0" in plain_url, f"expected from-start refetch, got {plain_url}"
+    assert "$skip=2" not in plain_url, f"positional seek leaked into park: {plain_url}"
+    assert inline_item["boundary"] is not None
+    # (2) Churn: an ALREADY-EMITTED child vanishes between batches.
+    del live[0]  # c1 == Id 101, emitted in batch 1
+    for _ in range(10):
+        records, offset = c.read_table("Parents__Children", offset, opts)
+        got.extend(r["Id"] for r in records)
+        if not offset.get("pending_fetches"):
+            break
+    else:
+        raise AssertionError("expand queue never drained")
+    # No loss (103-106 all arrive despite the deletion) and no duplicates.
+    assert sorted(got) == [101, 102, 103, 104, 105, 106]
+
+
+@responses.activate
 def test_expand_three_level_parked_offset_stays_depth_bounded():
     """O(depth), not O(width), on a genuinely DEEP path. Parents__Children__
     Notes with a fan-out (2 parents × 2 children) far wider than its depth
     (3 segments); each child's Notes are server-paged. A breadth-first drain
     would accumulate a continuation per child (O(width)); the depth-first
     stack machine walks one subtree at a time so the parked frontier is the
-    O(depth) path only. In nextlink mode the drainer finishes an in-flight
-    inline collection before parking (positional $skip resume would be
-    churn-unsafe), so a batch may overshoot the cap by one inline
-    collection's leaves — bounded, never the whole dataset. Every note
-    arrives exactly once."""
+    O(depth) path only. In nextlink mode a mid-way inline collection parks
+    as a FROM-START refetch (positional $skip resume would be churn-unsafe)
+    whose boundary elides the already-processed prefix on resume — so the
+    cap parks immediately at any depth. Every note arrives exactly once."""
     _mock_nested_metadata()
     parents = []
     for p in (1, 2):
@@ -7570,6 +7626,13 @@ def test_expand_three_level_parked_offset_stays_depth_bounded():
                 },
                 match_querystring=False,
             )
+        # The from-start refetch a mid-inline nextlink park issues on resume
+        # (boundary elides already-processed children client-side).
+        responses.get(
+            f"{SERVICE_URL}Parents({p})/Children",
+            json={"value": children},
+            match_querystring=False,
+        )
         parents.append({"Id": p, "Name": f"2024-01-0{p}T00:00:00Z", "Children": children})
     responses.get(f"{SERVICE_URL}Parents", json={"value": parents}, match_querystring=False)
     c = _make()

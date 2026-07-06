@@ -4522,8 +4522,9 @@ def register_lakeflow_source(spark):
             parked by re-fetching its collection past the last processed row: a
             fetched page re-fetches its own ``base_url`` with ``skip``/``boundary``;
             an inline-delivered collection synthesizes a seek continuation
-            (``_build_expand_continuation_url``; ``nextlink`` mode has no client
-            seek, so it falls back to positional ``$skip`` + boundary dedup —
+            (``_build_expand_continuation_url``; ``nextlink`` mode has no
+            churn-safe client seek, so it refetches FROM THE START and the parked
+            chronological ``boundary`` elides already-processed rows on resume —
             bounded duplicates, never loss). An ancestor frame's in-flight row is
             skipped on resume because its remaining subtree is carried by the
             deeper parked frames — no re-emit, no loss.
@@ -4546,9 +4547,8 @@ def register_lakeflow_source(spark):
             ``max_records``, so a lookback overlap larger than the cap cannot
             wedge the stream into an eternal park/complete cycle. Cap deviation
             per batch is bounded by ONE HTTP response's worth of leaf rows
-            (≤ ``page_size``; the cap is checked between rows, but an in-flight
-            inline collection is finished before parking in ``nextlink`` mode)
-            plus the lookback overlap.
+            (≤ ``page_size``) plus the lookback overlap — in every pagination
+            mode, since parking never has to finish an in-flight collection.
             """
             cur_field, cur_level, _ = ctx or (None, -1, None)
             countable = 0
@@ -4581,10 +4581,13 @@ def register_lakeflow_source(spark):
 
             leaf_level = len(segments) - 1
             # Client-driven seek used to synthesize a resume URL for an
-            # inline-delivered collection; ``nextlink`` has no client seek, so fall
-            # back to positional ``$skip`` (a server that ignores it re-reads from
-            # the start and the parked boundary dedups — bounded duplicates, never
-            # loss), matching ``_recover_expand_item``'s mode-agnostic rebuild.
+            # inline-delivered collection. ``nextlink`` has no churn-safe client
+            # seek — a positional ``$skip`` the server HONOURS can shift an unread
+            # row into the skipped prefix under between-batch churn (silent loss)
+            # — so ``_park`` refetches the collection FROM THE START there
+            # (``$skip=0``) and resume skips already-processed rows by the parked
+            # chronological ``boundary`` instead: bounded duplicate re-reads
+            # (≤ one inline page, elided client-side), never loss.
             mode = getattr(self, "_pagination", "nextlink")
             park_mode = mode if mode != "nextlink" else "skip"
 
@@ -4661,16 +4664,24 @@ def register_lakeflow_source(spark):
                     else:
                         # Inline-delivered rows have no page URL of their own; re-fetch
                         # the collection under its parent (chain holds keys 0..level-1)
-                        # seeking past the last processed row.
-                        last_child = frame["rows"][idx - 1] if idx else {}
+                        # seeking past the last processed row. ``nextlink`` has no
+                        # churn-safe client seek (a server-honoured ``$skip=idx``
+                        # can drop an unread row into the skipped prefix), so it
+                        # refetches FROM THE START and lets the ``boundary`` skip
+                        # already-processed rows on resume — bounded duplicates,
+                        # never loss.
+                        if mode != "nextlink":
+                            seek_child, seek_count = (frame["rows"][idx - 1] if idx else {}), idx
+                        else:
+                            seek_child, seek_count = {}, 0
                         park_url = self._build_expand_continuation_url(
                             segments,
                             level - 1,
                             frame["chain"],
                             cur_field if cur_field else None,
                             park_mode,
-                            last_child,
-                            idx,
+                            seek_child,
+                            seek_count,
                         )
                         park_skip = 0
                     parked.append(
@@ -4685,31 +4696,10 @@ def register_lakeflow_source(spark):
                     )
                 return parked
 
-            def _parkable() -> bool:
-                # A mid-way inline collection (0 < idx < len) can only be resumed
-                # by re-fetching it past the last processed row. Every mode except
-                # ``nextlink`` has a churn-safe client seek for that
-                # (``_build_expand_continuation_url``'s keyset). ``nextlink`` falls
-                # back to positional ``$skip``, which under between-batch churn can
-                # push an unread row into the skipped prefix (silent loss) — the
-                # exact failure the boundary resume exists to prevent. So in
-                # ``nextlink`` mode DON'T park while any inline collection is
-                # mid-way; finish it first (bounded by one server page, since a
-                # truncated inner collection is a server ``<Nav>@odata.nextLink``
-                # url frame, not an inline one). idx==0 (fresh) and idx==len
-                # (exhausted) park cleanly — a from-start refetch and a drop.
-                if mode != "nextlink":
-                    return True
-                return not any(
-                    f["kind"] == "rows" and f.get("from_inline") and 0 < f["idx"] < len(f["rows"])
-                    for f in stack
-                )
-
             while stack:
-                if countable >= max_records and _parkable():
+                if countable >= max_records:
                     # Cap reached — stop pulling new work and park the O(depth)
-                    # frontier. Overshoot is bounded by the last page's leaf rows
-                    # (plus, in nextlink mode, finishing an in-flight inline page).
+                    # frontier. Overshoot is bounded by the last page's leaf rows.
                     break
                 frame = stack[-1]
                 if frame["kind"] == "url":
