@@ -163,7 +163,7 @@ includes `pagination`, `cursor_probe`, `contained_fetch`, `num_partitions`,
 `cursor_nulls`, `filter_at_*`, `exclude_ancestor_columns`,
 `cursor_lookback_seconds`, `cursor_lookback_factor`, and
 `cursor_lookback_max_seconds` — the **authoritative, complete option
-reference is the [README's Per-table options table](README.md)**.
+reference is the [README's Per-table options section](README.md)**.
 
 `namespace` is consumed by the connector before the request is built; the rest all influence the URL, the per-batch loop, or the request semantics.
 

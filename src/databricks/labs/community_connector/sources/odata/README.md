@@ -318,28 +318,865 @@ build_pipeline(
 
 ## Per-table options
 
-| Option                  | Default | Description |
-| ----------------------- | ------- | ----------- |
-| `namespace`             |         | OData schema namespace (e.g. `Sales`, `HR`) — the schema's `Alias` is accepted interchangeably. Required only when two schemas declare an entity set with the same name. |
-| `cursor_field`          |         | Drives incremental reads. Omit for snapshot. |
-| `select`                | all     | Comma-separated `$select` projection, or `*` (all structural properties — equivalent to omitting the option). **Leaf-scoped on contained paths** in both modes: it lands on the leaf URL in N+1 mode and inside the innermost `$expand(...)` clause in expand mode (ancestor levels stay unprojected — their PKs and any ancestor cursor column are fetched by the machinery regardless), and the derived Spark schema is filtered to the same leaf columns (synthetic ancestor-FK columns survive). Must keep the leaf's primary-key columns and any leaf-level `cursor_field` (curated error otherwise). |
-| `filter`                |         | Extra OData `$filter` expression. Applied to the **leaf segment** in both modes — leaf URL in N+1 mode (`expand_contained=false`), innermost `$expand(...)` clause in expand mode. Equivalent to `filter_at_<leaf-segment>`; AND-composes with it if both are set. For per-segment placement on intermediate ancestors of contained paths, use `filter_at_<segment>` below. **Encoding:** the connector auto-encodes spaces and non-ASCII, but a URI-reserved character inside a **string literal** must be percent-encoded by you: `%`→`%25`, `&`→`%26`, `#`→`%23`, `+`→`%2B` (e.g. `Name eq 'AT%26T'`, `Grade eq 'A%2B'`, `Created gt 2024-01-01T00:00:00%2B01:00`). Left raw, an `&`/`#` truncates the query (usually a server 400; wrong rows on a lenient server) — the connector can't encode these for you without double-encoding an already-encoded value. |
-| `filter_at_<segment>` <br/> `filter_at_<idx>` | | Per-segment `$filter` for contained-path tables. Each entry is applied to the matching walk level — in N+1 mode the ancestor walks at each level get pruned to matching rows, cascading the savings down the children; in `expand_contained=true` mode the filter is injected inside the corresponding `$expand(...)` clause per OData v4 §5.1.1.6. Two equivalent forms: by segment name (`filter_at_Instances=Id eq 5` — must match a segment in the contained path) or by zero-based index (`filter_at_0=Id eq 5`). Index wins on conflict. Composes with cursor filters (AND-ed at the cursor's segment) and with the existing `filter` option (AND-ed at the leaf in N+1 mode, AND-ed at the top in expand mode). Unknown segment names and out-of-range indices raise `ValueError` at read time. Same string-literal encoding rule as `filter` above (percent-encode `%`/`&`/`#`/`+` inside values). |
-| `page_size`             | 1000 | Maximum per-response row budget. Must be a positive integer — `0` or garbage raises up front (`$top=0` is a valid URL the server answers with an empty page, which the drain would read as "table exhausted" and silently emit zero rows). Under the default `pagination=auto` **every** read — snapshot, cursor, and delta — defaults `page_size=1000` (→ `$top=1000`), because `auto` needs a `$top` to detect a page-limited response with no continuation link. The one exception is `pagination=nextlink`: there a **snapshot read** (no `cursor_field`, no delta) with `page_size` unset sends **no `$top` at all** — the server picks its own page size and the connector walks every page via `@odata.nextLink` (this avoids servers that reject or mishandle an explicit `$top`, e.g. a value above their per-page cap, on a full-table scan); cursor/delta reads still default to `1000` even under `nextlink`. Setting `page_size` explicitly applies to every mode and overrides the default. For flat tables the value becomes the `$top` at the single URL. For `expand_contained=true` paths it's distributed across all `$top` points (top URL + every nested `$expand(...)`) with triangular weights — top gets the largest share, each deeper level proportionally less — so the cross-product `top × inner_1 × inner_2 × …` fits in the budget. Each per-level `$top` is floored at 5 (very small pages amplify the `@odata.nextLink` chase at every level); when a deep level would drop below 5 it's pinned to 5 and the remaining budget is divided back across the upper levels, so the cross-product stays at or under `page_size`. Each level (top URL and every nested `$expand(...)`) additionally carries a stable `$orderby` for skiptoken-safe paging — see [Pagination ordering](#pagination-ordering). Examples with `page_size=1000`: depth 2 → `[100, 10]` (product 1000), depth 3 → `[34, 5, 5]` (850), depth 4 → `[8, 5, 5, 5]` (1000). For chains so deep that `5 ** N > page_size` the floor unavoidably wins (e.g. `5**5 = 3125`); raise `page_size` to restore the cap, or switch to `expand_contained=false` so the chain becomes N+1 single-segment fetches. |
-| `max_records_per_batch` | 10000   | Per-call upper bound on rows returned. The connector has **no wall-clock ceiling** — `max_records_per_batch` is the only cap on a single batch. Each batch fetches `cursor gt <last>` and pulls up to this many rows, then commits the offset. Smaller values give continuous-mode pipelines lower latency per micro-batch at the cost of more round trips; larger values amortize HTTP overhead. Honoured by every serial **cursor/delta** read path (flat / contained N+1) and by the `expand_contained=true` walks (which park a resumable depth-first drain — see below). **Ignored — with a warning — on flat and contained-N+1 snapshot reads** (no `cursor_field`, delta inactive): those shapes' streaming offset carries only the quiesce marker, no park state, so a cap could only truncate the snapshot and silently drop the remainder; their snapshot triggers always read the full table. An `expand_contained=true` **snapshot is the exception — it honours the cap** (its offset parks the resumable `pending_fetches` drain described below, so a capped snapshot spans multiple triggers and stamps the quiesce marker only once the drain completes). **Exception — partitioned streaming** (`num_partitions` with a top-level cursor): microbatches are sized by the cursor window (fence to fence), not by this cap — the per-partition Spark tasks have no shared park state to resume a capped batch from, so the cap is not applied there. On **delta-tracking** reads the cap is enforced at **page boundaries** (stop following `@odata.nextLink` once reached) and may overshoot by up to one server page — a mid-page stop would permanently skip the rest of that page, since the persisted resume link points at the *next* page. On the `expand_contained=true` path the cap is enforced **per HTTP fetch at any depth** by a **depth-first resumable stack machine**: the drainer walks one root→leaf path at a time, holding each parent's inline sibling collection as a single in-memory page frame and checking the cap between rows/fetches. When a batch parks, only the **boundary path from the root to the current leaf** is serialized — one item per contained segment on the current path — so the parked offset is **O(depth)**, *not* O(fan-out width). (An earlier breadth-first design parked one continuation per truncated inner collection, so a wide top page over an inner-paging server could balloon the offset to thousands of URL-carrying items and collapse throughput to ~one row per batch once the backlog exceeded the ceiling; depth-first eliminates that.) The parked frontier is `pending_fetches` — a list of `{url, level, chain, cur_val, skip, boundary}` items in bottom-to-top stack order (plus a transient `rebuilt` marker on items retried after a 404/410 recovery); the next `read()` re-pushes them to reconstruct the DFS path and resumes exactly where it stopped, **churn-safe via each item's chronological `boundary` order-key** — never a positional `$skip`, which could desync and drop rows under between-batch writes (`skip` remains only as a legacy downgrade fallback for offsets without a boundary). The frontier needs no explicit ceiling: depth-first descent holds only one root→leaf path at a time, so both the live stack and the parked `pending_fetches` stay O(depth) unconditionally, regardless of how wide any parent's inner collection grows. Cap deviation per batch is bounded by one HTTP response's worth of leaf rows (≤ `page_size`), regardless of how deep the chain is or how wide any single parent's inner collection grows. In cursor mode the watermark only advances once the chain fully drains; until then the running max sits in `running_max_cursor`. **Only rows strictly above the committed watermark count toward the cap**: `cursor_lookback_seconds` overlap re-reads ride on top (so an overlap window holding ≥ `max_records_per_batch` rows can't wedge the stream into an eternal park/re-read cycle — a pure-overlap batch completes and idles), meaning the cap may additionally overshoot by the overlap size, which is bounded by the configured lookback window. The default of 10000 balances commit frequency / visibility against HTTP overhead; lower it (e.g. to 100) for tighter per-batch latency or higher (e.g. 100000+) for throughput-oriented batch backfills. Validated up front: must parse as an integer **≥ 1** (curated error otherwise — the cap bounds *emitted* rows, so a non-positive value would park forever without emitting anything). **Sizing note for large contained parent sets:** each resumed batch re-pages the ancestor enumeration up to its park position (keys must be fetched to be matched), so a full capped cycle over `P` parents costs roughly `P²/(2·cap·server_page)` extra ancestor-page requests in aggregate — negligible at `P=10k`, ~50× the single-pass cost at `P=100k` with `cap=1000`. Size the cap so a cycle spans few batches on very large parent sets. |
-| `cursor_nulls`          | coalesce | How a cursor read handles rows whose `cursor_field` is **null**. `coalesce` (default): substitute a deterministic synthetic floor (a `2000-01-01…` timestamp carrying a per-PK sub-second offset, or the type's minimum for date/int/string cursors) for comparison and the watermark — the emitted row keeps its real `null`, the watermark always advances, and null-cursor rows are ingested once on the seed pass (server-side `cursor gt` excludes them thereafter, so null rows inserted *after* the seed aren't re-captured). The temporal floor year is configurable as `coalesce:<YYYY>` (e.g. `coalesce:1990`) — lower it below your oldest data; default `2000`. `error`: raise a no-progress `RuntimeError` when a batch's rows all have a null cursor (the watermark can't advance) — use to catch a misconfigured cursor. `ignore`: drop null-cursor rows entirely (never emitted). Applies to **flat and contained leaf-cursor** paths; ancestor-cursor and `expand_contained=true` paths treat nulls as `error`. For cursor types with no synthesisable floor (boolean/binary) the default silently falls back to `error`; setting `cursor_nulls=coalesce` explicitly on such a cursor raises. |
-| `pagination`            | auto | How the connector walks a collection's pages. `auto` (default): follow the server's `@odata.nextLink` whenever it emits one (identical to `nextlink` for spec-compliant servers); if the server **never** emits a link during a walk, fall back to a keyset seek (if the `$orderby` has keys) or skip and drain until an **empty** page — so a server that silently page-limits responses *below* the `$top` you request *and* omits `@odata.nextLink` (a common non-compliant shape, e.g. one that suppresses the link whenever `$top` is sent) is still read in full, with no per-table override. `nextlink`: follow `@odata.nextLink` only — strictly spec-compliant, and the choice when you want a `$top`-free snapshot scan (some servers reject or mishandle an explicit `$top`). `keyset`: ignore `@odata.nextLink` and always seek the next page with a `(k gt <last>)` predicate on the `$orderby` key set (`cursor`+PK, or PK-only). `skip`: ignore `@odata.nextLink` and page via `$top`+`$skip` — the keyless fallback (entities with no unique sort key); O(n) offsets and fragile under concurrent writes. **Termination differs by mode.** `nextlink` treats a *short* page (`len < $top`) with no continuation link as the end. `auto`, while the server is emitting links, trusts that short link-less final page as the end **only when the chain stopped *before* the `$top` budget was reached** (`fetched < $top`). OData `$top` is a **total-result limit** (§11.2.5.3), not a page size, and a spec-compliant server may propagate the remaining budget through its skiptoken `@odata.nextLink`s (e.g. Northwind: `$top=1000` → page 1's link carries `$top=500` → after 1000 rows no further link, though the collection has more). So if the link chain self-terminates at exactly the budget (`fetched >= $top`), `auto` does **not** trust the short final page — it seeks past the budget (keyset or `$skip`) and keeps draining until empty; otherwise any table larger than `page_size` would be silently capped at `page_size` rows. `auto` (once it has fallen back, i.e. the server gave no link), `keyset`, and `skip` instead drain until an **empty** page — a short non-empty page is NOT exhaustion, because the server's per-response page size may be **smaller than the `$top` you request**. The drain costs **one trailing empty request per collection that ends on a short page**; a spec-compliant server that keeps emitting `@odata.nextLink` incurs no extra request. Use `keyset`/`skip` explicitly only to *force* the seek strategy (e.g. ignore a buggy `@odata.nextLink` entirely). A **composite** keyset seek (`$orderby` = `cursor`+PK) builds an OR-across-different-columns `$filter` — `(cursor gt v) or (cursor eq v and pk gt p)` — which some servers reject (Hexagon Smart API: "on different columns, only AND operators are supported"). Before issuing such a seek the connector runs a one-shot, cached, **auth-aware OR-capability preflight** (`$top=1` carrying the OR filter); on a **definitive, non-transient 4xx** (e.g. the "AND operators only" 400) it transparently **falls back to `$skip`** (mode B) for that and every later walk, so the OR rejection never surfaces as an error or a dropped page. It applies the same definitive-vs-transient discipline as the other capability probes: a **transient** status (429/5xx) or a **transport/auth failure** (a `401` is refreshed, not misread as "unsupported") fails *open* for that seek and records **nothing**, so the next seek re-probes rather than durably pinning the slower `$skip` walk on a momentary blip. A single-key `$orderby` builds no OR and is never probed. The verdict is **threaded into the resume offset** (`or_filter_ok`, alongside `cursor_probe_ok`/`batch_ok`) so a reader the framework recreates each microbatch skips re-probing; these capability flags are bookkeeping and are excluded from the no-progress comparison. `auto`/`keyset`/`skip` require a `$top`, so they force a default `page_size` when none is set — including on snapshot scans under the default `auto`. A no-progress guard protects **every** mode against infinite loops: a walk stops with a warning if a continuation returns a page identical to the one before it (the server ignored the seek/`$skip`) or if the server hands back a self-referential/cyclic `@odata.nextLink` — this covers the client-driven modes, plain `nextlink`, and the delta-tracking walk. **Applies to every page walk**, including the nested `$expand` chain: flat reads, the contained leaf-cursor cap walk (the compound `(cursor eq V and pk gt last)` seek even drains a same-cursor cohort larger than a page), the ancestor walk, parent/ancestor enumeration, partitioned discovery, the top-level `$expand` collection, **and a parent's *inline child* collection inside `expand_contained=true`**. For the last case: when a parent's inline child page comes back full (`len == inner $top`) but the server omits the `<NavProp>@odata.nextLink`, the connector synthesizes a direct-navigation continuation — `Parent(key)/Child?$top=…&$expand=<grandchildren>` plus the keyset seek (or `$skip`) — and drains the rest, with the grandchildren still expanded and the cursor `$filter`/`$orderby` re-applied. This continuation flows through the same depth-first resumable drain, so `max_records_per_batch` and cross-batch `pending_fetches` resume cover it too. `expand_contained=false` (N+1) with `pagination=keyset` remains a valid alternative for these servers. |
-| `delta_tracking`        | disabled | Opt-in OData v4 delta queries. Values: `disabled` (default — no behavior change), `auto` (probe once, fall back to cursor/snapshot if the server doesn't acknowledge), `enabled` (require support; error if the server doesn't acknowledge). Under `auto`, a stream **pins its first read shape**: the delta path is sticky by offset shape (`delta_link`/`next_link`), and a fallback decision persists as `delta_ok: false` in the resume offset — pinned by the offset's *shape* alone (any non-empty snapshot/cursor offset) even when a transient first-batch probe left no stamped verdict — so a server that flaps its `Preference-Applied` acknowledgement can't flip an established stream's read shape away from the schema frozen at setup (which would silently drop the synthetic columns or fail parsing). Explicit `enabled`/`disabled` scrubs the flag, and switching back to `auto` re-probes. See [Delta tracking](#delta-tracking) below. |
-| `expand_contained`      | auto    | For contained-collection tables (`Parent__Child__...` paths). When `true`, the connector issues a single `GET Parent?$expand=Child($expand=...)` per pipeline trigger instead of the N+1 traversal (one parent fetch + one per-parent leaf fetch); `false` forces the N+1 traversal. **`auto`** (**default** when unset) attempts the `$expand` read behind a one-shot **behavioural preflight**: it issues the *real* nested-`$expand` URL (small page budget, top-level `$top=1`, with the same inner `$top`/`$orderby`/`$filter` constructs the read would send — including a synthetic `cursor gt <floor>` when no watermark exists yet, so the inner-`$filter` construct is exercised up front) and verifies inline child collections actually come back at every level, cross-checked against one direct-navigation `$top=1` GET (carrying the same level `$filter`) so a server that accepts the URL but **silently ignores `$expand`** is caught rather than dropping every deep row. **Only a conclusive pass runs the expand read** — `auto` never assumes `$expand` works before the verdict is in. Anything else falls back to the N+1 walks (`expand_contained=false`) for that batch, never raising on a capability shortfall: a definitive failure (hard 4xx, or ignored-`$expand`) is recorded so later batches skip the probe; a transient blip or an inconclusive sample (empty top set, or a genuinely childless probed branch — indistinguishable from an ignoring server) records nothing and re-probes next batch. The N+1 shape is always correct, so an unresolved verdict only costs request shape, never rows. **Verdict reset:** the PASS persists in the resume offset as `expand_ok` (the offset never carries a fail — checkpoints are immortal, and a baked-in false would skip the preflight even after the server is fixed; definitive fails live only in the 15-minute process-wide cache, so a fixed server gets re-probed) and both outcomes ride the process-wide capability cache (see below the table) — the latter is what spares **snapshot** (cursorless) contained streams and batch-reader refreshes, whose offsets stay bare, from re-probing every trigger; an explicit non-`auto` value (`true`/`false`) scrubs `expand_ok` from the outgoing offset **and purges the cache entry**, so re-selecting `auto` (or unsetting the option) re-runs the preflight. Because both modes share the same `cursor` watermark key, an `auto` verdict flip mid-stream degrades to a re-read from the held watermark (MERGE-deduped), never loss. Partition activation follows `auto`'s **resolved** shape: a verified server reads via `$expand` (one request — nothing to parallelise, not partitioned), while a preflight failure keeps the table on the N+1 shape **with its partitioned parallelism intact** (the streaming `get_partitions` never re-probes — the shape is fixed at stream setup by `is_partitioned`). Note that for **snapshot** (cursorless) streams the resolved shape also sets the refresh cadence: the partitioned N+1 snapshot stream re-snapshots **every trigger** (wall-clock epoch offsets), while the single-`$expand` snapshot stream reads once and quiesces until its checkpoint is reset (the `snapshot_done` marker persists in the checkpoint, so a checkpoint-preserving restart stays quiesced — use a full refresh to re-snapshot) — so flipping `expand_contained` (or a differing preflight verdict) changes how often a snapshot stream re-reads, not just its request shape. An explicit `cursor_probe=nested-expand`/`batch` applies only when `auto` falls back to the N+1 walk. See [Contained navigation properties](#contained-navigation-properties) below. |
-| `contained_fetch`       | auto    | How the **full** (un-cursored) contained walks hydrate each leaf-parent collection — the **snapshot read** (a contained table with no `cursor_field`) and the **framework batch-reader stream** (`LakeflowBatchReader`, `start_offset=None`, used for batch / full-refresh ingest). Accepts **`auto`**, **`batch`**, **`single`**, the size-suffixed **`auto:<N>`** / **`batch:<N>`**, or a **positive integer** *N*. **`auto`** (default) packs the per-leaf-parent GETs into OData **`$batch`** requests (chunked to **1000 operations/request**, server-driven paging with `@odata.nextLink` follow-up), collapsing *M* leaf-parent round-trips into `ceil(M/1000)`; a one-shot capability preflight gates it and on a server without `$batch` it transparently **falls back** to **`single`** (only a **definitive** preflight outcome — a working envelope, or a hard rejection like 404/405 — is recorded; a transient failure such as a 503 or a network blip degrades that batch only and is re-probed on the next, so a momentary blip never pins the stream to the slow path). **`batch`** is the same hydrate but **strict** — a server that fails the `$batch` capability preflight is an **error**, not a silent fall-back (use it when you know the server supports `$batch` and want to be told loudly if a deployment doesn't). **`auto:<N>`** and **`batch:<N>`** set the chunk size to **`N` operations/request** (`ceil(M/N)`, e.g. `batch:200` to start smaller) while keeping `auto`'s fall-back / `batch`'s strictness respectively. A bare positive integer *N* is like **`batch:<N>`** (strict): **`N` = 1 is equivalent to `single`** and **`N` > 1** tunes the batch size. **Adaptive sizing** (all batch modes): if the server rejects a batch for carrying too many sub-requests — matched across phrasings, e.g. *"OData batch message contains too many parts"* or *"$batch exceeds the maximum of N operations"* — the connector shrinks the working size by 25% and retries (up to 10 times — enough for the geometric shrink from 1000 to converge below a ~100-part server cap) before falling back to a plain per-leaf-parent GET; the discovered working size is **recorded once** and persisted in the resume offset (`batch_size_ok`, alongside `batch_ok`) so later batches and framework-recreated readers reuse it. (Strict mode errors only on the *preflight* — "server can't `$batch` at all"; the adaptive size give-up is a runtime resilience step that still degrades to GETs.) **Per-sub-request failures inside a 2xx envelope are never silently skipped**: a sub-response with an error status (e.g. one throttled leaf-parent) is re-issued as a plain GET — a transient (429/5xx) recovers through the normal retry/backoff path, a hard 4xx raises with the server's actual error — so a failed part can't quietly drop that parent's rows (which on a cursor walk would otherwise advance the watermark past them permanently). **Verdict reset:** the `$batch` capability + size verdicts (`batch_ok` / `batch_size_ok`) are **shared** with the `cursor_probe` `auto` cascade's hydrate, so they persist in the offset while **any** auto-mode consumer is live — `contained_fetch` `auto`/`auto:<N>`, or `cursor_probe` `auto` with the hydrate not suppressed by an explicit `single`/`1`. Only when every consumer is pinned non-`auto` are they scrubbed from the outgoing offset, so switching back to `auto` later **re-runs the preflight** (an all-pinned config carries no offset verdict, but the process-wide capability cache — see below the table — still spares the per-microbatch re-probe within a run). **`single`** is the original behaviour — one GET per leaf-parent. This mostly governs the **full walks** (no cursor filter / no resume), distinct from `cursor_probe` which accelerates the *incremental* leaf-cursor read (streaming, with a watermark). One cross-over: an explicit **`contained_fetch=single`** / **`1`** also forces the incremental leaf-cursor hydrate down the plain N+1 walk — both the `cursor_probe` probe's dirty-parent hydrate (the probe still prunes which parents to read; only its `$batch` hydrate is suppressed) and `auto`'s no-probe `$batch` cascade. The one exception is an explicit `cursor_probe=batch`, a direct demand for the `$batch` hydrate that wins the conflict. Emitted rows are identical regardless of value — only the request batching differs. No effect on flat tables or `expand_contained=true`. |
-| `cursor_probe`          | auto    | Request-count optimization for **incremental** reads of **deep** contained paths with a **leaf** `cursor_field` and **sparse** changes — the `expand_contained=false` counterpart to `expand_contained=true`. The plain N+1 incremental read enumerates every leaf-parent and issues one `cursor gt since` leaf fetch under each — thousands of mostly-empty requests when few leaves changed. **Four values** select the acceleration strategy: <br><br>• **`auto`** (default) — a best-effort cascade. Use the nested-`$expand` change-probe where it can pay off *and* the server is verified to honour `$orderby`/`$top` inside `$expand`; otherwise fall back to a `$batch` hydrate (where the server supports `$batch`, and unless an explicit `contained_fetch=single`/`1` suppresses it); otherwise the plain N+1 walk. **Never raises** on a server-capability shortfall — it degrades to a correct, slower strategy. <br>• **`nested-expand`** — strict nested-`$expand` probe. **Raises** a clear error if the path can't use it or the server mis-orders inner `$expand` ("I require the probe"). The dirty leaf-parents it identifies are then hydrated via OData **`$batch`** when the server supports it (a fail-closed preflight falls back to the plain N+1 walk) — the probe prunes *which* parents to read, `$batch` batches the hydrate of whichever remain. An explicit **`contained_fetch=single`** (or **`1`**) overrides this: the probe still prunes, but the dirty parents are hydrated via the plain N+1 walk (the `$batch` preflight is skipped entirely). <br>• **`batch`** (or **`batch:<N>`**) — skip the probe; hydrate the changed leaves via OData **`$batch`** (server-driven paging, no `$top`, `@odata.nextLink` follow-up, chunked to **1000 operations/request** by default, or **`N`** with the `batch:<N>` form — e.g. `batch:200` to start smaller), falling back to the plain N+1 walk if the server doesn't support `$batch`. If the server rejects a batch for too many sub-requests (matched across phrasings — *"too many parts"* or *"exceeds the maximum of N operations"*), the size is shrunk 25% and retried (up to 10 times, enough to converge below a ~100-part cap) before falling back, and the working size is recorded once in the offset (`batch_size_ok`) for reuse. Safe on servers (e.g. Hexagon Smart API) that reject nested-`$expand` options, since it relies only on top-level single-column `cursor gt` filters. <br>• **`false`** — force the plain N+1 walk. <br><br>**Probe mechanics:** the probe issues **one shallow probe per leaf-grandparent tuple** — `…/<LeafParent>?$select=<pk>&$expand=<Leaf>($orderby=<cursor> desc;$top=1;$select=<cursor>)` — reads each leaf-parent's **newest leaf**, and marks it dirty when that leaf's cursor is `> since` (compared client-side). It then hydrates **only** the dirty leaf-parents — via OData `$batch` when the server supports it (`_verify_batch_support` is fail-closed, so an unsupported server transparently falls back to the per-parent N+1 walk over the same dirty set). Emitted rows are identical to `false` **provided the probe identifies the dirty parents correctly**; the watermark, `max_records_per_batch` cap, key-based `parent_keys` resume (churn-stable; `parent_idx` is the legacy fallback), and no-progress guard are all reused unchanged (a resumed batch re-probes skipped parents — probes, no leaf fetches). Ordering the inner `$expand` by the cursor descending means the single returned row is the max-cursor leaf *by construction*, so a server that applies `$top` before anything else still returns the right row — and there is **no inner `$filter`** to mis-order against (the change test is client-side). **The probe engages only where it can pay off**: the cursor on the **leaf**, *and* the **distance from the leaf to the nearest batch-snapshot (non-cursor) ancestor > 1** — i.e. the leaf's *parent* collection is itself cursor-bearing (incremental, high-fan-out). So `…/WorkPackageDetails/WorkPackagesStepDetails` (leaf-parent `WorkPackageDetails` is cursor-bearing) qualifies, while `Instances/Projects/WorkPackageDetails` (leaf-parent `Projects` is snapshot — few rows, all dirty, nothing to skip) does not. Depth alone is not the criterion. **`$batch` hydrate:** issues the same per-leaf-parent `cursor gt since` reads as the plain walk but packs them into `$batch` requests, so *M* leaf-parent round-trips collapse to `ceil(M/1000)` (or `ceil(M/N)` with `cursor_probe=batch:<N>`, auto-reduced on a "too many parts" rejection); resume is chunk-aligned on the last drained chain's `parent_keys` (an exclusive, key-matched park; `parent_idx` rides along for downgrade compatibility) and the cap is overshot by at most one chunk's worth of changed rows. A 200 `$batch` envelope with a truncated/malformed JSON body — the largest response the connector ever receives, and the shape some servers produce under load — is re-POSTed once (GET-only sub-requests, so the retry is safe) before raising. ⚠️ **The probe's identify step relies on the server honouring `$orderby`/`$top` inside `$expand`** (optional OData v4 features). A server that ignores `$orderby` could return a non-newest leaf and report a dirty leaf-parent as **clean**, dropping its changed leaves. The connector runs a **one-time behavioural capability check** before engaging the probe (it verifies the inner `$expand` returns the true newest leaf for a real multi-leaf parent, cross-checked against trusted direct-navigation ordering). This catches **both** failure modes: a server that silently **mis-orders** inner `$expand` (returns an older leaf), and one that outright **rejects** the inner-`$expand` options with an HTTP error (e.g. Hexagon Smart API 400s on inner `$orderby`/`$top`/`$select`). Under `auto` either failure **cascades to `$batch`/the plain walk** (a rejection is recorded as a definitive `cursor_probe_ok=false`); under `nested-expand` either **raises** an actionable error — never a raw HTTP error. Both the probe-verified and `$batch`-supported verdicts are cached per table and persisted in the resume offset (`cursor_probe_ok` / `batch_ok`) so a per-batch-recreated reader skips the capability requests — the `$batch` preflight persists only **definitive** verdicts (a transient failure like a 503 degrades that batch to the plain walk and is re-probed on the next, never pinning the stream to the slow path). Under `auto`, **both** definitive preflight outcomes additionally ride the process-wide capability cache (see below the per-table options table): the offset only ever carries the *pass*, so without the cache a mis-ordering server would re-pay the preflight GETs on every framework-recreated reader before cascading to `$batch`. A mismatch where the probe-shaped `$expand` returns a leaf **newer** than the direct-navigation reference is a concurrent-write race (the two fetches aren't atomic), not mis-ordering evidence — a genuinely mis-ordering server returns an *older* leaf — so that sample is **skipped** and the scan moves on to another, exactly like a non-discriminating one. Only clean evidence (an *older*/missing inner leaf) is a definitive fail; nothing about a race is recorded, and one unlucky write can neither abort the whole preflight nor raise strict mode. A preflight that errors out **before reaching a verdict** — the parent-enumeration or trusted-reference fetch itself fails (indistinguishable from a transient blip, unlike the probe-shape rejection whose sibling fetches just succeeded) — likewise records **nothing**: under `auto` that read degrades to the `$batch`/plain cascade and the next batch re-probes; `nested-expand` raises an actionable error rather than the raw HTTP failure. **Verdict reset:** `cursor_probe_ok` is persisted only while `cursor_probe` is `auto`; any non-`auto` value (`nested-expand`, `batch`, `false`) scrubs it from the outgoing offset **and** purges the per-table cache entry on the next read (so the reset also reaches the bare-offset snapshot / batch-reader paths), so switching back to `auto` later **re-runs the probe preflight**. The strict `nested-expand` mode neither consults nor records the shared cache — it re-verifies each microbatch so its error always carries fresh evidence. An explicit `cursor_probe=nested-expand`/`batch` raises if combined with `expand_contained=true`, used on a flat table, or used without a `cursor_field`; `nested-expand` additionally raises with the cursor on a non-leaf ancestor or where the leaf-parent is a snapshot level (distance 1). |
-| `num_partitions`        | 4       | Number of Spark partitions for parallel reads of contained-collection tables. Honored whenever the read resolves to the N+1 walk: a contained path with `delta_tracking=disabled` and `expand_contained=false` — or `auto` whose preflight fell back to N+1. **Streaming** additionally requires any `cursor_field` to live on the top-level entity (the `SupportsPartitionedStream` gate); **batch** reads partition any N+1 contained path, leaf-level cursors included. Top-level rows are bin-packed into this many contiguous slices; each Spark task walks only its assigned subtrees. Ignored for non-partitionable tables (they fall back to single-task reads). **Null-cursor top parents are rejected** on this path (curated error at partition discovery): once a fence is committed, the `cursor gt` discovery filter excludes them server-side, so their subtrees' future changes would be dropped silently — the first (unfenced) batch sees them in discovery, and every later batch runs a one-request `eq null` probe so a null-cursor parent *inserted mid-stream* is caught too (best-effort: a server rejecting the `eq null` filter keeps the first-batch-only check). Exclude them with `filter_at_<top>` (`<cursor> ne null`), fix the data, or read serially. **The fence probe self-checks `$orderby` honoring**: the per-trigger watermark comes from one `$top=1&$orderby=<cursor> desc` request, and a server that silently ignores `$orderby` would pin the fence at a stale value and stall the stream with data pending — so after each probe the connector one-time-verifies it: `<cursor> gt <probed max>` should return nothing, and a contradiction is disambiguated by one desc re-probe (a busy source can legitimately insert a row between the two requests — an honoring server's re-probe then returns the fresh max, recording the PASS; only a re-probe still below the contradicting row proves `$orderby` is ignored). The PASS verdict rides the shared capability cache as `fence_desc_ok` (re-checked after its 15-min TTL); a proven desc-ignoring server raises an actionable error instead of stalling. (Edge: on a desc-ignoring server whose churn happens to surface a fresh max to the re-probe, the check can cache a false PASS for up to the 15-min TTL — one bounded silent-stall window — after which the re-check fires and raises the correct error.) **A parent deleted mid-batch is skipped with a warning** (its 404/410 can't fail the frozen partition descriptor's task retries; the next batch re-discovers the live parent set — matching the serial walks' self-healing). **Overlap posture**: `cursor_lookback_seconds=auto` resolves to **0** on partitioned streams (no walk-duration history rides the offset), so rows landing at-or-below the fence after it was probed are only re-scanned if you set an **explicit** `cursor_lookback_seconds` — serial cursor streams self-tune this overlap, partitioned ones don't. Two framework notes: on pure **batch** reads a partition-planning failure (including an invalid `num_partitions`) is swallowed by the framework and silently degrades to a serial read; and partition planning materializes the discovered parent slice on the driver (fine at 10k–100k parents, budget driver memory for millions). |
-| `cursor_lookback_seconds` | auto | Overlap window for incremental **contained** cursor reads over a **continuously-changing** source — applies to **all four** non-atomic contained cursor walks: `expand_contained=true`, the plain N+1 leaf-cursor walk, the `cursor_probe` walk, and the **ancestor-cursor** walk (there the window floors the *ancestor enumeration* filter — a dirty ancestor re-included by the overlap gets its whole subtree re-read, duplicate-safe — recovering parents whose cursor advanced mid-cycle to below the cycle's final watermark). None of them is a consistent snapshot — the walk takes many seconds, during which the source keeps changing — and the connector commits the watermark as the max cursor it saw. A row inserted *during* the walk under a leaf-parent the walk already passed (or one the probe already flagged clean) lands with a cursor below that final max and would be skipped forever by the next `cursor gt <max>`. With a window set, each batch reads from `cursor gt (committed − window)` instead, re-scanning the overlap so those mid-walk arrivals are captured on the next progressing batch (re-read rows are idempotent at the destination via `apply_changes` MERGE on the primary key). For `cursor_probe`, the floored value also re-arms the probe's dirty-detection, so a leaf-parent whose newest leaf fell in the overlap is re-flagged dirty and re-hydrated. The **partitioned streaming** path (`SupportsPartitionedStream`, level-0 cursor) honors an explicit integer window too — its fence is probed *before* partition discovery, so the overlap re-scans rows that landed at-or-below the fence mid-batch (a row landing at exactly the fence AFTER the stream went quiescent is only recovered once some newer row advances the fence and unblocks the no-progress gate — on a permanently quiescent source it stays invisible); `auto` is a no-op there (no walk-duration history rides the partitioned offset), so set an integer window explicitly for that shape. The committed watermark is **never** floored — only the read filter is — so the offset still advances to the true max, and it never *regresses* either: a completing batch's max is floored at the prior watermark, so an overlap re-read whose watermark-defining row was deleted between batches can't walk the offset backwards; a quiescent trigger (no row beyond the watermark) idles instead of looping. Values: **`auto`** (default) self-sizes the window from the **max** walk duration over the last few completed walks (persisted in the offset as `lb_history`) × `cursor_lookback_factor` (default 1.5), clamped to `cursor_lookback_max_seconds` (default 3600). A walk that `max_records_per_batch` caps into several batches records its **whole cycle's wall-clock span** — first capped batch to completion, trigger intervals included (anchored by `lb_cycle_started` in the offset) — since the churn-exposure window of a capped cycle is the full span, not one batch's drain time. Using the max of recent walks — rather than the last value × a large fudge — makes the estimate robust to a single slow spike — no manual guess, and a no-op until the first walk is measured, outside the contained cursor paths, and for non-timestamp cursors; **an integer** sets a fixed window in cursor units (seconds for a timestamp cursor) — set it at or above the worst-case walk duration, and it requires a timestamp `cursor_field` on a contained path (else raises); **`off`** (or `0`) disables the overlap (exact prior behaviour). Trade-off: a non-zero window re-reads (and re-MERGEs) the trailing overlap each batch — `auto` keeps that proportional to the actual walk time. |
-| `cursor_lookback_factor` | 1.5 | `auto`-mode only: multiplier applied to the max recent walk duration when sizing the overlap window (see `cursor_lookback_seconds`). Margin for a walk slower than any recently observed. Must be > 0; values < 1 risk under-covering (dropped rows). Ignored unless `cursor_lookback_seconds=auto`. |
-| `cursor_lookback_max_seconds` | 3600 | `auto`-mode only: ceiling clamp (runaway backstop) on the computed overlap window, in seconds. Must be > 0. Ignored unless `cursor_lookback_seconds=auto`. |
-| `exclude_ancestor_columns` | | Comma-separated list of synthetic ancestor-FK column names to **drop from the destination** for a contained-collection table. By default every non-leaf ancestor's PK is prepended as a `<segment>_<pkname>` column (see [Contained navigation properties](#contained-navigation-properties)); list the resolved column names here (e.g. `Instances_Id,Projects_Id`) to omit them, or a lone `*` to drop **all** ancestor-FK columns at once. Excluded columns disappear from the table schema, the stamped rows, **and the composite primary key** alike — so only exclude columns not needed for destination-key uniqueness, otherwise distinct leaf rows under different ancestors can collide on MERGE. **Only synthetic ancestor-FK columns can be excluded** — naming a real leaf/own table column (or a name that matches nothing) leaves the schema untouched and logs a warning, so the option can never drop an actual source column. No effect on flat tables. |
+Passed to the connector via the pipeline's `table_configuration` block.
+Every key must appear in the connection's `external_options_allowlist`
+(the connector spec already lists all of them).
 
-**Capability-verdict caching.** The preflight verdicts above (`expand_ok`, `batch_ok`, `batch_size_ok`, `or_filter_ok`, `cursor_probe_ok`, and `delta_ok` — the `delta_tracking=auto` probe's pinned fallback decision) live in up to three layers, consulted in order: the **resume offset** (streaming cursor reads — durable across restarts via the checkpoint), the **connector instance** (dedupes within one read), and a **process-wide cache keyed by `service_url`** with an on-disk mirror (tempdir JSON, 15-minute TTL, plain booleans only). The last layer exists for reads whose offsets *can't* carry verdicts — streaming **snapshot** offsets hold only the `snapshot_done` quiesce marker (the pyspark simple-reader wrapper accepts quiescence solely as an *empty batch with an unchanged offset*, so the marker must stay byte-stable across triggers and verdicts must not ride it), and the **batch reader** (pipeline snapshot refresh / full refresh) discards offsets entirely — which would otherwise re-run their preflights on every framework-recreated instance, i.e. every microbatch or trigger. Only **definitive** verdicts are recorded at any layer (a transient blip — or a race-contaminated `cursor_probe` sample — records nothing and re-probes next batch); `cursor_probe_ok` joins the shared cache only under the `auto` cascade (the strict `nested-expand` mode neither consults nor records it). The on-disk mirror is rewritten atomically (per-process, per-thread temp file + rename) so a concurrent worker never reads a half-written file, re-parsed only when its mtime changes (otherwise the hot lookup is a single `stat`), and all in-process access is serialized by a lock so concurrent streaming queries on one driver can't corrupt the shared dict. **Reset on a non-`auto` switch:** the **per-table** verdicts (`expand_ok` / `cursor_probe_ok`) are purged from the process/file cache — scoped to just that table — on the next read whenever their governing option is non-`auto`, which covers the bare-offset snapshot and batch-reader paths the offset scrub can't see; so for those, re-selecting `auto` always re-runs the preflight. The **server-wide** `$batch` verdicts (`batch_ok` / `batch_size_ok`) can't be table-scoped, so they're purged only on the cursor-stream **offset transition** (conservatively, so pinning one table's `$batch` off doesn't churn a sibling's live `auto` consumer). The OR-keyset verdict (`or_filter_ok`) is likewise server-wide and is scrubbed + cache-dropped when an explicit `pagination=skip`/`nextlink` is set (modes that never consume it) — pin one of those for a batch and unpin to force a re-probe, e.g. to clear a wrongly-false verdict persisted in an old checkpoint. The on-disk mirror files are per-user (owner-tagged filenames + an ownership check before reading), so a shared multi-user tempdir can neither poison nor leak verdicts across accounts. A consequence: a **snapshot-only** table (no cursor, no offset) that pins `contained_fetch` off and later returns to `auto` keeps the cached `batch_ok` until the disk TTL or a process restart — harmless, because the `$batch` path degrades to plain per-parent GETs if a batch attempt is ever rejected, so a stale `batch_ok=true` costs at most one failed batch, never rows.
+The table below is the quick reference; every non-trivial option has a
+detail subsection following it.
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `namespace` | — | Selects the OData schema (e.g. `Sales`, `HR`) when two schemas declare an entity set with the same name. The schema's `Alias` is accepted interchangeably. |
+| `cursor_field` | — | Drives incremental reads (`cursor gt <last>` per batch). Omit for snapshot. On contained paths the column may live on the leaf or an ancestor — see [Cursor-based incremental on contained tables](#cursor-based-incremental-on-contained-tables). |
+| `select` | all | `$select` projection, leaf-scoped on contained paths. |
+| `filter` | — | Extra `$filter` expression, applied to the leaf segment. |
+| `filter_at_<segment>` / `filter_at_<idx>` | — | Per-segment `$filter` for contained paths. |
+| `page_size` | `1000` | Per-response row budget (`$top`), distributed across `$expand` levels. |
+| `max_records_per_batch` | `10000` | Per-batch cap on emitted rows, with resumable park state. |
+| `cursor_nulls` | `coalesce` | How cursor reads handle rows whose `cursor_field` is null. |
+| `pagination` | `auto` | How collection pages are walked: `auto` / `nextlink` / `keyset` / `skip`. |
+| `delta_tracking` | `disabled` | Opt-in OData v4 delta queries — see [Delta tracking](#delta-tracking). |
+| `expand_contained` | `auto` | Nested-`$expand` vs N+1 read for contained paths. |
+| `contained_fetch` | `auto` | `$batch`-packing of the un-cursored contained walks' per-parent fetches. |
+| `cursor_probe` | `auto` | Change-probe acceleration for deep leaf-cursor N+1 reads. |
+| `num_partitions` | `4` | Spark-parallel reads of contained N+1 paths. |
+| `cursor_lookback_seconds` | `auto` | Overlap window re-scanning rows that landed mid-walk (with `cursor_lookback_factor`, `cursor_lookback_max_seconds`). |
+| `exclude_ancestor_columns` | — | Drop synthetic ancestor-FK columns from a contained table. |
+
+### select
+
+Comma-separated `$select` projection, or `*` (all structural properties
+— equivalent to omitting the option).
+
+**Leaf-scoped on contained paths** in both read modes: it lands on the
+leaf URL in N+1 mode and inside the innermost `$expand(...)` clause in
+expand mode. Ancestor levels stay unprojected — their PKs and any
+ancestor cursor column are fetched by the machinery regardless — and
+the derived Spark schema is filtered to the same leaf columns
+(synthetic ancestor-FK columns survive).
+
+Must keep the leaf's primary-key columns and any leaf-level
+`cursor_field` (curated error otherwise).
+
+### filter and filter_at_&lt;segment&gt;
+
+`filter` is an extra OData `$filter` expression applied to the **leaf
+segment** in both modes — the leaf URL in N+1 mode
+(`expand_contained=false`), the innermost `$expand(...)` clause in
+expand mode. It is equivalent to `filter_at_<leaf-segment>` and
+AND-composes with it if both are set.
+
+`filter_at_<segment>` / `filter_at_<idx>` places a `$filter` on a
+specific level of a contained path:
+
+- **N+1 mode**: the ancestor walk at that level is pruned to matching
+  rows, cascading the savings down to every child.
+- **Expand mode**: the filter is injected inside the corresponding
+  `$expand(...)` clause per OData v4 §5.1.1.6.
+- Two equivalent forms: by segment name (`filter_at_Instances=Id eq 5`
+  — must match a segment in the contained path) or by zero-based index
+  (`filter_at_0=Id eq 5`). Index wins on conflict.
+- Composes with cursor filters (AND-ed at the cursor's segment) and
+  with the `filter` option (AND-ed at the leaf in N+1 mode, AND-ed at
+  the top in expand mode).
+- Unknown segment names and out-of-range indices raise `ValueError` at
+  read time.
+
+**Encoding rule (both options):** the connector auto-encodes spaces and
+non-ASCII, but a URI-reserved character inside a **string literal**
+must be percent-encoded by you: `%`→`%25`, `&`→`%26`, `#`→`%23`,
+`+`→`%2B` (e.g. `Name eq 'AT%26T'`, `Grade eq 'A%2B'`,
+`Created gt 2024-01-01T00:00:00%2B01:00`). Left raw, an `&`/`#`
+truncates the query (usually a server 400; wrong rows on a lenient
+server) — the connector can't encode these for you without
+double-encoding an already-encoded value.
+
+See [Filtering individual segments](#filtering-individual-segments)
+for a worked example.
+
+### page_size
+
+Maximum per-response row budget. Must be a positive integer — `0` or
+garbage raises up front (`$top=0` is a valid URL the server answers
+with an empty page, which the drain would read as "table exhausted"
+and silently emit zero rows).
+
+**When a default applies.** Under the default `pagination=auto`
+**every** read — snapshot, cursor, and delta — defaults
+`page_size=1000` (→ `$top=1000`), because `auto` needs a `$top` to
+detect a page-limited response with no continuation link. The one
+exception is `pagination=nextlink`: there a **snapshot read** (no
+`cursor_field`, no delta) with `page_size` unset sends **no `$top` at
+all** — the server picks its own page size and the connector walks
+every page via `@odata.nextLink` (this avoids servers that reject or
+mishandle an explicit `$top`, e.g. a value above their per-page cap,
+on a full-table scan). Cursor/delta reads still default to `1000` even
+under `nextlink`. Setting `page_size` explicitly applies to every mode
+and overrides the default.
+
+**Flat tables**: the value becomes the `$top` at the single URL.
+
+**`expand_contained=true` paths**: the budget is distributed across
+all `$top` points (top URL + every nested `$expand(...)`) with
+triangular weights — top gets the largest share, each deeper level
+proportionally less — so the cross-product
+`top × inner_1 × inner_2 × …` fits in the budget. Each per-level
+`$top` is floored at 5 (very small pages amplify the
+`@odata.nextLink` chase at every level); when a deep level would drop
+below 5 it's pinned to 5 and the remaining budget is divided back
+across the upper levels, so the cross-product stays at or under
+`page_size`. Each level additionally carries a stable `$orderby` for
+skiptoken-safe paging — see
+[Pagination ordering](#pagination-ordering).
+
+Examples with `page_size=1000`: depth 2 → `[100, 10]` (product 1000),
+depth 3 → `[34, 5, 5]` (850), depth 4 → `[8, 5, 5, 5]` (1000). For
+chains so deep that `5 ** N > page_size` the floor unavoidably wins
+(e.g. `5**5 = 3125`); raise `page_size` to restore the cap, or switch
+to `expand_contained=false` so the chain becomes N+1 single-segment
+fetches.
+
+### max_records_per_batch
+
+Per-call upper bound on rows returned. The connector has **no
+wall-clock ceiling** — `max_records_per_batch` is the only cap on a
+single batch. Each batch fetches `cursor gt <last>` and pulls up to
+this many rows, then commits the offset. Smaller values give
+continuous-mode pipelines lower latency per micro-batch at the cost of
+more round trips; larger values amortize HTTP overhead. The default of
+10000 balances commit frequency / visibility against HTTP overhead;
+lower it (e.g. to 100) for tighter per-batch latency or higher (e.g.
+100000+) for throughput-oriented batch backfills. Validated up front:
+must parse as an integer **≥ 1** (curated error otherwise — the cap
+bounds *emitted* rows, so a non-positive value would park forever
+without emitting anything).
+
+**Where the cap applies:**
+
+- **Honoured** by every serial **cursor/delta** read path (flat /
+  contained N+1) and by the `expand_contained=true` walks (which park
+  a resumable depth-first drain — see below).
+- **Ignored — with a warning — on flat and contained-N+1 snapshot
+  reads** (no `cursor_field`, delta inactive): those shapes' streaming
+  offset carries only the quiesce marker, no park state, so a cap
+  could only truncate the snapshot and silently drop the remainder;
+  their snapshot triggers always read the full table. An
+  `expand_contained=true` **snapshot is the exception — it honours the
+  cap** (its offset parks the resumable `pending_fetches` drain, so a
+  capped snapshot spans multiple triggers and stamps the quiesce
+  marker only once the drain completes).
+- **Not applied on partitioned streaming** (`num_partitions` with a
+  top-level cursor): microbatches are sized by the cursor window
+  (fence to fence), not by this cap — the per-partition Spark tasks
+  have no shared park state to resume a capped batch from.
+- **Delta-tracking reads** enforce the cap at **page boundaries**
+  (stop following `@odata.nextLink` once reached) and may overshoot by
+  up to one server page — a mid-page stop would permanently skip the
+  rest of that page, since the persisted resume link points at the
+  *next* page.
+
+**How the `expand_contained=true` drain enforces it.** The cap is
+checked **per HTTP fetch at any depth** by a depth-first resumable
+stack machine:
+
+- The drainer walks one root→leaf path at a time, holding each
+  parent's inline sibling collection as a single in-memory page frame
+  and checking the cap between rows/fetches.
+- When a batch parks, only the **boundary path from the root to the
+  current leaf** is serialized — one item per contained segment on the
+  current path — so the parked offset is **O(depth)**, *not*
+  O(fan-out width). (An earlier breadth-first design parked one
+  continuation per truncated inner collection, so a wide top page over
+  an inner-paging server could balloon the offset to thousands of
+  URL-carrying items and collapse throughput to ~one row per batch
+  once the backlog exceeded its ceiling; depth-first eliminates that.)
+- The parked frontier is `pending_fetches` — a list of
+  `{url, level, chain, cur_val, skip, boundary}` items in
+  bottom-to-top stack order (plus a transient `rebuilt` marker on
+  items retried after a 404/410 recovery). The next `read()` re-pushes
+  them to reconstruct the DFS path and resumes exactly where it
+  stopped, **churn-safe via each item's chronological `boundary`
+  order-key** — never a positional `$skip`, which could desync and
+  drop rows under between-batch writes (`skip` remains only as a
+  legacy downgrade fallback for offsets without a boundary).
+- The frontier needs no explicit ceiling: depth-first descent holds
+  only one root→leaf path at a time, so both the live stack and the
+  parked `pending_fetches` stay O(depth) unconditionally, regardless
+  of how wide any parent's inner collection grows.
+- Cap deviation per batch is bounded by one HTTP response's worth of
+  leaf rows (≤ `page_size`), regardless of how deep the chain is or
+  how wide any single parent's inner collection grows.
+- In cursor mode the watermark only advances once the chain fully
+  drains; until then the running max sits in `running_max_cursor`.
+
+**What counts toward the cap.** Only rows strictly above the committed
+watermark: `cursor_lookback_seconds` overlap re-reads ride on top (so
+an overlap window holding ≥ `max_records_per_batch` rows can't wedge
+the stream into an eternal park/re-read cycle — a pure-overlap batch
+completes and idles), meaning the cap may additionally overshoot by
+the overlap size, which is bounded by the configured lookback window.
+
+**Sizing note for large contained parent sets:** each resumed batch
+re-pages the ancestor enumeration up to its park position (keys must
+be fetched to be matched), so a full capped cycle over `P` parents
+costs roughly `P²/(2·cap·server_page)` extra ancestor-page requests in
+aggregate — negligible at `P=10k`, ~50× the single-pass cost at
+`P=100k` with `cap=1000`. Size the cap so a cycle spans few batches on
+very large parent sets.
+
+### cursor_nulls
+
+How a cursor read handles rows whose `cursor_field` is **null**:
+
+- **`coalesce`** (default) — substitute a deterministic synthetic
+  floor (a `2000-01-01…` timestamp carrying a per-PK sub-second
+  offset, or the type's minimum for date/int/string cursors) for
+  comparison and the watermark. The emitted row keeps its real
+  `null`, the watermark always advances, and null-cursor rows are
+  ingested once on the seed pass (server-side `cursor gt` excludes
+  them thereafter, so null rows inserted *after* the seed aren't
+  re-captured). The temporal floor year is configurable as
+  `coalesce:<YYYY>` (e.g. `coalesce:1990`) — lower it below your
+  oldest data; default `2000`.
+- **`error`** — raise a no-progress `RuntimeError` when a batch's rows
+  all have a null cursor (the watermark can't advance). Use to catch a
+  misconfigured cursor.
+- **`ignore`** — drop null-cursor rows entirely (never emitted).
+
+Applies to **flat and contained leaf-cursor** paths; ancestor-cursor
+and `expand_contained=true` paths treat nulls as `error`. For cursor
+types with no synthesisable floor (boolean/binary) the default
+silently falls back to `error`; setting `cursor_nulls=coalesce`
+explicitly on such a cursor raises.
+
+### pagination
+
+How the connector walks a collection's pages. Four modes:
+
+- **`auto`** (default) — follow the server's `@odata.nextLink`
+  whenever it emits one (identical to `nextlink` for spec-compliant
+  servers). If the server **never** emits a link during a walk, fall
+  back to a keyset seek (if the `$orderby` has keys) or `$skip`, and
+  drain until an **empty** page — so a server that silently
+  page-limits responses *below* the `$top` you request *and* omits
+  `@odata.nextLink` (a common non-compliant shape, e.g. one that
+  suppresses the link whenever `$top` is sent) is still read in full,
+  with no per-table override.
+- **`nextlink`** — follow `@odata.nextLink` only. Strictly
+  spec-compliant, and the choice when you want a `$top`-free snapshot
+  scan (some servers reject or mishandle an explicit `$top`).
+- **`keyset`** — ignore `@odata.nextLink` and always seek the next
+  page with a `(k gt <last>)` predicate on the `$orderby` key set
+  (`cursor`+PK, or PK-only).
+- **`skip`** — ignore `@odata.nextLink` and page via `$top`+`$skip`.
+  The keyless fallback (entities with no unique sort key); O(n)
+  offsets and fragile under concurrent writes.
+
+Use `keyset`/`skip` explicitly only to *force* the seek strategy (e.g.
+to ignore a buggy `@odata.nextLink` entirely). `auto`/`keyset`/`skip`
+require a `$top`, so they force a default `page_size` when none is set
+— including on snapshot scans under the default `auto`.
+
+**Termination differs by mode.** `nextlink` treats a *short* page
+(`len < $top`) with no continuation link as the end. `auto`, while the
+server is emitting links, trusts that short link-less final page as
+the end **only when the chain stopped *before* the `$top` budget was
+reached** (`fetched < $top`). OData `$top` is a **total-result limit**
+(§11.2.5.3), not a page size, and a spec-compliant server may
+propagate the remaining budget through its skiptoken
+`@odata.nextLink`s (e.g. Northwind: `$top=1000` → page 1's link
+carries `$top=500` → after 1000 rows no further link, though the
+collection has more). So if the link chain self-terminates at exactly
+the budget (`fetched >= $top`), `auto` does **not** trust the short
+final page — it seeks past the budget (keyset or `$skip`) and keeps
+draining until empty; otherwise any table larger than `page_size`
+would be silently capped at `page_size` rows. `auto` (once it has
+fallen back, i.e. the server gave no link), `keyset`, and `skip`
+instead drain until an **empty** page — a short non-empty page is NOT
+exhaustion, because the server's per-response page size may be
+**smaller than the `$top` you request**. The drain costs **one
+trailing empty request per collection that ends on a short page**; a
+spec-compliant server that keeps emitting `@odata.nextLink` incurs no
+extra request.
+
+**Composite keyset seeks and the OR-capability preflight.** A
+composite keyset seek (`$orderby` = `cursor`+PK) builds an
+OR-across-different-columns `$filter` —
+`(cursor gt v) or (cursor eq v and pk gt p)` — which some servers
+reject (Hexagon Smart API: "on different columns, only AND operators
+are supported"). Before issuing such a seek the connector runs a
+one-shot, cached, **auth-aware OR-capability preflight** (`$top=1`
+carrying the OR filter). On a **definitive, non-transient 4xx** (e.g.
+the "AND operators only" 400) it transparently **falls back to
+`$skip`** for that and every later walk, so the OR rejection never
+surfaces as an error or a dropped page. It applies the same
+definitive-vs-transient discipline as the other capability probes: a
+**transient** status (429/5xx) or a **transport/auth failure** (a
+`401` is refreshed, not misread as "unsupported") fails *open* for
+that seek and records **nothing**, so the next seek re-probes rather
+than durably pinning the slower `$skip` walk on a momentary blip. A
+single-key `$orderby` builds no OR and is never probed. The verdict is
+**threaded into the resume offset** (`or_filter_ok`, alongside
+`cursor_probe_ok`/`batch_ok`) so a reader the framework recreates each
+microbatch skips re-probing; these capability flags are bookkeeping
+and are excluded from the no-progress comparison.
+
+**No-progress guard.** A walk stops with a warning if a continuation
+returns a page identical to the one before it (the server ignored the
+seek/`$skip`) or if the server hands back a self-referential/cyclic
+`@odata.nextLink`. This protects **every** mode against infinite
+loops — the client-driven modes, plain `nextlink`, and the
+delta-tracking walk.
+
+**Scope.** The pagination mode applies to **every page walk**: flat
+reads, the contained leaf-cursor cap walk (the compound
+`(cursor eq V and pk gt last)` seek even drains a same-cursor cohort
+larger than a page), the ancestor walk, parent/ancestor enumeration,
+partitioned discovery, the top-level `$expand` collection, **and a
+parent's *inline child* collection inside `expand_contained=true`**.
+For the last case: when a parent's inline child page comes back full
+(`len == inner $top`) but the server omits the
+`<NavProp>@odata.nextLink`, the connector synthesizes a
+direct-navigation continuation —
+`Parent(key)/Child?$top=…&$expand=<grandchildren>` plus the keyset
+seek (or `$skip`) — and drains the rest, with the grandchildren still
+expanded and the cursor `$filter`/`$orderby` re-applied. This
+continuation flows through the same depth-first resumable drain, so
+`max_records_per_batch` and cross-batch `pending_fetches` resume cover
+it too. `expand_contained=false` (N+1) with `pagination=keyset`
+remains a valid alternative for these servers.
+
+### delta_tracking
+
+Opt-in OData v4 delta queries. Values:
+
+- **`disabled`** (default) — no behavior change.
+- **`auto`** — probe once, fall back to cursor/snapshot if the server
+  doesn't acknowledge.
+- **`enabled`** — require support; error if the server doesn't
+  acknowledge.
+
+Under `auto`, a stream **pins its first read shape**: the delta path
+is sticky by offset shape (`delta_link`/`next_link`), and a fallback
+decision persists as `delta_ok: false` in the resume offset — pinned
+by the offset's *shape* alone (any non-empty snapshot/cursor offset)
+even when a transient first-batch probe left no stamped verdict — so a
+server that flaps its `Preference-Applied` acknowledgement can't flip
+an established stream's read shape away from the schema frozen at
+setup (which would silently drop the synthetic columns or fail
+parsing). Explicit `enabled`/`disabled` scrubs the flag, and switching
+back to `auto` re-probes.
+
+See [Delta tracking](#delta-tracking) below for the full contract,
+supported services, and caveats.
+
+### expand_contained
+
+For contained-collection tables (`Parent__Child__...` paths):
+
+- **`true`** — one `GET Parent?$expand=Child($expand=...)` per
+  pipeline trigger instead of the N+1 traversal (one parent fetch +
+  one per-parent leaf fetch).
+- **`false`** — force the N+1 traversal.
+- **`auto`** (**default** when unset) — attempt the `$expand` read
+  behind a one-shot **behavioural preflight**, described next.
+
+**The `auto` preflight.** It issues the *real* nested-`$expand` URL
+(small page budget, top-level `$top=1`, with the same inner
+`$top`/`$orderby`/`$filter` constructs the read would send — including
+a synthetic `cursor gt <floor>` when no watermark exists yet, so the
+inner-`$filter` construct is exercised up front) and verifies inline
+child collections actually come back at every level, cross-checked
+against one direct-navigation `$top=1` GET (carrying the same level
+`$filter`) so a server that accepts the URL but **silently ignores
+`$expand`** is caught rather than dropping every deep row. **Only a
+conclusive pass runs the expand read** — `auto` never assumes
+`$expand` works before the verdict is in. Anything else falls back to
+the N+1 walks (`expand_contained=false`) for that batch, never raising
+on a capability shortfall: a definitive failure (hard 4xx, or
+ignored-`$expand`) is recorded so later batches skip the probe; a
+transient blip or an inconclusive sample (empty top set, or a
+genuinely childless probed branch — indistinguishable from an ignoring
+server) records nothing and re-probes next batch. The N+1 shape is
+always correct, so an unresolved verdict only costs request shape,
+never rows.
+
+**Verdict reset.** The PASS persists in the resume offset as
+`expand_ok` — the offset never carries a fail: checkpoints are
+immortal, and a baked-in false would skip the preflight even after the
+server is fixed; definitive fails live only in the 15-minute
+process-wide cache, so a fixed server gets re-probed. Both outcomes
+ride the process-wide capability cache (see
+[Capability-verdict caching](#capability-verdict-caching)) — that is
+what spares **snapshot** (cursorless) contained streams and
+batch-reader refreshes, whose offsets stay bare, from re-probing every
+trigger. An explicit non-`auto` value (`true`/`false`) scrubs
+`expand_ok` from the outgoing offset **and purges the cache entry**,
+so re-selecting `auto` (or unsetting the option) re-runs the
+preflight. Because both modes share the same `cursor` watermark key,
+an `auto` verdict flip mid-stream degrades to a re-read from the held
+watermark (MERGE-deduped), never loss.
+
+**Interplay with partitioning and snapshot cadence.** Partition
+activation follows `auto`'s **resolved** shape: a verified server
+reads via `$expand` (one request — nothing to parallelise, not
+partitioned), while a preflight failure keeps the table on the N+1
+shape **with its partitioned parallelism intact** (the streaming
+`get_partitions` never re-probes — the shape is fixed at stream setup
+by `is_partitioned`). For **snapshot** (cursorless) streams the
+resolved shape also sets the refresh cadence: the partitioned N+1
+snapshot stream re-snapshots **every trigger** (wall-clock epoch
+offsets), while the single-`$expand` snapshot stream reads once and
+quiesces until its checkpoint is reset (the `snapshot_done` marker
+persists in the checkpoint, so a checkpoint-preserving restart stays
+quiesced — use a full refresh to re-snapshot). So flipping
+`expand_contained` (or a differing preflight verdict) changes how
+often a snapshot stream re-reads, not just its request shape.
+
+An explicit `cursor_probe=nested-expand`/`batch` applies only when
+`auto` falls back to the N+1 walk. See
+[Contained navigation properties](#contained-navigation-properties).
+
+### contained_fetch
+
+How the **full** (un-cursored) contained walks hydrate each
+leaf-parent collection — the **snapshot read** (a contained table with
+no `cursor_field`) and the **framework batch-reader stream**
+(`LakeflowBatchReader`, `start_offset=None`, used for batch /
+full-refresh ingest). Accepts `auto`, `batch`, `single`, the
+size-suffixed `auto:<N>` / `batch:<N>`, or a positive integer *N*:
+
+- **`auto`** (default) — packs the per-leaf-parent GETs into OData
+  **`$batch`** requests (chunked to **1000 operations/request**,
+  server-driven paging with `@odata.nextLink` follow-up), collapsing
+  *M* leaf-parent round-trips into `ceil(M/1000)`. A one-shot
+  capability preflight gates it; on a server without `$batch` it
+  transparently **falls back to `single`**. Only a **definitive**
+  preflight outcome — a working envelope, or a hard rejection like
+  404/405 — is recorded; a transient failure such as a 503 or a
+  network blip degrades that batch only and is re-probed on the next,
+  so a momentary blip never pins the stream to the slow path.
+- **`batch`** — the same hydrate but **strict**: a server that fails
+  the `$batch` capability preflight is an **error**, not a silent
+  fall-back. Use it when you know the server supports `$batch` and
+  want to be told loudly if a deployment doesn't.
+- **`auto:<N>`** / **`batch:<N>`** — set the chunk size to `N`
+  operations/request (`ceil(M/N)`, e.g. `batch:200` to start smaller)
+  while keeping `auto`'s fall-back / `batch`'s strictness
+  respectively.
+- **A bare positive integer *N*** — like `batch:<N>` (strict); `N=1`
+  is equivalent to `single`, `N>1` tunes the batch size.
+- **`single`** — the original behaviour: one GET per leaf-parent.
+
+**Adaptive sizing (all batch modes).** If the server rejects a batch
+for carrying too many sub-requests — matched across phrasings, e.g.
+*"OData batch message contains too many parts"* or *"$batch exceeds
+the maximum of N operations"* — the connector shrinks the working size
+by 25% and retries (up to 10 times — enough for the geometric shrink
+from 1000 to converge below a ~100-part server cap) before falling
+back to a plain per-leaf-parent GET. The discovered working size is
+**recorded once** and persisted in the resume offset
+(`batch_size_ok`, alongside `batch_ok`) so later batches and
+framework-recreated readers reuse it. (Strict mode errors only on the
+*preflight* — "server can't `$batch` at all"; the adaptive size
+give-up is a runtime resilience step that still degrades to GETs.)
+
+**Per-sub-request failures inside a 2xx envelope are never silently
+skipped**: a sub-response with an error status (e.g. one throttled
+leaf-parent) is re-issued as a plain GET — a transient (429/5xx)
+recovers through the normal retry/backoff path, a hard 4xx raises with
+the server's actual error — so a failed part can't quietly drop that
+parent's rows (which on a cursor walk would otherwise advance the
+watermark past them permanently).
+
+**Verdict reset.** The `$batch` capability + size verdicts
+(`batch_ok` / `batch_size_ok`) are **shared** with the `cursor_probe`
+`auto` cascade's hydrate, so they persist in the offset while **any**
+auto-mode consumer is live — `contained_fetch` `auto`/`auto:<N>`, or
+`cursor_probe` `auto` with the hydrate not suppressed by an explicit
+`single`/`1`. Only when every consumer is pinned non-`auto` are they
+scrubbed from the outgoing offset, so switching back to `auto` later
+**re-runs the preflight** (an all-pinned config carries no offset
+verdict, but the process-wide capability cache still spares the
+per-microbatch re-probe within a run).
+
+**Relationship to `cursor_probe`.** This option mostly governs the
+**full walks** (no cursor filter / no resume), distinct from
+`cursor_probe` which accelerates the *incremental* leaf-cursor read
+(streaming, with a watermark). One cross-over: an explicit
+`contained_fetch=single` / `1` also forces the incremental leaf-cursor
+hydrate down the plain N+1 walk — both the `cursor_probe` probe's
+dirty-parent hydrate (the probe still prunes which parents to read;
+only its `$batch` hydrate is suppressed) and `auto`'s no-probe
+`$batch` cascade. The one exception is an explicit
+`cursor_probe=batch`, a direct demand for the `$batch` hydrate that
+wins the conflict.
+
+Emitted rows are identical regardless of value — only the request
+batching differs. No effect on flat tables or `expand_contained=true`.
+
+### cursor_probe
+
+Request-count optimization for **incremental** reads of **deep**
+contained paths with a **leaf** `cursor_field` and **sparse** changes
+— the `expand_contained=false` counterpart to `expand_contained=true`.
+The plain N+1 incremental read enumerates every leaf-parent and issues
+one `cursor gt since` leaf fetch under each — thousands of
+mostly-empty requests when few leaves changed. Four values select the
+acceleration strategy:
+
+- **`auto`** (default) — a best-effort cascade. Use the
+  nested-`$expand` change-probe where it can pay off *and* the server
+  is verified to honour `$orderby`/`$top` inside `$expand`; otherwise
+  fall back to a `$batch` hydrate (where the server supports `$batch`,
+  and unless an explicit `contained_fetch=single`/`1` suppresses it);
+  otherwise the plain N+1 walk. **Never raises** on a
+  server-capability shortfall — it degrades to a correct, slower
+  strategy.
+- **`nested-expand`** — strict nested-`$expand` probe. **Raises** a
+  clear error if the path can't use it or the server mis-orders inner
+  `$expand` ("I require the probe"). The dirty leaf-parents it
+  identifies are then hydrated via OData `$batch` when the server
+  supports it (a fail-closed preflight falls back to the plain N+1
+  walk) — the probe prunes *which* parents to read, `$batch` batches
+  the hydrate of whichever remain. An explicit
+  `contained_fetch=single` (or `1`) overrides this: the probe still
+  prunes, but the dirty parents are hydrated via the plain N+1 walk
+  (the `$batch` preflight is skipped entirely).
+- **`batch`** (or **`batch:<N>`**) — skip the probe; hydrate the
+  changed leaves via OData `$batch` (server-driven paging, no `$top`,
+  `@odata.nextLink` follow-up, chunked to 1000 operations/request by
+  default, or `N` with the `batch:<N>` form — e.g. `batch:200` to
+  start smaller), falling back to the plain N+1 walk if the server
+  doesn't support `$batch`. If the server rejects a batch for too many
+  sub-requests (matched across phrasings — *"too many parts"* or
+  *"exceeds the maximum of N operations"*), the size is shrunk 25% and
+  retried (up to 10 times, enough to converge below a ~100-part cap)
+  before falling back, and the working size is recorded once in the
+  offset (`batch_size_ok`) for reuse. Safe on servers (e.g. Hexagon
+  Smart API) that reject nested-`$expand` options, since it relies
+  only on top-level single-column `cursor gt` filters.
+- **`false`** — force the plain N+1 walk.
+
+**Probe mechanics.** The probe issues **one shallow probe per
+leaf-grandparent tuple** —
+`…/<LeafParent>?$select=<pk>&$expand=<Leaf>($orderby=<cursor> desc;$top=1;$select=<cursor>)`
+— reads each leaf-parent's **newest leaf**, and marks it dirty when
+that leaf's cursor is `> since` (compared client-side). It then
+hydrates **only** the dirty leaf-parents — via OData `$batch` when the
+server supports it (`_verify_batch_support` is fail-closed, so an
+unsupported server transparently falls back to the per-parent N+1 walk
+over the same dirty set). Emitted rows are identical to `false`
+**provided the probe identifies the dirty parents correctly**; the
+watermark, `max_records_per_batch` cap, key-based `parent_keys` resume
+(churn-stable; `parent_idx` is the legacy fallback), and no-progress
+guard are all reused unchanged (a resumed batch re-probes skipped
+parents — probes, no leaf fetches). Ordering the inner `$expand` by
+the cursor descending means the single returned row is the max-cursor
+leaf *by construction*, so a server that applies `$top` before
+anything else still returns the right row — and there is **no inner
+`$filter`** to mis-order against (the change test is client-side).
+
+**Where the probe engages.** Only where it can pay off: the cursor on
+the **leaf**, *and* the **distance from the leaf to the nearest
+batch-snapshot (non-cursor) ancestor > 1** — i.e. the leaf's *parent*
+collection is itself cursor-bearing (incremental, high-fan-out). So
+`…/WorkPackageDetails/WorkPackagesStepDetails` (leaf-parent
+`WorkPackageDetails` is cursor-bearing) qualifies, while
+`Instances/Projects/WorkPackageDetails` (leaf-parent `Projects` is
+snapshot — few rows, all dirty, nothing to skip) does not. Depth alone
+is not the criterion.
+
+**`$batch` hydrate.** Issues the same per-leaf-parent
+`cursor gt since` reads as the plain walk but packs them into `$batch`
+requests, so *M* leaf-parent round-trips collapse to `ceil(M/1000)`
+(or `ceil(M/N)` with `cursor_probe=batch:<N>`, auto-reduced on a "too
+many parts" rejection); resume is chunk-aligned on the last drained
+chain's `parent_keys` (an exclusive, key-matched park; `parent_idx`
+rides along for downgrade compatibility) and the cap is overshot by at
+most one chunk's worth of changed rows. A 200 `$batch` envelope with a
+truncated/malformed JSON body — the largest response the connector
+ever receives, and the shape some servers produce under load — is
+re-POSTed once (GET-only sub-requests, so the retry is safe) before
+raising.
+
+⚠️ **The probe's identify step relies on the server honouring
+`$orderby`/`$top` inside `$expand`** (optional OData v4 features). A
+server that ignores `$orderby` could return a non-newest leaf and
+report a dirty leaf-parent as **clean**, dropping its changed leaves.
+The connector runs a **one-time behavioural capability check** before
+engaging the probe (it verifies the inner `$expand` returns the true
+newest leaf for a real multi-leaf parent, cross-checked against
+trusted direct-navigation ordering). This catches **both** failure
+modes: a server that silently **mis-orders** inner `$expand` (returns
+an older leaf), and one that outright **rejects** the inner-`$expand`
+options with an HTTP error (e.g. Hexagon Smart API 400s on inner
+`$orderby`/`$top`/`$select`). Under `auto` either failure **cascades
+to `$batch`/the plain walk** (a rejection is recorded as a definitive
+`cursor_probe_ok=false`); under `nested-expand` either **raises** an
+actionable error — never a raw HTTP error.
+
+**Race handling in the capability check.** A mismatch where the
+probe-shaped `$expand` returns a leaf **newer** than the
+direct-navigation reference is a concurrent-write race (the two
+fetches aren't atomic), not mis-ordering evidence — a genuinely
+mis-ordering server returns an *older* leaf — so that sample is
+**skipped** and the scan moves on to another, exactly like a
+non-discriminating one. Only clean evidence (an *older*/missing inner
+leaf) is a definitive fail; nothing about a race is recorded, and one
+unlucky write can neither abort the whole preflight nor raise strict
+mode. A preflight that errors out **before reaching a verdict** — the
+parent-enumeration or trusted-reference fetch itself fails
+(indistinguishable from a transient blip, unlike the probe-shape
+rejection whose sibling fetches just succeeded) — likewise records
+**nothing**: under `auto` that read degrades to the `$batch`/plain
+cascade and the next batch re-probes; `nested-expand` raises an
+actionable error rather than the raw HTTP failure.
+
+**Verdict caching and reset.** Both the probe-verified and
+`$batch`-supported verdicts are cached per table and persisted in the
+resume offset (`cursor_probe_ok` / `batch_ok`) so a
+per-batch-recreated reader skips the capability requests — the
+`$batch` preflight persists only **definitive** verdicts (a transient
+failure like a 503 degrades that batch to the plain walk and is
+re-probed on the next, never pinning the stream to the slow path).
+Under `auto`, **both** definitive preflight outcomes additionally ride
+the process-wide capability cache (see
+[Capability-verdict caching](#capability-verdict-caching)): the offset
+only ever carries the *pass*, so without the cache a mis-ordering
+server would re-pay the preflight GETs on every framework-recreated
+reader before cascading to `$batch`. `cursor_probe_ok` is persisted
+only while `cursor_probe` is `auto`; any non-`auto` value
+(`nested-expand`, `batch`, `false`) scrubs it from the outgoing offset
+**and** purges the per-table cache entry on the next read (so the
+reset also reaches the bare-offset snapshot / batch-reader paths), so
+switching back to `auto` later **re-runs the probe preflight**. The
+strict `nested-expand` mode neither consults nor records the shared
+cache — it re-verifies each microbatch so its error always carries
+fresh evidence.
+
+**Validation.** An explicit `cursor_probe=nested-expand`/`batch`
+raises if combined with `expand_contained=true`, used on a flat table,
+or used without a `cursor_field`; `nested-expand` additionally raises
+with the cursor on a non-leaf ancestor or where the leaf-parent is a
+snapshot level (distance 1).
+
+### num_partitions
+
+Number of Spark partitions for parallel reads of contained-collection
+tables. Honored whenever the read resolves to the N+1 walk: a
+contained path with `delta_tracking=disabled` and
+`expand_contained=false` — or `auto` whose preflight fell back to N+1.
+**Streaming** additionally requires any `cursor_field` to live on the
+top-level entity (the `SupportsPartitionedStream` gate); **batch**
+reads partition any N+1 contained path, leaf-level cursors included.
+Top-level rows are bin-packed into this many contiguous slices; each
+Spark task walks only its assigned subtrees. Ignored for
+non-partitionable tables (they fall back to single-task reads).
+
+- **Null-cursor top parents are rejected** on this path (curated error
+  at partition discovery): once a fence is committed, the `cursor gt`
+  discovery filter excludes them server-side, so their subtrees'
+  future changes would be dropped silently. The first (unfenced) batch
+  sees them in discovery, and every later batch runs a one-request
+  `eq null` probe so a null-cursor parent *inserted mid-stream* is
+  caught too (best-effort: a server rejecting the `eq null` filter
+  keeps the first-batch-only check). Exclude them with
+  `filter_at_<top>` (`<cursor> ne null`), fix the data, or read
+  serially.
+- **The fence probe self-checks `$orderby` honoring**: the per-trigger
+  watermark comes from one `$top=1&$orderby=<cursor> desc` request,
+  and a server that silently ignores `$orderby` would pin the fence at
+  a stale value and stall the stream with data pending. So after each
+  probe the connector one-time-verifies it: `<cursor> gt <probed max>`
+  should return nothing, and a contradiction is disambiguated by one
+  desc re-probe (a busy source can legitimately insert a row between
+  the two requests — an honoring server's re-probe then returns the
+  fresh max, recording the PASS; only a re-probe still below the
+  contradicting row proves `$orderby` is ignored). The PASS verdict
+  rides the shared capability cache as `fence_desc_ok` (re-checked
+  after its 15-min TTL); a proven desc-ignoring server raises an
+  actionable error instead of stalling. (Edge: on a desc-ignoring
+  server whose churn happens to surface a fresh max to the re-probe,
+  the check can cache a false PASS for up to the 15-min TTL — one
+  bounded silent-stall window — after which the re-check fires and
+  raises the correct error.)
+- **A parent deleted mid-batch is skipped with a warning** (its
+  404/410 can't fail the frozen partition descriptor's task retries;
+  the next batch re-discovers the live parent set — matching the
+  serial walks' self-healing).
+- **Overlap posture**: `cursor_lookback_seconds=auto` resolves to
+  **0** on partitioned streams (no walk-duration history rides the
+  offset), so rows landing at-or-below the fence after it was probed
+  are only re-scanned if you set an **explicit**
+  `cursor_lookback_seconds` — serial cursor streams self-tune this
+  overlap, partitioned ones don't.
+- **Framework notes**: on pure **batch** reads a partition-planning
+  failure (including an invalid `num_partitions`) is swallowed by the
+  framework and silently degrades to a serial read; and partition
+  planning materializes the discovered parent slice on the driver
+  (fine at 10k–100k parents, budget driver memory for millions).
+
+### cursor_lookback_seconds, cursor_lookback_factor, cursor_lookback_max_seconds
+
+Overlap window for incremental **contained** cursor reads over a
+**continuously-changing** source. None of the contained cursor walks
+is a consistent snapshot — the walk takes many seconds, during which
+the source keeps changing — and the connector commits the watermark as
+the max cursor it saw. A row inserted *during* the walk under a
+leaf-parent the walk already passed (or one the probe already flagged
+clean) lands with a cursor below that final max and would be skipped
+forever by the next `cursor gt <max>`.
+
+With a window set, each batch reads from
+`cursor gt (committed − window)` instead, re-scanning the overlap so
+those mid-walk arrivals are captured on the next progressing batch
+(re-read rows are idempotent at the destination via `apply_changes`
+MERGE on the primary key).
+
+**Applies to all four non-atomic contained cursor walks**:
+`expand_contained=true`, the plain N+1 leaf-cursor walk, the
+`cursor_probe` walk, and the **ancestor-cursor** walk (there the
+window floors the *ancestor enumeration* filter — a dirty ancestor
+re-included by the overlap gets its whole subtree re-read,
+duplicate-safe — recovering parents whose cursor advanced mid-cycle to
+below the cycle's final watermark). For `cursor_probe`, the floored
+value also re-arms the probe's dirty-detection, so a leaf-parent whose
+newest leaf fell in the overlap is re-flagged dirty and re-hydrated.
+
+The **partitioned streaming** path (`SupportsPartitionedStream`,
+level-0 cursor) honors an explicit integer window too — its fence is
+probed *before* partition discovery, so the overlap re-scans rows that
+landed at-or-below the fence mid-batch (a row landing at exactly the
+fence AFTER the stream went quiescent is only recovered once some
+newer row advances the fence and unblocks the no-progress gate — on a
+permanently quiescent source it stays invisible). `auto` is a no-op
+there (no walk-duration history rides the partitioned offset), so set
+an integer window explicitly for that shape.
+
+**The committed watermark is never floored** — only the read filter is
+— so the offset still advances to the true max, and it never
+*regresses* either: a completing batch's max is floored at the prior
+watermark, so an overlap re-read whose watermark-defining row was
+deleted between batches can't walk the offset backwards; a quiescent
+trigger (no row beyond the watermark) idles instead of looping.
+
+**Values for `cursor_lookback_seconds`:**
+
+- **`auto`** (default) — self-sizes the window from the **max** walk
+  duration over the last few completed walks (persisted in the offset
+  as `lb_history`) × `cursor_lookback_factor` (default 1.5), clamped
+  to `cursor_lookback_max_seconds` (default 3600). A walk that
+  `max_records_per_batch` caps into several batches records its
+  **whole cycle's wall-clock span** — first capped batch to
+  completion, trigger intervals included (anchored by
+  `lb_cycle_started` in the offset) — since the churn-exposure window
+  of a capped cycle is the full span, not one batch's drain time.
+  Using the max of recent walks — rather than the last value × a large
+  fudge — makes the estimate robust to a single slow spike. No manual
+  guess; a no-op until the first walk is measured, outside the
+  contained cursor paths, and for non-timestamp cursors.
+- **An integer** — a fixed window in cursor units (seconds for a
+  timestamp cursor). Set it at or above the worst-case walk duration.
+  Requires a timestamp `cursor_field` on a contained path (else
+  raises).
+- **`off`** (or `0`) — disables the overlap (exact prior behaviour).
+
+Trade-off: a non-zero window re-reads (and re-MERGEs) the trailing
+overlap each batch — `auto` keeps that proportional to the actual walk
+time.
+
+**`cursor_lookback_factor`** (default 1.5) — `auto`-mode only:
+multiplier applied to the max recent walk duration when sizing the
+window. Margin for a walk slower than any recently observed. Must
+be > 0; values < 1 risk under-covering (dropped rows). Ignored unless
+`cursor_lookback_seconds=auto`.
+
+**`cursor_lookback_max_seconds`** (default 3600) — `auto`-mode only:
+ceiling clamp (runaway backstop) on the computed window, in seconds.
+Must be > 0. Ignored unless `cursor_lookback_seconds=auto`.
+
+### exclude_ancestor_columns
+
+Comma-separated list of synthetic ancestor-FK column names to **drop
+from the destination** for a contained-collection table. By default
+every non-leaf ancestor's PK is prepended as a `<segment>_<pkname>`
+column (see
+[Contained navigation properties](#contained-navigation-properties));
+list the resolved column names here (e.g. `Instances_Id,Projects_Id`)
+to omit them, or a lone `*` to drop **all** ancestor-FK columns at
+once.
+
+Excluded columns disappear from the table schema, the stamped rows,
+**and the composite primary key** alike — so only exclude columns not
+needed for destination-key uniqueness, otherwise distinct leaf rows
+under different ancestors can collide on MERGE.
+
+**Only synthetic ancestor-FK columns can be excluded** — naming a real
+leaf/own table column (or a name that matches nothing) leaves the
+schema untouched and logs a warning, so the option can never drop an
+actual source column. No effect on flat tables.
+
+### Capability-verdict caching
+
+The preflight verdicts above — `expand_ok`, `batch_ok`,
+`batch_size_ok`, `or_filter_ok`, `cursor_probe_ok`, and `delta_ok`
+(the `delta_tracking=auto` probe's pinned fallback decision) — live in
+up to three layers, consulted in order:
+
+1. **The resume offset** (streaming cursor reads) — durable across
+   restarts via the checkpoint.
+2. **The connector instance** — dedupes within one read.
+3. **A process-wide cache keyed by `service_url`** with an on-disk
+   mirror (tempdir JSON, 15-minute TTL, plain booleans only).
+
+The last layer exists for reads whose offsets *can't* carry verdicts —
+streaming **snapshot** offsets hold only the `snapshot_done` quiesce
+marker (the pyspark simple-reader wrapper accepts quiescence solely as
+an *empty batch with an unchanged offset*, so the marker must stay
+byte-stable across triggers and verdicts must not ride it), and the
+**batch reader** (pipeline snapshot refresh / full refresh) discards
+offsets entirely — which would otherwise re-run their preflights on
+every framework-recreated instance, i.e. every microbatch or trigger.
+
+Rules:
+
+- **Only definitive verdicts are recorded** at any layer (a transient
+  blip — or a race-contaminated `cursor_probe` sample — records
+  nothing and re-probes next batch). `cursor_probe_ok` joins the
+  shared cache only under the `auto` cascade (the strict
+  `nested-expand` mode neither consults nor records it).
+- **The on-disk mirror is written atomically** (per-process,
+  per-thread temp file + rename) so a concurrent worker never reads a
+  half-written file. It is re-parsed only when its mtime changes
+  (otherwise the hot lookup is a single `stat`), and all in-process
+  access is serialized by a lock so concurrent streaming queries on
+  one driver can't corrupt the shared dict.
+- **Reset on a non-`auto` switch:** the **per-table** verdicts
+  (`expand_ok` / `cursor_probe_ok`) are purged from the process/file
+  cache — scoped to just that table — on the next read whenever their
+  governing option is non-`auto`, which covers the bare-offset
+  snapshot and batch-reader paths the offset scrub can't see; so for
+  those, re-selecting `auto` always re-runs the preflight. The
+  **server-wide** `$batch` verdicts (`batch_ok` / `batch_size_ok`)
+  can't be table-scoped, so they're purged only on the cursor-stream
+  **offset transition** (conservatively, so pinning one table's
+  `$batch` off doesn't churn a sibling's live `auto` consumer). The
+  OR-keyset verdict (`or_filter_ok`) is likewise server-wide and is
+  scrubbed + cache-dropped when an explicit `pagination=skip`/
+  `nextlink` is set (modes that never consume it) — pin one of those
+  for a batch and unpin to force a re-probe, e.g. to clear a
+  wrongly-false verdict persisted in an old checkpoint.
+- **The on-disk mirror files are per-user** (owner-tagged filenames +
+  an ownership check before reading), so a shared multi-user tempdir
+  can neither poison nor leak verdicts across accounts.
+- A consequence: a **snapshot-only** table (no cursor, no offset) that
+  pins `contained_fetch` off and later returns to `auto` keeps the
+  cached `batch_ok` until the disk TTL or a process restart — harmless,
+  because the `$batch` path degrades to plain per-parent GETs if a
+  batch attempt is ever rejected, so a stale `batch_ok=true` costs at
+  most one failed batch, never rows.
 
 ## Delta tracking
 
@@ -598,8 +1435,8 @@ MERGE.
 ### Read modes
 
 Two strategies via the ``expand_contained`` table option (default
-``auto`` — a behavioural preflight picks per table; see the option
-table above):
+``auto`` — a behavioural preflight picks per table; see
+[`expand_contained`](#expand_contained) under Per-table options):
 
 **N+1 traversal (`expand_contained=false`, and `auto`'s fallback)** —
 the connector issues one ``GET Parents?$select=<pks>`` to enumerate
@@ -801,7 +1638,7 @@ entity set name appears in two schemas, set the `namespace` table option:
 
 - Top-level / flat tables stay single-partition because `@odata.nextLink`
   skiptokens are opaque and can't be safely split — throughput on a flat
-  table is bounded by the source. See the `num_partitions` row in
+  table is bounded by the source. See the `num_partitions` section under
   [Per-table options](#per-table-options) for the contained-table
   parallel-read envelope.
 - Delete tombstones are synthesized only when `delta_tracking` is active.
@@ -824,7 +1661,7 @@ entity set name appears in two schemas, set the `namespace` table option:
   discard the offset regardless. You can also add a server-side `filter`
   to exclude null-cursor rows when the source allows them.
 - The `expand_contained=true` per-HTTP-fetch cap (see the
-  `max_records_per_batch` row in [Per-table options](#per-table-options))
+  `max_records_per_batch` section under [Per-table options](#per-table-options))
   cannot interrupt mid-response because the in-flight HTTP response body
   can't be serialized across batches. For tight caps, lower `page_size`
   (shrinks the per-level `$top` cross-product and therefore each
