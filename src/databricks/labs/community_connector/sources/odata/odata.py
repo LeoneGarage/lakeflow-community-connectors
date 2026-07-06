@@ -1588,6 +1588,7 @@ class ODataLakeflowConnect(
             # offset anyway. Preflight dedup across framework-recreated
             # instances comes from the process/file capability cache instead
             # (see ``_CAPABILITY_CACHE``), which needs no offset channel.
+            self._warn_streaming_snapshot_cap(table_name, opts, start_offset)
             return self._snapshot_stream_result(
                 start_offset, lambda: self._read_contained_snapshot(table_name, opts)
             )
@@ -1622,12 +1623,39 @@ class ODataLakeflowConnect(
                 table_name,
                 opts,
             )
+        self._warn_streaming_snapshot_cap(table_name, opts, start_offset)
         return self._stamp_delta_verdict(
             self._snapshot_stream_result(
                 start_offset, lambda: self._read_snapshot(table_name, opts)
             ),
             table_name,
             opts,
+        )
+
+    def _warn_streaming_snapshot_cap(
+        self, table_name: str, opts: dict, start_offset: dict | None
+    ) -> None:
+        """Warn when a STREAMING snapshot read (flat or contained N+1)
+        carries a user ``max_records_per_batch``: these shapes ignore the
+        cap by design — a snapshot offset holds only the quiesce marker (no
+        park state), so truncating would silently drop the remainder. The
+        expand snapshot honors the cap (it parks a resumable
+        ``pending_fetches`` queue), and batch-mode reads are warned by the
+        dispatcher's own override (which also rewrites the option, so this
+        never double-fires)."""
+        if start_offset is None or "max_records_per_batch" not in opts:
+            return
+        if opts["max_records_per_batch"] == str(_BATCH_UNCAPPED):
+            return
+        _LOG.warning(
+            "max_records_per_batch=%s ignored for %r: a snapshot stream's "
+            "offset carries no park state (only the quiesce marker), so a "
+            "cap could only truncate the snapshot and silently drop the "
+            "remainder. Reading the full snapshot this trigger. Use a "
+            "cursor_field (resumable capped batches) or expand_contained="
+            "true (parks a resumable queue) to bound per-trigger work.",
+            opts["max_records_per_batch"],
+            table_name,
         )
 
     def _snapshot_stream_result(self, start_offset: dict | None, read) -> tuple:

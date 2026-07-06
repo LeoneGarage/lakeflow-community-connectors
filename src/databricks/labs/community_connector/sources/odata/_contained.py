@@ -5299,7 +5299,10 @@ class ContainedNavMixin:
             if not use_batch:
                 if chain_next_link_out is not None:
                     end_offset["chain_next_link"] = chain_next_link_out
-                else:
+                elif truncated_chain_cursor_out is not None:
+                    # None/None with truncated=True is the vanished-anchor
+                    # RESET (positional restart at 0, no park) — stamping an
+                    # explicit null key would be inert but misleading.
                     end_offset["truncated_chain_cursor"] = truncated_chain_cursor_out
             if since is not None:
                 end_offset["cursor"] = since

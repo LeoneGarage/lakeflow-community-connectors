@@ -16898,6 +16898,9 @@ def test_capped_walk_vanished_string_key_park_resets_and_recovers(caplog):
     assert "was not re-found" in caplog.text
     assert "parent_keys" not in off2
     assert "cursor" not in off2  # floor (None) kept — running_max NOT folded
+    # Round 44: the reset offset must not stamp an inert explicit
+    # ``truncated_chain_cursor: None`` (cosmetic wart; resume reads .get()).
+    assert "truncated_chain_cursor" not in off2
     # Batch 3: full re-walk recovers B2's sub-max child.
     recs, off3 = _make().read_table("Parents__Children", off2, opts)
     assert [r["Cid"] for r in recs] == [3]
@@ -16997,3 +17000,96 @@ def test_enumerate_contained_paths_warns_on_unresolvable_root(caplog):
         tables = c.list_tables()
     assert "Orders" in tables
     assert "Cannot enumerate contained paths" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Round 44 — numeric-string cursor ordering (Decimal sort key), basic-format
+# ISO guard, streaming-snapshot cap warning, reset-offset hygiene
+# ---------------------------------------------------------------------------
+
+
+def test_cursor_numeric_string_pairs_order_numerically():
+    """Two numeric STRINGS used to compare ordinally ("1000" < "999") — the
+    round-38 Decimal bridge lived in the except-TypeError path, which
+    str/str never reaches. The sort key now Decimal-keys numeric strings,
+    aligning cursor_newer with cursor_same_instant's existing numeric
+    treatment of the same pair class."""
+    from databricks.labs.community_connector.sources.odata._helpers import (
+        cursor_le,
+        cursor_max,
+        cursor_newer,
+    )
+
+    assert cursor_newer("1000", "999") is True
+    assert cursor_newer("999", "1000") is False
+    assert cursor_le("1000", "999") is False
+    assert cursor_newer("100000", "99999") is True
+    # Watermark folds must be order-independent at the digit boundary.
+    assert cursor_max(["999", "1000"]) == "1000"
+    assert cursor_max(["1000", "999"]) == "1000"
+    # Cross-rendering (int vs numeric string) still orders in the primary path.
+    assert cursor_newer("5000", 4000) is True
+    assert cursor_newer(4000, "5000") is False
+
+
+@responses.activate
+def test_flat_stream_numeric_string_cursor_crosses_digit_boundary():
+    """E2E pin of the silent-stall shape: watermark "999", the server
+    correctly answers `Seq gt 999` with Seq="1000" (IEEE754Compatible
+    string rendering) — the client re-filter used to drop it every batch,
+    freezing the offset with data pending forever."""
+    responses.get(f"{SERVICE_URL}$metadata", body=R41_INT64_METADATA, status=200)
+    responses.get(
+        f"{SERVICE_URL}Events",
+        json={"value": [{"Id": 3, "Seq": "1000"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    records, offset = c.read_table(
+        "Events", {"cursor": "999"}, {"cursor_field": "Seq", "pagination": "nextlink"}
+    )
+    rows = list(records)
+    assert [r["Id"] for r in rows] == [3]
+    assert _drop_lb(offset) == {"cursor": "1000"}
+
+
+def test_basic_format_iso_strings_stay_numeric():
+    """`fromisoformat` on Python >= 3.11 parses BASIC format ("20240101"),
+    which the 3.10 floor rejects — without the structural guard the
+    comparison keys were version-divergent, and "20240101" aliased
+    "2024-01-01" as the same instant. 8-digit yyyymmdd string cursors now
+    key as Decimals uniformly (numeric order == chronological order)."""
+    from datetime import datetime
+
+    from databricks.labs.community_connector.sources.odata._helpers import (
+        cursor_newer,
+        cursor_same_instant,
+        cursor_sort_key,
+    )
+
+    assert not isinstance(cursor_sort_key("20240101"), datetime)
+    assert cursor_same_instant("20240101", "2024-01-01") is False
+    assert cursor_newer("20240102", "20240101") is True
+    # Extended format still datetime-keys.
+    assert isinstance(cursor_sort_key("2024-01-01"), datetime)
+
+
+@responses.activate
+def test_streaming_snapshot_warns_ignored_cap(caplog):
+    """Streaming snapshots (flat and contained N+1) ignore
+    max_records_per_batch BY DESIGN (no park state in a quiesce-marker
+    offset — truncating would be silent loss), but a user capping a
+    snapshot stream used to get one unbounded batch with no signal."""
+    _mock_metadata()
+    responses.get(
+        f"{SERVICE_URL}Customers",
+        json={"value": [{"Id": 1, "Name": "A", "ModifiedAt": "x"}]},
+        match_querystring=False,
+    )
+    c = _make()
+    with caplog.at_level(logging.WARNING):
+        records, offset = c.read_table("Customers", {}, {"max_records_per_batch": "1"})
+    assert len(list(records)) == 1  # cap NOT applied — full snapshot
+    assert offset.get("snapshot_done") is True
+    assert "max_records_per_batch=1 ignored" in caplog.text
+    assert "snapshot" in caplog.text

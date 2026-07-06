@@ -677,6 +677,18 @@ def register_lakeflow_source(spark):
         return datetime.fromisoformat(s)
 
 
+    def _iso_shaped(s: str) -> bool:
+        """Structural pre-check for extended-format ISO-8601 (``YYYY-MM-DD…``) —
+        the same rule ``looks_like_iso8601`` applies before parsing. Applying it
+        HERE too keeps the comparison keys version-uniform: ``fromisoformat`` on
+        Python ≥3.11 also parses BASIC format (``"20240101"``), which the 3.10
+        floor rejects — without the guard, an 8-digit numeric-string cursor
+        (yyyymmdd date keys rendered as strings, a real ERP pattern) would
+        datetime-key on one runtime and string-key on another, and would alias
+        ``"20240101"`` with ``"2024-01-01"`` as the same instant."""
+        return len(s) >= 10 and s[4] == "-" and s[7] == "-"
+
+
     def cursor_sort_key(value: Any) -> Any:
         """Chronological sort key for one cursor value.
 
@@ -689,26 +701,44 @@ def register_lakeflow_source(spark):
         first (``.`` < ``Z``), which silently drops server-returned rows at the
         ``<= since`` re-filters and regresses watermark maxes. ISO-8601-looking
         strings therefore parse to a datetime for ordering (naive values are
-        pinned to UTC so mixed naive/aware renderings still totally order);
-        anything else orders as itself. Offsets and ``$filter`` literals keep the
+        pinned to UTC so mixed naive/aware renderings still totally order).
+
+        NUMERIC strings key as exact :class:`Decimal` for the same reason in the
+        other direction: an IEEE754Compatible server renders Int64/Decimal
+        cursors as JSON strings, and ordinal string order inverts at every
+        digit-length boundary (``"1000" < "999"``) — which silently STALLS the
+        stream (the ``<= since`` re-filter drops every genuinely-newer row the
+        server returns, forever) and regresses watermark maxes.
+        :func:`cursor_same_instant` already treated this pair class numerically;
+        the sort key now agrees. A Decimal key still cross-compares with raw
+        int/float values (one column mixing ``5000`` and ``"5000"``), while
+        Decimal-vs-datetime / Decimal-vs-text pairs raise ``TypeError`` into
+        :func:`cursor_newer`'s existing shape-mixed fallback.
+
+        Anything else orders as itself. Offsets and ``$filter`` literals keep the
         server's raw text — this key is for COMPARISON only."""
         if isinstance(value, str):
-            try:
-                dt = parse_iso8601(value)
-            except (ValueError, TypeError):
-                return value
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
+            if _iso_shaped(value):
+                try:
+                    dt = parse_iso8601(value)
+                except (ValueError, TypeError):
+                    return value
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+            num = _as_exact_number(value)
+            if num is not None:
+                return num
         return value
 
 
     def cursor_newer(a: Any, b: Any) -> bool:
         """Whether ``a`` is strictly newer (greater) than ``b`` in cursor order —
-        chronological where both render as ISO-8601 (see
-        :func:`cursor_sort_key`), raw ordering otherwise. A shape-mixed column
-        (one value parses, the other doesn't) falls back to comparing the raw
-        values, preserving the pre-helper behavior for such data.
+        chronological where both render as ISO-8601, exact-numeric where both
+        render as numbers (see :func:`cursor_sort_key`), raw ordering otherwise.
+        A shape-mixed column (one value parses, the other doesn't) falls back to
+        comparing the raw values, preserving the pre-helper behavior for such
+        data.
 
         Key TIES between different raw texts break on the FRACTION DIGITS,
         zero-padded to a common width: Python datetimes hold microseconds, so
@@ -6225,7 +6255,10 @@ def register_lakeflow_source(spark):
                 if not use_batch:
                     if chain_next_link_out is not None:
                         end_offset["chain_next_link"] = chain_next_link_out
-                    else:
+                    elif truncated_chain_cursor_out is not None:
+                        # None/None with truncated=True is the vanished-anchor
+                        # RESET (positional restart at 0, no park) — stamping an
+                        # explicit null key would be inert but misleading.
                         end_offset["truncated_chain_cursor"] = truncated_chain_cursor_out
                 if since is not None:
                     end_offset["cursor"] = since
@@ -8703,6 +8736,7 @@ def register_lakeflow_source(spark):
                 # offset anyway. Preflight dedup across framework-recreated
                 # instances comes from the process/file capability cache instead
                 # (see ``_CAPABILITY_CACHE``), which needs no offset channel.
+                self._warn_streaming_snapshot_cap(table_name, opts, start_offset)
                 return self._snapshot_stream_result(
                     start_offset, lambda: self._read_contained_snapshot(table_name, opts)
                 )
@@ -8737,12 +8771,39 @@ def register_lakeflow_source(spark):
                     table_name,
                     opts,
                 )
+            self._warn_streaming_snapshot_cap(table_name, opts, start_offset)
             return self._stamp_delta_verdict(
                 self._snapshot_stream_result(
                     start_offset, lambda: self._read_snapshot(table_name, opts)
                 ),
                 table_name,
                 opts,
+            )
+
+        def _warn_streaming_snapshot_cap(
+            self, table_name: str, opts: dict, start_offset: dict | None
+        ) -> None:
+            """Warn when a STREAMING snapshot read (flat or contained N+1)
+            carries a user ``max_records_per_batch``: these shapes ignore the
+            cap by design — a snapshot offset holds only the quiesce marker (no
+            park state), so truncating would silently drop the remainder. The
+            expand snapshot honors the cap (it parks a resumable
+            ``pending_fetches`` queue), and batch-mode reads are warned by the
+            dispatcher's own override (which also rewrites the option, so this
+            never double-fires)."""
+            if start_offset is None or "max_records_per_batch" not in opts:
+                return
+            if opts["max_records_per_batch"] == str(_BATCH_UNCAPPED):
+                return
+            _LOG.warning(
+                "max_records_per_batch=%s ignored for %r: a snapshot stream's "
+                "offset carries no park state (only the quiesce marker), so a "
+                "cap could only truncate the snapshot and silently drop the "
+                "remainder. Reading the full snapshot this trigger. Use a "
+                "cursor_field (resumable capped batches) or expand_contained="
+                "true (parks a resumable queue) to bound per-trigger work.",
+                opts["max_records_per_batch"],
+                table_name,
             )
 
         def _snapshot_stream_result(self, start_offset: dict | None, read) -> tuple:
