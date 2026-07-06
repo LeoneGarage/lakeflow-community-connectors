@@ -36,18 +36,35 @@ from requests.utils import requote_uri
 
 from databricks.labs.community_connector.sources.odata._helpers import (
     _as_exact_number,
-    cursor_le as _cursor_le,
-    cursor_max as _cursor_max,
-    cursor_newer as _cursor_newer,
-    cursor_same_instant as _cursor_same_instant,
-    cursor_same_rendering as _cursor_same_rendering,
-    max_or as _max_or,
     parse_iso8601,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
+    cursor_le as _cursor_le,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
+    cursor_max as _cursor_max,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
+    cursor_newer as _cursor_newer,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
+    cursor_same_instant as _cursor_same_instant,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
+    cursor_same_rendering as _cursor_same_rendering,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
+    max_or as _max_or,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
     parse_max_records as _parse_max_records,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
     trim_to_distinct_cursor_boundary as _trim_to_distinct_cursor_boundary,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
     url_origin as _url_origin,
 )
-
 
 _LOG = logging.getLogger(__name__)
 
@@ -1303,14 +1320,14 @@ class ContainedNavMixin:
                 f"key_chain length {len(key_chain)} does not match "
                 f"non-leaf segment count {len(segments) - 1}"
             )
-        return _URL_SEGMENT_SEP.join(
-            (
-                f"{seg}{self._format_key_predicate(key_chain[i], self._edm_types_for_level(segments, i, namespace))}"
-                if i < len(key_chain)
-                else seg
-            )
-            for i, seg in enumerate(segments)
-        )
+
+        def _render(i: int, seg: str) -> str:
+            if i >= len(key_chain):
+                return seg
+            types = self._edm_types_for_level(segments, i, namespace)
+            return f"{seg}{self._format_key_predicate(key_chain[i], types)}"
+
+        return _URL_SEGMENT_SEP.join(_render(i, seg) for i, seg in enumerate(segments))
 
     # pylint: disable=too-many-arguments,too-many-positional-arguments
     def _build_contained_url(
@@ -2299,11 +2316,12 @@ class ContainedNavMixin:
             # an actionable error — instead of the raw HTTP error escaping and
             # failing the read, which would break the "auto never raises on a
             # capability shortfall" contract.
+            probe_path = self._build_contained_path(segments, full_chain, namespace)
             return (
                 "error",
                 "cursor_probe=nested-expand needs the source to accept "
                 "$orderby/$top/$select inside $expand, but "
-                f"{self._build_contained_path(segments, full_chain, namespace)!r} rejected the probe "
+                f"{probe_path!r} rejected the probe "
                 "query with an error (the server does not support these inner-$expand "
                 "options). Use cursor_probe=batch or cursor_probe=auto (which falls back "
                 "to $batch / the plain N+1 walk), or cursor_probe=false for the plain walk.",
@@ -3570,16 +3588,10 @@ class ContainedNavMixin:
         strictly above the committed watermark count toward
         ``max_records``, so a lookback overlap larger than the cap cannot
         wedge the stream into an eternal park/complete cycle. Cap deviation
-        per batch is bounded by one page's worth of leaf rows (the cap is
-        checked between rows, but an in-flight inline collection is finished
-        before parking in ``nextlink`` mode) plus the lookback overlap.
-
-        ``count_floor`` — see ``_walk_contained_with_cursor``: only rows
-        strictly above the committed watermark count toward
-        ``max_records``, so a lookback overlap larger than the cap cannot
-        wedge the stream into an eternal park/complete cycle. Cap
-        deviation per batch is bounded by ONE HTTP response's worth of
-        leaf rows (≤ ``page_size``) plus the lookback overlap.
+        per batch is bounded by ONE HTTP response's worth of leaf rows
+        (≤ ``page_size``; the cap is checked between rows, but an in-flight
+        inline collection is finished before parking in ``nextlink`` mode)
+        plus the lookback overlap.
         """
         cur_field, cur_level, _ = ctx or (None, -1, None)
         countable = 0
@@ -3763,12 +3775,17 @@ class ContainedNavMixin:
                     continue
                 if not page_rows:
                     if page_next_url:
+                        # Forward the resume ``boundary`` (content-based,
+                        # churn-safe) so an empty first page doesn't drop it
+                        # before the rows it guards; ``skip`` is positional to
+                        # THIS page and so resets for the server continuation.
                         _push_url(
                             {
                                 "url": page_next_url,
                                 "level": level,
                                 "chain": frame["chain"],
                                 "cur_val": frame["cur_val"],
+                                "boundary": frame.get("boundary"),
                             }
                         )
                     continue
@@ -3903,9 +3920,12 @@ class ContainedNavMixin:
         checkpoint-size concern), while this queue never persists and its
         items are small descriptors; a server deferring every inner
         collection grows it to one descriptor per parent, modest even at
-        100k parents. Emission order matches the drainer's ``emitted``
-        order — inline rows first, deferred continuations processed when
-        their queue item is popped."""
+        100k parents. Within each page rows flatten inline-first (parent
+        then children), matching ``_emit_leaf_row`` order; ACROSS pages this
+        reader is breadth-first (FIFO queue) whereas the capped drainer is
+        depth-first, so cross-parent order differs between the two. That is
+        immaterial here: the batch path is uncapped and never checkpoints, so
+        emission order carries no resume semantics."""
         queue: list[dict] = list(initial_queue)
         cur_field, cur_level, _ = ctx or (None, -1, None)
         while queue:
