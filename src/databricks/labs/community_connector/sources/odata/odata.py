@@ -1444,17 +1444,32 @@ class ODataLakeflowConnect(
         if self._table_segments(table_name) is None and self._delta_active_for(
             table_name, table_options
         ):
-            # Same reserved-column guard get_table_schema applies, so metadata
-            # fails as loudly (and in the same place) as the later read rather
-            # than reporting cdc success for a table read_table would reject.
-            self._assert_no_reserved_delta_columns(
-                table_name, (f.name for f in self._fields_for(table_name, namespace))
-            )
+            # Mirror the read's own validation EXACTLY: get_table_schema runs
+            # the reserved-column collision check on the select/exclusion-
+            # filtered fields (a select that drops a colliding source column
+            # is legal — the synthetic takes its place), so calling it here
+            # fails iff read_table would, in the same place. Checking the raw
+            # _fields_for instead over-fires on a select that drops the
+            # collision — a config that actually reads fine.
+            self.get_table_schema(table_name, table_options)
             return {
                 "primary_keys": primary_keys,
                 "cursor_field": _SEQUENCE_COL,
                 "ingestion_type": "cdc",
             }
+        if user_cursor and not primary_keys:
+            # cursor_field reports ingestion_type=cdc, which apply_changes
+            # MERGEs on the primary key — a keyless entity type declares none,
+            # so the MERGE has no key to match on (silent loss by
+            # construction). Fail loudly, mirroring the keyless delta gate in
+            # _delta_active_for, rather than emitting a broken CDC contract.
+            raise ValueError(
+                f"cursor_field={user_cursor!r} makes {table_name!r} an incremental "
+                f"(CDC) source, which MERGEs on the primary key, but the entity "
+                f"type declares no key in $metadata — matched rows would be lost. "
+                f"Remove cursor_field for a full-snapshot read, or point at a "
+                f"keyed entity set."
+            )
         return {
             "primary_keys": primary_keys,
             "cursor_field": user_cursor,

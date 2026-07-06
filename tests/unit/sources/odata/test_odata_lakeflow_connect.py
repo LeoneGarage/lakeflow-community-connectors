@@ -17973,3 +17973,70 @@ def test_reserved_column_guard_also_in_read_table_metadata():
     c = _make()
     with pytest.raises(ValueError, match="reserved delta synthetic"):
         c.read_table_metadata("Widgets", {"delta_tracking": "enabled"})
+
+
+# ---------------------------------------------------------------------------
+# Round 51 — metadata reserved-column guard mirrors the read's select filter,
+# keyless entity set + cursor_field fails loudly (no keyless CDC contract)
+# ---------------------------------------------------------------------------
+
+
+@responses.activate
+def test_reserved_column_metadata_respects_select_drop():
+    """When `select` drops the colliding source column, the synthetic takes
+    its place and the READ succeeds — so read_table_metadata must NOT raise
+    (it now mirrors get_table_schema's select-filtered check, not raw
+    _fields_for). Round-50's guard over-fired here."""
+    responses.get(f"{SERVICE_URL}$metadata", body=_COLLISION_MD, status=200)
+    c = _make()
+    opts = {"delta_tracking": "enabled", "select": "Id"}
+    # The read path is happy — source _deleted/_lc_sequence dropped by select,
+    # synthetics appended.
+    names = [f.name for f in c.get_table_schema("Widgets", opts).fields]
+    assert names == ["Id", "_deleted", "_lc_sequence"]
+    # Metadata must agree (no false-positive raise).
+    meta = c.read_table_metadata("Widgets", opts)
+    assert meta["ingestion_type"] == "cdc"
+    assert meta["cursor_field"] == "_lc_sequence"
+
+
+@responses.activate
+def test_reserved_column_metadata_raises_when_collision_kept():
+    """With no select (colliding source column survives), metadata still
+    raises — the guard fires exactly when the read would."""
+    responses.get(f"{SERVICE_URL}$metadata", body=_COLLISION_MD, status=200)
+    c = _make()
+    with pytest.raises(ValueError, match="reserved delta synthetic"):
+        c.read_table_metadata("Widgets", {"delta_tracking": "enabled"})
+
+
+_KEYLESS_MD = """<?xml version="1.0"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+ <edmx:DataServices><Schema Namespace="NS" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+  <EntityType Name="V">
+   <Property Name="X" Type="Edm.Int32"/>
+   <Property Name="M" Type="Edm.DateTimeOffset"/></EntityType>
+  <EntityContainer Name="C"><EntitySet Name="Views" EntityType="NS.V"/></EntityContainer>
+ </Schema></edmx:DataServices></edmx:Edmx>"""
+
+
+@responses.activate
+def test_keyless_cursor_field_fails_loudly():
+    """cursor_field reports ingestion_type=cdc, which apply_changes MERGEs on
+    the primary key; a keyless entity type declares none, so the MERGE has no
+    key — silent loss by construction. Mirror the keyless delta gate: raise,
+    don't emit a keyless CDC contract."""
+    responses.get(f"{SERVICE_URL}$metadata", body=_KEYLESS_MD, status=200)
+    c = _make()
+    with pytest.raises(ValueError, match="no key in .metadata"):
+        c.read_table_metadata("Views", {"cursor_field": "M"})
+
+
+@responses.activate
+def test_keyless_snapshot_still_ok():
+    """A keyless set WITHOUT cursor_field is a plain snapshot (no MERGE, no
+    key needed) — must still succeed."""
+    responses.get(f"{SERVICE_URL}$metadata", body=_KEYLESS_MD, status=200)
+    c = _make()
+    meta = c.read_table_metadata("Views", {})
+    assert meta == {"primary_keys": [], "cursor_field": None, "ingestion_type": "snapshot"}
