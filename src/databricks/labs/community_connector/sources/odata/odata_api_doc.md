@@ -274,6 +274,8 @@ Prefer: odata.track-changes[, odata.maxpagesize=<page_size>]
 
 No `$top` is ever sent on the delta path: OData `$top` is a **total-result** limit (§11.2.5.3), so it would end change tracking at `page_size` rows and permanently drop the rest of the table from the bootstrap. An explicit user `page_size` is forwarded as `Prefer: odata.maxpagesize` — the spec's per-response sizing hint — instead.
 
+**Driver-memory note.** Unlike the flat / N+1 / expand read shapes — which stream lazily one page at a time under a `LakeflowBatchReader` (full-refresh / snapshot) read — the delta path **accumulates the batch's rows in memory** before returning, because it must reach the terminal `@odata.deltaLink` and stamp `_lc_sequence` ordering across the whole change set. In *streaming* this is bounded by `max_records_per_batch` (enforced at page boundaries). In *batch mode* (a pipeline snapshot-refresh / full-refresh of a delta table) the cap is effectively unlimited, so the **entire entity set is materialized on the driver** for the bootstrap. Budget driver memory accordingly for a large delta table's first full read, or bootstrap it once via a cursor/snapshot table and switch to `delta_tracking` afterward — the same driver-memory caveat as `num_partitions` planning on millions of parents.
+
 Resume (`delta_link` or `next_link` in offset):
 
 ```

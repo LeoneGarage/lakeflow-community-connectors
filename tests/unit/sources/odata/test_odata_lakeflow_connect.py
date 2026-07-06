@@ -17516,3 +17516,89 @@ def test_lb_history_garbage_sanitized():
     c._cursor_lookback = "auto"
     assert c._resolve_active_lookback({"lb_history": ["abc", -5.0, float("nan"), True]}) == 0
     assert c._resolve_active_lookback({"lb_history": ["abc", 2.0]}) == 3.0  # 2.0 × 1.5
+
+
+# ---------------------------------------------------------------------------
+# Round 47 — capability cache LRU cap (memory + disk-inode bound)
+# ---------------------------------------------------------------------------
+
+
+def test_capability_cache_caps_entries_and_sweeps_disk():
+    """`_CAPABILITY_CACHE` used to grow one dict entry + one mtime-memo entry
+    + one tempdir file per distinct service_url for the driver's whole
+    lifetime (its sibling _METADATA_CACHE was capped, this one wasn't). It's
+    now bounded: creating > cap distinct services evicts oldest-created
+    entries and deletes their on-disk mirrors."""
+    import glob
+
+    from databricks.labs.community_connector.sources.odata.odata import (
+        _CAPABILITY_CACHE,
+        _CAPABILITY_CACHE_MAX_SERVICES,
+        _CAPABILITY_DISK_MTIME,
+        _capability_cache_path,
+        _capability_cache_store,
+        _clear_capability_cache,
+    )
+
+    _clear_capability_cache()
+    n = _CAPABILITY_CACHE_MAX_SERVICES + 50
+    paths = []
+    for i in range(n):
+        svc = f"https://cap-r47-{i}.example.com/odata/"
+        paths.append(_capability_cache_path(svc))
+        _capability_cache_store(svc, "batch_ok", True)
+    try:
+        # In-memory dict and mtime memo are both bounded at the cap.
+        assert len(_CAPABILITY_CACHE) == _CAPABILITY_CACHE_MAX_SERVICES
+        assert len(_CAPABILITY_DISK_MTIME) <= _CAPABILITY_CACHE_MAX_SERVICES
+        # The most-recent cap services survive; the oldest are evicted.
+        assert f"https://cap-r47-{n - 1}.example.com/odata/" in _CAPABILITY_CACHE
+        assert f"https://cap-r47-0.example.com/odata/" not in _CAPABILITY_CACHE
+        # Evicted services' disk mirrors are deleted, not left as dead inodes.
+        assert not os.path.exists(paths[0])
+        assert os.path.exists(paths[-1])
+        # Total on-disk mirror count is bounded at the cap too.
+        assert sum(os.path.exists(p) for p in paths) == _CAPABILITY_CACHE_MAX_SERVICES
+    finally:
+        _clear_capability_cache()
+
+
+def test_capability_cache_cap_survives_concurrent_first_touch():
+    """Entry creation now happens under _CAPABILITY_LOCK (the eviction
+    iterates the shared dict); concurrent first-touches of many services
+    must not raise or blow past the cap."""
+    import sys
+    import threading
+
+    from databricks.labs.community_connector.sources.odata.odata import (
+        _CAPABILITY_CACHE,
+        _CAPABILITY_CACHE_MAX_SERVICES,
+        _capability_cache_store,
+        _clear_capability_cache,
+    )
+
+    _clear_capability_cache()
+    errors = []
+    prev = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+
+        def _hammer(tid):
+            try:
+                for i in range(200):
+                    _capability_cache_store(
+                        f"https://race-r47-{tid}-{i}.example.com/odata/", "batch_ok", True
+                    )
+            except Exception as exc:  # pragma: no cover - pre-fix would surface here
+                errors.append(repr(exc))
+
+        threads = [threading.Thread(target=_hammer, args=(t,)) for t in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        sys.setswitchinterval(prev)
+    assert errors == []
+    assert len(_CAPABILITY_CACHE) == _CAPABILITY_CACHE_MAX_SERVICES
+    _clear_capability_cache()

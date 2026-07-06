@@ -7892,6 +7892,21 @@ def register_lakeflow_source(spark):
     # ``_scrub_nonauto_verdicts``), so re-selecting ``auto`` still re-probes.
     _CAPABILITY_FILE_CACHE_TTL_SECONDS = 900
 
+    # Cap on distinct service_urls held in the process capability cache (and its
+    # on-disk mirror). The metadata cache got _METADATA_CACHE_MAX_SERVICES; this
+    # sibling — same per-service_url keying, same "SDP forks/recreates instances"
+    # rationale — lacked one, so a long-lived multi-tenant driver issuing
+    # ``.load()`` against many services accumulated one dict entry + one
+    # mtime-memo entry + one tempdir file PER service for the driver's whole
+    # lifetime (the TTL only makes a stale file IGNORED on read, never deletes
+    # it). Generous relative to the metadata cap of 16 because these entries are
+    # tiny (a few booleans + a small JSON file, vs multi-MB CSDL trees), so the
+    # cap sits well above any realistic concurrent working set — a service in
+    # active rotation never evicts — while still bounding a driver that touches
+    # thousands of distinct services over its lifetime. Eviction is by first-
+    # touch (creation) order.
+    _CAPABILITY_CACHE_MAX_SERVICES = 256
+
     # Per-service mtime of the on-disk mirror the last time this process merged it
     # into ``_CAPABILITY_CACHE``. Lets ``_capability_cache_load`` skip the re-read +
     # re-parse when the file hasn't changed since — so the hot lookup on the
@@ -7967,6 +7982,30 @@ def register_lakeflow_source(spark):
             pass
 
 
+    def _capability_cache_evict_locked(keep_url: str) -> None:
+        """Drop oldest-created cache entries beyond
+        :data:`_CAPABILITY_CACHE_MAX_SERVICES`, deleting each evicted service's
+        on-disk mirror + mtime-memo entry so both memory and tempdir inodes stay
+        bounded. The caller MUST hold :data:`_CAPABILITY_LOCK` (this iterates the
+        shared dict). Never evicts ``keep_url`` (the entry the caller just
+        created). Eviction only fires once the working set exceeds the cap, i.e.
+        the evicted service is cold by the cap's own logic; a concurrent process
+        still using it keeps its own in-memory copy and rewrites the file on its
+        next store — worst case one re-probe, the same best-effort posture as TTL
+        expiry."""
+        while len(_CAPABILITY_CACHE) > _CAPABILITY_CACHE_MAX_SERVICES:
+            victim = next((k for k in _CAPABILITY_CACHE if k != keep_url), None)
+            if victim is None:
+                return
+            _CAPABILITY_CACHE.pop(victim, None)
+            path = _capability_cache_path(victim)
+            _CAPABILITY_DISK_MTIME.pop(path, None)
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
     def _capability_cache_load(service_url: str) -> dict:
         """The cached capability verdicts for ``service_url``: the process-wide
         entry, hydrated from the on-disk JSON (when fresh) for keys the process
@@ -7976,7 +8015,17 @@ def register_lakeflow_source(spark):
         The blocking file read runs lock-free; only the merge (which iterates the
         shared dict) is under :data:`_CAPABILITY_LOCK`. The returned dict is a live
         reference read afterwards via atomic ``.get`` only."""
-        entry = _CAPABILITY_CACHE.setdefault(service_url, {})  # atomic; no iteration
+        entry = _CAPABILITY_CACHE.get(service_url)  # atomic; no iteration
+        if entry is None:
+            # First touch of this service — create under the lock so the cap
+            # eviction (which iterates the shared dict) can't race a sibling
+            # thread's insert. The steady-state path (entry present) stays
+            # lock-free: a single atomic ``.get``.
+            with _CAPABILITY_LOCK:
+                entry = _CAPABILITY_CACHE.get(service_url)
+                if entry is None:
+                    entry = _CAPABILITY_CACHE[service_url] = {}
+                    _capability_cache_evict_locked(service_url)
         path = _capability_cache_path(service_url)
         try:
             mtime = os.path.getmtime(path)
