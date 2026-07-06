@@ -5244,11 +5244,12 @@ def test_contained_expand_truncates_mid_page_and_parks_pending_fetches():
 
 @responses.activate
 def test_contained_expand_truncates_at_page_boundary_queues_only_next_page():
-    """When the cap happens to fire exactly at a page's last top_row,
-    the current page item is NOT re-queued (it's fully drained); the
-    server's next-page URL stays in ``pending_fetches`` alongside one
-    inner-collection drain probe per parent whose short, link-less inline
-    Children page wasn't confirmed exhausted before the cap fired."""
+    """When the cap fires exactly at the top page's last row, that page is
+    fully drained (NOT re-queued with a skip>0 resume position) and its
+    server next-page URL is parked. Depth-first: each parent's inline
+    Children page is a link-less auto page, so it's PROBED in-batch (drained,
+    not parked) — except a probe still pending when the cap fires, which
+    parks. The parked queue stays O(depth)-small, never O(fan-out width)."""
     _mock_nested_metadata()
     next_link = f"{SERVICE_URL}Parents?$skiptoken=p2"
 
@@ -5268,6 +5269,10 @@ def test_contained_expand_truncates_at_page_boundary_queues_only_next_page():
         )
 
     responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_initial)
+    # Auto mode probes each parent's short link-less inline Children page to
+    # confirm exhaustion; depth-first fetches these in-batch (empty = done).
+    responses.get(f"{SERVICE_URL}Parents(1)/Children", json={"value": []}, match_querystring=False)
+    responses.get(f"{SERVICE_URL}Parents(2)/Children", json={"value": []}, match_querystring=False)
     c = _make()
     records, offset = c.read_table(
         "Parents__Children",
@@ -5275,16 +5280,18 @@ def test_contained_expand_truncates_at_page_boundary_queues_only_next_page():
         {"expand_contained": "true", "max_records_per_batch": "2"},
     )
     rows = list(records)
-    assert len(rows) == 2
+    assert sorted(r["Id"] for r in rows) == [11, 22]
     pending = offset.get("pending_fetches")
     # The fully-drained top-level page is NOT re-queued — no item carries a
     # skip>0 resume position — and its server next-page URL is parked.
-    assert {"url": next_link, "level": 0, "chain": [], "cur_val": None, "skip": 0} in pending
+    assert any(
+        it["url"] == next_link and it["level"] == 0 and it["chain"] == [] and it["skip"] == 0
+        for it in pending
+    )
     assert all(item["skip"] == 0 for item in pending)
-    # One inner-collection drain probe per parent (Fix: inner collections drain
-    # like the top-level auto walk, so a short link-less inline page is probed).
-    inner = [item for item in pending if item["level"] == 1]
-    assert sorted(item["chain"][0]["Id"] for item in inner) == [1, 2]
+    # O(depth): the frontier is the top next-page link plus at most one
+    # in-flight inner continuation — never one-per-parent (O(width)).
+    assert len(pending) <= 3
     assert "cursor" not in offset
 
 
@@ -7285,43 +7292,37 @@ def test_expand_midpage_park_resumes_by_row_key_not_position():
     assert sorted(got) == [101, 301, 401]
 
 
-def _expand_inner_park_batch1(c):
-    """Shared setup: batch 1 of an expand read parks an inner-collection
-    continuation under parent 1 (server pages Children with
-    ``Children@odata.nextLink``) in ``pending_fetches``."""
+def _expand_inner_park_batch1():
+    """Shared setup: a parked LEVEL-1 inner-collection continuation under
+    parent 1 (the server paged Children with ``Children@odata.nextLink``),
+    constructed DIRECTLY.
+
+    The depth-first drainer drains an inner continuation in the same batch it
+    discovers it, so a real batch-1 seldom parks one mid-collection — but a
+    parked inner continuation is still a valid resume state (the cap can fire
+    with one pending, and old offsets carry them). The recovery path
+    (:meth:`_recover_expand_item`) is unchanged; resuming from this hand-built
+    offset exercises it in isolation, exactly as a real park would."""
     inner_link = f"{SERVICE_URL}Parents(1)/Children?$skiptoken=t1"
-    responses.get(
-        f"{SERVICE_URL}Parents",
-        json={
-            "value": [
-                {
-                    "Id": 1,
-                    "Name": "2024-01-01T00:00:00Z",
-                    "Children": [
-                        {"Id": 11, "Label": "a"},
-                        {"Id": 12, "Label": "b"},
-                    ],
-                    "Children@odata.nextLink": inner_link,
-                },
-                {
-                    "Id": 2,
-                    "Name": "2024-01-02T00:00:00Z",
-                    "Children": [{"Id": 21, "Label": "c"}],
-                },
-            ]
-        },
-        match_querystring=False,
-    )
     opts = {
         "expand_contained": "true",
         "cursor_field": "Name",
         "max_records_per_batch": "3",
         "pagination": "nextlink",
     }
-    recs1, offset1 = c.read_table("Parents__Children", {}, opts)
-    assert sorted(r["Id"] for r in recs1) == [11, 12, 21]
-    pending = offset1["pending_fetches"]
-    assert len(pending) == 1 and pending[0]["url"] == inner_link
+    offset1 = {
+        "pending_fetches": [
+            {
+                "url": inner_link,
+                "level": 1,
+                "chain": [{"Id": 1}],
+                "cur_val": "2024-01-01T00:00:00Z",
+                "skip": 0,
+            }
+        ],
+        "cursor": "2024-01-01T00:00:00Z",
+        "running_max_cursor": "2024-01-01T00:00:00Z",
+    }
     return opts, offset1
 
 
@@ -7335,7 +7336,7 @@ def test_expand_parked_continuation_for_deleted_parent_drops_subtree():
     subtree, duplicate-safe."""
     _mock_nested_metadata()
     c = _make()
-    opts, offset1 = _expand_inner_park_batch1(c)
+    opts, offset1 = _expand_inner_park_batch1()
     # Parent 1 deleted: BOTH the parked continuation and any rebuilt
     # collection URL under it now 404.
     responses.add_callback(
@@ -7358,7 +7359,7 @@ def test_expand_stale_inner_continuation_rebuilds_from_scratch():
     it from scratch: bounded duplicates, never loss."""
     _mock_nested_metadata()
     c = _make()
-    opts, offset1 = _expand_inner_park_batch1(c)
+    opts, offset1 = _expand_inner_park_batch1()
 
     def children_cb(req):
         if "skiptoken" in req.url:
@@ -7471,15 +7472,16 @@ def test_expand_top_level_collection_truly_gone_still_raises():
 
 
 @responses.activate
-def test_expand_pending_queue_length_is_soft_capped(monkeypatch):
-    """The cap bounds EMITTED rows, not queue growth: a wide top page over
-    an inner-paging server could park thousands of URL-carrying items into
-    a multi-MB pending_fetches offset. Above the soft ceiling the drainer
-    parks early and drains across later batches — bounded offsets, no
-    loss."""
-    from databricks.labs.community_connector.sources.odata import _contained as _contained_mod
-
-    monkeypatch.setattr(_contained_mod, "_MAX_PENDING_FETCHES", 3)
+def test_expand_parked_queue_is_depth_bounded_not_width():
+    """The parked ``pending_fetches`` frontier is bounded by the contained
+    path DEPTH, not by the top page's fan-out WIDTH. A wide top page over an
+    inner-paging server (here 6 parents, each with a server-paged Children
+    collection) would, under a breadth-first drain, park one continuation per
+    parent — O(width), a multi-MB offset at scale. The depth-first stack
+    machine drains each parent's subtree before the next, so at any park the
+    frontier is just the current top-page position plus the O(depth) path
+    being walked — never one-per-parent. Every child still arrives exactly
+    once across the capped batches."""
     _mock_nested_metadata()
     parents = []
     for i in range(1, 7):
@@ -7501,33 +7503,166 @@ def test_expand_pending_queue_length_is_soft_capped(monkeypatch):
     opts = {
         "expand_contained": "true",
         "cursor_field": "Name",
-        "max_records_per_batch": "100",  # never the trigger — queue length is
+        # LOW cap so the CAP (not any ceiling) drives parking every batch.
+        "max_records_per_batch": "2",
         "pagination": "nextlink",
     }
+    # Parents__Children has 2 contained segments; the frontier is O(depth):
+    # the top-page resume item plus at most one in-flight inner continuation.
+    depth_bound = 2 + 2  # len(segments) + a small constant
     got: list[int] = []
     offset: dict = {}
     parked = False
-    for _ in range(25):
+    for _ in range(50):
         records, offset = c.read_table("Parents__Children", offset, opts)
         got.extend(r["Id"] for r in records)
         pending = offset.get("pending_fetches")
         if not pending:
             break
         parked = True
-        # Parked queues stay near the ceiling — soft cap: threshold (3)
-        # plus at most the in-flight page's own fan-out (6 rows here) —
-        # never unbounded growth.
-        assert len(pending) <= 9
+        # The load-bearing assertion: the frontier stays DEPTH-bounded even
+        # though the fan-out (6 parents) is far wider.
+        assert len(pending) <= depth_bound, f"offset grew to {len(pending)} — width leaked in"
     else:
         raise AssertionError("expand queue never drained")
-    # The ceiling must actually FIRE for this test to prove anything: with
-    # the feature deleted, batch 1 drains everything (12 rows < cap 100)
-    # and the length assertion above never executes.
-    assert parked, "queue ceiling never parked — feature inert, test vacuous"
-    # Every inline and every paged child arrived exactly once each cycle.
-    assert sorted(set(got)) == sorted(
+    # The cap must actually park for this test to prove anything.
+    assert parked, "never parked — cap too high, test vacuous"
+    # Every inline and every paged child arrived exactly once.
+    assert sorted(got) == sorted(
         [i * 100 + 1 for i in range(1, 7)] + [i * 100 + 2 for i in range(1, 7)]
     )
+
+
+@responses.activate
+def test_expand_three_level_parked_offset_stays_depth_bounded():
+    """O(depth), not O(width), on a genuinely DEEP path. Parents__Children__
+    Notes with a fan-out (2 parents × 2 children) far wider than its depth
+    (3 segments); each child's Notes are server-paged. A breadth-first drain
+    would accumulate a continuation per child (O(width)); the depth-first
+    stack machine walks one subtree at a time so the parked frontier is the
+    O(depth) path only. In nextlink mode the drainer finishes an in-flight
+    inline collection before parking (positional $skip resume would be
+    churn-unsafe), so a batch may overshoot the cap by one inline
+    collection's leaves — bounded, never the whole dataset. Every note
+    arrives exactly once."""
+    _mock_nested_metadata()
+    parents = []
+    for p in (1, 2):
+        children = []
+        for cidx in (1, 2):
+            cid = p * 10 + cidx
+            notes_link = f"{SERVICE_URL}Parents({p})/Children({cid})/Notes?$skiptoken=n"
+            children.append(
+                {
+                    "Id": cid,
+                    "Label": f"c{cid}",
+                    "Notes": [],  # notes deferred behind the nextLink
+                    "Notes@odata.nextLink": notes_link,
+                }
+            )
+            responses.get(
+                f"{SERVICE_URL}Parents({p})/Children({cid})/Notes",
+                json={
+                    "value": [
+                        {"Id": cid * 100 + 1, "Text": "a"},
+                        {"Id": cid * 100 + 2, "Text": "b"},
+                    ]
+                },
+                match_querystring=False,
+            )
+        parents.append({"Id": p, "Name": f"2024-01-0{p}T00:00:00Z", "Children": children})
+    responses.get(f"{SERVICE_URL}Parents", json={"value": parents}, match_querystring=False)
+    c = _make()
+    opts = {
+        "expand_contained": "true",
+        "cursor_field": "Name",
+        "max_records_per_batch": "2",  # LOW: force parking across batches
+        "pagination": "nextlink",
+    }
+    depth_bound = 3 + 2  # len(segments) + small constant
+    got: list[int] = []
+    offset: dict = {}
+    parked = False
+    for _ in range(50):
+        records, offset = c.read_table("Parents__Children__Notes", offset, opts)
+        got.extend(r["Id"] for r in records)
+        pending = offset.get("pending_fetches")
+        if not pending:
+            break
+        parked = True
+        assert len(pending) <= depth_bound, f"offset grew to {len(pending)} — width leaked in"
+    else:
+        raise AssertionError("expand queue never drained")
+    assert parked, "never parked — cap too high, test vacuous"
+    # 2 parents × 2 children × 2 notes = 8 leaves, each exactly once.
+    expected = [
+        cid * 100 + n for p in (1, 2) for cidx in (1, 2) for cid in [p * 10 + cidx] for n in (1, 2)
+    ]
+    assert sorted(got) == sorted(expected)
+
+
+@responses.activate
+def test_expand_deep_single_collection_pages_with_bounded_offset():
+    """The DEPTH case (a single parent whose inner collection pages across
+    many server pages) must still page via ``$top``/``@odata.nextLink`` with
+    an O(1) parked offset and bounded per-batch memory — the property the
+    width-bounding redesign must NOT regress. One parent, Children paged
+    across three server pages, cap=1: each batch emits ~one page and parks a
+    single continuation; every child arrives exactly once."""
+    _mock_nested_metadata()
+    responses.get(
+        f"{SERVICE_URL}Parents",
+        json={
+            "value": [
+                {
+                    "Id": 1,
+                    "Name": "2024-01-01T00:00:00Z",
+                    "Children": [{"Id": 101, "Label": "p1"}],
+                    "Children@odata.nextLink": f"{SERVICE_URL}Parents(1)/Children?$skiptoken=p2",
+                }
+            ]
+        },
+        match_querystring=False,
+    )
+
+    def children_cb(req):
+        if "skiptoken=p2" in req.url:
+            return (
+                200,
+                {},
+                json.dumps(
+                    {
+                        "value": [{"Id": 102, "Label": "p2"}],
+                        "@odata.nextLink": f"{SERVICE_URL}Parents(1)/Children?$skiptoken=p3",
+                    }
+                ),
+            )
+        return (200, {}, json.dumps({"value": [{"Id": 103, "Label": "p3"}]}))  # last page
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents(1)/Children", callback=children_cb)
+    c = _make()
+    opts = {
+        "expand_contained": "true",
+        "cursor_field": "Name",
+        "max_records_per_batch": "1",
+        "pagination": "nextlink",
+    }
+    got: list[int] = []
+    offset: dict = {}
+    max_pending = 0
+    for _ in range(20):
+        records, offset = c.read_table("Parents__Children", offset, opts)
+        got.extend(r["Id"] for r in records)
+        pending = offset.get("pending_fetches") or []
+        max_pending = max(max_pending, len(pending))
+        if not pending:
+            break
+    else:
+        raise AssertionError("deep collection never drained")
+    # O(1) offset — the parked frontier is one in-flight continuation, never
+    # grows with the collection length.
+    assert max_pending <= 2
+    assert sorted(got) == [101, 102, 103]
 
 
 @responses.activate
@@ -13186,16 +13321,19 @@ def test_pg_filter_percent24_spelling_folded():
 
 
 @responses.activate
-def test_expand_queue_park_before_first_emit_preserves_queue(monkeypatch):
-    """Round-26 regression: the ``_MAX_PENDING_FETCHES`` ceiling can park a
-    non-empty queue BEFORE any leaf row is emitted (a server that defers
-    every inner collection behind ``<Nav>@odata.nextLink``). The idle
-    shortcut in ``_read_contained_expand`` must not treat that as an empty
-    batch and echo ``start_offset`` — that discards the queue and the read
-    livelocks at zero rows forever."""
-    from databricks.labs.community_connector.sources.odata import _contained as _contained_mod
-
-    monkeypatch.setattr(_contained_mod, "_MAX_PENDING_FETCHES", 3)
+def test_expand_all_children_deferred_drain_without_dropping_queue():
+    """A server that defers EVERY inner collection behind
+    ``<Nav>@odata.nextLink`` (nothing inline) must still drain fully across
+    capped batches, and the parked ``pending_fetches`` must never be silently
+    dropped by the idle shortcut in ``_read_contained_expand`` (round-26: an
+    empty-``emitted`` batch that echoes ``start_offset`` discards the queue
+    and livelocks at zero rows). Depth-first drains each deferred child in the
+    batch it's discovered, so the queue makes progress every batch and stays
+    depth-bounded; every paged child arrives exactly once. (The specific
+    "park before the first emit" trigger the old ceiling produced is no longer
+    reachable under depth-first — the drainer emits as it descends — but the
+    idle-shortcut guard remains as defense and this exercises the drain it
+    protects.)"""
     _mock_nested_metadata()
     parents = []
     for i in range(1, 7):
@@ -13217,21 +13355,27 @@ def test_expand_queue_park_before_first_emit_preserves_queue(monkeypatch):
     opts = {
         "expand_contained": "true",
         "cursor_field": "Name",
-        "max_records_per_batch": "100",
+        "max_records_per_batch": "2",  # LOW: park across batches
         "pagination": "nextlink",
     }
-    records, offset = c.read_table("Parents__Children", {}, opts)
-    assert list(records) == []  # ceiling parked before the first leaf row...
-    assert offset.get("pending_fetches"), "parked queue was dropped from the offset"
     got: list[int] = []
-    for _ in range(25):
+    offset: dict = {}
+    parked = False
+    for _ in range(50):
         records, offset = c.read_table("Parents__Children", offset, opts)
-        got.extend(r["Id"] for r in records)
-        if not offset.get("pending_fetches"):
+        rows = [r["Id"] for r in records]
+        got.extend(rows)
+        pending = offset.get("pending_fetches")
+        if not pending:
             break
+        parked = True
+        # Progress every batch (queue never dropped/stalled) and depth-bounded.
+        assert rows, "batch parked a queue but emitted nothing — possible livelock"
+        assert len(pending) <= 4
     else:
         raise AssertionError("expand queue never drained")
-    assert sorted(set(got)) == sorted(i * 100 + 2 for i in range(1, 7))
+    assert parked, "never parked — cap too high, test vacuous"
+    assert sorted(got) == sorted(i * 100 + 2 for i in range(1, 7))
 
 
 def test_cursor_completion_floored_at_since():
@@ -17630,7 +17774,10 @@ def test_pagination_period2_nextlink_cycle_stops(caplog):
             200,
             {},
             json.dumps(
-                {"value": [{"Id": row}], "@odata.nextLink": f"{SERVICE_URL}T?$top=1&$skiptoken={nxt}"}
+                {
+                    "value": [{"Id": row}],
+                    "@odata.nextLink": f"{SERVICE_URL}T?$top=1&$skiptoken={nxt}",
+                }
             ),
         )
 
@@ -17641,7 +17788,9 @@ def test_pagination_period2_nextlink_cycle_stops(caplog):
         c._pagination = mode
         with caplog.at_level(logging.WARNING):
             rows = []
-            for page_rows, _nxt in c._fetch_pages_with_links(f"{SERVICE_URL}T?$top=1&$orderby=Id asc"):
+            for page_rows, _nxt in c._fetch_pages_with_links(
+                f"{SERVICE_URL}T?$top=1&$orderby=Id asc"
+            ):
                 rows.extend(page_rows)
                 assert len(rows) < 50, f"{mode}: cycle guard did not stop the walk"
         assert "continuation URL repeated" in caplog.text
@@ -17653,6 +17802,7 @@ def test_pagination_period2_nextlink_cycle_stops(caplog):
 def test_pagination_long_distinct_walk_not_false_flagged():
     """A legitimate long walk (all-distinct continuation URLs) must not
     trip the cycle guard — the window slides, never false-positives."""
+
     def _cb(request):
         from urllib.parse import parse_qs, unquote, urlparse
 
@@ -17663,7 +17813,10 @@ def test_pagination_long_distinct_walk_not_false_flagged():
             200,
             {},
             json.dumps(
-                {"value": [{"Id": i}], "@odata.nextLink": f"{SERVICE_URL}T?$top=1&$skiptoken={i + 1}"}
+                {
+                    "value": [{"Id": i}],
+                    "@odata.nextLink": f"{SERVICE_URL}T?$top=1&$skiptoken={i + 1}",
+                }
             ),
         )
 

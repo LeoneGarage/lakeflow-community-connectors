@@ -4500,41 +4500,60 @@ def register_lakeflow_source(spark):
             count_floor: Any = None,
             leaf_pks: list[str] | None = None,
         ) -> list[dict]:
-            """Iterative work-queue processor.
+            """Resumable depth-first stack machine over the contained ``$expand``.
 
-            Each queue item is a self-contained "fetch this URL and
-            process the rows it returns" task::
+            The parked offset (``pending_fetches``) is this method's return
+            value, serialized every microbatch — so its size must stay bounded.
+            A naive breadth-first queue that appended one continuation per
+            truncated inner collection parked O(fan-out width) items (a wide top
+            page over an inner-paging server → thousands of URL-carrying items, a
+            multi-MB offset). This walks DEPTH-FIRST instead, so the parked
+            frontier is O(depth) — one frame per contained segment on the current
+            path — regardless of fan-out.
 
-                {
-                    "url":      str,             # HTTP URL to GET (one page)
-                    "level":    int,             # level the URL's rows live at
-                    "chain":    list[dict],      # ancestor PK chain (snapshot)
-                    "cur_val":  Any | None,      # captured cursor value
-                    "skip":     int,             # legacy positional fallback
-                    "boundary": list | None,     # last processed row's order key
-                }
+            The work stack holds two frame kinds:
 
-            Items are popped FIFO; each pop performs ONE HTTP fetch and
-            processes its top_rows. Inner-collection ``@odata.nextLink``
-            values discovered during a row's inline descent are APPENDED to
-            the queue (via ``_flatten_expand_response``'s ``pending_fetches``
-            arg) rather than followed inline. After each fully-processed
-            top_row the ``max_records`` cap is checked: when exceeded, the
-            current item is re-queued at the front carrying the just-processed
-            row's ORDER KEY (its ``$orderby`` values — cursor + level PKs, or
-            PKs alone), and the loop exits. The resumed batch re-fetches the
-            URL and skips rows at-or-below that boundary by chronological
-            comparison — NOT by position: the page is re-fetched from a
-            mutating source, so a positional ``skip`` desynchronizes under
-            churn (an update to an already-emitted row on a cursor-ordered
-            page moves it to the tail and shifts an UNREAD row into the
-            skipped prefix — its subtree lost behind the watermark; a delete
-            on a PK-ordered page does the same). ``skip`` remains as the
-            legacy/downgrade fallback for parked offsets without a boundary.
-            Rows whose boundary comparison is incomparable are processed
-            (duplicate-safe), never skipped. The returned queue is the work
-            left to do — non-empty means "continuation pending", empty means
-            "chain drained".
+            * **url**  — ``{url, level, chain, cur_val, boundary, skip}``: fetch
+              ONE page, then push a ``rows`` frame for its contents. This is the
+              only serializable shape (what a parked/seed queue item looks like).
+            * **rows** — an in-memory page of sibling rows at ``level`` plus an
+              ``idx`` cursor (``rows, level, chain, cur_val, idx, from_inline,
+              base_url, page_next_url, boundary, tops``). A wide inline sibling
+              collection is ONE rows frame, not N queued items — that is what
+              keeps the frontier O(depth) rather than O(width).
+
+            Per iteration the ``max_records`` cap is checked at the top; when
+            reached the loop stops pulling new work and ``_park`` serializes the
+            stack (bottom-to-top) into O(depth) ``url`` items. A ``rows`` frame is
+            parked by re-fetching its collection past the last processed row: a
+            fetched page re-fetches its own ``base_url`` with ``skip``/``boundary``;
+            an inline-delivered collection synthesizes a seek continuation
+            (``_build_expand_continuation_url``; ``nextlink`` mode has no client
+            seek, so it falls back to positional ``$skip`` + boundary dedup —
+            bounded duplicates, never loss). An ancestor frame's in-flight row is
+            skipped on resume because its remaining subtree is carried by the
+            deeper parked frames — no re-emit, no loss.
+
+            Resume re-fetches each parked url and skips rows at-or-below its
+            ``boundary`` by chronological ORDER KEY comparison — NOT by position:
+            the page is re-fetched from a mutating source, so a positional
+            ``skip`` desynchronizes under churn (an update to an already-emitted
+            row on a cursor-ordered page moves it to the tail and shifts an UNREAD
+            row into the skipped prefix — its subtree lost behind the watermark; a
+            delete on a PK-ordered page does the same). ``skip`` remains as the
+            legacy/downgrade fallback for parked offsets without a boundary. Rows
+            whose boundary comparison is incomparable are processed
+            (duplicate-safe), never skipped. The returned queue is the work left
+            to do — non-empty means "continuation pending", empty means "chain
+            drained".
+
+            ``count_floor`` — see ``_walk_contained_with_cursor``: only rows
+            strictly above the committed watermark count toward
+            ``max_records``, so a lookback overlap larger than the cap cannot
+            wedge the stream into an eternal park/complete cycle. Cap deviation
+            per batch is bounded by one page's worth of leaf rows (the cap is
+            checked between rows, but an in-flight inline collection is finished
+            before parking in ``nextlink`` mode) plus the lookback overlap.
 
             ``count_floor`` — see ``_walk_contained_with_cursor``: only rows
             strictly above the committed watermark count toward
@@ -4543,9 +4562,6 @@ def register_lakeflow_source(spark):
             deviation per batch is bounded by ONE HTTP response's worth of
             leaf rows (≤ ``page_size``) plus the lookback overlap.
             """
-            # Take ownership: mutated in-place by appends from
-            # ``_flatten_expand_response`` and by our own front re-queues.
-            queue: list[dict] = list(initial_queue)
             cur_field, cur_level, _ = ctx or (None, -1, None)
             countable = 0
 
@@ -4575,112 +4591,275 @@ def register_lakeflow_source(spark):
                 key.extend(row.get(pk) for pk in pks)
                 return key
 
-            while queue and countable < max_records:
-                item = queue.pop(0)
-                url = item["url"]
-                level = item["level"]
-                chain = [dict(p) for p in item.get("chain") or []]
-                cur_val = item.get("cur_val")
-                skip = int(item.get("skip", 0) or 0)
-                boundary = item.get("boundary")
-                item_ctx = (cur_field, cur_level, cur_val) if cur_field else None
-                # Tops budgeted over only THIS request's collection levels
-                # (root == item level downward); ancestors above are fixed keys.
-                item_tops = (
-                    compute_expand_tops_for_root(page_size, len(segments), level) if page_size else None
+            leaf_level = len(segments) - 1
+            # Client-driven seek used to synthesize a resume URL for an
+            # inline-delivered collection; ``nextlink`` has no client seek, so fall
+            # back to positional ``$skip`` (a server that ignores it re-reads from
+            # the start and the parked boundary dedups — bounded duplicates, never
+            # loss), matching ``_recover_expand_item``'s mode-agnostic rebuild.
+            mode = getattr(self, "_pagination", "nextlink")
+            park_mode = mode if mode != "nextlink" else "skip"
+
+            def _push_url(item: dict) -> None:
+                stack.append(
+                    {
+                        "kind": "url",
+                        "url": item["url"],
+                        "level": int(item["level"]),
+                        "chain": [dict(p) for p in item.get("chain") or []],
+                        "cur_val": item.get("cur_val"),
+                        "boundary": item.get("boundary"),
+                        "skip": int(item.get("skip", 0) or 0),
+                        "rebuilt": bool(item.get("rebuilt")),
+                    }
                 )
-                # Fetch one page only — pulling further pages of THIS
-                # collection waits until the next dequeue so we can check
-                # the cap between them.
-                try:
-                    page_rows, page_next_url = self._fetch_one_expand_page(
-                        url, self._expand_level_types(level)
-                    )
-                except requests.HTTPError as exc:
-                    replacement = self._recover_expand_item(exc, item, segments, cur_field)
-                    if replacement is not None:
-                        queue.insert(0, replacement)
-                    continue
-                if not page_rows:
-                    if page_next_url:
-                        queue.append(
+
+            # Reconstruct the work stack from the parked (or seed) queue. Parked
+            # frames are stored bottom-to-top (see ``_park``), so pushing them in
+            # order restores the DFS path with the deepest (leaf-most) frame on
+            # top — resumed first, exactly where the prior batch stopped.
+            stack: list[dict] = []
+            for item in initial_queue:
+                _push_url(item)
+
+            def _park() -> list[dict]:
+                # Serialize the whole stack (O(depth)) bottom-to-top. Each frame's
+                # ``boundary`` is its CURRENT row's order key: the deepest frame's
+                # current row is fully done (skip it, resume at the next); an
+                # ancestor's current row is in flight but its remaining subtree is
+                # carried by the deeper parked frames, so skipping it here and
+                # resuming at the next sibling is exactly right — no re-emit, no
+                # loss. This is what bounds the offset to O(depth), not O(width).
+                parked: list[dict] = []
+                for frame in stack:
+                    if frame["kind"] == "url":
+                        parked.append(
                             {
-                                "url": page_next_url,
-                                "level": level,
-                                "chain": [dict(p) for p in chain],
-                                "cur_val": cur_val,
-                                "skip": 0,
+                                "url": frame["url"],
+                                "level": frame["level"],
+                                "chain": frame["chain"],
+                                "cur_val": frame["cur_val"],
+                                "skip": frame.get("skip", 0),
+                                "boundary": frame.get("boundary"),
+                                "rebuilt": frame.get("rebuilt", False),
+                            }
+                        )
+                        continue
+                    idx = frame["idx"]
+                    level = frame["level"]
+                    if idx >= len(frame["rows"]):
+                        # Page fully processed this batch — no remaining rows to
+                        # resume here. An inline-delivered collection is complete
+                        # as delivered (nothing to synthesize); a fetched page
+                        # parks its server next-link so the sibling pages follow.
+                        if not frame.get("from_inline") and frame.get("page_next_url"):
+                            parked.append(
+                                {
+                                    "url": frame["page_next_url"],
+                                    "level": level,
+                                    "chain": frame["chain"],
+                                    "cur_val": frame["cur_val"],
+                                    "skip": 0,
+                                    "boundary": None,
+                                }
+                            )
+                        continue
+                    boundary = (
+                        _row_order_key(frame["rows"][idx - 1], level) if idx else frame.get("boundary")
+                    )
+                    if not frame.get("from_inline"):
+                        park_url = frame["base_url"]
+                        park_skip = idx
+                    else:
+                        # Inline-delivered rows have no page URL of their own; re-fetch
+                        # the collection under its parent (chain holds keys 0..level-1)
+                        # seeking past the last processed row.
+                        last_child = frame["rows"][idx - 1] if idx else {}
+                        park_url = self._build_expand_continuation_url(
+                            segments,
+                            level - 1,
+                            frame["chain"],
+                            cur_field if cur_field else None,
+                            park_mode,
+                            last_child,
+                            idx,
+                        )
+                        park_skip = 0
+                    parked.append(
+                        {
+                            "url": park_url,
+                            "level": level,
+                            "chain": frame["chain"],
+                            "cur_val": frame["cur_val"],
+                            "skip": park_skip,
+                            "boundary": boundary,
+                        }
+                    )
+                return parked
+
+            def _parkable() -> bool:
+                # A mid-way inline collection (0 < idx < len) can only be resumed
+                # by re-fetching it past the last processed row. Every mode except
+                # ``nextlink`` has a churn-safe client seek for that
+                # (``_build_expand_continuation_url``'s keyset). ``nextlink`` falls
+                # back to positional ``$skip``, which under between-batch churn can
+                # push an unread row into the skipped prefix (silent loss) — the
+                # exact failure the boundary resume exists to prevent. So in
+                # ``nextlink`` mode DON'T park while any inline collection is
+                # mid-way; finish it first (bounded by one server page, since a
+                # truncated inner collection is a server ``<Nav>@odata.nextLink``
+                # url frame, not an inline one). idx==0 (fresh) and idx==len
+                # (exhausted) park cleanly — a from-start refetch and a drop.
+                if mode != "nextlink":
+                    return True
+                return not any(
+                    f["kind"] == "rows" and f.get("from_inline") and 0 < f["idx"] < len(f["rows"])
+                    for f in stack
+                )
+
+            while stack:
+                if countable >= max_records and _parkable():
+                    # Cap reached — stop pulling new work and park the O(depth)
+                    # frontier. Overshoot is bounded by the last page's leaf rows
+                    # (plus, in nextlink mode, finishing an in-flight inline page).
+                    break
+                if len(stack) > _MAX_PENDING_FETCHES:
+                    # Safety valve: an extreme single-parent fan-out (or a
+                    # nextlink server that page-limits without seek support, so
+                    # depth-first still can't fully collapse) would otherwise grow
+                    # the frontier unbounded. Park what we have and resume.
+                    break
+                frame = stack[-1]
+                if frame["kind"] == "url":
+                    stack.pop()
+                    level = frame["level"]
+                    try:
+                        page_rows, page_next_url = self._fetch_one_expand_page(
+                            frame["url"], self._expand_level_types(level)
+                        )
+                    except requests.HTTPError as exc:
+                        replacement = self._recover_expand_item(exc, frame, segments, cur_field)
+                        if replacement is not None:
+                            _push_url(replacement)
+                        continue
+                    if not page_rows:
+                        if page_next_url:
+                            _push_url(
+                                {
+                                    "url": page_next_url,
+                                    "level": level,
+                                    "chain": frame["chain"],
+                                    "cur_val": frame["cur_val"],
+                                }
+                            )
+                        continue
+                    start_idx, resume_boundary = _expand_resume_start(
+                        page_rows,
+                        frame.get("boundary"),
+                        frame.get("skip", 0),
+                        lambda r, lv=level: _row_order_key(r, lv),
+                    )
+                    stack.append(
+                        {
+                            "kind": "rows",
+                            "rows": page_rows,
+                            "level": level,
+                            "chain": frame["chain"],
+                            "cur_val": frame["cur_val"],
+                            "idx": start_idx,
+                            "from_inline": False,
+                            "base_url": frame["url"],
+                            "page_next_url": page_next_url,
+                            "boundary": resume_boundary,
+                            # Tops budgeted over only THIS page's collection levels
+                            # (root == fetch level downward); ancestors are fixed keys.
+                            "tops": (
+                                compute_expand_tops_for_root(page_size, len(segments), level)
+                                if page_size
+                                else None
+                            ),
+                        }
+                    )
+                    continue
+                # rows frame
+                if frame["idx"] >= len(frame["rows"]):
+                    stack.pop()
+                    if frame.get("page_next_url"):
+                        _push_url(
+                            {
+                                "url": frame["page_next_url"],
+                                "level": frame["level"],
+                                "chain": frame["chain"],
+                                "cur_val": frame["cur_val"],
                             }
                         )
                     continue
-                truncated = False
-                start_idx, boundary = _expand_resume_start(
-                    page_rows, boundary, skip, lambda r: _row_order_key(r, level)
-                )
-                for row_idx in range(start_idx, len(page_rows)):
-                    row = page_rows[row_idx]
-                    if boundary is not None:
-                        row_key = _row_order_key(row, level)
-                        # Anchor row missing: skip only rows PROVABLY at-or-below
-                        # the parked boundary (collation-honest — see
-                        # _chain_strictly_before); anything else is processed
-                        # (duplicate-safe, never silent loss).
-                        if row_key == boundary or _chain_strictly_before(row_key, boundary):
-                            continue
+                row = frame["rows"][frame["idx"]]
+                frame["idx"] += 1
+                level = frame["level"]
+                if frame.get("boundary") is not None:
+                    row_key = _row_order_key(row, level)
+                    # Anchor row missing: skip only rows PROVABLY at-or-below the
+                    # parked boundary (collation-honest — see _chain_strictly_before);
+                    # anything else is processed (duplicate-safe, never silent loss).
+                    if row_key == frame["boundary"] or _chain_strictly_before(
+                        row_key, frame["boundary"]
+                    ):
+                        continue
+                row_cur_val = frame["cur_val"]
+                if cur_field and level == cur_level:
+                    row_cur_val = row.get(cur_field)
+                if level == leaf_level:
                     prev_len = len(emitted)
-                    self._flatten_expand_response(
-                        level,
-                        row,
-                        segments,
-                        pks_per_level,
-                        chain,
-                        fk_columns,
-                        emitted,
-                        item_ctx,
-                        item_tops,
-                        response_url=url,
-                        pending_fetches=queue,
-                        page_size=page_size,
+                    self._emit_leaf_row(
+                        row, segments, frame["chain"], fk_columns, emitted, cur_field, row_cur_val
                     )
                     countable += _count_new(emitted[prev_len:])
-                    if (
-                        countable >= max_records or len(queue) >= _MAX_PENDING_FETCHES
-                    ) and row_idx + 1 < len(page_rows):
-                        # Mid-page: re-queue the SAME URL at the front so
-                        # the next batch resumes here without scrambling
-                        # depth ordering — carrying the just-processed row's
-                        # order key (churn-stable), with the positional skip
-                        # only as a downgrade fallback.
-                        queue.insert(
-                            0,
-                            {
-                                "url": url,
-                                "level": level,
-                                "chain": [dict(p) for p in chain],
-                                "cur_val": cur_val,
-                                "skip": row_idx + 1,
-                                "boundary": _row_order_key(row, level),
-                            },
-                        )
-                        truncated = True
-                        break
-                if not truncated and page_next_url:
-                    queue.append(
+                    continue
+                # Non-leaf: descend depth-first. Push the truncated-tail
+                # continuation FIRST (bottom) and the inline children ON TOP, so
+                # inline rows drain before the tail — and the inline collection is
+                # ONE in-memory rows frame, never N queued items (kills the width
+                # burst; the frontier stays O(depth)).
+                child_chain = frame["chain"] + [{pk: row.get(pk) for pk in pks_per_level[level]}]
+                next_ctx = (cur_field, cur_level, row_cur_val) if cur_field else None
+                cont_url = self._derive_child_continuation(
+                    level,
+                    row,
+                    segments,
+                    child_chain,
+                    next_ctx,
+                    frame.get("tops"),
+                    page_size,
+                    frame["base_url"],
+                )
+                inline_children = row.get(segments[level + 1]) or []
+                if cont_url is not None:
+                    _push_url(
                         {
-                            "url": page_next_url,
-                            "level": level,
-                            "chain": [dict(p) for p in chain],
-                            "cur_val": cur_val,
-                            "skip": 0,
+                            "url": cont_url,
+                            "level": level + 1,
+                            "chain": child_chain,
+                            "cur_val": row_cur_val,
                         }
                     )
-                if len(queue) >= _MAX_PENDING_FETCHES:
-                    # Park before the queue balloons further (offset-size
-                    # ceiling — see _MAX_PENDING_FETCHES). Checked AFTER the
-                    # item was processed, so every batch makes progress even
-                    # when it resumes an already-oversized parked queue.
-                    break
-            return queue
+                if inline_children:
+                    stack.append(
+                        {
+                            "kind": "rows",
+                            "rows": inline_children,
+                            "level": level + 1,
+                            "chain": child_chain,
+                            "cur_val": row_cur_val,
+                            "idx": 0,
+                            "from_inline": True,
+                            "base_url": frame["base_url"],
+                            "page_next_url": None,
+                            "boundary": None,
+                            "tops": frame.get("tops"),
+                        }
+                    )
+            return _park() if stack else []
 
         def _stream_expand_pages(
             self,
@@ -5033,6 +5212,113 @@ def register_lakeflow_source(spark):
                 None,
             )
 
+        # pylint: disable=too-many-arguments,too-many-positional-arguments
+        def _emit_leaf_row(
+            self,
+            row: dict,
+            segments: list[str],
+            chain: list[dict[str, Any]],
+            fk_columns: dict[tuple[int, str], str],
+            out: list[dict],
+            cur_field: str | None,
+            cur_val: Any,
+        ) -> None:
+            """Emit one LEAF row: strip OData annotations, tag ancestor FKs, and
+            stamp the inherited cursor value when the leaf doesn't carry its own.
+            Shared by :meth:`_flatten_expand_response` (streaming recursion) and
+            the :meth:`_drain_expand_pages` stack machine so both emit identically.
+            """
+            # Drop both top-level (``@odata.foo``) and per-property
+            # (``Foo@odata.nextLink``) annotations from leaf rows; the framework
+            # wouldn't know what to do with either.
+            clean = {k: v for k, v in row.items() if "@odata." not in k}
+            self._tag_with_ancestor_fks(clean, segments, chain, fk_columns)
+            if cur_field and cur_val is not None and clean.get(cur_field) is None:
+                clean[cur_field] = cur_val
+            out.append(clean)
+
+        # pylint: disable=too-many-arguments,too-many-positional-arguments
+        def _derive_child_continuation(
+            self,
+            level: int,
+            row: dict,
+            segments: list[str],
+            chain: list[dict[str, Any]],
+            next_ctx: tuple[str | None, int, Any] | None,
+            per_level_tops: list[int] | None,
+            page_size: int | None,
+            base_url: str,
+        ) -> str | None:
+            """Resolve the continuation URL for ``row``'s inner collection at
+            ``level + 1`` (or ``None`` when the collection is complete / not
+            continuable). ``chain`` MUST already include ``row``'s own keys
+            (levels ``0..level``). Extracted verbatim from
+            :meth:`_flatten_expand_response` so the stack machine derives the
+            exact same continuations.
+            """
+            next_seg = segments[level + 1]
+            inner_next = row.get(f"{next_seg}@odata.nextLink")
+            if inner_next:
+                # _resolve_next_link, NOT a plain urljoin: some servers (Hexagon
+                # SCApi, SAP Gateway) return per-property continuation links
+                # relative to the SERVICE ROOT — urljoin against this deep page
+                # URL would double the ancestor path (→ 404 and a full
+                # rebuild-from-keys re-read on every inner continuation).
+                resolved = self._resolve_next_link(base_url, inner_next)
+                if per_level_tops:
+                    # Continuation pages the collection at ``level + 1`` under one
+                    # specific parent at ``level``. The original ``$top`` for that
+                    # level was sized against the FULL cross-product budget
+                    # (top × inner × …); the continuation is one outer level
+                    # shallower, so we have more budget to spend per response. New
+                    # $top is ``page_size_budget / inner_product`` where
+                    # ``inner_product`` is the cross-product of all levels deeper
+                    # than ``level + 1`` (which the server-side ``$expand`` chain
+                    # in the nextLink still applies).
+                    continuation_level = level + 1
+                    inner_product = 1
+                    for t in per_level_tops[continuation_level + 1 :]:
+                        inner_product *= t
+                    # Budget is the full page_size: the ancestors 0..level are a
+                    # single fixed parent in the continuation, so they don't
+                    # multiply. ``page_size`` is passed explicitly rather than
+                    # re-derived from per_level_tops, whose entries below this
+                    # request's root level are placeholders. (per_level_tops is only
+                    # truthy when page_size was set, so page_size is present here.)
+                    new_top = max(MIN_DYNAMIC_TOP, (page_size or 0) // max(1, inner_product))
+                    resolved = rewrite_top_in_url(resolved, new_top)
+                return resolved
+            if next_seg in row and row[next_seg] is not None:
+                # No ``<NavProp>@odata.nextLink``. In a client-driven pagination
+                # mode (keyset/skip/auto), synthesize a direct-navigation
+                # continuation when the inline page is a FULL page (== $top) and
+                # so plausibly truncated; otherwise the inline page is taken as
+                # the whole collection — today's nextlink-only behaviour. This
+                # closes the inner-``$expand`` hole for servers that page-limit a
+                # response but never emit the continuation link.
+                return self._inner_expand_continuation_url(
+                    level, row, segments, chain, next_ctx, per_level_tops
+                )
+            # The expanded property is wholly ABSENT (or null) — spec-violating:
+            # OData v4 requires every ``$expand``-ed property be PRESENT on each
+            # row (a genuinely empty collection comes back as ``[]``, which the
+            # branch above trusts). A partial-expansion server that inlines
+            # children for some parents and omits the property for others would
+            # otherwise have those subtrees silently dropped — absent is NOT
+            # verified-empty. Fetch the collection directly from the start: mode
+            # "skip" + count 0 yields a plain ``$skip=0`` from-the-beginning URL
+            # with the deeper ``$expand`` chain intact, without engaging the
+            # keyset OR-support probe an empty boundary couldn't use anyway.
+            return self._build_expand_continuation_url(
+                segments,
+                level,
+                chain,
+                next_ctx[0] if next_ctx else None,
+                "skip",
+                {},
+                0,
+            )
+
         # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
         def _flatten_expand_response(
             self,
@@ -5090,14 +5376,7 @@ def register_lakeflow_source(spark):
             if cur_field and level == cur_level:
                 cur_val = row.get(cur_field)
             if level == len(segments) - 1:
-                # Drop both top-level (``@odata.foo``) and per-property
-                # (``Foo@odata.nextLink``) annotations from leaf rows; the
-                # framework wouldn't know what to do with either.
-                clean = {k: v for k, v in row.items() if "@odata." not in k}
-                self._tag_with_ancestor_fks(clean, segments, chain, fk_columns)
-                if cur_field and cur_val is not None and clean.get(cur_field) is None:
-                    clean[cur_field] = cur_val
-                out.append(clean)
+                self._emit_leaf_row(row, segments, chain, fk_columns, out, cur_field, cur_val)
                 return
             pks = pks_per_level[level]
             chain.append({pk: row.get(pk) for pk in pks})
@@ -5118,69 +5397,9 @@ def register_lakeflow_source(spark):
                     pending_fetches=pending_fetches,
                     page_size=page_size,
                 )
-            inner_next = row.get(f"{next_seg}@odata.nextLink")
-            if inner_next:
-                # _resolve_next_link, NOT a plain urljoin: some servers (Hexagon
-                # SCApi, SAP Gateway) return per-property continuation links
-                # relative to the SERVICE ROOT — urljoin against this deep page
-                # URL would double the ancestor path (→ 404 and a full
-                # rebuild-from-keys re-read on every inner continuation).
-                resolved = self._resolve_next_link(base_url, inner_next)
-                if per_level_tops:
-                    # Continuation pages the collection at ``level + 1``
-                    # under one specific parent at ``level``. The original
-                    # ``$top`` for that level was sized against the FULL
-                    # cross-product budget (top × inner × …); the
-                    # continuation is one outer level shallower, so we
-                    # have more budget to spend per response. New $top is
-                    # ``page_size_budget / inner_product`` where
-                    # ``inner_product`` is the cross-product of all levels
-                    # deeper than ``level + 1`` (which the server-side
-                    # ``$expand`` chain in the nextLink still applies).
-                    continuation_level = level + 1
-                    inner_product = 1
-                    for t in per_level_tops[continuation_level + 1 :]:
-                        inner_product *= t
-                    # Budget is the full page_size: the ancestors 0..level are a
-                    # single fixed parent in the continuation, so they don't
-                    # multiply. ``page_size`` is passed explicitly rather than
-                    # re-derived from per_level_tops, whose entries below this
-                    # request's root level are placeholders. (per_level_tops is only
-                    # truthy when page_size was set, so page_size is present here.)
-                    new_top = max(MIN_DYNAMIC_TOP, (page_size or 0) // max(1, inner_product))
-                    resolved = rewrite_top_in_url(resolved, new_top)
-            elif next_seg in row and row[next_seg] is not None:
-                # No ``<NavProp>@odata.nextLink``. In a client-driven pagination
-                # mode (keyset/skip/auto), synthesize a direct-navigation
-                # continuation when the inline page is a FULL page (== $top) and
-                # so plausibly truncated; otherwise the inline page is taken as
-                # the whole collection — today's nextlink-only behaviour. This
-                # closes the inner-``$expand`` hole for servers that page-limit a
-                # response but never emit the continuation link.
-                resolved = self._inner_expand_continuation_url(
-                    level, row, segments, chain, next_ctx, per_level_tops
-                )
-            else:
-                # The expanded property is wholly ABSENT (or null) — spec-
-                # violating: OData v4 requires every ``$expand``-ed property be
-                # PRESENT on each row (a genuinely empty collection comes back
-                # as ``[]``, which the branch above trusts). A partial-expansion
-                # server that inlines children for some parents and omits the
-                # property for others would otherwise have those subtrees
-                # silently dropped — absent is NOT verified-empty. Fetch the
-                # collection directly from the start: mode "skip" + count 0
-                # yields a plain ``$skip=0`` from-the-beginning URL with the
-                # deeper ``$expand`` chain intact, without engaging the keyset
-                # OR-support probe an empty boundary couldn't use anyway.
-                resolved = self._build_expand_continuation_url(
-                    segments,
-                    level,
-                    chain,
-                    next_ctx[0] if next_ctx else None,
-                    "skip",
-                    {},
-                    0,
-                )
+            resolved = self._derive_child_continuation(
+                level, row, segments, chain, next_ctx, per_level_tops, page_size, base_url
+            )
             if resolved is not None:
                 if pending_fetches is not None:
                     # Defer the follow: the outer drainer pops one fetch
