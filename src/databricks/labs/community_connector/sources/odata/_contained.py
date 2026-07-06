@@ -90,17 +90,6 @@ MAX_CONTAINED_DEPTH = 10
 # ``@odata.nextLink`` chase at every level.
 MIN_DYNAMIC_TOP = 5
 
-# Soft ceiling on the expand work queue's length at park time. The
-# ``max_records_per_batch`` cap bounds EMITTED rows, not queue growth: every
-# flattened top row can append one URL-carrying work item per truncated
-# inner collection (~0.3–2KB each), so a wide top page over an
-# inner-paging server can otherwise park thousands of items — a multi-MB
-# ``pending_fetches`` offset persisted every microbatch. Once the queue
-# reaches this length the drainer parks early (clean boundary item for the
-# current page, then stop dequeuing); the parked queue drains across later
-# batches. Soft: one in-flight page can still overshoot by its own fan-out.
-_MAX_PENDING_FETCHES = 2000
-
 # Default ``page_size`` applied to **cursor-based** reads (cursor_field
 # or delta) when the user didn't set one, so a ``$top`` is still sent.
 # Snapshot reads deliberately omit ``$top`` entirely when ``page_size``
@@ -3509,12 +3498,13 @@ class ContainedNavMixin:
             return iter(emitted), end_offset
         if not emitted and not resuming and not remaining_queue:
             # Idle batch: nothing emitted, nothing resumed, nothing PARKED.
-            # The last guard is load-bearing — the queue ceiling
-            # (``_MAX_PENDING_FETCHES``) can park a non-empty queue before
-            # the first leaf row is emitted (servers that defer every inner
-            # collection behind ``<Nav>@odata.nextLink``), and echoing
-            # ``start_offset`` here would DROP that queue: every batch then
-            # re-does the same fetches and emits nothing, forever.
+            # The ``not remaining_queue`` clause is defensive — echoing
+            # ``start_offset`` when a batch parked a non-empty queue without
+            # emitting a leaf would DROP that queue and re-do the same fetches
+            # forever. The depth-first drain only parks after the cap trips
+            # (which requires an emitted leaf), so a non-empty park implies
+            # emitted rows — but the clause keeps the invariant robust
+            # regardless of how the drain evolves.
             return iter([]), start_offset or {}
         records, out_offset = self._finalize_cursor_read(
             start_offset, end_offset, emitted, table_name, cursor_field
@@ -3757,12 +3747,6 @@ class ContainedNavMixin:
                 # frontier. Overshoot is bounded by the last page's leaf rows
                 # (plus, in nextlink mode, finishing an in-flight inline page).
                 break
-            if len(stack) > _MAX_PENDING_FETCHES:
-                # Safety valve: an extreme single-parent fan-out (or a
-                # nextlink server that page-limits without seek support, so
-                # depth-first still can't fully collapse) would otherwise grow
-                # the frontier unbounded. Park what we have and resume.
-                break
             frame = stack[-1]
             if frame["kind"] == "url":
                 stack.pop()
@@ -3917,14 +3901,15 @@ class ContainedNavMixin:
         queue exactly as the drainer does. No ``max_records`` cap and no
         cross-page accumulation: peak memory is one response's flattened
         cross-product (bounded by the ``page_size`` budget) plus the queue
-        of pending fetch descriptors (URLs + chains, not rows). Unlike the
-        drainer, the queue here has NO ``_MAX_PENDING_FETCHES`` ceiling —
-        the drainer's cap bounds what gets PARKED INTO THE OFFSET (a
-        checkpoint-size concern), while this queue never persists and its
+        of pending fetch descriptors (URLs + chains, not rows). This queue
+        is unbounded but never persists (no offset, no checkpoint) and its
         items are small descriptors; a server deferring every inner
         collection grows it to one descriptor per parent, modest even at
-        100k parents. Within each page rows flatten inline-first (parent
-        then children), matching ``_emit_leaf_row`` order; ACROSS pages this
+        100k parents. (The drainer, by contrast, walks depth-first, so its
+        live frontier — and the ``pending_fetches`` it parks into the
+        offset — stays O(path depth) regardless of fan-out.) Within each
+        page rows flatten inline-first (parent then children), matching
+        ``_emit_leaf_row`` order; ACROSS pages this
         reader is breadth-first (FIFO queue) whereas the capped drainer is
         depth-first, so cross-parent order differs between the two. That is
         immaterial here: the batch path is uncapped and never checkpoints, so
