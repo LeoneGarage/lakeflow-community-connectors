@@ -27,16 +27,44 @@ import time
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Iterator
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
 
+import requests
 from pyspark.sql.types import StructField
+from requests.utils import requote_uri
 
 from databricks.labs.community_connector.sources.odata._helpers import (
+    _as_exact_number,
+    parse_iso8601,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
+    cursor_le as _cursor_le,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
+    cursor_max as _cursor_max,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
+    cursor_newer as _cursor_newer,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
+    cursor_same_instant as _cursor_same_instant,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
+    cursor_same_rendering as _cursor_same_rendering,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
     max_or as _max_or,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
+    parse_max_records as _parse_max_records,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
     trim_to_distinct_cursor_boundary as _trim_to_distinct_cursor_boundary,
 )
-
+from databricks.labs.community_connector.sources.odata._helpers import (
+    url_origin as _url_origin,
+)
 
 _LOG = logging.getLogger(__name__)
 
@@ -62,6 +90,17 @@ MAX_CONTAINED_DEPTH = 10
 # ``@odata.nextLink`` chase at every level.
 MIN_DYNAMIC_TOP = 5
 
+# Soft ceiling on the expand work queue's length at park time. The
+# ``max_records_per_batch`` cap bounds EMITTED rows, not queue growth: every
+# flattened top row can append one URL-carrying work item per truncated
+# inner collection (~0.3–2KB each), so a wide top page over an
+# inner-paging server can otherwise park thousands of items — a multi-MB
+# ``pending_fetches`` offset persisted every microbatch. Once the queue
+# reaches this length the drainer parks early (clean boundary item for the
+# current page, then stop dequeuing); the parked queue drains across later
+# batches. Soft: one in-flight page can still overshoot by its own fan-out.
+_MAX_PENDING_FETCHES = 2000
+
 # Default ``page_size`` applied to **cursor-based** reads (cursor_field
 # or delta) when the user didn't set one, so a ``$top`` is still sent.
 # Snapshot reads deliberately omit ``$top`` entirely when ``page_size``
@@ -77,6 +116,28 @@ _TOP_PARAM_RE = re.compile(r"(?<=[?&])(\$top=|%24top=)\d+", re.IGNORECASE)
 # for a discriminating sample (>= 2 distinct leaf cursors) before giving up and
 # allowing the read (inconclusive). Bounds the preflight's request cost.
 _CURSOR_PROBE_PREFLIGHT_SCAN = 50
+
+# Instance-cache ``problem`` message stamped when a per-instance cursor_probe
+# verdict is rehydrated from the shared process/file cache as a definitive fail
+# (the original preflight message isn't cached across instances). Only surfaced
+# if a same-instance strict call reuses it — non-strict callers just fall back.
+_CURSOR_PROBE_SHARED_FAIL = (
+    "cursor_probe nested-$expand support was previously found unreliable on this "
+    "server (cached verdict); using the $batch / plain N+1 fallback."
+)
+
+
+class _CursorProbePreflightUnavailable(Exception):
+    """The cursor-probe preflight's enumeration or trusted-reference fetch
+    failed before reaching a verdict — indistinguishable from a transient,
+    so it must degrade a ``cursor_probe=auto`` read to the ``$batch``/plain
+    cascade (recording nothing) rather than escape as a raw HTTP error.
+
+    Raised ONLY around the preflight's HTTP fetches, so
+    ``_verify_cursor_probe_support`` can catch exactly this — a programming
+    error in the preflight's own logic still propagates instead of being
+    silently converted into permanent degradation."""
+
 
 # Max GET sub-requests packed into one OData ``$batch`` request by the
 # ``cursor_probe=batch`` / ``auto``-fallback hydrate. A hard cap — some Smart
@@ -95,12 +156,40 @@ _BATCH_MAX_OPS = 1000
 _BATCH_SHRINK_FACTOR = 0.75
 _BATCH_OVERFLOW_RETRIES = 10
 
+# Page budget for the ``expand_contained=auto`` preflight GET. Small on
+# purpose: ``compute_dynamic_tops`` floors every inner ``$expand`` level at
+# ``MIN_DYNAMIC_TOP`` (5) and the top-level ``$top`` is rewritten to 1, so the
+# probe response is one shallow subtree, not a real page.
+_EXPAND_PREFLIGHT_PAGE = "25"
+
 # HTTP statuses that say nothing definitive about a server's capabilities —
 # throttling and transient server-side failures. A capability preflight that
 # hits one records NO verdict (the read degrades for this batch only and the
 # next batch re-probes); only a definitive outcome (a working envelope, or a
 # hard rejection like 404/405) is cached and persisted as ``batch_ok``.
 _TRANSIENT_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+
+def _is_vanished_error(exc: requests.HTTPError) -> bool:
+    """Whether ``exc`` is a 404/410 — the entity addressed by the URL is
+    gone. On the partitioned walk that means a parent frozen into the task
+    descriptor at planning was deleted before this task walked it."""
+    status = getattr(exc.response, "status_code", None)
+    return status in (404, 410)
+
+
+def _log_vanished_parent(chain: list, exc: requests.HTTPError) -> None:
+    """One warning per skipped parent subtree. The next batch's re-plan
+    re-discovers the live parent set, so the skip is self-healing; rows of
+    the deleted parent already at the destination linger exactly as they
+    would on any non-delta path (no tombstones)."""
+    status = getattr(exc.response, "status_code", None)
+    _LOG.warning(
+        "partitioned read: parent chain %r vanished mid-batch (HTTP %s) — "
+        "skipping its subtree; the next batch re-discovers the live parent set.",
+        chain,
+        status,
+    )
 
 
 class _BatchTooManyParts(RuntimeError):
@@ -236,39 +325,162 @@ def join_url(base: str, suffix: str) -> str:
 
 
 def looks_like_iso8601(s: str) -> bool:
-    """Cheap ISO-8601 sniff used by ``odata_literal`` to render bare timestamps."""
+    """Cheap ISO-8601 sniff used by ``odata_literal`` to render bare timestamps.
+
+    Routed through :func:`parse_iso8601` so the verdict is identical on
+    every supported Python — a bare ``fromisoformat`` on 3.10 rejects
+    ``…00.5Z`` (1/2/4/5/7+ fractional digits), which would QUOTE a
+    fractional watermark in ``$filter`` and 400 every incremental batch."""
     if len(s) < 10 or s[4] != "-" or s[7] != "-":
         return False
     try:
-        datetime.fromisoformat(s.replace("Z", "+00:00"))
+        parse_iso8601(s)
         return True
     except ValueError:
         return False
 
 
+# URL-reserved characters percent-encoded inside GENERATED literal text
+# (row-data-derived values only — user-authored ``filter``/``select`` syntax
+# is never touched). ``requests`` does NOT encode these when sending an
+# already-assembled URL string (it only encodes spaces/non-ASCII, and it
+# preserves existing escapes, so pre-encoding here is safe and decodes
+# correctly server-side):
+#   * ``%`` first (so the escapes below aren't double-escaped);
+#   * ``+`` — form-decoding servers (ASP.NET, servlet stacks) read a raw
+#     query-string ``+`` as a SPACE: a non-UTC ISO watermark
+#     (``…T12:00:00+10:00``) becomes a malformed timestamp → 400 on every
+#     incremental batch; ``+`` inside a quoted seek boundary silently
+#     compares against the wrong value;
+#   * ``&`` — splits the query at the value;
+#   * ``#`` — truncates the whole request at the fragment;
+#   * ``?`` — starts the query string when the literal sits in a PATH
+#     segment (a key predicate ``Parent('A?B')``);
+#   * ``/`` — splits the PATH segment when the literal sits in a key
+#     predicate (``Parent('A/B')`` parses as two segments). ``%2F`` is the
+#     spec form inside quoted path literals; in a query string it decodes
+#     back to ``/`` server-side, so encoding it in both contexts is safe.
+_LITERAL_ESCAPES = (
+    ("%", "%25"),
+    ("+", "%2B"),
+    ("&", "%26"),
+    ("#", "%23"),
+    ("?", "%3F"),
+    ("/", "%2F"),
+)
+
+
+def _escape_literal_text(s: str) -> str:
+    """Percent-encode URL-reserved characters in generated literal text
+    (see :data:`_LITERAL_ESCAPES`)."""
+    for raw, enc in _LITERAL_ESCAPES:
+        s = s.replace(raw, enc)
+    return s
+
+
 def odata_literal(value: Any) -> str:
-    """Render a Python value as an OData v4 literal for $filter."""
+    """Render a Python value as an OData v4 literal for a generated
+    ``$filter`` / key predicate. The literal ends up interpolated into a
+    URL string, so URL-reserved characters inside the VALUE text are
+    percent-encoded (see :data:`_LITERAL_ESCAPES`); structural characters
+    (the surrounding single quotes) stay raw."""
     if isinstance(value, datetime):
-        return value.isoformat().replace("+00:00", "Z")
+        # Non-UTC offsets keep a ``+`` (only +00:00 normalizes to Z) —
+        # escape it so the wire form survives form-decoding servers.
+        return _escape_literal_text(value.isoformat().replace("+00:00", "Z"))
     if isinstance(value, date):
         return value.isoformat()
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, int | float | Decimal):
-        return str(value)
+        finite = (
+            value.is_finite()
+            if isinstance(value, Decimal)
+            else (isinstance(value, int) or math.isfinite(value))
+        )
+        if not finite:
+            # OData ABNF spells these ``NaN`` / ``INF`` / ``-INF``;
+            # Python's ``nan`` / ``inf`` / ``Decimal("Infinity")`` are
+            # not valid wire literals. (NaN check first — comparing a
+            # Decimal NaN with ``>`` raises InvalidOperation.)
+            nan = value.is_nan() if isinstance(value, Decimal) else math.isnan(value)
+            return "NaN" if nan else ("INF" if value > 0 else "-INF")
+        if isinstance(value, Decimal):
+            # OData's ``decimalValue`` ABNF has NO exponent form —
+            # ``str(Decimal("1.5E+7"))`` keeps the exponent and a strict
+            # server 400s. ``format(…, 'f')`` renders the exact value in
+            # plain positional notation.
+            return _escape_literal_text(format(value, "f"))
+        # ``str(1e20)`` renders ``1e+20`` — valid for Edm.Double, whose
+        # ABNF allows exponents, but the exponent's ``+`` must be escaped
+        # like any literal ``+`` (form-decoding servers read a raw
+        # query-string ``+`` as a space → malformed number → 400).
+        return _escape_literal_text(str(value))
     s = str(value)
     if looks_like_iso8601(s):
-        return s
-    return "'" + s.replace("'", "''") + "'"
+        return _escape_literal_text(s)
+    return "'" + _escape_literal_text(s.replace("'", "''")) + "'"
+
+
+# Edm types whose literals are BARE (unquoted) on the wire even though the
+# OData JSON payload delivers the value as a JSON string. ``Edm.Guid`` is the
+# big one — guid key predicates / seek boundaries are unquoted per the v4
+# ABNF, and strict stacks (Olingo, SAP) 400 on ``Set('<guid>')``. The numeric
+# types cover IEEE754Compatible servers that render Int64/Decimal as strings.
+_EDM_BARE_TYPES = frozenset(
+    {
+        "Edm.Guid",
+        "Edm.Boolean",
+        "Edm.Byte",
+        "Edm.SByte",
+        "Edm.Int16",
+        "Edm.Int32",
+        "Edm.Int64",
+        "Edm.Single",
+        "Edm.Double",
+        "Edm.Decimal",
+        "Edm.Date",
+        "Edm.DateTimeOffset",
+        "Edm.TimeOfDay",
+    }
+)
+
+
+def odata_literal_typed(value: Any, edm_type: str | None) -> str:
+    """:func:`odata_literal` with the property's declared Edm type steering
+    the quote decision for STRING values, instead of value sniffing.
+
+    The sniff in :func:`odata_literal` misfires in both directions on typed
+    columns: an ``Edm.Guid`` key arrives as a JSON string and gets QUOTED
+    (strict servers 400 the key predicate / keyset seek), while an
+    ``Edm.String`` key whose text happens to look ISO-8601 (``"2024-01-01"``)
+    gets rendered BARE (invalid predicate). When the caller knows the declared
+    type — key predicates and ``$orderby`` seek boundaries, where the CSDL is
+    already indexed — that type wins. Falls back to :func:`odata_literal` for
+    non-string values, unknown/missing types, and types with wrapped literal
+    forms this connector never generates (``Edm.Duration``, ``Edm.Binary``,
+    enums). Cursor-watermark filters (``_cursor_filter``) pass the declared
+    type too — watermarks round-trip through offsets as strings, so the
+    declared type is the only reliable quote signal; the sniff remains the
+    fallback when the CSDL lookup misses."""
+    if isinstance(value, str) and edm_type:
+        if edm_type in _EDM_BARE_TYPES:
+            return _escape_literal_text(value)
+        if edm_type == "Edm.String":
+            return "'" + _escape_literal_text(value.replace("'", "''")) + "'"
+    return odata_literal(value)
 
 
 # --- client-side pagination URL helpers -----------------------------------
 # These manipulate the connector's own generated URLs, where query options
-# (``$top``/``$filter``/``$orderby``/``$skip``) are stored raw (un-encoded),
-# one per ``&``-separated segment, and no generated value contains a literal
-# ``&``. So splitting on ``&`` and matching on a ``$name=`` prefix is safe —
-# the same convention ``rewrite_top_in_url`` relies on. requests url-encodes
-# the values when the request is actually sent. They live here (rather than in
+# (``$top``/``$filter``/``$orderby``/``$skip``) are stored one per
+# ``&``-separated segment. Generated values contain no literal ``&`` — any
+# ``&`` in row-derived literal text is percent-encoded at generation time by
+# ``odata_literal`` (see ``_LITERAL_ESCAPES``; requests only encodes
+# spaces/non-ASCII in an assembled URL, NOT reserved characters, so the
+# encoding must happen here) — which is what makes splitting on ``&`` and
+# matching on a ``$name=`` prefix safe, the same convention
+# ``rewrite_top_in_url`` relies on. They live here (rather than in
 # ``odata.py``) so both the flat pager (``_client_paginate_pages``) and the
 # inner-``$expand`` continuation builder can use them without an import cycle;
 # ``odata.py`` re-exports them for callers that still import from there.
@@ -309,6 +521,53 @@ def _pg_parse_top(url: str) -> int | None:
     return int(raw) if raw and raw.isdigit() else None
 
 
+def _pg_param_name(part: str) -> str:
+    """Normalized query-option name of one raw ``k=v`` query pair:
+    ``%24`` decoded to ``$`` and lowercased. Server-issued continuation
+    params use arbitrary casing (Microsoft stacks emit ``$skipToken``), so
+    name comparisons on foreign URLs must not be case-sensitive."""
+    name = part.split("=", 1)[0]
+    return name.replace("%24", "$").lower()
+
+
+_PG_POSITIONAL = ("$skiptoken", "$skip")
+
+
+def _pg_is_continuation(url: str) -> bool:
+    """Whether ``url`` carries a positional param (``$skiptoken`` or
+    ``$skip``, any casing/encoding) — i.e. it points mid-collection.
+    NOTE this matches the connector's OWN synthesized ``$skip``
+    continuations too, not just server-issued token links: the sole
+    consumer today (the ``$batch`` re-issue's ``$top`` injection guard)
+    wants exactly that — never append ``$top`` onto anything positioned
+    mid-walk (the §11.2.5.7 hazard) — but a future consumer needing
+    "server-issued token specifically" must test for ``$skiptoken``
+    alone. Case-insensitive: a camelCase ``$skipToken=`` continuation
+    must not be mistaken for a plain collection URL."""
+    _, _, query = url.partition("?")
+    return any(
+        _pg_param_name(part) in _PG_POSITIONAL for part in (query.split("&") if query else [])
+    )
+
+
+def _pg_strip_positional(url: str) -> str:
+    """Remove every offset/token positional param (``$skip`` /
+    ``$skiptoken``, any casing or ``%24`` encoding) from ``url``.
+
+    A keyset seek positions **absolutely** via its ``$filter``, so a
+    residual positional param would ALSO be applied by the server —
+    ``$skip=N`` riding a seek URL skips N rows INSIDE the seek window on
+    every seek page (silent, repeating loss). Reachable whenever the drain
+    re-enables keyset on an entry URL that came from offset paging: a
+    cap-resumed parked ``$skip`` checkpoint, or an inner-expand ``$skip``
+    continuation whose later boundary rows have non-null keys."""
+    head, _sep, query = url.partition("?")
+    if not query:
+        return url
+    kept = [p for p in query.split("&") if _pg_param_name(p) not in _PG_POSITIONAL]
+    return f"{head}?{'&'.join(kept)}" if kept else head
+
+
 def _pg_orderby_keys(url: str) -> list[str]:
     """Column names from the URL's ``$orderby``, in order. Returns ``[]``
     when there's no ``$orderby`` or any term is ``desc`` (a ``gt`` seek
@@ -317,7 +576,11 @@ def _pg_orderby_keys(url: str) -> list[str]:
     if not raw:
         return []
     keys = []
-    for term in raw.replace("%20", " ").split(","):
+    # ``+`` is a legal space encoding in query strings and server-issued
+    # continuation links may use it ("Id+asc") — without decoding it the
+    # desc guard misses and the "key" keeps its suffix, seeking on a
+    # nonexistent column (null boundary → $skip, or a server 400).
+    for term in raw.replace("%20", " ").replace("+", " ").split(","):
         term = term.strip()
         if term.endswith(" desc"):
             return []
@@ -325,14 +588,20 @@ def _pg_orderby_keys(url: str) -> list[str]:
     return [k for k in keys if k]
 
 
-def _pg_keyset_filter(order_keys: list[str], row: dict) -> str | None:
+def _pg_keyset_filter(
+    order_keys: list[str], row: dict, edm_types: dict[str, str] | None = None
+) -> str | None:
     """Build the ascending seek predicate placing the cursor strictly after
     ``row`` in ``order_keys`` order::
 
         (k1 gt v1) or (k1 eq v1 and k2 gt v2) or …
 
     Returns ``None`` if any key's value is null (no comparable boundary —
-    the caller falls back to ``$skip``)."""
+    the caller falls back to ``$skip``). ``edm_types`` (property → declared
+    Edm type, when the caller has the CSDL in reach) steers quoting via
+    :func:`odata_literal_typed` — a guid boundary must render BARE, an
+    ISO-looking string boundary must stay QUOTED."""
+    types = edm_types or {}
     vals = []
     for k in order_keys:
         v = row.get(k)
@@ -341,21 +610,36 @@ def _pg_keyset_filter(order_keys: list[str], row: dict) -> str | None:
         vals.append((k, v))
     clauses = []
     for i, (k, v) in enumerate(vals):
-        terms = [f"{vals[j][0]} eq {odata_literal(vals[j][1])}" for j in range(i)]
-        terms.append(f"{k} gt {odata_literal(v)}")
+        terms = [
+            f"{vals[j][0]} eq {odata_literal_typed(vals[j][1], types.get(vals[j][0]))}"
+            for j in range(i)
+        ]
+        terms.append(f"{k} gt {odata_literal_typed(v, types.get(k))}")
         clauses.append(" and ".join(terms))
     if len(clauses) == 1:
         return clauses[0]
     return " or ".join(f"({c})" for c in clauses)
 
 
+def _pg_get_filter(url: str) -> str | None:
+    """The URL's ``$filter`` value, matching the ``%24filter`` spelling a
+    server-issued continuation may carry (mirroring ``_pg_parse_top`` /
+    ``_pg_orderby_keys`` — the positional params already get this via
+    ``_pg_param_name``, but the filter readers matched only the literal
+    ``$``)."""
+    val = _pg_get_query(url, "$filter")
+    return val if val is not None else _pg_get_query(url, "%24filter")
+
+
 def _pg_with_extra_filter(url: str, clause: str) -> str:
     """AND ``clause`` into the URL's ``$filter`` (replacing any prior seek —
     the caller always rebuilds from the original base URL, so seeks never
-    accumulate)."""
-    existing = _pg_get_query(url, "$filter")
+    accumulate). A ``%24filter`` spelling is folded into the one ``$filter``
+    param (never left behind — two filter params make the server pick one
+    arbitrarily or 400)."""
+    existing = _pg_get_filter(url)
     combined = f"({existing}) and ({clause})" if existing else clause
-    return _pg_set_query(url, "$filter", combined)
+    return _pg_set_query(_pg_strip_query(url, "%24filter"), "$filter", combined)
 
 
 # Connector-private query option carrying the stable base ``$filter`` across
@@ -377,11 +661,13 @@ def _pg_strip_query(url: str, name: str) -> str:
 def _pg_base_filter(url: str) -> str | None:
     """The stable base ``$filter`` for a keyset walk: the stashed ``__pgbase``
     if present (a resumed walk), else the URL's current ``$filter`` (the first
-    page, before any seek). An empty ``__pgbase`` marker means 'no base'."""
+    page, before any seek — matched in both the ``$`` and ``%24`` spellings,
+    see :func:`_pg_get_filter`). An empty ``__pgbase`` marker means 'no
+    base'."""
     marker = _pg_get_query(url, _PG_BASE)
     if marker is not None:
         return marker or None
-    return _pg_get_query(url, "$filter")
+    return _pg_get_filter(url)
 
 
 def _pg_keyset_seek_url(url: str, base_filter: str | None, seek: str) -> str:
@@ -394,9 +680,19 @@ def _pg_keyset_seek_url(url: str, base_filter: str | None, seek: str) -> str:
     batch — otherwise the ``$filter`` grows one keyset clause per batch and
     eventually overflows the server's URL-length limit. The seeks are
     monotonic so the accumulated form is merely redundant, never wrong, but it
-    is unbounded. ``__pgbase`` is stripped before the request is sent."""
+    is unbounded. ``__pgbase`` is stripped before the request is sent.
+
+    Any positional param on the entry URL (``$skip`` from a resumed parked
+    checkpoint or an inner-expand continuation, a stray ``$skiptoken``) is
+    stripped: the seek is absolute, and a retained ``$skip=N`` would skip N
+    rows inside the seek window on every seek page — see
+    :func:`_pg_strip_positional`."""
     combined = f"({base_filter}) and ({seek})" if base_filter else seek
-    out = _pg_set_query(url, "$filter", combined)
+    # Strip an encoded ``%24filter`` spelling before setting ``$filter`` so a
+    # server-issued continuation resumed into this walk never ends up with
+    # two filter params (the base was already recovered via _pg_get_filter).
+    cleaned = _pg_strip_query(_pg_strip_positional(url), "%24filter")
+    out = _pg_set_query(cleaned, "$filter", combined)
     return _pg_set_query(out, _PG_BASE, base_filter or "")
 
 
@@ -406,8 +702,156 @@ def _pg_page_fingerprint(page_rows: list[dict]) -> int:
     a single walk — and costs one page's worth of work. Two consecutive
     non-empty pages with the same fingerprint mean the server returned the
     same data twice (it ignored our seek/``$skip`` or handed back a cyclic
-    ``@odata.nextLink``), so the walk has stalled."""
+    ``@odata.nextLink``), so the walk has stalled. Callers pass the RAW
+    payload items (``@odata.*`` annotations included): with a
+    low-cardinality ``$select``, two distinct consecutive pages can be
+    identical after the annotation strip, and per-entity annotations
+    (id/etag) are what disambiguate them."""
     return hash(repr(page_rows))
+
+
+# Sentinel distinguishing "walk has no ancestor cursor" (leaf-cursor / $batch
+# walks) from "ancestor cursor is None" (the ancestor-cursor walk, where a
+# null stamped cursor is a real value the ordering must carry).
+_NO_ANCESTOR_CURSOR = object()
+
+
+def _chain_resume_key(
+    chain: list[dict],
+    ancestor_cursor: Any = _NO_ANCESTOR_CURSOR,
+    cursor_level: int = 0,
+) -> list:
+    """Client-side ordering key for one ancestor key chain, mirroring the
+    chain enumerations' server-side ordering. The enumeration is NESTED —
+    each level orders within its parent (PK asc; the cursor level prefixes
+    ``cursor asc`` WITHIN that level, see ``_iter_parent_chains_with_cursor``)
+    — so the ancestor-cursor walk's cursor term is inserted at its LEVEL's
+    position, never globally first: a globally-first cursor misorders every
+    ``cursor_level >= 1`` path (a chain under a later top-level parent with
+    a lower cursor would sort "before" the park and be skipped unwalked —
+    permanent subtree loss on a completely stable source). Values stay RAW
+    (the server's rendered text); all ordering happens in
+    :func:`_chain_strictly_before` via the chronological comparators.
+
+    MUST return a ``list`` (not a tuple): this key is parked in the resume
+    offset and JSON round-trips to a list, so the resume-skip equality
+    (``chain == parked_chain``) only holds if the freshly-built key is also a
+    list. A tuple would silently defeat the skip (harmless — the walk just
+    reprocesses the parked boundary, duplicate-safe — but slower)."""
+    key: list = []
+    for idx, level_keys in enumerate(chain):
+        if ancestor_cursor is not _NO_ANCESTOR_CURSOR and idx == cursor_level:
+            key.append(ancestor_cursor)
+        key.extend(level_keys.values())
+    if ancestor_cursor is not _NO_ANCESTOR_CURSOR and cursor_level >= len(chain):
+        key.append(ancestor_cursor)
+    return key
+
+
+def _order_reproducible(a: Any, b: Any) -> bool:
+    """Whether the client can reproduce the server's relative ORDER for a
+    differing pair of enumeration-key elements. JSON numbers order
+    numerically on every server; ISO-rendered instants order chronologically
+    under every collation; and a real number paired with a numeric string
+    proves the property is numeric (a rendering flip), so the exact-Decimal
+    bridge holds. Anything else — plain text, GUID strings, digits-only
+    ``Edm.String`` values — is ordered by the SERVER's collation
+    (case-insensitive SQL Server defaults, ``uniqueidentifier`` byte-group
+    order, ICU locales…), which Python's ordinal comparison cannot
+    reproduce: trusting it turns "not yet walked" into "already walked" and
+    silently drops whole subtrees at a park boundary."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return False
+    a_num = isinstance(a, (int, float))
+    b_num = isinstance(b, (int, float))
+    if a_num and b_num:
+        return True
+    if (a_num or b_num) and _as_exact_number(a) is not None and _as_exact_number(b) is not None:
+        return True
+
+    def _chrono(v: Any) -> bool:
+        return isinstance(v, datetime) or (isinstance(v, str) and looks_like_iso8601(v))
+
+    return _chrono(a) and _chrono(b)
+
+
+def _chain_seek_order(key_a: list, key_b: list) -> str:
+    """Collation-honest three-way order of enumeration position ``key_a``
+    vs ``key_b`` (both from :func:`_chain_resume_key`, raw values):
+    ``"before"`` / ``"after"`` only when the first differing element's order
+    is provable client-side (:func:`_order_reproducible`), else
+    ``"unknown"`` — the seek loops keep seeking on their identity anchor
+    for unknowns instead of guessing (see the call sites)."""
+    try:
+        for a, b in zip(key_a, key_b):
+            # Same-RENDERING equality (raw, chronological-key, or a
+            # number/numeric-string type flip) — two renderings of an
+            # EQUAL element must fall through to the next element, not
+            # decide the order. Deliberately NOT cursor_same_instant:
+            # its numeric branch calls two numeric STRINGS with different
+            # text ("007" vs "7") equal, which conflates two DISTINCT
+            # parents into one position and lets a later element decide
+            # order ACROSS parents — a false "before" skips an unwalked
+            # subtree past the vanished-anchor reset (silent loss).
+            if _cursor_same_rendering(a, b):
+                continue
+            if not _order_reproducible(a, b):
+                return "unknown"
+            # First differing element decides: a sorts before b iff b is
+            # strictly newer/greater. cursor_newer is a strict total order
+            # over comparable values, so this is well-defined.
+            return "before" if _cursor_newer(b, a) else "after"
+        if len(key_a) < len(key_b):
+            return "before"
+        return "after"
+    except TypeError:
+        return "unknown"
+
+
+def _expand_resume_start(page_rows: list, boundary: list | None, skip: int, order_key) -> tuple:
+    """Resume position for a re-fetched parked expand page: identity-anchor
+    on the parked row itself (``order_key(row) == boundary``) and resume
+    right after it — exact for EVERY key type with zero reliance on
+    reproducing the server's collation client-side. Returns
+    ``(start_idx, boundary)``: the anchor consumes the boundary (``None``);
+    an anchor row that's gone (deleted / churned out of the page) keeps the
+    boundary so the caller's per-row PROVABLE-order skip takes over
+    (duplicate-safe). ``skip`` is the legacy positional fallback used only
+    when no boundary was parked at all."""
+    if boundary is None:
+        return skip, None
+    for anchor_idx, anchor_row in enumerate(page_rows):
+        if order_key(anchor_row) == boundary:
+            return anchor_idx + 1, None
+    return 0, boundary
+
+
+def _chain_strictly_before(key_a: list, key_b: list) -> bool:
+    """Whether enumeration position ``key_a`` PROVABLY sorts strictly before
+    ``key_b`` (both from :func:`_chain_resume_key`, raw values).
+
+    This drives the "already walked in a prior capped batch" skip. The
+    positional (index-based) skip it replaces silently desynchronizes
+    under parent-set churn between batches — a deleted parent shifts
+    every successor left one slot, so the resume skips an unwalked
+    parent forever; an insert shifts right, so a parked mid-collection
+    continuation link gets applied to the WRONG parent (its rows then
+    FK-tagged with that parent's keys). Comparing by the enumeration's
+    own ordering keys is churn-stable.
+
+    Elements compare via :func:`cursor_newer` — chronological for
+    ISO-rendered values INCLUDING the padded-fraction sub-microsecond
+    tie-break. A µs-truncating comparison here re-opens the round-18 tie
+    class one layer up: two 100ns-distinct cursors (SQL Server
+    ``datetime2(7)``) tie, the seek loop stops one chain early, the
+    parked continuation is silently dropped, and the walk re-parks a
+    byte-identical offset — a permanently failing (no-progress) or
+    silently starved stream. Pairs whose order isn't provable client-side
+    (cross-type values after a metadata change, or plain-text/GUID keys
+    the SERVER orders by ITS collation — see :func:`_order_reproducible`)
+    return ``False`` — the chain is NOT skipped, degrading to a
+    duplicate-safe re-read instead of a silent skip."""
+    return _chain_seek_order(key_a, key_b) == "before"
 
 
 # Re-export of the EDM namespace prefix used by the main module.
@@ -555,6 +999,30 @@ def fk_column_name(segment: str, pk_name: str) -> str:
     return f"{segment}_{pk_name}"
 
 
+def validate_page_size(opts: dict) -> None:
+    """Reject a non-positive / non-numeric ``page_size`` with a curated error.
+
+    ``$top=0`` is the nasty case: it's a perfectly valid URL the server
+    answers with an empty page, which the client-driven drain reads as
+    exhaustion — every read of the table would silently emit zero rows. A
+    non-numeric value would ride into the URL raw and surface only as a
+    confusing server 400. Every other numeric table option raises a curated
+    error on garbage; ``page_size`` shouldn't be the silent one. Called from
+    ``read_table`` and the partition entry points (``is_partitioned`` /
+    ``get_partitions``), which don't route through ``read_table``."""
+    raw = opts.get("page_size")
+    if raw is None:
+        return
+    text = str(raw).strip()
+    if not text.isdigit() or int(text) < 1:
+        raise ValueError(
+            f"page_size={raw!r} is not a positive integer. page_size sets "
+            f"the per-request $top; use a value >= 1, or unset it for the "
+            f"default (1000 — or, under pagination=nextlink, no $top at "
+            f"all on snapshot reads)."
+        )
+
+
 def _ancestor_pk_order_by(ancestor_pks: list[str]) -> str:
     """Build a stable PK-only ``$orderby`` clause for ancestor key
     enumeration. OData v4 §11.2.5.7 (server-driven paging) doesn't
@@ -591,7 +1059,16 @@ class ContainedNavMixin:
         break cycles via target-type set."""
         try:
             root_et = self._flat_entity_type_for(top_level_set, namespace)
-        except ValueError:
+        except ValueError as exc:
+            # The flat set still lists (its own read fails loudly), but its
+            # contained children can't be enumerated — say so instead of
+            # silently listing it childless.
+            _LOG.warning(
+                "Cannot enumerate contained paths under %r: %s. The set is "
+                "listed without contained children.",
+                top_level_set,
+                exc,
+            )
             return []
         paths: list[str] = []
         # Cycle detection: start with an empty ``seen`` so the very first
@@ -606,6 +1083,23 @@ class ContainedNavMixin:
             for nav_name, target_ref in self._all_contained_nav_props(et):
                 if target_ref in seen:
                     continue
+                if CONTAINED_PATH_SEP in nav_name:
+                    # A nav property whose NAME contains the path separator
+                    # ("My__Kids" — CSDL SimpleIdentifiers legally allow
+                    # consecutive underscores) would list as a table name
+                    # the read path's ``__``-splitting can never resolve
+                    # back (declared-flat-set longest-prefix matching covers
+                    # entity SETS only, not nav-prop names). Emitting it
+                    # breaks the discovery→read round trip: skip with a
+                    # warning instead of listing an unreadable table.
+                    _LOG.warning(
+                        "Skipping contained collection %r under %r: navigation-"
+                        "property names containing '__' cannot be addressed by "
+                        "this connector's path syntax.",
+                        nav_name,
+                        CONTAINED_PATH_SEP.join(segments),
+                    )
+                    continue
                 target_et = self._resolve_type_ref(target_ref)
                 if target_et is None:
                     continue
@@ -616,12 +1110,37 @@ class ContainedNavMixin:
 
     # --- option parsing ----------------------------------------------------
 
+    def _expand_contained_mode(self, table_options: dict[str, str] | None) -> str:
+        """Parse the ``expand_contained`` table option: ``true``, ``false``,
+        or ``auto`` (**default** when unset).
+
+        ``auto`` attempts the nested-``$expand`` read first: a one-shot
+        behavioural preflight (:meth:`_verify_expand_support`) issues the real
+        expand URL — with the same inner ``$top``/``$orderby``/``$filter``
+        constructs the read would send — and verifies the server actually
+        returns inline child collections (cross-checked against direct
+        navigation, so a server that accepts the URL but silently ignores
+        ``$expand`` is caught). ONLY a conclusive pass runs the expand read;
+        anything else — a definitive failure, a transient blip, or an
+        inconclusive sample — **falls back** to the N+1 walks
+        (``expand_contained=false``) for that batch, never raising on a
+        capability shortfall and never assuming ``$expand`` works before the
+        verdict is in. The verdict persists in the resume offset as
+        ``expand_ok`` (mirrors ``batch_ok``); any non-``auto`` value scrubs
+        it so re-selecting ``auto`` re-runs the preflight."""
+        raw = ((table_options or {}).get("expand_contained") or "auto").strip().lower()
+        if raw not in {"true", "false", "auto"}:
+            raise ValueError(
+                f"Invalid expand_contained={raw!r}. Expected one of: true, false, auto."
+            )
+        return raw
+
     def _expand_contained_active(self, table_options: dict[str, str] | None) -> bool:
-        """Parse the boolean ``expand_contained`` table option."""
-        raw = ((table_options or {}).get("expand_contained") or "false").strip().lower()
-        if raw not in {"true", "false"}:
-            raise ValueError(f"Invalid expand_contained={raw!r}. Expected one of: true, false.")
-        return raw == "true"
+        """``True`` only for an explicit ``expand_contained=true`` (the strict
+        opt-in). ``auto`` returns ``False`` here — validation gates that key on
+        this (e.g. the ``cursor_probe`` conflict check) must not fire for
+        ``auto``, whose expand attempt silently degrades instead."""
+        return self._expand_contained_mode(table_options) == "true"
 
     def _cursor_probe_mode(self, table_options: dict[str, str] | None) -> str:
         """Parse the ``cursor_probe`` table option into a leaf-cursor read
@@ -746,23 +1265,69 @@ class ContainedNavMixin:
 
     # --- URL construction --------------------------------------------------
 
-    def _format_key_predicate(self, pk_values: dict[str, Any]) -> str:
-        """``(value)`` for single key; ``(K1=v1,K2=v2)`` for composite."""
+    def _format_key_predicate(
+        self, pk_values: dict[str, Any], edm_types: dict[str, str] | None = None
+    ) -> str:
+        """``(value)`` for single key; ``(K1=v1,K2=v2)`` for composite.
+        ``edm_types`` (the level's declared property types) steers quoting —
+        a guid key renders BARE, an ISO-looking string key stays QUOTED."""
+        types = edm_types or {}
         if len(pk_values) == 1:
-            return f"({odata_literal(next(iter(pk_values.values())))})"
-        return "(" + ",".join(f"{k}={odata_literal(v)}" for k, v in pk_values.items()) + ")"
+            ((k, v),) = pk_values.items()
+            return f"({odata_literal_typed(v, types.get(k))})"
+        return (
+            "("
+            + ",".join(f"{k}={odata_literal_typed(v, types.get(k))}" for k, v in pk_values.items())
+            + ")"
+        )
 
-    def _build_contained_path(self, segments: list[str], key_chain: list[dict[str, Any]]) -> str:
-        """``A(1)/B('x')/C`` — leaf segment has no key; ``key_chain`` len = N-1."""
+    def _edm_types_for_level(
+        self, segments: list[str], level: int, namespace: str | None
+    ) -> dict[str, str]:
+        """Best-effort property-type map for the collection at
+        ``segments[level]``. Resolution failure (e.g. an entity-set name
+        ambiguous across namespaces when the caller has no ``namespace`` in
+        scope) degrades to ``{}`` — sniff-based literal rendering — rather
+        than failing a URL build that worked untyped for years. The failure
+        outcome is memoized per (path, namespace): this runs once per URL
+        build (per parent chain on an N+1 walk), and re-raising +
+        re-formatting ``_entity_type_for``'s sorted "Available: …" error
+        100k times per cycle is pure waste (success is already memoized
+        inside ``_entity_type_for``/``_edm_types_for_et``)."""
+        path = CONTAINED_PATH_SEP.join(segments[: level + 1])
+        failed = self.__dict__.setdefault("_edm_types_unresolvable", set())
+        if (path, namespace) in failed:
+            return {}
+        try:
+            return self._edm_types_for_et(self._entity_type_for(path, namespace))
+        except Exception:  # noqa: BLE001 — metadata gaps must not break URL builds
+            failed.add((path, namespace))
+            return {}
+
+    def _build_contained_path(
+        self,
+        segments: list[str],
+        key_chain: list[dict[str, Any]],
+        namespace: str | None = None,
+    ) -> str:
+        """``A(1)/B('x')/C`` — leaf segment has no key; ``key_chain`` len = N-1.
+        Key values render TYPED per level (guid bare / string quoted); the
+        type lookup is best-effort, so callers without a ``namespace`` in
+        scope still work (sniff-rendered) on ambiguous multi-namespace
+        services."""
         if len(key_chain) != len(segments) - 1:
             raise ValueError(
                 f"key_chain length {len(key_chain)} does not match "
                 f"non-leaf segment count {len(segments) - 1}"
             )
-        return _URL_SEGMENT_SEP.join(
-            f"{seg}{self._format_key_predicate(key_chain[i])}" if i < len(key_chain) else seg
-            for i, seg in enumerate(segments)
-        )
+
+        def _render(i: int, seg: str) -> str:
+            if i >= len(key_chain):
+                return seg
+            types = self._edm_types_for_level(segments, i, namespace)
+            return f"{seg}{self._format_key_predicate(key_chain[i], types)}"
+
+        return _URL_SEGMENT_SEP.join(_render(i, seg) for i, seg in enumerate(segments))
 
     # pylint: disable=too-many-arguments,too-many-positional-arguments
     def _build_contained_url(
@@ -774,7 +1339,10 @@ class ContainedNavMixin:
         order_by: str | None = None,
     ) -> str:
         """Full URL for a contained-collection read at one parent tuple."""
-        base = join_url(self.service_url, self._build_contained_path(segments, key_chain))
+        base = join_url(
+            self.service_url,
+            self._build_contained_path(segments, key_chain, table_options.get("namespace")),
+        )
         return f"{base}?{self._format_query_params(table_options, extra_filter, order_by)}"
 
     # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -909,13 +1477,21 @@ class ContainedNavMixin:
         namespace = (table_options or {}).get("namespace")
         opts = table_options or {}
         has_children = start_level < len(segments) - 1
-        # The table's ``filter`` option is the leaf filter — same as N+1
-        # mode, where it lands at the leaf URL — so strip it from the
-        # start-level query params when there are deeper levels. It re-enters
-        # at the innermost ``$expand(...)`` clause below. Without this split,
-        # ``filter="Id eq 3"`` on a ``Instances__Projects`` table would land
-        # at Instances (wrong segment) and 400 the server.
-        top_opts = {k: v for k, v in opts.items() if k != "filter"} if has_children else dict(opts)
+        # The table's ``filter`` and ``select`` options are LEAF-scoped —
+        # same as N+1 mode, where they land at the leaf URL, and same as the
+        # schema derivation / option validation, which resolve them against
+        # the leaf entity type — so strip both from the start-level query
+        # params when there are deeper levels. They re-enter at the innermost
+        # ``$expand(...)`` clause below. Without this split, ``filter="Id eq
+        # 3"`` (or ``select="Id,Label"``) on a ``Instances__Projects`` table
+        # would land at Instances (wrong segment): a leaf-only column 400s
+        # the server, and a name shared across levels silently projects the
+        # TOP entity while the leaf comes back unprojected.
+        top_opts = (
+            {k: v for k, v in opts.items() if k not in ("filter", "select")}
+            if has_children
+            else dict(opts)
+        )
         if per_level_tops is not None:
             # Override page_size in the opts dict ``_format_query_params``
             # reads from, so the start-level ``$top`` reflects the dynamic
@@ -936,6 +1512,7 @@ class ContainedNavMixin:
         if not has_children:
             return f"{base}?{query}"
         user_leaf_filter = opts.get("filter")
+        user_leaf_select = opts.get("select")
         inner = ""
         for i in range(len(segments) - 1, start_level, -1):
             is_leaf = i == len(segments) - 1
@@ -948,8 +1525,17 @@ class ContainedNavMixin:
                 segment_filters.get(i),
                 user_leaf_filter if is_leaf else None,
             )
-            if cursor_level == i and cursor_select:
-                parts.append(f"$select={cursor_select}")
+            level_select = cursor_select if cursor_level == i and cursor_select else None
+            if is_leaf and user_leaf_select:
+                # Leaf-scoped user projection, merged (deduped, user order
+                # first) with any cursor projection targeting the same level.
+                merged = [c.strip() for c in user_leaf_select.split(",") if c.strip()]
+                for col in (level_select or "").split(","):
+                    if col.strip() and col.strip() not in merged:
+                        merged.append(col.strip())
+                level_select = ",".join(merged)
+            if level_select:
+                parts.append(f"$select={level_select}")
             if level_filter:
                 parts.append(f"$filter={level_filter}")
             level_order = self._expand_level_order_by(
@@ -992,8 +1578,8 @@ class ContainedNavMixin:
 
     def _resolve_fk_columns(
         self, segments: list[str], namespace: str | None
-    ) -> dict[tuple[str, str], str]:
-        """Map ``(segment, pk_name) → unique FK column name`` for every
+    ) -> dict[tuple[int, str], str]:
+        """Map ``(level_index, pk_name) → unique FK column name`` for every
         non-leaf ancestor.
 
         OData v4 §13.4.3 makes contained-entity keys unique only within
@@ -1001,6 +1587,13 @@ class ContainedNavMixin:
         the full ancestor chain to be globally unique. Default name is
         ``<segment>_<pk>``; collisions get a leading ``_`` until unique.
         Empty mapping for flat tables.
+
+        Keyed by the segment's **index**, not its name: a recursive
+        containment path can repeat a nav-prop name at two non-leaf
+        levels (``Folders__Children__Children__Files``), and a
+        name-keyed map would collapse both levels into one entry —
+        losing a composite-key component (silent MERGE collisions) and
+        duplicating the surviving column in the schema.
 
         FK columns named in the ``exclude_ancestor_columns`` table option
         (parsed onto ``self._excluded_ancestor_columns`` at each entry
@@ -1034,7 +1627,7 @@ class ContainedNavMixin:
                     candidate = fk_column_name(seg, pk)
                     while candidate in used:
                         candidate = "_" + candidate
-                    resolved[(seg, pk)] = candidate
+                    resolved[(idx, pk)] = candidate
                     used.add(candidate)
             state.fk_columns[cache_key] = resolved
         excluded = getattr(self, "_excluded_ancestor_columns", frozenset())
@@ -1049,16 +1642,34 @@ class ContainedNavMixin:
         row: dict,
         segments: list[str],
         chain: list[dict[str, Any]],
-        fk_columns: dict[tuple[str, str], str],
+        fk_columns: dict[tuple[int, str], str],
     ) -> None:
         """Write every ancestor's primary-key values onto ``row`` under
-        the resolved FK column names from ``fk_columns``."""
+        the resolved FK column names from ``fk_columns`` (keyed by level
+        index, so repeated nav-prop names at different depths stay
+        distinct columns)."""
         for idx, ancestor_keys in enumerate(chain):
-            seg = segments[idx]
             for pk_name, pk_val in ancestor_keys.items():
-                col = fk_columns.get((seg, pk_name))
-                if col is not None:
-                    row[col] = pk_val
+                col = fk_columns.get((idx, pk_name))
+                if col is None:
+                    continue
+                if pk_val is None:
+                    # A parent entity omitted or nulled its own primary key
+                    # (non-conformant — OData keys are never null). Stamping
+                    # ``None`` onto the non-nullable FK column would send a
+                    # null MERGE key into ``apply_changes`` — the same silent
+                    # null-key row the leaf-PK ``never_pad`` guard rejects
+                    # loudly. Fail here rather than emit it (or build a
+                    # malformed ``Parent('None')/child`` continuation URL).
+                    raise ValueError(
+                        f"Ancestor entity at path level {idx} is missing its key "
+                        f"{pk_name!r} (got null); cannot form foreign-key column "
+                        f"{col!r}. A parent omitted/nulled its primary key (a "
+                        f"non-conformant response) — its child rows would carry a "
+                        f"null MERGE key. Fix the source response, or exclude this "
+                        f"path."
+                    )
+                row[col] = pk_val
 
     def _find_cursor_level(
         self,
@@ -1082,7 +1693,7 @@ class ContainedNavMixin:
         ancestor of a contained path; ``None`` when the leaf owns it or
         the path is flat. Used by ``get_table_schema`` to add the column
         to the leaf schema."""
-        segments = parse_contained_path(table_name) or [table_name]
+        segments = self._table_segments(table_name) or [table_name]
         if len(segments) < 2:
             return None
         cursor_level = self._find_cursor_level(segments, namespace, cursor_field)
@@ -1105,6 +1716,7 @@ class ContainedNavMixin:
         cursor_field: str,
         since: Any,
         top_parent_rows: list[dict] | None = None,
+        tolerate_vanished: bool = False,
     ) -> Iterator[tuple[list[dict[str, Any]], Any]]:
         """Like ``_iter_parent_key_chains`` but applies a cursor filter at
         the ancestor that owns ``cursor_field``. Yields
@@ -1116,7 +1728,11 @@ class ContainedNavMixin:
         fetching the whole top-level set. Each row dict must carry the
         top-level entity's PKs (and, when ``cursor_level == 0``, the
         cursor value). The supplied subset is consumed in order without
-        re-fetching."""
+        re-fetching.
+
+        ``tolerate_vanished`` (partitioned callers): skip-with-warning a
+        parent whose sub-level fetch 404/410s — see
+        :meth:`_iter_parent_key_chains`."""
         segment_filters = resolve_segment_filters(table_options, segments)
 
         def _walk(level: int, chain: list[dict[str, Any]], cur_val: Any):
@@ -1149,7 +1765,11 @@ class ContainedNavMixin:
                 if level == cursor_level:
                     if cursor_field not in select_cols:
                         select_cols.append(cursor_field)
-                    extra_filter = self._cursor_filter(cursor_field, since)
+                    extra_filter = self._cursor_filter(
+                        cursor_field,
+                        since,
+                        edm_type=self._edm_types_for_et(ancestor_et).get(cursor_field),
+                    )
                     terms = [f"{cursor_field} asc"]
                     terms.extend(f"{pk} asc" for pk in ancestor_pks if pk != cursor_field)
                     order_by = ",".join(terms)
@@ -1172,12 +1792,18 @@ class ContainedNavMixin:
                         order_by=order_by,
                     )
                 )
-                row_source = self._fetch_pages(url)
+                row_source = self._fetch_pages(url, self._edm_types_for_et(ancestor_et))
             for row in row_source:
                 next_cur = row.get(cursor_field) if level == cursor_level else cur_val
                 chain.append({pk: row.get(pk) for pk in ancestor_pks})
-                yield from _walk(level + 1, chain, next_cur)
-                chain.pop()
+                try:
+                    yield from _walk(level + 1, chain, next_cur)
+                except requests.HTTPError as exc:
+                    if not (tolerate_vanished and _is_vanished_error(exc)):
+                        raise
+                    _log_vanished_parent(chain, exc)
+                finally:
+                    chain.pop()
 
         yield from _walk(0, [], None)
 
@@ -1187,6 +1813,7 @@ class ContainedNavMixin:
         namespace: str | None,
         table_options: dict[str, str] | None,
         top_parent_rows: list[dict] | None = None,
+        tolerate_vanished: bool = False,
     ) -> Iterator[list[dict[str, Any]]]:
         """Yield every ancestor key chain (len = len(segments) - 1) reaching
         the leaf. Each level fetched with ``$select=<pks>``; user ``filter``
@@ -1195,7 +1822,15 @@ class ContainedNavMixin:
 
         ``top_parent_rows`` lets a partitioned caller supply a pre-
         discovered subset of level-0 rows; when provided, the level-0
-        HTTP fetch is skipped and the rows are consumed in order."""
+        HTTP fetch is skipped and the rows are consumed in order.
+
+        ``tolerate_vanished``: a parent whose sub-level fetch 404/410s is
+        skipped with a warning instead of failing the walk. ONLY the
+        partitioned path sets this — its parent set is frozen into the
+        task descriptor at planning, so a parent deleted mid-batch would
+        otherwise fail every Spark task retry deterministically (the
+        serial walks re-enumerate parents each trigger and self-heal
+        without it)."""
         segment_filters = resolve_segment_filters(table_options, segments)
 
         def _walk(level: int, chain: list[dict[str, Any]]):
@@ -1237,11 +1872,17 @@ class ContainedNavMixin:
                     if level == 0
                     else self._build_contained_url(sub_segments, chain, opts, order_by=order_by)
                 )
-                row_source = self._fetch_pages(url)
+                row_source = self._fetch_pages(url, self._edm_types_for_et(ancestor_et))
             for row in row_source:
                 chain.append({pk: row.get(pk) for pk in ancestor_pks})
-                yield from _walk(level + 1, chain)
-                chain.pop()
+                try:
+                    yield from _walk(level + 1, chain)
+                except requests.HTTPError as exc:
+                    if not (tolerate_vanished and _is_vanished_error(exc)):
+                        raise
+                    _log_vanished_parent(chain, exc)
+                finally:
+                    chain.pop()
 
         yield from _walk(0, [])
 
@@ -1303,7 +1944,10 @@ class ContainedNavMixin:
         if order_by:
             outer.append(f"$orderby={order_by}")
         outer.append(f"$expand={leaf_nav}({';'.join(inner)})")
-        base = join_url(self.service_url, self._build_contained_path(parent_segments, parent_chain))
+        base = join_url(
+            self.service_url,
+            self._build_contained_path(parent_segments, parent_chain, namespace),
+        )
         return f"{base}?{'&'.join(outer)}"
 
     def _iter_dirty_leaf_parent_chains(
@@ -1322,35 +1966,44 @@ class ContainedNavMixin:
         read: it enumerates leaf-grandparent tuples the same way, then runs
         one :meth:`_build_probe_url` per tuple and emits the leaf-parent key
         (extending the chain) only for parents the probe flags dirty. Like
-        the plain enumerator it is consumed lazily and is deterministic for
-        a fixed ``since``, so the leaf-cursor walk's flat ``parent_idx``
-        resume works unchanged — a resumed batch re-probes the skipped
-        parents (cheap; no leaf fetches) exactly as the plain walk re-pages
-        skipped ancestors.
+        the plain enumerator it is consumed lazily and — LOAD-BEARING — it
+        yields chains in **PK order at every level**: grandparents via
+        ``_iter_parent_key_chains``' PK ``$orderby``, leaf-parents via the
+        probe URL's own outer ``$orderby=<pks> asc``
+        (:meth:`_build_probe_url`). The capped walk's key-based resume
+        (``parent_keys``, :func:`_chain_strictly_before`) skips
+        "already-walked" chains by exactly that ordering; dropping either
+        ``$orderby`` would silently skip dirty parents that enumerate after
+        a park. A resumed batch re-probes the skipped parents (cheap; no
+        leaf fetches) exactly as the plain walk re-pages skipped ancestors.
 
         ``since`` is ``None`` on the first batch → every leaf-parent with any
         leaf reads as dirty, so the first incremental batch behaves like the
         standard full walk (correct, no speed-up until a watermark exists)."""
         parent_segments = segments[:-1]
         leaf_nav = segments[-1]
-        lp_pks = self._own_primary_keys_for_et(
-            self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
-        )
+        lp_et = self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
+        lp_pks = self._own_primary_keys_for_et(lp_et)
+        lp_types = self._edm_types_for_et(lp_et)
         for pchain in self._iter_parent_key_chains(parent_segments, namespace, table_options):
             url = self._build_probe_url(segments, pchain, table_options, cursor_field)
-            for row in self._fetch_pages(url):
+            for row in self._fetch_pages(url, lp_types):
                 # The probe returns the newest leaf (``$orderby cursor desc;
                 # $top=1``). Max over the returned rows so we're still correct
                 # if a server ignores ``$top`` and hands back several. Dirty
                 # when that max cursor exceeds the watermark (or on the first
                 # batch, ``since is None``, whenever the leaf-parent has a
                 # leaf at all) — this matches the hydrate's ``cursor gt since``.
+                # Chronological comparisons (``_cursor_newer``): a lexical
+                # ``>`` against a value-dependently-fractional rendering
+                # (``…00.5Z`` vs watermark ``…00Z``) would mark a genuinely
+                # dirty leaf-parent CLEAN and skip its changed leaves.
                 max_cursor = None
                 for child in row.get(leaf_nav) or []:
                     val = child.get(cursor_field)
-                    if val is not None and (max_cursor is None or val > max_cursor):
+                    if val is not None and (max_cursor is None or _cursor_newer(val, max_cursor)):
                         max_cursor = val
-                if max_cursor is not None and (since is None or max_cursor > since):
+                if max_cursor is not None and (since is None or _cursor_newer(max_cursor, since)):
                     yield pchain + [{pk: row.get(pk) for pk in lp_pks}]
 
     def _verify_cursor_probe_support(
@@ -1384,31 +2037,140 @@ class ContainedNavMixin:
         *conclusive* pass is also persisted in the resume offset as
         ``cursor_probe_ok``; when a prior batch's offset carries it, the
         preflight requests are skipped entirely. Only a conclusive pass is
-        trusted this way. An *inconclusive* result — no leaf-parent yet has
-        ``>= 2`` distinct leaf cursors, so ordering can't cause a miss — is
-        re-checked every batch, so a server that begins to mis-order once its
-        data grows discriminating is still caught.
+        trusted this way. Under the non-strict ``auto`` cascade BOTH
+        definitive outcomes additionally ride the process/file capability
+        cache (per contained path) — the offset never carries a fail, so
+        without it a mis-ordering server would re-pay the preflight GETs on
+        every framework-recreated reader. Strict mode neither consults nor
+        records the shared cache (an explicit mode keeps no recorded
+        verdicts, and its error must carry fresh evidence). An *inconclusive*
+        result — no leaf-parent yet has ``>= 2`` distinct leaf cursors, so
+        ordering can't cause a miss — is re-checked every batch, so a server
+        that begins to mis-order once its data grows discriminating is still
+        caught; a race-contaminated sample (see
+        :meth:`_cursor_probe_check_sample`) likewise records nothing.
 
         ``(supported, conclusive)``: ``supported`` is ``True`` via the persisted
         offset flag or any non-mis-ordering preflight verdict; ``conclusive`` is
         ``True`` only on a conclusive pass the caller may persist as
         ``cursor_probe_ok`` (an *inconclusive* scan is re-checked every batch).
         Raises (``strict``) or returns ``(False, False)`` (non-strict) on a
-        mis-ordering server."""
+        mis-ordering server. A preflight that errors out before reaching a
+        verdict (transport/HTTP failure on the enumeration or trusted-
+        reference fetch — indistinguishable from a transient) likewise
+        degrades a non-strict read to the ``$batch``/plain cascade for this
+        batch while caching and recording nothing; strict raises an
+        actionable error instead of the raw HTTP failure."""
         if (start_offset or {}).get("cursor_probe_ok"):
             return (True, True)
         cache = self.__dict__.setdefault("_cursor_probe_verified", {})
         cache_key = (tuple(segments), namespace)
         if cache_key not in cache:
-            cache[cache_key] = self._run_cursor_probe_preflight(
-                segments, namespace, table_options, cursor_field
+            # Process/file capability cache — ``auto`` cascade only. The
+            # strict mode (``cursor_probe=nested-expand``) is an explicit
+            # non-``auto`` selection: it neither consults nor records the
+            # shared verdict (same rule as the offset scrub) and re-probes
+            # so its error carries fresh, actionable evidence. Both
+            # definitive outcomes are shared: a conclusive pass AND a
+            # mis-ordering fail (otherwise ``auto`` against a mis-ordering
+            # server would re-pay the preflight GETs on every framework-
+            # recreated reader — the offset only ever carries the pass). A
+            # shared hit fills the per-instance cache (like the other
+            # verifiers) so repeat calls this instance skip the file read.
+            shared_key = self._cursor_probe_shared_key(segments, namespace)
+            shared = (
+                None
+                if strict
+                else self._cached_capability("cursor_probe_ok", table_name=shared_key)
             )
-        problem, conclusive = cache[cache_key]
+            if shared is True:
+                cache[cache_key] = (None, True, False)
+            elif shared is False:
+                cache[cache_key] = (_CURSOR_PROBE_SHARED_FAIL, False, False)
+            else:
+                try:
+                    cache[cache_key] = self._run_cursor_probe_preflight(
+                        segments, namespace, table_options, cursor_field
+                    )
+                except _CursorProbePreflightUnavailable as exc:
+                    # A preflight fetch failed before reaching a verdict —
+                    # the enumeration, the trusted-reference fetch, or (since
+                    # round 41) a TRANSIENT failure of the probe-shaped fetch
+                    # itself (only an immediate non-retryable HTTPError there
+                    # is a definitive shape rejection; retry-exhausted
+                    # throttling and network exhaustion land here — a
+                    # programming error in the preflight's own logic still
+                    # propagates). There is no evidence to distinguish a
+                    # capability shortfall from a transient blip — so treat
+                    # it like the other verifiers treat transients: degrade
+                    # THIS read to the $batch/plain cascade, cache and record
+                    # NOTHING (the next batch re-probes), and never let the
+                    # raw HTTP error escape a ``cursor_probe=auto`` read.
+                    msg = (
+                        f"cursor_probe preflight against "
+                        f"{CONTAINED_PATH_SEP.join(segments)!r} failed before reaching "
+                        f"a verdict: {exc}. If this persists (the server rejects "
+                        f"$orderby/$select on direct navigation to the leaf "
+                        f"collection), use cursor_probe=batch or cursor_probe=false."
+                    )
+                    if strict:
+                        raise ValueError(msg) from exc
+                    _LOG.warning("%s Falling back to $batch / the plain N+1 walk.", msg)
+                    return (False, False)
+                problem, conclusive, _race = cache[cache_key]
+                if not strict:
+                    if problem:  # clean mis-ordering evidence — a definitive fail
+                        self._store_capability("cursor_probe_ok", False, table_name=shared_key)
+                    elif conclusive:
+                        self._store_capability("cursor_probe_ok", True, table_name=shared_key)
+                    # Inconclusive scans (no discriminating sample, or only
+                    # concurrent-write races) record nothing and re-check next
+                    # batch, so a server that starts mis-ordering once its data
+                    # grows discriminating is still caught.
+        problem, conclusive, race_tainted = cache[cache_key]
         if problem:
             if strict:
                 raise ValueError(problem)
             return (False, False)
+        if race_tainted and not conclusive:
+            # The verdict-less scan contained a RACE skip — a sample that HAD
+            # discriminating cursors but returned newer-than-reference. Unlike
+            # a genuinely non-discriminating scan (where engaging the probe
+            # unverified is safe — ordering can't cause a miss), this may be a
+            # mis-ordering server hiding behind concurrent writes. Decline the
+            # probe for this batch (the caller cascades to $batch / the plain
+            # walk — rows stay correct; under strict mode this degrades the
+            # REQUEST SHAPE for one batch rather than raising on a transient)
+            # and record nothing; the next batch re-checks.
+            _LOG.warning(
+                "cursor_probe preflight for %r was race-contaminated (concurrent "
+                "writes during every discriminating sample); declining the probe "
+                "for this batch and reading via $batch / the plain walk. The next "
+                "batch re-checks.",
+                CONTAINED_PATH_SEP.join(segments),
+            )
+            return (False, False)
         return (True, conclusive)
+
+    @staticmethod
+    def _cursor_probe_shared_key(segments: list[str], namespace: str | None) -> str:
+        """Per-path key for the shared ``cursor_probe_ok`` verdict — the
+        contained path (the probe shape depends on it), namespace-qualified
+        for multi-schema services."""
+        path = CONTAINED_PATH_SEP.join(segments)
+        return f"{namespace}:{path}" if namespace else path
+
+    @staticmethod
+    def _expand_shared_key(table_name: str, table_options: dict | None) -> str:
+        """Memo/shared-cache key for the per-table ``expand_ok`` verdict —
+        namespace-qualified like :meth:`_cursor_probe_shared_key`. The same
+        contained path string (``Customers__Addresses``) can resolve to
+        differently-shaped types in two namespaces of one service, so a
+        bare-table key would share one verdict across both — the exact
+        unverified-``$expand`` leak the per-table keying exists to
+        prevent, one level up."""
+        namespace = (table_options or {}).get("namespace")
+        return f"{namespace}:{table_name}" if namespace else table_name
 
     def _run_cursor_probe_preflight(
         self,
@@ -1419,42 +2181,59 @@ class ContainedNavMixin:
     ) -> tuple[str | None, bool]:
         """Behavioural capability check for :meth:`_iter_dirty_leaf_parent_chains`.
 
-        Returns ``(problem, conclusive)``: ``problem`` is an actionable error
-        message when the server mishandles inner ``$expand`` ordering (the probe
-        would under-report dirty leaf-parents and drop rows), else ``None``.
+        Returns ``(problem, conclusive, race_tainted)``: ``problem`` is an
+        actionable error message on clean mis-ordering evidence (inner leaf
+        OLDER than / missing from the trusted reference — the direction a
+        genuinely mis-ordering server produces), else ``None``. A ``problem``
+        is always a *definitive* fail the caller may persist as
+        ``cursor_probe_ok=false`` (and, in strict mode, raise on).
         ``conclusive`` is ``True`` only when a discriminating sample was found
         AND the probe shape returned the true newest leaf — the verdict the
-        caller may persist across batches (see
-        :meth:`_verify_cursor_probe_support`); ``False`` on an inconclusive
-        scan, which must be re-checked rather than trusted.
+        caller may persist as ``cursor_probe_ok=true``; ``False`` on an
+        inconclusive scan (``problem`` ``None``), which must be re-checked
+        rather than trusted. ``race_tainted`` is ``True`` when an inconclusive
+        scan contained at least one RACE skip (a sample that HAD
+        discriminating cursors but returned newer-than-reference): unlike a
+        genuinely non-discriminating scan — where ordering can't cause a
+        miss, so engaging the probe unverified is safe — a race-tainted scan
+        may be hiding a mis-ordering server behind concurrent writes, so the
+        caller must decline the probe for this batch (cascade to ``$batch`` /
+        the plain walk) while still recording nothing.
 
         Finds a sample leaf-parent with ≥2 distinct leaf cursors and verifies
         that the probe's own ``$expand($orderby cursor desc;$top=1)`` returns
         the true newest leaf — cross-checked against a trusted direct-navigation
         ``$orderby`` query (basic collection ordering, far more universally
-        honoured than inner-``$expand`` ordering). Inconclusive (no
-        discriminating sample within :data:`_CURSOR_PROBE_PREFLIGHT_SCAN`) →
-        ``(None, False)``: with ≤1 leaf per parent, ordering can't cause a
-        miss."""
+        honoured than inner-``$expand`` ordering). A sample that can't
+        discriminate (≤1 distinct leaf cursor) or that races a concurrent write
+        (inner leaf NEWER than the reference — see
+        :meth:`_cursor_probe_check_sample`) is skipped and the scan moves on."""
         parent_segments = segments[:-1]
         leaf_nav = segments[-1]
-        lp_pks = self._own_primary_keys_for_et(
-            self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
-        )
+        lp_et = self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
+        lp_pks = self._own_primary_keys_for_et(lp_et)
         if not lp_pks:
-            return (None, False)
+            # Inconclusive, not race-tainted — the 3-tuple contract every
+            # consumer unpacks. The walk itself then raises the actionable
+            # "segment X has no primary key declared in $metadata" error.
+            return (None, False, False)
+        lp_types = self._edm_types_for_et(lp_et)
         page_size = (table_options or {}).get("page_size") or DEFAULT_PAGE_SIZE
         lp_order = _ancestor_pk_order_by(lp_pks)
         scanned = 0
+        saw_race = False
         for pchain in self._iter_parent_key_chains(parent_segments, namespace, table_options):
             lp_base = join_url(
-                self.service_url, self._build_contained_path(parent_segments, pchain)
+                self.service_url, self._build_contained_path(parent_segments, pchain, namespace)
             )
             next_url: str | None = f"{lp_base}?$select={','.join(lp_pks)}&$top={page_size}"
             if lp_order:
                 next_url += f"&$orderby={lp_order}"
             while next_url:
-                lp_rows, next_url = self._fetch_one_expand_page(next_url)
+                try:
+                    lp_rows, next_url = self._fetch_one_expand_page(next_url, lp_types)
+                except Exception as exc:  # enumeration fetch failed — no verdict
+                    raise _CursorProbePreflightUnavailable(str(exc)) from exc
                 for lp_row in lp_rows:
                     scanned += 1
                     lp_key = {pk: lp_row.get(pk) for pk in lp_pks}
@@ -1462,12 +2241,14 @@ class ContainedNavMixin:
                         parent_segments, pchain, segments, namespace, lp_key, leaf_nav, cursor_field
                     )
                     if status == "ok":
-                        return (None, True)
+                        return (None, True, False)
                     if status == "error":
-                        return (message, False)
+                        return (message, False, False)
+                    if status == "race":
+                        saw_race = True
                     if scanned >= _CURSOR_PROBE_PREFLIGHT_SCAN:
-                        return (None, False)
-        return (None, False)
+                        return (None, False, saw_race)
+        return (None, False, saw_race)
 
     # pylint: disable=too-many-arguments,too-many-positional-arguments
     def _cursor_probe_check_sample(
@@ -1482,43 +2263,120 @@ class ContainedNavMixin:
     ) -> tuple[str, str | None]:
         """Verify the probe shape against trusted ordering for one leaf-parent.
 
-        Returns ``("skip", None)`` when the sample can't discriminate (< 2
-        distinct leaf cursors), ``("ok", None)`` when the probe's inner
-        ``$expand`` ordering returns the true newest leaf, or
-        ``("error", msg)`` when it does not."""
+        Returns ``("skip", None)`` when the sample can't be trusted as
+        evidence — either it can't discriminate (< 2 distinct leaf cursors)
+        or the probe returned a leaf NEWER than the reference (a concurrent
+        write between the two non-atomic fetches, not ordering evidence) — so
+        the scan should move on to another sample; ``("ok", None)`` when the
+        probe's inner ``$expand`` ordering returns the true newest leaf; or
+        ``("error", msg)`` when it returns an OLDER/missing leaf (the
+        direction a genuinely mis-ordering server produces — clean
+        evidence)."""
         full_chain = pchain + [lp_key]
-        leaf_base = join_url(self.service_url, self._build_contained_path(segments, full_chain))
-        # Trusted reference: direct-navigation ordering on the leaf collection.
-        direct_rows, _ = self._fetch_one_expand_page(
-            f"{leaf_base}?$orderby={cursor_field} desc&$top=2&$select={cursor_field}"
+        leaf_base = join_url(
+            self.service_url, self._build_contained_path(segments, full_chain, namespace)
         )
+        # Trusted reference: direct-navigation ordering on the leaf collection.
+        try:
+            direct_rows, _ = self._fetch_one_expand_page(
+                f"{leaf_base}?$orderby={cursor_field} desc&$top=2&$select={cursor_field}"
+            )
+        except Exception as exc:  # reference fetch failed — no verdict either way
+            raise _CursorProbePreflightUnavailable(str(exc)) from exc
         vals = [r.get(cursor_field) for r in direct_rows if r.get(cursor_field) is not None]
         if len(vals) < 2 or vals[0] == vals[1]:
             return ("skip", None)
         direct_max = vals[0]
         # The probe's own shape, targeted to this leaf-parent via an outer
         # key $filter (basic collection filtering, not an inner-$expand option).
-        lp_coll = join_url(self.service_url, self._build_contained_path(parent_segments, pchain))
-        pk_filter = " and ".join(f"{k} eq {odata_literal(v)}" for k, v in lp_key.items())
-        lp_pks = self._own_primary_keys_for_et(
-            self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
+        lp_coll = join_url(
+            self.service_url, self._build_contained_path(parent_segments, pchain, namespace)
         )
+        lp_et = self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
+        lp_types = self._edm_types_for_et(lp_et)
+        pk_filter = " and ".join(
+            f"{k} eq {odata_literal_typed(v, lp_types.get(k))}" for k, v in lp_key.items()
+        )
+        lp_pks = self._own_primary_keys_for_et(lp_et)
         expand_url = (
             f"{lp_coll}?$select={','.join(lp_pks)}&$filter={pk_filter}"
             f"&$expand={leaf_nav}($orderby={cursor_field} desc;$top=1;$select={cursor_field})"
         )
-        exp_rows, _ = self._fetch_one_expand_page(expand_url)
+        try:
+            exp_rows, _ = self._fetch_one_expand_page(expand_url)
+        except requests.HTTPError:  # server REJECTED the nested-$expand probe shape
+            # e.g. Hexagon Smart API 400s on inner $orderby/$top/$select rather
+            # than accepting it (or silently mis-ordering). An immediate
+            # HTTPError is a NON-RETRYABLE 4xx (the retryable statuses exhaust
+            # the retry budget into RuntimeError, and network failures re-raise
+            # their own types — neither reaches this clause), so this is a
+            # definitive capability rejection. Report it like the mis-order
+            # case ("error") so ``auto`` cascades to $batch / the plain walk
+            # (persisting cursor_probe_ok=False) and ``nested-expand`` raises
+            # an actionable error — instead of the raw HTTP error escaping and
+            # failing the read, which would break the "auto never raises on a
+            # capability shortfall" contract.
+            probe_path = self._build_contained_path(segments, full_chain, namespace)
+            return (
+                "error",
+                "cursor_probe=nested-expand needs the source to accept "
+                "$orderby/$top/$select inside $expand, but "
+                f"{probe_path!r} rejected the probe "
+                "query with an error (the server does not support these inner-$expand "
+                "options). Use cursor_probe=batch or cursor_probe=auto (which falls back "
+                "to $batch / the plain N+1 walk), or cursor_probe=false for the plain walk.",
+            )
+        except Exception as exc:  # noqa: BLE001 — transient, NOT a capability verdict
+            # Retry-exhausted throttling (RuntimeError after the 429/503
+            # budget), network exhaustion (ConnectionError/Timeout), auth —
+            # a throttle window can open BETWEEN the sibling fetches, so
+            # "the reference fetch just succeeded" is not evidence of a
+            # capability rejection. Treating these as definitive pinned a
+            # false cursor_probe_ok=False for the cache TTL under ``auto``
+            # and raised a misleading capability error under strict mode.
+            # Route to the same no-verdict path as the enumeration and
+            # reference fetch sites: degrade this batch, record nothing,
+            # re-probe next batch.
+            raise _CursorProbePreflightUnavailable(str(exc)) from exc
         children = (exp_rows[0].get(leaf_nav) if exp_rows else None) or []
-        inner_max = max(
-            (c.get(cursor_field) for c in children if c.get(cursor_field) is not None),
-            default=None,
-        )
-        if inner_max == direct_max:
+        # Chronological max (``_cursor_max``, not ``max``): a lexical max over
+        # mixed fractional renderings can pick the wrong CHILD's value,
+        # failing the equality below and fabricating a definitive mis-order
+        # verdict against an honest server.
+        inner_vals = [c.get(cursor_field) for c in children if c.get(cursor_field) is not None]
+        inner_max = _cursor_max(inner_vals) if inner_vals else None
+        # SAME-INSTANT equality, not raw text: the two fetches can hit
+        # different LB backends rendering one instant differently
+        # (…00Z vs …00.000Z). Raw equality would fall through, and the
+        # direction whose raw tie-break reads as "older" would land in the
+        # error branch below — fabricating definitive mis-ordering evidence
+        # against an honest server (false cursor_probe_ok=false under
+        # ``auto``; a spurious raise under strict ``nested-expand``). Same
+        # hazard class the ``_cursor_max`` comment above guards against.
+        if _cursor_same_instant(inner_max, direct_max):
             return ("ok", None)
+        # Direction matters, because a fail verdict now outlives the instance
+        # (shared capability cache) and can raise in strict mode. A newest-leaf
+        # NEWER than the trusted reference is NOT ordering evidence: the two
+        # fetches aren't atomic, so a leaf inserted between them makes an honest
+        # server look mismatched. A genuinely mis-ordering server returns an
+        # OLDER leaf, never a newer one — so the newer direction is skipped like
+        # a non-discriminating sample (keep scanning for a clean one) rather
+        # than treated as a failure. This keeps one concurrent write from
+        # aborting the whole preflight or spuriously raising strict mode.
+        try:
+            if inner_max is not None and _cursor_newer(inner_max, direct_max):
+                # Distinct status from the non-discriminating "skip": a race
+                # skip means this sample HAD discriminating cursors — an
+                # all-race scan must decline the probe for this batch rather
+                # than engage it unverified (see _run_cursor_probe_preflight).
+                return ("race", None)
+        except TypeError:
+            pass  # incomparable cursor values — keep the mismatch as evidence
         return (
             "error",
             "cursor_probe=nested-expand requires the source to honour $orderby/$top "
-            f"inside $expand, but {self._build_contained_path(segments, full_chain)!r} "
+            f"inside $expand, but {self._build_contained_path(segments, full_chain, namespace)!r} "
             f"returned {inner_max!r} as its newest {leaf_nav} via $expand when the "
             f"true newest is {direct_max!r} (direct navigation). This server "
             "silently mis-orders inner $expand, so cursor_probe would drop changed "
@@ -1558,14 +2416,37 @@ class ContainedNavMixin:
         The OData v4 JSON batch format resolves a sub-request ``url`` against the
         service root, so an absolute URL under the root is stripped to its
         remainder; an already-relative URL (e.g. a resolved ``@odata.nextLink``
-        that came back service-relative) is returned without a leading slash."""
+        that came back service-relative) is returned without a leading slash.
+
+        The result is percent-encoded via ``requote_uri`` — the same encoding
+        ``requests`` applies to a plain GET's URL — because a sub-request URL
+        rides inside the JSON envelope and never passes through ``requests``'
+        URL preparation: without this, generated ``$orderby=Id asc`` /
+        ``$filter=… gt …`` shapes carry literal spaces, which a strict OData
+        v4 server may reject. ``requote_uri`` preserves existing escapes, so
+        the literal-level encoding from ``odata_literal`` is not doubled."""
         root = self.service_url if self.service_url.endswith("/") else self.service_url + "/"
         if url.startswith(root):
-            return url[len(root) :]
+            return requote_uri(url[len(root) :])
         parsed = urlparse(url)
         if parsed.scheme:
-            return parsed.path.lstrip("/") + (f"?{parsed.query}" if parsed.query else "")
-        return url.lstrip("/")
+            query = f"?{parsed.query}" if parsed.query else ""
+            # Same origin under normalization (default port spelled out,
+            # host-case difference) but a raw prefix miss: strip the service
+            # root's PATH so the sub-request stays service-relative. Without
+            # this the fallback below keeps the root's own path segments and
+            # the sub-request 404s — self-healing via the plain-GET re-issue
+            # in ``_checked_batch_subresponse``, but one wasted round-trip
+            # plus an alarming warning per continuation.
+            try:
+                same_origin = _url_origin(url) == _url_origin(root)
+            except ValueError:
+                same_origin = False
+            root_path = urlparse(root).path
+            if same_origin and parsed.path.startswith(root_path):
+                return requote_uri(parsed.path[len(root_path) :] + query)
+            return requote_uri(parsed.path.lstrip("/") + query)
+        return requote_uri(url.lstrip("/"))
 
     def _post_batch(self, urls: list[str]) -> list[dict]:
         """POST one OData v4 JSON ``$batch`` of GET sub-requests; return the
@@ -1585,8 +2466,10 @@ class ContainedNavMixin:
             ]
         }
         batch_url = join_url(self.service_url, "$batch")
-        resp = self._http_get(session, batch_url, method="POST", json=payload)
-        if resp.status_code >= 400:
+
+        def _raise_for_batch_status(resp):
+            if resp.status_code < 400:
+                return
             body = resp.text or ""
             if _is_batch_too_large(body):
                 raise _BatchTooManyParts(
@@ -1596,7 +2479,33 @@ class ContainedNavMixin:
             raise RuntimeError(
                 f"OData $batch POST to {batch_url!r} failed: " f"{resp.status_code} {body[:300]}"
             )
-        data = resp.json()
+
+        resp = self._http_get(session, batch_url, method="POST", json=payload)
+        _raise_for_batch_status(resp)
+        try:
+            data = resp.json()
+        except ValueError:
+            # Corrupt 200: same failure mode ``_fetch_page_payload`` retries
+            # for — some servers (Hexagon) truncate LARGE bodies under load,
+            # and the $batch envelope is the largest response the connector
+            # ever receives. One re-POST is safe (GET-only sub-requests).
+            resp = self._http_get(session, batch_url, method="POST", json=payload)
+            # The retry can come back non-2xx (the corrupt 200 was a blip, the
+            # real answer is an error): route it through the SAME status
+            # handling — a "too many parts" 400 must still trigger the
+            # adaptive shrink, and a plain 4xx must carry its status/body
+            # instead of decoding as a responses-less envelope ("missing
+            # sub-response id 0").
+            _raise_for_batch_status(resp)
+            try:
+                data = resp.json()
+            except ValueError:
+                raise RuntimeError(
+                    f"OData $batch response from {batch_url!r} returned "
+                    f"{resp.status_code} with a malformed JSON body twice "
+                    f"(likely truncated by the server). First 300 chars: "
+                    f"{(resp.text or '')[:300]!r}"
+                ) from None
         by_id = {str(r.get("id")): r for r in data.get("responses", [])}
         out = []
         for i in range(len(urls)):
@@ -1633,6 +2542,7 @@ class ContainedNavMixin:
         if new_cap >= cap:  # ensure forward progress when the factor rounds up
             new_cap = max(1, cap - 1)
         self.__dict__["_batch_size_cap"] = new_cap
+        self._store_capability("batch_size_ok", new_cap)
         self.__dict__["_batch_shrinks"] = shrinks + 1
         _LOG.warning(
             "OData $batch rejected %d parts (too many); reducing batch size to "
@@ -1644,7 +2554,7 @@ class ContainedNavMixin:
         )
         return True
 
-    def _get_as_batch_response(self, url: str) -> dict:
+    def _get_as_batch_response(self, url: str, edm_types: dict[str, str] | None = None) -> dict:
         """Plain GET fall-back for one leaf-parent, shaped like a ``$batch``
         sub-response (``{"status", "body": {"value": [...]}}``) so the drain loops
         parse it identically. All pages are drained here (no ``@odata.nextLink``
@@ -1657,13 +2567,85 @@ class ContainedNavMixin:
         page-limits while omitting ``@odata.nextLink`` would be silently
         truncated. Re-add the default ``$top`` under keyset/skip/auto so the
         drain can size its pages and seek until empty (nextlink mode is left
-        untouched — it trusts the server's links either way)."""
-        if getattr(self, "_pagination", "nextlink") != "nextlink" and _pg_parse_top(url) is None:
+        untouched — it trusts the server's links either way).
+
+        Server-issued continuation links are exempt from the ``$top``
+        injection: a re-queued ``@odata.nextLink`` (recognisable by its
+        ``$skiptoken``/``$skip``) can land here when the ``$batch`` give-up
+        sentinel fires mid-walk, and OData v4 §11.2.5.7 requires the client
+        to use the nextLink as-is — appending an option to an opaque
+        skiptoken URL can 400 or corrupt the server's paging state. A
+        continuation also proves the server emits links, so the
+        starvation this injection defends against can't occur on it."""
+        if (
+            getattr(self, "_pagination", "nextlink") != "nextlink"
+            and _pg_parse_top(url) is None
+            and not _pg_is_continuation(url)
+        ):
             url = _pg_set_query(url, "$top", DEFAULT_PAGE_SIZE)
-        rows = list(self._fetch_pages(url))
+        rows = list(self._fetch_pages(url, edm_types))
         return {"status": 200, "body": {"value": rows}}
 
-    def _post_batch_adaptive(self, urls: list[str]) -> list[dict]:
+    def _checked_batch_subresponse(
+        self, resp: dict, req_url: str, edm_types: dict[str, str] | None = None
+    ) -> dict:
+        """Validate one ``$batch`` sub-response before the drain loops parse it.
+
+        :meth:`_post_batch` deliberately carries per-sub-request HTTP errors
+        inside the envelope for the caller to inspect — and this is that
+        inspection. Without it a 2xx envelope holding one failed sub-response
+        (a throttled or errored leaf-parent) parses as ``rows = []`` and that
+        parent's whole collection is silently skipped; on the cursor walk the
+        other parents still advance the watermark past the failed parent's
+        changed rows, so ``cursor gt since`` never re-reads them — permanent
+        loss.
+
+        A sub-response with a < 400 status AND a dict ``body`` passes through
+        untouched. Anything else — an error status, a shape that isn't a
+        sub-response dict, OR a 2xx whose ``body`` is a string/absent (the
+        JSON-batch spec lets a server serialize a sub-response body as a
+        JSON *string* for non-JSON media; the drains take ``rows = []`` for
+        a non-dict body, so that parent's whole collection would vanish and
+        the cursor walk would advance past it) — is re-issued as a plain GET
+        via :meth:`_get_as_batch_response`: a transient failure (429/5xx)
+        recovers through ``_http_get``'s retry/backoff/token-refresh path,
+        and a hard 4xx raises out of the read with the server's actual error
+        body — never a silent skip."""
+        status = resp.get("status") if isinstance(resp, dict) else None
+        try:
+            bad_status = status is None or int(status) >= 400
+        except (TypeError, ValueError):
+            bad_status = True
+        body = resp.get("body") if isinstance(resp, dict) else None
+        # A <400 sub-response the drains can't read is re-fetched as a plain
+        # GET (so ``_fetch_page_payload`` parses it properly) rather than
+        # dropping the parent. Every sub-request this connector issues is a
+        # COLLECTION GET (both ``$batch`` producers build URLs via
+        # ``_build_contained_url``), so a drainable body is exactly a JSON
+        # object whose ``value`` is a LIST. Anything else — a string body
+        # (the JSON-batch spec's form for non-JSON media), an OData ``error``
+        # envelope behind a success status, a v2-style ``{"d": …}`` gateway
+        # shape (no ``value`` at all — the drains would silently take
+        # ``rows = []`` and the cursor walk would advance past the parent),
+        # or ``{"value": null}`` / a non-list ``value`` (the drains would
+        # crash iterating it) — is re-issued. An empty-collection 200
+        # (``{"value": []}``) passes through untouched.
+        undrainable_body = not isinstance(body, dict) or not isinstance(body.get("value"), list)
+        if not bad_status and not undrainable_body:
+            return resp
+        _LOG.warning(
+            "OData $batch sub-response for %r unusable (status %r, "
+            "body type %s); re-issuing as a plain GET so the rows aren't "
+            "silently skipped.",
+            req_url,
+            status,
+            type(body).__name__,
+        )
+        return self._get_as_batch_response(req_url, edm_types)
+
+    def _post_batch_adaptive(
+        self, urls: list[str], edm_types: dict[str, str] | None = None
+    ) -> list[dict]:
         """:meth:`_post_batch` with adaptive sizing: post ``urls`` in chunks no
         larger than the working cap, and on a "too many parts" rejection shrink
         the cap by 25% and retry the offending chunk re-split at the new cap — up
@@ -1675,13 +2657,13 @@ class ContainedNavMixin:
         plus every later round — fall back to a plain per-leaf-parent GET.
         Returns responses aligned with ``urls`` (``$batch`` sub-response shape)."""
         if self.__dict__.get("_batch_size_cap") == 1:  # give-up sentinel → plain GET
-            return [self._get_as_batch_response(u) for u in urls]
+            return [self._get_as_batch_response(u, edm_types) for u in urls]
         out: list[dict] = []
         pending = list(urls)
         while pending:
             cap = self.__dict__.get("_batch_size_cap")
             if cap == 1:  # gave up mid-walk → plain GET the rest
-                out.extend(self._get_as_batch_response(u) for u in pending)
+                out.extend(self._get_as_batch_response(u, edm_types) for u in pending)
                 break
             # Always slice the front at the CURRENT cap, so a shrink applies to
             # every remaining chunk — no stale oversized chunk wastes a retry.
@@ -1694,7 +2676,8 @@ class ContainedNavMixin:
                     # Budget spent or batch collapsed to one part → give up on
                     # $batch and plain-GET everything still pending.
                     self.__dict__["_batch_size_cap"] = 1
-                    out.extend(self._get_as_batch_response(u) for u in pending)
+                    self._store_capability("batch_size_ok", 1)
+                    out.extend(self._get_as_batch_response(u, edm_types) for u in pending)
                     break
                 # cap shrank; retry the (now smaller) front of pending.
         return out
@@ -1734,7 +2717,25 @@ class ContainedNavMixin:
         cached = self.__dict__.get("_batch_supported")
         if cached is not None:
             return cached
-        probe_url = join_url(self.service_url, segments[0]) + "?$top=1"
+        # Process/file cache: paths whose offsets can't carry the verdict
+        # (contained snapshot streams — bare ``{}`` offsets — and the batch
+        # reader) would otherwise re-pay this POST on every framework-
+        # recreated instance. Pull the discovered chunk cap along with the
+        # verdict so the adaptive shrink doesn't re-discover it either.
+        cached = self._cached_capability("batch_ok")
+        if cached is not None:
+            self.__dict__["_batch_supported"] = cached
+            cap = self._cached_capability("batch_size_ok")
+            if cap is not None and "_batch_size_cap" not in self.__dict__:
+                self.__dict__["_batch_size_cap"] = int(cap)
+            return cached
+        # Probe with the SAME shape the real hydrate sends: no ``$top`` (the
+        # sub-requests deliberately strip it and let the server drive paging
+        # inside the batch). Probing with ``?$top=1`` would false-fail servers
+        # that reject an explicit ``$top`` — a case the connector explicitly
+        # accommodates on plain snapshot reads — and persist ``batch_ok=False``
+        # even though the actual hydrate shape works.
+        probe_url = join_url(self.service_url, segments[0])
         payload = {
             "requests": [{"id": "0", "method": "GET", "url": self._batch_relative(probe_url)}]
         }
@@ -1753,11 +2754,23 @@ class ContainedNavMixin:
             if resp.status_code < 400:
                 try:
                     subs = resp.json().get("responses") or []
-                    sub_status = int(subs[0].get("status", 0) or 0) if subs else None
+                    # Require the ``id`` echo, not just a sub-response: the
+                    # real hydrate (``_post_batch``) keys sub-responses by the
+                    # echoed id and hard-raises when it's missing, and that
+                    # raise is not ``_BatchTooManyParts`` — so a pass verdict
+                    # for an id-less server would pin ``batch_ok: true`` and
+                    # then fail EVERY hydrate with "missing sub-response id"
+                    # instead of degrading to plain GETs.
+                    # Last-wins on duplicate ids, matching how _post_batch's
+                    # by_id dict resolves them — probe and hydrate must judge
+                    # the same sub-response.
+                    by_id = {str(r.get("id")): r for r in subs if isinstance(r, dict)}
+                    sub = by_id.get("0")
+                    sub_status = int(sub.get("status", 0) or 0) if sub else None
                 except Exception:
                     sub_status = None
                 if sub_status is None:
-                    definitive = True  # 2xx, but not a $batch envelope
+                    definitive = True  # 2xx, but not a consumable $batch envelope
                 elif sub_status < 400:
                     ok = definitive = True
                 elif sub_status not in _TRANSIENT_HTTP_STATUSES:
@@ -1766,7 +2779,301 @@ class ContainedNavMixin:
                 definitive = True  # e.g. 404/405 — no $batch endpoint
         if definitive:
             self.__dict__["_batch_supported"] = ok
+            self._store_capability("batch_ok", ok)
         return ok
+
+    def _expand_read_active(
+        self,
+        table_name: str,
+        table_options: dict[str, str] | None,
+        start_offset: dict | None = None,
+    ) -> bool:
+        """The RESOLVED expand decision for this table: an explicit
+        ``expand_contained=true``, or ``auto`` whose preflight verifies the
+        server (see :meth:`_verify_expand_support`). ``false`` (incl. unset)
+        and ``auto``-with-a-failed-preflight return ``False`` — the N+1 shape.
+
+        Shared by ``read_table`` (which passes ``start_offset`` so a persisted
+        ``expand_ok`` skips the probe) and the partition activation
+        (``is_partitioned`` / batch ``get_partitions``, no offset available —
+        the instance cache dedupes the probe within one setup)."""
+        mode = self._expand_contained_mode(table_options)
+        if mode != "auto":
+            return mode == "true"
+        segments = self._table_segments(table_name)
+        if segments is None:
+            return False  # flat table — nothing to expand
+        return self._verify_expand_support(table_name, segments, table_options, start_offset)
+
+    def _verify_expand_support(
+        self,
+        table_name: str,
+        segments: list[str],
+        table_options: dict[str, str] | None,
+        start_offset: dict | None = None,
+    ) -> bool:
+        """Whether the server supports the nested-``$expand`` read for this
+        path (the ``expand_contained=auto`` preflight; never raises).
+
+        Mirrors :meth:`_verify_batch_support`'s verdict discipline: a pass is
+        persisted in the resume offset as ``expand_ok`` and cached per
+        instance **per table** (unlike the genuinely server-wide
+        ``_or_filter_ok`` / ``_batch_supported`` scalars — different nesting
+        depths can verify differently, so one table's verdict must never
+        answer for another on a multi-table instance), but only a
+        **definitive** outcome is recorded —
+
+        * definitive pass — the real expand URL returns 2xx AND inline child
+          collections are present at every level down to the leaf;
+        * definitive fail — a hard 4xx on the expand URL, a non-collection
+          2xx body, or a level whose inline children are missing/empty while
+          direct navigation shows children exist (the server accepted the URL
+          but silently ignored ``$expand`` — using it would drop rows);
+        * transient / inconclusive — transport errors, retryable statuses, or
+          a sample too empty to discriminate (empty top set, or a genuinely
+          childless probed branch): **fall back to the N+1 shape for THIS
+          batch** and re-run the preflight next batch, recording nothing.
+
+        Expand behaviour engages ONLY on a conclusive pass — ``auto`` never
+        assumes the server can ``$expand`` before the verdict is in. The
+        N+1 walk is always correct, so an unresolved verdict costs request
+        shape, never rows; the risky direction (expand on an unverified
+        server) is what silently drops every deep row. A childless-first-
+        branch server that ignores ``$expand`` would otherwise read as
+        inconclusive forever while losing data on every other branch."""
+        if (start_offset or {}).get("expand_ok"):
+            return True
+        key = self._expand_shared_key(table_name, table_options)
+        memo = self.__dict__.setdefault("_expand_supported", {})
+        cached = memo.get(key)
+        if cached is not None:
+            return cached
+        # Process/file cache (per-table, namespace-qualified — different
+        # nesting depths / namespaces can verify differently): covers the
+        # contained snapshot stream (bare ``{}`` offsets) and the batch
+        # reader, where the offset channel can't carry ``expand_ok`` across
+        # framework-recreated instances.
+        cached = self._cached_capability("expand_ok", table_name=key)
+        if cached is not None:
+            memo[key] = cached
+            return cached
+        ok, definitive = self._run_expand_preflight(
+            table_name, segments, table_options, start_offset
+        )
+        if definitive:
+            memo[key] = ok
+            self._store_capability("expand_ok", ok, table_name=key)
+        return ok
+
+    def _expand_preflight_url(
+        self,
+        table_name: str,
+        segments: list[str],
+        table_options: dict[str, str] | None,
+        start_offset: dict | None,
+    ) -> tuple[str, int, str | None]:
+        """Build the preflight GET: the REAL expand URL for this table (same
+        inner ``$top``/``$orderby``/``$filter`` construction as the read),
+        with a small page budget and the top-level ``$top`` pinned to 1 so the
+        probe response stays a single subtree. When a cursor is configured but
+        no watermark exists yet, a synthetic floor value stands in so the
+        inner ``cursor gt`` ``$filter`` construct is still exercised (later
+        batches will send one; a server that rejects it must fail the
+        preflight now, not the first filtered read). Returns
+        ``(url, cursor_level, cursor_filter)`` — the filter pieces feed the
+        direct-navigation cross-check."""
+        namespace = (table_options or {}).get("namespace")
+        cursor_field = (table_options or {}).get("cursor_field")
+        since = (start_offset or {}).get("cursor")
+        if cursor_field and since is None:
+            try:
+                since, _kind = self._cursor_floor(table_name, namespace, cursor_field)
+            except ValueError:
+                since = None  # no synthesisable floor — probe unfiltered
+        if cursor_field:
+            cursor_level, cursor_filter, cursor_order, cursor_select = self._cursor_expand_clause(
+                segments, namespace, cursor_field, since
+            )
+        else:
+            cursor_level, cursor_filter, cursor_order, cursor_select = -1, None, None, None
+        probe_opts = {**(table_options or {}), "page_size": _EXPAND_PREFLIGHT_PAGE}
+        url = self._build_expand_url(
+            segments,
+            probe_opts,
+            cursor_level=cursor_level if cursor_field else None,
+            cursor_filter=cursor_filter,
+            cursor_order=cursor_order,
+            cursor_select=cursor_select,
+        )
+        # Only the top-level ``$top`` follows ``?``/``&``; the inner expand
+        # tops (after ``(``/``;``) are left at their per-level floor.
+        return rewrite_top_in_url(url, 1), cursor_level, cursor_filter
+
+    def _run_expand_preflight(
+        self,
+        table_name: str,
+        segments: list[str],
+        table_options: dict[str, str] | None,
+        start_offset: dict | None,
+    ) -> tuple[bool, bool]:
+        """One-shot behavioural probe for ``expand_contained=auto``. Returns
+        ``(ok, definitive)`` — see :meth:`_verify_expand_support` for the
+        verdict semantics. SINGLE auth-aware attempt (``_http_get_once``):
+        a capability probe must fail fast, and a transient blip only degrades
+        this batch."""
+        url, cursor_level, cursor_filter = self._expand_preflight_url(
+            table_name, segments, table_options, start_offset
+        )
+        try:
+            resp = self._http_get_once(self._get_session(), url)
+        except Exception:  # transport/auth failure — no verdict on $expand itself
+            return (False, False)
+        if resp.status_code >= 400:
+            return (False, resp.status_code not in _TRANSIENT_HTTP_STATUSES)
+        try:
+            top_rows = resp.json().get("value")
+        except Exception:
+            return (False, False)
+        if not isinstance(top_rows, list):
+            return (False, True)  # 2xx, but not an OData collection payload
+        if not top_rows:
+            # Empty top set — nothing to discriminate. N+1 this batch (it
+            # emits the same nothing), re-probe next batch.
+            return (False, False)
+        return self._expand_preflight_walk(
+            segments, top_rows, table_options, cursor_level, cursor_filter
+        )
+
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
+    def _expand_preflight_walk(
+        self,
+        segments: list[str],
+        top_rows: list[dict],
+        table_options: dict[str, str] | None,
+        cursor_level: int,
+        cursor_filter: str | None,
+    ) -> tuple[bool, bool]:
+        """Walk the probe response level by level verifying inline containment.
+
+        At each level, descend through every row whose child nav property is a
+        non-empty inline list. The first level with NO inline children anywhere
+        is ambiguous — either the server ignored ``$expand`` (rows dropped!) or
+        this branch is genuinely childless — so it is resolved with ONE direct-
+        navigation ``$top=1`` GET on the first parent's child collection
+        (carrying the same level ``$filter`` the expand sent, so a filtered-
+        empty level isn't misread as ignored-``$expand``): children found ⇒
+        definitive fail; none (or the check itself fails) ⇒ **inconclusive —
+        fall back to N+1 for this batch** and re-probe next batch. Expand only
+        ever runs on the one conclusive-pass outcome: inline rows present at
+        every level down to the leaf."""
+        namespace = (table_options or {}).get("namespace")
+        pending: list[tuple[dict, list[dict[str, Any]]]] = [(r, []) for r in top_rows]
+        for lvl in range(len(segments) - 1):
+            try:
+                pks = self._own_primary_keys_for_et(
+                    self._entity_type_for(CONTAINED_PATH_SEP.join(segments[: lvl + 1]), namespace)
+                )
+            except ValueError:
+                return (False, False)
+            if not pks:
+                return (False, False)  # can't address a child collection to verify
+            child_key = segments[lvl + 1]
+            nxt: list[tuple[dict, list[dict[str, Any]]]] = []
+            for row, chain in pending:
+                kids = row.get(child_key)
+                if isinstance(kids, list) and kids:
+                    parent_keys = {pk: row.get(pk) for pk in pks}
+                    nxt.extend((k, chain + [parent_keys]) for k in kids)
+            if nxt:
+                pending = nxt
+                continue
+            row, chain = pending[0]
+            full_chain = chain + [{pk: row.get(pk) for pk in pks}]
+            check_url = self._expand_preflight_child_check_url(
+                segments, lvl, full_chain, table_options, cursor_level, cursor_filter
+            )
+            try:
+                r2 = self._http_get_once(self._get_session(), check_url)
+                direct = (r2.json().get("value") or []) if r2.status_code < 400 else None
+            except Exception:
+                direct = None
+            if direct is None:
+                return (False, False)  # couldn't verify — N+1, re-probe next batch
+            if direct:
+                if any(f"{child_key}@odata.nextLink" in r for r, _ in pending):
+                    # ANNOTATION-DEFERRING server: it acknowledged the expanded
+                    # property with a ``<Nav>@odata.nextLink`` instead of
+                    # inlining rows — the READ path follows exactly that
+                    # annotation (see ``_flatten_expand_response``), so this
+                    # level's containment IS honored; a definitive fail here
+                    # would permanently pin N+1 on a server where
+                    # ``expand_contained=true`` works end-to-end. Verify the
+                    # DEEPER levels with a sub-rooted expand probe (the direct
+                    # check's children were fetched WITHOUT ``$expand``, so
+                    # descending through them raw would false-fail one level
+                    # down).
+                    if lvl + 2 >= len(segments):
+                        return (True, True)  # deferring level's children ARE leaves
+                    sub_url = self._assemble_expand_url(
+                        join_url(
+                            self.service_url,
+                            self._build_contained_path(segments[: lvl + 2], full_chain, namespace),
+                        ),
+                        segments,
+                        lvl + 1,
+                        {**(table_options or {}), "page_size": _EXPAND_PREFLIGHT_PAGE},
+                        resolve_segment_filters(table_options, segments),
+                        cursor_level,
+                        cursor_filter,
+                        None,
+                        None,
+                        None,
+                    )
+                    try:
+                        r3 = self._http_get_once(self._get_session(), sub_url)
+                        sub_rows = (r3.json().get("value") or []) if r3.status_code < 400 else None
+                    except Exception:
+                        sub_rows = None
+                    if not sub_rows:
+                        return (False, False)  # deeper levels unverifiable — re-probe
+                    pending = [(r, full_chain) for r in sub_rows]
+                    continue
+                return (False, True)  # children exist but $expand omitted them
+            return (False, False)  # sampled branch genuinely childless — N+1, re-probe
+        return (True, True)
+
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
+    def _expand_preflight_child_check_url(
+        self,
+        segments: list[str],
+        lvl: int,
+        chain: list[dict[str, Any]],
+        table_options: dict[str, str] | None,
+        cursor_level: int,
+        cursor_filter: str | None,
+    ) -> str:
+        """Direct-navigation URL for the cross-check: the child collection at
+        ``lvl + 1`` under ``chain``, ``$top=1``, carrying the SAME ``$filter``
+        the expand's inner clause applied at that level (cursor filter /
+        ``filter_at_<segment>`` / the leaf ``filter``) so a legitimately
+        filtered-empty level isn't misread as the server ignoring ``$expand``."""
+        segment_filters = resolve_segment_filters(table_options, segments)
+        is_leaf = (lvl + 1) == len(segments) - 1
+        level_filter = combine_filters(
+            cursor_filter if cursor_level == lvl + 1 else None,
+            segment_filters.get(lvl + 1),
+            (table_options or {}).get("filter") if is_leaf else None,
+        )
+        base = join_url(
+            self.service_url,
+            self._build_contained_path(
+                segments[: lvl + 2], chain, (table_options or {}).get("namespace")
+            ),
+        )
+        url = f"{base}?$top=1"
+        if level_filter:
+            url += f"&$filter={level_filter}"
+        return url
 
     def _contained_fetch_batch_size(self, table_options: dict[str, str] | None) -> int:
         """Parse the ``contained_fetch`` table option into a requested ``$batch``
@@ -1917,12 +3224,15 @@ class ContainedNavMixin:
         ``$top`` stripped so the server drives paging, and any sub-response
         ``@odata.nextLink`` is re-batched until drained. Lazy at group
         granularity (≤ one chunk of collections buffered at a time)."""
+        leaf_types = self._edm_types_for_level(
+            segments, len(segments) - 1, (table_options or {}).get("namespace")
+        )
         if batch_size <= 1:
             for chain, meta in chain_meta_iter:
                 url = self._build_contained_url(
                     segments, chain, table_options, extra_filter=extra_filter, order_by=order_by
                 )
-                for row in self._fetch_pages(url):
+                for row in self._fetch_pages(url, leaf_types):
                     yield meta, row
             return
         # ``$batch``: drop ``page_size`` so sub-requests carry no ``$top`` and
@@ -1934,12 +3244,12 @@ class ContainedNavMixin:
             group.append((chain, meta))
             if len(group) >= batch_size:
                 yield from self._drain_contained_group(
-                    segments, group, leaf_opts, extra_filter, order_by, batch_size
+                    segments, group, leaf_opts, extra_filter, order_by, batch_size, leaf_types
                 )
                 group = []
         if group:
             yield from self._drain_contained_group(
-                segments, group, leaf_opts, extra_filter, order_by, batch_size
+                segments, group, leaf_opts, extra_filter, order_by, batch_size, leaf_types
             )
 
     def _drain_contained_group(
@@ -1950,6 +3260,7 @@ class ContainedNavMixin:
         extra_filter: str | None,
         order_by: str | None,
         batch_size: int,
+        edm_types: dict[str, str] | None = None,
     ) -> Iterator[tuple[Any, dict]]:
         """Hydrate one group of leaf-parent chains via ``$batch`` (+ nextLink
         continuations), yielding ``(meta, raw_row)`` with ``@odata.*`` stripped.
@@ -1971,8 +3282,9 @@ class ContainedNavMixin:
             eff = self._effective_batch_size(batch_size)
             round_ = pending[:eff]
             pending = pending[eff:]
-            responses = self._post_batch_adaptive([u for _, u in round_])
+            responses = self._post_batch_adaptive([u for _, u in round_], edm_types)
             for (key, req_url), resp in zip(round_, responses):
+                resp = self._checked_batch_subresponse(resp, req_url, edm_types)
                 body = resp.get("body") if isinstance(resp, dict) else None
                 rows = body.get("value", []) if isinstance(body, dict) else []
                 for row in rows:
@@ -1993,7 +3305,7 @@ class ContainedNavMixin:
         per parent) this keeps peak memory bounded by one page worth
         of rows rather than the whole result set.
         """
-        segments = parse_contained_path(table_name) or [table_name]
+        segments = self._table_segments(table_name) or [table_name]
         namespace = (table_options or {}).get("namespace")
         fk_columns = self._resolve_fk_columns(segments, namespace)
         segment_filters = resolve_segment_filters(table_options, segments)
@@ -2073,7 +3385,7 @@ class ContainedNavMixin:
         ``running_max_cursor`` in the offset; on chain completion it
         becomes the new ``cursor`` value.
         """
-        segments = parse_contained_path(table_name) or [table_name]
+        segments = self._table_segments(table_name) or [table_name]
         if len(segments) < 2:
             raise ValueError(f"expand_contained requires a contained path; {table_name!r} is flat.")
         namespace = (table_options or {}).get("namespace")
@@ -2091,8 +3403,19 @@ class ContainedNavMixin:
         # ``_build_expand_continuation_url``). Stashed on ``self`` — like
         # ``self._pagination`` — so it survives into the lazy streaming
         # generator without threading through every flatten call site.
+        # Leans on the framework's serial-calls contract (see the
+        # ``_pagination`` stash in ``_read_table_dispatch``): the lazy
+        # generator is drained before any other entry point runs on this
+        # instance, so nothing can clobber the stash mid-drain.
         self._expand_cont_opts = table_options
         self._expand_cont_since = (start_offset or {}).get("cursor")
+        # Per-level property→Edm-type maps for the same recursion (and the
+        # queue drains), so keyset-seek boundaries built while paging a
+        # collection at any depth render TYPED (guid bare / ISO-looking
+        # string quoted) — same stash-on-self pattern as above.
+        self._expand_types_per_level = [
+            self._edm_types_for_level(segments, i, namespace) for i in range(len(segments))
+        ]
         if cursor_field and cursor_level == -1:
             raise ValueError(
                 f"cursor_field={cursor_field!r} is not a property of any "
@@ -2109,7 +3432,7 @@ class ContainedNavMixin:
                 )
             pks_per_level.append(pks)
         fk_columns = self._resolve_fk_columns(segments, namespace)
-        max_records = int((table_options or {}).get("max_records_per_batch", "10000"))
+        max_records = _parse_max_records(table_options)
         # Either resume from a parked work queue or seed it with the
         # top-level URL. Each queue item is self-contained (URL +
         # level + ancestor chain + captured cursor) so resume needs
@@ -2171,6 +3494,12 @@ class ContainedNavMixin:
             emitted,
             ctx,
             page_size,
+            # New-rows-only cap accounting: the committed watermark (never
+            # the lookback-floored read filter) is the counting floor.
+            count_floor=(start_offset or {}).get("cursor") if cursor_field else None,
+            leaf_pks=self._own_primary_keys_for_et(
+                self._entity_type_for(CONTAINED_PATH_SEP.join(segments), namespace)
+            ),
         )
         drain_elapsed = time.monotonic() - drain_start
         end_offset = self._build_expand_end_offset(
@@ -2178,7 +3507,14 @@ class ContainedNavMixin:
         )
         if not cursor_field:
             return iter(emitted), end_offset
-        if not emitted and not resuming:
+        if not emitted and not resuming and not remaining_queue:
+            # Idle batch: nothing emitted, nothing resumed, nothing PARKED.
+            # The last guard is load-bearing — the queue ceiling
+            # (``_MAX_PENDING_FETCHES``) can park a non-empty queue before
+            # the first leaf row is emitted (servers that defer every inner
+            # collection behind ``<Nav>@odata.nextLink``), and echoing
+            # ``start_offset`` here would DROP that queue: every batch then
+            # re-does the same fetches and emits nothing, forever.
             return iter([]), start_offset or {}
         records, out_offset = self._finalize_cursor_read(
             start_offset, end_offset, emitted, table_name, cursor_field
@@ -2188,129 +3524,388 @@ class ContainedNavMixin:
         )
 
     # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
+    # pylint: disable=too-many-statements  # one cohesive DFS stack machine (see docstring);
+    # splitting it fragments the tightly-coupled park/resume/emit invariants — matches the
+    # inline-disable convention already used for _walk_contained_with_cursor below.
     def _drain_expand_pages(
         self,
         initial_queue: list[dict],
         max_records: int,
         segments: list[str],
         pks_per_level: list[list[str]],
-        fk_columns: dict[str, str],
+        fk_columns: dict[tuple[int, str], str],
         emitted: list[dict],
         ctx: tuple | None,
         page_size: int | None,
+        count_floor: Any = None,
+        leaf_pks: list[str] | None = None,
     ) -> list[dict]:
-        """Iterative work-queue processor.
+        """Resumable depth-first stack machine over the contained ``$expand``.
 
-        Each queue item is a self-contained "fetch this URL and
-        process the rows it returns" task::
+        The parked offset (``pending_fetches``) is this method's return
+        value, serialized every microbatch — so its size must stay bounded.
+        A naive breadth-first queue that appended one continuation per
+        truncated inner collection parked O(fan-out width) items (a wide top
+        page over an inner-paging server → thousands of URL-carrying items, a
+        multi-MB offset). This walks DEPTH-FIRST instead, so the parked
+        frontier is O(depth) — one frame per contained segment on the current
+        path — regardless of fan-out.
 
-            {
-                "url":     str,              # HTTP URL to GET (one page)
-                "level":   int,              # level the URL's rows live at
-                "chain":   list[dict],       # ancestor PK chain (snapshot)
-                "cur_val": Any | None,       # captured cursor value
-                "skip":    int,              # top_row index to start at
-            }
+        The work stack holds two frame kinds:
 
-        Items are popped FIFO; each pop performs ONE HTTP fetch and
-        processes its top_rows starting from ``skip``. Inner-collection
-        ``@odata.nextLink`` values discovered during a row's inline
-        descent are APPENDED to the queue (via
-        ``_flatten_expand_response``'s ``pending_fetches`` arg) rather
-        than followed inline. After each fully-processed top_row the
-        ``max_records`` cap is checked: when exceeded, the current
-        item is re-queued at the front with ``skip`` advanced past the
-        rows just emitted, and the loop exits. The returned queue is
-        the work left to do — non-empty means "continuation pending",
-        empty means "chain drained".
+        * **url**  — ``{url, level, chain, cur_val, boundary, skip}``: fetch
+          ONE page, then push a ``rows`` frame for its contents. This is the
+          only serializable shape (what a parked/seed queue item looks like).
+        * **rows** — an in-memory page of sibling rows at ``level`` plus an
+          ``idx`` cursor (``rows, level, chain, cur_val, idx, from_inline,
+          base_url, page_next_url, boundary, tops``). A wide inline sibling
+          collection is ONE rows frame, not N queued items — that is what
+          keeps the frontier O(depth) rather than O(width).
 
-        Cap deviation per batch is bounded by ONE HTTP response's
-        worth of leaf rows (≤ ``page_size``), not by the size of a
-        single top_row's subtree as in the previous design.
+        Per iteration the ``max_records`` cap is checked at the top; when
+        reached the loop stops pulling new work and ``_park`` serializes the
+        stack (bottom-to-top) into O(depth) ``url`` items. A ``rows`` frame is
+        parked by re-fetching its collection past the last processed row: a
+        fetched page re-fetches its own ``base_url`` with ``skip``/``boundary``;
+        an inline-delivered collection synthesizes a seek continuation
+        (``_build_expand_continuation_url``; ``nextlink`` mode has no client
+        seek, so it falls back to positional ``$skip`` + boundary dedup —
+        bounded duplicates, never loss). An ancestor frame's in-flight row is
+        skipped on resume because its remaining subtree is carried by the
+        deeper parked frames — no re-emit, no loss.
+
+        Resume re-fetches each parked url and skips rows at-or-below its
+        ``boundary`` by chronological ORDER KEY comparison — NOT by position:
+        the page is re-fetched from a mutating source, so a positional
+        ``skip`` desynchronizes under churn (an update to an already-emitted
+        row on a cursor-ordered page moves it to the tail and shifts an UNREAD
+        row into the skipped prefix — its subtree lost behind the watermark; a
+        delete on a PK-ordered page does the same). ``skip`` remains as the
+        legacy/downgrade fallback for parked offsets without a boundary. Rows
+        whose boundary comparison is incomparable are processed
+        (duplicate-safe), never skipped. The returned queue is the work left
+        to do — non-empty means "continuation pending", empty means "chain
+        drained".
+
+        ``count_floor`` — see ``_walk_contained_with_cursor``: only rows
+        strictly above the committed watermark count toward
+        ``max_records``, so a lookback overlap larger than the cap cannot
+        wedge the stream into an eternal park/complete cycle. Cap deviation
+        per batch is bounded by ONE HTTP response's worth of leaf rows
+        (≤ ``page_size``; the cap is checked between rows, but an in-flight
+        inline collection is finished before parking in ``nextlink`` mode)
+        plus the lookback overlap.
         """
-        # Take ownership: mutated in-place by appends from
-        # ``_flatten_expand_response`` and by our own front re-queues.
-        queue: list[dict] = list(initial_queue)
         cur_field, cur_level, _ = ctx or (None, -1, None)
-        while queue and len(emitted) < max_records:
-            item = queue.pop(0)
-            url = item["url"]
-            level = item["level"]
-            chain = [dict(p) for p in item.get("chain") or []]
-            cur_val = item.get("cur_val")
-            skip = int(item.get("skip", 0) or 0)
-            item_ctx = (cur_field, cur_level, cur_val) if cur_field else None
-            # Tops budgeted over only THIS request's collection levels
-            # (root == item level downward); ancestors above are fixed keys.
-            item_tops = (
-                compute_expand_tops_for_root(page_size, len(segments), level) if page_size else None
+        countable = 0
+
+        def _count_new(rows_slice: list[dict]) -> int:
+            if count_floor is None or cur_field is None:
+                return len(rows_slice)
+            return sum(
+                1
+                for r in rows_slice
+                if r.get(cur_field) is not None and _cursor_newer(r.get(cur_field), count_floor)
             )
-            # Fetch one page only — pulling further pages of THIS
-            # collection waits until the next dequeue so we can check
-            # the cap between them.
-            page_rows, page_next_url = self._fetch_one_expand_page(url)
-            if not page_rows:
-                if page_next_url:
-                    queue.append(
+
+        def _row_order_key(row: dict, level: int) -> list:
+            # The row's values for its page's own $orderby terms (see
+            # _expand_level_order_by: cursor-first at the cursor level,
+            # PK-only elsewhere) — the churn-stable within-page identity.
+            # ``pks_per_level`` covers ancestor levels only; leaf-level
+            # pages (inner continuations) use the leaf's own PKs.
+            # MUST return a ``list``: parked as ``boundary`` in the offset and
+            # compared (``row_key == boundary``) after a JSON round-trip that
+            # makes it a list — a tuple would silently break the resume-skip
+            # (duplicate-safe, never loss, just re-work).
+            key: list = []
+            if cur_field is not None and level == cur_level:
+                key.append(row.get(cur_field))
+            pks = pks_per_level[level] if level < len(pks_per_level) else (leaf_pks or [])
+            key.extend(row.get(pk) for pk in pks)
+            return key
+
+        leaf_level = len(segments) - 1
+        # Client-driven seek used to synthesize a resume URL for an
+        # inline-delivered collection; ``nextlink`` has no client seek, so fall
+        # back to positional ``$skip`` (a server that ignores it re-reads from
+        # the start and the parked boundary dedups — bounded duplicates, never
+        # loss), matching ``_recover_expand_item``'s mode-agnostic rebuild.
+        mode = getattr(self, "_pagination", "nextlink")
+        park_mode = mode if mode != "nextlink" else "skip"
+
+        def _push_url(item: dict) -> None:
+            stack.append(
+                {
+                    "kind": "url",
+                    "url": item["url"],
+                    "level": int(item["level"]),
+                    "chain": [dict(p) for p in item.get("chain") or []],
+                    "cur_val": item.get("cur_val"),
+                    "boundary": item.get("boundary"),
+                    "skip": int(item.get("skip", 0) or 0),
+                    "rebuilt": bool(item.get("rebuilt")),
+                }
+            )
+
+        # Reconstruct the work stack from the parked (or seed) queue. Parked
+        # frames are stored bottom-to-top (see ``_park``), so pushing them in
+        # order restores the DFS path with the deepest (leaf-most) frame on
+        # top — resumed first, exactly where the prior batch stopped.
+        stack: list[dict] = []
+        for item in initial_queue:
+            _push_url(item)
+
+        def _park() -> list[dict]:
+            # Serialize the whole stack (O(depth)) bottom-to-top. Each frame's
+            # ``boundary`` is its CURRENT row's order key: the deepest frame's
+            # current row is fully done (skip it, resume at the next); an
+            # ancestor's current row is in flight but its remaining subtree is
+            # carried by the deeper parked frames, so skipping it here and
+            # resuming at the next sibling is exactly right — no re-emit, no
+            # loss. This is what bounds the offset to O(depth), not O(width).
+            parked: list[dict] = []
+            for frame in stack:
+                if frame["kind"] == "url":
+                    parked.append(
                         {
-                            "url": page_next_url,
-                            "level": level,
-                            "chain": [dict(p) for p in chain],
-                            "cur_val": cur_val,
-                            "skip": 0,
+                            "url": frame["url"],
+                            "level": frame["level"],
+                            "chain": frame["chain"],
+                            "cur_val": frame["cur_val"],
+                            "skip": frame.get("skip", 0),
+                            "boundary": frame.get("boundary"),
+                            "rebuilt": frame.get("rebuilt", False),
+                        }
+                    )
+                    continue
+                idx = frame["idx"]
+                level = frame["level"]
+                if idx >= len(frame["rows"]):
+                    # Page fully processed this batch — no remaining rows to
+                    # resume here. An inline-delivered collection is complete
+                    # as delivered (nothing to synthesize); a fetched page
+                    # parks its server next-link so the sibling pages follow.
+                    if not frame.get("from_inline") and frame.get("page_next_url"):
+                        parked.append(
+                            {
+                                "url": frame["page_next_url"],
+                                "level": level,
+                                "chain": frame["chain"],
+                                "cur_val": frame["cur_val"],
+                                "skip": 0,
+                                "boundary": None,
+                            }
+                        )
+                    continue
+                boundary = (
+                    _row_order_key(frame["rows"][idx - 1], level) if idx else frame.get("boundary")
+                )
+                if not frame.get("from_inline"):
+                    park_url = frame["base_url"]
+                    park_skip = idx
+                else:
+                    # Inline-delivered rows have no page URL of their own; re-fetch
+                    # the collection under its parent (chain holds keys 0..level-1)
+                    # seeking past the last processed row.
+                    last_child = frame["rows"][idx - 1] if idx else {}
+                    park_url = self._build_expand_continuation_url(
+                        segments,
+                        level - 1,
+                        frame["chain"],
+                        cur_field if cur_field else None,
+                        park_mode,
+                        last_child,
+                        idx,
+                    )
+                    park_skip = 0
+                parked.append(
+                    {
+                        "url": park_url,
+                        "level": level,
+                        "chain": frame["chain"],
+                        "cur_val": frame["cur_val"],
+                        "skip": park_skip,
+                        "boundary": boundary,
+                    }
+                )
+            return parked
+
+        def _parkable() -> bool:
+            # A mid-way inline collection (0 < idx < len) can only be resumed
+            # by re-fetching it past the last processed row. Every mode except
+            # ``nextlink`` has a churn-safe client seek for that
+            # (``_build_expand_continuation_url``'s keyset). ``nextlink`` falls
+            # back to positional ``$skip``, which under between-batch churn can
+            # push an unread row into the skipped prefix (silent loss) — the
+            # exact failure the boundary resume exists to prevent. So in
+            # ``nextlink`` mode DON'T park while any inline collection is
+            # mid-way; finish it first (bounded by one server page, since a
+            # truncated inner collection is a server ``<Nav>@odata.nextLink``
+            # url frame, not an inline one). idx==0 (fresh) and idx==len
+            # (exhausted) park cleanly — a from-start refetch and a drop.
+            if mode != "nextlink":
+                return True
+            return not any(
+                f["kind"] == "rows" and f.get("from_inline") and 0 < f["idx"] < len(f["rows"])
+                for f in stack
+            )
+
+        while stack:
+            if countable >= max_records and _parkable():
+                # Cap reached — stop pulling new work and park the O(depth)
+                # frontier. Overshoot is bounded by the last page's leaf rows
+                # (plus, in nextlink mode, finishing an in-flight inline page).
+                break
+            if len(stack) > _MAX_PENDING_FETCHES:
+                # Safety valve: an extreme single-parent fan-out (or a
+                # nextlink server that page-limits without seek support, so
+                # depth-first still can't fully collapse) would otherwise grow
+                # the frontier unbounded. Park what we have and resume.
+                break
+            frame = stack[-1]
+            if frame["kind"] == "url":
+                stack.pop()
+                level = frame["level"]
+                try:
+                    page_rows, page_next_url = self._fetch_one_expand_page(
+                        frame["url"], self._expand_level_types(level)
+                    )
+                except requests.HTTPError as exc:
+                    replacement = self._recover_expand_item(exc, frame, segments, cur_field)
+                    if replacement is not None:
+                        _push_url(replacement)
+                    continue
+                if not page_rows:
+                    if page_next_url:
+                        # Forward the resume ``boundary`` (content-based,
+                        # churn-safe) so an empty first page doesn't drop it
+                        # before the rows it guards; ``skip`` is positional to
+                        # THIS page and so resets for the server continuation.
+                        _push_url(
+                            {
+                                "url": page_next_url,
+                                "level": level,
+                                "chain": frame["chain"],
+                                "cur_val": frame["cur_val"],
+                                "boundary": frame.get("boundary"),
+                            }
+                        )
+                    continue
+                start_idx, resume_boundary = _expand_resume_start(
+                    page_rows,
+                    frame.get("boundary"),
+                    frame.get("skip", 0),
+                    lambda r, lv=level: _row_order_key(r, lv),
+                )
+                stack.append(
+                    {
+                        "kind": "rows",
+                        "rows": page_rows,
+                        "level": level,
+                        "chain": frame["chain"],
+                        "cur_val": frame["cur_val"],
+                        "idx": start_idx,
+                        "from_inline": False,
+                        "base_url": frame["url"],
+                        "page_next_url": page_next_url,
+                        "boundary": resume_boundary,
+                        # Tops budgeted over only THIS page's collection levels
+                        # (root == fetch level downward); ancestors are fixed keys.
+                        "tops": (
+                            compute_expand_tops_for_root(page_size, len(segments), level)
+                            if page_size
+                            else None
+                        ),
+                    }
+                )
+                continue
+            # rows frame
+            if frame["idx"] >= len(frame["rows"]):
+                stack.pop()
+                if frame.get("page_next_url"):
+                    _push_url(
+                        {
+                            "url": frame["page_next_url"],
+                            "level": frame["level"],
+                            "chain": frame["chain"],
+                            "cur_val": frame["cur_val"],
                         }
                     )
                 continue
-            truncated = False
-            for row_idx in range(skip, len(page_rows)):
-                self._flatten_expand_response(
-                    level,
-                    page_rows[row_idx],
-                    segments,
-                    pks_per_level,
-                    chain,
-                    fk_columns,
-                    emitted,
-                    item_ctx,
-                    item_tops,
-                    response_url=url,
-                    pending_fetches=queue,
-                    page_size=page_size,
+            row = frame["rows"][frame["idx"]]
+            frame["idx"] += 1
+            level = frame["level"]
+            if frame.get("boundary") is not None:
+                row_key = _row_order_key(row, level)
+                # Anchor row missing: skip only rows PROVABLY at-or-below the
+                # parked boundary (collation-honest — see _chain_strictly_before);
+                # anything else is processed (duplicate-safe, never silent loss).
+                if row_key == frame["boundary"] or _chain_strictly_before(
+                    row_key, frame["boundary"]
+                ):
+                    continue
+            row_cur_val = frame["cur_val"]
+            if cur_field and level == cur_level:
+                row_cur_val = row.get(cur_field)
+            if level == leaf_level:
+                prev_len = len(emitted)
+                self._emit_leaf_row(
+                    row, segments, frame["chain"], fk_columns, emitted, cur_field, row_cur_val
                 )
-                if len(emitted) >= max_records and row_idx + 1 < len(page_rows):
-                    # Mid-page: re-queue the SAME URL at the front so
-                    # the next batch resumes here without scrambling
-                    # depth ordering.
-                    queue.insert(
-                        0,
-                        {
-                            "url": url,
-                            "level": level,
-                            "chain": [dict(p) for p in chain],
-                            "cur_val": cur_val,
-                            "skip": row_idx + 1,
-                        },
-                    )
-                    truncated = True
-                    break
-            if not truncated and page_next_url:
-                queue.append(
+                countable += _count_new(emitted[prev_len:])
+                continue
+            # Non-leaf: descend depth-first. Push the truncated-tail
+            # continuation FIRST (bottom) and the inline children ON TOP, so
+            # inline rows drain before the tail — and the inline collection is
+            # ONE in-memory rows frame, never N queued items (kills the width
+            # burst; the frontier stays O(depth)).
+            child_chain = frame["chain"] + [{pk: row.get(pk) for pk in pks_per_level[level]}]
+            next_ctx = (cur_field, cur_level, row_cur_val) if cur_field else None
+            cont_url = self._derive_child_continuation(
+                level,
+                row,
+                segments,
+                child_chain,
+                next_ctx,
+                frame.get("tops"),
+                page_size,
+                frame["base_url"],
+            )
+            inline_children = row.get(segments[level + 1]) or []
+            if cont_url is not None:
+                _push_url(
                     {
-                        "url": page_next_url,
-                        "level": level,
-                        "chain": [dict(p) for p in chain],
-                        "cur_val": cur_val,
-                        "skip": 0,
+                        "url": cont_url,
+                        "level": level + 1,
+                        "chain": child_chain,
+                        "cur_val": row_cur_val,
                     }
                 )
-        return queue
+            if inline_children:
+                stack.append(
+                    {
+                        "kind": "rows",
+                        "rows": inline_children,
+                        "level": level + 1,
+                        "chain": child_chain,
+                        "cur_val": row_cur_val,
+                        "idx": 0,
+                        "from_inline": True,
+                        "base_url": frame["base_url"],
+                        "page_next_url": None,
+                        "boundary": None,
+                        "tops": frame.get("tops"),
+                    }
+                )
+        return _park() if stack else []
 
     def _stream_expand_pages(
         self,
         initial_queue: list[dict],
         segments: list[str],
         pks_per_level: list[list[str]],
-        fk_columns: dict[tuple[str, str], str],
+        fk_columns: dict[tuple[int, str], str],
         ctx: tuple | None,
         page_size: int | None,
     ) -> Iterator[dict]:
@@ -2322,9 +3917,18 @@ class ContainedNavMixin:
         queue exactly as the drainer does. No ``max_records`` cap and no
         cross-page accumulation: peak memory is one response's flattened
         cross-product (bounded by the ``page_size`` budget) plus the queue
-        of pending fetch descriptors (URLs + chains, not rows). Emission
-        order matches the drainer's ``emitted`` order — inline rows first,
-        deferred continuations processed when their queue item is popped."""
+        of pending fetch descriptors (URLs + chains, not rows). Unlike the
+        drainer, the queue here has NO ``_MAX_PENDING_FETCHES`` ceiling —
+        the drainer's cap bounds what gets PARKED INTO THE OFFSET (a
+        checkpoint-size concern), while this queue never persists and its
+        items are small descriptors; a server deferring every inner
+        collection grows it to one descriptor per parent, modest even at
+        100k parents. Within each page rows flatten inline-first (parent
+        then children), matching ``_emit_leaf_row`` order; ACROSS pages this
+        reader is breadth-first (FIFO queue) whereas the capped drainer is
+        depth-first, so cross-parent order differs between the two. That is
+        immaterial here: the batch path is uncapped and never checkpoints, so
+        emission order carries no resume semantics."""
         queue: list[dict] = list(initial_queue)
         cur_field, cur_level, _ = ctx or (None, -1, None)
         while queue:
@@ -2338,7 +3942,18 @@ class ContainedNavMixin:
             item_tops = (
                 compute_expand_tops_for_root(page_size, len(segments), level) if page_size else None
             )
-            page_rows, page_next_url = self._fetch_one_expand_page(url)
+            # Same deleted-parent / stale-continuation recovery as the
+            # drainer: inner continuations queued earlier in THIS walk can
+            # 404 when the parent vanishes mid-walk.
+            try:
+                page_rows, page_next_url = self._fetch_one_expand_page(
+                    url, self._expand_level_types(level)
+                )
+            except requests.HTTPError as exc:
+                replacement = self._recover_expand_item(exc, item, segments, cur_field)
+                if replacement is not None:
+                    queue.insert(0, replacement)
+                continue
             if not page_rows:
                 if page_next_url:
                     queue.append(
@@ -2379,10 +3994,123 @@ class ContainedNavMixin:
                     }
                 )
 
-    def _fetch_one_expand_page(self, url: str) -> tuple[list[dict], str | None]:
+    def _recover_expand_item(
+        self,
+        exc: requests.HTTPError,
+        item: dict,
+        segments: list[str],
+        cursor_field: str | None,
+    ) -> dict | None:
+        """Handle a 404/410 on a parked expand work item's URL.
+
+        Level >= 1 items carry ENTITY-SCOPED URLs
+        (``Parents(k)/Children?$skiptoken=…``) parked across batches in
+        ``pending_fetches`` — and the world moves between batches. Two
+        distinct causes produce the same status:
+
+        * the parent entity was **deleted** → every URL under it is dead
+          forever; re-raising turns the checkpoint into a permanently
+          failing stream (the resume replays the same dead URL on every
+          trigger — only a full refresh recovers);
+        * the **continuation went stale** (e.g. an expired server
+          ``$skiptoken``) while the parent still exists → dropping the
+          item would silently lose the rest of that collection.
+
+        Disambiguate by REBUILDING the item's URL from scratch and
+        re-queueing it marked ``rebuilt``: a level >= 1 item's child
+        collection via ``_build_expand_continuation_url`` (``mode="skip"``,
+        ``inline_count=0`` — the read's cursor filter/order and grandchild
+        expands intact); a level-0 item — a parked TOP-LEVEL server
+        continuation, whose ``$skiptoken`` can equally expire while the
+        collection lives — via the same seed-URL construction the read
+        entry uses (``_cursor_expand_clause`` + ``_build_expand_url`` from
+        the stashed options/watermark), re-reading the top collection from
+        ``since``. If the rebuilt URL fails too, the SECOND recovery pass
+        resolves by level: level >= 1 DROPS the item (the parent entity is
+        gone — duplicate-safe; already-emitted rows stand), while level 0
+        RE-RAISES (the whole collection vanishing is a config/service
+        error, not row churn). Non-404/410 statuses always re-raise.
+
+        Returns the replacement item, or ``None`` to drop.
+        """
+        status = exc.response.status_code if exc.response is not None else None
+        level = item.get("level", 0)
+        if status not in (404, 410):
+            raise exc
+        chain = [dict(p) for p in item.get("chain") or []]
+        if item.get("rebuilt"):
+            if level < 1:
+                raise exc  # collection itself is gone — config error
+            _LOG.warning(
+                "expand resume: parent %s no longer exists (HTTP %s on the "
+                "rebuilt collection URL too) — dropping its parked subtree. "
+                "Rows already emitted for it remain; the deletion is not "
+                "propagated (connector is insert/upsert-only).",
+                chain,
+                status,
+            )
+            return None
+        _LOG.warning(
+            "expand resume: parked continuation (level %s, parent %s) returned "
+            "HTTP %s (deleted parent, or a stale server continuation) — "
+            "rebuilding the URL from scratch and retrying once.",
+            level,
+            chain,
+            status,
+        )
+        if level >= 1:
+            fresh_url = self._build_expand_continuation_url(
+                segments, level - 1, chain, cursor_field, "skip", {}, 0
+            )
+        else:
+            # Rebuild the top-level seed exactly as the read entry does.
+            table_options = getattr(self, "_expand_cont_opts", None) or {}
+            since = getattr(self, "_expand_cont_since", None)
+            namespace = table_options.get("namespace")
+            if cursor_field:
+                (
+                    cursor_level,
+                    cursor_filter,
+                    cursor_order,
+                    cursor_select,
+                ) = self._cursor_expand_clause(segments, namespace, cursor_field, since)
+            else:
+                cursor_level, cursor_filter, cursor_order, cursor_select = -1, None, None, None
+            fresh_url = self._build_expand_url(
+                segments,
+                table_options,
+                cursor_level=cursor_level if cursor_field else None,
+                cursor_filter=cursor_filter,
+                cursor_order=cursor_order,
+                cursor_select=cursor_select,
+            )
+        return {
+            "url": fresh_url,
+            "level": level,
+            "chain": chain,
+            "cur_val": item.get("cur_val"),
+            "skip": 0,
+            "rebuilt": True,
+        }
+
+    def _expand_level_types(self, level: int) -> dict[str, str] | None:
+        """The stashed property→Edm-type map for the collection at ``level``
+        of the current expand read (see the stash in
+        ``_read_contained_expand``), or ``None`` outside one / past the
+        stash's depth — the seek builder then falls back to value sniffing."""
+        stash = getattr(self, "_expand_types_per_level", None)
+        if stash and 0 <= level < len(stash):
+            return stash[level]
+        return None
+
+    def _fetch_one_expand_page(
+        self, url: str, edm_types: dict[str, str] | None = None
+    ) -> tuple[list[dict], str | None]:
         """One HTTP GET; returns ``(page_rows, next_url)``. Thin wrapper
         over :meth:`_fetch_pages_with_links` that consumes a single
         iteration so the caller can check the cap between fetches.
+        ``edm_types`` (the fetched collection's declared property types)
+        types any keyset-seek boundary built for the returned ``next_url``.
 
         No-progress guard for the work-queue drainers: those slice pagination
         one page per call, so the in-generator guard in
@@ -2408,7 +4136,7 @@ class ContainedNavMixin:
         — and a repeated row is deduped at the destination by ``apply_changes``'
         MERGE on the primary key (a harmless duplicate, vs. the data loss a
         short-page stop causes)."""
-        for page_rows, page_next_url in self._fetch_pages_with_links(url):
+        for page_rows, page_next_url in self._fetch_pages_with_links(url, edm_types):
             return page_rows, (None if page_next_url == url else page_next_url)
         return [], None
 
@@ -2441,10 +4169,13 @@ class ContainedNavMixin:
             return {"pending_fetches": list(pending_queue)} if in_flight else {}
         prior_running = (start_offset or {}).get("running_max_cursor")
         batch_cursors = [r.get(cursor_field) for r in emitted if r.get(cursor_field) is not None]
+        # Chronological max (``_cursor_max``): a lexical max over mixed
+        # fractional renderings regresses the running watermark behind
+        # emitted rows.
         if batch_cursors and prior_running is not None:
-            new_running = max([*batch_cursors, prior_running])
+            new_running = _cursor_max([*batch_cursors, prior_running])
         elif batch_cursors:
-            new_running = max(batch_cursors)
+            new_running = _cursor_max(batch_cursors)
         else:
             new_running = prior_running
         since = (start_offset or {}).get("cursor")
@@ -2456,7 +4187,12 @@ class ContainedNavMixin:
                 offset["running_max_cursor"] = new_running
             return offset
         if new_running is not None:
-            return {"cursor": new_running}
+            # Floored at ``since``: the lookback overlap re-reads below the
+            # committed watermark, so after a deleted watermark row (or a
+            # stale ``running_max_cursor`` resumed from a mode flip) the
+            # running max alone can sit BELOW ``since`` — committing it
+            # as-is would regress the watermark.
+            return {"cursor": _max_or(new_running, since)}
         if since is not None:
             return {"cursor": since}
         # Chain drained AND no watermark to park (no prior ``since``, no
@@ -2479,9 +4215,10 @@ class ContainedNavMixin:
         """``(cursor_level, $filter, $orderby, $select)`` for ``$expand``
         mode. Returns ``(-1, None, None, None)`` when no cursor is set;
         the caller raises if the cursor isn't a property of any segment.
-        ``$select`` is non-empty only when the cursor lives on a non-top
-        segment — it forces the server to project the cursor column on
-        the expanded ancestor (some servers default-omit it)."""
+        The ``$select`` slot is always ``None`` today (see the comment
+        below) but stays in the tuple: ``_build_expand_url`` merges it
+        into the cursor level's clause, and the leaf level additionally
+        merges the user's leaf-scoped ``select`` option."""
         if not cursor_field:
             return -1, None, None, None
         cursor_level = self._find_cursor_level(segments, namespace, cursor_field)
@@ -2508,9 +4245,120 @@ class ContainedNavMixin:
         read_since = self._apply_cursor_lookback(since)
         return (
             cursor_level,
-            self._cursor_filter(cursor_field, read_since),
+            self._cursor_filter(
+                cursor_field,
+                read_since,
+                edm_type=self._edm_types_for_et(level_et).get(cursor_field),
+            ),
             ",".join(order_terms),
             None,
+        )
+
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
+    def _emit_leaf_row(
+        self,
+        row: dict,
+        segments: list[str],
+        chain: list[dict[str, Any]],
+        fk_columns: dict[tuple[int, str], str],
+        out: list[dict],
+        cur_field: str | None,
+        cur_val: Any,
+    ) -> None:
+        """Emit one LEAF row: strip OData annotations, tag ancestor FKs, and
+        stamp the inherited cursor value when the leaf doesn't carry its own.
+        Shared by :meth:`_flatten_expand_response` (streaming recursion) and
+        the :meth:`_drain_expand_pages` stack machine so both emit identically.
+        """
+        # Drop both top-level (``@odata.foo``) and per-property
+        # (``Foo@odata.nextLink``) annotations from leaf rows; the framework
+        # wouldn't know what to do with either.
+        clean = {k: v for k, v in row.items() if "@odata." not in k}
+        self._tag_with_ancestor_fks(clean, segments, chain, fk_columns)
+        if cur_field and cur_val is not None and clean.get(cur_field) is None:
+            clean[cur_field] = cur_val
+        out.append(clean)
+
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
+    def _derive_child_continuation(
+        self,
+        level: int,
+        row: dict,
+        segments: list[str],
+        chain: list[dict[str, Any]],
+        next_ctx: tuple[str | None, int, Any] | None,
+        per_level_tops: list[int] | None,
+        page_size: int | None,
+        base_url: str,
+    ) -> str | None:
+        """Resolve the continuation URL for ``row``'s inner collection at
+        ``level + 1`` (or ``None`` when the collection is complete / not
+        continuable). ``chain`` MUST already include ``row``'s own keys
+        (levels ``0..level``). Extracted verbatim from
+        :meth:`_flatten_expand_response` so the stack machine derives the
+        exact same continuations.
+        """
+        next_seg = segments[level + 1]
+        inner_next = row.get(f"{next_seg}@odata.nextLink")
+        if inner_next:
+            # _resolve_next_link, NOT a plain urljoin: some servers (Hexagon
+            # SCApi, SAP Gateway) return per-property continuation links
+            # relative to the SERVICE ROOT — urljoin against this deep page
+            # URL would double the ancestor path (→ 404 and a full
+            # rebuild-from-keys re-read on every inner continuation).
+            resolved = self._resolve_next_link(base_url, inner_next)
+            if per_level_tops:
+                # Continuation pages the collection at ``level + 1`` under one
+                # specific parent at ``level``. The original ``$top`` for that
+                # level was sized against the FULL cross-product budget
+                # (top × inner × …); the continuation is one outer level
+                # shallower, so we have more budget to spend per response. New
+                # $top is ``page_size_budget / inner_product`` where
+                # ``inner_product`` is the cross-product of all levels deeper
+                # than ``level + 1`` (which the server-side ``$expand`` chain
+                # in the nextLink still applies).
+                continuation_level = level + 1
+                inner_product = 1
+                for t in per_level_tops[continuation_level + 1 :]:
+                    inner_product *= t
+                # Budget is the full page_size: the ancestors 0..level are a
+                # single fixed parent in the continuation, so they don't
+                # multiply. ``page_size`` is passed explicitly rather than
+                # re-derived from per_level_tops, whose entries below this
+                # request's root level are placeholders. (per_level_tops is only
+                # truthy when page_size was set, so page_size is present here.)
+                new_top = max(MIN_DYNAMIC_TOP, (page_size or 0) // max(1, inner_product))
+                resolved = rewrite_top_in_url(resolved, new_top)
+            return resolved
+        if next_seg in row and row[next_seg] is not None:
+            # No ``<NavProp>@odata.nextLink``. In a client-driven pagination
+            # mode (keyset/skip/auto), synthesize a direct-navigation
+            # continuation when the inline page is a FULL page (== $top) and
+            # so plausibly truncated; otherwise the inline page is taken as
+            # the whole collection — today's nextlink-only behaviour. This
+            # closes the inner-``$expand`` hole for servers that page-limit a
+            # response but never emit the continuation link.
+            return self._inner_expand_continuation_url(
+                level, row, segments, chain, next_ctx, per_level_tops
+            )
+        # The expanded property is wholly ABSENT (or null) — spec-violating:
+        # OData v4 requires every ``$expand``-ed property be PRESENT on each
+        # row (a genuinely empty collection comes back as ``[]``, which the
+        # branch above trusts). A partial-expansion server that inlines
+        # children for some parents and omits the property for others would
+        # otherwise have those subtrees silently dropped — absent is NOT
+        # verified-empty. Fetch the collection directly from the start: mode
+        # "skip" + count 0 yields a plain ``$skip=0`` from-the-beginning URL
+        # with the deeper ``$expand`` chain intact, without engaging the
+        # keyset OR-support probe an empty boundary couldn't use anyway.
+        return self._build_expand_continuation_url(
+            segments,
+            level,
+            chain,
+            next_ctx[0] if next_ctx else None,
+            "skip",
+            {},
+            0,
         )
 
     # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
@@ -2521,7 +4369,7 @@ class ContainedNavMixin:
         segments: list[str],
         pks_per_level: list[list[str]],
         chain: list[dict[str, Any]],
-        fk_columns: dict[tuple[str, str], str],
+        fk_columns: dict[tuple[int, str], str],
         out: list[dict],
         cursor_ctx: tuple[str | None, int, Any] | None = None,
         per_level_tops: list[int] | None = None,
@@ -2570,14 +4418,7 @@ class ContainedNavMixin:
         if cur_field and level == cur_level:
             cur_val = row.get(cur_field)
         if level == len(segments) - 1:
-            # Drop both top-level (``@odata.foo``) and per-property
-            # (``Foo@odata.nextLink``) annotations from leaf rows; the
-            # framework wouldn't know what to do with either.
-            clean = {k: v for k, v in row.items() if "@odata." not in k}
-            self._tag_with_ancestor_fks(clean, segments, chain, fk_columns)
-            if cur_field and cur_val is not None and clean.get(cur_field) is None:
-                clean[cur_field] = cur_val
-            out.append(clean)
+            self._emit_leaf_row(row, segments, chain, fk_columns, out, cur_field, cur_val)
             return
         pks = pks_per_level[level]
         chain.append({pk: row.get(pk) for pk in pks})
@@ -2598,43 +4439,9 @@ class ContainedNavMixin:
                 pending_fetches=pending_fetches,
                 page_size=page_size,
             )
-        inner_next = row.get(f"{next_seg}@odata.nextLink")
-        if inner_next:
-            resolved = urljoin(base_url, inner_next)
-            if per_level_tops:
-                # Continuation pages the collection at ``level + 1``
-                # under one specific parent at ``level``. The original
-                # ``$top`` for that level was sized against the FULL
-                # cross-product budget (top × inner × …); the
-                # continuation is one outer level shallower, so we
-                # have more budget to spend per response. New $top is
-                # ``page_size_budget / inner_product`` where
-                # ``inner_product`` is the cross-product of all levels
-                # deeper than ``level + 1`` (which the server-side
-                # ``$expand`` chain in the nextLink still applies).
-                continuation_level = level + 1
-                inner_product = 1
-                for t in per_level_tops[continuation_level + 1 :]:
-                    inner_product *= t
-                # Budget is the full page_size: the ancestors 0..level are a
-                # single fixed parent in the continuation, so they don't
-                # multiply. ``page_size`` is passed explicitly rather than
-                # re-derived from per_level_tops, whose entries below this
-                # request's root level are placeholders. (per_level_tops is only
-                # truthy when page_size was set, so page_size is present here.)
-                new_top = max(MIN_DYNAMIC_TOP, (page_size or 0) // max(1, inner_product))
-                resolved = rewrite_top_in_url(resolved, new_top)
-        else:
-            # No ``<NavProp>@odata.nextLink``. In a client-driven pagination
-            # mode (keyset/skip/auto), synthesize a direct-navigation
-            # continuation when the inline page is a FULL page (== $top) and
-            # so plausibly truncated; otherwise the inline page is taken as
-            # the whole collection — today's nextlink-only behaviour. This
-            # closes the inner-``$expand`` hole for servers that page-limit a
-            # response but never emit the continuation link.
-            resolved = self._inner_expand_continuation_url(
-                level, row, segments, chain, next_ctx, per_level_tops
-            )
+        resolved = self._derive_child_continuation(
+            level, row, segments, chain, next_ctx, per_level_tops, page_size, base_url
+        )
         if resolved is not None:
             if pending_fetches is not None:
                 # Defer the follow: the outer drainer pops one fetch
@@ -2658,7 +4465,9 @@ class ContainedNavMixin:
             # continuation via ``_client_paginate_pages`` (the synthesized
             # URL carries the seek/skip), draining the whole collection.
             inner_current = resolved
-            for page_rows, page_next in self._fetch_pages_with_links(resolved):
+            for page_rows, page_next in self._fetch_pages_with_links(
+                resolved, self._expand_level_types(level + 1)
+            ):
                 for child in page_rows:
                     self._flatten_expand_response(
                         level + 1,
@@ -2685,13 +4494,16 @@ class ContainedNavMixin:
         per_level_tops: list[int] | None,
     ) -> str | None:
         """Synthesize a client-driven continuation for a parent's inner
-        collection when the server returned a *full* inline page but omitted
-        its ``<NavProp>@odata.nextLink``.
+        collection when the server returned a NON-EMPTY inline page but
+        omitted its ``<NavProp>@odata.nextLink``.
 
-        Returns ``None`` unless ``pagination`` is keyset/skip/auto, ``$top``
-        is in force (``per_level_tops`` set), and the inline child page is
-        exactly ``$top`` rows (so it's plausibly truncated). A short page is
-        proof the collection is complete, so it's taken at face value.
+        Returns ``None`` only when ``pagination`` is ``nextlink``, ``$top``
+        isn't in force (``per_level_tops`` unset), or the inline collection
+        is empty. Any non-empty inline page gets a continuation — a short
+        page is NOT taken as proof of completeness (a server may page-limit
+        a nested ``$expand`` below the requested per-level ``$top``); see
+        the inline comment below for the full rationale and the one-empty-
+        request cost this trades for closing that silent-truncation hole.
         """
         mode = getattr(self, "_pagination", "nextlink")
         if mode == "nextlink" or per_level_tops is None:
@@ -2771,7 +4583,7 @@ class ContainedNavMixin:
         # root the request at this parent's child collection.
         contained_base = join_url(
             self.service_url,
-            self._build_contained_path(segments[: child_level + 1], chain),
+            self._build_contained_path(segments[: child_level + 1], chain, namespace),
         )
         # Budget the continuation's $top over only its own collection levels
         # (child_level..leaf); levels 0..level are now fixed keys in the path, so
@@ -2798,19 +4610,23 @@ class ContainedNavMixin:
             cont_tops,
         )
         order_keys = _pg_orderby_keys(url)
+        # $orderby names properties of the CHILD collection's entity type —
+        # its declared types steer seek-literal quoting (guid bare / string
+        # quoted); best-effort so a resolution gap degrades to the sniff.
+        child_types = self._edm_types_for_level(segments, child_level, namespace)
         # Skip the OR-across-columns keyset seek on servers that reject it
         # (preflight, cached) — fall through to $skip (mode B). Single-key
         # $orderby never builds an OR, so the probe short-circuits there.
         if (
             mode in ("keyset", "auto")
             and order_keys
-            and self._verify_or_filter_support(url, order_keys, last_child)
+            and self._verify_or_filter_support(url, order_keys, last_child, child_types)
         ):
-            seek = _pg_keyset_filter(order_keys, last_child)
+            seek = _pg_keyset_filter(order_keys, last_child, child_types)
             if seek is not None:
                 # Stash the clean child-level $filter as the keyset base so a
                 # cross-batch resume REPLACES the seek instead of accumulating.
-                return _pg_keyset_seek_url(url, _pg_get_query(url, "$filter"), seek)
+                return _pg_keyset_seek_url(url, _pg_get_filter(url), seek)
         return _pg_set_query(url, "$skip", str(inline_count))
 
     def _leaf_cursor_order_by(
@@ -2837,7 +4653,7 @@ class ContainedNavMixin:
         leaf_et = self._entity_type_for(CONTAINED_PATH_SEP.join(segments), namespace)
         return _ancestor_pk_order_by(self._own_primary_keys_for_et(leaf_et))
 
-    # pylint: disable=too-many-statements
+    # pylint: disable=too-many-statements,too-many-branches
     def _walk_contained_with_cursor(
         self,
         segments: list[str],
@@ -2850,11 +4666,13 @@ class ContainedNavMixin:
         truncated_chain_cursor: Any,
         chain_next_link: str | None,
         max_records: int,
-        fk_columns: dict[tuple[str, str], str],
+        fk_columns: dict[tuple[int, str], str],
         leaf_segment_filter: str | None = None,
         effective=None,
         skip_null: bool = False,
-    ) -> tuple[list[dict], bool, int, str | None, Any]:
+        parked_chain: list | None = None,
+        count_floor: Any = None,
+    ) -> tuple[list[dict], bool, int, list | None, str | None, Any]:
         """Drive the per-parent fetch loop (leaf-cursor mode).
 
         ``chains_iter`` is consumed lazily and the walk stops at the
@@ -2865,7 +4683,20 @@ class ContainedNavMixin:
         is emitted in full and absorbed into the walk rather than
         checkpointed.
 
-        Resume preference, applied to the chain at ``parent_idx_start``:
+        Resume positioning: ``parked_chain`` (the truncated parent's key
+        chain, parked by the previous batch) is matched by the
+        enumeration's own ordering keys — churn-stable, unlike the
+        positional ``parent_idx_start`` skip it supersedes (see
+        :func:`_chain_strictly_before` for the loss/mis-tagging modes a
+        positional resume has under inserts/deletes between batches).
+        Offsets written before ``parent_keys`` existed carry only
+        ``parent_idx``, and fall back to the positional skip. A parked
+        chain that vanished (parent deleted) resumes at the first chain
+        past its position with the global ``since``. A park written by
+        the ``$batch`` walk (no continuation keys) is EXCLUSIVE — the
+        parked chain itself was fully drained and is skipped.
+
+        Resume preference, applied to the resume-target chain:
 
         1. ``chain_next_link`` (server skiptoken) — fetched directly,
            bypassing URL rebuild. Used when the previous batch parked
@@ -2888,8 +4719,10 @@ class ContainedNavMixin:
           the walk continues to the next parent. The cap is overshot
           for that one parent (bounded by one server response).
 
-        Returns ``(rows, truncated, parent_idx, chain_next_link_out,
-        truncated_chain_cursor_out)``.
+        Returns ``(rows, truncated, parent_idx, parked_chain_out,
+        chain_next_link_out, truncated_chain_cursor_out)`` —
+        ``parked_chain_out`` is the truncated parent's key chain (for the
+        next batch's key-based resume), ``None`` when not truncated.
 
         ``effective(row)`` supplies the cursor value used for filtering,
         the boundary trim and (via the caller) the watermark — the
@@ -2905,26 +4738,78 @@ class ContainedNavMixin:
         truncated = False
         parent_idx = 0
         chain_start_idx = 0
+        # Only rows strictly above the COMMITTED watermark (``count_floor``,
+        # the true ``since`` — not the lookback-floored read filter) count
+        # toward ``max_records``: overlap re-reads ride on top, so a lookback
+        # window holding >= max_records rows can't wedge the stream into an
+        # eternal park/complete duplicate cycle — a pure-overlap walk always
+        # completes and hits the suppressed-idle rule. The cap may overshoot
+        # by the overlap size (bounded by the user's lookback window).
+        countable = 0
+        parked_chain_out: list | None = None
         chain_next_link_out: str | None = None
         truncated_chain_cursor_out: Any = None
+        parked_key = _chain_resume_key(parked_chain) if parked_chain is not None else None
+        # A park with a continuation key resumes AT the parked chain; a park
+        # without one (written by the $batch walk) is exclusive — the parked
+        # chain was fully drained.
+        resume_inclusive = chain_next_link is not None or truncated_chain_cursor is not None
+        seeking = parked_key is not None
+        # Leaf-collection property types: the compound keyset seek built while
+        # paging a leaf collection (ALSO the cap-hit resume checkpoint) must
+        # render its boundaries typed (guid bare / ISO-looking string quoted).
+        leaf_types = self._edm_types_for_level(
+            segments, len(segments) - 1, (table_options or {}).get("namespace")
+        )
         for chain in chains_iter:
-            # Skip the chains we already emitted in prior batches. The
-            # iterator still pays for the ancestor pages that produce
-            # those chains (no way to skip without knowing the keys),
-            # but no leaf fetches happen here.
-            if parent_idx < parent_idx_start:
-                parent_idx += 1
-                continue
+            # Skip the chains we already emitted in prior batches — by the
+            # enumeration's own ordering keys when the offset parked them
+            # (churn-stable), positionally for legacy index-only offsets.
+            # The iterator still pays for the ancestor pages that produce
+            # those chains (no way to skip without fetching the keys),
+            # but no leaf fetches happen during the skip.
+            if parked_key is not None:
+                if seeking:
+                    at_parked = chain == parked_chain
+                    if (
+                        not at_parked
+                        and _chain_seek_order(_chain_resume_key(chain), parked_key) != "after"
+                    ):
+                        # "before": provably drained by a prior batch.
+                        # "unknown" (server-collated text keys whose order
+                        # isn't reproducible client-side): keep seeking on
+                        # the identity anchor rather than trusting ordinal
+                        # comparison, which silently skips unwalked subtrees
+                        # on CI-collation servers. If the parked chain
+                        # vanished, the seek runs out, this batch emits
+                        # nothing, and the cleared park re-walks everything
+                        # next batch (duplicate-safe, never loss — see the
+                        # post-loop warning).
+                        parent_idx += 1
+                        continue
+                    seeking = False
+                    if at_parked and not resume_inclusive:
+                        # Exclusive park: the parked chain itself is done.
+                        parent_idx += 1
+                        continue
+                    is_resume_target = at_parked
+                else:
+                    is_resume_target = False
+            else:
+                if parent_idx < parent_idx_start:
+                    parent_idx += 1
+                    continue
+                is_resume_target = parent_idx == parent_idx_start
             chain_start_idx = len(emitted)
             chain_since: Any
             initial_url: str
-            if parent_idx == parent_idx_start and chain_next_link is not None:
+            if is_resume_target and chain_next_link is not None:
                 # Resume from the server's own skiptoken; no client-side
                 # filter — the link already encodes filter/order state.
                 chain_since = None
                 initial_url = chain_next_link
             else:
-                if parent_idx == parent_idx_start and truncated_chain_cursor is not None:
+                if is_resume_target and truncated_chain_cursor is not None:
                     chain_since = truncated_chain_cursor
                 else:
                     chain_since = since
@@ -2933,7 +4818,11 @@ class ContainedNavMixin:
                     chain,
                     table_options,
                     extra_filter=combine_filters(
-                        self._cursor_filter(cursor_field, chain_since),
+                        self._cursor_filter(
+                            cursor_field,
+                            chain_since,
+                            edm_type=leaf_types.get(cursor_field),
+                        ),
                         leaf_segment_filter,
                     ),
                     order_by=order_by,
@@ -2951,20 +4840,26 @@ class ContainedNavMixin:
             # cohort that spans the cap (better than the cursor-only trim below,
             # which is kept for nextlink mode / whole-leaf-in-one-response
             # servers where ``page_next_url`` is None).
-            for page_rows, page_next_url in self._fetch_pages_with_links(initial_url):
+            for page_rows, page_next_url in self._fetch_pages_with_links(initial_url, leaf_types):
                 for row in page_rows:
                     if skip_null and row.get(cursor_field) is None:
                         continue
                     rec_cursor = effective(row)
+                    # Chronological, not lexical (``_cursor_le``) — see the
+                    # flat re-filter in ``_read_incremental``.
                     if (
                         chain_since is not None
                         and rec_cursor is not None
-                        and rec_cursor <= chain_since
+                        and _cursor_le(rec_cursor, chain_since)
                     ):
                         continue
                     self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                     emitted.append(row)
-                    if len(emitted) >= max_records:
+                    if count_floor is None or (
+                        rec_cursor is not None and _cursor_newer(rec_cursor, count_floor)
+                    ):
+                        countable += 1
+                    if countable >= max_records:
                         cap_hit_in_page = True
                 if cap_hit_in_page:
                     # Finish the current page (above) so its nextLink is a
@@ -2974,9 +4869,11 @@ class ContainedNavMixin:
             if cap_hit_in_page:
                 if page_next_url is not None:
                     # Page boundary mid-collection: the server skiptoken is
-                    # a clean resume point — park it and re-enter this
-                    # parent next batch.
+                    # a clean resume point — park it (with this chain's keys
+                    # so the resume re-finds THIS parent under churn) and
+                    # re-enter this parent next batch.
                     truncated = True
+                    parked_chain_out = chain
                     chain_next_link_out = page_next_url
                     break
                 # No nextLink ⇒ the server returned this parent's ENTIRE
@@ -2988,6 +4885,7 @@ class ContainedNavMixin:
                 if trimmed:
                     del emitted[chain_start_idx + len(trimmed) :]
                     truncated = True
+                    parked_chain_out = chain
                     # Effective value (synthetic floor for a null under
                     # coalesce) so the resumed ``cursor gt`` is a real,
                     # comparable boundary — never the restored-null column.
@@ -3003,10 +4901,34 @@ class ContainedNavMixin:
                 parent_idx += 1
                 continue
             parent_idx += 1
+        if seeking:
+            # The anchor was never re-found (parent deleted, or its key
+            # rendering changed between batches) and the remaining chains
+            # couldn't be PROVEN already-walked. Completing here would let
+            # the caller fold ``running_max`` into the committed cursor —
+            # locking every unwalked subtree's sub-max rows out forever —
+            # so return a TRUNCATED reset instead: no park, positional
+            # restart at 0, cursor floor kept. The next batch re-walks
+            # everything above ``since`` (duplicate-safe, deduplicated by
+            # the destination MERGE), never loss.
+            _LOG.warning(
+                "Parked resume position %r was not re-found while enumerating "
+                "%r; this batch emitted nothing and reset the walk — the next "
+                "batch re-walks from the committed cursor floor "
+                "(duplicate-safe).",
+                parked_chain,
+                segments,
+            )
+            truncated = True
+            parent_idx = 0
+            parked_chain_out = None
+            chain_next_link_out = None
+            truncated_chain_cursor_out = None
         return (
             emitted,
             truncated,
             parent_idx,
+            parked_chain_out,
             chain_next_link_out,
             truncated_chain_cursor_out,
         )
@@ -3022,12 +4944,15 @@ class ContainedNavMixin:
         cursor_field: str,
         since: Any,
         max_records: int,
-        fk_columns: dict[tuple[str, str], str],
+        fk_columns: dict[tuple[int, str], str],
         leaf_segment_filter: str | None = None,
         effective=None,
         skip_null: bool = False,
         batch_size: int = _BATCH_MAX_OPS,
-    ) -> tuple[list[dict], bool, int, None, None]:
+        parked_chain: list | None = None,
+        resume_inclusive: bool = False,
+        count_floor: Any = None,
+    ) -> tuple[list[dict], bool, int, list | None, None, None]:
         """OData ``$batch`` counterpart to :meth:`_walk_contained_with_cursor`.
 
         Hydrates leaf collections via ``$batch`` instead of one GET per
@@ -3041,14 +4966,19 @@ class ContainedNavMixin:
         is identical — only the request shape differs.
 
         Resume + cap are **chunk-aligned**: the cap is checked after each
-        fully-drained group, so truncation parks ``parent_idx`` at the next group
-        boundary. ``chain_next_link`` / ``truncated_chain_cursor`` are unused
-        (returned ``None``) — a resumed batch re-enumerates ancestors and skips
-        ``parent_idx`` chains exactly like the plain walk. The cap is overshot by
-        at most one group's worth of changed rows (the same bounded-overshoot
-        tolerance the plain walk applies to a single complete parent).
+        fully-drained group, so truncation parks the LAST DRAINED chain's keys
+        (an EXCLUSIVE park — that chain is complete; the resume skips through
+        it by the enumeration's ordering keys, churn-stable). Legacy
+        index-only offsets fall back to the positional ``parent_idx`` skip.
+        ``chain_next_link`` / ``truncated_chain_cursor`` are unused (returned
+        ``None``); a serial-walk park resumed here (``resume_inclusive``)
+        re-drains the parked chain in full — duplicates, never loss. The cap
+        is overshot by at most one group's worth of changed rows (the same
+        bounded-overshoot tolerance the plain walk applies to a single
+        complete parent).
 
-        Returns the 5-tuple ``(emitted, truncated, parent_idx, None, None)``."""
+        Returns the 6-tuple
+        ``(emitted, truncated, parent_idx, parked_chain_out, None, None)``."""
         if effective is None:
 
             def effective(row):
@@ -3057,14 +4987,20 @@ class ContainedNavMixin:
         emitted: list[dict] = []
         truncated = False
         parent_idx = 0
+        # New-rows-only cap accounting — see _walk_contained_with_cursor.
+        countable = 0
         group: list[list[dict[str, Any]]] = []
         # Drop ``page_size`` so the per-leaf-parent sub-requests carry NO ``$top``
         # — the server drives paging and emits ``@odata.nextLink`` for any
         # overflow (the keyset/$skip drain the plain ``auto`` walk would use to
         # continue a short link-less page can't run inside a batch sub-request).
         leaf_opts = {k: v for k, v in (table_options or {}).items() if k != "page_size"}
+        leaf_types = self._edm_types_for_level(
+            segments, len(segments) - 1, (table_options or {}).get("namespace")
+        )
 
         def _drain_group(buffered: list[list[dict[str, Any]]]) -> None:
+            nonlocal countable
             # idx-keyed initial URLs (no $top → server pages + emits nextLink).
             pending: list[tuple[int, str]] = []
             chain_by_key: dict[int, list[dict[str, Any]]] = {}
@@ -3077,7 +5013,12 @@ class ContainedNavMixin:
                             chain,
                             leaf_opts,
                             extra_filter=combine_filters(
-                                self._cursor_filter(cursor_field, since), leaf_segment_filter
+                                self._cursor_filter(
+                                    cursor_field,
+                                    since,
+                                    edm_type=leaf_types.get(cursor_field),
+                                ),
+                                leaf_segment_filter,
                             ),
                             order_by=order_by,
                         ),
@@ -3088,8 +5029,9 @@ class ContainedNavMixin:
                 eff = self._effective_batch_size(batch_size)
                 round_ = pending[:eff]
                 pending = pending[eff:]
-                responses = self._post_batch_adaptive([u for _, u in round_])
+                responses = self._post_batch_adaptive([u for _, u in round_], leaf_types)
                 for (key, req_url), resp in zip(round_, responses):
+                    resp = self._checked_batch_subresponse(resp, req_url, leaf_types)
                     body = resp.get("body") if isinstance(resp, dict) else None
                     rows = body.get("value", []) if isinstance(body, dict) else []
                     chain = chain_by_key[key]
@@ -3097,31 +5039,79 @@ class ContainedNavMixin:
                         if skip_null and row.get(cursor_field) is None:
                             continue
                         rec_cursor = effective(row)
-                        if since is not None and rec_cursor is not None and rec_cursor <= since:
+                        # Chronological, not lexical (``_cursor_le``) — see
+                        # the flat re-filter in ``_read_incremental``.
+                        if (
+                            since is not None
+                            and rec_cursor is not None
+                            and _cursor_le(rec_cursor, since)
+                        ):
                             continue
                         clean = {k: v for k, v in row.items() if not k.startswith("@odata.")}
                         self._tag_with_ancestor_fks(clean, segments, chain, fk_columns)
                         emitted.append(clean)
+                        if count_floor is None or (
+                            rec_cursor is not None and _cursor_newer(rec_cursor, count_floor)
+                        ):
+                            countable += 1
                     raw_next = body.get("@odata.nextLink") if isinstance(body, dict) else None
                     if raw_next:
                         pending.append((key, self._resolve_next_link(req_url, raw_next)))
 
+        parked_key = _chain_resume_key(parked_chain) if parked_chain is not None else None
+        seeking = parked_key is not None
+        parked_chain_out: list | None = None
         for chain in chains_iter:
-            if parent_idx < parent_idx_start:
-                parent_idx += 1
-                continue
+            if parked_key is not None:
+                if seeking:
+                    at_parked = chain == parked_chain
+                    if (
+                        not at_parked
+                        and _chain_seek_order(_chain_resume_key(chain), parked_key) != "after"
+                    ):
+                        # Same seek contract as the plain leaf-cursor walk
+                        # above: "before" is provably drained; "unknown"
+                        # keeps seeking on the identity anchor (never trust
+                        # ordinal order of server-collated text keys).
+                        parent_idx += 1
+                        continue
+                    seeking = False
+                    if at_parked and not resume_inclusive:
+                        parent_idx += 1
+                        continue
+            else:
+                if parent_idx < parent_idx_start:
+                    parent_idx += 1
+                    continue
             group.append(chain)
             parent_idx += 1
             if len(group) >= batch_size:
+                last_drained = group[-1]
                 _drain_group(group)
                 group = []
-                if len(emitted) >= max_records:
+                if countable >= max_records:
                     truncated = True
+                    parked_chain_out = last_drained
                     break
         else:
             if group:
                 _drain_group(group)
-        return (emitted, truncated, parent_idx, None, None)
+        if seeking:
+            # See the plain walk above: a never-found anchor must reset via a
+            # TRUNCATED no-park offset (positional restart, floor kept) — a
+            # clean completion would fold running_max past unwalked subtrees.
+            _LOG.warning(
+                "Parked resume position %r was not re-found while enumerating "
+                "%r; this batch emitted nothing and reset the walk — the next "
+                "batch re-walks from the committed cursor floor "
+                "(duplicate-safe).",
+                parked_chain,
+                segments,
+            )
+            truncated = True
+            parent_idx = 0
+            parked_chain_out = None
+        return (emitted, truncated, parent_idx, parked_chain_out, None, None)
 
     def _no_progress_cursor_error(
         self, table_name: str, cursor_field: str, n_emitted: int
@@ -3142,7 +5132,8 @@ class ContainedNavMixin:
             f"whose {cursor_field} equals the prior offset (server did not "
             f"honor `{cursor_field} gt <since>`). Fix the cursor at the "
             f"source (non-nullable, strictly monotonic), exclude offending "
-            f"rows with `filter`/`filter_at_<segment>`, or pick a different "
+            f"rows with `filter`/`filter_at_<segment>` (or drop null-cursor "
+            f"rows entirely with cursor_nulls=ignore), or pick a different "
             f"cursor."
         )
 
@@ -3181,7 +5172,15 @@ class ContainedNavMixin:
                 k: v
                 for k, v in (off or {}).items()
                 if not k.startswith("lb_")
-                and k not in ("cursor_probe_ok", "batch_ok", "batch_size_ok", "or_filter_ok")
+                and k
+                not in (
+                    "cursor_probe_ok",
+                    "batch_ok",
+                    "batch_size_ok",
+                    "or_filter_ok",
+                    "expand_ok",
+                    "delta_ok",
+                )
             }
 
         if _progress_view(start_offset) == _progress_view(end_offset):
@@ -3215,7 +5214,7 @@ class ContainedNavMixin:
         for next-call resume. When the leaf entity doesn't declare
         ``cursor_field``, the closest ancestor that does owns the filter
         and its cursor value is propagated onto each leaf row."""
-        segments = parse_contained_path(table_name) or [table_name]
+        segments = self._table_segments(table_name) or [table_name]
         namespace = (table_options or {}).get("namespace")
         cursor_level = self._find_cursor_level(segments, namespace, cursor_field)
         if cursor_level == -1:
@@ -3473,7 +5472,10 @@ class ContainedNavMixin:
         read_since = self._apply_cursor_lookback(since)
         truncated_chain_cursor_in = (start_offset or {}).get("truncated_chain_cursor")
         chain_next_link_in = (start_offset or {}).get("chain_next_link")
-        max_records = int((table_options or {}).get("max_records_per_batch", "10000"))
+        # Key-based resume position (churn-stable); legacy offsets carry only
+        # ``parent_idx`` and fall back to the positional skip inside the walks.
+        parked_chain_in = (start_offset or {}).get("parent_keys")
+        max_records = _parse_max_records(table_options)
         order_by = self._leaf_cursor_order_by(table_name, namespace, cursor_field)
         if chains_iter is None:
             chains_iter = self._iter_parent_key_chains(segments, namespace, table_options)
@@ -3492,6 +5494,7 @@ class ContainedNavMixin:
                 emitted,
                 truncated,
                 parent_idx,
+                parent_keys_out,
                 chain_next_link_out,
                 truncated_chain_cursor_out,
             ) = self._batch_walk_contained_with_cursor(
@@ -3508,12 +5511,20 @@ class ContainedNavMixin:
                 effective=effective,
                 skip_null=skip_null,
                 batch_size=self._cursor_probe_batch_size(table_options),
+                parked_chain=parked_chain_in,
+                # A serial-walk park (continuation keys present) resumes AT
+                # the parked chain; the batch walk re-drains it in full.
+                resume_inclusive=(
+                    chain_next_link_in is not None or truncated_chain_cursor_in is not None
+                ),
+                count_floor=since,
             )
         else:
             (
                 emitted,
                 truncated,
                 parent_idx,
+                parent_keys_out,
                 chain_next_link_out,
                 truncated_chain_cursor_out,
             ) = self._walk_contained_with_cursor(
@@ -3531,6 +5542,8 @@ class ContainedNavMixin:
                 leaf_segment_filter=segment_filters.get(len(segments) - 1),
                 effective=effective,
                 skip_null=skip_null,
+                parked_chain=parked_chain_in,
+                count_floor=since,
             )
         walk_elapsed = time.monotonic() - walk_start
         if truncated:
@@ -3540,17 +5553,39 @@ class ContainedNavMixin:
             # parent with a distinct-cursor boundary. (A complete parent
             # with a single cursor value never truncates — the walk emits
             # it in full and continues — so there's no failure case here.)
+            # ``parent_idx`` rides along for downgrade compatibility; the
+            # resume itself positions on ``parent_keys`` (churn-stable).
             end_offset: dict = {"parent_idx": parent_idx}
-            # The ``$batch`` walk resumes purely on ``parent_idx`` (chunk-aligned)
-            # — it never parks a mid-collection checkpoint — so its truncation
-            # offset carries neither continuation key.
+            if parent_keys_out is not None:
+                end_offset["parent_keys"] = parent_keys_out
+            # The ``$batch`` walk's park is chunk-aligned and EXCLUSIVE (the
+            # parked chain is fully drained) — it never parks a
+            # mid-collection checkpoint, so its truncation offset carries
+            # neither continuation key.
             if not use_batch:
                 if chain_next_link_out is not None:
                     end_offset["chain_next_link"] = chain_next_link_out
-                else:
+                elif truncated_chain_cursor_out is not None:
+                    # None/None with truncated=True is the vanished-anchor
+                    # RESET (positional restart at 0, no park) — stamping an
+                    # explicit null key would be inert but misleading.
                     end_offset["truncated_chain_cursor"] = truncated_chain_cursor_out
             if since is not None:
                 end_offset["cursor"] = since
+            # Accumulate the max cursor seen across the truncated cycle's
+            # batches (mirrors ``_ancestor_cursor_offset``): the committed
+            # ``cursor`` must stay at ``since`` while in flight, but WITHOUT
+            # this a resume that completes EMPTY would clear the checkpoint
+            # back to ``{"cursor": since}`` and lose every truncated batch's
+            # progress — a permanent period-2 duplicate loop on a static
+            # source whose new rows fit exactly in one capped batch.
+            batch_cursors = [effective(r) for r in emitted if effective(r) is not None]
+            running_max = _max_or(
+                _cursor_max(batch_cursors) if batch_cursors else None,
+                (start_offset or {}).get("running_max"),
+            )
+            if running_max is not None:
+                end_offset["running_max"] = running_max
         else:
             if not emitted:
                 empty = start_offset or {}
@@ -3566,9 +5601,44 @@ class ContainedNavMixin:
                 # checkpointed rows vanish between batches. Dropping the
                 # checkpoint (keeping ``cursor`` and the bookkeeping keys)
                 # marks the walk complete so the next batch starts fresh.
-                checkpoint_keys = ("parent_idx", "chain_next_link", "truncated_chain_cursor")
+                checkpoint_keys = (
+                    "parent_idx",
+                    "parent_keys",
+                    "parent_cursor",
+                    "chain_next_link",
+                    "truncated_chain_cursor",
+                    "running_max",
+                    # Foreign park keys from an ``expand_contained`` read of
+                    # the same table (mode flipped off mid-park): a stale
+                    # queue / running max must not ride every future N+1
+                    # offset — its watermark is folded below like our own.
+                    "pending_fetches",
+                    "running_max_cursor",
+                    # The capped cycle is OVER (this completion ends it), so
+                    # the auto-lookback span anchor must not survive: this
+                    # early return bypasses _attach_lookback_state, and a
+                    # leaked anchor makes the NEXT progressing walk record
+                    # the whole idle gap as a "cycle span" — lb_history then
+                    # carries a bogus multi-hour entry and the window pins
+                    # at the ceiling for the next 5 walks (an hour of
+                    # overlap re-read per batch; duplicates, never loss).
+                    # The measurement itself is deliberately dropped —
+                    # a vanished-checkpoint completion is idle-shaped, not
+                    # a real walk worth sizing the window from.
+                    "lb_cycle_started",
+                )
                 if any(k in empty for k in checkpoint_keys):
+                    # Fold the cycle's accumulated max into the committed
+                    # cursor BEFORE clearing — the truncated batches' rows
+                    # were emitted under it, and dropping it re-reads them
+                    # forever (period-2 duplicate loop).
+                    committed = _max_or(
+                        _max_or(empty.get("running_max"), empty.get("running_max_cursor")),
+                        empty.get("cursor"),
+                    )
                     empty = {k: v for k, v in empty.items() if k not in checkpoint_keys}
+                    if committed is not None:
+                        empty["cursor"] = committed
                 if persist_probe_ok:
                     empty = self._with_probe_ok(empty)
                 if persist_batch_ok:
@@ -3580,6 +5650,15 @@ class ContainedNavMixin:
             # batch and no prior ``since`` to carry, the offset is ``{}`` —
             # not ``{"cursor": None}`` (see ``_cursor_max_end_offset``).
             end_offset = self._cursor_max_end_offset(cursors, since)
+            # Completing a previously-truncated cycle: fold the accumulated
+            # ``running_max`` into the committed cursor (and drop the key —
+            # terminal offsets stay clean).
+            prior_running = (start_offset or {}).get("running_max")
+            if prior_running is not None:
+                committed = _max_or(end_offset.get("cursor"), prior_running)
+                end_offset = {k: v for k, v in end_offset.items() if k != "cursor"}
+                if committed is not None:
+                    end_offset["cursor"] = committed
         records, out_offset = self._finalize_cursor_read(
             start_offset, end_offset, emitted, table_name, cursor_field
         )
@@ -3620,11 +5699,25 @@ class ContainedNavMixin:
         construction, so a within-chain ``cursor gt`` rebuild would
         either re-fetch the whole chain or skip the whole chain — there
         is no meaningful split.
+
+        The lookback floor applies to the ANCESTOR enumeration filter
+        (``cursor gt <since - window>``): re-enumerating recently-dirty
+        ancestors re-reads their whole subtrees, which is exactly the
+        duplicate-safe recovery this walk needs — a parent updated
+        mid-cycle whose cursor lands below the cycle's final
+        ``running_max`` is otherwise excluded by ``cursor gt
+        <watermark>`` forever. The committed watermark is never floored
+        (``_ancestor_cursor_offset`` folds true stamped maxes), and the
+        floor stays stable across a capped cycle's batches because the
+        ``auto`` history is carried unchanged while in-flight.
         """
         namespace = (table_options or {}).get("namespace")
         since = (start_offset or {}).get("cursor")
+        self._active_lookback_seconds = self._resolve_active_lookback(start_offset)
+        read_since = self._apply_cursor_lookback(since)
+        walk_start = time.monotonic()
         chains_iter = self._iter_parent_chains_with_cursor(
-            segments, namespace, table_options, cursor_level, cursor_field, since
+            segments, namespace, table_options, cursor_level, cursor_field, read_since
         )
         segment_filters = resolve_segment_filters(table_options, segments)
         walk_state = self._walk_ancestor_chains(
@@ -3634,13 +5727,23 @@ class ContainedNavMixin:
             cursor_field,
             int((start_offset or {}).get("parent_idx", 0)),
             (start_offset or {}).get("chain_next_link"),
-            int((table_options or {}).get("max_records_per_batch", "10000")),
+            _parse_max_records(table_options),
             self._resolve_fk_columns(segments, namespace),
             leaf_segment_filter=segment_filters.get(len(segments) - 1),
+            parked_chain=(start_offset or {}).get("parent_keys"),
+            parked_cursor=(start_offset or {}).get("parent_cursor"),
+            cursor_level=cursor_level,
+            # New-rows-only cap accounting keys on the COMMITTED watermark,
+            # never the floored read filter — overlap re-reads don't burn cap.
+            count_floor=since,
         )
+        walk_elapsed = time.monotonic() - walk_start
         end_offset = self._ancestor_cursor_offset(walk_state, start_offset, since, cursor_field)
-        return self._finalize_cursor_read(
+        records, out_offset = self._finalize_cursor_read(
             start_offset, end_offset, walk_state["emitted"], table_name, cursor_field
+        )
+        return records, self._attach_lookback_state(
+            out_offset, start_offset, walk_state["truncated"], walk_elapsed
         )
 
     def _walk_ancestor_chains(
@@ -3652,8 +5755,12 @@ class ContainedNavMixin:
         parent_idx_start: int,
         chain_next_link_in: str | None,
         max_records: int,
-        fk_columns: dict[tuple[str, str], str],
+        fk_columns: dict[tuple[int, str], str],
         leaf_segment_filter: str | None = None,
+        parked_chain: list | None = None,
+        parked_cursor: Any = None,
+        cursor_level: int = 0,
+        count_floor: Any = None,
     ) -> dict[str, Any]:
         """Walk ancestor chains, fetching each chain's leaf collection
         and stamping rows with the chain's cursor.
@@ -3665,21 +5772,103 @@ class ContainedNavMixin:
 
         Page-aware: a truncation at a page boundary parks the chain's
         ``@odata.nextLink``; when the chain happens to end on the
-        truncating page, ``parent_idx`` simply advances past it."""
+        truncating page the park is EXCLUSIVE (no link — the chain is
+        complete and the resume skips through it).
+
+        Resume positioning is key-based (``parked_chain`` +
+        ``parked_cursor``, matching the enumeration's nested ordering with
+        the cursor term at ``cursor_level``'s position — see
+        :func:`_chain_resume_key`): this enumeration is ordered by a
+        MUTABLE cursor column and filtered by ``cursor gt since``, so
+        positional resume desynchronizes under any churn — updates
+        included, not just inserts/deletes (see
+        :func:`_chain_strictly_before`). A parked parent whose cursor
+        advanced between batches re-enters at its new position and is
+        re-walked in full with a fresh stamp (duplicate-safe; its old
+        mid-page link is correctly dropped). Legacy index-only offsets
+        fall back to the positional skip. ``count_floor`` — see
+        ``_walk_contained_with_cursor``: only rows stamped strictly above
+        the committed watermark count toward the cap."""
         namespace = (table_options or {}).get("namespace")
         leaf_order_by = self._leaf_pk_order_by(segments, namespace)
         parent_idx = 0
         emitted: list[dict] = []
         truncated = False
+        countable = 0
         chain_next_link_out: str | None = None
+        parked_chain_out: list | None = None
+        parked_cursor_out: Any = None
+        parked_key = (
+            _chain_resume_key(parked_chain, parked_cursor, cursor_level)
+            if parked_chain is not None
+            else None
+        )
+        seeking = parked_key is not None
+        # Same typed-seek requirement as the leaf-cursor walk below.
+        leaf_types = self._edm_types_for_level(
+            segments, len(segments) - 1, (table_options or {}).get("namespace")
+        )
         for chain, ancestor_cursor in chains_iter:
-            # Skip already-emitted chains. Ancestor-page HTTP cost is
-            # unavoidable (we need the keys to identify the chain), but
-            # no leaf fetches happen during the skip.
-            if parent_idx < parent_idx_start:
-                parent_idx += 1
-                continue
-            if parent_idx == parent_idx_start and chain_next_link_in is not None:
+            # Skip already-emitted chains — key-based when parked
+            # (churn-stable), positional for legacy offsets. Ancestor-page
+            # HTTP cost is unavoidable (we need the keys to identify the
+            # chain), but no leaf fetches happen during the skip.
+            use_link = False
+            if parked_key is not None:
+                if seeking:
+                    # Park identity is PK **and** cursor INSTANT: a parked
+                    # parent whose cursor advanced between batches is NOT "the
+                    # parked chain" any more — it re-enumerates at its new
+                    # (later) position and must be re-walked in full there,
+                    # because the server is saying its subtree changed since
+                    # we drained it. PK-only matching would skip it (exclusive
+                    # park) or resume its STALE mid-page link (link park), and
+                    # either way this batch's ``running_max`` then commits
+                    # past its new cursor, so ``cursor gt <watermark>`` locks
+                    # the update out forever. Same-INSTANT rendering changes
+                    # (``…00Z`` vs ``…00.000Z`` — a mixed-version load
+                    # balancer can alternate them PER REQUEST) still count as
+                    # parked: the parent didn't change, so resuming its link
+                    # is safe — and treating every text mismatch as a change
+                    # would re-walk from page 1 each batch for as long as the
+                    # alternation lasts, a livelock the no-progress guard
+                    # can't see (the offset text alternates, reading as
+                    # progress).
+                    pk_match = chain == parked_chain
+                    at_parked = pk_match and _cursor_same_instant(ancestor_cursor, parked_cursor)
+                    # A PK-matched chain must NEVER take the strictly-before
+                    # skip: when its cursor genuinely changed AND sorts before
+                    # the parked key (a regression), the generic skip would
+                    # drop the chain — and its parked link — losing the
+                    # collection's undrained remainder while running_max
+                    # commits past it. Ending the seek here re-walks it in
+                    # full instead: duplicate-safe in BOTH mismatch
+                    # directions, as promised above. Non-matched chains take
+                    # the three-way seek: "before" is provably drained;
+                    # "unknown" (server-collated text keys) keeps seeking on
+                    # the PK anchor rather than trusting ordinal order,
+                    # which silently skips unwalked subtrees on
+                    # CI-collation servers.
+                    if not pk_match and (
+                        _chain_seek_order(
+                            _chain_resume_key(chain, ancestor_cursor, cursor_level), parked_key
+                        )
+                        != "after"
+                    ):
+                        parent_idx += 1
+                        continue
+                    seeking = False
+                    if at_parked and chain_next_link_in is None:
+                        # Exclusive park: chain completed exactly at the cap.
+                        parent_idx += 1
+                        continue
+                    use_link = at_parked and chain_next_link_in is not None
+            else:
+                if parent_idx < parent_idx_start:
+                    parent_idx += 1
+                    continue
+                use_link = parent_idx == parent_idx_start and chain_next_link_in is not None
+            if use_link:
                 initial_url = chain_next_link_in
             else:
                 initial_url = self._build_contained_url(
@@ -3694,12 +5883,16 @@ class ContainedNavMixin:
             # default auto drains a link-omitting, sub-$top-capped leaf via the
             # keyset seek, and the synthesized seek doubles as the cap-hit resume
             # checkpoint.
-            for page_rows, page_next_url in self._fetch_pages_with_links(initial_url):
+            for page_rows, page_next_url in self._fetch_pages_with_links(initial_url, leaf_types):
                 for row in page_rows:
                     self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                     row[cursor_field] = ancestor_cursor
                     emitted.append(row)
-                if len(emitted) >= max_records:
+                    if count_floor is None or (
+                        ancestor_cursor is not None and _cursor_newer(ancestor_cursor, count_floor)
+                    ):
+                        countable += 1
+                if countable >= max_records:
                     truncated = True
                     break
             if truncated:
@@ -3707,12 +5900,34 @@ class ContainedNavMixin:
                     chain_next_link_out = page_next_url
                 else:
                     parent_idx += 1
+                parked_chain_out = chain
+                parked_cursor_out = ancestor_cursor
                 break
             parent_idx += 1
+        if seeking:
+            # See _walk_contained_with_cursor: a never-found anchor must
+            # reset via a TRUNCATED no-park offset (positional restart,
+            # floor kept) — a clean completion would fold running_max past
+            # unwalked subtrees, locking their sub-max rows out forever.
+            _LOG.warning(
+                "Parked resume position %r was not re-found while enumerating "
+                "%r; this batch emitted nothing and reset the walk — the next "
+                "batch re-walks from the committed cursor floor "
+                "(duplicate-safe).",
+                parked_chain,
+                segments,
+            )
+            truncated = True
+            parent_idx = 0
+            parked_chain_out = None
+            parked_cursor_out = None
+            chain_next_link_out = None
         return {
             "emitted": emitted,
             "truncated": truncated,
             "parent_idx": parent_idx,
+            "parent_keys": parked_chain_out,
+            "parent_cursor": parked_cursor_out,
             "chain_next_link": chain_next_link_out,
         }
 
@@ -3736,11 +5951,18 @@ class ContainedNavMixin:
         """
         emitted = walk_state["emitted"]
         cursors = [r.get(cursor_field) for r in emitted if r.get(cursor_field) is not None]
-        this_batch_max = max(cursors) if cursors else None
+        this_batch_max = _cursor_max(cursors) if cursors else None
         prev_running_max = (start_offset or {}).get("running_max")
         new_running_max = _max_or(this_batch_max, prev_running_max)
         if walk_state["truncated"]:
+            # ``parent_idx`` rides along for downgrade compatibility; the
+            # resume positions on ``parent_keys``/``parent_cursor``
+            # (churn-stable — this enumeration is ordered by a mutable
+            # cursor column, see ``_walk_ancestor_chains``).
             offset: dict = {"parent_idx": walk_state["parent_idx"]}
+            if walk_state["parent_keys"] is not None:
+                offset["parent_keys"] = walk_state["parent_keys"]
+                offset["parent_cursor"] = walk_state["parent_cursor"]
             if since is not None:
                 offset["cursor"] = since
             if walk_state["chain_next_link"] is not None:

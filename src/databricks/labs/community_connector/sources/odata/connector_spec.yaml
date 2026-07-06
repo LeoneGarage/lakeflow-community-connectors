@@ -122,21 +122,23 @@ connection:
       type: string
       required: false
       description: >
-        TTL for the on-disk ``$metadata`` pickle cache (seconds). The
-        cache lets forked PySpark Python Data Source workers share one
-        fetch + parse during pipeline INITIALIZING. Default 60. Set to
-        ``0`` to disable file caching entirely; raise for stable
-        schemas where you want to skip even the first-fork fetch over
-        a longer window.
+        TTL for the cached parsed ``$metadata`` document (seconds) —
+        governs both the in-process cache and the on-disk pickle that
+        forked PySpark Python Data Source workers share during pipeline
+        INITIALIZING. Default 60. Set to ``0`` to disable both layers
+        (every instance re-fetches); raise for stable schemas where you
+        want to skip even the first-fork fetch over a longer window.
 
     - name: max_retries
       type: string
       required: false
       description: >
-        Retry budget for transient HTTP 429 (throttling) and 503
-        (service unavailable) responses. Default 5. Set to ``0`` to
-        disable retries (any 429/503 surfaces immediately as
-        RuntimeError).
+        Retry budget for transient failures — HTTP 408, 429, 500, 502,
+        503, 504 (honouring ``Retry-After`` where the server sends it,
+        with jittered exponential backoff otherwise) and
+        connection-level errors (TCP reset, timeout, chunked-encoding
+        failure). Default 5. Set to ``0`` to disable retries (any
+        transient failure surfaces immediately).
 
     - name: retry_max_delay_seconds
       type: string

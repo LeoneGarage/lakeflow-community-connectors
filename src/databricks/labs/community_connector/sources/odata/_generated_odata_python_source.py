@@ -13,8 +13,9 @@ from datetime import (
     timedelta,
     timezone,
 )
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Iterator, Sequence
+import collections
 import itertools
 import json
 import os
@@ -52,14 +53,17 @@ from pyspark.sql.types import (
     VariantVal,
 )
 from requests.auth import HTTPBasicAuth
-from urllib.parse import urljoin, urlparse
+from requests.utils import requote_uri
+from urllib.parse import unquote, urljoin, urlparse
 from xml.etree import ElementTree as ET
 import base64
 import hashlib
 import logging
 import math
+import random
 import requests
 import tempfile
+import threading
 
 
 def register_lakeflow_source(spark):
@@ -611,6 +615,292 @@ def register_lakeflow_source(spark):
     # src/databricks/labs/community_connector/sources/odata/_helpers.py
     ########################################################
 
+    DELETED_COL = "_deleted"
+    SEQUENCE_COL = "_lc_sequence"
+
+    _ISO_FRACTION_RE = re.compile(r"\.(\d+)")
+
+
+    def url_origin(url: str) -> tuple[str, str, int | None]:
+        """``(scheme, host, port)`` for same-origin comparison, host lower-cased
+        and the default port for the scheme filled in so ``https://h`` and
+        ``https://h:443`` compare equal.
+
+        A malformed port raises ``ValueError`` naming the URL — ``urlparse``
+        defers port validation to the ``.port`` accessor, so without the wrap
+        the bare "Port could not be cast to integer value" message escapes with
+        no hint of WHICH url (service_url, a server-supplied @odata.nextLink, a
+        $batch sub-response continuation) carried the garbage."""
+        p = urlparse(url)
+        scheme = (p.scheme or "").lower()
+        host = (p.hostname or "").lower()
+        try:
+            port = p.port
+        except ValueError as exc:
+            raise ValueError(f"Invalid port in URL {url!r}: {exc}") from None
+        if port is None:
+            port = {"http": 80, "https": 443}.get(scheme)
+        return (scheme, host, port)
+
+
+    def _fraction_digits(value: Any) -> str:
+        """The fractional-second digit run of an ISO-rendered string, or ``""``.
+        Used by :func:`cursor_newer`'s tie-break — see there for why the digits
+        are compared zero-padded rather than as raw text."""
+        if isinstance(value, str):
+            match = _ISO_FRACTION_RE.search(value)
+            if match:
+                return match.group(1)
+        return ""
+
+
+    def parse_iso8601(value: str) -> datetime:
+        """``datetime.fromisoformat`` with version-uniform fraction handling.
+
+        The connector's floor is Python 3.10 (DBR 13.3 LTS), where
+        ``fromisoformat`` accepts fractional seconds of EXACTLY 3 or 6 digits —
+        while real servers render value-dependent digit counts (Olingo/SAP trim
+        trailing zeros → ``.5``; nanosecond servers emit 7+ digits, which even
+        3.10 rejects). Left unnormalized, a ``…00.5Z`` watermark on a 3.10
+        runtime fails the ISO sniff (→ ``odata_literal`` QUOTES it → wire 400
+        every batch) and falls out of the chronological comparisons (→ back to
+        the lexical silent-loss ordering those comparisons exist to prevent).
+        Normalizing the fraction to exactly 6 digits (pad short, truncate
+        long — sub-microsecond precision only affects ordering ties, which are
+        duplicate-safe) makes parsing identical on every supported version.
+        Also maps the ``Z`` designator 3.10 can't parse. Raises ``ValueError``
+        like ``fromisoformat`` for non-ISO input."""
+        s = value.replace("Z", "+00:00")
+        frac = _ISO_FRACTION_RE.search(s)
+        if frac:
+            digits = frac.group(1)
+            s = s[: frac.start(1)] + digits[:6].ljust(6, "0") + s[frac.end(1) :]
+        return datetime.fromisoformat(s)
+
+
+    def _iso_shaped(s: str) -> bool:
+        """Structural pre-check for extended-format ISO-8601 (``YYYY-MM-DD…``) —
+        the same rule ``looks_like_iso8601`` applies before parsing. Applying it
+        HERE too keeps the comparison keys version-uniform: ``fromisoformat`` on
+        Python ≥3.11 also parses BASIC format (``"20240101"``), which the 3.10
+        floor rejects — without the guard, an 8-digit numeric-string cursor
+        (yyyymmdd date keys rendered as strings, a real ERP pattern) would
+        datetime-key on one runtime and string-key on another, and would alias
+        ``"20240101"`` with ``"2024-01-01"`` as the same instant."""
+        return len(s) >= 10 and s[4] == "-" and s[7] == "-"
+
+
+    def cursor_sort_key(value: Any) -> Any:
+        """Chronological sort key for one cursor value.
+
+        The server orders cursor columns chronologically, but the client-side
+        comparisons (re-filters, watermark maxes, probe dirty checks) receive the
+        server's *rendered text* — and OData's JSON format makes fractional
+        seconds optional per value (real stacks — Olingo, SAP — trim trailing
+        zeros), so one column legitimately renders both ``…T23:00:00Z`` and
+        ``…T23:00:00.5Z``. Python string order puts the LATER ``.5Z`` instant
+        first (``.`` < ``Z``), which silently drops server-returned rows at the
+        ``<= since`` re-filters and regresses watermark maxes. ISO-8601-looking
+        strings therefore parse to a datetime for ordering (naive values are
+        pinned to UTC so mixed naive/aware renderings still totally order).
+
+        NUMERIC strings key as exact :class:`Decimal` for the same reason in the
+        other direction: an IEEE754Compatible server renders Int64/Decimal
+        cursors as JSON strings, and ordinal string order inverts at every
+        digit-length boundary (``"1000" < "999"``) — which silently STALLS the
+        stream (the ``<= since`` re-filter drops every genuinely-newer row the
+        server returns, forever) and regresses watermark maxes.
+        :func:`cursor_same_instant` already treated this pair class numerically;
+        the sort key now agrees. A Decimal key still cross-compares with raw
+        int/float values (one column mixing ``5000`` and ``"5000"``), while
+        Decimal-vs-datetime / Decimal-vs-text pairs raise ``TypeError`` into
+        :func:`cursor_newer`'s existing shape-mixed fallback.
+
+        Anything else orders as itself. Offsets and ``$filter`` literals keep the
+        server's raw text — this key is for COMPARISON only."""
+        if isinstance(value, str):
+            if _iso_shaped(value):
+                try:
+                    dt = parse_iso8601(value)
+                except (ValueError, TypeError):
+                    return value
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+            num = _as_exact_number(value)
+            if num is not None:
+                return num
+        return value
+
+
+    def cursor_newer(a: Any, b: Any) -> bool:
+        """Whether ``a`` is strictly newer (greater) than ``b`` in cursor order —
+        chronological where both render as ISO-8601, exact-numeric where both
+        render as numbers (see :func:`cursor_sort_key`), raw ordering otherwise.
+        A shape-mixed column (one value parses, the other doesn't) falls back to
+        comparing the raw values, preserving the pre-helper behavior for such
+        data.
+
+        Key TIES between different raw texts break on the FRACTION DIGITS,
+        zero-padded to a common width: Python datetimes hold microseconds, so
+        :func:`parse_iso8601` truncates sub-microsecond digits — two
+        chronologically DIFFERENT 100ns-precision cursors (SQL Server
+        ``datetime2(7)`` sources emit 7-digit fractions) would otherwise tie,
+        and a tie at the ``<= since`` re-filter drops a strictly-newer row the
+        server correctly returned. Padding before comparing matters: raw-text
+        comparison inverts when digit counts differ (the shorter fraction's
+        terminator ``Z``/``+`` sorts above any digit), whereas equal-width
+        digit strings compare numerically. Genuinely equal instants rendered
+        two ways (``…Z`` vs ``…+00:00``, trailing zeros) fall through to an
+        arbitrary-but-consistent raw order that errs only in the
+        duplicate-safe direction."""
+        key_a, key_b = cursor_sort_key(a), cursor_sort_key(b)
+        try:
+            if key_a > key_b:
+                return True
+            if key_b > key_a:
+                return False
+        except TypeError:
+            try:
+                return a > b
+            except TypeError:
+                # Incomparable raw pair (str vs int — an IEEE754Compatible
+                # server rendering one Int64 cursor as 5000 and "5000"). A
+                # NUMERIC pair still orders truly via exact Decimal: without
+                # this bridge, a server that PERMANENTLY switches int→string
+                # rendering (gateway upgrade) against an int-typed checkpoint
+                # makes cursor_le(new_row, since) read True for genuinely
+                # NEWER rows — the client-side re-filter then drops every
+                # returned row and the stream silently stalls forever with
+                # data pending (a flat False here is duplicate-safe for the
+                # watermark fold but NOT for the re-filter). Non-numeric
+                # incomparable pairs keep the arbitrary-but-consistent False,
+                # matching ``_chain_strictly_before``'s documented posture:
+                # degrade duplicate-safe, never raise out of a fold.
+                num_a, num_b = _as_exact_number(a), _as_exact_number(b)
+                if num_a is not None and num_b is not None:
+                    return num_a > num_b
+                return False
+        if a == b:
+            return False
+        # Exact-key tie with different texts: sub-microsecond digits (or two
+        # renderings of one instant). Compare fractions numerically first.
+        frac_a, frac_b = _fraction_digits(a), _fraction_digits(b)
+        width = max(len(frac_a), len(frac_b))
+        frac_a, frac_b = frac_a.ljust(width, "0"), frac_b.ljust(width, "0")
+        if frac_a != frac_b:
+            return frac_a > frac_b
+        try:
+            return a > b  # same instant — consistent arbitrary order
+        except TypeError:
+            return False
+
+
+    def _as_exact_number(value: Any) -> Decimal | None:
+        """``value`` as an exact :class:`Decimal`, or ``None`` when it isn't a
+        number (or a numeric string). Exactness matters: a float round-trip
+        would collapse Int64 cursors beyond 2^53 (``9007199254740993`` vs
+        ``…92``) into one value and mis-report distinct instants as equal."""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return Decimal(value)
+        if isinstance(value, float):
+            return Decimal(str(value))
+        if isinstance(value, str):
+            try:
+                dec = Decimal(value.strip())
+            except InvalidOperation:
+                return None
+            return dec if dec.is_finite() else None
+        return None
+
+
+    def cursor_same_instant(a: Any, b: Any) -> bool:
+        """Whether ``a`` and ``b`` denote the SAME instant/value, tolerating
+        rendering differences — timestamp forms (``…00Z`` vs ``…00.000Z`` vs
+        ``…00+00:00``) and numeric forms (``5000`` vs ``"5000"``, the
+        IEEE754Compatible string rendering of an Int64/Decimal).
+
+        Identical values are trivially the same instant. ISO-8601-parsing pairs
+        (via :func:`cursor_sort_key`) must reach equal datetimes AND carry equal
+        zero-padded fraction digits — the fraction check restores the
+        sub-microsecond precision ``cursor_sort_key`` truncates, so two
+        chronologically distinct 100ns cursors (SQL Server ``datetime2(7)``)
+        never count as the same instant. Otherwise a numeric pair compares as
+        exact :class:`Decimal` (see :func:`_as_exact_number`). Anything else is
+        the same instant only if raw-equal.
+
+        Used by the ancestor-walk park identity: a parked parent whose cursor
+        TEXT changed but instant didn't (a mixed-version load balancer
+        alternating renderings per request) hasn't been modified — resuming its
+        parked link is safe and makes progress, where treating every text
+        mismatch as a change re-walks from page 1 each batch and livelocks for
+        as long as the alternation lasts."""
+        if a == b:
+            return True
+        key_a, key_b = cursor_sort_key(a), cursor_sort_key(b)
+        if isinstance(key_a, datetime) and isinstance(key_b, datetime):
+            if key_a != key_b:
+                return False
+            frac_a, frac_b = _fraction_digits(a), _fraction_digits(b)
+            width = max(len(frac_a), len(frac_b))
+            return frac_a.ljust(width, "0") == frac_b.ljust(width, "0")
+        num_a, num_b = _as_exact_number(a), _as_exact_number(b)
+        if num_a is not None and num_b is not None:
+            return num_a == num_b
+        return False
+
+
+    def cursor_same_rendering(a: Any, b: Any) -> bool:
+        """Whether ``a`` and ``b`` can plausibly be ONE value's two renderings —
+        the narrower cousin of :func:`cursor_same_instant` for comparing
+        IDENTITY key elements (chain positions), not cursor watermarks.
+
+        The difference is the both-strings numeric case: a server renders one
+        numeric VALUE as ``5000`` (JSON number) or ``"5000"`` (IEEE754Compatible
+        string) — a type flip — but it never re-renders one string key's TEXT
+        (``"007"`` stays ``"007"``). Two numeric STRINGS with different text
+        (``"007"`` vs ``"7"``, ``"1.0"`` vs ``"1"``, ``"0"`` vs ``"-0"``) are
+        therefore two DISTINCT identities that merely alias numerically —
+        ``cursor_same_instant`` calls them equal (right for watermarks, where
+        only the instant matters), but conflating them as one chain POSITION
+        lets a later element decide order across two different parents,
+        defeating the vanished-anchor reset and silently dropping a subtree.
+        Chronological renderings (``…00Z`` vs ``…00.000Z``) still conflate:
+        real servers do re-render one instant's text per request."""
+        if isinstance(a, str) and isinstance(b, str):
+            key_a, key_b = cursor_sort_key(a), cursor_sort_key(b)
+            if isinstance(key_a, datetime) and isinstance(key_b, datetime):
+                return cursor_same_instant(a, b)
+            return a == b
+        return cursor_same_instant(a, b)
+
+
+    def cursor_le(a: Any, b: Any) -> bool:
+        """Whether ``a <= b`` in cursor order — the exact complement of
+        :func:`cursor_newer` under its strict total order (including the
+        raw-text tie-break), so the re-filter and the watermark max can never
+        disagree about a boundary row."""
+        return not cursor_newer(a, b)
+
+
+    def cursor_max(values: Any) -> Any:
+        """Max of an iterable of non-``None`` cursor values in cursor order.
+        Pairwise via :func:`cursor_newer` (not ``max(key=…)``) so a shape-mixed
+        iterable degrades per-pair instead of raising. With the raw-text
+        tie-break in :func:`cursor_newer`, only IDENTICAL texts (or
+        incomparable pairs) still tie — for those the first-seen value wins,
+        matching ``max``'s tie behavior."""
+        result = sentinel = object()
+        for value in values:
+            if result is sentinel or cursor_newer(value, result):
+                result = value
+        if result is sentinel:
+            raise ValueError("cursor_max() arg is an empty sequence")
+        return result
+
+
     def trim_to_distinct_cursor_boundary(
         records: list[dict],
         cursor_field: str,
@@ -635,24 +925,105 @@ def register_lakeflow_source(spark):
         Returns an empty list when every record shares one cursor value;
         the caller decides whether that's recoverable (natural exhaustion)
         or a hard failure (truncated batch with too-small cap).
+
+        Cohort membership is SAME-INSTANT (:func:`cursor_same_instant`), not
+        raw equality: a mixed-rendering batch (page 1 renders an Int64 cursor
+        as ints, page 2 as strings — a mixed-version LB) would otherwise
+        split one value's cohort at the rendering seam, trim only the
+        differently-rendered tail, and leave the watermark EQUAL to the
+        trimmed rows' value — ``cursor gt <watermark>`` then never re-fetches
+        them (permanent loss). Same-instant grouping trims the whole cohort
+        as one, restoring the watermark-strictly-below-boundary invariant
+        regardless of rendering.
         """
         if not records:
             return records
         boundary = records[-1].get(cursor_field)
         trim_idx = len(records)
-        while trim_idx > 0 and records[trim_idx - 1].get(cursor_field) == boundary:
+        while trim_idx > 0 and cursor_same_instant(records[trim_idx - 1].get(cursor_field), boundary):
             trim_idx -= 1
         return records[:trim_idx]
 
 
+    def jsonify_complex_values(row: dict) -> dict:
+        """Render structured (dict/list) property values in an emitted row as
+        JSON text.
+
+        The connector's schema maps complex-typed / ``Collection(...)`` /
+        enum / untyped CSDL properties to ``StringType``, and the framework's
+        string parser stringifies via ``str()`` — which for a dict/list
+        produces a Python **repr** (``{'City': 'X'}``, single quotes) that
+        downstream ``from_json`` can't parse. Every structured value still
+        present in a row at the emit boundary is by construction destined for
+        a string column (the connector never declares struct/array columns,
+        and nav-collection structures are consumed by the expand flattener
+        before emit), so serializing them here is schema-independent and
+        lossless. Rows with only scalar values pass through untouched."""
+        if any(isinstance(v, (dict, list)) for v in row.values()):
+            return {
+                k: json.dumps(v, separators=(",", ":")) if isinstance(v, (dict, list)) else v
+                for k, v in row.items()
+            }
+        return row
+
+
+    def pad_row_to_fields(row: dict, field_names, never_pad=frozenset()) -> dict:
+        """Return ``row`` with an explicit ``None`` for every name in
+        ``field_names`` it doesn't already carry — except names in ``never_pad``.
+
+        OData servers may legally omit null-valued properties from a JSON entity,
+        and the framework's row parser rejects a declared column that is *absent*
+        (even a nullable one is fine as an explicit ``None``, but a non-nullable
+        absent column raises and kills the batch). Padding to the declared schema
+        makes an omit-null response parse cleanly.
+
+        ``never_pad`` holds the columns whose absence must STAY loud because the
+        omit-null rationale can't apply to them: primary keys (a key is never
+        null, so a missing one means a broken response — padding it would send a
+        silent null-key row into the destination's ``apply_changes`` MERGE) and
+        the connector-stamped delta synthetics (absence there is a connector
+        stamping bug, not server behavior). Returns ``row`` unchanged (no copy)
+        when nothing needs padding — the common case — otherwise a new dict,
+        never mutating the caller's row (lookback re-emits the same object)."""
+        missing = [n for n in field_names if n not in row and n not in never_pad]
+        if not missing:
+            return row
+        padded = dict(row)
+        for name in missing:
+            padded[name] = None
+        return padded
+
+
+    def parse_max_records(table_options: dict | None) -> int:
+        """Parse the ``max_records_per_batch`` table option (default 10000) with
+        curated validation. The cap counts EMITTED rows per batch, so ``0`` or a
+        negative value would make every walk park (or livelock) without emitting
+        a single row — reject it up front instead of silently reading nothing."""
+        raw = (table_options or {}).get("max_records_per_batch", "10000")
+        try:
+            value = int(str(raw).strip())
+        except (ValueError, TypeError):
+            raise ValueError(
+                f"Invalid max_records_per_batch={raw!r}: expected a positive integer."
+            ) from None
+        if value < 1:
+            raise ValueError(
+                f"Invalid max_records_per_batch={raw!r}: must be >= 1 — the cap "
+                f"bounds rows emitted per batch, and a non-positive cap would "
+                f"emit nothing forever."
+            )
+        return value
+
+
     def max_or(a: Any, b: Any) -> Any:
-        """Max of two values where either may be ``None``. Returns the other
-        when one is ``None``; ``None`` only if both are."""
+        """Max of two values in CURSOR order (see :func:`cursor_newer`) where
+        either may be ``None``. Returns the other when one is ``None``; ``None``
+        only if both are. ``a`` wins ties (matching ``max``'s first-arg-wins)."""
         if a is None:
             return b
         if b is None:
             return a
-        return max(a, b)
+        return b if cursor_newer(b, a) else a
 
 
     ########################################################
@@ -683,6 +1054,17 @@ def register_lakeflow_source(spark):
     # ``@odata.nextLink`` chase at every level.
     MIN_DYNAMIC_TOP = 5
 
+    # Soft ceiling on the expand work queue's length at park time. The
+    # ``max_records_per_batch`` cap bounds EMITTED rows, not queue growth: every
+    # flattened top row can append one URL-carrying work item per truncated
+    # inner collection (~0.3–2KB each), so a wide top page over an
+    # inner-paging server can otherwise park thousands of items — a multi-MB
+    # ``pending_fetches`` offset persisted every microbatch. Once the queue
+    # reaches this length the drainer parks early (clean boundary item for the
+    # current page, then stop dequeuing); the parked queue drains across later
+    # batches. Soft: one in-flight page can still overshoot by its own fan-out.
+    _MAX_PENDING_FETCHES = 2000
+
     # Default ``page_size`` applied to **cursor-based** reads (cursor_field
     # or delta) when the user didn't set one, so a ``$top`` is still sent.
     # Snapshot reads deliberately omit ``$top`` entirely when ``page_size``
@@ -698,6 +1080,28 @@ def register_lakeflow_source(spark):
     # for a discriminating sample (>= 2 distinct leaf cursors) before giving up and
     # allowing the read (inconclusive). Bounds the preflight's request cost.
     _CURSOR_PROBE_PREFLIGHT_SCAN = 50
+
+    # Instance-cache ``problem`` message stamped when a per-instance cursor_probe
+    # verdict is rehydrated from the shared process/file cache as a definitive fail
+    # (the original preflight message isn't cached across instances). Only surfaced
+    # if a same-instance strict call reuses it — non-strict callers just fall back.
+    _CURSOR_PROBE_SHARED_FAIL = (
+        "cursor_probe nested-$expand support was previously found unreliable on this "
+        "server (cached verdict); using the $batch / plain N+1 fallback."
+    )
+
+
+    class _CursorProbePreflightUnavailable(Exception):
+        """The cursor-probe preflight's enumeration or trusted-reference fetch
+        failed before reaching a verdict — indistinguishable from a transient,
+        so it must degrade a ``cursor_probe=auto`` read to the ``$batch``/plain
+        cascade (recording nothing) rather than escape as a raw HTTP error.
+
+        Raised ONLY around the preflight's HTTP fetches, so
+        ``_verify_cursor_probe_support`` can catch exactly this — a programming
+        error in the preflight's own logic still propagates instead of being
+        silently converted into permanent degradation."""
+
 
     # Max GET sub-requests packed into one OData ``$batch`` request by the
     # ``cursor_probe=batch`` / ``auto``-fallback hydrate. A hard cap — some Smart
@@ -716,12 +1120,40 @@ def register_lakeflow_source(spark):
     _BATCH_SHRINK_FACTOR = 0.75
     _BATCH_OVERFLOW_RETRIES = 10
 
+    # Page budget for the ``expand_contained=auto`` preflight GET. Small on
+    # purpose: ``compute_dynamic_tops`` floors every inner ``$expand`` level at
+    # ``MIN_DYNAMIC_TOP`` (5) and the top-level ``$top`` is rewritten to 1, so the
+    # probe response is one shallow subtree, not a real page.
+    _EXPAND_PREFLIGHT_PAGE = "25"
+
     # HTTP statuses that say nothing definitive about a server's capabilities —
     # throttling and transient server-side failures. A capability preflight that
     # hits one records NO verdict (the read degrades for this batch only and the
     # next batch re-probes); only a definitive outcome (a working envelope, or a
     # hard rejection like 404/405) is cached and persisted as ``batch_ok``.
     _TRANSIENT_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+
+    def _is_vanished_error(exc: requests.HTTPError) -> bool:
+        """Whether ``exc`` is a 404/410 — the entity addressed by the URL is
+        gone. On the partitioned walk that means a parent frozen into the task
+        descriptor at planning was deleted before this task walked it."""
+        status = getattr(exc.response, "status_code", None)
+        return status in (404, 410)
+
+
+    def _log_vanished_parent(chain: list, exc: requests.HTTPError) -> None:
+        """One warning per skipped parent subtree. The next batch's re-plan
+        re-discovers the live parent set, so the skip is self-healing; rows of
+        the deleted parent already at the destination linger exactly as they
+        would on any non-delta path (no tombstones)."""
+        status = getattr(exc.response, "status_code", None)
+        _LOG.warning(
+            "partitioned read: parent chain %r vanished mid-batch (HTTP %s) — "
+            "skipping its subtree; the next batch re-discovers the live parent set.",
+            chain,
+            status,
+        )
 
 
     class _BatchTooManyParts(RuntimeError):
@@ -857,39 +1289,162 @@ def register_lakeflow_source(spark):
 
 
     def looks_like_iso8601(s: str) -> bool:
-        """Cheap ISO-8601 sniff used by ``odata_literal`` to render bare timestamps."""
+        """Cheap ISO-8601 sniff used by ``odata_literal`` to render bare timestamps.
+
+        Routed through :func:`parse_iso8601` so the verdict is identical on
+        every supported Python — a bare ``fromisoformat`` on 3.10 rejects
+        ``…00.5Z`` (1/2/4/5/7+ fractional digits), which would QUOTE a
+        fractional watermark in ``$filter`` and 400 every incremental batch."""
         if len(s) < 10 or s[4] != "-" or s[7] != "-":
             return False
         try:
-            datetime.fromisoformat(s.replace("Z", "+00:00"))
+            parse_iso8601(s)
             return True
         except ValueError:
             return False
 
 
+    # URL-reserved characters percent-encoded inside GENERATED literal text
+    # (row-data-derived values only — user-authored ``filter``/``select`` syntax
+    # is never touched). ``requests`` does NOT encode these when sending an
+    # already-assembled URL string (it only encodes spaces/non-ASCII, and it
+    # preserves existing escapes, so pre-encoding here is safe and decodes
+    # correctly server-side):
+    #   * ``%`` first (so the escapes below aren't double-escaped);
+    #   * ``+`` — form-decoding servers (ASP.NET, servlet stacks) read a raw
+    #     query-string ``+`` as a SPACE: a non-UTC ISO watermark
+    #     (``…T12:00:00+10:00``) becomes a malformed timestamp → 400 on every
+    #     incremental batch; ``+`` inside a quoted seek boundary silently
+    #     compares against the wrong value;
+    #   * ``&`` — splits the query at the value;
+    #   * ``#`` — truncates the whole request at the fragment;
+    #   * ``?`` — starts the query string when the literal sits in a PATH
+    #     segment (a key predicate ``Parent('A?B')``);
+    #   * ``/`` — splits the PATH segment when the literal sits in a key
+    #     predicate (``Parent('A/B')`` parses as two segments). ``%2F`` is the
+    #     spec form inside quoted path literals; in a query string it decodes
+    #     back to ``/`` server-side, so encoding it in both contexts is safe.
+    _LITERAL_ESCAPES = (
+        ("%", "%25"),
+        ("+", "%2B"),
+        ("&", "%26"),
+        ("#", "%23"),
+        ("?", "%3F"),
+        ("/", "%2F"),
+    )
+
+
+    def _escape_literal_text(s: str) -> str:
+        """Percent-encode URL-reserved characters in generated literal text
+        (see :data:`_LITERAL_ESCAPES`)."""
+        for raw, enc in _LITERAL_ESCAPES:
+            s = s.replace(raw, enc)
+        return s
+
+
     def odata_literal(value: Any) -> str:
-        """Render a Python value as an OData v4 literal for $filter."""
+        """Render a Python value as an OData v4 literal for a generated
+        ``$filter`` / key predicate. The literal ends up interpolated into a
+        URL string, so URL-reserved characters inside the VALUE text are
+        percent-encoded (see :data:`_LITERAL_ESCAPES`); structural characters
+        (the surrounding single quotes) stay raw."""
         if isinstance(value, datetime):
-            return value.isoformat().replace("+00:00", "Z")
+            # Non-UTC offsets keep a ``+`` (only +00:00 normalizes to Z) —
+            # escape it so the wire form survives form-decoding servers.
+            return _escape_literal_text(value.isoformat().replace("+00:00", "Z"))
         if isinstance(value, date):
             return value.isoformat()
         if isinstance(value, bool):
             return "true" if value else "false"
         if isinstance(value, int | float | Decimal):
-            return str(value)
+            finite = (
+                value.is_finite()
+                if isinstance(value, Decimal)
+                else (isinstance(value, int) or math.isfinite(value))
+            )
+            if not finite:
+                # OData ABNF spells these ``NaN`` / ``INF`` / ``-INF``;
+                # Python's ``nan`` / ``inf`` / ``Decimal("Infinity")`` are
+                # not valid wire literals. (NaN check first — comparing a
+                # Decimal NaN with ``>`` raises InvalidOperation.)
+                nan = value.is_nan() if isinstance(value, Decimal) else math.isnan(value)
+                return "NaN" if nan else ("INF" if value > 0 else "-INF")
+            if isinstance(value, Decimal):
+                # OData's ``decimalValue`` ABNF has NO exponent form —
+                # ``str(Decimal("1.5E+7"))`` keeps the exponent and a strict
+                # server 400s. ``format(…, 'f')`` renders the exact value in
+                # plain positional notation.
+                return _escape_literal_text(format(value, "f"))
+            # ``str(1e20)`` renders ``1e+20`` — valid for Edm.Double, whose
+            # ABNF allows exponents, but the exponent's ``+`` must be escaped
+            # like any literal ``+`` (form-decoding servers read a raw
+            # query-string ``+`` as a space → malformed number → 400).
+            return _escape_literal_text(str(value))
         s = str(value)
         if looks_like_iso8601(s):
-            return s
-        return "'" + s.replace("'", "''") + "'"
+            return _escape_literal_text(s)
+        return "'" + _escape_literal_text(s.replace("'", "''")) + "'"
+
+
+    # Edm types whose literals are BARE (unquoted) on the wire even though the
+    # OData JSON payload delivers the value as a JSON string. ``Edm.Guid`` is the
+    # big one — guid key predicates / seek boundaries are unquoted per the v4
+    # ABNF, and strict stacks (Olingo, SAP) 400 on ``Set('<guid>')``. The numeric
+    # types cover IEEE754Compatible servers that render Int64/Decimal as strings.
+    _EDM_BARE_TYPES = frozenset(
+        {
+            "Edm.Guid",
+            "Edm.Boolean",
+            "Edm.Byte",
+            "Edm.SByte",
+            "Edm.Int16",
+            "Edm.Int32",
+            "Edm.Int64",
+            "Edm.Single",
+            "Edm.Double",
+            "Edm.Decimal",
+            "Edm.Date",
+            "Edm.DateTimeOffset",
+            "Edm.TimeOfDay",
+        }
+    )
+
+
+    def odata_literal_typed(value: Any, edm_type: str | None) -> str:
+        """:func:`odata_literal` with the property's declared Edm type steering
+        the quote decision for STRING values, instead of value sniffing.
+
+        The sniff in :func:`odata_literal` misfires in both directions on typed
+        columns: an ``Edm.Guid`` key arrives as a JSON string and gets QUOTED
+        (strict servers 400 the key predicate / keyset seek), while an
+        ``Edm.String`` key whose text happens to look ISO-8601 (``"2024-01-01"``)
+        gets rendered BARE (invalid predicate). When the caller knows the declared
+        type — key predicates and ``$orderby`` seek boundaries, where the CSDL is
+        already indexed — that type wins. Falls back to :func:`odata_literal` for
+        non-string values, unknown/missing types, and types with wrapped literal
+        forms this connector never generates (``Edm.Duration``, ``Edm.Binary``,
+        enums). Cursor-watermark filters (``_cursor_filter``) pass the declared
+        type too — watermarks round-trip through offsets as strings, so the
+        declared type is the only reliable quote signal; the sniff remains the
+        fallback when the CSDL lookup misses."""
+        if isinstance(value, str) and edm_type:
+            if edm_type in _EDM_BARE_TYPES:
+                return _escape_literal_text(value)
+            if edm_type == "Edm.String":
+                return "'" + _escape_literal_text(value.replace("'", "''")) + "'"
+        return odata_literal(value)
 
 
     # --- client-side pagination URL helpers -----------------------------------
     # These manipulate the connector's own generated URLs, where query options
-    # (``$top``/``$filter``/``$orderby``/``$skip``) are stored raw (un-encoded),
-    # one per ``&``-separated segment, and no generated value contains a literal
-    # ``&``. So splitting on ``&`` and matching on a ``$name=`` prefix is safe —
-    # the same convention ``rewrite_top_in_url`` relies on. requests url-encodes
-    # the values when the request is actually sent. They live here (rather than in
+    # (``$top``/``$filter``/``$orderby``/``$skip``) are stored one per
+    # ``&``-separated segment. Generated values contain no literal ``&`` — any
+    # ``&`` in row-derived literal text is percent-encoded at generation time by
+    # ``odata_literal`` (see ``_LITERAL_ESCAPES``; requests only encodes
+    # spaces/non-ASCII in an assembled URL, NOT reserved characters, so the
+    # encoding must happen here) — which is what makes splitting on ``&`` and
+    # matching on a ``$name=`` prefix safe, the same convention
+    # ``rewrite_top_in_url`` relies on. They live here (rather than in
     # ``odata.py``) so both the flat pager (``_client_paginate_pages``) and the
     # inner-``$expand`` continuation builder can use them without an import cycle;
     # ``odata.py`` re-exports them for callers that still import from there.
@@ -930,6 +1485,53 @@ def register_lakeflow_source(spark):
         return int(raw) if raw and raw.isdigit() else None
 
 
+    def _pg_param_name(part: str) -> str:
+        """Normalized query-option name of one raw ``k=v`` query pair:
+        ``%24`` decoded to ``$`` and lowercased. Server-issued continuation
+        params use arbitrary casing (Microsoft stacks emit ``$skipToken``), so
+        name comparisons on foreign URLs must not be case-sensitive."""
+        name = part.split("=", 1)[0]
+        return name.replace("%24", "$").lower()
+
+
+    _PG_POSITIONAL = ("$skiptoken", "$skip")
+
+
+    def _pg_is_continuation(url: str) -> bool:
+        """Whether ``url`` carries a positional param (``$skiptoken`` or
+        ``$skip``, any casing/encoding) — i.e. it points mid-collection.
+        NOTE this matches the connector's OWN synthesized ``$skip``
+        continuations too, not just server-issued token links: the sole
+        consumer today (the ``$batch`` re-issue's ``$top`` injection guard)
+        wants exactly that — never append ``$top`` onto anything positioned
+        mid-walk (the §11.2.5.7 hazard) — but a future consumer needing
+        "server-issued token specifically" must test for ``$skiptoken``
+        alone. Case-insensitive: a camelCase ``$skipToken=`` continuation
+        must not be mistaken for a plain collection URL."""
+        _, _, query = url.partition("?")
+        return any(
+            _pg_param_name(part) in _PG_POSITIONAL for part in (query.split("&") if query else [])
+        )
+
+
+    def _pg_strip_positional(url: str) -> str:
+        """Remove every offset/token positional param (``$skip`` /
+        ``$skiptoken``, any casing or ``%24`` encoding) from ``url``.
+
+        A keyset seek positions **absolutely** via its ``$filter``, so a
+        residual positional param would ALSO be applied by the server —
+        ``$skip=N`` riding a seek URL skips N rows INSIDE the seek window on
+        every seek page (silent, repeating loss). Reachable whenever the drain
+        re-enables keyset on an entry URL that came from offset paging: a
+        cap-resumed parked ``$skip`` checkpoint, or an inner-expand ``$skip``
+        continuation whose later boundary rows have non-null keys."""
+        head, _sep, query = url.partition("?")
+        if not query:
+            return url
+        kept = [p for p in query.split("&") if _pg_param_name(p) not in _PG_POSITIONAL]
+        return f"{head}?{'&'.join(kept)}" if kept else head
+
+
     def _pg_orderby_keys(url: str) -> list[str]:
         """Column names from the URL's ``$orderby``, in order. Returns ``[]``
         when there's no ``$orderby`` or any term is ``desc`` (a ``gt`` seek
@@ -938,7 +1540,11 @@ def register_lakeflow_source(spark):
         if not raw:
             return []
         keys = []
-        for term in raw.replace("%20", " ").split(","):
+        # ``+`` is a legal space encoding in query strings and server-issued
+        # continuation links may use it ("Id+asc") — without decoding it the
+        # desc guard misses and the "key" keeps its suffix, seeking on a
+        # nonexistent column (null boundary → $skip, or a server 400).
+        for term in raw.replace("%20", " ").replace("+", " ").split(","):
             term = term.strip()
             if term.endswith(" desc"):
                 return []
@@ -946,14 +1552,20 @@ def register_lakeflow_source(spark):
         return [k for k in keys if k]
 
 
-    def _pg_keyset_filter(order_keys: list[str], row: dict) -> str | None:
+    def _pg_keyset_filter(
+        order_keys: list[str], row: dict, edm_types: dict[str, str] | None = None
+    ) -> str | None:
         """Build the ascending seek predicate placing the cursor strictly after
         ``row`` in ``order_keys`` order::
 
             (k1 gt v1) or (k1 eq v1 and k2 gt v2) or …
 
         Returns ``None`` if any key's value is null (no comparable boundary —
-        the caller falls back to ``$skip``)."""
+        the caller falls back to ``$skip``). ``edm_types`` (property → declared
+        Edm type, when the caller has the CSDL in reach) steers quoting via
+        :func:`odata_literal_typed` — a guid boundary must render BARE, an
+        ISO-looking string boundary must stay QUOTED."""
+        types = edm_types or {}
         vals = []
         for k in order_keys:
             v = row.get(k)
@@ -962,21 +1574,36 @@ def register_lakeflow_source(spark):
             vals.append((k, v))
         clauses = []
         for i, (k, v) in enumerate(vals):
-            terms = [f"{vals[j][0]} eq {odata_literal(vals[j][1])}" for j in range(i)]
-            terms.append(f"{k} gt {odata_literal(v)}")
+            terms = [
+                f"{vals[j][0]} eq {odata_literal_typed(vals[j][1], types.get(vals[j][0]))}"
+                for j in range(i)
+            ]
+            terms.append(f"{k} gt {odata_literal_typed(v, types.get(k))}")
             clauses.append(" and ".join(terms))
         if len(clauses) == 1:
             return clauses[0]
         return " or ".join(f"({c})" for c in clauses)
 
 
+    def _pg_get_filter(url: str) -> str | None:
+        """The URL's ``$filter`` value, matching the ``%24filter`` spelling a
+        server-issued continuation may carry (mirroring ``_pg_parse_top`` /
+        ``_pg_orderby_keys`` — the positional params already get this via
+        ``_pg_param_name``, but the filter readers matched only the literal
+        ``$``)."""
+        val = _pg_get_query(url, "$filter")
+        return val if val is not None else _pg_get_query(url, "%24filter")
+
+
     def _pg_with_extra_filter(url: str, clause: str) -> str:
         """AND ``clause`` into the URL's ``$filter`` (replacing any prior seek —
         the caller always rebuilds from the original base URL, so seeks never
-        accumulate)."""
-        existing = _pg_get_query(url, "$filter")
+        accumulate). A ``%24filter`` spelling is folded into the one ``$filter``
+        param (never left behind — two filter params make the server pick one
+        arbitrarily or 400)."""
+        existing = _pg_get_filter(url)
         combined = f"({existing}) and ({clause})" if existing else clause
-        return _pg_set_query(url, "$filter", combined)
+        return _pg_set_query(_pg_strip_query(url, "%24filter"), "$filter", combined)
 
 
     # Connector-private query option carrying the stable base ``$filter`` across
@@ -998,11 +1625,13 @@ def register_lakeflow_source(spark):
     def _pg_base_filter(url: str) -> str | None:
         """The stable base ``$filter`` for a keyset walk: the stashed ``__pgbase``
         if present (a resumed walk), else the URL's current ``$filter`` (the first
-        page, before any seek). An empty ``__pgbase`` marker means 'no base'."""
+        page, before any seek — matched in both the ``$`` and ``%24`` spellings,
+        see :func:`_pg_get_filter`). An empty ``__pgbase`` marker means 'no
+        base'."""
         marker = _pg_get_query(url, _PG_BASE)
         if marker is not None:
             return marker or None
-        return _pg_get_query(url, "$filter")
+        return _pg_get_filter(url)
 
 
     def _pg_keyset_seek_url(url: str, base_filter: str | None, seek: str) -> str:
@@ -1015,9 +1644,19 @@ def register_lakeflow_source(spark):
         batch — otherwise the ``$filter`` grows one keyset clause per batch and
         eventually overflows the server's URL-length limit. The seeks are
         monotonic so the accumulated form is merely redundant, never wrong, but it
-        is unbounded. ``__pgbase`` is stripped before the request is sent."""
+        is unbounded. ``__pgbase`` is stripped before the request is sent.
+
+        Any positional param on the entry URL (``$skip`` from a resumed parked
+        checkpoint or an inner-expand continuation, a stray ``$skiptoken``) is
+        stripped: the seek is absolute, and a retained ``$skip=N`` would skip N
+        rows inside the seek window on every seek page — see
+        :func:`_pg_strip_positional`."""
         combined = f"({base_filter}) and ({seek})" if base_filter else seek
-        out = _pg_set_query(url, "$filter", combined)
+        # Strip an encoded ``%24filter`` spelling before setting ``$filter`` so a
+        # server-issued continuation resumed into this walk never ends up with
+        # two filter params (the base was already recovered via _pg_get_filter).
+        cleaned = _pg_strip_query(_pg_strip_positional(url), "%24filter")
+        out = _pg_set_query(cleaned, "$filter", combined)
         return _pg_set_query(out, _PG_BASE, base_filter or "")
 
 
@@ -1027,8 +1666,156 @@ def register_lakeflow_source(spark):
         a single walk — and costs one page's worth of work. Two consecutive
         non-empty pages with the same fingerprint mean the server returned the
         same data twice (it ignored our seek/``$skip`` or handed back a cyclic
-        ``@odata.nextLink``), so the walk has stalled."""
+        ``@odata.nextLink``), so the walk has stalled. Callers pass the RAW
+        payload items (``@odata.*`` annotations included): with a
+        low-cardinality ``$select``, two distinct consecutive pages can be
+        identical after the annotation strip, and per-entity annotations
+        (id/etag) are what disambiguate them."""
         return hash(repr(page_rows))
+
+
+    # Sentinel distinguishing "walk has no ancestor cursor" (leaf-cursor / $batch
+    # walks) from "ancestor cursor is None" (the ancestor-cursor walk, where a
+    # null stamped cursor is a real value the ordering must carry).
+    _NO_ANCESTOR_CURSOR = object()
+
+
+    def _chain_resume_key(
+        chain: list[dict],
+        ancestor_cursor: Any = _NO_ANCESTOR_CURSOR,
+        cursor_level: int = 0,
+    ) -> list:
+        """Client-side ordering key for one ancestor key chain, mirroring the
+        chain enumerations' server-side ordering. The enumeration is NESTED —
+        each level orders within its parent (PK asc; the cursor level prefixes
+        ``cursor asc`` WITHIN that level, see ``_iter_parent_chains_with_cursor``)
+        — so the ancestor-cursor walk's cursor term is inserted at its LEVEL's
+        position, never globally first: a globally-first cursor misorders every
+        ``cursor_level >= 1`` path (a chain under a later top-level parent with
+        a lower cursor would sort "before" the park and be skipped unwalked —
+        permanent subtree loss on a completely stable source). Values stay RAW
+        (the server's rendered text); all ordering happens in
+        :func:`_chain_strictly_before` via the chronological comparators.
+
+        MUST return a ``list`` (not a tuple): this key is parked in the resume
+        offset and JSON round-trips to a list, so the resume-skip equality
+        (``chain == parked_chain``) only holds if the freshly-built key is also a
+        list. A tuple would silently defeat the skip (harmless — the walk just
+        reprocesses the parked boundary, duplicate-safe — but slower)."""
+        key: list = []
+        for idx, level_keys in enumerate(chain):
+            if ancestor_cursor is not _NO_ANCESTOR_CURSOR and idx == cursor_level:
+                key.append(ancestor_cursor)
+            key.extend(level_keys.values())
+        if ancestor_cursor is not _NO_ANCESTOR_CURSOR and cursor_level >= len(chain):
+            key.append(ancestor_cursor)
+        return key
+
+
+    def _order_reproducible(a: Any, b: Any) -> bool:
+        """Whether the client can reproduce the server's relative ORDER for a
+        differing pair of enumeration-key elements. JSON numbers order
+        numerically on every server; ISO-rendered instants order chronologically
+        under every collation; and a real number paired with a numeric string
+        proves the property is numeric (a rendering flip), so the exact-Decimal
+        bridge holds. Anything else — plain text, GUID strings, digits-only
+        ``Edm.String`` values — is ordered by the SERVER's collation
+        (case-insensitive SQL Server defaults, ``uniqueidentifier`` byte-group
+        order, ICU locales…), which Python's ordinal comparison cannot
+        reproduce: trusting it turns "not yet walked" into "already walked" and
+        silently drops whole subtrees at a park boundary."""
+        if isinstance(a, bool) or isinstance(b, bool):
+            return False
+        a_num = isinstance(a, (int, float))
+        b_num = isinstance(b, (int, float))
+        if a_num and b_num:
+            return True
+        if (a_num or b_num) and _as_exact_number(a) is not None and _as_exact_number(b) is not None:
+            return True
+
+        def _chrono(v: Any) -> bool:
+            return isinstance(v, datetime) or (isinstance(v, str) and looks_like_iso8601(v))
+
+        return _chrono(a) and _chrono(b)
+
+
+    def _chain_seek_order(key_a: list, key_b: list) -> str:
+        """Collation-honest three-way order of enumeration position ``key_a``
+        vs ``key_b`` (both from :func:`_chain_resume_key`, raw values):
+        ``"before"`` / ``"after"`` only when the first differing element's order
+        is provable client-side (:func:`_order_reproducible`), else
+        ``"unknown"`` — the seek loops keep seeking on their identity anchor
+        for unknowns instead of guessing (see the call sites)."""
+        try:
+            for a, b in zip(key_a, key_b):
+                # Same-RENDERING equality (raw, chronological-key, or a
+                # number/numeric-string type flip) — two renderings of an
+                # EQUAL element must fall through to the next element, not
+                # decide the order. Deliberately NOT cursor_same_instant:
+                # its numeric branch calls two numeric STRINGS with different
+                # text ("007" vs "7") equal, which conflates two DISTINCT
+                # parents into one position and lets a later element decide
+                # order ACROSS parents — a false "before" skips an unwalked
+                # subtree past the vanished-anchor reset (silent loss).
+                if _cursor_same_rendering(a, b):
+                    continue
+                if not _order_reproducible(a, b):
+                    return "unknown"
+                # First differing element decides: a sorts before b iff b is
+                # strictly newer/greater. cursor_newer is a strict total order
+                # over comparable values, so this is well-defined.
+                return "before" if _cursor_newer(b, a) else "after"
+            if len(key_a) < len(key_b):
+                return "before"
+            return "after"
+        except TypeError:
+            return "unknown"
+
+
+    def _expand_resume_start(page_rows: list, boundary: list | None, skip: int, order_key) -> tuple:
+        """Resume position for a re-fetched parked expand page: identity-anchor
+        on the parked row itself (``order_key(row) == boundary``) and resume
+        right after it — exact for EVERY key type with zero reliance on
+        reproducing the server's collation client-side. Returns
+        ``(start_idx, boundary)``: the anchor consumes the boundary (``None``);
+        an anchor row that's gone (deleted / churned out of the page) keeps the
+        boundary so the caller's per-row PROVABLE-order skip takes over
+        (duplicate-safe). ``skip`` is the legacy positional fallback used only
+        when no boundary was parked at all."""
+        if boundary is None:
+            return skip, None
+        for anchor_idx, anchor_row in enumerate(page_rows):
+            if order_key(anchor_row) == boundary:
+                return anchor_idx + 1, None
+        return 0, boundary
+
+
+    def _chain_strictly_before(key_a: list, key_b: list) -> bool:
+        """Whether enumeration position ``key_a`` PROVABLY sorts strictly before
+        ``key_b`` (both from :func:`_chain_resume_key`, raw values).
+
+        This drives the "already walked in a prior capped batch" skip. The
+        positional (index-based) skip it replaces silently desynchronizes
+        under parent-set churn between batches — a deleted parent shifts
+        every successor left one slot, so the resume skips an unwalked
+        parent forever; an insert shifts right, so a parked mid-collection
+        continuation link gets applied to the WRONG parent (its rows then
+        FK-tagged with that parent's keys). Comparing by the enumeration's
+        own ordering keys is churn-stable.
+
+        Elements compare via :func:`cursor_newer` — chronological for
+        ISO-rendered values INCLUDING the padded-fraction sub-microsecond
+        tie-break. A µs-truncating comparison here re-opens the round-18 tie
+        class one layer up: two 100ns-distinct cursors (SQL Server
+        ``datetime2(7)``) tie, the seek loop stops one chain early, the
+        parked continuation is silently dropped, and the walk re-parks a
+        byte-identical offset — a permanently failing (no-progress) or
+        silently starved stream. Pairs whose order isn't provable client-side
+        (cross-type values after a metadata change, or plain-text/GUID keys
+        the SERVER orders by ITS collation — see :func:`_order_reproducible`)
+        return ``False`` — the chain is NOT skipped, degrading to a
+        duplicate-safe re-read instead of a silent skip."""
+        return _chain_seek_order(key_a, key_b) == "before"
 
 
     # Re-export of the EDM namespace prefix used by the main module.
@@ -1176,6 +1963,30 @@ def register_lakeflow_source(spark):
         return f"{segment}_{pk_name}"
 
 
+    def validate_page_size(opts: dict) -> None:
+        """Reject a non-positive / non-numeric ``page_size`` with a curated error.
+
+        ``$top=0`` is the nasty case: it's a perfectly valid URL the server
+        answers with an empty page, which the client-driven drain reads as
+        exhaustion — every read of the table would silently emit zero rows. A
+        non-numeric value would ride into the URL raw and surface only as a
+        confusing server 400. Every other numeric table option raises a curated
+        error on garbage; ``page_size`` shouldn't be the silent one. Called from
+        ``read_table`` and the partition entry points (``is_partitioned`` /
+        ``get_partitions``), which don't route through ``read_table``."""
+        raw = opts.get("page_size")
+        if raw is None:
+            return
+        text = str(raw).strip()
+        if not text.isdigit() or int(text) < 1:
+            raise ValueError(
+                f"page_size={raw!r} is not a positive integer. page_size sets "
+                f"the per-request $top; use a value >= 1, or unset it for the "
+                f"default (1000 — or, under pagination=nextlink, no $top at "
+                f"all on snapshot reads)."
+            )
+
+
     def _ancestor_pk_order_by(ancestor_pks: list[str]) -> str:
         """Build a stable PK-only ``$orderby`` clause for ancestor key
         enumeration. OData v4 §11.2.5.7 (server-driven paging) doesn't
@@ -1212,7 +2023,16 @@ def register_lakeflow_source(spark):
             break cycles via target-type set."""
             try:
                 root_et = self._flat_entity_type_for(top_level_set, namespace)
-            except ValueError:
+            except ValueError as exc:
+                # The flat set still lists (its own read fails loudly), but its
+                # contained children can't be enumerated — say so instead of
+                # silently listing it childless.
+                _LOG.warning(
+                    "Cannot enumerate contained paths under %r: %s. The set is "
+                    "listed without contained children.",
+                    top_level_set,
+                    exc,
+                )
                 return []
             paths: list[str] = []
             # Cycle detection: start with an empty ``seen`` so the very first
@@ -1227,6 +2047,23 @@ def register_lakeflow_source(spark):
                 for nav_name, target_ref in self._all_contained_nav_props(et):
                     if target_ref in seen:
                         continue
+                    if CONTAINED_PATH_SEP in nav_name:
+                        # A nav property whose NAME contains the path separator
+                        # ("My__Kids" — CSDL SimpleIdentifiers legally allow
+                        # consecutive underscores) would list as a table name
+                        # the read path's ``__``-splitting can never resolve
+                        # back (declared-flat-set longest-prefix matching covers
+                        # entity SETS only, not nav-prop names). Emitting it
+                        # breaks the discovery→read round trip: skip with a
+                        # warning instead of listing an unreadable table.
+                        _LOG.warning(
+                            "Skipping contained collection %r under %r: navigation-"
+                            "property names containing '__' cannot be addressed by "
+                            "this connector's path syntax.",
+                            nav_name,
+                            CONTAINED_PATH_SEP.join(segments),
+                        )
+                        continue
                     target_et = self._resolve_type_ref(target_ref)
                     if target_et is None:
                         continue
@@ -1237,12 +2074,37 @@ def register_lakeflow_source(spark):
 
         # --- option parsing ----------------------------------------------------
 
+        def _expand_contained_mode(self, table_options: dict[str, str] | None) -> str:
+            """Parse the ``expand_contained`` table option: ``true``, ``false``,
+            or ``auto`` (**default** when unset).
+
+            ``auto`` attempts the nested-``$expand`` read first: a one-shot
+            behavioural preflight (:meth:`_verify_expand_support`) issues the real
+            expand URL — with the same inner ``$top``/``$orderby``/``$filter``
+            constructs the read would send — and verifies the server actually
+            returns inline child collections (cross-checked against direct
+            navigation, so a server that accepts the URL but silently ignores
+            ``$expand`` is caught). ONLY a conclusive pass runs the expand read;
+            anything else — a definitive failure, a transient blip, or an
+            inconclusive sample — **falls back** to the N+1 walks
+            (``expand_contained=false``) for that batch, never raising on a
+            capability shortfall and never assuming ``$expand`` works before the
+            verdict is in. The verdict persists in the resume offset as
+            ``expand_ok`` (mirrors ``batch_ok``); any non-``auto`` value scrubs
+            it so re-selecting ``auto`` re-runs the preflight."""
+            raw = ((table_options or {}).get("expand_contained") or "auto").strip().lower()
+            if raw not in {"true", "false", "auto"}:
+                raise ValueError(
+                    f"Invalid expand_contained={raw!r}. Expected one of: true, false, auto."
+                )
+            return raw
+
         def _expand_contained_active(self, table_options: dict[str, str] | None) -> bool:
-            """Parse the boolean ``expand_contained`` table option."""
-            raw = ((table_options or {}).get("expand_contained") or "false").strip().lower()
-            if raw not in {"true", "false"}:
-                raise ValueError(f"Invalid expand_contained={raw!r}. Expected one of: true, false.")
-            return raw == "true"
+            """``True`` only for an explicit ``expand_contained=true`` (the strict
+            opt-in). ``auto`` returns ``False`` here — validation gates that key on
+            this (e.g. the ``cursor_probe`` conflict check) must not fire for
+            ``auto``, whose expand attempt silently degrades instead."""
+            return self._expand_contained_mode(table_options) == "true"
 
         def _cursor_probe_mode(self, table_options: dict[str, str] | None) -> str:
             """Parse the ``cursor_probe`` table option into a leaf-cursor read
@@ -1367,23 +2229,69 @@ def register_lakeflow_source(spark):
 
         # --- URL construction --------------------------------------------------
 
-        def _format_key_predicate(self, pk_values: dict[str, Any]) -> str:
-            """``(value)`` for single key; ``(K1=v1,K2=v2)`` for composite."""
+        def _format_key_predicate(
+            self, pk_values: dict[str, Any], edm_types: dict[str, str] | None = None
+        ) -> str:
+            """``(value)`` for single key; ``(K1=v1,K2=v2)`` for composite.
+            ``edm_types`` (the level's declared property types) steers quoting —
+            a guid key renders BARE, an ISO-looking string key stays QUOTED."""
+            types = edm_types or {}
             if len(pk_values) == 1:
-                return f"({odata_literal(next(iter(pk_values.values())))})"
-            return "(" + ",".join(f"{k}={odata_literal(v)}" for k, v in pk_values.items()) + ")"
+                ((k, v),) = pk_values.items()
+                return f"({odata_literal_typed(v, types.get(k))})"
+            return (
+                "("
+                + ",".join(f"{k}={odata_literal_typed(v, types.get(k))}" for k, v in pk_values.items())
+                + ")"
+            )
 
-        def _build_contained_path(self, segments: list[str], key_chain: list[dict[str, Any]]) -> str:
-            """``A(1)/B('x')/C`` — leaf segment has no key; ``key_chain`` len = N-1."""
+        def _edm_types_for_level(
+            self, segments: list[str], level: int, namespace: str | None
+        ) -> dict[str, str]:
+            """Best-effort property-type map for the collection at
+            ``segments[level]``. Resolution failure (e.g. an entity-set name
+            ambiguous across namespaces when the caller has no ``namespace`` in
+            scope) degrades to ``{}`` — sniff-based literal rendering — rather
+            than failing a URL build that worked untyped for years. The failure
+            outcome is memoized per (path, namespace): this runs once per URL
+            build (per parent chain on an N+1 walk), and re-raising +
+            re-formatting ``_entity_type_for``'s sorted "Available: …" error
+            100k times per cycle is pure waste (success is already memoized
+            inside ``_entity_type_for``/``_edm_types_for_et``)."""
+            path = CONTAINED_PATH_SEP.join(segments[: level + 1])
+            failed = self.__dict__.setdefault("_edm_types_unresolvable", set())
+            if (path, namespace) in failed:
+                return {}
+            try:
+                return self._edm_types_for_et(self._entity_type_for(path, namespace))
+            except Exception:  # noqa: BLE001 — metadata gaps must not break URL builds
+                failed.add((path, namespace))
+                return {}
+
+        def _build_contained_path(
+            self,
+            segments: list[str],
+            key_chain: list[dict[str, Any]],
+            namespace: str | None = None,
+        ) -> str:
+            """``A(1)/B('x')/C`` — leaf segment has no key; ``key_chain`` len = N-1.
+            Key values render TYPED per level (guid bare / string quoted); the
+            type lookup is best-effort, so callers without a ``namespace`` in
+            scope still work (sniff-rendered) on ambiguous multi-namespace
+            services."""
             if len(key_chain) != len(segments) - 1:
                 raise ValueError(
                     f"key_chain length {len(key_chain)} does not match "
                     f"non-leaf segment count {len(segments) - 1}"
                 )
-            return _URL_SEGMENT_SEP.join(
-                f"{seg}{self._format_key_predicate(key_chain[i])}" if i < len(key_chain) else seg
-                for i, seg in enumerate(segments)
-            )
+
+            def _render(i: int, seg: str) -> str:
+                if i >= len(key_chain):
+                    return seg
+                types = self._edm_types_for_level(segments, i, namespace)
+                return f"{seg}{self._format_key_predicate(key_chain[i], types)}"
+
+            return _URL_SEGMENT_SEP.join(_render(i, seg) for i, seg in enumerate(segments))
 
         # pylint: disable=too-many-arguments,too-many-positional-arguments
         def _build_contained_url(
@@ -1395,7 +2303,10 @@ def register_lakeflow_source(spark):
             order_by: str | None = None,
         ) -> str:
             """Full URL for a contained-collection read at one parent tuple."""
-            base = join_url(self.service_url, self._build_contained_path(segments, key_chain))
+            base = join_url(
+                self.service_url,
+                self._build_contained_path(segments, key_chain, table_options.get("namespace")),
+            )
             return f"{base}?{self._format_query_params(table_options, extra_filter, order_by)}"
 
         # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -1530,13 +2441,21 @@ def register_lakeflow_source(spark):
             namespace = (table_options or {}).get("namespace")
             opts = table_options or {}
             has_children = start_level < len(segments) - 1
-            # The table's ``filter`` option is the leaf filter — same as N+1
-            # mode, where it lands at the leaf URL — so strip it from the
-            # start-level query params when there are deeper levels. It re-enters
-            # at the innermost ``$expand(...)`` clause below. Without this split,
-            # ``filter="Id eq 3"`` on a ``Instances__Projects`` table would land
-            # at Instances (wrong segment) and 400 the server.
-            top_opts = {k: v for k, v in opts.items() if k != "filter"} if has_children else dict(opts)
+            # The table's ``filter`` and ``select`` options are LEAF-scoped —
+            # same as N+1 mode, where they land at the leaf URL, and same as the
+            # schema derivation / option validation, which resolve them against
+            # the leaf entity type — so strip both from the start-level query
+            # params when there are deeper levels. They re-enter at the innermost
+            # ``$expand(...)`` clause below. Without this split, ``filter="Id eq
+            # 3"`` (or ``select="Id,Label"``) on a ``Instances__Projects`` table
+            # would land at Instances (wrong segment): a leaf-only column 400s
+            # the server, and a name shared across levels silently projects the
+            # TOP entity while the leaf comes back unprojected.
+            top_opts = (
+                {k: v for k, v in opts.items() if k not in ("filter", "select")}
+                if has_children
+                else dict(opts)
+            )
             if per_level_tops is not None:
                 # Override page_size in the opts dict ``_format_query_params``
                 # reads from, so the start-level ``$top`` reflects the dynamic
@@ -1557,6 +2476,7 @@ def register_lakeflow_source(spark):
             if not has_children:
                 return f"{base}?{query}"
             user_leaf_filter = opts.get("filter")
+            user_leaf_select = opts.get("select")
             inner = ""
             for i in range(len(segments) - 1, start_level, -1):
                 is_leaf = i == len(segments) - 1
@@ -1569,8 +2489,17 @@ def register_lakeflow_source(spark):
                     segment_filters.get(i),
                     user_leaf_filter if is_leaf else None,
                 )
-                if cursor_level == i and cursor_select:
-                    parts.append(f"$select={cursor_select}")
+                level_select = cursor_select if cursor_level == i and cursor_select else None
+                if is_leaf and user_leaf_select:
+                    # Leaf-scoped user projection, merged (deduped, user order
+                    # first) with any cursor projection targeting the same level.
+                    merged = [c.strip() for c in user_leaf_select.split(",") if c.strip()]
+                    for col in (level_select or "").split(","):
+                        if col.strip() and col.strip() not in merged:
+                            merged.append(col.strip())
+                    level_select = ",".join(merged)
+                if level_select:
+                    parts.append(f"$select={level_select}")
                 if level_filter:
                     parts.append(f"$filter={level_filter}")
                 level_order = self._expand_level_order_by(
@@ -1613,8 +2542,8 @@ def register_lakeflow_source(spark):
 
         def _resolve_fk_columns(
             self, segments: list[str], namespace: str | None
-        ) -> dict[tuple[str, str], str]:
-            """Map ``(segment, pk_name) → unique FK column name`` for every
+        ) -> dict[tuple[int, str], str]:
+            """Map ``(level_index, pk_name) → unique FK column name`` for every
             non-leaf ancestor.
 
             OData v4 §13.4.3 makes contained-entity keys unique only within
@@ -1622,6 +2551,13 @@ def register_lakeflow_source(spark):
             the full ancestor chain to be globally unique. Default name is
             ``<segment>_<pk>``; collisions get a leading ``_`` until unique.
             Empty mapping for flat tables.
+
+            Keyed by the segment's **index**, not its name: a recursive
+            containment path can repeat a nav-prop name at two non-leaf
+            levels (``Folders__Children__Children__Files``), and a
+            name-keyed map would collapse both levels into one entry —
+            losing a composite-key component (silent MERGE collisions) and
+            duplicating the surviving column in the schema.
 
             FK columns named in the ``exclude_ancestor_columns`` table option
             (parsed onto ``self._excluded_ancestor_columns`` at each entry
@@ -1655,7 +2591,7 @@ def register_lakeflow_source(spark):
                         candidate = fk_column_name(seg, pk)
                         while candidate in used:
                             candidate = "_" + candidate
-                        resolved[(seg, pk)] = candidate
+                        resolved[(idx, pk)] = candidate
                         used.add(candidate)
                 state.fk_columns[cache_key] = resolved
             excluded = getattr(self, "_excluded_ancestor_columns", frozenset())
@@ -1670,16 +2606,34 @@ def register_lakeflow_source(spark):
             row: dict,
             segments: list[str],
             chain: list[dict[str, Any]],
-            fk_columns: dict[tuple[str, str], str],
+            fk_columns: dict[tuple[int, str], str],
         ) -> None:
             """Write every ancestor's primary-key values onto ``row`` under
-            the resolved FK column names from ``fk_columns``."""
+            the resolved FK column names from ``fk_columns`` (keyed by level
+            index, so repeated nav-prop names at different depths stay
+            distinct columns)."""
             for idx, ancestor_keys in enumerate(chain):
-                seg = segments[idx]
                 for pk_name, pk_val in ancestor_keys.items():
-                    col = fk_columns.get((seg, pk_name))
-                    if col is not None:
-                        row[col] = pk_val
+                    col = fk_columns.get((idx, pk_name))
+                    if col is None:
+                        continue
+                    if pk_val is None:
+                        # A parent entity omitted or nulled its own primary key
+                        # (non-conformant — OData keys are never null). Stamping
+                        # ``None`` onto the non-nullable FK column would send a
+                        # null MERGE key into ``apply_changes`` — the same silent
+                        # null-key row the leaf-PK ``never_pad`` guard rejects
+                        # loudly. Fail here rather than emit it (or build a
+                        # malformed ``Parent('None')/child`` continuation URL).
+                        raise ValueError(
+                            f"Ancestor entity at path level {idx} is missing its key "
+                            f"{pk_name!r} (got null); cannot form foreign-key column "
+                            f"{col!r}. A parent omitted/nulled its primary key (a "
+                            f"non-conformant response) — its child rows would carry a "
+                            f"null MERGE key. Fix the source response, or exclude this "
+                            f"path."
+                        )
+                    row[col] = pk_val
 
         def _find_cursor_level(
             self,
@@ -1703,7 +2657,7 @@ def register_lakeflow_source(spark):
             ancestor of a contained path; ``None`` when the leaf owns it or
             the path is flat. Used by ``get_table_schema`` to add the column
             to the leaf schema."""
-            segments = parse_contained_path(table_name) or [table_name]
+            segments = self._table_segments(table_name) or [table_name]
             if len(segments) < 2:
                 return None
             cursor_level = self._find_cursor_level(segments, namespace, cursor_field)
@@ -1726,6 +2680,7 @@ def register_lakeflow_source(spark):
             cursor_field: str,
             since: Any,
             top_parent_rows: list[dict] | None = None,
+            tolerate_vanished: bool = False,
         ) -> Iterator[tuple[list[dict[str, Any]], Any]]:
             """Like ``_iter_parent_key_chains`` but applies a cursor filter at
             the ancestor that owns ``cursor_field``. Yields
@@ -1737,7 +2692,11 @@ def register_lakeflow_source(spark):
             fetching the whole top-level set. Each row dict must carry the
             top-level entity's PKs (and, when ``cursor_level == 0``, the
             cursor value). The supplied subset is consumed in order without
-            re-fetching."""
+            re-fetching.
+
+            ``tolerate_vanished`` (partitioned callers): skip-with-warning a
+            parent whose sub-level fetch 404/410s — see
+            :meth:`_iter_parent_key_chains`."""
             segment_filters = resolve_segment_filters(table_options, segments)
 
             def _walk(level: int, chain: list[dict[str, Any]], cur_val: Any):
@@ -1770,7 +2729,11 @@ def register_lakeflow_source(spark):
                     if level == cursor_level:
                         if cursor_field not in select_cols:
                             select_cols.append(cursor_field)
-                        extra_filter = self._cursor_filter(cursor_field, since)
+                        extra_filter = self._cursor_filter(
+                            cursor_field,
+                            since,
+                            edm_type=self._edm_types_for_et(ancestor_et).get(cursor_field),
+                        )
                         terms = [f"{cursor_field} asc"]
                         terms.extend(f"{pk} asc" for pk in ancestor_pks if pk != cursor_field)
                         order_by = ",".join(terms)
@@ -1793,12 +2756,18 @@ def register_lakeflow_source(spark):
                             order_by=order_by,
                         )
                     )
-                    row_source = self._fetch_pages(url)
+                    row_source = self._fetch_pages(url, self._edm_types_for_et(ancestor_et))
                 for row in row_source:
                     next_cur = row.get(cursor_field) if level == cursor_level else cur_val
                     chain.append({pk: row.get(pk) for pk in ancestor_pks})
-                    yield from _walk(level + 1, chain, next_cur)
-                    chain.pop()
+                    try:
+                        yield from _walk(level + 1, chain, next_cur)
+                    except requests.HTTPError as exc:
+                        if not (tolerate_vanished and _is_vanished_error(exc)):
+                            raise
+                        _log_vanished_parent(chain, exc)
+                    finally:
+                        chain.pop()
 
             yield from _walk(0, [], None)
 
@@ -1808,6 +2777,7 @@ def register_lakeflow_source(spark):
             namespace: str | None,
             table_options: dict[str, str] | None,
             top_parent_rows: list[dict] | None = None,
+            tolerate_vanished: bool = False,
         ) -> Iterator[list[dict[str, Any]]]:
             """Yield every ancestor key chain (len = len(segments) - 1) reaching
             the leaf. Each level fetched with ``$select=<pks>``; user ``filter``
@@ -1816,7 +2786,15 @@ def register_lakeflow_source(spark):
 
             ``top_parent_rows`` lets a partitioned caller supply a pre-
             discovered subset of level-0 rows; when provided, the level-0
-            HTTP fetch is skipped and the rows are consumed in order."""
+            HTTP fetch is skipped and the rows are consumed in order.
+
+            ``tolerate_vanished``: a parent whose sub-level fetch 404/410s is
+            skipped with a warning instead of failing the walk. ONLY the
+            partitioned path sets this — its parent set is frozen into the
+            task descriptor at planning, so a parent deleted mid-batch would
+            otherwise fail every Spark task retry deterministically (the
+            serial walks re-enumerate parents each trigger and self-heal
+            without it)."""
             segment_filters = resolve_segment_filters(table_options, segments)
 
             def _walk(level: int, chain: list[dict[str, Any]]):
@@ -1858,11 +2836,17 @@ def register_lakeflow_source(spark):
                         if level == 0
                         else self._build_contained_url(sub_segments, chain, opts, order_by=order_by)
                     )
-                    row_source = self._fetch_pages(url)
+                    row_source = self._fetch_pages(url, self._edm_types_for_et(ancestor_et))
                 for row in row_source:
                     chain.append({pk: row.get(pk) for pk in ancestor_pks})
-                    yield from _walk(level + 1, chain)
-                    chain.pop()
+                    try:
+                        yield from _walk(level + 1, chain)
+                    except requests.HTTPError as exc:
+                        if not (tolerate_vanished and _is_vanished_error(exc)):
+                            raise
+                        _log_vanished_parent(chain, exc)
+                    finally:
+                        chain.pop()
 
             yield from _walk(0, [])
 
@@ -1924,7 +2908,10 @@ def register_lakeflow_source(spark):
             if order_by:
                 outer.append(f"$orderby={order_by}")
             outer.append(f"$expand={leaf_nav}({';'.join(inner)})")
-            base = join_url(self.service_url, self._build_contained_path(parent_segments, parent_chain))
+            base = join_url(
+                self.service_url,
+                self._build_contained_path(parent_segments, parent_chain, namespace),
+            )
             return f"{base}?{'&'.join(outer)}"
 
         def _iter_dirty_leaf_parent_chains(
@@ -1943,35 +2930,44 @@ def register_lakeflow_source(spark):
             read: it enumerates leaf-grandparent tuples the same way, then runs
             one :meth:`_build_probe_url` per tuple and emits the leaf-parent key
             (extending the chain) only for parents the probe flags dirty. Like
-            the plain enumerator it is consumed lazily and is deterministic for
-            a fixed ``since``, so the leaf-cursor walk's flat ``parent_idx``
-            resume works unchanged — a resumed batch re-probes the skipped
-            parents (cheap; no leaf fetches) exactly as the plain walk re-pages
-            skipped ancestors.
+            the plain enumerator it is consumed lazily and — LOAD-BEARING — it
+            yields chains in **PK order at every level**: grandparents via
+            ``_iter_parent_key_chains``' PK ``$orderby``, leaf-parents via the
+            probe URL's own outer ``$orderby=<pks> asc``
+            (:meth:`_build_probe_url`). The capped walk's key-based resume
+            (``parent_keys``, :func:`_chain_strictly_before`) skips
+            "already-walked" chains by exactly that ordering; dropping either
+            ``$orderby`` would silently skip dirty parents that enumerate after
+            a park. A resumed batch re-probes the skipped parents (cheap; no
+            leaf fetches) exactly as the plain walk re-pages skipped ancestors.
 
             ``since`` is ``None`` on the first batch → every leaf-parent with any
             leaf reads as dirty, so the first incremental batch behaves like the
             standard full walk (correct, no speed-up until a watermark exists)."""
             parent_segments = segments[:-1]
             leaf_nav = segments[-1]
-            lp_pks = self._own_primary_keys_for_et(
-                self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
-            )
+            lp_et = self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
+            lp_pks = self._own_primary_keys_for_et(lp_et)
+            lp_types = self._edm_types_for_et(lp_et)
             for pchain in self._iter_parent_key_chains(parent_segments, namespace, table_options):
                 url = self._build_probe_url(segments, pchain, table_options, cursor_field)
-                for row in self._fetch_pages(url):
+                for row in self._fetch_pages(url, lp_types):
                     # The probe returns the newest leaf (``$orderby cursor desc;
                     # $top=1``). Max over the returned rows so we're still correct
                     # if a server ignores ``$top`` and hands back several. Dirty
                     # when that max cursor exceeds the watermark (or on the first
                     # batch, ``since is None``, whenever the leaf-parent has a
                     # leaf at all) — this matches the hydrate's ``cursor gt since``.
+                    # Chronological comparisons (``_cursor_newer``): a lexical
+                    # ``>`` against a value-dependently-fractional rendering
+                    # (``…00.5Z`` vs watermark ``…00Z``) would mark a genuinely
+                    # dirty leaf-parent CLEAN and skip its changed leaves.
                     max_cursor = None
                     for child in row.get(leaf_nav) or []:
                         val = child.get(cursor_field)
-                        if val is not None and (max_cursor is None or val > max_cursor):
+                        if val is not None and (max_cursor is None or _cursor_newer(val, max_cursor)):
                             max_cursor = val
-                    if max_cursor is not None and (since is None or max_cursor > since):
+                    if max_cursor is not None and (since is None or _cursor_newer(max_cursor, since)):
                         yield pchain + [{pk: row.get(pk) for pk in lp_pks}]
 
         def _verify_cursor_probe_support(
@@ -2005,31 +3001,140 @@ def register_lakeflow_source(spark):
             *conclusive* pass is also persisted in the resume offset as
             ``cursor_probe_ok``; when a prior batch's offset carries it, the
             preflight requests are skipped entirely. Only a conclusive pass is
-            trusted this way. An *inconclusive* result — no leaf-parent yet has
-            ``>= 2`` distinct leaf cursors, so ordering can't cause a miss — is
-            re-checked every batch, so a server that begins to mis-order once its
-            data grows discriminating is still caught.
+            trusted this way. Under the non-strict ``auto`` cascade BOTH
+            definitive outcomes additionally ride the process/file capability
+            cache (per contained path) — the offset never carries a fail, so
+            without it a mis-ordering server would re-pay the preflight GETs on
+            every framework-recreated reader. Strict mode neither consults nor
+            records the shared cache (an explicit mode keeps no recorded
+            verdicts, and its error must carry fresh evidence). An *inconclusive*
+            result — no leaf-parent yet has ``>= 2`` distinct leaf cursors, so
+            ordering can't cause a miss — is re-checked every batch, so a server
+            that begins to mis-order once its data grows discriminating is still
+            caught; a race-contaminated sample (see
+            :meth:`_cursor_probe_check_sample`) likewise records nothing.
 
             ``(supported, conclusive)``: ``supported`` is ``True`` via the persisted
             offset flag or any non-mis-ordering preflight verdict; ``conclusive`` is
             ``True`` only on a conclusive pass the caller may persist as
             ``cursor_probe_ok`` (an *inconclusive* scan is re-checked every batch).
             Raises (``strict``) or returns ``(False, False)`` (non-strict) on a
-            mis-ordering server."""
+            mis-ordering server. A preflight that errors out before reaching a
+            verdict (transport/HTTP failure on the enumeration or trusted-
+            reference fetch — indistinguishable from a transient) likewise
+            degrades a non-strict read to the ``$batch``/plain cascade for this
+            batch while caching and recording nothing; strict raises an
+            actionable error instead of the raw HTTP failure."""
             if (start_offset or {}).get("cursor_probe_ok"):
                 return (True, True)
             cache = self.__dict__.setdefault("_cursor_probe_verified", {})
             cache_key = (tuple(segments), namespace)
             if cache_key not in cache:
-                cache[cache_key] = self._run_cursor_probe_preflight(
-                    segments, namespace, table_options, cursor_field
+                # Process/file capability cache — ``auto`` cascade only. The
+                # strict mode (``cursor_probe=nested-expand``) is an explicit
+                # non-``auto`` selection: it neither consults nor records the
+                # shared verdict (same rule as the offset scrub) and re-probes
+                # so its error carries fresh, actionable evidence. Both
+                # definitive outcomes are shared: a conclusive pass AND a
+                # mis-ordering fail (otherwise ``auto`` against a mis-ordering
+                # server would re-pay the preflight GETs on every framework-
+                # recreated reader — the offset only ever carries the pass). A
+                # shared hit fills the per-instance cache (like the other
+                # verifiers) so repeat calls this instance skip the file read.
+                shared_key = self._cursor_probe_shared_key(segments, namespace)
+                shared = (
+                    None
+                    if strict
+                    else self._cached_capability("cursor_probe_ok", table_name=shared_key)
                 )
-            problem, conclusive = cache[cache_key]
+                if shared is True:
+                    cache[cache_key] = (None, True, False)
+                elif shared is False:
+                    cache[cache_key] = (_CURSOR_PROBE_SHARED_FAIL, False, False)
+                else:
+                    try:
+                        cache[cache_key] = self._run_cursor_probe_preflight(
+                            segments, namespace, table_options, cursor_field
+                        )
+                    except _CursorProbePreflightUnavailable as exc:
+                        # A preflight fetch failed before reaching a verdict —
+                        # the enumeration, the trusted-reference fetch, or (since
+                        # round 41) a TRANSIENT failure of the probe-shaped fetch
+                        # itself (only an immediate non-retryable HTTPError there
+                        # is a definitive shape rejection; retry-exhausted
+                        # throttling and network exhaustion land here — a
+                        # programming error in the preflight's own logic still
+                        # propagates). There is no evidence to distinguish a
+                        # capability shortfall from a transient blip — so treat
+                        # it like the other verifiers treat transients: degrade
+                        # THIS read to the $batch/plain cascade, cache and record
+                        # NOTHING (the next batch re-probes), and never let the
+                        # raw HTTP error escape a ``cursor_probe=auto`` read.
+                        msg = (
+                            f"cursor_probe preflight against "
+                            f"{CONTAINED_PATH_SEP.join(segments)!r} failed before reaching "
+                            f"a verdict: {exc}. If this persists (the server rejects "
+                            f"$orderby/$select on direct navigation to the leaf "
+                            f"collection), use cursor_probe=batch or cursor_probe=false."
+                        )
+                        if strict:
+                            raise ValueError(msg) from exc
+                        _LOG.warning("%s Falling back to $batch / the plain N+1 walk.", msg)
+                        return (False, False)
+                    problem, conclusive, _race = cache[cache_key]
+                    if not strict:
+                        if problem:  # clean mis-ordering evidence — a definitive fail
+                            self._store_capability("cursor_probe_ok", False, table_name=shared_key)
+                        elif conclusive:
+                            self._store_capability("cursor_probe_ok", True, table_name=shared_key)
+                        # Inconclusive scans (no discriminating sample, or only
+                        # concurrent-write races) record nothing and re-check next
+                        # batch, so a server that starts mis-ordering once its data
+                        # grows discriminating is still caught.
+            problem, conclusive, race_tainted = cache[cache_key]
             if problem:
                 if strict:
                     raise ValueError(problem)
                 return (False, False)
+            if race_tainted and not conclusive:
+                # The verdict-less scan contained a RACE skip — a sample that HAD
+                # discriminating cursors but returned newer-than-reference. Unlike
+                # a genuinely non-discriminating scan (where engaging the probe
+                # unverified is safe — ordering can't cause a miss), this may be a
+                # mis-ordering server hiding behind concurrent writes. Decline the
+                # probe for this batch (the caller cascades to $batch / the plain
+                # walk — rows stay correct; under strict mode this degrades the
+                # REQUEST SHAPE for one batch rather than raising on a transient)
+                # and record nothing; the next batch re-checks.
+                _LOG.warning(
+                    "cursor_probe preflight for %r was race-contaminated (concurrent "
+                    "writes during every discriminating sample); declining the probe "
+                    "for this batch and reading via $batch / the plain walk. The next "
+                    "batch re-checks.",
+                    CONTAINED_PATH_SEP.join(segments),
+                )
+                return (False, False)
             return (True, conclusive)
+
+        @staticmethod
+        def _cursor_probe_shared_key(segments: list[str], namespace: str | None) -> str:
+            """Per-path key for the shared ``cursor_probe_ok`` verdict — the
+            contained path (the probe shape depends on it), namespace-qualified
+            for multi-schema services."""
+            path = CONTAINED_PATH_SEP.join(segments)
+            return f"{namespace}:{path}" if namespace else path
+
+        @staticmethod
+        def _expand_shared_key(table_name: str, table_options: dict | None) -> str:
+            """Memo/shared-cache key for the per-table ``expand_ok`` verdict —
+            namespace-qualified like :meth:`_cursor_probe_shared_key`. The same
+            contained path string (``Customers__Addresses``) can resolve to
+            differently-shaped types in two namespaces of one service, so a
+            bare-table key would share one verdict across both — the exact
+            unverified-``$expand`` leak the per-table keying exists to
+            prevent, one level up."""
+            namespace = (table_options or {}).get("namespace")
+            return f"{namespace}:{table_name}" if namespace else table_name
 
         def _run_cursor_probe_preflight(
             self,
@@ -2040,42 +3145,59 @@ def register_lakeflow_source(spark):
         ) -> tuple[str | None, bool]:
             """Behavioural capability check for :meth:`_iter_dirty_leaf_parent_chains`.
 
-            Returns ``(problem, conclusive)``: ``problem`` is an actionable error
-            message when the server mishandles inner ``$expand`` ordering (the probe
-            would under-report dirty leaf-parents and drop rows), else ``None``.
+            Returns ``(problem, conclusive, race_tainted)``: ``problem`` is an
+            actionable error message on clean mis-ordering evidence (inner leaf
+            OLDER than / missing from the trusted reference — the direction a
+            genuinely mis-ordering server produces), else ``None``. A ``problem``
+            is always a *definitive* fail the caller may persist as
+            ``cursor_probe_ok=false`` (and, in strict mode, raise on).
             ``conclusive`` is ``True`` only when a discriminating sample was found
             AND the probe shape returned the true newest leaf — the verdict the
-            caller may persist across batches (see
-            :meth:`_verify_cursor_probe_support`); ``False`` on an inconclusive
-            scan, which must be re-checked rather than trusted.
+            caller may persist as ``cursor_probe_ok=true``; ``False`` on an
+            inconclusive scan (``problem`` ``None``), which must be re-checked
+            rather than trusted. ``race_tainted`` is ``True`` when an inconclusive
+            scan contained at least one RACE skip (a sample that HAD
+            discriminating cursors but returned newer-than-reference): unlike a
+            genuinely non-discriminating scan — where ordering can't cause a
+            miss, so engaging the probe unverified is safe — a race-tainted scan
+            may be hiding a mis-ordering server behind concurrent writes, so the
+            caller must decline the probe for this batch (cascade to ``$batch`` /
+            the plain walk) while still recording nothing.
 
             Finds a sample leaf-parent with ≥2 distinct leaf cursors and verifies
             that the probe's own ``$expand($orderby cursor desc;$top=1)`` returns
             the true newest leaf — cross-checked against a trusted direct-navigation
             ``$orderby`` query (basic collection ordering, far more universally
-            honoured than inner-``$expand`` ordering). Inconclusive (no
-            discriminating sample within :data:`_CURSOR_PROBE_PREFLIGHT_SCAN`) →
-            ``(None, False)``: with ≤1 leaf per parent, ordering can't cause a
-            miss."""
+            honoured than inner-``$expand`` ordering). A sample that can't
+            discriminate (≤1 distinct leaf cursor) or that races a concurrent write
+            (inner leaf NEWER than the reference — see
+            :meth:`_cursor_probe_check_sample`) is skipped and the scan moves on."""
             parent_segments = segments[:-1]
             leaf_nav = segments[-1]
-            lp_pks = self._own_primary_keys_for_et(
-                self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
-            )
+            lp_et = self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
+            lp_pks = self._own_primary_keys_for_et(lp_et)
             if not lp_pks:
-                return (None, False)
+                # Inconclusive, not race-tainted — the 3-tuple contract every
+                # consumer unpacks. The walk itself then raises the actionable
+                # "segment X has no primary key declared in $metadata" error.
+                return (None, False, False)
+            lp_types = self._edm_types_for_et(lp_et)
             page_size = (table_options or {}).get("page_size") or DEFAULT_PAGE_SIZE
             lp_order = _ancestor_pk_order_by(lp_pks)
             scanned = 0
+            saw_race = False
             for pchain in self._iter_parent_key_chains(parent_segments, namespace, table_options):
                 lp_base = join_url(
-                    self.service_url, self._build_contained_path(parent_segments, pchain)
+                    self.service_url, self._build_contained_path(parent_segments, pchain, namespace)
                 )
                 next_url: str | None = f"{lp_base}?$select={','.join(lp_pks)}&$top={page_size}"
                 if lp_order:
                     next_url += f"&$orderby={lp_order}"
                 while next_url:
-                    lp_rows, next_url = self._fetch_one_expand_page(next_url)
+                    try:
+                        lp_rows, next_url = self._fetch_one_expand_page(next_url, lp_types)
+                    except Exception as exc:  # enumeration fetch failed — no verdict
+                        raise _CursorProbePreflightUnavailable(str(exc)) from exc
                     for lp_row in lp_rows:
                         scanned += 1
                         lp_key = {pk: lp_row.get(pk) for pk in lp_pks}
@@ -2083,12 +3205,14 @@ def register_lakeflow_source(spark):
                             parent_segments, pchain, segments, namespace, lp_key, leaf_nav, cursor_field
                         )
                         if status == "ok":
-                            return (None, True)
+                            return (None, True, False)
                         if status == "error":
-                            return (message, False)
+                            return (message, False, False)
+                        if status == "race":
+                            saw_race = True
                         if scanned >= _CURSOR_PROBE_PREFLIGHT_SCAN:
-                            return (None, False)
-            return (None, False)
+                            return (None, False, saw_race)
+            return (None, False, saw_race)
 
         # pylint: disable=too-many-arguments,too-many-positional-arguments
         def _cursor_probe_check_sample(
@@ -2103,43 +3227,120 @@ def register_lakeflow_source(spark):
         ) -> tuple[str, str | None]:
             """Verify the probe shape against trusted ordering for one leaf-parent.
 
-            Returns ``("skip", None)`` when the sample can't discriminate (< 2
-            distinct leaf cursors), ``("ok", None)`` when the probe's inner
-            ``$expand`` ordering returns the true newest leaf, or
-            ``("error", msg)`` when it does not."""
+            Returns ``("skip", None)`` when the sample can't be trusted as
+            evidence — either it can't discriminate (< 2 distinct leaf cursors)
+            or the probe returned a leaf NEWER than the reference (a concurrent
+            write between the two non-atomic fetches, not ordering evidence) — so
+            the scan should move on to another sample; ``("ok", None)`` when the
+            probe's inner ``$expand`` ordering returns the true newest leaf; or
+            ``("error", msg)`` when it returns an OLDER/missing leaf (the
+            direction a genuinely mis-ordering server produces — clean
+            evidence)."""
             full_chain = pchain + [lp_key]
-            leaf_base = join_url(self.service_url, self._build_contained_path(segments, full_chain))
-            # Trusted reference: direct-navigation ordering on the leaf collection.
-            direct_rows, _ = self._fetch_one_expand_page(
-                f"{leaf_base}?$orderby={cursor_field} desc&$top=2&$select={cursor_field}"
+            leaf_base = join_url(
+                self.service_url, self._build_contained_path(segments, full_chain, namespace)
             )
+            # Trusted reference: direct-navigation ordering on the leaf collection.
+            try:
+                direct_rows, _ = self._fetch_one_expand_page(
+                    f"{leaf_base}?$orderby={cursor_field} desc&$top=2&$select={cursor_field}"
+                )
+            except Exception as exc:  # reference fetch failed — no verdict either way
+                raise _CursorProbePreflightUnavailable(str(exc)) from exc
             vals = [r.get(cursor_field) for r in direct_rows if r.get(cursor_field) is not None]
             if len(vals) < 2 or vals[0] == vals[1]:
                 return ("skip", None)
             direct_max = vals[0]
             # The probe's own shape, targeted to this leaf-parent via an outer
             # key $filter (basic collection filtering, not an inner-$expand option).
-            lp_coll = join_url(self.service_url, self._build_contained_path(parent_segments, pchain))
-            pk_filter = " and ".join(f"{k} eq {odata_literal(v)}" for k, v in lp_key.items())
-            lp_pks = self._own_primary_keys_for_et(
-                self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
+            lp_coll = join_url(
+                self.service_url, self._build_contained_path(parent_segments, pchain, namespace)
             )
+            lp_et = self._entity_type_for(CONTAINED_PATH_SEP.join(parent_segments), namespace)
+            lp_types = self._edm_types_for_et(lp_et)
+            pk_filter = " and ".join(
+                f"{k} eq {odata_literal_typed(v, lp_types.get(k))}" for k, v in lp_key.items()
+            )
+            lp_pks = self._own_primary_keys_for_et(lp_et)
             expand_url = (
                 f"{lp_coll}?$select={','.join(lp_pks)}&$filter={pk_filter}"
                 f"&$expand={leaf_nav}($orderby={cursor_field} desc;$top=1;$select={cursor_field})"
             )
-            exp_rows, _ = self._fetch_one_expand_page(expand_url)
+            try:
+                exp_rows, _ = self._fetch_one_expand_page(expand_url)
+            except requests.HTTPError:  # server REJECTED the nested-$expand probe shape
+                # e.g. Hexagon Smart API 400s on inner $orderby/$top/$select rather
+                # than accepting it (or silently mis-ordering). An immediate
+                # HTTPError is a NON-RETRYABLE 4xx (the retryable statuses exhaust
+                # the retry budget into RuntimeError, and network failures re-raise
+                # their own types — neither reaches this clause), so this is a
+                # definitive capability rejection. Report it like the mis-order
+                # case ("error") so ``auto`` cascades to $batch / the plain walk
+                # (persisting cursor_probe_ok=False) and ``nested-expand`` raises
+                # an actionable error — instead of the raw HTTP error escaping and
+                # failing the read, which would break the "auto never raises on a
+                # capability shortfall" contract.
+                probe_path = self._build_contained_path(segments, full_chain, namespace)
+                return (
+                    "error",
+                    "cursor_probe=nested-expand needs the source to accept "
+                    "$orderby/$top/$select inside $expand, but "
+                    f"{probe_path!r} rejected the probe "
+                    "query with an error (the server does not support these inner-$expand "
+                    "options). Use cursor_probe=batch or cursor_probe=auto (which falls back "
+                    "to $batch / the plain N+1 walk), or cursor_probe=false for the plain walk.",
+                )
+            except Exception as exc:  # noqa: BLE001 — transient, NOT a capability verdict
+                # Retry-exhausted throttling (RuntimeError after the 429/503
+                # budget), network exhaustion (ConnectionError/Timeout), auth —
+                # a throttle window can open BETWEEN the sibling fetches, so
+                # "the reference fetch just succeeded" is not evidence of a
+                # capability rejection. Treating these as definitive pinned a
+                # false cursor_probe_ok=False for the cache TTL under ``auto``
+                # and raised a misleading capability error under strict mode.
+                # Route to the same no-verdict path as the enumeration and
+                # reference fetch sites: degrade this batch, record nothing,
+                # re-probe next batch.
+                raise _CursorProbePreflightUnavailable(str(exc)) from exc
             children = (exp_rows[0].get(leaf_nav) if exp_rows else None) or []
-            inner_max = max(
-                (c.get(cursor_field) for c in children if c.get(cursor_field) is not None),
-                default=None,
-            )
-            if inner_max == direct_max:
+            # Chronological max (``_cursor_max``, not ``max``): a lexical max over
+            # mixed fractional renderings can pick the wrong CHILD's value,
+            # failing the equality below and fabricating a definitive mis-order
+            # verdict against an honest server.
+            inner_vals = [c.get(cursor_field) for c in children if c.get(cursor_field) is not None]
+            inner_max = _cursor_max(inner_vals) if inner_vals else None
+            # SAME-INSTANT equality, not raw text: the two fetches can hit
+            # different LB backends rendering one instant differently
+            # (…00Z vs …00.000Z). Raw equality would fall through, and the
+            # direction whose raw tie-break reads as "older" would land in the
+            # error branch below — fabricating definitive mis-ordering evidence
+            # against an honest server (false cursor_probe_ok=false under
+            # ``auto``; a spurious raise under strict ``nested-expand``). Same
+            # hazard class the ``_cursor_max`` comment above guards against.
+            if _cursor_same_instant(inner_max, direct_max):
                 return ("ok", None)
+            # Direction matters, because a fail verdict now outlives the instance
+            # (shared capability cache) and can raise in strict mode. A newest-leaf
+            # NEWER than the trusted reference is NOT ordering evidence: the two
+            # fetches aren't atomic, so a leaf inserted between them makes an honest
+            # server look mismatched. A genuinely mis-ordering server returns an
+            # OLDER leaf, never a newer one — so the newer direction is skipped like
+            # a non-discriminating sample (keep scanning for a clean one) rather
+            # than treated as a failure. This keeps one concurrent write from
+            # aborting the whole preflight or spuriously raising strict mode.
+            try:
+                if inner_max is not None and _cursor_newer(inner_max, direct_max):
+                    # Distinct status from the non-discriminating "skip": a race
+                    # skip means this sample HAD discriminating cursors — an
+                    # all-race scan must decline the probe for this batch rather
+                    # than engage it unverified (see _run_cursor_probe_preflight).
+                    return ("race", None)
+            except TypeError:
+                pass  # incomparable cursor values — keep the mismatch as evidence
             return (
                 "error",
                 "cursor_probe=nested-expand requires the source to honour $orderby/$top "
-                f"inside $expand, but {self._build_contained_path(segments, full_chain)!r} "
+                f"inside $expand, but {self._build_contained_path(segments, full_chain, namespace)!r} "
                 f"returned {inner_max!r} as its newest {leaf_nav} via $expand when the "
                 f"true newest is {direct_max!r} (direct navigation). This server "
                 "silently mis-orders inner $expand, so cursor_probe would drop changed "
@@ -2179,14 +3380,37 @@ def register_lakeflow_source(spark):
             The OData v4 JSON batch format resolves a sub-request ``url`` against the
             service root, so an absolute URL under the root is stripped to its
             remainder; an already-relative URL (e.g. a resolved ``@odata.nextLink``
-            that came back service-relative) is returned without a leading slash."""
+            that came back service-relative) is returned without a leading slash.
+
+            The result is percent-encoded via ``requote_uri`` — the same encoding
+            ``requests`` applies to a plain GET's URL — because a sub-request URL
+            rides inside the JSON envelope and never passes through ``requests``'
+            URL preparation: without this, generated ``$orderby=Id asc`` /
+            ``$filter=… gt …`` shapes carry literal spaces, which a strict OData
+            v4 server may reject. ``requote_uri`` preserves existing escapes, so
+            the literal-level encoding from ``odata_literal`` is not doubled."""
             root = self.service_url if self.service_url.endswith("/") else self.service_url + "/"
             if url.startswith(root):
-                return url[len(root) :]
+                return requote_uri(url[len(root) :])
             parsed = urlparse(url)
             if parsed.scheme:
-                return parsed.path.lstrip("/") + (f"?{parsed.query}" if parsed.query else "")
-            return url.lstrip("/")
+                query = f"?{parsed.query}" if parsed.query else ""
+                # Same origin under normalization (default port spelled out,
+                # host-case difference) but a raw prefix miss: strip the service
+                # root's PATH so the sub-request stays service-relative. Without
+                # this the fallback below keeps the root's own path segments and
+                # the sub-request 404s — self-healing via the plain-GET re-issue
+                # in ``_checked_batch_subresponse``, but one wasted round-trip
+                # plus an alarming warning per continuation.
+                try:
+                    same_origin = _url_origin(url) == _url_origin(root)
+                except ValueError:
+                    same_origin = False
+                root_path = urlparse(root).path
+                if same_origin and parsed.path.startswith(root_path):
+                    return requote_uri(parsed.path[len(root_path) :] + query)
+                return requote_uri(parsed.path.lstrip("/") + query)
+            return requote_uri(url.lstrip("/"))
 
         def _post_batch(self, urls: list[str]) -> list[dict]:
             """POST one OData v4 JSON ``$batch`` of GET sub-requests; return the
@@ -2206,8 +3430,10 @@ def register_lakeflow_source(spark):
                 ]
             }
             batch_url = join_url(self.service_url, "$batch")
-            resp = self._http_get(session, batch_url, method="POST", json=payload)
-            if resp.status_code >= 400:
+
+            def _raise_for_batch_status(resp):
+                if resp.status_code < 400:
+                    return
                 body = resp.text or ""
                 if _is_batch_too_large(body):
                     raise _BatchTooManyParts(
@@ -2217,7 +3443,33 @@ def register_lakeflow_source(spark):
                 raise RuntimeError(
                     f"OData $batch POST to {batch_url!r} failed: " f"{resp.status_code} {body[:300]}"
                 )
-            data = resp.json()
+
+            resp = self._http_get(session, batch_url, method="POST", json=payload)
+            _raise_for_batch_status(resp)
+            try:
+                data = resp.json()
+            except ValueError:
+                # Corrupt 200: same failure mode ``_fetch_page_payload`` retries
+                # for — some servers (Hexagon) truncate LARGE bodies under load,
+                # and the $batch envelope is the largest response the connector
+                # ever receives. One re-POST is safe (GET-only sub-requests).
+                resp = self._http_get(session, batch_url, method="POST", json=payload)
+                # The retry can come back non-2xx (the corrupt 200 was a blip, the
+                # real answer is an error): route it through the SAME status
+                # handling — a "too many parts" 400 must still trigger the
+                # adaptive shrink, and a plain 4xx must carry its status/body
+                # instead of decoding as a responses-less envelope ("missing
+                # sub-response id 0").
+                _raise_for_batch_status(resp)
+                try:
+                    data = resp.json()
+                except ValueError:
+                    raise RuntimeError(
+                        f"OData $batch response from {batch_url!r} returned "
+                        f"{resp.status_code} with a malformed JSON body twice "
+                        f"(likely truncated by the server). First 300 chars: "
+                        f"{(resp.text or '')[:300]!r}"
+                    ) from None
             by_id = {str(r.get("id")): r for r in data.get("responses", [])}
             out = []
             for i in range(len(urls)):
@@ -2254,6 +3506,7 @@ def register_lakeflow_source(spark):
             if new_cap >= cap:  # ensure forward progress when the factor rounds up
                 new_cap = max(1, cap - 1)
             self.__dict__["_batch_size_cap"] = new_cap
+            self._store_capability("batch_size_ok", new_cap)
             self.__dict__["_batch_shrinks"] = shrinks + 1
             _LOG.warning(
                 "OData $batch rejected %d parts (too many); reducing batch size to "
@@ -2265,7 +3518,7 @@ def register_lakeflow_source(spark):
             )
             return True
 
-        def _get_as_batch_response(self, url: str) -> dict:
+        def _get_as_batch_response(self, url: str, edm_types: dict[str, str] | None = None) -> dict:
             """Plain GET fall-back for one leaf-parent, shaped like a ``$batch``
             sub-response (``{"status", "body": {"value": [...]}}``) so the drain loops
             parse it identically. All pages are drained here (no ``@odata.nextLink``
@@ -2278,13 +3531,85 @@ def register_lakeflow_source(spark):
             page-limits while omitting ``@odata.nextLink`` would be silently
             truncated. Re-add the default ``$top`` under keyset/skip/auto so the
             drain can size its pages and seek until empty (nextlink mode is left
-            untouched — it trusts the server's links either way)."""
-            if getattr(self, "_pagination", "nextlink") != "nextlink" and _pg_parse_top(url) is None:
+            untouched — it trusts the server's links either way).
+
+            Server-issued continuation links are exempt from the ``$top``
+            injection: a re-queued ``@odata.nextLink`` (recognisable by its
+            ``$skiptoken``/``$skip``) can land here when the ``$batch`` give-up
+            sentinel fires mid-walk, and OData v4 §11.2.5.7 requires the client
+            to use the nextLink as-is — appending an option to an opaque
+            skiptoken URL can 400 or corrupt the server's paging state. A
+            continuation also proves the server emits links, so the
+            starvation this injection defends against can't occur on it."""
+            if (
+                getattr(self, "_pagination", "nextlink") != "nextlink"
+                and _pg_parse_top(url) is None
+                and not _pg_is_continuation(url)
+            ):
                 url = _pg_set_query(url, "$top", DEFAULT_PAGE_SIZE)
-            rows = list(self._fetch_pages(url))
+            rows = list(self._fetch_pages(url, edm_types))
             return {"status": 200, "body": {"value": rows}}
 
-        def _post_batch_adaptive(self, urls: list[str]) -> list[dict]:
+        def _checked_batch_subresponse(
+            self, resp: dict, req_url: str, edm_types: dict[str, str] | None = None
+        ) -> dict:
+            """Validate one ``$batch`` sub-response before the drain loops parse it.
+
+            :meth:`_post_batch` deliberately carries per-sub-request HTTP errors
+            inside the envelope for the caller to inspect — and this is that
+            inspection. Without it a 2xx envelope holding one failed sub-response
+            (a throttled or errored leaf-parent) parses as ``rows = []`` and that
+            parent's whole collection is silently skipped; on the cursor walk the
+            other parents still advance the watermark past the failed parent's
+            changed rows, so ``cursor gt since`` never re-reads them — permanent
+            loss.
+
+            A sub-response with a < 400 status AND a dict ``body`` passes through
+            untouched. Anything else — an error status, a shape that isn't a
+            sub-response dict, OR a 2xx whose ``body`` is a string/absent (the
+            JSON-batch spec lets a server serialize a sub-response body as a
+            JSON *string* for non-JSON media; the drains take ``rows = []`` for
+            a non-dict body, so that parent's whole collection would vanish and
+            the cursor walk would advance past it) — is re-issued as a plain GET
+            via :meth:`_get_as_batch_response`: a transient failure (429/5xx)
+            recovers through ``_http_get``'s retry/backoff/token-refresh path,
+            and a hard 4xx raises out of the read with the server's actual error
+            body — never a silent skip."""
+            status = resp.get("status") if isinstance(resp, dict) else None
+            try:
+                bad_status = status is None or int(status) >= 400
+            except (TypeError, ValueError):
+                bad_status = True
+            body = resp.get("body") if isinstance(resp, dict) else None
+            # A <400 sub-response the drains can't read is re-fetched as a plain
+            # GET (so ``_fetch_page_payload`` parses it properly) rather than
+            # dropping the parent. Every sub-request this connector issues is a
+            # COLLECTION GET (both ``$batch`` producers build URLs via
+            # ``_build_contained_url``), so a drainable body is exactly a JSON
+            # object whose ``value`` is a LIST. Anything else — a string body
+            # (the JSON-batch spec's form for non-JSON media), an OData ``error``
+            # envelope behind a success status, a v2-style ``{"d": …}`` gateway
+            # shape (no ``value`` at all — the drains would silently take
+            # ``rows = []`` and the cursor walk would advance past the parent),
+            # or ``{"value": null}`` / a non-list ``value`` (the drains would
+            # crash iterating it) — is re-issued. An empty-collection 200
+            # (``{"value": []}``) passes through untouched.
+            undrainable_body = not isinstance(body, dict) or not isinstance(body.get("value"), list)
+            if not bad_status and not undrainable_body:
+                return resp
+            _LOG.warning(
+                "OData $batch sub-response for %r unusable (status %r, "
+                "body type %s); re-issuing as a plain GET so the rows aren't "
+                "silently skipped.",
+                req_url,
+                status,
+                type(body).__name__,
+            )
+            return self._get_as_batch_response(req_url, edm_types)
+
+        def _post_batch_adaptive(
+            self, urls: list[str], edm_types: dict[str, str] | None = None
+        ) -> list[dict]:
             """:meth:`_post_batch` with adaptive sizing: post ``urls`` in chunks no
             larger than the working cap, and on a "too many parts" rejection shrink
             the cap by 25% and retry the offending chunk re-split at the new cap — up
@@ -2296,13 +3621,13 @@ def register_lakeflow_source(spark):
             plus every later round — fall back to a plain per-leaf-parent GET.
             Returns responses aligned with ``urls`` (``$batch`` sub-response shape)."""
             if self.__dict__.get("_batch_size_cap") == 1:  # give-up sentinel → plain GET
-                return [self._get_as_batch_response(u) for u in urls]
+                return [self._get_as_batch_response(u, edm_types) for u in urls]
             out: list[dict] = []
             pending = list(urls)
             while pending:
                 cap = self.__dict__.get("_batch_size_cap")
                 if cap == 1:  # gave up mid-walk → plain GET the rest
-                    out.extend(self._get_as_batch_response(u) for u in pending)
+                    out.extend(self._get_as_batch_response(u, edm_types) for u in pending)
                     break
                 # Always slice the front at the CURRENT cap, so a shrink applies to
                 # every remaining chunk — no stale oversized chunk wastes a retry.
@@ -2315,7 +3640,8 @@ def register_lakeflow_source(spark):
                         # Budget spent or batch collapsed to one part → give up on
                         # $batch and plain-GET everything still pending.
                         self.__dict__["_batch_size_cap"] = 1
-                        out.extend(self._get_as_batch_response(u) for u in pending)
+                        self._store_capability("batch_size_ok", 1)
+                        out.extend(self._get_as_batch_response(u, edm_types) for u in pending)
                         break
                     # cap shrank; retry the (now smaller) front of pending.
             return out
@@ -2355,7 +3681,25 @@ def register_lakeflow_source(spark):
             cached = self.__dict__.get("_batch_supported")
             if cached is not None:
                 return cached
-            probe_url = join_url(self.service_url, segments[0]) + "?$top=1"
+            # Process/file cache: paths whose offsets can't carry the verdict
+            # (contained snapshot streams — bare ``{}`` offsets — and the batch
+            # reader) would otherwise re-pay this POST on every framework-
+            # recreated instance. Pull the discovered chunk cap along with the
+            # verdict so the adaptive shrink doesn't re-discover it either.
+            cached = self._cached_capability("batch_ok")
+            if cached is not None:
+                self.__dict__["_batch_supported"] = cached
+                cap = self._cached_capability("batch_size_ok")
+                if cap is not None and "_batch_size_cap" not in self.__dict__:
+                    self.__dict__["_batch_size_cap"] = int(cap)
+                return cached
+            # Probe with the SAME shape the real hydrate sends: no ``$top`` (the
+            # sub-requests deliberately strip it and let the server drive paging
+            # inside the batch). Probing with ``?$top=1`` would false-fail servers
+            # that reject an explicit ``$top`` — a case the connector explicitly
+            # accommodates on plain snapshot reads — and persist ``batch_ok=False``
+            # even though the actual hydrate shape works.
+            probe_url = join_url(self.service_url, segments[0])
             payload = {
                 "requests": [{"id": "0", "method": "GET", "url": self._batch_relative(probe_url)}]
             }
@@ -2374,11 +3718,23 @@ def register_lakeflow_source(spark):
                 if resp.status_code < 400:
                     try:
                         subs = resp.json().get("responses") or []
-                        sub_status = int(subs[0].get("status", 0) or 0) if subs else None
+                        # Require the ``id`` echo, not just a sub-response: the
+                        # real hydrate (``_post_batch``) keys sub-responses by the
+                        # echoed id and hard-raises when it's missing, and that
+                        # raise is not ``_BatchTooManyParts`` — so a pass verdict
+                        # for an id-less server would pin ``batch_ok: true`` and
+                        # then fail EVERY hydrate with "missing sub-response id"
+                        # instead of degrading to plain GETs.
+                        # Last-wins on duplicate ids, matching how _post_batch's
+                        # by_id dict resolves them — probe and hydrate must judge
+                        # the same sub-response.
+                        by_id = {str(r.get("id")): r for r in subs if isinstance(r, dict)}
+                        sub = by_id.get("0")
+                        sub_status = int(sub.get("status", 0) or 0) if sub else None
                     except Exception:
                         sub_status = None
                     if sub_status is None:
-                        definitive = True  # 2xx, but not a $batch envelope
+                        definitive = True  # 2xx, but not a consumable $batch envelope
                     elif sub_status < 400:
                         ok = definitive = True
                     elif sub_status not in _TRANSIENT_HTTP_STATUSES:
@@ -2387,7 +3743,301 @@ def register_lakeflow_source(spark):
                     definitive = True  # e.g. 404/405 — no $batch endpoint
             if definitive:
                 self.__dict__["_batch_supported"] = ok
+                self._store_capability("batch_ok", ok)
             return ok
+
+        def _expand_read_active(
+            self,
+            table_name: str,
+            table_options: dict[str, str] | None,
+            start_offset: dict | None = None,
+        ) -> bool:
+            """The RESOLVED expand decision for this table: an explicit
+            ``expand_contained=true``, or ``auto`` whose preflight verifies the
+            server (see :meth:`_verify_expand_support`). ``false`` (incl. unset)
+            and ``auto``-with-a-failed-preflight return ``False`` — the N+1 shape.
+
+            Shared by ``read_table`` (which passes ``start_offset`` so a persisted
+            ``expand_ok`` skips the probe) and the partition activation
+            (``is_partitioned`` / batch ``get_partitions``, no offset available —
+            the instance cache dedupes the probe within one setup)."""
+            mode = self._expand_contained_mode(table_options)
+            if mode != "auto":
+                return mode == "true"
+            segments = self._table_segments(table_name)
+            if segments is None:
+                return False  # flat table — nothing to expand
+            return self._verify_expand_support(table_name, segments, table_options, start_offset)
+
+        def _verify_expand_support(
+            self,
+            table_name: str,
+            segments: list[str],
+            table_options: dict[str, str] | None,
+            start_offset: dict | None = None,
+        ) -> bool:
+            """Whether the server supports the nested-``$expand`` read for this
+            path (the ``expand_contained=auto`` preflight; never raises).
+
+            Mirrors :meth:`_verify_batch_support`'s verdict discipline: a pass is
+            persisted in the resume offset as ``expand_ok`` and cached per
+            instance **per table** (unlike the genuinely server-wide
+            ``_or_filter_ok`` / ``_batch_supported`` scalars — different nesting
+            depths can verify differently, so one table's verdict must never
+            answer for another on a multi-table instance), but only a
+            **definitive** outcome is recorded —
+
+            * definitive pass — the real expand URL returns 2xx AND inline child
+              collections are present at every level down to the leaf;
+            * definitive fail — a hard 4xx on the expand URL, a non-collection
+              2xx body, or a level whose inline children are missing/empty while
+              direct navigation shows children exist (the server accepted the URL
+              but silently ignored ``$expand`` — using it would drop rows);
+            * transient / inconclusive — transport errors, retryable statuses, or
+              a sample too empty to discriminate (empty top set, or a genuinely
+              childless probed branch): **fall back to the N+1 shape for THIS
+              batch** and re-run the preflight next batch, recording nothing.
+
+            Expand behaviour engages ONLY on a conclusive pass — ``auto`` never
+            assumes the server can ``$expand`` before the verdict is in. The
+            N+1 walk is always correct, so an unresolved verdict costs request
+            shape, never rows; the risky direction (expand on an unverified
+            server) is what silently drops every deep row. A childless-first-
+            branch server that ignores ``$expand`` would otherwise read as
+            inconclusive forever while losing data on every other branch."""
+            if (start_offset or {}).get("expand_ok"):
+                return True
+            key = self._expand_shared_key(table_name, table_options)
+            memo = self.__dict__.setdefault("_expand_supported", {})
+            cached = memo.get(key)
+            if cached is not None:
+                return cached
+            # Process/file cache (per-table, namespace-qualified — different
+            # nesting depths / namespaces can verify differently): covers the
+            # contained snapshot stream (bare ``{}`` offsets) and the batch
+            # reader, where the offset channel can't carry ``expand_ok`` across
+            # framework-recreated instances.
+            cached = self._cached_capability("expand_ok", table_name=key)
+            if cached is not None:
+                memo[key] = cached
+                return cached
+            ok, definitive = self._run_expand_preflight(
+                table_name, segments, table_options, start_offset
+            )
+            if definitive:
+                memo[key] = ok
+                self._store_capability("expand_ok", ok, table_name=key)
+            return ok
+
+        def _expand_preflight_url(
+            self,
+            table_name: str,
+            segments: list[str],
+            table_options: dict[str, str] | None,
+            start_offset: dict | None,
+        ) -> tuple[str, int, str | None]:
+            """Build the preflight GET: the REAL expand URL for this table (same
+            inner ``$top``/``$orderby``/``$filter`` construction as the read),
+            with a small page budget and the top-level ``$top`` pinned to 1 so the
+            probe response stays a single subtree. When a cursor is configured but
+            no watermark exists yet, a synthetic floor value stands in so the
+            inner ``cursor gt`` ``$filter`` construct is still exercised (later
+            batches will send one; a server that rejects it must fail the
+            preflight now, not the first filtered read). Returns
+            ``(url, cursor_level, cursor_filter)`` — the filter pieces feed the
+            direct-navigation cross-check."""
+            namespace = (table_options or {}).get("namespace")
+            cursor_field = (table_options or {}).get("cursor_field")
+            since = (start_offset or {}).get("cursor")
+            if cursor_field and since is None:
+                try:
+                    since, _kind = self._cursor_floor(table_name, namespace, cursor_field)
+                except ValueError:
+                    since = None  # no synthesisable floor — probe unfiltered
+            if cursor_field:
+                cursor_level, cursor_filter, cursor_order, cursor_select = self._cursor_expand_clause(
+                    segments, namespace, cursor_field, since
+                )
+            else:
+                cursor_level, cursor_filter, cursor_order, cursor_select = -1, None, None, None
+            probe_opts = {**(table_options or {}), "page_size": _EXPAND_PREFLIGHT_PAGE}
+            url = self._build_expand_url(
+                segments,
+                probe_opts,
+                cursor_level=cursor_level if cursor_field else None,
+                cursor_filter=cursor_filter,
+                cursor_order=cursor_order,
+                cursor_select=cursor_select,
+            )
+            # Only the top-level ``$top`` follows ``?``/``&``; the inner expand
+            # tops (after ``(``/``;``) are left at their per-level floor.
+            return rewrite_top_in_url(url, 1), cursor_level, cursor_filter
+
+        def _run_expand_preflight(
+            self,
+            table_name: str,
+            segments: list[str],
+            table_options: dict[str, str] | None,
+            start_offset: dict | None,
+        ) -> tuple[bool, bool]:
+            """One-shot behavioural probe for ``expand_contained=auto``. Returns
+            ``(ok, definitive)`` — see :meth:`_verify_expand_support` for the
+            verdict semantics. SINGLE auth-aware attempt (``_http_get_once``):
+            a capability probe must fail fast, and a transient blip only degrades
+            this batch."""
+            url, cursor_level, cursor_filter = self._expand_preflight_url(
+                table_name, segments, table_options, start_offset
+            )
+            try:
+                resp = self._http_get_once(self._get_session(), url)
+            except Exception:  # transport/auth failure — no verdict on $expand itself
+                return (False, False)
+            if resp.status_code >= 400:
+                return (False, resp.status_code not in _TRANSIENT_HTTP_STATUSES)
+            try:
+                top_rows = resp.json().get("value")
+            except Exception:
+                return (False, False)
+            if not isinstance(top_rows, list):
+                return (False, True)  # 2xx, but not an OData collection payload
+            if not top_rows:
+                # Empty top set — nothing to discriminate. N+1 this batch (it
+                # emits the same nothing), re-probe next batch.
+                return (False, False)
+            return self._expand_preflight_walk(
+                segments, top_rows, table_options, cursor_level, cursor_filter
+            )
+
+        # pylint: disable=too-many-arguments,too-many-positional-arguments
+        def _expand_preflight_walk(
+            self,
+            segments: list[str],
+            top_rows: list[dict],
+            table_options: dict[str, str] | None,
+            cursor_level: int,
+            cursor_filter: str | None,
+        ) -> tuple[bool, bool]:
+            """Walk the probe response level by level verifying inline containment.
+
+            At each level, descend through every row whose child nav property is a
+            non-empty inline list. The first level with NO inline children anywhere
+            is ambiguous — either the server ignored ``$expand`` (rows dropped!) or
+            this branch is genuinely childless — so it is resolved with ONE direct-
+            navigation ``$top=1`` GET on the first parent's child collection
+            (carrying the same level ``$filter`` the expand sent, so a filtered-
+            empty level isn't misread as ignored-``$expand``): children found ⇒
+            definitive fail; none (or the check itself fails) ⇒ **inconclusive —
+            fall back to N+1 for this batch** and re-probe next batch. Expand only
+            ever runs on the one conclusive-pass outcome: inline rows present at
+            every level down to the leaf."""
+            namespace = (table_options or {}).get("namespace")
+            pending: list[tuple[dict, list[dict[str, Any]]]] = [(r, []) for r in top_rows]
+            for lvl in range(len(segments) - 1):
+                try:
+                    pks = self._own_primary_keys_for_et(
+                        self._entity_type_for(CONTAINED_PATH_SEP.join(segments[: lvl + 1]), namespace)
+                    )
+                except ValueError:
+                    return (False, False)
+                if not pks:
+                    return (False, False)  # can't address a child collection to verify
+                child_key = segments[lvl + 1]
+                nxt: list[tuple[dict, list[dict[str, Any]]]] = []
+                for row, chain in pending:
+                    kids = row.get(child_key)
+                    if isinstance(kids, list) and kids:
+                        parent_keys = {pk: row.get(pk) for pk in pks}
+                        nxt.extend((k, chain + [parent_keys]) for k in kids)
+                if nxt:
+                    pending = nxt
+                    continue
+                row, chain = pending[0]
+                full_chain = chain + [{pk: row.get(pk) for pk in pks}]
+                check_url = self._expand_preflight_child_check_url(
+                    segments, lvl, full_chain, table_options, cursor_level, cursor_filter
+                )
+                try:
+                    r2 = self._http_get_once(self._get_session(), check_url)
+                    direct = (r2.json().get("value") or []) if r2.status_code < 400 else None
+                except Exception:
+                    direct = None
+                if direct is None:
+                    return (False, False)  # couldn't verify — N+1, re-probe next batch
+                if direct:
+                    if any(f"{child_key}@odata.nextLink" in r for r, _ in pending):
+                        # ANNOTATION-DEFERRING server: it acknowledged the expanded
+                        # property with a ``<Nav>@odata.nextLink`` instead of
+                        # inlining rows — the READ path follows exactly that
+                        # annotation (see ``_flatten_expand_response``), so this
+                        # level's containment IS honored; a definitive fail here
+                        # would permanently pin N+1 on a server where
+                        # ``expand_contained=true`` works end-to-end. Verify the
+                        # DEEPER levels with a sub-rooted expand probe (the direct
+                        # check's children were fetched WITHOUT ``$expand``, so
+                        # descending through them raw would false-fail one level
+                        # down).
+                        if lvl + 2 >= len(segments):
+                            return (True, True)  # deferring level's children ARE leaves
+                        sub_url = self._assemble_expand_url(
+                            join_url(
+                                self.service_url,
+                                self._build_contained_path(segments[: lvl + 2], full_chain, namespace),
+                            ),
+                            segments,
+                            lvl + 1,
+                            {**(table_options or {}), "page_size": _EXPAND_PREFLIGHT_PAGE},
+                            resolve_segment_filters(table_options, segments),
+                            cursor_level,
+                            cursor_filter,
+                            None,
+                            None,
+                            None,
+                        )
+                        try:
+                            r3 = self._http_get_once(self._get_session(), sub_url)
+                            sub_rows = (r3.json().get("value") or []) if r3.status_code < 400 else None
+                        except Exception:
+                            sub_rows = None
+                        if not sub_rows:
+                            return (False, False)  # deeper levels unverifiable — re-probe
+                        pending = [(r, full_chain) for r in sub_rows]
+                        continue
+                    return (False, True)  # children exist but $expand omitted them
+                return (False, False)  # sampled branch genuinely childless — N+1, re-probe
+            return (True, True)
+
+        # pylint: disable=too-many-arguments,too-many-positional-arguments
+        def _expand_preflight_child_check_url(
+            self,
+            segments: list[str],
+            lvl: int,
+            chain: list[dict[str, Any]],
+            table_options: dict[str, str] | None,
+            cursor_level: int,
+            cursor_filter: str | None,
+        ) -> str:
+            """Direct-navigation URL for the cross-check: the child collection at
+            ``lvl + 1`` under ``chain``, ``$top=1``, carrying the SAME ``$filter``
+            the expand's inner clause applied at that level (cursor filter /
+            ``filter_at_<segment>`` / the leaf ``filter``) so a legitimately
+            filtered-empty level isn't misread as the server ignoring ``$expand``."""
+            segment_filters = resolve_segment_filters(table_options, segments)
+            is_leaf = (lvl + 1) == len(segments) - 1
+            level_filter = combine_filters(
+                cursor_filter if cursor_level == lvl + 1 else None,
+                segment_filters.get(lvl + 1),
+                (table_options or {}).get("filter") if is_leaf else None,
+            )
+            base = join_url(
+                self.service_url,
+                self._build_contained_path(
+                    segments[: lvl + 2], chain, (table_options or {}).get("namespace")
+                ),
+            )
+            url = f"{base}?$top=1"
+            if level_filter:
+                url += f"&$filter={level_filter}"
+            return url
 
         def _contained_fetch_batch_size(self, table_options: dict[str, str] | None) -> int:
             """Parse the ``contained_fetch`` table option into a requested ``$batch``
@@ -2538,12 +4188,15 @@ def register_lakeflow_source(spark):
             ``$top`` stripped so the server drives paging, and any sub-response
             ``@odata.nextLink`` is re-batched until drained. Lazy at group
             granularity (≤ one chunk of collections buffered at a time)."""
+            leaf_types = self._edm_types_for_level(
+                segments, len(segments) - 1, (table_options or {}).get("namespace")
+            )
             if batch_size <= 1:
                 for chain, meta in chain_meta_iter:
                     url = self._build_contained_url(
                         segments, chain, table_options, extra_filter=extra_filter, order_by=order_by
                     )
-                    for row in self._fetch_pages(url):
+                    for row in self._fetch_pages(url, leaf_types):
                         yield meta, row
                 return
             # ``$batch``: drop ``page_size`` so sub-requests carry no ``$top`` and
@@ -2555,12 +4208,12 @@ def register_lakeflow_source(spark):
                 group.append((chain, meta))
                 if len(group) >= batch_size:
                     yield from self._drain_contained_group(
-                        segments, group, leaf_opts, extra_filter, order_by, batch_size
+                        segments, group, leaf_opts, extra_filter, order_by, batch_size, leaf_types
                     )
                     group = []
             if group:
                 yield from self._drain_contained_group(
-                    segments, group, leaf_opts, extra_filter, order_by, batch_size
+                    segments, group, leaf_opts, extra_filter, order_by, batch_size, leaf_types
                 )
 
         def _drain_contained_group(
@@ -2571,6 +4224,7 @@ def register_lakeflow_source(spark):
             extra_filter: str | None,
             order_by: str | None,
             batch_size: int,
+            edm_types: dict[str, str] | None = None,
         ) -> Iterator[tuple[Any, dict]]:
             """Hydrate one group of leaf-parent chains via ``$batch`` (+ nextLink
             continuations), yielding ``(meta, raw_row)`` with ``@odata.*`` stripped.
@@ -2592,8 +4246,9 @@ def register_lakeflow_source(spark):
                 eff = self._effective_batch_size(batch_size)
                 round_ = pending[:eff]
                 pending = pending[eff:]
-                responses = self._post_batch_adaptive([u for _, u in round_])
+                responses = self._post_batch_adaptive([u for _, u in round_], edm_types)
                 for (key, req_url), resp in zip(round_, responses):
+                    resp = self._checked_batch_subresponse(resp, req_url, edm_types)
                     body = resp.get("body") if isinstance(resp, dict) else None
                     rows = body.get("value", []) if isinstance(body, dict) else []
                     for row in rows:
@@ -2614,7 +4269,7 @@ def register_lakeflow_source(spark):
             per parent) this keeps peak memory bounded by one page worth
             of rows rather than the whole result set.
             """
-            segments = parse_contained_path(table_name) or [table_name]
+            segments = self._table_segments(table_name) or [table_name]
             namespace = (table_options or {}).get("namespace")
             fk_columns = self._resolve_fk_columns(segments, namespace)
             segment_filters = resolve_segment_filters(table_options, segments)
@@ -2694,7 +4349,7 @@ def register_lakeflow_source(spark):
             ``running_max_cursor`` in the offset; on chain completion it
             becomes the new ``cursor`` value.
             """
-            segments = parse_contained_path(table_name) or [table_name]
+            segments = self._table_segments(table_name) or [table_name]
             if len(segments) < 2:
                 raise ValueError(f"expand_contained requires a contained path; {table_name!r} is flat.")
             namespace = (table_options or {}).get("namespace")
@@ -2712,8 +4367,19 @@ def register_lakeflow_source(spark):
             # ``_build_expand_continuation_url``). Stashed on ``self`` — like
             # ``self._pagination`` — so it survives into the lazy streaming
             # generator without threading through every flatten call site.
+            # Leans on the framework's serial-calls contract (see the
+            # ``_pagination`` stash in ``_read_table_dispatch``): the lazy
+            # generator is drained before any other entry point runs on this
+            # instance, so nothing can clobber the stash mid-drain.
             self._expand_cont_opts = table_options
             self._expand_cont_since = (start_offset or {}).get("cursor")
+            # Per-level property→Edm-type maps for the same recursion (and the
+            # queue drains), so keyset-seek boundaries built while paging a
+            # collection at any depth render TYPED (guid bare / ISO-looking
+            # string quoted) — same stash-on-self pattern as above.
+            self._expand_types_per_level = [
+                self._edm_types_for_level(segments, i, namespace) for i in range(len(segments))
+            ]
             if cursor_field and cursor_level == -1:
                 raise ValueError(
                     f"cursor_field={cursor_field!r} is not a property of any "
@@ -2730,7 +4396,7 @@ def register_lakeflow_source(spark):
                     )
                 pks_per_level.append(pks)
             fk_columns = self._resolve_fk_columns(segments, namespace)
-            max_records = int((table_options or {}).get("max_records_per_batch", "10000"))
+            max_records = _parse_max_records(table_options)
             # Either resume from a parked work queue or seed it with the
             # top-level URL. Each queue item is self-contained (URL +
             # level + ancestor chain + captured cursor) so resume needs
@@ -2792,6 +4458,12 @@ def register_lakeflow_source(spark):
                 emitted,
                 ctx,
                 page_size,
+                # New-rows-only cap accounting: the committed watermark (never
+                # the lookback-floored read filter) is the counting floor.
+                count_floor=(start_offset or {}).get("cursor") if cursor_field else None,
+                leaf_pks=self._own_primary_keys_for_et(
+                    self._entity_type_for(CONTAINED_PATH_SEP.join(segments), namespace)
+                ),
             )
             drain_elapsed = time.monotonic() - drain_start
             end_offset = self._build_expand_end_offset(
@@ -2799,7 +4471,14 @@ def register_lakeflow_source(spark):
             )
             if not cursor_field:
                 return iter(emitted), end_offset
-            if not emitted and not resuming:
+            if not emitted and not resuming and not remaining_queue:
+                # Idle batch: nothing emitted, nothing resumed, nothing PARKED.
+                # The last guard is load-bearing — the queue ceiling
+                # (``_MAX_PENDING_FETCHES``) can park a non-empty queue before
+                # the first leaf row is emitted (servers that defer every inner
+                # collection behind ``<Nav>@odata.nextLink``), and echoing
+                # ``start_offset`` here would DROP that queue: every batch then
+                # re-does the same fetches and emits nothing, forever.
                 return iter([]), start_offset or {}
             records, out_offset = self._finalize_cursor_read(
                 start_offset, end_offset, emitted, table_name, cursor_field
@@ -2809,129 +4488,388 @@ def register_lakeflow_source(spark):
             )
 
         # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
+        # pylint: disable=too-many-statements  # one cohesive DFS stack machine (see docstring);
+        # splitting it fragments the tightly-coupled park/resume/emit invariants — matches the
+        # inline-disable convention already used for _walk_contained_with_cursor below.
         def _drain_expand_pages(
             self,
             initial_queue: list[dict],
             max_records: int,
             segments: list[str],
             pks_per_level: list[list[str]],
-            fk_columns: dict[str, str],
+            fk_columns: dict[tuple[int, str], str],
             emitted: list[dict],
             ctx: tuple | None,
             page_size: int | None,
+            count_floor: Any = None,
+            leaf_pks: list[str] | None = None,
         ) -> list[dict]:
-            """Iterative work-queue processor.
+            """Resumable depth-first stack machine over the contained ``$expand``.
 
-            Each queue item is a self-contained "fetch this URL and
-            process the rows it returns" task::
+            The parked offset (``pending_fetches``) is this method's return
+            value, serialized every microbatch — so its size must stay bounded.
+            A naive breadth-first queue that appended one continuation per
+            truncated inner collection parked O(fan-out width) items (a wide top
+            page over an inner-paging server → thousands of URL-carrying items, a
+            multi-MB offset). This walks DEPTH-FIRST instead, so the parked
+            frontier is O(depth) — one frame per contained segment on the current
+            path — regardless of fan-out.
 
-                {
-                    "url":     str,              # HTTP URL to GET (one page)
-                    "level":   int,              # level the URL's rows live at
-                    "chain":   list[dict],       # ancestor PK chain (snapshot)
-                    "cur_val": Any | None,       # captured cursor value
-                    "skip":    int,              # top_row index to start at
-                }
+            The work stack holds two frame kinds:
 
-            Items are popped FIFO; each pop performs ONE HTTP fetch and
-            processes its top_rows starting from ``skip``. Inner-collection
-            ``@odata.nextLink`` values discovered during a row's inline
-            descent are APPENDED to the queue (via
-            ``_flatten_expand_response``'s ``pending_fetches`` arg) rather
-            than followed inline. After each fully-processed top_row the
-            ``max_records`` cap is checked: when exceeded, the current
-            item is re-queued at the front with ``skip`` advanced past the
-            rows just emitted, and the loop exits. The returned queue is
-            the work left to do — non-empty means "continuation pending",
-            empty means "chain drained".
+            * **url**  — ``{url, level, chain, cur_val, boundary, skip}``: fetch
+              ONE page, then push a ``rows`` frame for its contents. This is the
+              only serializable shape (what a parked/seed queue item looks like).
+            * **rows** — an in-memory page of sibling rows at ``level`` plus an
+              ``idx`` cursor (``rows, level, chain, cur_val, idx, from_inline,
+              base_url, page_next_url, boundary, tops``). A wide inline sibling
+              collection is ONE rows frame, not N queued items — that is what
+              keeps the frontier O(depth) rather than O(width).
 
-            Cap deviation per batch is bounded by ONE HTTP response's
-            worth of leaf rows (≤ ``page_size``), not by the size of a
-            single top_row's subtree as in the previous design.
+            Per iteration the ``max_records`` cap is checked at the top; when
+            reached the loop stops pulling new work and ``_park`` serializes the
+            stack (bottom-to-top) into O(depth) ``url`` items. A ``rows`` frame is
+            parked by re-fetching its collection past the last processed row: a
+            fetched page re-fetches its own ``base_url`` with ``skip``/``boundary``;
+            an inline-delivered collection synthesizes a seek continuation
+            (``_build_expand_continuation_url``; ``nextlink`` mode has no client
+            seek, so it falls back to positional ``$skip`` + boundary dedup —
+            bounded duplicates, never loss). An ancestor frame's in-flight row is
+            skipped on resume because its remaining subtree is carried by the
+            deeper parked frames — no re-emit, no loss.
+
+            Resume re-fetches each parked url and skips rows at-or-below its
+            ``boundary`` by chronological ORDER KEY comparison — NOT by position:
+            the page is re-fetched from a mutating source, so a positional
+            ``skip`` desynchronizes under churn (an update to an already-emitted
+            row on a cursor-ordered page moves it to the tail and shifts an UNREAD
+            row into the skipped prefix — its subtree lost behind the watermark; a
+            delete on a PK-ordered page does the same). ``skip`` remains as the
+            legacy/downgrade fallback for parked offsets without a boundary. Rows
+            whose boundary comparison is incomparable are processed
+            (duplicate-safe), never skipped. The returned queue is the work left
+            to do — non-empty means "continuation pending", empty means "chain
+            drained".
+
+            ``count_floor`` — see ``_walk_contained_with_cursor``: only rows
+            strictly above the committed watermark count toward
+            ``max_records``, so a lookback overlap larger than the cap cannot
+            wedge the stream into an eternal park/complete cycle. Cap deviation
+            per batch is bounded by ONE HTTP response's worth of leaf rows
+            (≤ ``page_size``; the cap is checked between rows, but an in-flight
+            inline collection is finished before parking in ``nextlink`` mode)
+            plus the lookback overlap.
             """
-            # Take ownership: mutated in-place by appends from
-            # ``_flatten_expand_response`` and by our own front re-queues.
-            queue: list[dict] = list(initial_queue)
             cur_field, cur_level, _ = ctx or (None, -1, None)
-            while queue and len(emitted) < max_records:
-                item = queue.pop(0)
-                url = item["url"]
-                level = item["level"]
-                chain = [dict(p) for p in item.get("chain") or []]
-                cur_val = item.get("cur_val")
-                skip = int(item.get("skip", 0) or 0)
-                item_ctx = (cur_field, cur_level, cur_val) if cur_field else None
-                # Tops budgeted over only THIS request's collection levels
-                # (root == item level downward); ancestors above are fixed keys.
-                item_tops = (
-                    compute_expand_tops_for_root(page_size, len(segments), level) if page_size else None
+            countable = 0
+
+            def _count_new(rows_slice: list[dict]) -> int:
+                if count_floor is None or cur_field is None:
+                    return len(rows_slice)
+                return sum(
+                    1
+                    for r in rows_slice
+                    if r.get(cur_field) is not None and _cursor_newer(r.get(cur_field), count_floor)
                 )
-                # Fetch one page only — pulling further pages of THIS
-                # collection waits until the next dequeue so we can check
-                # the cap between them.
-                page_rows, page_next_url = self._fetch_one_expand_page(url)
-                if not page_rows:
-                    if page_next_url:
-                        queue.append(
+
+            def _row_order_key(row: dict, level: int) -> list:
+                # The row's values for its page's own $orderby terms (see
+                # _expand_level_order_by: cursor-first at the cursor level,
+                # PK-only elsewhere) — the churn-stable within-page identity.
+                # ``pks_per_level`` covers ancestor levels only; leaf-level
+                # pages (inner continuations) use the leaf's own PKs.
+                # MUST return a ``list``: parked as ``boundary`` in the offset and
+                # compared (``row_key == boundary``) after a JSON round-trip that
+                # makes it a list — a tuple would silently break the resume-skip
+                # (duplicate-safe, never loss, just re-work).
+                key: list = []
+                if cur_field is not None and level == cur_level:
+                    key.append(row.get(cur_field))
+                pks = pks_per_level[level] if level < len(pks_per_level) else (leaf_pks or [])
+                key.extend(row.get(pk) for pk in pks)
+                return key
+
+            leaf_level = len(segments) - 1
+            # Client-driven seek used to synthesize a resume URL for an
+            # inline-delivered collection; ``nextlink`` has no client seek, so fall
+            # back to positional ``$skip`` (a server that ignores it re-reads from
+            # the start and the parked boundary dedups — bounded duplicates, never
+            # loss), matching ``_recover_expand_item``'s mode-agnostic rebuild.
+            mode = getattr(self, "_pagination", "nextlink")
+            park_mode = mode if mode != "nextlink" else "skip"
+
+            def _push_url(item: dict) -> None:
+                stack.append(
+                    {
+                        "kind": "url",
+                        "url": item["url"],
+                        "level": int(item["level"]),
+                        "chain": [dict(p) for p in item.get("chain") or []],
+                        "cur_val": item.get("cur_val"),
+                        "boundary": item.get("boundary"),
+                        "skip": int(item.get("skip", 0) or 0),
+                        "rebuilt": bool(item.get("rebuilt")),
+                    }
+                )
+
+            # Reconstruct the work stack from the parked (or seed) queue. Parked
+            # frames are stored bottom-to-top (see ``_park``), so pushing them in
+            # order restores the DFS path with the deepest (leaf-most) frame on
+            # top — resumed first, exactly where the prior batch stopped.
+            stack: list[dict] = []
+            for item in initial_queue:
+                _push_url(item)
+
+            def _park() -> list[dict]:
+                # Serialize the whole stack (O(depth)) bottom-to-top. Each frame's
+                # ``boundary`` is its CURRENT row's order key: the deepest frame's
+                # current row is fully done (skip it, resume at the next); an
+                # ancestor's current row is in flight but its remaining subtree is
+                # carried by the deeper parked frames, so skipping it here and
+                # resuming at the next sibling is exactly right — no re-emit, no
+                # loss. This is what bounds the offset to O(depth), not O(width).
+                parked: list[dict] = []
+                for frame in stack:
+                    if frame["kind"] == "url":
+                        parked.append(
                             {
-                                "url": page_next_url,
-                                "level": level,
-                                "chain": [dict(p) for p in chain],
-                                "cur_val": cur_val,
-                                "skip": 0,
+                                "url": frame["url"],
+                                "level": frame["level"],
+                                "chain": frame["chain"],
+                                "cur_val": frame["cur_val"],
+                                "skip": frame.get("skip", 0),
+                                "boundary": frame.get("boundary"),
+                                "rebuilt": frame.get("rebuilt", False),
+                            }
+                        )
+                        continue
+                    idx = frame["idx"]
+                    level = frame["level"]
+                    if idx >= len(frame["rows"]):
+                        # Page fully processed this batch — no remaining rows to
+                        # resume here. An inline-delivered collection is complete
+                        # as delivered (nothing to synthesize); a fetched page
+                        # parks its server next-link so the sibling pages follow.
+                        if not frame.get("from_inline") and frame.get("page_next_url"):
+                            parked.append(
+                                {
+                                    "url": frame["page_next_url"],
+                                    "level": level,
+                                    "chain": frame["chain"],
+                                    "cur_val": frame["cur_val"],
+                                    "skip": 0,
+                                    "boundary": None,
+                                }
+                            )
+                        continue
+                    boundary = (
+                        _row_order_key(frame["rows"][idx - 1], level) if idx else frame.get("boundary")
+                    )
+                    if not frame.get("from_inline"):
+                        park_url = frame["base_url"]
+                        park_skip = idx
+                    else:
+                        # Inline-delivered rows have no page URL of their own; re-fetch
+                        # the collection under its parent (chain holds keys 0..level-1)
+                        # seeking past the last processed row.
+                        last_child = frame["rows"][idx - 1] if idx else {}
+                        park_url = self._build_expand_continuation_url(
+                            segments,
+                            level - 1,
+                            frame["chain"],
+                            cur_field if cur_field else None,
+                            park_mode,
+                            last_child,
+                            idx,
+                        )
+                        park_skip = 0
+                    parked.append(
+                        {
+                            "url": park_url,
+                            "level": level,
+                            "chain": frame["chain"],
+                            "cur_val": frame["cur_val"],
+                            "skip": park_skip,
+                            "boundary": boundary,
+                        }
+                    )
+                return parked
+
+            def _parkable() -> bool:
+                # A mid-way inline collection (0 < idx < len) can only be resumed
+                # by re-fetching it past the last processed row. Every mode except
+                # ``nextlink`` has a churn-safe client seek for that
+                # (``_build_expand_continuation_url``'s keyset). ``nextlink`` falls
+                # back to positional ``$skip``, which under between-batch churn can
+                # push an unread row into the skipped prefix (silent loss) — the
+                # exact failure the boundary resume exists to prevent. So in
+                # ``nextlink`` mode DON'T park while any inline collection is
+                # mid-way; finish it first (bounded by one server page, since a
+                # truncated inner collection is a server ``<Nav>@odata.nextLink``
+                # url frame, not an inline one). idx==0 (fresh) and idx==len
+                # (exhausted) park cleanly — a from-start refetch and a drop.
+                if mode != "nextlink":
+                    return True
+                return not any(
+                    f["kind"] == "rows" and f.get("from_inline") and 0 < f["idx"] < len(f["rows"])
+                    for f in stack
+                )
+
+            while stack:
+                if countable >= max_records and _parkable():
+                    # Cap reached — stop pulling new work and park the O(depth)
+                    # frontier. Overshoot is bounded by the last page's leaf rows
+                    # (plus, in nextlink mode, finishing an in-flight inline page).
+                    break
+                if len(stack) > _MAX_PENDING_FETCHES:
+                    # Safety valve: an extreme single-parent fan-out (or a
+                    # nextlink server that page-limits without seek support, so
+                    # depth-first still can't fully collapse) would otherwise grow
+                    # the frontier unbounded. Park what we have and resume.
+                    break
+                frame = stack[-1]
+                if frame["kind"] == "url":
+                    stack.pop()
+                    level = frame["level"]
+                    try:
+                        page_rows, page_next_url = self._fetch_one_expand_page(
+                            frame["url"], self._expand_level_types(level)
+                        )
+                    except requests.HTTPError as exc:
+                        replacement = self._recover_expand_item(exc, frame, segments, cur_field)
+                        if replacement is not None:
+                            _push_url(replacement)
+                        continue
+                    if not page_rows:
+                        if page_next_url:
+                            # Forward the resume ``boundary`` (content-based,
+                            # churn-safe) so an empty first page doesn't drop it
+                            # before the rows it guards; ``skip`` is positional to
+                            # THIS page and so resets for the server continuation.
+                            _push_url(
+                                {
+                                    "url": page_next_url,
+                                    "level": level,
+                                    "chain": frame["chain"],
+                                    "cur_val": frame["cur_val"],
+                                    "boundary": frame.get("boundary"),
+                                }
+                            )
+                        continue
+                    start_idx, resume_boundary = _expand_resume_start(
+                        page_rows,
+                        frame.get("boundary"),
+                        frame.get("skip", 0),
+                        lambda r, lv=level: _row_order_key(r, lv),
+                    )
+                    stack.append(
+                        {
+                            "kind": "rows",
+                            "rows": page_rows,
+                            "level": level,
+                            "chain": frame["chain"],
+                            "cur_val": frame["cur_val"],
+                            "idx": start_idx,
+                            "from_inline": False,
+                            "base_url": frame["url"],
+                            "page_next_url": page_next_url,
+                            "boundary": resume_boundary,
+                            # Tops budgeted over only THIS page's collection levels
+                            # (root == fetch level downward); ancestors are fixed keys.
+                            "tops": (
+                                compute_expand_tops_for_root(page_size, len(segments), level)
+                                if page_size
+                                else None
+                            ),
+                        }
+                    )
+                    continue
+                # rows frame
+                if frame["idx"] >= len(frame["rows"]):
+                    stack.pop()
+                    if frame.get("page_next_url"):
+                        _push_url(
+                            {
+                                "url": frame["page_next_url"],
+                                "level": frame["level"],
+                                "chain": frame["chain"],
+                                "cur_val": frame["cur_val"],
                             }
                         )
                     continue
-                truncated = False
-                for row_idx in range(skip, len(page_rows)):
-                    self._flatten_expand_response(
-                        level,
-                        page_rows[row_idx],
-                        segments,
-                        pks_per_level,
-                        chain,
-                        fk_columns,
-                        emitted,
-                        item_ctx,
-                        item_tops,
-                        response_url=url,
-                        pending_fetches=queue,
-                        page_size=page_size,
+                row = frame["rows"][frame["idx"]]
+                frame["idx"] += 1
+                level = frame["level"]
+                if frame.get("boundary") is not None:
+                    row_key = _row_order_key(row, level)
+                    # Anchor row missing: skip only rows PROVABLY at-or-below the
+                    # parked boundary (collation-honest — see _chain_strictly_before);
+                    # anything else is processed (duplicate-safe, never silent loss).
+                    if row_key == frame["boundary"] or _chain_strictly_before(
+                        row_key, frame["boundary"]
+                    ):
+                        continue
+                row_cur_val = frame["cur_val"]
+                if cur_field and level == cur_level:
+                    row_cur_val = row.get(cur_field)
+                if level == leaf_level:
+                    prev_len = len(emitted)
+                    self._emit_leaf_row(
+                        row, segments, frame["chain"], fk_columns, emitted, cur_field, row_cur_val
                     )
-                    if len(emitted) >= max_records and row_idx + 1 < len(page_rows):
-                        # Mid-page: re-queue the SAME URL at the front so
-                        # the next batch resumes here without scrambling
-                        # depth ordering.
-                        queue.insert(
-                            0,
-                            {
-                                "url": url,
-                                "level": level,
-                                "chain": [dict(p) for p in chain],
-                                "cur_val": cur_val,
-                                "skip": row_idx + 1,
-                            },
-                        )
-                        truncated = True
-                        break
-                if not truncated and page_next_url:
-                    queue.append(
+                    countable += _count_new(emitted[prev_len:])
+                    continue
+                # Non-leaf: descend depth-first. Push the truncated-tail
+                # continuation FIRST (bottom) and the inline children ON TOP, so
+                # inline rows drain before the tail — and the inline collection is
+                # ONE in-memory rows frame, never N queued items (kills the width
+                # burst; the frontier stays O(depth)).
+                child_chain = frame["chain"] + [{pk: row.get(pk) for pk in pks_per_level[level]}]
+                next_ctx = (cur_field, cur_level, row_cur_val) if cur_field else None
+                cont_url = self._derive_child_continuation(
+                    level,
+                    row,
+                    segments,
+                    child_chain,
+                    next_ctx,
+                    frame.get("tops"),
+                    page_size,
+                    frame["base_url"],
+                )
+                inline_children = row.get(segments[level + 1]) or []
+                if cont_url is not None:
+                    _push_url(
                         {
-                            "url": page_next_url,
-                            "level": level,
-                            "chain": [dict(p) for p in chain],
-                            "cur_val": cur_val,
-                            "skip": 0,
+                            "url": cont_url,
+                            "level": level + 1,
+                            "chain": child_chain,
+                            "cur_val": row_cur_val,
                         }
                     )
-            return queue
+                if inline_children:
+                    stack.append(
+                        {
+                            "kind": "rows",
+                            "rows": inline_children,
+                            "level": level + 1,
+                            "chain": child_chain,
+                            "cur_val": row_cur_val,
+                            "idx": 0,
+                            "from_inline": True,
+                            "base_url": frame["base_url"],
+                            "page_next_url": None,
+                            "boundary": None,
+                            "tops": frame.get("tops"),
+                        }
+                    )
+            return _park() if stack else []
 
         def _stream_expand_pages(
             self,
             initial_queue: list[dict],
             segments: list[str],
             pks_per_level: list[list[str]],
-            fk_columns: dict[tuple[str, str], str],
+            fk_columns: dict[tuple[int, str], str],
             ctx: tuple | None,
             page_size: int | None,
         ) -> Iterator[dict]:
@@ -2943,9 +4881,18 @@ def register_lakeflow_source(spark):
             queue exactly as the drainer does. No ``max_records`` cap and no
             cross-page accumulation: peak memory is one response's flattened
             cross-product (bounded by the ``page_size`` budget) plus the queue
-            of pending fetch descriptors (URLs + chains, not rows). Emission
-            order matches the drainer's ``emitted`` order — inline rows first,
-            deferred continuations processed when their queue item is popped."""
+            of pending fetch descriptors (URLs + chains, not rows). Unlike the
+            drainer, the queue here has NO ``_MAX_PENDING_FETCHES`` ceiling —
+            the drainer's cap bounds what gets PARKED INTO THE OFFSET (a
+            checkpoint-size concern), while this queue never persists and its
+            items are small descriptors; a server deferring every inner
+            collection grows it to one descriptor per parent, modest even at
+            100k parents. Within each page rows flatten inline-first (parent
+            then children), matching ``_emit_leaf_row`` order; ACROSS pages this
+            reader is breadth-first (FIFO queue) whereas the capped drainer is
+            depth-first, so cross-parent order differs between the two. That is
+            immaterial here: the batch path is uncapped and never checkpoints, so
+            emission order carries no resume semantics."""
             queue: list[dict] = list(initial_queue)
             cur_field, cur_level, _ = ctx or (None, -1, None)
             while queue:
@@ -2959,7 +4906,18 @@ def register_lakeflow_source(spark):
                 item_tops = (
                     compute_expand_tops_for_root(page_size, len(segments), level) if page_size else None
                 )
-                page_rows, page_next_url = self._fetch_one_expand_page(url)
+                # Same deleted-parent / stale-continuation recovery as the
+                # drainer: inner continuations queued earlier in THIS walk can
+                # 404 when the parent vanishes mid-walk.
+                try:
+                    page_rows, page_next_url = self._fetch_one_expand_page(
+                        url, self._expand_level_types(level)
+                    )
+                except requests.HTTPError as exc:
+                    replacement = self._recover_expand_item(exc, item, segments, cur_field)
+                    if replacement is not None:
+                        queue.insert(0, replacement)
+                    continue
                 if not page_rows:
                     if page_next_url:
                         queue.append(
@@ -3000,10 +4958,123 @@ def register_lakeflow_source(spark):
                         }
                     )
 
-        def _fetch_one_expand_page(self, url: str) -> tuple[list[dict], str | None]:
+        def _recover_expand_item(
+            self,
+            exc: requests.HTTPError,
+            item: dict,
+            segments: list[str],
+            cursor_field: str | None,
+        ) -> dict | None:
+            """Handle a 404/410 on a parked expand work item's URL.
+
+            Level >= 1 items carry ENTITY-SCOPED URLs
+            (``Parents(k)/Children?$skiptoken=…``) parked across batches in
+            ``pending_fetches`` — and the world moves between batches. Two
+            distinct causes produce the same status:
+
+            * the parent entity was **deleted** → every URL under it is dead
+              forever; re-raising turns the checkpoint into a permanently
+              failing stream (the resume replays the same dead URL on every
+              trigger — only a full refresh recovers);
+            * the **continuation went stale** (e.g. an expired server
+              ``$skiptoken``) while the parent still exists → dropping the
+              item would silently lose the rest of that collection.
+
+            Disambiguate by REBUILDING the item's URL from scratch and
+            re-queueing it marked ``rebuilt``: a level >= 1 item's child
+            collection via ``_build_expand_continuation_url`` (``mode="skip"``,
+            ``inline_count=0`` — the read's cursor filter/order and grandchild
+            expands intact); a level-0 item — a parked TOP-LEVEL server
+            continuation, whose ``$skiptoken`` can equally expire while the
+            collection lives — via the same seed-URL construction the read
+            entry uses (``_cursor_expand_clause`` + ``_build_expand_url`` from
+            the stashed options/watermark), re-reading the top collection from
+            ``since``. If the rebuilt URL fails too, the SECOND recovery pass
+            resolves by level: level >= 1 DROPS the item (the parent entity is
+            gone — duplicate-safe; already-emitted rows stand), while level 0
+            RE-RAISES (the whole collection vanishing is a config/service
+            error, not row churn). Non-404/410 statuses always re-raise.
+
+            Returns the replacement item, or ``None`` to drop.
+            """
+            status = exc.response.status_code if exc.response is not None else None
+            level = item.get("level", 0)
+            if status not in (404, 410):
+                raise exc
+            chain = [dict(p) for p in item.get("chain") or []]
+            if item.get("rebuilt"):
+                if level < 1:
+                    raise exc  # collection itself is gone — config error
+                _LOG.warning(
+                    "expand resume: parent %s no longer exists (HTTP %s on the "
+                    "rebuilt collection URL too) — dropping its parked subtree. "
+                    "Rows already emitted for it remain; the deletion is not "
+                    "propagated (connector is insert/upsert-only).",
+                    chain,
+                    status,
+                )
+                return None
+            _LOG.warning(
+                "expand resume: parked continuation (level %s, parent %s) returned "
+                "HTTP %s (deleted parent, or a stale server continuation) — "
+                "rebuilding the URL from scratch and retrying once.",
+                level,
+                chain,
+                status,
+            )
+            if level >= 1:
+                fresh_url = self._build_expand_continuation_url(
+                    segments, level - 1, chain, cursor_field, "skip", {}, 0
+                )
+            else:
+                # Rebuild the top-level seed exactly as the read entry does.
+                table_options = getattr(self, "_expand_cont_opts", None) or {}
+                since = getattr(self, "_expand_cont_since", None)
+                namespace = table_options.get("namespace")
+                if cursor_field:
+                    (
+                        cursor_level,
+                        cursor_filter,
+                        cursor_order,
+                        cursor_select,
+                    ) = self._cursor_expand_clause(segments, namespace, cursor_field, since)
+                else:
+                    cursor_level, cursor_filter, cursor_order, cursor_select = -1, None, None, None
+                fresh_url = self._build_expand_url(
+                    segments,
+                    table_options,
+                    cursor_level=cursor_level if cursor_field else None,
+                    cursor_filter=cursor_filter,
+                    cursor_order=cursor_order,
+                    cursor_select=cursor_select,
+                )
+            return {
+                "url": fresh_url,
+                "level": level,
+                "chain": chain,
+                "cur_val": item.get("cur_val"),
+                "skip": 0,
+                "rebuilt": True,
+            }
+
+        def _expand_level_types(self, level: int) -> dict[str, str] | None:
+            """The stashed property→Edm-type map for the collection at ``level``
+            of the current expand read (see the stash in
+            ``_read_contained_expand``), or ``None`` outside one / past the
+            stash's depth — the seek builder then falls back to value sniffing."""
+            stash = getattr(self, "_expand_types_per_level", None)
+            if stash and 0 <= level < len(stash):
+                return stash[level]
+            return None
+
+        def _fetch_one_expand_page(
+            self, url: str, edm_types: dict[str, str] | None = None
+        ) -> tuple[list[dict], str | None]:
             """One HTTP GET; returns ``(page_rows, next_url)``. Thin wrapper
             over :meth:`_fetch_pages_with_links` that consumes a single
             iteration so the caller can check the cap between fetches.
+            ``edm_types`` (the fetched collection's declared property types)
+            types any keyset-seek boundary built for the returned ``next_url``.
 
             No-progress guard for the work-queue drainers: those slice pagination
             one page per call, so the in-generator guard in
@@ -3029,7 +5100,7 @@ def register_lakeflow_source(spark):
             — and a repeated row is deduped at the destination by ``apply_changes``'
             MERGE on the primary key (a harmless duplicate, vs. the data loss a
             short-page stop causes)."""
-            for page_rows, page_next_url in self._fetch_pages_with_links(url):
+            for page_rows, page_next_url in self._fetch_pages_with_links(url, edm_types):
                 return page_rows, (None if page_next_url == url else page_next_url)
             return [], None
 
@@ -3062,10 +5133,13 @@ def register_lakeflow_source(spark):
                 return {"pending_fetches": list(pending_queue)} if in_flight else {}
             prior_running = (start_offset or {}).get("running_max_cursor")
             batch_cursors = [r.get(cursor_field) for r in emitted if r.get(cursor_field) is not None]
+            # Chronological max (``_cursor_max``): a lexical max over mixed
+            # fractional renderings regresses the running watermark behind
+            # emitted rows.
             if batch_cursors and prior_running is not None:
-                new_running = max([*batch_cursors, prior_running])
+                new_running = _cursor_max([*batch_cursors, prior_running])
             elif batch_cursors:
-                new_running = max(batch_cursors)
+                new_running = _cursor_max(batch_cursors)
             else:
                 new_running = prior_running
             since = (start_offset or {}).get("cursor")
@@ -3077,7 +5151,12 @@ def register_lakeflow_source(spark):
                     offset["running_max_cursor"] = new_running
                 return offset
             if new_running is not None:
-                return {"cursor": new_running}
+                # Floored at ``since``: the lookback overlap re-reads below the
+                # committed watermark, so after a deleted watermark row (or a
+                # stale ``running_max_cursor`` resumed from a mode flip) the
+                # running max alone can sit BELOW ``since`` — committing it
+                # as-is would regress the watermark.
+                return {"cursor": _max_or(new_running, since)}
             if since is not None:
                 return {"cursor": since}
             # Chain drained AND no watermark to park (no prior ``since``, no
@@ -3100,9 +5179,10 @@ def register_lakeflow_source(spark):
             """``(cursor_level, $filter, $orderby, $select)`` for ``$expand``
             mode. Returns ``(-1, None, None, None)`` when no cursor is set;
             the caller raises if the cursor isn't a property of any segment.
-            ``$select`` is non-empty only when the cursor lives on a non-top
-            segment — it forces the server to project the cursor column on
-            the expanded ancestor (some servers default-omit it)."""
+            The ``$select`` slot is always ``None`` today (see the comment
+            below) but stays in the tuple: ``_build_expand_url`` merges it
+            into the cursor level's clause, and the leaf level additionally
+            merges the user's leaf-scoped ``select`` option."""
             if not cursor_field:
                 return -1, None, None, None
             cursor_level = self._find_cursor_level(segments, namespace, cursor_field)
@@ -3129,9 +5209,120 @@ def register_lakeflow_source(spark):
             read_since = self._apply_cursor_lookback(since)
             return (
                 cursor_level,
-                self._cursor_filter(cursor_field, read_since),
+                self._cursor_filter(
+                    cursor_field,
+                    read_since,
+                    edm_type=self._edm_types_for_et(level_et).get(cursor_field),
+                ),
                 ",".join(order_terms),
                 None,
+            )
+
+        # pylint: disable=too-many-arguments,too-many-positional-arguments
+        def _emit_leaf_row(
+            self,
+            row: dict,
+            segments: list[str],
+            chain: list[dict[str, Any]],
+            fk_columns: dict[tuple[int, str], str],
+            out: list[dict],
+            cur_field: str | None,
+            cur_val: Any,
+        ) -> None:
+            """Emit one LEAF row: strip OData annotations, tag ancestor FKs, and
+            stamp the inherited cursor value when the leaf doesn't carry its own.
+            Shared by :meth:`_flatten_expand_response` (streaming recursion) and
+            the :meth:`_drain_expand_pages` stack machine so both emit identically.
+            """
+            # Drop both top-level (``@odata.foo``) and per-property
+            # (``Foo@odata.nextLink``) annotations from leaf rows; the framework
+            # wouldn't know what to do with either.
+            clean = {k: v for k, v in row.items() if "@odata." not in k}
+            self._tag_with_ancestor_fks(clean, segments, chain, fk_columns)
+            if cur_field and cur_val is not None and clean.get(cur_field) is None:
+                clean[cur_field] = cur_val
+            out.append(clean)
+
+        # pylint: disable=too-many-arguments,too-many-positional-arguments
+        def _derive_child_continuation(
+            self,
+            level: int,
+            row: dict,
+            segments: list[str],
+            chain: list[dict[str, Any]],
+            next_ctx: tuple[str | None, int, Any] | None,
+            per_level_tops: list[int] | None,
+            page_size: int | None,
+            base_url: str,
+        ) -> str | None:
+            """Resolve the continuation URL for ``row``'s inner collection at
+            ``level + 1`` (or ``None`` when the collection is complete / not
+            continuable). ``chain`` MUST already include ``row``'s own keys
+            (levels ``0..level``). Extracted verbatim from
+            :meth:`_flatten_expand_response` so the stack machine derives the
+            exact same continuations.
+            """
+            next_seg = segments[level + 1]
+            inner_next = row.get(f"{next_seg}@odata.nextLink")
+            if inner_next:
+                # _resolve_next_link, NOT a plain urljoin: some servers (Hexagon
+                # SCApi, SAP Gateway) return per-property continuation links
+                # relative to the SERVICE ROOT — urljoin against this deep page
+                # URL would double the ancestor path (→ 404 and a full
+                # rebuild-from-keys re-read on every inner continuation).
+                resolved = self._resolve_next_link(base_url, inner_next)
+                if per_level_tops:
+                    # Continuation pages the collection at ``level + 1`` under one
+                    # specific parent at ``level``. The original ``$top`` for that
+                    # level was sized against the FULL cross-product budget
+                    # (top × inner × …); the continuation is one outer level
+                    # shallower, so we have more budget to spend per response. New
+                    # $top is ``page_size_budget / inner_product`` where
+                    # ``inner_product`` is the cross-product of all levels deeper
+                    # than ``level + 1`` (which the server-side ``$expand`` chain
+                    # in the nextLink still applies).
+                    continuation_level = level + 1
+                    inner_product = 1
+                    for t in per_level_tops[continuation_level + 1 :]:
+                        inner_product *= t
+                    # Budget is the full page_size: the ancestors 0..level are a
+                    # single fixed parent in the continuation, so they don't
+                    # multiply. ``page_size`` is passed explicitly rather than
+                    # re-derived from per_level_tops, whose entries below this
+                    # request's root level are placeholders. (per_level_tops is only
+                    # truthy when page_size was set, so page_size is present here.)
+                    new_top = max(MIN_DYNAMIC_TOP, (page_size or 0) // max(1, inner_product))
+                    resolved = rewrite_top_in_url(resolved, new_top)
+                return resolved
+            if next_seg in row and row[next_seg] is not None:
+                # No ``<NavProp>@odata.nextLink``. In a client-driven pagination
+                # mode (keyset/skip/auto), synthesize a direct-navigation
+                # continuation when the inline page is a FULL page (== $top) and
+                # so plausibly truncated; otherwise the inline page is taken as
+                # the whole collection — today's nextlink-only behaviour. This
+                # closes the inner-``$expand`` hole for servers that page-limit a
+                # response but never emit the continuation link.
+                return self._inner_expand_continuation_url(
+                    level, row, segments, chain, next_ctx, per_level_tops
+                )
+            # The expanded property is wholly ABSENT (or null) — spec-violating:
+            # OData v4 requires every ``$expand``-ed property be PRESENT on each
+            # row (a genuinely empty collection comes back as ``[]``, which the
+            # branch above trusts). A partial-expansion server that inlines
+            # children for some parents and omits the property for others would
+            # otherwise have those subtrees silently dropped — absent is NOT
+            # verified-empty. Fetch the collection directly from the start: mode
+            # "skip" + count 0 yields a plain ``$skip=0`` from-the-beginning URL
+            # with the deeper ``$expand`` chain intact, without engaging the
+            # keyset OR-support probe an empty boundary couldn't use anyway.
+            return self._build_expand_continuation_url(
+                segments,
+                level,
+                chain,
+                next_ctx[0] if next_ctx else None,
+                "skip",
+                {},
+                0,
             )
 
         # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
@@ -3142,7 +5333,7 @@ def register_lakeflow_source(spark):
             segments: list[str],
             pks_per_level: list[list[str]],
             chain: list[dict[str, Any]],
-            fk_columns: dict[tuple[str, str], str],
+            fk_columns: dict[tuple[int, str], str],
             out: list[dict],
             cursor_ctx: tuple[str | None, int, Any] | None = None,
             per_level_tops: list[int] | None = None,
@@ -3191,14 +5382,7 @@ def register_lakeflow_source(spark):
             if cur_field and level == cur_level:
                 cur_val = row.get(cur_field)
             if level == len(segments) - 1:
-                # Drop both top-level (``@odata.foo``) and per-property
-                # (``Foo@odata.nextLink``) annotations from leaf rows; the
-                # framework wouldn't know what to do with either.
-                clean = {k: v for k, v in row.items() if "@odata." not in k}
-                self._tag_with_ancestor_fks(clean, segments, chain, fk_columns)
-                if cur_field and cur_val is not None and clean.get(cur_field) is None:
-                    clean[cur_field] = cur_val
-                out.append(clean)
+                self._emit_leaf_row(row, segments, chain, fk_columns, out, cur_field, cur_val)
                 return
             pks = pks_per_level[level]
             chain.append({pk: row.get(pk) for pk in pks})
@@ -3219,43 +5403,9 @@ def register_lakeflow_source(spark):
                     pending_fetches=pending_fetches,
                     page_size=page_size,
                 )
-            inner_next = row.get(f"{next_seg}@odata.nextLink")
-            if inner_next:
-                resolved = urljoin(base_url, inner_next)
-                if per_level_tops:
-                    # Continuation pages the collection at ``level + 1``
-                    # under one specific parent at ``level``. The original
-                    # ``$top`` for that level was sized against the FULL
-                    # cross-product budget (top × inner × …); the
-                    # continuation is one outer level shallower, so we
-                    # have more budget to spend per response. New $top is
-                    # ``page_size_budget / inner_product`` where
-                    # ``inner_product`` is the cross-product of all levels
-                    # deeper than ``level + 1`` (which the server-side
-                    # ``$expand`` chain in the nextLink still applies).
-                    continuation_level = level + 1
-                    inner_product = 1
-                    for t in per_level_tops[continuation_level + 1 :]:
-                        inner_product *= t
-                    # Budget is the full page_size: the ancestors 0..level are a
-                    # single fixed parent in the continuation, so they don't
-                    # multiply. ``page_size`` is passed explicitly rather than
-                    # re-derived from per_level_tops, whose entries below this
-                    # request's root level are placeholders. (per_level_tops is only
-                    # truthy when page_size was set, so page_size is present here.)
-                    new_top = max(MIN_DYNAMIC_TOP, (page_size or 0) // max(1, inner_product))
-                    resolved = rewrite_top_in_url(resolved, new_top)
-            else:
-                # No ``<NavProp>@odata.nextLink``. In a client-driven pagination
-                # mode (keyset/skip/auto), synthesize a direct-navigation
-                # continuation when the inline page is a FULL page (== $top) and
-                # so plausibly truncated; otherwise the inline page is taken as
-                # the whole collection — today's nextlink-only behaviour. This
-                # closes the inner-``$expand`` hole for servers that page-limit a
-                # response but never emit the continuation link.
-                resolved = self._inner_expand_continuation_url(
-                    level, row, segments, chain, next_ctx, per_level_tops
-                )
+            resolved = self._derive_child_continuation(
+                level, row, segments, chain, next_ctx, per_level_tops, page_size, base_url
+            )
             if resolved is not None:
                 if pending_fetches is not None:
                     # Defer the follow: the outer drainer pops one fetch
@@ -3279,7 +5429,9 @@ def register_lakeflow_source(spark):
                 # continuation via ``_client_paginate_pages`` (the synthesized
                 # URL carries the seek/skip), draining the whole collection.
                 inner_current = resolved
-                for page_rows, page_next in self._fetch_pages_with_links(resolved):
+                for page_rows, page_next in self._fetch_pages_with_links(
+                    resolved, self._expand_level_types(level + 1)
+                ):
                     for child in page_rows:
                         self._flatten_expand_response(
                             level + 1,
@@ -3306,13 +5458,16 @@ def register_lakeflow_source(spark):
             per_level_tops: list[int] | None,
         ) -> str | None:
             """Synthesize a client-driven continuation for a parent's inner
-            collection when the server returned a *full* inline page but omitted
-            its ``<NavProp>@odata.nextLink``.
+            collection when the server returned a NON-EMPTY inline page but
+            omitted its ``<NavProp>@odata.nextLink``.
 
-            Returns ``None`` unless ``pagination`` is keyset/skip/auto, ``$top``
-            is in force (``per_level_tops`` set), and the inline child page is
-            exactly ``$top`` rows (so it's plausibly truncated). A short page is
-            proof the collection is complete, so it's taken at face value.
+            Returns ``None`` only when ``pagination`` is ``nextlink``, ``$top``
+            isn't in force (``per_level_tops`` unset), or the inline collection
+            is empty. Any non-empty inline page gets a continuation — a short
+            page is NOT taken as proof of completeness (a server may page-limit
+            a nested ``$expand`` below the requested per-level ``$top``); see
+            the inline comment below for the full rationale and the one-empty-
+            request cost this trades for closing that silent-truncation hole.
             """
             mode = getattr(self, "_pagination", "nextlink")
             if mode == "nextlink" or per_level_tops is None:
@@ -3392,7 +5547,7 @@ def register_lakeflow_source(spark):
             # root the request at this parent's child collection.
             contained_base = join_url(
                 self.service_url,
-                self._build_contained_path(segments[: child_level + 1], chain),
+                self._build_contained_path(segments[: child_level + 1], chain, namespace),
             )
             # Budget the continuation's $top over only its own collection levels
             # (child_level..leaf); levels 0..level are now fixed keys in the path, so
@@ -3419,19 +5574,23 @@ def register_lakeflow_source(spark):
                 cont_tops,
             )
             order_keys = _pg_orderby_keys(url)
+            # $orderby names properties of the CHILD collection's entity type —
+            # its declared types steer seek-literal quoting (guid bare / string
+            # quoted); best-effort so a resolution gap degrades to the sniff.
+            child_types = self._edm_types_for_level(segments, child_level, namespace)
             # Skip the OR-across-columns keyset seek on servers that reject it
             # (preflight, cached) — fall through to $skip (mode B). Single-key
             # $orderby never builds an OR, so the probe short-circuits there.
             if (
                 mode in ("keyset", "auto")
                 and order_keys
-                and self._verify_or_filter_support(url, order_keys, last_child)
+                and self._verify_or_filter_support(url, order_keys, last_child, child_types)
             ):
-                seek = _pg_keyset_filter(order_keys, last_child)
+                seek = _pg_keyset_filter(order_keys, last_child, child_types)
                 if seek is not None:
                     # Stash the clean child-level $filter as the keyset base so a
                     # cross-batch resume REPLACES the seek instead of accumulating.
-                    return _pg_keyset_seek_url(url, _pg_get_query(url, "$filter"), seek)
+                    return _pg_keyset_seek_url(url, _pg_get_filter(url), seek)
             return _pg_set_query(url, "$skip", str(inline_count))
 
         def _leaf_cursor_order_by(
@@ -3458,7 +5617,7 @@ def register_lakeflow_source(spark):
             leaf_et = self._entity_type_for(CONTAINED_PATH_SEP.join(segments), namespace)
             return _ancestor_pk_order_by(self._own_primary_keys_for_et(leaf_et))
 
-        # pylint: disable=too-many-statements
+        # pylint: disable=too-many-statements,too-many-branches
         def _walk_contained_with_cursor(
             self,
             segments: list[str],
@@ -3471,11 +5630,13 @@ def register_lakeflow_source(spark):
             truncated_chain_cursor: Any,
             chain_next_link: str | None,
             max_records: int,
-            fk_columns: dict[tuple[str, str], str],
+            fk_columns: dict[tuple[int, str], str],
             leaf_segment_filter: str | None = None,
             effective=None,
             skip_null: bool = False,
-        ) -> tuple[list[dict], bool, int, str | None, Any]:
+            parked_chain: list | None = None,
+            count_floor: Any = None,
+        ) -> tuple[list[dict], bool, int, list | None, str | None, Any]:
             """Drive the per-parent fetch loop (leaf-cursor mode).
 
             ``chains_iter`` is consumed lazily and the walk stops at the
@@ -3486,7 +5647,20 @@ def register_lakeflow_source(spark):
             is emitted in full and absorbed into the walk rather than
             checkpointed.
 
-            Resume preference, applied to the chain at ``parent_idx_start``:
+            Resume positioning: ``parked_chain`` (the truncated parent's key
+            chain, parked by the previous batch) is matched by the
+            enumeration's own ordering keys — churn-stable, unlike the
+            positional ``parent_idx_start`` skip it supersedes (see
+            :func:`_chain_strictly_before` for the loss/mis-tagging modes a
+            positional resume has under inserts/deletes between batches).
+            Offsets written before ``parent_keys`` existed carry only
+            ``parent_idx``, and fall back to the positional skip. A parked
+            chain that vanished (parent deleted) resumes at the first chain
+            past its position with the global ``since``. A park written by
+            the ``$batch`` walk (no continuation keys) is EXCLUSIVE — the
+            parked chain itself was fully drained and is skipped.
+
+            Resume preference, applied to the resume-target chain:
 
             1. ``chain_next_link`` (server skiptoken) — fetched directly,
                bypassing URL rebuild. Used when the previous batch parked
@@ -3509,8 +5683,10 @@ def register_lakeflow_source(spark):
               the walk continues to the next parent. The cap is overshot
               for that one parent (bounded by one server response).
 
-            Returns ``(rows, truncated, parent_idx, chain_next_link_out,
-            truncated_chain_cursor_out)``.
+            Returns ``(rows, truncated, parent_idx, parked_chain_out,
+            chain_next_link_out, truncated_chain_cursor_out)`` —
+            ``parked_chain_out`` is the truncated parent's key chain (for the
+            next batch's key-based resume), ``None`` when not truncated.
 
             ``effective(row)`` supplies the cursor value used for filtering,
             the boundary trim and (via the caller) the watermark — the
@@ -3526,26 +5702,78 @@ def register_lakeflow_source(spark):
             truncated = False
             parent_idx = 0
             chain_start_idx = 0
+            # Only rows strictly above the COMMITTED watermark (``count_floor``,
+            # the true ``since`` — not the lookback-floored read filter) count
+            # toward ``max_records``: overlap re-reads ride on top, so a lookback
+            # window holding >= max_records rows can't wedge the stream into an
+            # eternal park/complete duplicate cycle — a pure-overlap walk always
+            # completes and hits the suppressed-idle rule. The cap may overshoot
+            # by the overlap size (bounded by the user's lookback window).
+            countable = 0
+            parked_chain_out: list | None = None
             chain_next_link_out: str | None = None
             truncated_chain_cursor_out: Any = None
+            parked_key = _chain_resume_key(parked_chain) if parked_chain is not None else None
+            # A park with a continuation key resumes AT the parked chain; a park
+            # without one (written by the $batch walk) is exclusive — the parked
+            # chain was fully drained.
+            resume_inclusive = chain_next_link is not None or truncated_chain_cursor is not None
+            seeking = parked_key is not None
+            # Leaf-collection property types: the compound keyset seek built while
+            # paging a leaf collection (ALSO the cap-hit resume checkpoint) must
+            # render its boundaries typed (guid bare / ISO-looking string quoted).
+            leaf_types = self._edm_types_for_level(
+                segments, len(segments) - 1, (table_options or {}).get("namespace")
+            )
             for chain in chains_iter:
-                # Skip the chains we already emitted in prior batches. The
-                # iterator still pays for the ancestor pages that produce
-                # those chains (no way to skip without knowing the keys),
-                # but no leaf fetches happen here.
-                if parent_idx < parent_idx_start:
-                    parent_idx += 1
-                    continue
+                # Skip the chains we already emitted in prior batches — by the
+                # enumeration's own ordering keys when the offset parked them
+                # (churn-stable), positionally for legacy index-only offsets.
+                # The iterator still pays for the ancestor pages that produce
+                # those chains (no way to skip without fetching the keys),
+                # but no leaf fetches happen during the skip.
+                if parked_key is not None:
+                    if seeking:
+                        at_parked = chain == parked_chain
+                        if (
+                            not at_parked
+                            and _chain_seek_order(_chain_resume_key(chain), parked_key) != "after"
+                        ):
+                            # "before": provably drained by a prior batch.
+                            # "unknown" (server-collated text keys whose order
+                            # isn't reproducible client-side): keep seeking on
+                            # the identity anchor rather than trusting ordinal
+                            # comparison, which silently skips unwalked subtrees
+                            # on CI-collation servers. If the parked chain
+                            # vanished, the seek runs out, this batch emits
+                            # nothing, and the cleared park re-walks everything
+                            # next batch (duplicate-safe, never loss — see the
+                            # post-loop warning).
+                            parent_idx += 1
+                            continue
+                        seeking = False
+                        if at_parked and not resume_inclusive:
+                            # Exclusive park: the parked chain itself is done.
+                            parent_idx += 1
+                            continue
+                        is_resume_target = at_parked
+                    else:
+                        is_resume_target = False
+                else:
+                    if parent_idx < parent_idx_start:
+                        parent_idx += 1
+                        continue
+                    is_resume_target = parent_idx == parent_idx_start
                 chain_start_idx = len(emitted)
                 chain_since: Any
                 initial_url: str
-                if parent_idx == parent_idx_start and chain_next_link is not None:
+                if is_resume_target and chain_next_link is not None:
                     # Resume from the server's own skiptoken; no client-side
                     # filter — the link already encodes filter/order state.
                     chain_since = None
                     initial_url = chain_next_link
                 else:
-                    if parent_idx == parent_idx_start and truncated_chain_cursor is not None:
+                    if is_resume_target and truncated_chain_cursor is not None:
                         chain_since = truncated_chain_cursor
                     else:
                         chain_since = since
@@ -3554,7 +5782,11 @@ def register_lakeflow_source(spark):
                         chain,
                         table_options,
                         extra_filter=combine_filters(
-                            self._cursor_filter(cursor_field, chain_since),
+                            self._cursor_filter(
+                                cursor_field,
+                                chain_since,
+                                edm_type=leaf_types.get(cursor_field),
+                            ),
                             leaf_segment_filter,
                         ),
                         order_by=order_by,
@@ -3572,20 +5804,26 @@ def register_lakeflow_source(spark):
                 # cohort that spans the cap (better than the cursor-only trim below,
                 # which is kept for nextlink mode / whole-leaf-in-one-response
                 # servers where ``page_next_url`` is None).
-                for page_rows, page_next_url in self._fetch_pages_with_links(initial_url):
+                for page_rows, page_next_url in self._fetch_pages_with_links(initial_url, leaf_types):
                     for row in page_rows:
                         if skip_null and row.get(cursor_field) is None:
                             continue
                         rec_cursor = effective(row)
+                        # Chronological, not lexical (``_cursor_le``) — see the
+                        # flat re-filter in ``_read_incremental``.
                         if (
                             chain_since is not None
                             and rec_cursor is not None
-                            and rec_cursor <= chain_since
+                            and _cursor_le(rec_cursor, chain_since)
                         ):
                             continue
                         self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                         emitted.append(row)
-                        if len(emitted) >= max_records:
+                        if count_floor is None or (
+                            rec_cursor is not None and _cursor_newer(rec_cursor, count_floor)
+                        ):
+                            countable += 1
+                        if countable >= max_records:
                             cap_hit_in_page = True
                     if cap_hit_in_page:
                         # Finish the current page (above) so its nextLink is a
@@ -3595,9 +5833,11 @@ def register_lakeflow_source(spark):
                 if cap_hit_in_page:
                     if page_next_url is not None:
                         # Page boundary mid-collection: the server skiptoken is
-                        # a clean resume point — park it and re-enter this
-                        # parent next batch.
+                        # a clean resume point — park it (with this chain's keys
+                        # so the resume re-finds THIS parent under churn) and
+                        # re-enter this parent next batch.
                         truncated = True
+                        parked_chain_out = chain
                         chain_next_link_out = page_next_url
                         break
                     # No nextLink ⇒ the server returned this parent's ENTIRE
@@ -3609,6 +5849,7 @@ def register_lakeflow_source(spark):
                     if trimmed:
                         del emitted[chain_start_idx + len(trimmed) :]
                         truncated = True
+                        parked_chain_out = chain
                         # Effective value (synthetic floor for a null under
                         # coalesce) so the resumed ``cursor gt`` is a real,
                         # comparable boundary — never the restored-null column.
@@ -3624,10 +5865,34 @@ def register_lakeflow_source(spark):
                     parent_idx += 1
                     continue
                 parent_idx += 1
+            if seeking:
+                # The anchor was never re-found (parent deleted, or its key
+                # rendering changed between batches) and the remaining chains
+                # couldn't be PROVEN already-walked. Completing here would let
+                # the caller fold ``running_max`` into the committed cursor —
+                # locking every unwalked subtree's sub-max rows out forever —
+                # so return a TRUNCATED reset instead: no park, positional
+                # restart at 0, cursor floor kept. The next batch re-walks
+                # everything above ``since`` (duplicate-safe, deduplicated by
+                # the destination MERGE), never loss.
+                _LOG.warning(
+                    "Parked resume position %r was not re-found while enumerating "
+                    "%r; this batch emitted nothing and reset the walk — the next "
+                    "batch re-walks from the committed cursor floor "
+                    "(duplicate-safe).",
+                    parked_chain,
+                    segments,
+                )
+                truncated = True
+                parent_idx = 0
+                parked_chain_out = None
+                chain_next_link_out = None
+                truncated_chain_cursor_out = None
             return (
                 emitted,
                 truncated,
                 parent_idx,
+                parked_chain_out,
                 chain_next_link_out,
                 truncated_chain_cursor_out,
             )
@@ -3643,12 +5908,15 @@ def register_lakeflow_source(spark):
             cursor_field: str,
             since: Any,
             max_records: int,
-            fk_columns: dict[tuple[str, str], str],
+            fk_columns: dict[tuple[int, str], str],
             leaf_segment_filter: str | None = None,
             effective=None,
             skip_null: bool = False,
             batch_size: int = _BATCH_MAX_OPS,
-        ) -> tuple[list[dict], bool, int, None, None]:
+            parked_chain: list | None = None,
+            resume_inclusive: bool = False,
+            count_floor: Any = None,
+        ) -> tuple[list[dict], bool, int, list | None, None, None]:
             """OData ``$batch`` counterpart to :meth:`_walk_contained_with_cursor`.
 
             Hydrates leaf collections via ``$batch`` instead of one GET per
@@ -3662,14 +5930,19 @@ def register_lakeflow_source(spark):
             is identical — only the request shape differs.
 
             Resume + cap are **chunk-aligned**: the cap is checked after each
-            fully-drained group, so truncation parks ``parent_idx`` at the next group
-            boundary. ``chain_next_link`` / ``truncated_chain_cursor`` are unused
-            (returned ``None``) — a resumed batch re-enumerates ancestors and skips
-            ``parent_idx`` chains exactly like the plain walk. The cap is overshot by
-            at most one group's worth of changed rows (the same bounded-overshoot
-            tolerance the plain walk applies to a single complete parent).
+            fully-drained group, so truncation parks the LAST DRAINED chain's keys
+            (an EXCLUSIVE park — that chain is complete; the resume skips through
+            it by the enumeration's ordering keys, churn-stable). Legacy
+            index-only offsets fall back to the positional ``parent_idx`` skip.
+            ``chain_next_link`` / ``truncated_chain_cursor`` are unused (returned
+            ``None``); a serial-walk park resumed here (``resume_inclusive``)
+            re-drains the parked chain in full — duplicates, never loss. The cap
+            is overshot by at most one group's worth of changed rows (the same
+            bounded-overshoot tolerance the plain walk applies to a single
+            complete parent).
 
-            Returns the 5-tuple ``(emitted, truncated, parent_idx, None, None)``."""
+            Returns the 6-tuple
+            ``(emitted, truncated, parent_idx, parked_chain_out, None, None)``."""
             if effective is None:
 
                 def effective(row):
@@ -3678,14 +5951,20 @@ def register_lakeflow_source(spark):
             emitted: list[dict] = []
             truncated = False
             parent_idx = 0
+            # New-rows-only cap accounting — see _walk_contained_with_cursor.
+            countable = 0
             group: list[list[dict[str, Any]]] = []
             # Drop ``page_size`` so the per-leaf-parent sub-requests carry NO ``$top``
             # — the server drives paging and emits ``@odata.nextLink`` for any
             # overflow (the keyset/$skip drain the plain ``auto`` walk would use to
             # continue a short link-less page can't run inside a batch sub-request).
             leaf_opts = {k: v for k, v in (table_options or {}).items() if k != "page_size"}
+            leaf_types = self._edm_types_for_level(
+                segments, len(segments) - 1, (table_options or {}).get("namespace")
+            )
 
             def _drain_group(buffered: list[list[dict[str, Any]]]) -> None:
+                nonlocal countable
                 # idx-keyed initial URLs (no $top → server pages + emits nextLink).
                 pending: list[tuple[int, str]] = []
                 chain_by_key: dict[int, list[dict[str, Any]]] = {}
@@ -3698,7 +5977,12 @@ def register_lakeflow_source(spark):
                                 chain,
                                 leaf_opts,
                                 extra_filter=combine_filters(
-                                    self._cursor_filter(cursor_field, since), leaf_segment_filter
+                                    self._cursor_filter(
+                                        cursor_field,
+                                        since,
+                                        edm_type=leaf_types.get(cursor_field),
+                                    ),
+                                    leaf_segment_filter,
                                 ),
                                 order_by=order_by,
                             ),
@@ -3709,8 +5993,9 @@ def register_lakeflow_source(spark):
                     eff = self._effective_batch_size(batch_size)
                     round_ = pending[:eff]
                     pending = pending[eff:]
-                    responses = self._post_batch_adaptive([u for _, u in round_])
+                    responses = self._post_batch_adaptive([u for _, u in round_], leaf_types)
                     for (key, req_url), resp in zip(round_, responses):
+                        resp = self._checked_batch_subresponse(resp, req_url, leaf_types)
                         body = resp.get("body") if isinstance(resp, dict) else None
                         rows = body.get("value", []) if isinstance(body, dict) else []
                         chain = chain_by_key[key]
@@ -3718,31 +6003,79 @@ def register_lakeflow_source(spark):
                             if skip_null and row.get(cursor_field) is None:
                                 continue
                             rec_cursor = effective(row)
-                            if since is not None and rec_cursor is not None and rec_cursor <= since:
+                            # Chronological, not lexical (``_cursor_le``) — see
+                            # the flat re-filter in ``_read_incremental``.
+                            if (
+                                since is not None
+                                and rec_cursor is not None
+                                and _cursor_le(rec_cursor, since)
+                            ):
                                 continue
                             clean = {k: v for k, v in row.items() if not k.startswith("@odata.")}
                             self._tag_with_ancestor_fks(clean, segments, chain, fk_columns)
                             emitted.append(clean)
+                            if count_floor is None or (
+                                rec_cursor is not None and _cursor_newer(rec_cursor, count_floor)
+                            ):
+                                countable += 1
                         raw_next = body.get("@odata.nextLink") if isinstance(body, dict) else None
                         if raw_next:
                             pending.append((key, self._resolve_next_link(req_url, raw_next)))
 
+            parked_key = _chain_resume_key(parked_chain) if parked_chain is not None else None
+            seeking = parked_key is not None
+            parked_chain_out: list | None = None
             for chain in chains_iter:
-                if parent_idx < parent_idx_start:
-                    parent_idx += 1
-                    continue
+                if parked_key is not None:
+                    if seeking:
+                        at_parked = chain == parked_chain
+                        if (
+                            not at_parked
+                            and _chain_seek_order(_chain_resume_key(chain), parked_key) != "after"
+                        ):
+                            # Same seek contract as the plain leaf-cursor walk
+                            # above: "before" is provably drained; "unknown"
+                            # keeps seeking on the identity anchor (never trust
+                            # ordinal order of server-collated text keys).
+                            parent_idx += 1
+                            continue
+                        seeking = False
+                        if at_parked and not resume_inclusive:
+                            parent_idx += 1
+                            continue
+                else:
+                    if parent_idx < parent_idx_start:
+                        parent_idx += 1
+                        continue
                 group.append(chain)
                 parent_idx += 1
                 if len(group) >= batch_size:
+                    last_drained = group[-1]
                     _drain_group(group)
                     group = []
-                    if len(emitted) >= max_records:
+                    if countable >= max_records:
                         truncated = True
+                        parked_chain_out = last_drained
                         break
             else:
                 if group:
                     _drain_group(group)
-            return (emitted, truncated, parent_idx, None, None)
+            if seeking:
+                # See the plain walk above: a never-found anchor must reset via a
+                # TRUNCATED no-park offset (positional restart, floor kept) — a
+                # clean completion would fold running_max past unwalked subtrees.
+                _LOG.warning(
+                    "Parked resume position %r was not re-found while enumerating "
+                    "%r; this batch emitted nothing and reset the walk — the next "
+                    "batch re-walks from the committed cursor floor "
+                    "(duplicate-safe).",
+                    parked_chain,
+                    segments,
+                )
+                truncated = True
+                parent_idx = 0
+                parked_chain_out = None
+            return (emitted, truncated, parent_idx, parked_chain_out, None, None)
 
         def _no_progress_cursor_error(
             self, table_name: str, cursor_field: str, n_emitted: int
@@ -3763,7 +6096,8 @@ def register_lakeflow_source(spark):
                 f"whose {cursor_field} equals the prior offset (server did not "
                 f"honor `{cursor_field} gt <since>`). Fix the cursor at the "
                 f"source (non-nullable, strictly monotonic), exclude offending "
-                f"rows with `filter`/`filter_at_<segment>`, or pick a different "
+                f"rows with `filter`/`filter_at_<segment>` (or drop null-cursor "
+                f"rows entirely with cursor_nulls=ignore), or pick a different "
                 f"cursor."
             )
 
@@ -3802,7 +6136,15 @@ def register_lakeflow_source(spark):
                     k: v
                     for k, v in (off or {}).items()
                     if not k.startswith("lb_")
-                    and k not in ("cursor_probe_ok", "batch_ok", "batch_size_ok", "or_filter_ok")
+                    and k
+                    not in (
+                        "cursor_probe_ok",
+                        "batch_ok",
+                        "batch_size_ok",
+                        "or_filter_ok",
+                        "expand_ok",
+                        "delta_ok",
+                    )
                 }
 
             if _progress_view(start_offset) == _progress_view(end_offset):
@@ -3836,7 +6178,7 @@ def register_lakeflow_source(spark):
             for next-call resume. When the leaf entity doesn't declare
             ``cursor_field``, the closest ancestor that does owns the filter
             and its cursor value is propagated onto each leaf row."""
-            segments = parse_contained_path(table_name) or [table_name]
+            segments = self._table_segments(table_name) or [table_name]
             namespace = (table_options or {}).get("namespace")
             cursor_level = self._find_cursor_level(segments, namespace, cursor_field)
             if cursor_level == -1:
@@ -4094,7 +6436,10 @@ def register_lakeflow_source(spark):
             read_since = self._apply_cursor_lookback(since)
             truncated_chain_cursor_in = (start_offset or {}).get("truncated_chain_cursor")
             chain_next_link_in = (start_offset or {}).get("chain_next_link")
-            max_records = int((table_options or {}).get("max_records_per_batch", "10000"))
+            # Key-based resume position (churn-stable); legacy offsets carry only
+            # ``parent_idx`` and fall back to the positional skip inside the walks.
+            parked_chain_in = (start_offset or {}).get("parent_keys")
+            max_records = _parse_max_records(table_options)
             order_by = self._leaf_cursor_order_by(table_name, namespace, cursor_field)
             if chains_iter is None:
                 chains_iter = self._iter_parent_key_chains(segments, namespace, table_options)
@@ -4113,6 +6458,7 @@ def register_lakeflow_source(spark):
                     emitted,
                     truncated,
                     parent_idx,
+                    parent_keys_out,
                     chain_next_link_out,
                     truncated_chain_cursor_out,
                 ) = self._batch_walk_contained_with_cursor(
@@ -4129,12 +6475,20 @@ def register_lakeflow_source(spark):
                     effective=effective,
                     skip_null=skip_null,
                     batch_size=self._cursor_probe_batch_size(table_options),
+                    parked_chain=parked_chain_in,
+                    # A serial-walk park (continuation keys present) resumes AT
+                    # the parked chain; the batch walk re-drains it in full.
+                    resume_inclusive=(
+                        chain_next_link_in is not None or truncated_chain_cursor_in is not None
+                    ),
+                    count_floor=since,
                 )
             else:
                 (
                     emitted,
                     truncated,
                     parent_idx,
+                    parent_keys_out,
                     chain_next_link_out,
                     truncated_chain_cursor_out,
                 ) = self._walk_contained_with_cursor(
@@ -4152,6 +6506,8 @@ def register_lakeflow_source(spark):
                     leaf_segment_filter=segment_filters.get(len(segments) - 1),
                     effective=effective,
                     skip_null=skip_null,
+                    parked_chain=parked_chain_in,
+                    count_floor=since,
                 )
             walk_elapsed = time.monotonic() - walk_start
             if truncated:
@@ -4161,17 +6517,39 @@ def register_lakeflow_source(spark):
                 # parent with a distinct-cursor boundary. (A complete parent
                 # with a single cursor value never truncates — the walk emits
                 # it in full and continues — so there's no failure case here.)
+                # ``parent_idx`` rides along for downgrade compatibility; the
+                # resume itself positions on ``parent_keys`` (churn-stable).
                 end_offset: dict = {"parent_idx": parent_idx}
-                # The ``$batch`` walk resumes purely on ``parent_idx`` (chunk-aligned)
-                # — it never parks a mid-collection checkpoint — so its truncation
-                # offset carries neither continuation key.
+                if parent_keys_out is not None:
+                    end_offset["parent_keys"] = parent_keys_out
+                # The ``$batch`` walk's park is chunk-aligned and EXCLUSIVE (the
+                # parked chain is fully drained) — it never parks a
+                # mid-collection checkpoint, so its truncation offset carries
+                # neither continuation key.
                 if not use_batch:
                     if chain_next_link_out is not None:
                         end_offset["chain_next_link"] = chain_next_link_out
-                    else:
+                    elif truncated_chain_cursor_out is not None:
+                        # None/None with truncated=True is the vanished-anchor
+                        # RESET (positional restart at 0, no park) — stamping an
+                        # explicit null key would be inert but misleading.
                         end_offset["truncated_chain_cursor"] = truncated_chain_cursor_out
                 if since is not None:
                     end_offset["cursor"] = since
+                # Accumulate the max cursor seen across the truncated cycle's
+                # batches (mirrors ``_ancestor_cursor_offset``): the committed
+                # ``cursor`` must stay at ``since`` while in flight, but WITHOUT
+                # this a resume that completes EMPTY would clear the checkpoint
+                # back to ``{"cursor": since}`` and lose every truncated batch's
+                # progress — a permanent period-2 duplicate loop on a static
+                # source whose new rows fit exactly in one capped batch.
+                batch_cursors = [effective(r) for r in emitted if effective(r) is not None]
+                running_max = _max_or(
+                    _cursor_max(batch_cursors) if batch_cursors else None,
+                    (start_offset or {}).get("running_max"),
+                )
+                if running_max is not None:
+                    end_offset["running_max"] = running_max
             else:
                 if not emitted:
                     empty = start_offset or {}
@@ -4187,9 +6565,44 @@ def register_lakeflow_source(spark):
                     # checkpointed rows vanish between batches. Dropping the
                     # checkpoint (keeping ``cursor`` and the bookkeeping keys)
                     # marks the walk complete so the next batch starts fresh.
-                    checkpoint_keys = ("parent_idx", "chain_next_link", "truncated_chain_cursor")
+                    checkpoint_keys = (
+                        "parent_idx",
+                        "parent_keys",
+                        "parent_cursor",
+                        "chain_next_link",
+                        "truncated_chain_cursor",
+                        "running_max",
+                        # Foreign park keys from an ``expand_contained`` read of
+                        # the same table (mode flipped off mid-park): a stale
+                        # queue / running max must not ride every future N+1
+                        # offset — its watermark is folded below like our own.
+                        "pending_fetches",
+                        "running_max_cursor",
+                        # The capped cycle is OVER (this completion ends it), so
+                        # the auto-lookback span anchor must not survive: this
+                        # early return bypasses _attach_lookback_state, and a
+                        # leaked anchor makes the NEXT progressing walk record
+                        # the whole idle gap as a "cycle span" — lb_history then
+                        # carries a bogus multi-hour entry and the window pins
+                        # at the ceiling for the next 5 walks (an hour of
+                        # overlap re-read per batch; duplicates, never loss).
+                        # The measurement itself is deliberately dropped —
+                        # a vanished-checkpoint completion is idle-shaped, not
+                        # a real walk worth sizing the window from.
+                        "lb_cycle_started",
+                    )
                     if any(k in empty for k in checkpoint_keys):
+                        # Fold the cycle's accumulated max into the committed
+                        # cursor BEFORE clearing — the truncated batches' rows
+                        # were emitted under it, and dropping it re-reads them
+                        # forever (period-2 duplicate loop).
+                        committed = _max_or(
+                            _max_or(empty.get("running_max"), empty.get("running_max_cursor")),
+                            empty.get("cursor"),
+                        )
                         empty = {k: v for k, v in empty.items() if k not in checkpoint_keys}
+                        if committed is not None:
+                            empty["cursor"] = committed
                     if persist_probe_ok:
                         empty = self._with_probe_ok(empty)
                     if persist_batch_ok:
@@ -4201,6 +6614,15 @@ def register_lakeflow_source(spark):
                 # batch and no prior ``since`` to carry, the offset is ``{}`` —
                 # not ``{"cursor": None}`` (see ``_cursor_max_end_offset``).
                 end_offset = self._cursor_max_end_offset(cursors, since)
+                # Completing a previously-truncated cycle: fold the accumulated
+                # ``running_max`` into the committed cursor (and drop the key —
+                # terminal offsets stay clean).
+                prior_running = (start_offset or {}).get("running_max")
+                if prior_running is not None:
+                    committed = _max_or(end_offset.get("cursor"), prior_running)
+                    end_offset = {k: v for k, v in end_offset.items() if k != "cursor"}
+                    if committed is not None:
+                        end_offset["cursor"] = committed
             records, out_offset = self._finalize_cursor_read(
                 start_offset, end_offset, emitted, table_name, cursor_field
             )
@@ -4241,11 +6663,25 @@ def register_lakeflow_source(spark):
             construction, so a within-chain ``cursor gt`` rebuild would
             either re-fetch the whole chain or skip the whole chain — there
             is no meaningful split.
+
+            The lookback floor applies to the ANCESTOR enumeration filter
+            (``cursor gt <since - window>``): re-enumerating recently-dirty
+            ancestors re-reads their whole subtrees, which is exactly the
+            duplicate-safe recovery this walk needs — a parent updated
+            mid-cycle whose cursor lands below the cycle's final
+            ``running_max`` is otherwise excluded by ``cursor gt
+            <watermark>`` forever. The committed watermark is never floored
+            (``_ancestor_cursor_offset`` folds true stamped maxes), and the
+            floor stays stable across a capped cycle's batches because the
+            ``auto`` history is carried unchanged while in-flight.
             """
             namespace = (table_options or {}).get("namespace")
             since = (start_offset or {}).get("cursor")
+            self._active_lookback_seconds = self._resolve_active_lookback(start_offset)
+            read_since = self._apply_cursor_lookback(since)
+            walk_start = time.monotonic()
             chains_iter = self._iter_parent_chains_with_cursor(
-                segments, namespace, table_options, cursor_level, cursor_field, since
+                segments, namespace, table_options, cursor_level, cursor_field, read_since
             )
             segment_filters = resolve_segment_filters(table_options, segments)
             walk_state = self._walk_ancestor_chains(
@@ -4255,13 +6691,23 @@ def register_lakeflow_source(spark):
                 cursor_field,
                 int((start_offset or {}).get("parent_idx", 0)),
                 (start_offset or {}).get("chain_next_link"),
-                int((table_options or {}).get("max_records_per_batch", "10000")),
+                _parse_max_records(table_options),
                 self._resolve_fk_columns(segments, namespace),
                 leaf_segment_filter=segment_filters.get(len(segments) - 1),
+                parked_chain=(start_offset or {}).get("parent_keys"),
+                parked_cursor=(start_offset or {}).get("parent_cursor"),
+                cursor_level=cursor_level,
+                # New-rows-only cap accounting keys on the COMMITTED watermark,
+                # never the floored read filter — overlap re-reads don't burn cap.
+                count_floor=since,
             )
+            walk_elapsed = time.monotonic() - walk_start
             end_offset = self._ancestor_cursor_offset(walk_state, start_offset, since, cursor_field)
-            return self._finalize_cursor_read(
+            records, out_offset = self._finalize_cursor_read(
                 start_offset, end_offset, walk_state["emitted"], table_name, cursor_field
+            )
+            return records, self._attach_lookback_state(
+                out_offset, start_offset, walk_state["truncated"], walk_elapsed
             )
 
         def _walk_ancestor_chains(
@@ -4273,8 +6719,12 @@ def register_lakeflow_source(spark):
             parent_idx_start: int,
             chain_next_link_in: str | None,
             max_records: int,
-            fk_columns: dict[tuple[str, str], str],
+            fk_columns: dict[tuple[int, str], str],
             leaf_segment_filter: str | None = None,
+            parked_chain: list | None = None,
+            parked_cursor: Any = None,
+            cursor_level: int = 0,
+            count_floor: Any = None,
         ) -> dict[str, Any]:
             """Walk ancestor chains, fetching each chain's leaf collection
             and stamping rows with the chain's cursor.
@@ -4286,21 +6736,103 @@ def register_lakeflow_source(spark):
 
             Page-aware: a truncation at a page boundary parks the chain's
             ``@odata.nextLink``; when the chain happens to end on the
-            truncating page, ``parent_idx`` simply advances past it."""
+            truncating page the park is EXCLUSIVE (no link — the chain is
+            complete and the resume skips through it).
+
+            Resume positioning is key-based (``parked_chain`` +
+            ``parked_cursor``, matching the enumeration's nested ordering with
+            the cursor term at ``cursor_level``'s position — see
+            :func:`_chain_resume_key`): this enumeration is ordered by a
+            MUTABLE cursor column and filtered by ``cursor gt since``, so
+            positional resume desynchronizes under any churn — updates
+            included, not just inserts/deletes (see
+            :func:`_chain_strictly_before`). A parked parent whose cursor
+            advanced between batches re-enters at its new position and is
+            re-walked in full with a fresh stamp (duplicate-safe; its old
+            mid-page link is correctly dropped). Legacy index-only offsets
+            fall back to the positional skip. ``count_floor`` — see
+            ``_walk_contained_with_cursor``: only rows stamped strictly above
+            the committed watermark count toward the cap."""
             namespace = (table_options or {}).get("namespace")
             leaf_order_by = self._leaf_pk_order_by(segments, namespace)
             parent_idx = 0
             emitted: list[dict] = []
             truncated = False
+            countable = 0
             chain_next_link_out: str | None = None
+            parked_chain_out: list | None = None
+            parked_cursor_out: Any = None
+            parked_key = (
+                _chain_resume_key(parked_chain, parked_cursor, cursor_level)
+                if parked_chain is not None
+                else None
+            )
+            seeking = parked_key is not None
+            # Same typed-seek requirement as the leaf-cursor walk below.
+            leaf_types = self._edm_types_for_level(
+                segments, len(segments) - 1, (table_options or {}).get("namespace")
+            )
             for chain, ancestor_cursor in chains_iter:
-                # Skip already-emitted chains. Ancestor-page HTTP cost is
-                # unavoidable (we need the keys to identify the chain), but
-                # no leaf fetches happen during the skip.
-                if parent_idx < parent_idx_start:
-                    parent_idx += 1
-                    continue
-                if parent_idx == parent_idx_start and chain_next_link_in is not None:
+                # Skip already-emitted chains — key-based when parked
+                # (churn-stable), positional for legacy offsets. Ancestor-page
+                # HTTP cost is unavoidable (we need the keys to identify the
+                # chain), but no leaf fetches happen during the skip.
+                use_link = False
+                if parked_key is not None:
+                    if seeking:
+                        # Park identity is PK **and** cursor INSTANT: a parked
+                        # parent whose cursor advanced between batches is NOT "the
+                        # parked chain" any more — it re-enumerates at its new
+                        # (later) position and must be re-walked in full there,
+                        # because the server is saying its subtree changed since
+                        # we drained it. PK-only matching would skip it (exclusive
+                        # park) or resume its STALE mid-page link (link park), and
+                        # either way this batch's ``running_max`` then commits
+                        # past its new cursor, so ``cursor gt <watermark>`` locks
+                        # the update out forever. Same-INSTANT rendering changes
+                        # (``…00Z`` vs ``…00.000Z`` — a mixed-version load
+                        # balancer can alternate them PER REQUEST) still count as
+                        # parked: the parent didn't change, so resuming its link
+                        # is safe — and treating every text mismatch as a change
+                        # would re-walk from page 1 each batch for as long as the
+                        # alternation lasts, a livelock the no-progress guard
+                        # can't see (the offset text alternates, reading as
+                        # progress).
+                        pk_match = chain == parked_chain
+                        at_parked = pk_match and _cursor_same_instant(ancestor_cursor, parked_cursor)
+                        # A PK-matched chain must NEVER take the strictly-before
+                        # skip: when its cursor genuinely changed AND sorts before
+                        # the parked key (a regression), the generic skip would
+                        # drop the chain — and its parked link — losing the
+                        # collection's undrained remainder while running_max
+                        # commits past it. Ending the seek here re-walks it in
+                        # full instead: duplicate-safe in BOTH mismatch
+                        # directions, as promised above. Non-matched chains take
+                        # the three-way seek: "before" is provably drained;
+                        # "unknown" (server-collated text keys) keeps seeking on
+                        # the PK anchor rather than trusting ordinal order,
+                        # which silently skips unwalked subtrees on
+                        # CI-collation servers.
+                        if not pk_match and (
+                            _chain_seek_order(
+                                _chain_resume_key(chain, ancestor_cursor, cursor_level), parked_key
+                            )
+                            != "after"
+                        ):
+                            parent_idx += 1
+                            continue
+                        seeking = False
+                        if at_parked and chain_next_link_in is None:
+                            # Exclusive park: chain completed exactly at the cap.
+                            parent_idx += 1
+                            continue
+                        use_link = at_parked and chain_next_link_in is not None
+                else:
+                    if parent_idx < parent_idx_start:
+                        parent_idx += 1
+                        continue
+                    use_link = parent_idx == parent_idx_start and chain_next_link_in is not None
+                if use_link:
                     initial_url = chain_next_link_in
                 else:
                     initial_url = self._build_contained_url(
@@ -4315,12 +6847,16 @@ def register_lakeflow_source(spark):
                 # default auto drains a link-omitting, sub-$top-capped leaf via the
                 # keyset seek, and the synthesized seek doubles as the cap-hit resume
                 # checkpoint.
-                for page_rows, page_next_url in self._fetch_pages_with_links(initial_url):
+                for page_rows, page_next_url in self._fetch_pages_with_links(initial_url, leaf_types):
                     for row in page_rows:
                         self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                         row[cursor_field] = ancestor_cursor
                         emitted.append(row)
-                    if len(emitted) >= max_records:
+                        if count_floor is None or (
+                            ancestor_cursor is not None and _cursor_newer(ancestor_cursor, count_floor)
+                        ):
+                            countable += 1
+                    if countable >= max_records:
                         truncated = True
                         break
                 if truncated:
@@ -4328,12 +6864,34 @@ def register_lakeflow_source(spark):
                         chain_next_link_out = page_next_url
                     else:
                         parent_idx += 1
+                    parked_chain_out = chain
+                    parked_cursor_out = ancestor_cursor
                     break
                 parent_idx += 1
+            if seeking:
+                # See _walk_contained_with_cursor: a never-found anchor must
+                # reset via a TRUNCATED no-park offset (positional restart,
+                # floor kept) — a clean completion would fold running_max past
+                # unwalked subtrees, locking their sub-max rows out forever.
+                _LOG.warning(
+                    "Parked resume position %r was not re-found while enumerating "
+                    "%r; this batch emitted nothing and reset the walk — the next "
+                    "batch re-walks from the committed cursor floor "
+                    "(duplicate-safe).",
+                    parked_chain,
+                    segments,
+                )
+                truncated = True
+                parent_idx = 0
+                parked_chain_out = None
+                parked_cursor_out = None
+                chain_next_link_out = None
             return {
                 "emitted": emitted,
                 "truncated": truncated,
                 "parent_idx": parent_idx,
+                "parent_keys": parked_chain_out,
+                "parent_cursor": parked_cursor_out,
                 "chain_next_link": chain_next_link_out,
             }
 
@@ -4357,11 +6915,18 @@ def register_lakeflow_source(spark):
             """
             emitted = walk_state["emitted"]
             cursors = [r.get(cursor_field) for r in emitted if r.get(cursor_field) is not None]
-            this_batch_max = max(cursors) if cursors else None
+            this_batch_max = _cursor_max(cursors) if cursors else None
             prev_running_max = (start_offset or {}).get("running_max")
             new_running_max = _max_or(this_batch_max, prev_running_max)
             if walk_state["truncated"]:
+                # ``parent_idx`` rides along for downgrade compatibility; the
+                # resume positions on ``parent_keys``/``parent_cursor``
+                # (churn-stable — this enumeration is ordered by a mutable
+                # cursor column, see ``_walk_ancestor_chains``).
                 offset: dict = {"parent_idx": walk_state["parent_idx"]}
+                if walk_state["parent_keys"] is not None:
+                    offset["parent_keys"] = walk_state["parent_keys"]
+                    offset["parent_cursor"] = walk_state["parent_cursor"]
                 if since is not None:
                     offset["cursor"] = since
                 if walk_state["chain_next_link"] is not None:
@@ -4412,10 +6977,26 @@ def register_lakeflow_source(spark):
             them from ``self.options`` — safe because each
             ``LakeflowSource`` instance carries one table's options.
             """
-            if parse_contained_path(table_name) is None:
+            if self._table_segments(table_name) is None:
                 return False
             opts = getattr(self, "options", {}) or {}
-            if opts.get("expand_contained", "false").strip().lower() == "true":
+            # Fail fast at stream setup: a partitionable table never routes
+            # through read_table, so its option validation must run here. This
+            # includes ``contained_fetch`` — it has no other parse on the
+            # partition path (``expand_contained`` is parsed just below), so a
+            # typo'd value would otherwise be silently accepted, the one enum
+            # still silent where the round-33 dispatch fix made the rest loud.
+            validate_page_size(opts)
+            _parse_num_partitions(opts)
+            self._contained_fetch_batch_size(opts)
+            # Reset any per-table shared-cache verdict pinned non-``auto`` here too:
+            # a partitionable table streams through the partition path (this →
+            # get_partitions → read_partition), never read_table, so without this
+            # the reset would never fire for it and a later switch back to ``auto``
+            # would reuse a stale verdict. Table-scoped + idempotent (see
+            # ``_purge_nonauto_table_verdicts``); a no-op under ``auto``.
+            self._purge_nonauto_table_verdicts(table_name, opts)
+            if self._expand_contained_mode(opts) == "true":
                 return False
             if self._delta_setting(opts) != "disabled":
                 return False
@@ -4424,11 +7005,18 @@ def register_lakeflow_source(spark):
             # cursor_field) clear this trivially.
             cursor_field = opts.get("cursor_field")
             if cursor_field:
-                segments = parse_contained_path(table_name) or [table_name]
+                segments = self._table_segments(table_name) or [table_name]
                 namespace = opts.get("namespace")
                 if self._find_cursor_level(segments, namespace, cursor_field) != 0:
                     return False
-            return True
+            # ``expand_contained=auto`` follows its RESOLVED shape: the preflight
+            # verdict decides (single-$expand read → no fan-out to parallelise →
+            # not partitioned; N+1 fallback → partitionable). Checked LAST so the
+            # probe only runs for tables every cheap gate above already admitted;
+            # the instance cache dedupes it across is_partitioned/get_partitions
+            # within one setup. A transient preflight failure resolves to the N+1
+            # (partitioned) shape for this stream — correct, just parallel.
+            return not self._expand_read_active(table_name, opts)
 
         def latest_offset(
             self,
@@ -4451,15 +7039,24 @@ def register_lakeflow_source(spark):
             cursor_field = opts.get("cursor_field")
             if not cursor_field:
                 return {"snapshot_id": _wall_clock_ns()}
-            segments = parse_contained_path(table_name) or [table_name]
+            # Honour the user's ``pagination=`` for the fence probe's page walk —
+            # get_partitions/read_partition set this at entry too, but this method
+            # can run first (or alone) on a freshly-recreated driver instance, and
+            # the probe walking under a stale/default mode can misread a
+            # link-omitting server's short page as the whole top set.
+            self._pagination = self._parse_pagination(opts)
+            segments = self._table_segments(table_name) or [table_name]
             namespace = opts.get("namespace")
-            max_cursor = self._probe_top_level_max_cursor(segments[0], namespace, cursor_field)
+            max_cursor = self._probe_top_level_max_cursor(segments, namespace, cursor_field, opts)
             prior = (start_offset or {}).get("cursor")
             if max_cursor is None:
                 # Empty top set or all-null cursor column. Keep the prior
                 # value so Spark sees no progress and skips the batch.
                 return {"cursor": prior} if prior is not None else {}
-            return {"cursor": max_cursor}
+            # Never regress the committed fence (replica lag, deletion of the
+            # max row): the docstring's monotonic-progression promise is what
+            # lets ``cursor gt fence`` be the sole dedup boundary.
+            return {"cursor": _max_or(prior, max_cursor)}
 
         def get_partitions(
             self,
@@ -4484,18 +7081,45 @@ def register_lakeflow_source(spark):
             single empty descriptor so ``read_partition`` falls through
             to the existing serial ``read_table`` semantics.
             """
-            if parse_contained_path(table_name) is None:
+            if self._table_segments(table_name) is None:
                 # Flat table — let the existing serial path handle it.
                 return [{}]
             opts = table_options or {}
-            if opts.get("expand_contained", "false").strip().lower() == "true":
+            validate_page_size(opts)
+            num_partitions = _parse_num_partitions(opts)
+            # Validate ``contained_fetch`` here too (not just ``is_partitioned``):
+            # the batch reader can reach ``get_partitions`` without a prior
+            # ``is_partitioned`` call, and a typo'd value should fail the same way
+            # on every partition entry point. Inert on the read itself (partition
+            # walks are always plain N+1), but consistency > silence.
+            self._contained_fetch_batch_size(opts)
+            # Reset any per-table shared-cache verdict pinned non-``auto`` on the
+            # partition path too (called every microbatch for a partitioned stream,
+            # which never reaches read_table's reset). Table-scoped + idempotent;
+            # a no-op under ``auto``.
+            self._purge_nonauto_table_verdicts(table_name, opts)
+            if self._expand_contained_mode(opts) == "true":
                 return [{}]
             if self._delta_setting(opts) != "disabled":
                 return [{}]
             if start_offset == end_offset and start_offset is not None:
                 # Streaming: no new data — no work to partition.
                 return []
-            segments = parse_contained_path(table_name) or [table_name]
+            # ``expand_contained=auto`` on the BATCH invocation (no offsets)
+            # follows its resolved shape: expand verified → a single empty
+            # descriptor defers to the serial ``read_table`` (which re-uses the
+            # cached verdict); preflight fail → partitionable N+1 below. The
+            # STREAMING invocation never re-probes: ``is_partitioned`` already
+            # resolved the shape at stream setup, and a divergent verdict here
+            # (e.g. a transient flip) would pair the partitioned reader with a
+            # ``[{}]`` descriptor — an uncapped serial read per microbatch.
+            if (
+                start_offset is None
+                and end_offset is None
+                and self._expand_read_active(table_name, opts)
+            ):
+                return [{}]
+            segments = self._table_segments(table_name) or [table_name]
             namespace = opts.get("namespace")
             cursor_field = opts.get("cursor_field")
             self._pagination = self._parse_pagination(opts)
@@ -4504,17 +7128,62 @@ def register_lakeflow_source(spark):
                 # $top to size pages): default page_size so a $top is sent.
                 # Snapshot + nextlink leaves it unset → no $top.
                 opts = {**opts, "page_size": opts.get("page_size", DEFAULT_PAGE_SIZE)}
-            # ``cursor_lower`` is "what we've already read up to" — used
-            # by read_partition as ``cursor gt cursor_lower``. ``end`` is
-            # the previously-probed fence; we stamp it onto each row's
-            # cursor column so the next batch's ``cursor_lower`` matches.
+            # ``cursor_lower`` is "what we've already read up to" — used by
+            # read_partition as ``cursor gt cursor_lower``. There is NO upper
+            # fence filter: rows landing above the previously-probed fence are
+            # read now AND re-read next batch (``latest_offset`` commits the
+            # probed fence, not the rows' max) — duplicate-safe by design, and
+            # each row keeps its REAL cursor value. ``end_offset`` is consumed
+            # only by the ``start == end`` quiescence check below.
             cursor_lower = (start_offset or {}).get("cursor")
+            if cursor_field:
+                # Mirror the serial reads: floor the READ boundary by the
+                # configured lookback so rows that land at-or-below the
+                # committed fence after the fence was probed (the fence is
+                # taken BEFORE discovery, so that race window is real) are
+                # re-scanned. Only the read floor moves — ``latest_offset``
+                # still commits the true probed max, and re-read rows are
+                # duplicate-safe. ``auto`` resolves to 0 on this path (no
+                # walk-duration history rides the partitioned offset), so
+                # overlap here requires an explicit ``cursor_lookback_seconds``.
+                self._cursor_lookback = self._parse_cursor_lookback(opts)
+                self._cursor_lookback_factor = self._parse_cursor_lookback_factor(opts)
+                self._cursor_lookback_max_seconds = self._parse_cursor_lookback_ceiling(opts)
+                self._active_lookback_seconds = self._resolve_active_lookback(start_offset)
+                cursor_lower = self._apply_cursor_lookback(cursor_lower)
             top_rows = self._discover_top_parent_rows(
                 segments, namespace, opts, cursor_field, cursor_lower
             )
+            streaming = start_offset is not None or end_offset is not None
+            if (
+                streaming
+                and cursor_field
+                and any(
+                    f.name == cursor_field
+                    for f in self._own_fields_for_et(self._entity_type_for(segments[0], namespace))
+                )
+            ):
+                # Null-cursor top parents are UNSUPPORTED on the partitioned
+                # STREAMING path: once a fence is committed every batch's
+                # ``cursor gt`` discovery filter excludes them SERVER-SIDE —
+                # their subtrees' future changes would be dropped silently, with
+                # no error and no log (the serial ancestor-cursor path raises on
+                # the same configuration). The unfenced FIRST batch still sees
+                # them in ``top_rows``; every fenced batch runs a one-request
+                # ``eq null`` probe instead, so a null-cursor parent INSERTED
+                # mid-stream is caught too, not just pre-existing ones. The
+                # BATCH invocation (no offsets) is exempt: it re-discovers
+                # unfenced every run, so null-cursor parents are always visible
+                # and always read correctly there.
+                nulls = [r for r in top_rows if r.get(cursor_field) is None]
+                if nulls:
+                    self._raise_null_cursor_parents(table_name, segments, cursor_field, len(nulls))
+                if cursor_lower is not None and self._null_cursor_parents_exist(
+                    segments, namespace, opts, cursor_field
+                ):
+                    self._raise_null_cursor_parents(table_name, segments, cursor_field, None)
             if not top_rows:
                 return []
-            num_partitions = max(1, int(opts.get(_OPT_NUM_PARTITIONS, _DEFAULT_NUM_PARTITIONS)))
             return _bin_pack(top_rows, num_partitions, cursor_lower)
 
         def read_partition(
@@ -4538,9 +7207,15 @@ def register_lakeflow_source(spark):
                 # mode commits offsets via latest_offset, not per-read.
                 records, _ = self.read_table(table_name, None, opts)
                 return records
-            segments = parse_contained_path(table_name) or [table_name]
+            segments = self._table_segments(table_name) or [table_name]
             cursor_field = opts.get("cursor_field")
             self._pagination = self._parse_pagination(opts)
+            # Parse THIS table's exclusion list before tagging rows — this entry
+            # point never routes through read_table's reset, so without it a
+            # stale exclusion from another table on a shared instance would
+            # drop this table's FK columns (declared non-nullable → hard parse
+            # failure downstream).
+            self._set_excluded_ancestor_columns(opts)
             if cursor_field or self._pagination != "nextlink":
                 # Cursor-based read, or client-driven pagination (needs a $top
                 # to size pages): default page_size so a $top is sent.
@@ -4548,8 +7223,28 @@ def register_lakeflow_source(spark):
                 opts = {**opts, "page_size": opts.get("page_size", DEFAULT_PAGE_SIZE)}
             top_parent_rows = partition["top_parent_rows"]
             cursor_lower = partition.get("cursor_lower")
-            return self._iter_partition_rows(
-                segments, opts, top_parent_rows, cursor_field, cursor_lower
+            # Same emit-boundary treatment as read_table: pad each row to the
+            # declared schema (so a server that omits a null-valued non-nullable
+            # property doesn't hard-fail the framework parser) then JSON-render
+            # structured values, with primary keys exempt (a missing KEY is a
+            # broken response that must stay loud — see pad_row_to_fields).
+            # ``get_table_schema`` rebuilds from memoized parts — no I/O after
+            # the first call.
+            field_names = tuple(f.name for f in self.get_table_schema(table_name, opts).fields)
+            # The delta synthetics are exempt too, mirroring read_table — today a
+            # partitioned schema never declares them (delta != disabled forces the
+            # serial fallback), so this only keeps the emit-boundary rule uniform.
+            never_pad = frozenset(self._primary_keys_for(table_name, opts.get("namespace")) or ()) | {
+                _DELETED_COL,
+                _SEQUENCE_COL,
+            }
+
+            def _emit(row):
+                return _jsonify_complex_values(pad_row_to_fields(row, field_names, never_pad))
+
+            return map(
+                _emit,
+                self._iter_partition_rows(segments, opts, top_parent_rows, cursor_field, cursor_lower),
             )
 
         # ------------------------------------------------------------------
@@ -4558,16 +7253,30 @@ def register_lakeflow_source(spark):
 
         def _probe_top_level_max_cursor(
             self,
-            top_set: str,
+            segments: list[str],
             namespace: str | None,
             cursor_field: str,
+            table_options: dict[str, str],
         ):
             """One HTTP probe: ``$top=1&$orderby=<cursor> desc`` → max value.
 
-            Returns ``None`` when the top set is empty or every row has a
-            null cursor. The caller decides whether that means "no new
+            The probe ANDs in the level-0 segment filter (``filter_at_<top>``)
+            so the fence is the max over the SAME row population the discovery
+            fetch reads. An unfiltered probe can fence past the filtered
+            population's max (a fresher row OUTSIDE the filter); any filtered-in
+            row that later lands with a cursor at or below that fence would sit
+            behind the next batch's ``cursor gt fence`` forever. It also filters
+            ``<cursor> ne null`` so a backend that sorts nulls FIRST under
+            ``desc`` doesn't hand the ``$top=1`` probe a single null row and
+            silently stall the stream; a backend that rejects null comparisons
+            with a 400 gets one retry without that guard (keeping the
+            population-defining segment filter).
+
+            Returns ``None`` when the (filtered) top set is empty or the probed
+            row's cursor is null. The caller decides whether that means "no new
             data" or "first call against an empty source."
             """
+            top_set = segments[0]
             # Use the existing URL builder + page-fetch plumbing so OAuth,
             # extra_headers, retries, etc. all carry through unchanged.
             et = self._entity_type_for(top_set, namespace)
@@ -4578,12 +7287,154 @@ def register_lakeflow_source(spark):
                 "page_size": "1",
                 "select": cursor_field,
             }
-            url = self._build_url(top_set, opts, order_by=f"{cursor_field} desc")
-            for row in self._fetch_pages(url):
-                value = row.get(cursor_field)
-                if value is not None:
-                    return value
-            return None
+            order_by = f"{cursor_field} desc"
+            seg_filter = resolve_segment_filters(table_options or {}, segments).get(0)
+
+            def _first_value(extra_filter, use_order_by=order_by):
+                url = self._build_url(top_set, opts, extra_filter=extra_filter, order_by=use_order_by)
+                for row in self._fetch_pages(url):
+                    value = row.get(cursor_field)
+                    if value is not None:
+                        return value
+                return None
+
+            def _probe_max():
+                try:
+                    return _first_value(combine_filters(seg_filter, f"{cursor_field} ne null"))
+                except requests.HTTPError as exc:
+                    if exc.response is None or exc.response.status_code != 400:
+                        raise
+                    return _first_value(seg_filter)
+
+            value = _probe_max()
+            if value is not None:
+                self._verify_fence_orderby_desc(
+                    top_set, namespace, cursor_field, seg_filter, value, _first_value, _probe_max
+                )
+            return value
+
+        def _verify_fence_orderby_desc(
+            self, top_set, namespace, cursor_field, seg_filter, probed_max, first_value, probe_max
+        ) -> None:
+            """One-time behavioural check that the fence probe's ``$orderby …
+            desc`` is actually honoured: ask for any row with ``cursor gt
+            <probed max>`` — a row coming back means the probe returned a
+            NON-max row, which unchecked would pin the fence at a stale value
+            and silently stall the stream forever (``latest_offset`` returns
+            ``end == start``, every trigger skipped, data accumulating unread).
+            The adjacent nulls-first quirk already has its ``ne null`` guard;
+            this closes the other way the ``$top=1`` probe can lie.
+
+            A contradiction alone is NOT proof of a desc-ignoring server: on a
+            busy source a row inserted in the one-RTT window between the probe
+            and the check produces the same observation on a fully compliant
+            server — and partitioned streaming targets exactly the busy
+            sources, so raising on first contradiction would fail triggers
+            spuriously at a rate scaling with write load. Disambiguate by
+            RE-PROBING with ``desc``: an honoring server's re-probe returns a
+            value at or above the check-found row (desc demonstrably surfaces
+            the new max — the first probe was merely stale), which records the
+            PASS; only a re-probe still BELOW the check-found row proves the
+            server is ignoring ``$orderby`` → raise actionably. An empty
+            re-probe (rows vanished mid-check) is inconclusive: no verdict, no
+            raise, re-checked next trigger.
+
+            The PASS verdict rides the shared process/file capability cache
+            (15-min TTL, same layer as ``batch_ok``) so the extra request is
+            paid once per table per TTL, not per trigger; a proven FAIL raises
+            every time — a desc-ignoring server cannot stream partitioned, and
+            silence here is the stall."""
+            shared_key = f"{namespace}:{top_set}" if namespace else top_set
+            if self._cached_capability("fence_desc_ok", table_name=shared_key):
+                return
+            edm_type = self._edm_types_for_et(self._entity_type_for(top_set, namespace)).get(
+                cursor_field
+            )
+            above = first_value(
+                combine_filters(seg_filter, self._cursor_filter(cursor_field, probed_max, edm_type)),
+                use_order_by=None,
+            )
+            if above is None:
+                self._store_capability("fence_desc_ok", True, table_name=shared_key)
+                return
+            reprobed = probe_max()
+            if reprobed is not None and _cursor_le(above, reprobed):
+                # desc demonstrably works — the first probe raced an insert.
+                # The fence stays at the ORIGINAL probed max (monotonic and
+                # valid; the fresher rows land next trigger).
+                self._store_capability("fence_desc_ok", True, table_name=shared_key)
+                return
+            if reprobed is None:
+                return  # rows vanished mid-check — inconclusive, re-check next trigger
+            # ``above`` was read BEFORE the re-probe. On a fully compliant server
+            # the row that exceeded ``probed_max`` can be DELETED in the interim
+            # (an insert-then-delete race, not just an insert), leaving
+            # ``reprobed < above`` with no desc-ignore at all — the re-probe simply
+            # surfaces the true post-delete max. The genuine desc-ignore signature
+            # is a row that STILL persists strictly above what desc surfaces NOW;
+            # re-check that against ``reprobed`` before accusing the server. If it
+            # has vanished, treat as inconclusive (like the empty-re-probe case)
+            # and re-check next trigger — collapsing the single insert-then-delete
+            # race into no-verdict rather than a fatal, misleading raise.
+            still_above = first_value(
+                combine_filters(seg_filter, self._cursor_filter(cursor_field, reprobed, edm_type)),
+                use_order_by=None,
+            )
+            if still_above is None:
+                return
+            raise ValueError(
+                f"The partitioned-stream fence probe on {top_set!r} is unreliable: "
+                f"$orderby={cursor_field} desc&$top=1 returned {reprobed!r}, the server "
+                f"still has rows with {cursor_field} gt {reprobed!r} (e.g. {still_above!r}) — "
+                f"it is ignoring $orderby. A mis-probed fence pins the stream's watermark "
+                f"and silently stalls it with data pending. Fix the server's ordering "
+                f"support, or read this table serially (drop num_partitions / use a "
+                f"non-partitioned configuration)."
+            )
+
+        def _raise_null_cursor_parents(
+            self, table_name: str, segments: list[str], cursor_field: str, count: int | None
+        ) -> None:
+            """The shared refusal for null-cursor top parents on the partitioned
+            streaming path — from the first batch's in-discovery check (exact
+            ``count``) or a fenced batch's probe (``count=None``)."""
+            found = f"{count} top-level parent(s) have" if count else "a top-level parent has"
+            raise ValueError(
+                f"Partitioned read of {table_name!r}: {found} a null "
+                f"{cursor_field!r}. Null-cursor parents are invisible to the "
+                f"partitioned fence filter, so their contained rows would be "
+                f"silently dropped. Exclude them server-side (e.g. "
+                f'filter_at_{segments[0]}="{cursor_field} ne null"), fix the '
+                f"data, or read serially (num_partitions unset)."
+            )
+
+        def _null_cursor_parents_exist(
+            self,
+            segments: list[str],
+            namespace: str | None,
+            table_options: dict[str, str],
+            cursor_field: str,
+        ) -> bool:
+            """One ``$top=1`` probe for null-cursor top parents. Fenced batches
+            need it because their ``cursor gt fence`` discovery filter hides
+            null-cursor rows server-side — without the probe the round-29 guard
+            is dead after batch 1 and a parent inserted with a null cursor is
+            silently invisible forever. Best-effort: a server that rejects the
+            ``eq null`` filter — or any transport/transient failure — keeps the
+            (first-batch-only) guard behavior rather than failing the batch
+            (the same fail-open discipline as the capability probes)."""
+            segment_filters = resolve_segment_filters(table_options, segments)
+            extra = combine_filters(f"{cursor_field} eq null", segment_filters.get(0))
+            pks = self._own_primary_keys_for_et(self._entity_type_for(segments[0], namespace))
+            url = self._build_url(
+                segments[0],
+                {"select": ",".join(pks), "page_size": "1"},
+                extra_filter=extra,
+            )
+            try:
+                return next(iter(self._fetch_pages(url)), None) is not None
+            except (requests.RequestException, RuntimeError):
+                return False
 
         def _discover_top_parent_rows(
             self,
@@ -4615,7 +7466,11 @@ def register_lakeflow_source(spark):
                     if cursor_field not in select_cols:
                         select_cols.append(cursor_field)
                     if cursor_lower is not None:
-                        cursor_extra = self._cursor_filter(cursor_field, cursor_lower)
+                        cursor_extra = self._cursor_filter(
+                            cursor_field,
+                            cursor_lower,
+                            edm_type=self._edm_types_for_et(ancestor_et).get(cursor_field),
+                        )
                     terms = [f"{cursor_field} asc"]
                     terms.extend(f"{pk} asc" for pk in ancestor_pks if pk != cursor_field)
                     order_by = ",".join(terms)
@@ -4634,7 +7489,21 @@ def register_lakeflow_source(spark):
             if table_options.get("page_size"):
                 opts["page_size"] = table_options["page_size"]
             url = self._build_url(top_set, opts, extra_filter=extra_filter, order_by=order_by)
-            return list(self._fetch_pages(url))
+            return list(self._fetch_pages(url, self._edm_types_for_et(ancestor_et)))
+
+        def _leaf_pages_tolerating_vanished(self, url: str, leaf_types, chain: list) -> Iterator[dict]:
+            """One chain's leaf pages, skipping the chain when its parent
+            vanished (404/410) between planning and this task's walk. The
+            partition descriptor is frozen at planning, so without the skip a
+            parent deleted mid-batch fails every Spark task retry
+            deterministically and kills the streaming query (the serial walks
+            re-enumerate each trigger and self-heal without this)."""
+            try:
+                yield from self._fetch_pages(url, leaf_types)
+            except requests.HTTPError as exc:
+                if not _is_vanished_error(exc):
+                    raise
+                _log_vanished_parent(chain, exc)
 
         def _iter_partition_rows(
             self,
@@ -4656,9 +7525,16 @@ def register_lakeflow_source(spark):
             segment_filters = resolve_segment_filters(table_options, segments)
             leaf_seg_filter = segment_filters.get(len(segments) - 1)
             leaf_order_by = self._leaf_pk_order_by(segments, namespace)
+            # Leaf-collection types so keyset-seek boundaries render typed
+            # (guid bare / ISO-looking string quoted) — see odata_literal_typed.
+            leaf_types = self._edm_types_for_level(segments, len(segments) - 1, namespace)
             if not cursor_field:
                 for chain in self._iter_parent_key_chains(
-                    segments, namespace, table_options, top_parent_rows=top_parent_rows
+                    segments,
+                    namespace,
+                    table_options,
+                    top_parent_rows=top_parent_rows,
+                    tolerate_vanished=True,
                 ):
                     url = self._build_contained_url(
                         segments,
@@ -4667,7 +7543,7 @@ def register_lakeflow_source(spark):
                         extra_filter=leaf_seg_filter,
                         order_by=leaf_order_by,
                     )
-                    for row in self._fetch_pages(url):
+                    for row in self._leaf_pages_tolerating_vanished(url, leaf_types, chain):
                         self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                         yield row
                 return
@@ -4677,10 +7553,21 @@ def register_lakeflow_source(spark):
                     f"cursor_field {cursor_field!r} is not a property on "
                     f"the contained path or any of its ancestors."
                 )
-            # Partition activation requires cursor at level 0 for the
-            # streaming probe to make sense; this branch is the only one
-            # reached in practice. We still go through the with-cursor
-            # iterator so the cursor column is stamped onto leaf rows.
+            # STREAMING partition activation requires cursor at level 0, but the
+            # BATCH reader plans partitions without consulting ``is_partitioned``
+            # — so the leaf-cursor branch below IS reached on partitioned batch
+            # reads and must match the serial paths row-for-row. In particular
+            # the ``cursor_nulls`` policy: every other path applies
+            # ``skip_null`` from ``_make_cursor_resolver``; without it here a
+            # partitioned batch read emits null-cursor rows the user configured
+            # ``cursor_nulls=ignore`` to drop — and nondeterministically so,
+            # since the framework silently falls back to the (correct) serial
+            # read on any planning exception.
+            skip_null = False
+            if cursor_level == len(segments) - 1:
+                skip_null, _effective = self._make_cursor_resolver(
+                    CONTAINED_PATH_SEP.join(segments), namespace, cursor_field, table_options
+                )
             chains_iter = self._iter_parent_chains_with_cursor(
                 segments,
                 namespace,
@@ -4689,25 +7576,52 @@ def register_lakeflow_source(spark):
                 cursor_field,
                 cursor_lower,
                 top_parent_rows=top_parent_rows,
+                tolerate_vanished=True,
             )
             for chain, ancestor_cursor in chains_iter:
                 url = self._build_contained_url(
                     segments, chain, table_options, extra_filter=leaf_seg_filter, order_by=leaf_order_by
                 )
-                for row in self._fetch_pages(url):
+                for row in self._leaf_pages_tolerating_vanished(url, leaf_types, chain):
                     self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                     if cursor_level == len(segments) - 1:
                         # Leaf-cursor mode: filter per row by ``cursor gt
-                        # cursor_lower``. (Server-side filter would be
-                        # cheaper, but partition activation gates this to
-                        # cursor_level==0; this branch exists for
-                        # completeness only.)
+                        # cursor_lower`` — chronological via ``_cursor_le``,
+                        # never lexical (``.5Z`` vs ``Z`` renderings invert
+                        # under string order).
                         rec = row.get(cursor_field)
-                        if cursor_lower is not None and rec is not None and rec <= cursor_lower:
+                        if skip_null and rec is None:
+                            continue
+                        if (
+                            cursor_lower is not None
+                            and rec is not None
+                            and _cursor_le(rec, cursor_lower)
+                        ):
                             continue
                     else:
                         row[cursor_field] = ancestor_cursor
                     yield row
+
+
+    def _parse_num_partitions(opts: dict) -> int:
+        """Curated parse of ``num_partitions`` (default 4).
+
+        Mirrors ``validate_page_size``: garbage must fail fast with a clear
+        error instead of riding into a bare ``int()`` — on the batch path the
+        framework swallows planner exceptions and silently degrades to a
+        serial read, so an uncurated ``ValueError`` would cost the user their
+        parallelism with no hint why. Called from ``is_partitioned`` (stream
+        setup, where a raise still surfaces) and ``get_partitions``."""
+        raw = opts.get(_OPT_NUM_PARTITIONS)
+        if raw is None:
+            return _DEFAULT_NUM_PARTITIONS
+        text = str(raw).strip()
+        if not text.isdigit() or int(text) < 1:
+            raise ValueError(
+                f"num_partitions={raw!r} is not a positive integer. Use a value "
+                f">= 1, or unset it for the default ({_DEFAULT_NUM_PARTITIONS})."
+            )
+        return int(text)
 
 
     def _bin_pack(rows: list[dict], num_partitions: int, cursor_lower) -> list[dict]:
@@ -4776,16 +7690,123 @@ def register_lakeflow_source(spark):
     _NS_EDMX = "{http://docs.oasis-open.org/odata/ns/edmx}"
     _NS_EDM = "{http://docs.oasis-open.org/odata/ns/edm}"
 
+
+    def _spark_type_for_property(prop, edm_type: str | None = None):
+        """Spark type for one CSDL ``<Property>`` element: the static EDM map,
+        except ``Edm.Decimal``, which honours the declared ``Precision`` /
+        ``Scale`` facets (a hardcoded ``DecimalType(38, 18)`` leaves only 20
+        digits left of the point — it can't hold a ``Decimal(38, 0)`` ID
+        column's large values). Facet handling:
+
+        * both facets absent — the historical wide ``DecimalType(38, 18)``,
+          so existing destinations don't shift types;
+        * ``Scale="variable"``/``"floating"`` — also ``(38, 18)`` (Spark's
+          fixed-scale decimal can't express a varying scale);
+        * ``Scale`` absent with ``Precision`` declared — scale 0 (the CSDL
+          default);
+        * values clamped to Spark's 38-digit maximum with
+          ``scale <= precision``.
+
+        ``edm_type`` (when given) overrides the element's raw ``Type`` — the
+        caller passes the ``TypeDefinition``-resolved underlying primitive so a
+        property typed ``ta.Qty`` (UnderlyingType ``Edm.Int64``) maps to
+        ``LongType`` instead of falling to the ``StringType`` default while the
+        literal-rendering map correctly knows it's numeric. A Decimal-backed
+        definition still gets the wide ``(38, 18)`` default (its facets live on
+        the TypeDefinition element, which isn't threaded here)."""
+        edm_type = edm_type or prop.get("Type", "Edm.String")
+        if edm_type != "Edm.Decimal":
+            return _EDM_TO_SPARK.get(edm_type, StringType())
+        raw_precision = prop.get("Precision")
+        raw_scale = prop.get("Scale")
+        if raw_precision is None and raw_scale is None:
+            return DecimalType(38, 18)
+        if raw_scale is None:
+            scale = 0
+        elif raw_scale.isdigit():
+            scale = int(raw_scale)
+        else:  # "variable" / "floating"
+            return DecimalType(38, 18)
+        precision = int(raw_precision) if raw_precision and raw_precision.isdigit() else 38
+        precision = min(max(precision, 1), 38)
+        return DecimalType(precision, min(scale, precision))
+
+
     # Delta tracking constants.
     #
-    # Synthetic columns appended to the schema when delta is active so the
-    # destination MERGE (apply_changes) has a sequence column and a tombstone
-    # flag. Their names are namespaced so they can't collide with any real
-    # OData property — OData property names start with a letter, never an
-    # underscore.
+    # The synthetic MERGE columns appended to the schema when delta is active
+    # (``_DELETED_COL`` tombstone flag / ``_SEQUENCE_COL`` sequence) are imported
+    # from ``_helpers`` above — they live there so the partition mixin can share
+    # them. The OData v4 ABNF permits a leading underscore in a property name, so a
+    # real source column CAN collide with these; ``get_table_schema`` detects the
+    # collision and raises a curated reserved-name error rather than emitting a
+    # schema with duplicate columns (Spark rejects those) and silently overwriting
+    # the source value at stamp time.
     _DELTA_PREFER = "odata.track-changes"
-    _DELETED_COL = "_deleted"
-    _SEQUENCE_COL = "_lc_sequence"
+
+    # ``Name=value`` (named-key) form inside a key predicate — the name is a
+    # simple identifier, so a ``=`` inside a quoted VALUE can't false-match.
+    _KEY_EQ_RE = re.compile(r"^\w+\s*=")
+
+
+    def _split_key_predicate(pred: str) -> list[str]:
+        """Split a key-predicate body on top-level commas, honoring OData
+        string quoting (``''`` escapes a quote inside a quoted value)."""
+        parts: list[str] = []
+        buf: list[str] = []
+        in_quote = False
+        i = 0
+        while i < len(pred):
+            ch = pred[i]
+            if ch == "'":
+                if in_quote and i + 1 < len(pred) and pred[i + 1] == "'":
+                    buf.append("''")
+                    i += 2
+                    continue
+                in_quote = not in_quote
+                buf.append(ch)
+            elif ch == "," and not in_quote:
+                parts.append("".join(buf))
+                buf = []
+            else:
+                buf.append(ch)
+            i += 1
+        if buf:
+            parts.append("".join(buf))
+        return [p.strip() for p in parts if p.strip()]
+
+
+    def _coerce_key_literal(text: str, edm_type: str | None):
+        """One key-predicate literal → the Python value the matching UPSERT
+        rows carry (JSON-decoded), so a tombstone built from an entity
+        reference MERGE-matches them. Quoted strings un-escape ``''``;
+        numeric/boolean Edm types parse; everything else (guids, dates,
+        unknown types) stays as its raw text — exactly how the JSON payload
+        delivers those."""
+        if len(text) >= 2 and text.startswith("'") and text.endswith("'"):
+            return text[1:-1].replace("''", "'")
+        if edm_type in ("Edm.Int16", "Edm.Int32", "Edm.Int64", "Edm.Byte", "Edm.SByte"):
+            try:
+                return int(text)
+            except ValueError:
+                return text
+        if edm_type in ("Edm.Single", "Edm.Double"):
+            try:
+                return float(text)
+            except ValueError:
+                return text
+        if edm_type == "Edm.Boolean" and text.lower() in ("true", "false"):
+            return text.lower() == "true"
+        if edm_type is None:
+            # Untyped fallback: an integer-looking bare literal parses (JSON
+            # would have carried it as a number); anything else stays text.
+            try:
+                return int(text)
+            except ValueError:
+                return text
+        return text
+
+
     # Effectively-unlimited value for ``max_records_per_batch`` when the
     # framework's batch reader is detected (``start_offset is None``).
     # A bare ``sys.maxsize`` is unnecessary — the per-fetch cap arithmetic
@@ -4829,14 +7850,96 @@ def register_lakeflow_source(spark):
     # has a strictly increasing sequence value, so apply_changes can pick a
     # deterministic winner when the same primary key appears multiple times
     # in one batch (e.g. update then delete arriving back-to-back).
-    _SEQUENCE_COUNTER = itertools.count()
+
+
+    class _SequenceCounter:
+        """Pickle-safe wrapper around ``itertools.count`` for the
+        ``_lc_sequence`` tie-breaker.
+
+        A bare module-level ``itertools.count`` breaks the DEPLOYED artifact on
+        Python >= 3.14 (which removed itertools pickling): in the merged
+        single-file bundle every class is function-local, so cloudpickle — what
+        PySpark uses to ship readers to executors — serializes the connector
+        class BY VALUE, walking the closure cells that hold this counter, and
+        raises ``TypeError: cannot pickle 'itertools.count' object``. (The
+        package layout pickles the class by reference and never touches the
+        counter, which is why the module-level unit suite alone can't catch
+        it — see the bundle round-trip test.) The iterator is excluded from
+        the pickled state; an executor copy restarts at zero, which is benign:
+        the nanosecond timestamp dominates ``_next_sequence`` ordering and the
+        counter only breaks same-nanosecond ties within one process."""
+
+        def __init__(self):
+            self._it = itertools.count()
+
+        def __next__(self):
+            return next(self._it)  # GIL-atomic increment, like the bare count
+
+        def __getstate__(self):
+            return {}
+
+        def __setstate__(self, _state):
+            self._it = itertools.count()
+
+
+    _SEQUENCE_COUNTER = _SequenceCounter()
 
     # Process-wide CSDL cache, keyed by service_url. SDP creates a fresh
     # ``LakeflowSource`` (and ``ODataLakeflowConnect``) for every
     # ``spark.readStream.format("lakeflow_connect").load()`` call; within
     # a single Python process this cache makes all instances share one
-    # parse.
-    _METADATA_CACHE: dict[str, tuple[str, ET.Element, "_CsdlIndex"]] = {}
+    # parse. Entries carry the wall-clock time the document was FETCHED
+    # (for file-cache hits, the file's mtime — the fetch time of the
+    # process that wrote it) so ``metadata_cache_ttl_seconds`` governs this
+    # layer exactly like the on-disk one: entries expire after the TTL and
+    # a TTL of 0 disables the layer entirely. Without the stamp a
+    # long-running driver would serve the same parsed ``$metadata`` forever
+    # regardless of the configured TTL. Deliberately lock-free (unlike the
+    # capability cache, whose entries are MERGED read-modify-write under
+    # ``_CAPABILITY_LOCK``): entries here are immutable tuples swapped
+    # whole, and the worst race — two threads observing an expired entry —
+    # costs a duplicate fetch, never a torn value.
+    _METADATA_CACHE: dict[str, tuple[str, ET.Element, "_CsdlIndex", float]] = {}
+
+    # Expired entries for a service are only popped when THAT service is next
+    # read, so a long-lived driver serving many distinct services would retain
+    # one multi-MB parsed tree per service forever. Cap the cache and evict
+    # oldest-first on insert (per-entry TTLs belong to the writing instance, so
+    # age is the only cross-service eviction signal); an evicted service just
+    # re-fetches on its next read.
+    _METADATA_CACHE_MAX_SERVICES = 16
+
+
+    def _metadata_cache_put(
+        service_url: str, entry: tuple[str, ET.Element, "_CsdlIndex", float]
+    ) -> None:
+        """Insert into :data:`_METADATA_CACHE`, evicting the oldest entries
+        (by their ``fetched_at`` stamp) beyond :data:`_METADATA_CACHE_MAX_SERVICES`.
+        The just-inserted key is exempt from eviction: the file-cache-hit path
+        stamps entries with the FILE's mtime, which can be older than every
+        cached entry — evicting the newcomer itself would make that service
+        re-parse its pickle on every fresh instance while 16 idle services
+        stay cached, the exact thrash this cache exists to avoid. Same
+        lock-free discipline as the cache itself — a racing double-evict just
+        costs the loser a re-fetch.
+
+        The eviction candidates are SNAPSHOTTED before choosing: iterating the
+        live dict while sibling threads insert/pop (a driver streaming from
+        more than the cap's worth of distinct services) raises "dictionary
+        changed size during iteration" — iteration+mutation is not one of the
+        GIL-atomic dict operations the lock-free discipline relies on, unlike
+        the single-shot ``list(...)`` copy and the ``pop(..., None)``."""
+        _METADATA_CACHE[service_url] = entry
+        while len(_METADATA_CACHE) > _METADATA_CACHE_MAX_SERVICES:
+            candidates = [
+                (stamp, key)
+                for key, (_, _, _, stamp) in list(_METADATA_CACHE.items())
+                if key != service_url
+            ]
+            if not candidates:
+                break
+            _METADATA_CACHE.pop(min(candidates)[1], None)
+
 
     # On-disk CSDL cache. PySpark's Python Data Source forks a fresh
     # ``pyspark.daemon`` worker for schema inference on every ``.load()``
@@ -4848,6 +7951,18 @@ def register_lakeflow_source(spark):
     # first. The TTL is short so subsequent pipeline triggers pick up
     # upstream schema changes; per-trigger we still pay one fresh fetch.
     _METADATA_FILE_CACHE_TTL_SECONDS = 60
+
+    # Rotated OAuth2 refresh tokens, keyed by
+    # ``(token_url, client_id, ORIGINAL refresh token as supplied on the
+    # connection)``. Providers with single-use rotation revoke the old token
+    # on every refresh — but SDP constructs a FRESH connector from the
+    # connection's original options on every load/microbatch, so an
+    # instance-local write-back would replay the revoked original next batch
+    # and hard-fail the stream. Keying by the original supplied value lets
+    # every recreated instance find the latest rotation; chained rotations
+    # update the same entry. Plain dict ops (GIL-atomic) — worst race is two
+    # refreshes where one rotation wins, exactly the provider-side reality.
+    _ROTATED_REFRESH_TOKENS: dict[tuple[str, str, str], str] = {}
 
     # Network-level exceptions treated as transient by ``_http_get``'s retry
     # loop. ``ConnectionError`` covers TCP resets, DNS failures, and remote
@@ -4862,6 +7977,11 @@ def register_lakeflow_source(spark):
     )
 
     # HTTP status codes treated as transient by ``_http_get``'s retry loop:
+    # * 408 — Request Timeout. The server (or a proxy) gave up waiting for
+    #   the request; same transient shape as a read timeout, which IS
+    #   retried as a network error. Keeps this set aligned with
+    #   ``_TRANSIENT_HTTP_STATUSES`` in ``_contained.py`` so a flaky
+    #   408-emitting proxy doesn't kill a read a 503-emitting one survives.
     # * 429 — Too Many Requests (throttling).
     # * 500 — Internal Server Error. Frequently transient (the "contact
     #   support" templated body that Hexagon SCApi returns under load is
@@ -4874,7 +7994,11 @@ def register_lakeflow_source(spark):
     # 429 and 503 honour the server's ``Retry-After`` header when present;
     # 500/502/504 fall back to pure exponential backoff (Retry-After is
     # rarely emitted on those, and we shouldn't trust it if it is).
-    _RETRYABLE_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
+    _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+    # Cap on manually-followed same-origin redirects per request (redirect-loop
+    # guard). Off-origin redirects never count — they raise immediately.
+    _MAX_SAME_ORIGIN_REDIRECTS = 5
 
     # Module logger. Always-on:
     #   * WARNING — every retry (network/429/503/JSON decode), so an
@@ -4891,10 +8015,126 @@ def register_lakeflow_source(spark):
     _LOG = logging.getLogger(__name__)
 
 
+    class _PageCycleGuard:
+        """Bounded-window repeat detector for pagination continuation URLs.
+
+        The per-page guards (identical consecutive fingerprint, self-referential
+        link) catch only a PERIOD-1 cycle. A server or caching proxy that
+        ALTERNATES skiptokens (``tokA → tokB → tokA → …``) yields pages whose
+        consecutive fingerprints AND links both differ every step, so only
+        revisiting a URL reveals the loop — otherwise the walk runs forever
+        (OOM under the uncapped batch reader; a never-advancing stream under the
+        microbatch reader). Continuation URLs are strictly forward (each
+        skiptoken/seek advances), so ANY repeat is a spurious cycle. Tracks the
+        last ``_WINDOW`` fetched URLs — bounded so a legitimate long walk (all
+        distinct URLs) never grows unboundedly or false-positives; a real cyclic
+        server alternates only a handful of tokens, caught well within the
+        window."""
+
+        _WINDOW = 512
+
+        def __init__(self):
+            self._seen: set[str] = set()
+            self._order: "collections.deque[str]" = collections.deque()
+
+        def seen_before(self, url: str) -> bool:
+            """Record ``url`` and return whether it was already in the window."""
+            if url in self._seen:
+                return True
+            self._seen.add(url)
+            self._order.append(url)
+            if len(self._order) > self._WINDOW:
+                self._seen.discard(self._order.popleft())
+            return False
+
+
+    def _cache_owner_tag() -> str:
+        """Per-user tag baked into every tempdir cache filename. The system
+        tempdir is world-writable on multi-user hosts and both cache paths are
+        otherwise predictable (digest of ``service_url`` only) — another local
+        user could pre-create the file. For the CSDL cache that file feeds
+        ``pickle.load`` (arbitrary code execution); for the capability JSON it
+        could force an unverified ``$expand`` read. A per-user filename plus the
+        ownership check in the readers closes both."""
+        try:
+            return str(os.getuid())
+        except AttributeError:  # Windows — no uid; fall back to the login name
+            import getpass
+
+            try:
+                # Windows account names can't contain path separators, but the
+                # value can come from the USERNAME env var — sanitize so the
+                # tag can never smuggle path syntax into the cache filename.
+                return re.sub(r"[^A-Za-z0-9._-]", "_", getpass.getuser())
+            except Exception:  # noqa: BLE001 — cache tag must never fail
+                return "user"
+
+
+    def _cache_file_owned_by_us(path: str) -> bool:
+        """Whether ``path`` itself is owned by the current uid (POSIX). Uses
+        ``lstat`` so a foreign-owned symlink planted at the (predictable) cache
+        path fails the check outright — with following ``stat`` a symlink
+        pointing at some victim-owned file would pass, diverging from what the
+        subsequent ``open`` actually reads. On platforms without ``os.getuid``
+        the per-user filename is the only guard."""
+        try:
+            return os.lstat(path).st_uid == os.getuid()
+        except AttributeError:
+            return True
+        except OSError:
+            return False
+
+
+    def _replace_with_private_tmp(path: str, data: bytes) -> bool:
+        """Atomically publish ``data`` at ``path`` via a private temp file in
+        the same directory. The temp name embeds ``os.urandom`` so it can't be
+        predicted, and it is opened ``O_CREAT | O_EXCL | O_NOFOLLOW`` with mode
+        ``0o600`` — a pre-planted file or symlink at the name makes the open
+        fail instead of following the link and clobbering whatever it points
+        at (the tempdir is world-writable on multi-user hosts). Best-effort:
+        returns ``False`` on any OSError, ``True`` once ``os.replace`` lands."""
+        tmp = f"{path}.{os.getpid()}.{os.urandom(4).hex()}.tmp"
+        # O_BINARY: without it the Windows CRT applies text-mode LF→CRLF
+        # translation to the fd, corrupting the pickle/JSON bytes (readers
+        # then fail closed — a silent permanent cache miss, not corruption).
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_BINARY", 0)
+        )
+        try:
+            fd = os.open(tmp, flags, 0o600)
+        except OSError:
+            return False
+        try:
+            fh = os.fdopen(fd, "wb")
+        except OSError:
+            os.close(fd)  # fdopen failed to take ownership — don't leak the fd
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return False
+        try:
+            with fh:
+                fh.write(data)
+            os.replace(tmp, path)
+            return True
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return False
+
+
     def _metadata_cache_path(service_url: str) -> str:
-        """Tempdir path for the pickled CSDL of ``service_url``."""
+        """Tempdir path for the pickled CSDL of ``service_url`` (per-user —
+        see :func:`_cache_owner_tag`)."""
         digest = hashlib.sha256(service_url.encode("utf-8")).hexdigest()[:16]
-        return os.path.join(tempfile.gettempdir(), f"odata_csdl_{digest}.pickle")
+        return os.path.join(tempfile.gettempdir(), f"odata_csdl_{_cache_owner_tag()}_{digest}.pickle")
 
 
     def _clear_metadata_cache() -> None:
@@ -4914,6 +8154,317 @@ def register_lakeflow_source(spark):
                         pass
         except OSError:
             pass
+
+
+    # Process-wide capability-verdict cache, keyed by service_url — same
+    # lifecycle problem as ``_METADATA_CACHE``: SDP recreates the connector
+    # instance per microbatch / ``.load()``, so instance caches don't survive,
+    # and the paths that keep their offsets bare (contained snapshot streams)
+    # or have no offset at all (the batch reader behind pipeline snapshot
+    # refreshes) would otherwise re-run their preflight probes on every read.
+    # Entry shape: ``{"batch_ok": bool, "batch_size_ok": int,
+    # "or_filter_ok": bool, "expand_ok": {table_name: bool},
+    # "cursor_probe_ok": {shared_key: bool}}`` — the server-wide verdicts flat,
+    # the per-table verdicts (nested-$expand and cursor-probe, listed in
+    # ``_PER_TABLE_CAPABILITY_KEYS``) keyed by contained path (different
+    # nesting depths can verify differently).
+    _CAPABILITY_CACHE: dict[str, dict] = {}
+
+    # The verdict keys stored as ``{table_key: bool}`` maps rather than flat
+    # server-wide values — the disk merge must union these per table instead of
+    # ``setdefault``-shadowing a sibling worker's whole map.
+    _PER_TABLE_CAPABILITY_KEYS = ("expand_ok", "cursor_probe_ok")
+
+    # On-disk mirror of the capability cache (JSON, not pickle — plain data
+    # only). Covers the forked-worker gap the process dict can't (PySpark may
+    # fork a fresh daemon worker per ``.load()``), so a pipeline refresh with N
+    # contained snapshot tables pays each probe once, not N times. The TTL is
+    # much longer than the CSDL cache's (a capability verdict is a couple of
+    # booleans that only change when the SERVER is upgraded, and the
+    # offset-persisted copies of these same verdicts never expire at all);
+    # an explicit non-``auto`` mode switch purges the entry immediately (see
+    # ``_scrub_nonauto_verdicts``), so re-selecting ``auto`` still re-probes.
+    _CAPABILITY_FILE_CACHE_TTL_SECONDS = 900
+
+    # Cap on distinct service_urls held in the process capability cache (and its
+    # on-disk mirror). The metadata cache got _METADATA_CACHE_MAX_SERVICES; this
+    # sibling — same per-service_url keying, same "SDP forks/recreates instances"
+    # rationale — lacked one, so a long-lived multi-tenant driver issuing
+    # ``.load()`` against many services accumulated one dict entry + one
+    # mtime-memo entry + one tempdir file PER service for the driver's whole
+    # lifetime (the TTL only makes a stale file IGNORED on read, never deletes
+    # it). Generous relative to the metadata cap of 16 because these entries are
+    # tiny (a few booleans + a small JSON file, vs multi-MB CSDL trees), so the
+    # cap sits well above any realistic concurrent working set — a service in
+    # active rotation never evicts — while still bounding a driver that touches
+    # thousands of distinct services over its lifetime. Eviction is by first-
+    # touch (creation) order.
+    _CAPABILITY_CACHE_MAX_SERVICES = 256
+
+    # Per-service mtime of the on-disk mirror the last time this process merged it
+    # into ``_CAPABILITY_CACHE``. Lets ``_capability_cache_load`` skip the re-read +
+    # re-parse when the file hasn't changed since — so the hot lookup on the
+    # offset-less paths (snapshot / batch reader, once per table per microbatch) is
+    # a single ``stat`` rather than a full JSON parse. A sibling worker's write
+    # bumps the mtime and is picked up on the next load.
+    _CAPABILITY_DISK_MTIME: dict[str, float] = {}
+
+    # Serializes every read-modify-write-serialize of the shared cache. On the
+    # standard GIL interpreter the individual dict ops are already atomic (and all
+    # callers share one dict object, so there are no lost updates), but under a
+    # free-threaded build (PEP 703, available in 3.14) concurrent streaming queries
+    # on one driver — same ``service_url`` — would race the mutations against the
+    # ``json.dump`` / merge iterations. Cheap and uncontended in the common case;
+    # re-entrant because store/drop nest load and write under a single hold.
+
+
+    class _PicklableRLock:
+        """Re-entrant lock that survives pickling by re-creating itself.
+
+        Same deployment constraint as ``_SequenceCounter``: in the merged
+        single-file bundle this lock lives in a closure cell that cloudpickle
+        walks when shipping the connector class BY VALUE to executors, and a
+        bare ``threading.RLock`` raises ``TypeError: cannot pickle
+        '_thread.RLock' object``. A fresh lock per unpickled copy is the
+        CORRECT semantics anyway — a lock guards state within one process,
+        and each executor gets its own process-wide caches to guard."""
+
+        def __init__(self):
+            self._lock = threading.RLock()
+
+        def __enter__(self):
+            return self._lock.__enter__()
+
+        def __exit__(self, *exc_info):
+            return self._lock.__exit__(*exc_info)
+
+        def __getstate__(self):
+            return {}
+
+        def __setstate__(self, _state):
+            self._lock = threading.RLock()
+
+
+    _CAPABILITY_LOCK = _PicklableRLock()
+
+
+    def _capability_cache_path(service_url: str) -> str:
+        """Tempdir path for the capability-verdict JSON of ``service_url``
+        (per-user — see :func:`_cache_owner_tag`)."""
+        digest = hashlib.sha256(service_url.encode("utf-8")).hexdigest()[:16]
+        return os.path.join(tempfile.gettempdir(), f"odata_caps_{_cache_owner_tag()}_{digest}.json")
+
+
+    def _capability_cache_flush(service_url: str, payload: str) -> None:
+        """Write an already-serialized ``payload`` string to the on-disk mirror
+        via :func:`_replace_with_private_tmp` (unpredictable ``O_EXCL`` temp name
+        + ``os.replace``), so a concurrent worker never observes a half-written
+        file and a pre-planted symlink can't redirect the write. Takes a
+        **string**, not the live dict, so the caller serializes under
+        :data:`_CAPABILITY_LOCK` and the blocking disk I/O here runs lock-free —
+        concurrent cache ops don't serialize on each other's I/O. Best-effort:
+        like the cross-process case, a concurrent writer's swap can win
+        (last-writer-wins on the mirror); the in-memory cache stays authoritative
+        and a re-probe/TTL recovers any lag. The mtime memo is refreshed so the
+        writing process doesn't immediately re-read its own write."""
+        path = _capability_cache_path(service_url)
+        if not _replace_with_private_tmp(path, payload.encode("utf-8")):
+            return
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return
+        # Plant the "already merged" memo ONLY while the service is still live in
+        # the cache — under the lock so a concurrent eviction can't interleave.
+        # If the service was evicted in the load->flush window, skip the memo: an
+        # orphaned memo would leak (eviction only reclaims memos it pops) AND make
+        # the next load short-circuit past this on-disk verdict (a redundant
+        # re-probe). Skipping it lets that next load re-read + merge the file
+        # instead. The in-memory copy — when present — is authoritative, so not
+        # re-reading our own write stays the fast path.
+        with _CAPABILITY_LOCK:
+            if service_url in _CAPABILITY_CACHE:
+                _CAPABILITY_DISK_MTIME[path] = mtime
+
+
+    def _capability_cache_evict_locked(keep_url: str) -> None:
+        """Drop oldest-created cache entries beyond
+        :data:`_CAPABILITY_CACHE_MAX_SERVICES`, deleting each evicted service's
+        on-disk mirror + mtime-memo entry so both memory and tempdir inodes stay
+        bounded. The caller MUST hold :data:`_CAPABILITY_LOCK` (this iterates the
+        shared dict). Never evicts ``keep_url`` (the entry the caller just
+        created). Eviction only fires once the working set exceeds the cap, i.e.
+        the evicted service is cold by the cap's own logic; a concurrent process
+        still using it keeps its own in-memory copy and rewrites the file on its
+        next store — worst case one re-probe, the same best-effort posture as TTL
+        expiry."""
+        while len(_CAPABILITY_CACHE) > _CAPABILITY_CACHE_MAX_SERVICES:
+            victim = next((k for k in _CAPABILITY_CACHE if k != keep_url), None)
+            if victim is None:
+                return
+            _CAPABILITY_CACHE.pop(victim, None)
+            path = _capability_cache_path(victim)
+            _CAPABILITY_DISK_MTIME.pop(path, None)
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+    def _capability_cache_load(service_url: str) -> dict:
+        """The cached capability verdicts for ``service_url``: the process-wide
+        entry, hydrated from the on-disk JSON (when fresh) for keys the process
+        hasn't determined itself. Returns the live process entry (mutable). The
+        disk file is re-parsed only when its mtime changed since the last merge
+        (see :data:`_CAPABILITY_DISK_MTIME`); otherwise this is just a ``stat``.
+        The blocking file read runs lock-free; only the merge (which iterates the
+        shared dict) is under :data:`_CAPABILITY_LOCK`. The returned dict is a live
+        reference read afterwards via atomic ``.get`` only."""
+        entry = _CAPABILITY_CACHE.get(service_url)  # atomic; no iteration
+        if entry is None:
+            # First touch of this service — create under the lock so the cap
+            # eviction (which iterates the shared dict) can't race a sibling
+            # thread's insert. The steady-state path (entry present) stays
+            # lock-free: a single atomic ``.get``.
+            with _CAPABILITY_LOCK:
+                entry = _CAPABILITY_CACHE.get(service_url)
+                if entry is None:
+                    entry = _CAPABILITY_CACHE[service_url] = {}
+                    _capability_cache_evict_locked(service_url)
+        path = _capability_cache_path(service_url)
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return entry  # no file yet — process entry stands alone
+        if mtime < time.time() - _CAPABILITY_FILE_CACHE_TTL_SECONDS:
+            return entry  # stale on disk — ignore it (process entry stands)
+        if _CAPABILITY_DISK_MTIME.get(path) == mtime:
+            return entry  # already merged this exact disk state
+        if not _cache_file_owned_by_us(path):
+            # A foreign-owned file at our (predictable) cache path is not ours to
+            # trust: a poisoned ``expand_ok: true`` would force an UNVERIFIED
+            # $expand read — the deep-row-loss case the preflight exists to
+            # prevent. The per-user filename already makes this unreachable in
+            # practice; defense-in-depth backstop.
+            return entry
+        try:
+            with open(path, "r", encoding="utf-8") as fh:  # blocking read, lock-free
+                disk = json.load(fh)
+        except (OSError, ValueError):
+            return entry  # missing/corrupt file — the process entry stands alone
+        with _CAPABILITY_LOCK:  # only the shared-dict merge needs the lock
+            if isinstance(disk, dict):
+                for key, value in disk.items():
+                    if key in _PER_TABLE_CAPABILITY_KEYS and isinstance(value, dict):
+                        # Per-table maps union table-by-table (process verdicts
+                        # win) — ``setdefault`` would shadow a sibling worker's
+                        # whole map as soon as this process holds ANY table.
+                        current = entry.get(key)
+                        entry[key] = {**value, **current} if isinstance(current, dict) else dict(value)
+                    else:
+                        entry.setdefault(key, value)
+            # Only memo the merged mtime while this service is still the live
+            # cache entry. A sibling ``load(other)`` can trip cap-eviction and pop
+            # THIS service during the lock-free file read above; planting the memo
+            # unconditionally would then orphan it against an evicted entry, and
+            # the next load would short-circuit past the on-disk verdicts (return
+            # ``{}``). Symmetric to the guard in ``_capability_cache_flush``.
+            if service_url in _CAPABILITY_CACHE:
+                _CAPABILITY_DISK_MTIME[path] = mtime
+        return entry
+
+
+    def _capability_cache_store(service_url: str, key: str, value, table_name: str | None = None):
+        """Record one capability verdict in the process cache and rewrite the on-disk
+        mirror. ``expand_ok`` verdicts are per-table (``table_name`` required);
+        everything else is server-wide. The mutation + serialization run under
+        :data:`_CAPABILITY_LOCK` (so a concurrent reader/writer never sees the dict
+        mid-mutation); the load's file read and the flush's disk write run lock-free
+        (see :func:`_capability_cache_flush`)."""
+        entry = _capability_cache_load(service_url)
+        with _CAPABILITY_LOCK:
+            if table_name is not None:
+                entry.setdefault(key, {})[table_name] = value
+            else:
+                entry[key] = value
+            payload = json.dumps(entry)
+        _capability_cache_flush(service_url, payload)
+
+
+    def _cap_dict_has(container: dict, key: str, table_name: str | None) -> bool:
+        """Whether ``container`` holds the verdict identified by ``key`` (+ optional
+        ``table_name`` for a per-table map) — the guard that keeps a purge from
+        rewriting the file when there is nothing to remove."""
+        if key not in container:
+            return False
+        if table_name is None:
+            return True
+        value = container[key]
+        return isinstance(value, dict) and table_name in value
+
+
+    def _cap_dict_drop(container: dict, key: str, table_name: str | None) -> None:
+        """Remove one verdict from a cache dict in place. With ``table_name`` and a
+        per-table map, drop only that table's entry (leaving sibling tables intact);
+        otherwise drop the whole key."""
+        if table_name is not None and isinstance(container.get(key), dict):
+            container[key].pop(table_name, None)
+        else:
+            container.pop(key, None)
+
+
+    def _capability_cache_drop(service_url: str, keys: set[str], table_name: str | None = None) -> None:
+        """Purge ``keys`` from the cached verdicts of ``service_url`` (process AND
+        disk) — called when an explicit non-``auto`` mode leaves a recorded verdict
+        the user asked to forget, so the shared cache can't resurrect it. With
+        ``table_name`` the per-table verdicts (``expand_ok`` / ``cursor_probe_ok``)
+        drop only that table's entry, leaving sibling tables' verdicts intact;
+        without it the whole key is dropped (server-wide verdicts, or a
+        table-agnostic reset).
+
+        Goes through :func:`_capability_cache_load` for the authoritative merged
+        view, so when nothing matches it returns without touching the file — and
+        that check is a bare ``stat`` while the mtime is unchanged (the common
+        steady-state pinned read every microbatch), not a full JSON parse. The
+        check-mutate-serialize runs under :data:`_CAPABILITY_LOCK`; the load's file
+        read and the flush's disk write run lock-free."""
+        entry = _capability_cache_load(service_url)
+        with _CAPABILITY_LOCK:
+            if not any(_cap_dict_has(entry, k, table_name) for k in keys):
+                return  # nothing recorded anywhere — no rewrite
+            for key in keys:
+                _cap_dict_drop(entry, key, table_name)
+            payload = json.dumps(entry)
+        _capability_cache_flush(service_url, payload)
+
+
+    def _clear_capability_cache() -> None:
+        """Clear the in-process capability cache and remove any on-disk JSON
+        files. Tests use this between cases that reuse a ``service_url`` with
+        different mocked server behaviours."""
+        with _CAPABILITY_LOCK:
+            _CAPABILITY_CACHE.clear()
+            _CAPABILITY_DISK_MTIME.clear()
+        tmpdir = tempfile.gettempdir()
+        try:
+            for entry in os.listdir(tmpdir):
+                # Also sweep orphaned atomic-write temps (a process killed
+                # between creating its private ``…json.<pid>.<rand>.tmp`` file
+                # and the rename leaves it behind forever otherwise).
+                if entry.startswith("odata_caps_") and (".json" in entry):
+                    try:
+                        os.remove(os.path.join(tmpdir, entry))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+
+    def _clear_rotated_refresh_tokens() -> None:
+        """Clear the process-wide rotated-refresh-token stash. Tests use this
+        between cases that reuse the same token endpoint / client id with
+        different mocked rotation behaviours."""
+        _ROTATED_REFRESH_TOKENS.clear()
 
 
     @dataclass
@@ -4961,6 +8512,13 @@ def register_lakeflow_source(spark):
         # All namespaces that declare at least one entity set. Used for
         # error hints when the requested namespace declares only types.
         namespaces_with_sets: list[str]
+        # Fully-qualified ``<TypeDefinition>`` name (canonical namespace) →
+        # its ``UnderlyingType`` (an ``Edm.*`` primitive). Properties typed
+        # via a TypeDefinition quote their literals per the underlying
+        # primitive — without this map an ``Edm.String``-backed definition
+        # would fall out of typed rendering and an ISO-looking value would
+        # render bare (invalid predicate).
+        typedef_underlying: dict[str, str]
 
 
     def _build_csdl_index(root: ET.Element) -> _CsdlIndex:
@@ -4980,6 +8538,7 @@ def register_lakeflow_source(spark):
         alias_to_namespace: dict[str, str] = {}
         entity_type_by_qname: dict[str, ET.Element] = {}
         namespaces_with_sets: list[str] = []
+        typedef_underlying: dict[str, str] = {}
 
         for schema in root.iter(f"{_NS_EDM}Schema"):
             ns = schema.get("Namespace") or ""
@@ -4987,12 +8546,20 @@ def register_lakeflow_source(spark):
                 alias_to_namespace[ns] = ns
             alias = schema.get("Alias")
             if alias:
+                # Duplicate aliases across schemas (spec-malformed) resolve
+                # last-writer-wins — same policy as duplicate namespaces.
                 alias_to_namespace[alias] = ns
 
             for entity_type in schema.findall(f"{_NS_EDM}EntityType"):
                 type_name = entity_type.get("Name")
                 if type_name:
                     entity_type_by_qname[f"{ns}.{type_name}"] = entity_type
+
+            for typedef in schema.findall(f"{_NS_EDM}TypeDefinition"):
+                td_name = typedef.get("Name")
+                underlying = typedef.get("UnderlyingType")
+                if td_name and underlying:
+                    typedef_underlying[f"{ns}.{td_name}"] = underlying
 
             had_set = False
             for container in schema.iter(f"{_NS_EDM}EntityContainer"):
@@ -5015,6 +8582,7 @@ def register_lakeflow_source(spark):
             alias_to_namespace=alias_to_namespace,
             entity_type_by_qname=entity_type_by_qname,
             namespaces_with_sets=namespaces_with_sets,
+            typedef_underlying=typedef_underlying,
         )
 
 
@@ -5034,7 +8602,8 @@ def register_lakeflow_source(spark):
         # All memos are keyed off either ``id(et)`` (for methods taking
         # an ``ET.Element``) or ``(table_name, namespace)``. They're
         # safe across the lifetime of ``root`` because element identity
-        # is stable within one parsed tree.
+        # is stable within one parsed tree — and within one PROCESS: see
+        # ``__getstate__`` for the pickle boundary.
         fields: dict = field(default_factory=dict)
         primary_keys: dict = field(default_factory=dict)
         base_chain: dict = field(default_factory=dict)
@@ -5042,6 +8611,42 @@ def register_lakeflow_source(spark):
         own_pks: dict = field(default_factory=dict)
         entity_type: dict = field(default_factory=dict)
         fk_columns: dict = field(default_factory=dict)
+        edm_types: dict = field(default_factory=dict)
+
+        def __getstate__(self):
+            """Drop the ``id(et)``-keyed memos at the pickle boundary.
+
+            Spark pickles the reader (and this bundle with it) to executor
+            tasks. There the unpickled tree's elements have NEW addresses, so
+            driver-address keys are guaranteed dead weight (serialized per task,
+            never hit again) — and an address coincidence between a worker
+            element and a stale driver key would silently return the WRONG
+            entity type's fields. The executor re-derives per element on first
+            use (one tree walk); the name-keyed memos stay, they're
+            process-portable. Fork-based workers (no pickle) preserve identity
+            and never pass through here."""
+            state = self.__dict__.copy()
+            for memo in ("base_chain", "own_fields", "own_pks", "edm_types"):
+                state[memo] = {}
+            return state
+
+
+    def _parse_conn_int(options: dict, key: str, default, minimum: int) -> int:
+        """Curated parse for a connection-level integer option — same
+        discipline as the per-table numeric parsers (``validate_page_size``,
+        ``parse_max_records``, ``_parse_num_partitions``). A bare ``int()``
+        turns garbage into an uncurated traceback at construction, and a
+        negative ``max_retries`` makes every ``range(max_retries + 1)`` retry
+        loop run ZERO iterations → ``UnboundLocalError`` on ``resp`` instead
+        of any HTTP call."""
+        raw = options.get(key, default)
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            raise ValueError(f"Invalid {key}={raw!r}: expected an integer.") from None
+        if value < minimum:
+            raise ValueError(f"Invalid {key}={raw!r}: must be >= {minimum}.")
+        return value
 
 
     def _next_sequence() -> str:
@@ -5052,7 +8657,17 @@ def register_lakeflow_source(spark):
         ``apply_changes`` matches the underlying numeric ordering. The
         nanosecond timestamp tracks wall-clock so values stay ordered
         across process restarts (latest data wins per key); the counter
-        breaks ties for records emitted in the same nanosecond.
+        breaks ties for records emitted in the same nanosecond. The counter
+        is per-process, so two PARTITION tasks emitting the same primary
+        key in the same nanosecond could mint equal sequences — an
+        astronomically unlikely tie apply_changes resolves arbitrarily,
+        accepted rather than paying a per-partition discriminator on every
+        row. Cross-batch ordering ASSUMES a non-regressing wall clock: after
+        a backwards step (VM snapshot restore, hard NTP correction) a later
+        batch's rows sequence BELOW already-applied ones and lose the MERGE
+        until the clock passes its old high-water mark — accepted; a
+        monotonic source would instead regress on every process restart,
+        which is the common case.
 
         ``time.time_ns()`` skips the ``datetime`` + ``strftime`` round-
         trip the previous ISO-8601 format paid per row — meaningful for
@@ -5082,21 +8697,61 @@ def register_lakeflow_source(spark):
         def __init__(self, options: dict[str, str]) -> None:
             super().__init__(options)
             self.service_url = _require(options, "service_url")
+            parsed_root = urlparse(self.service_url)
+            # (scheme, host, port) the credential-bearing session may talk to.
+            # Every request URL — including server-supplied ``@odata.nextLink``s
+            # — is checked against this before the auth-carrying session sends
+            # it, so a malicious/compromised source (or a MITM injecting one
+            # nextLink field) can't redirect the Authorization header off-origin.
+            self._service_origin = _url_origin(self.service_url)
+            if parsed_root.username or parsed_root.password:
+                # The URL is echoed verbatim in logs (verbose_http_logging,
+                # every retry/no-progress warning) and in error messages —
+                # embedded credentials would leak on every request.
+                raise ValueError(
+                    "service_url must not embed credentials (the "
+                    "'user:password@host' userinfo form) — the URL is echoed "
+                    "in logs and error messages on every request. Use "
+                    "auth_type=basic with the 'username' / 'password' "
+                    "connection options instead."
+                )
+            if parsed_root.query or parsed_root.fragment or set(self.service_url) & {"?", "#"}:
+                # The raw-char check catches a bare trailing "?"/"#"
+                # (urlparse reports an EMPTY query/fragment for those, but
+                # join_url would still produce "svc?/Customers").
+                # Every URL builder appends '/<path>' to the root, so a query-
+                # carrying root (the SAP Gateway '?sap-client=100' form) would
+                # put the entity path INSIDE the query string on every request
+                # — the first symptom is the $metadata fetch dying in the XML
+                # parser with no hint the URL was malformed. Fail at
+                # construction with the working alternative instead.
+                cut = min(i for i in (self.service_url.find("?"), self.service_url.find("#")) if i >= 0)
+                trailing = self.service_url[cut:]
+                raise ValueError(
+                    f"service_url must not carry a query string or fragment "
+                    f"(got {trailing!r}); the connector appends entity paths "
+                    f"to it, which would land inside the query. For SAP "
+                    f"Gateway client selection ('?sap-client=NNN'), pass the "
+                    f"client as a header instead: "
+                    f"extra_headers='sap-client: NNN' — SAP accepts the "
+                    f"header form. Other root query parameters have no "
+                    f"equivalent; such services are not supported."
+                )
             # Default 180s (3 min). Deep ``expand_contained=true`` chains
             # (3+ segments) materialise a large cross-product server-side
             # before responding; 60s isn't long enough for most real
             # deployments and the previous default surfaced as
             # ``ReadTimeout`` retried-to-exhaustion failures. Connection
             # option ``timeout_seconds`` overrides per deployment.
-            self.timeout = int(options.get("timeout_seconds", "180"))
+            self.timeout = _parse_conn_int(options, "timeout_seconds", "180", 1)
             # On-disk pickle TTL. The default suits typical 1-minute SDP
             # trigger intervals — each trigger spawns a fresh forked
             # worker, the file cache survives, but stale state is bounded.
             # Users with stable schemas can raise this to skip even the
             # first-fork fetch within a longer window; users iterating on
             # the source model can drop it to 0 to disable file caching.
-            self.metadata_cache_ttl_seconds = int(
-                options.get("metadata_cache_ttl_seconds", _METADATA_FILE_CACHE_TTL_SECONDS)
+            self.metadata_cache_ttl_seconds = _parse_conn_int(
+                options, "metadata_cache_ttl_seconds", _METADATA_FILE_CACHE_TTL_SECONDS, 0
             )
             # Retry budget for transient server-side failures (HTTP 429 / 503).
             # 5 attempts at exponential backoff (1, 2, 4, 8, 16 s) covers the
@@ -5105,19 +8760,27 @@ def register_lakeflow_source(spark):
             # indefinitely. `retry_max_delay_seconds` caps any single sleep —
             # honour the server's Retry-After header but never sleep longer
             # than this (some misbehaving servers emit hour-long values).
-            self.max_retries = int(options.get("max_retries", "5"))
-            self.retry_max_delay_seconds = int(options.get("retry_max_delay_seconds", "60"))
+            self.max_retries = _parse_conn_int(options, "max_retries", "5", 0)
+            self.retry_max_delay_seconds = _parse_conn_int(options, "retry_max_delay_seconds", "60", 0)
             # Per-request diagnostic logging. Off by default — when on,
             # writes one INFO line per HTTP request (URL + status + body
             # snippet) to the module logger. The body snippet is the
             # source's response data, so enabling this emits source rows
             # into pipeline logs; turn it on only for triage.
-            self.verbose_http_logging = (
-                options.get("verbose_http_logging") or "false"
-            ).strip().lower() == "true"
+            verbose_raw = (options.get("verbose_http_logging") or "false").strip().lower()
+            if verbose_raw not in ("true", "false"):
+                # Strict like every other enum option — a typo'd "1"/"yes" would
+                # otherwise silently mean OFF, the opposite of what the user
+                # asked for while triaging.
+                raise ValueError(
+                    f"Invalid verbose_http_logging={verbose_raw!r}: expected 'true' or 'false'."
+                )
+            self.verbose_http_logging = verbose_raw == "true"
             # How many chars of the response body to include in each INFO
             # log line when ``verbose_http_logging`` is on. Default 500.
-            self.verbose_http_log_body_chars = int(options.get("verbose_http_log_body_chars", "500"))
+            self.verbose_http_log_body_chars = _parse_conn_int(
+                options, "verbose_http_log_body_chars", "500", 0
+            )
             self._session: requests.Session | None = None
             # Parsed CSDL bundle: root + lookup index + per-instance memos.
             # ``None`` until the first ``_metadata_root()`` call.
@@ -5162,16 +8825,29 @@ def register_lakeflow_source(spark):
 
         def list_tables_in_namespace(self, namespace: list[str]) -> list[str]:
             index = self._entity_set_index()
-            if not namespace:
+            if len(namespace) != 1:
                 # Entity sets always live inside a Schema with a Namespace
-                # attribute; root-level tables don't exist in OData v4.
+                # attribute; root-level tables don't exist in OData v4, and
+                # namespaces are single-level — a multi-segment path names
+                # nothing (returning segment[0]'s tables would fabricate
+                # rows under a nonexistent namespace path).
                 return []
+            # Accept the schema's ``Alias`` as well as its canonical
+            # ``Namespace`` — the same contract as the ``namespace`` table
+            # option (CSDL lets references use either, and the read path
+            # already resolves both; an alias-spelled listing used to return
+            # a silent ``[]``).
             target = namespace[0]
+            target = self._metadata_state().index.alias_to_namespace.get(target, target)
             flat = sorted({es for ns, es in index if ns == target})
             contained: set[str] = set()
             for es_name in flat:
                 contained.update(self._enumerate_contained_paths(es_name, target))
-            return flat + sorted(contained)
+            # Dedup against flat: a containment-path spelling that collides
+            # with a declared flat set (e.g. flat ``My__Set`` next to ``My``
+            # with a contained ``Set``) is shadowed by the flat set anyway —
+            # listing it twice would fabricate a duplicate table.
+            return flat + sorted(contained - set(flat))
 
         def get_table_schema(self, table_name: str, table_options: dict[str, str]) -> StructType:
             namespace = (table_options or {}).get("namespace")
@@ -5184,8 +8860,8 @@ def register_lakeflow_source(spark):
             # place. Validate against the path's real FK columns, but only for
             # contained paths: a flat table has none, so a connection-wide
             # default applied to it is a silent no-op rather than warning noise.
-            if excluded and "*" not in excluded and _parse_contained_path(table_name) is not None:
-                segments = _parse_contained_path(table_name)
+            if excluded and "*" not in excluded and self._table_segments(table_name) is not None:
+                segments = self._table_segments(table_name)
                 all_fk = self._all_fk_column_names(segments, namespace)
                 non_fk = excluded - all_fk
                 if non_fk:
@@ -5215,10 +8891,16 @@ def register_lakeflow_source(spark):
             select = (table_options or {}).get("select")
             if select:
                 wanted = {c.strip() for c in select.split(",")}
-                # ``select`` filters leaf columns only; FK columns survive.
-                segments = _parse_contained_path(table_name) or [table_name]
-                fk_names = set(self._resolve_fk_columns(segments, namespace).values())
-                fields = [f for f in fields if f.name in fk_names or f.name in wanted]
+                # ``$select=*`` means every structural property (OData v4
+                # §11.2.4.2.1) — the wire is unprojected, so the schema must be
+                # too. Without this, no field is literally named ``*`` and the
+                # filter below would silently drop every non-FK column (flat
+                # tables then fail the non-empty-schema check outright).
+                if "*" not in wanted:
+                    # ``select`` filters leaf columns only; FK columns survive.
+                    segments = self._table_segments(table_name) or [table_name]
+                    fk_names = set(self._resolve_fk_columns(segments, namespace).values())
+                    fields = [f for f in fields if f.name in fk_names or f.name in wanted]
             # Contained path + cursor_field lives on an ancestor → propagate
             # the ancestor's cursor column type onto the leaf schema. The
             # incremental read path stamps the value onto each emitted row.
@@ -5236,29 +8918,83 @@ def register_lakeflow_source(spark):
             # two synthetic columns alongside the entity's own properties:
             # ``_deleted`` (in-band tombstone flag) and ``_lc_sequence`` (the
             # cursor column apply_changes uses to order updates). Both must be
-            # in the declared schema so Spark accepts the records.
-            if self._delta_active_for(table_name, table_options):
+            # in the declared schema so Spark accepts the records. Contained
+            # paths never take the delta read path (``read_table`` rejects
+            # ``enabled`` there and ``read_table_metadata`` skips the probe with
+            # the same guard) — without it, a contained table under
+            # ``delta_tracking=auto`` whose server 200-acknowledges the Prefer
+            # header on the contained URL would declare two NON-NULLABLE columns
+            # no emitted row carries.
+            if self._table_segments(table_name) is None and self._delta_active_for(
+                table_name, table_options
+            ):
+                self._assert_no_reserved_delta_columns(table_name, (f.name for f in fields))
                 fields = list(fields) + [
                     StructField(_DELETED_COL, BooleanType(), False),
                     StructField(_SEQUENCE_COL, StringType(), False),
                 ]
             return StructType(fields)
 
+        @staticmethod
+        def _assert_no_reserved_delta_columns(table_name: str, field_names) -> None:
+            """Delta stamps ``_deleted`` / ``_lc_sequence``; the OData v4 ABNF
+            allows a leading underscore in a property name, so a source column can
+            legally carry one of those names. Emitting the synthetic anyway would
+            produce a schema with duplicate columns (Spark rejects those) and
+            silently overwrite the source value at stamp time — raise a curated
+            error instead."""
+            clash = set(field_names) & {_DELETED_COL, _SEQUENCE_COL}
+            if clash:
+                raise ValueError(
+                    f"Table {table_name!r} has source column(s) {sorted(clash)} "
+                    f"that collide with the reserved delta synthetic column(s) "
+                    f"{sorted({_DELETED_COL, _SEQUENCE_COL})}. Delta tracking stamps "
+                    f"those names, which would produce a schema with duplicate "
+                    f"columns and overwrite the source value. Rename the source "
+                    f"column(s) or disable delta_tracking for this table."
+                )
+
         def read_table_metadata(self, table_name: str, table_options: dict[str, str]) -> dict:
             namespace = (table_options or {}).get("namespace")
             self._set_excluded_ancestor_columns(table_options)
+            # Mirror the read's own select validation (dispatch runs it for every
+            # read shape) so metadata fails in the same place rather than
+            # reporting a valid source the read then rejects (a select that drops
+            # the cursor_field or a PK).
+            self._validate_select_columns(table_name, table_options or {})
             primary_keys = self._primary_keys_for(table_name, namespace)
             user_cursor = (table_options or {}).get("cursor_field")
             # Contained paths skip the delta probe (server delta is for
             # top-level sets only; mutex enforced in dispatch below).
-            if _parse_contained_path(table_name) is None and self._delta_active_for(
+            if self._table_segments(table_name) is None and self._delta_active_for(
                 table_name, table_options
             ):
+                # Mirror the read's own validation EXACTLY: get_table_schema runs
+                # the reserved-column collision check on the select/exclusion-
+                # filtered fields (a select that drops a colliding source column
+                # is legal — the synthetic takes its place), so calling it here
+                # fails iff read_table would, in the same place. Checking the raw
+                # _fields_for instead over-fires on a select that drops the
+                # collision — a config that actually reads fine.
+                self.get_table_schema(table_name, table_options)
                 return {
                     "primary_keys": primary_keys,
                     "cursor_field": _SEQUENCE_COL,
                     "ingestion_type": "cdc",
                 }
+            if user_cursor and not primary_keys:
+                # cursor_field reports ingestion_type=cdc, which apply_changes
+                # MERGEs on the primary key — a keyless entity type declares none,
+                # so the MERGE has no key to match on (silent loss by
+                # construction). Fail loudly, mirroring the keyless delta gate in
+                # _delta_active_for, rather than emitting a broken CDC contract.
+                raise ValueError(
+                    f"cursor_field={user_cursor!r} makes {table_name!r} an incremental "
+                    f"(CDC) source, which MERGEs on the primary key, but the entity "
+                    f"type declares no key in $metadata — matched rows would be lost. "
+                    f"Remove cursor_field for a full-snapshot read, or point at a "
+                    f"keyed entity set."
+                )
             return {
                 "primary_keys": primary_keys,
                 "cursor_field": user_cursor,
@@ -5266,6 +9002,93 @@ def register_lakeflow_source(spark):
             }
 
         def read_table(
+            self, table_name: str, start_offset: dict, table_options: dict[str, str]
+        ) -> tuple[Iterator[dict], dict]:
+            """Dispatch the read, then JSON-render structured values at the emit
+            boundary (see :func:`_jsonify_complex_values` — complex-typed /
+            collection values map to string columns, and ``str()`` of a dict is
+            an unparseable Python repr). List results stay lists (tests and any
+            len()-callers rely on that); iterators stay lazy."""
+            records, offset = self._read_table_dispatch(table_name, start_offset, table_options)
+            # Declared column names for this read (respects ``select`` / streams /
+            # ancestor-FK exclusions and the delta synthetics). Emitted rows are
+            # padded to it with explicit ``None`` for any absent column: the
+            # framework parser rejects an ABSENT non-nullable column but accepts
+            # an explicit null, and a server may legally omit null-valued
+            # properties from the JSON — without the pad the first such row would
+            # hard-fail the whole batch with a cryptic framework error (the delta
+            # path already pads tombstones for the same reason; this extends it to
+            # every read shape). ``get_table_schema`` itself isn't memoized, but
+            # everything it reads (metadata bundle, field cache, capability
+            # verdicts) is — this call rebuilds the schema from cached parts with
+            # no I/O after the first call. Primary keys and the delta synthetics
+            # are exempt from padding: a server never legally omits a KEY (so a
+            # missing one is a broken response that must fail loudly, not MERGE a
+            # null-key row), and the synthetics are stamped by the connector
+            # itself (absence = stamping bug).
+            schema = self.get_table_schema(table_name, table_options)
+            field_names = tuple(f.name for f in schema.fields)
+            # ``Edm.Binary`` arrives as base64url TEXT on the wire (OData v4.01
+            # JSON); the framework's row parser only understands standard base64,
+            # so it corrupts the base64url alphabet (``-``/``_``). Decode
+            # Binary-typed columns to raw ``bytes`` here — the parser passes bytes
+            # through untouched. Empty set (the common case) short-circuits.
+            binary_fields = frozenset(
+                f.name for f in schema.fields if isinstance(f.dataType, BinaryType)
+            )
+            never_pad = frozenset(
+                self._primary_keys_for(table_name, (table_options or {}).get("namespace")) or ()
+            ) | {_DELETED_COL, _SEQUENCE_COL}
+
+            def _emit(row: dict) -> dict:
+                return _jsonify_complex_values(
+                    _decode_binary_fields(
+                        _pad_row_to_fields(row, field_names, never_pad), binary_fields
+                    )
+                )
+
+            if isinstance(records, list):
+                return [_emit(r) for r in records], offset
+            return map(_emit, records), offset
+
+        def _validate_select_columns(self, table_name: str, opts: dict[str, str]) -> None:
+            """A user ``select`` must keep the columns the machinery depends on.
+            Omitting a PK desyncs the schema (drops the column) from
+            read_table_metadata (still lists it) — apply_changes then MERGEs on
+            an undeclared column. Omitting the cursor_field is worse and
+            SILENT: every row's cursor reads None, so under the default
+            cursor_nulls=coalesce each batch re-reads the whole table forever
+            behind a synthetic-floor watermark, and under ``ignore`` the read
+            emits nothing. Both misconfigurations raise here instead."""
+            select_raw = (opts.get("select") or "").strip()
+            if not select_raw:
+                return
+            select_cols = {c.strip() for c in select_raw.split(",") if c.strip()}
+            if "*" in select_cols:
+                return
+            leaf_et = self._entity_type_for(table_name, opts.get("namespace"))
+            missing_pks = [pk for pk in self._own_primary_keys_for_et(leaf_et) if pk not in select_cols]
+            if missing_pks:
+                raise ValueError(
+                    f"select={select_raw!r} omits primary-key column(s) "
+                    f"{missing_pks} of {table_name!r}. The destination MERGE "
+                    f"keys on them; add them to select (or drop select)."
+                )
+            cf = opts.get("cursor_field")
+            if (
+                cf
+                and cf not in select_cols
+                and any(f.name == cf for f in self._own_fields_for_et(leaf_et))
+            ):
+                raise ValueError(
+                    f"select={select_raw!r} omits cursor_field={cf!r}. The "
+                    f"incremental read filters and watermarks on that column; "
+                    f"without it every row's cursor reads null (silent "
+                    f"full-table re-reads under cursor_nulls=coalesce, zero "
+                    f"rows under ignore). Add {cf!r} to select."
+                )
+
+        def _read_table_dispatch(
             self, table_name: str, start_offset: dict, table_options: dict[str, str]
         ) -> tuple[Iterator[dict], dict]:
             # The Spark Python Data Source batch reader
@@ -5288,29 +9111,40 @@ def register_lakeflow_source(spark):
             # ``_read_contained_expand``) so an uncapped batch doesn't
             # materialise the whole result set in memory.
             opts = dict(table_options or {})
+            # The user's OWN page_size, captured before any default is injected
+            # below — the delta branch must distinguish "user asked for response
+            # sizing" (honored via Prefer: odata.maxpagesize) from "client-paging
+            # default" (dropped outright: $top is fatal to a delta bootstrap).
+            user_page_size = opts.get("page_size")
             # Pagination strategy for this read. keyset/skip/auto drive
             # pagination client-side (for servers that omit @odata.nextLink)
             # and need a $top to size pages, so force a default page_size when
             # the user left it unset. Held on ``self`` for the duration of the
             # read so the shared fetch primitives pick it up without threading
             # it through every call site; defaults to nextlink (today's
-            # behaviour) for any path that doesn't set it.
+            # behaviour) for any path that doesn't set it. This (like every
+            # read-scoped field below) leans on the framework's SERIAL-calls
+            # contract: one instance serves one table's calls sequentially, and
+            # the lazy batch-mode generators are drained before any other entry
+            # point runs on this instance. An interleaving framework would
+            # clobber these mid-drain.
             self._pagination = self._parse_pagination(opts)
             self._set_excluded_ancestor_columns(opts)
             # Overlap re-read window for non-atomic walks. Held on ``self`` for
             # the read's duration (like ``_pagination``); the floor is applied
             # only to the read filter (``_apply_cursor_lookback``), never to the
             # committed offset. Applies to every contained cursor-read path —
-            # ``expand_contained=true``, the N+1 leaf-cursor walk, and the
-            # ``cursor_probe`` hydrate — each of which self-sizes the ``auto``
-            # window from its measured walk duration. No-op for non-timestamp
-            # cursors.
+            # ``expand_contained=true``, the N+1 leaf-cursor walk, the
+            # ``cursor_probe`` hydrate, and the ancestor-cursor walk (floored at
+            # the ancestor enumeration filter) — each of which self-sizes the
+            # ``auto`` window from its measured walk/cycle duration. No-op for
+            # non-timestamp cursors.
             self._cursor_lookback = self._parse_cursor_lookback(opts)
             # ``auto`` tuning knobs (ignored for static/off modes).
             self._cursor_lookback_factor = self._parse_cursor_lookback_factor(opts)
             self._cursor_lookback_max_seconds = self._parse_cursor_lookback_ceiling(opts)
-            # Resolved per-read in the expand-cursor path (see
-            # ``_read_contained_expand``); stays 0 for every other read.
+            # Resolved per-read by each contained cursor-read path; stays 0 for
+            # every other read.
             self._active_lookback_seconds = 0
             # Only an EXPLICIT positive window is validated against the read
             # config — the default ``auto`` is a no-op outside the expand-cursor
@@ -5319,22 +9153,26 @@ def register_lakeflow_source(spark):
             if (
                 isinstance(self._cursor_lookback, int)
                 and self._cursor_lookback > 0
-                and not (_parse_contained_path(table_name) is not None and opts.get("cursor_field"))
+                and not (self._table_segments(table_name) is not None and opts.get("cursor_field"))
             ):
                 raise ValueError(
                     "cursor_lookback_seconds (an explicit value) is supported "
-                    "only with a cursor_field on a contained path — it floors the "
-                    "read filter for the non-atomic expand_contained=true walk and "
-                    "the leaf-cursor N+1 / cursor_probe walk. Use 'auto' (default) "
-                    "or 'off' for other read configurations."
+                    "only with a cursor_field on a contained path — it floors "
+                    "the read filter for the non-atomic expand_contained=true "
+                    "walk, the leaf-cursor N+1 / cursor_probe walk, and the "
+                    "ancestor-cursor walk (where it floors the ancestor "
+                    "enumeration filter, re-reading recently-dirty subtrees). "
+                    "Use 'auto' (default) or 'off' for other read "
+                    "configurations."
                 )
+            self._validate_select_columns(table_name, opts)
             # ``auto`` (the default) is a best-effort hint that no-ops where it can't
             # engage, so these conflict checks fire only on an EXPLICIT strategy
             # opt-in (``cursor_probe=nested-expand`` or ``cursor_probe=batch``) — otherwise
             # every flat / snapshot / expand_contained read would trip them.
             cursor_probe_raw = (opts.get("cursor_probe") or "").strip().lower()
             if "cursor_probe" in opts and self._cursor_probe_mode(opts) in ("probe", "batch"):
-                if _parse_contained_path(table_name) is None:
+                if self._table_segments(table_name) is None:
                     raise ValueError(
                         f"cursor_probe={cursor_probe_raw} is supported only on "
                         f"contained-collection paths; {table_name!r} is a flat entity "
@@ -5354,6 +9192,13 @@ def register_lakeflow_source(spark):
                         "only changes how a leaf-owned cursor read is executed). Set "
                         "cursor_field or drop cursor_probe."
                     )
+            _validate_page_size(opts)
+            # Validate the contained-read shape options for EVERY table, flat
+            # included: their parsers otherwise run only on contained paths (and
+            # ``contained_fetch``'s only after enumeration HTTP), so a typo'd
+            # value was silent exactly where every other enum option is loud.
+            self._expand_contained_mode(opts)
+            self._contained_fetch_batch_size(opts)
             if self._pagination != "nextlink":
                 opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
             if start_offset is None:
@@ -5377,8 +9222,8 @@ def register_lakeflow_source(spark):
             offset = start_offset or {}
             # Seed per-instance capability verdicts from the resume offset so a
             # reader the framework recreates each microbatch skips re-probing.
-            self._seed_capability_caches(start_offset)
-            if _parse_contained_path(table_name) is not None:
+            self._seed_capability_caches(table_name, opts, start_offset)
+            if self._table_segments(table_name) is not None:
                 if self._delta_setting(opts) == "enabled":
                     raise ValueError(
                         "delta_tracking=enabled is not supported on contained-"
@@ -5386,53 +9231,245 @@ def register_lakeflow_source(spark):
                         "to top-level entity sets). Set delta_tracking=disabled "
                         "or ingest the parent set directly."
                     )
-                if self._expand_contained_active(opts):
+                # Reset any per-table shared-cache verdict whose option is pinned
+                # non-``auto`` before resolving the read, so a switch back to
+                # ``auto`` re-probes even on the bare-offset snapshot / batch-reader
+                # paths (the offset scrub only sees offset-carrying reads).
+                self._purge_nonauto_table_verdicts(table_name, opts)
+                # ``expand_contained``: ``true`` forces the nested-$expand read;
+                # ``auto`` attempts it behind a one-shot behavioural preflight
+                # (real expand URL + inline-containment cross-check; verdict
+                # persisted as ``expand_ok``) and falls back to the N+1 branches
+                # below when the server can't be trusted with $expand. The same
+                # resolver drives partition activation, so an ``auto`` table that
+                # falls back to N+1 stays partitionable.
+                if self._expand_read_active(table_name, opts, start_offset):
                     # Cursor-based expand keeps a default $top (page_size);
-                    # snapshot expand omits $top when page_size is unset.
+                    # snapshot expand omits $top when page_size is unset — which
+                    # can only happen under pagination=nextlink (every other mode
+                    # already defaulted page_size above).
                     if opts.get("cursor_field"):
                         opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
-                    return self._with_capabilities(
-                        self._read_contained_expand(table_name, start_offset, opts), opts
+                        return self._with_capabilities(
+                            self._read_contained_expand(table_name, start_offset, opts),
+                            opts,
+                            table_name,
+                        )
+                    # Snapshot expand: same streaming-snapshot marker rule as the
+                    # N+1 snapshot below (see ``_snapshot_stream_result``); the
+                    # preflight verdict rides the process/file capability cache
+                    # instead of the offset.
+                    return self._snapshot_stream_result(
+                        start_offset,
+                        lambda: self._read_contained_expand(table_name, start_offset, opts),
                     )
                 if opts.get("cursor_field"):
                     # Cursor-based read: default page_size so a $top is sent.
-                    # Snapshot (the branch below) leaves it unset → no $top.
+                    # Snapshot (the branch below) leaves it unset — no $top only
+                    # under pagination=nextlink; other modes defaulted it above.
                     opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
                     return self._with_capabilities(
                         self._read_contained_incremental(
                             table_name, start_offset, opts, opts["cursor_field"]
                         ),
                         opts,
+                        table_name,
                     )
-                # Snapshot: the terminal offset stays a bare ``{}`` — deliberately
-                # NOT threaded with capability verdicts. A streaming snapshot
-                # quiesces on ``end == start``; merging flags would turn the first
-                # trigger's ``{}`` into ``{"batch_ok": …}`` and buy one extra full
-                # snapshot re-read before settling. The batch reader discards the
-                # offset anyway, and the per-read preflight POST is noise next to
-                # a full snapshot walk.
-                return self._read_contained_snapshot(table_name, opts)
-            # Offset-shape check ahead of the delta predicate so a resumed
-            # delta stream (offset carries delta_link / next_link) takes the
-            # delta path even if delta_tracking is no longer set in options.
-            if (
-                "delta_link" in offset
-                or "next_link" in offset
-                or self._delta_active_for(table_name, opts)
+                # Snapshot: the streaming offset carries only the
+                # ``snapshot_done`` marker (see ``_snapshot_stream_result``) —
+                # still deliberately NOT threaded with capability verdicts, so
+                # the marker offset stays byte-stable across triggers (the
+                # quiesce shape the pyspark wrapper accepts is an EMPTY batch
+                # with an unchanged offset). The batch reader discards the
+                # offset anyway. Preflight dedup across framework-recreated
+                # instances comes from the process/file capability cache instead
+                # (see ``_CAPABILITY_CACHE``), which needs no offset channel.
+                self._warn_streaming_snapshot_cap(table_name, opts, start_offset)
+                return self._snapshot_stream_result(
+                    start_offset, lambda: self._read_contained_snapshot(table_name, opts)
+                )
+            if self._delta_offset_shape_gate(table_name, opts, offset) or self._delta_active_for(
+                table_name, opts
             ):
-                # Delta (CDC) is cursor-based — keep a default $top.
-                opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
-                return self._read_incremental_delta(table_name, offset, opts)
+                # NEVER send $top on the delta path. OData §11.2.5.3 makes $top a
+                # TOTAL-RESULT limit — the exact trap the pagination docs call out
+                # for the flat walks — and the delta walker follows only raw
+                # @odata.nextLinks (no seek-past-budget fallback, by design). A
+                # spec-compliant server would end the bootstrap at $top rows and
+                # mint the terminal deltaLink there, silently and permanently
+                # dropping every never-again-changed row beyond it. So the
+                # client-paging default injected above is stripped, and an
+                # EXPLICIT user page_size is honored through the spec's
+                # response-sizing mechanism instead (Prefer: odata.maxpagesize —
+                # see _delta_initial_request).
+                delta_opts = {k: v for k, v in opts.items() if k != "page_size"}
+                if user_page_size:
+                    delta_opts["page_size"] = user_page_size
+                return self._read_incremental_delta(table_name, offset, delta_opts)
             if opts.get("cursor_field"):
                 # Cursor-based read: default page_size so a $top is sent.
                 # Snapshot (the branch below) leaves it unset → no $top.
                 opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
-                return self._with_capabilities(
-                    self._read_incremental(table_name, start_offset, opts, opts["cursor_field"]), opts
+                return self._stamp_delta_verdict(
+                    self._with_capabilities(
+                        self._read_incremental(table_name, start_offset, opts, opts["cursor_field"]),
+                        opts,
+                        table_name,
+                    ),
+                    table_name,
+                    opts,
                 )
-            return self._read_snapshot(table_name, opts)
+            self._warn_streaming_snapshot_cap(table_name, opts, start_offset)
+            return self._stamp_delta_verdict(
+                self._snapshot_stream_result(
+                    start_offset, lambda: self._read_snapshot(table_name, opts)
+                ),
+                table_name,
+                opts,
+            )
 
-        def _seed_capability_caches(self, start_offset: dict | None) -> None:
+        def _warn_streaming_snapshot_cap(
+            self, table_name: str, opts: dict, start_offset: dict | None
+        ) -> None:
+            """Warn when a STREAMING snapshot read (flat or contained N+1)
+            carries a user ``max_records_per_batch``: these shapes ignore the
+            cap by design — a snapshot offset holds only the quiesce marker (no
+            park state), so truncating would silently drop the remainder. The
+            expand snapshot honors the cap (it parks a resumable
+            ``pending_fetches`` queue), and batch-mode reads are warned by the
+            dispatcher's own override (which also rewrites the option, so this
+            never double-fires)."""
+            if start_offset is None or "max_records_per_batch" not in opts:
+                return
+            if opts["max_records_per_batch"] == str(_BATCH_UNCAPPED):
+                return
+            _LOG.warning(
+                "max_records_per_batch=%s ignored for %r: a snapshot stream's "
+                "offset carries no park state (only the quiesce marker), so a "
+                "cap could only truncate the snapshot and silently drop the "
+                "remainder. Reading the full snapshot this trigger. Use a "
+                "cursor_field (resumable capped batches) or expand_contained="
+                "true (parks a resumable queue) to bound per-trigger work.",
+                opts["max_records_per_batch"],
+                table_name,
+            )
+
+        def _snapshot_stream_result(self, start_offset: dict | None, read) -> tuple:
+            """Streaming-snapshot semantics under pyspark's simple-reader wrapper.
+
+            The wrapper (``_SimpleStreamReaderWrapper.add_result_to_cache``)
+            raises ``SIMPLE_STREAM_READER_OFFSET_DID_NOT_ADVANCE`` for a
+            NON-EMPTY batch whose end offset equals its start — so a bare-``{}``
+            "quiesce on end == start" contract only ever worked for empty
+            batches, and a snapshot read is never empty. Streaming snapshots
+            therefore mark the first pass done (``{"snapshot_done": True}`` —
+            the offset advances, satisfying the wrapper) and every later trigger
+            returns an EMPTY batch with the unchanged marker offset — the one
+            quiesce shape the wrapper accepts. The marker check runs BEFORE the
+            read, so idle triggers cost zero HTTP. Batch mode (``start_offset is
+            None`` — offset discarded) passes through untouched. Restart
+            semantics: a FRESH checkpoint re-reads once, then quiesces; a
+            checkpoint-preserving restart stays quiesced (the marker persists
+            in the checkpoint — a full refresh re-snapshots). Compat-safe: this shape
+            previously CRASHED on its first or second trigger, so no working
+            checkpoint carries a bare ``{}``.
+
+            The marker stamps only a TERMINAL (``{}``) offset: a capped expand
+            snapshot parks ``pending_fetches`` mid-drain, and stamping that
+            pass would strand the queue forever behind the marker's early
+            return — a parked offset already differs from its start, so the
+            wrapper needs no marker until the drain completes."""
+            if start_offset is None:
+                return read()
+            if start_offset.get("snapshot_done"):
+                return iter([]), start_offset
+            records, offset = read()
+            if offset:
+                return records, offset
+            return records, {**offset, "snapshot_done": True}
+
+        def _delta_offset_shape_gate(
+            self, table_name: str, table_options: dict | None, offset: dict
+        ) -> bool:
+            """The offset-shape check ahead of the delta predicate, both ways.
+
+            Returns True when the offset is delta-shaped (carries a
+            ``delta_link``/``next_link``), so a resumed delta stream takes the
+            delta path even if ``delta_tracking`` is no longer set in options.
+
+            The REVERSE shape check runs as a side effect: under ``auto``, a
+            non-empty fallback-shaped offset (``snapshot_done`` / ``cursor``, no
+            delta link) proves earlier batches of THIS stream ran the
+            cursor/snapshot shape against the setup-frozen schema. If the first
+            batch's probe was transient, nothing was stamped (``delta_ok`` rides
+            definitive verdicts only) and a later re-probe coming back TRUE would
+            flip the stream ONTO the delta path mid-stream — emitting
+            ``_deleted``/``_lc_sequence`` columns the frozen schema never
+            declared; the framework parser drops undeclared columns silently, so
+            a delta tombstone MERGEs as a live row. So the fallback is pinned for
+            the checkpoint's lifetime: the instance verdict makes
+            ``_delta_active_for`` skip the re-probe, and ``_stamp_delta_verdict``
+            persists ``delta_ok: false`` into the outgoing offset. Deliberately
+            NOT written to the shared process/file cache — the pin is evidence
+            about this checkpoint's frozen schema, not about the server.
+            Cursor-configured tables are exempt (cursor wins deterministically —
+            they never probe, so there is no flip to pin against)."""
+            if "delta_link" in offset or "next_link" in offset:
+                return True
+            if (
+                offset
+                and not (table_options or {}).get("cursor_field")
+                and self._delta_setting(table_options) == "auto"
+            ):
+                self._delta_capable[self._delta_cache_key(table_name, table_options)] = False
+            return False
+
+        def _stamp_delta_verdict(
+            self, result: tuple, table_name: str, table_options: dict | None
+        ) -> tuple:
+            """Thread the definitive ``delta_tracking=auto`` probe verdict into the
+            outgoing offset (``delta_ok``) so a stream that has decided its read
+            shape once never re-decides differently.
+
+            Only the FALLBACK direction needs the stamp: the delta path's own
+            offsets carry ``delta_link``/``next_link`` and the offset-shape check
+            in ``_read_table_dispatch`` routes them back to the delta path
+            regardless of later verdicts. A bare cursor/snapshot offset, though,
+            would let a later batch's re-probe (15-minute shared cache expired +
+            a ``Preference-Applied``-flapping server) flip the stream ONTO the
+            delta path mid-stream — emitting ``_deleted``/``_lc_sequence`` columns
+            the setup-frozen schema never declared; the framework parser drops
+            undeclared columns silently, so a delta tombstone MERGEs as a live
+            all-null-column upsert over good destination values.
+
+            Definitive verdicts only: a transient probe failure leaves
+            ``_delta_capable`` unset and stamps nothing, so a blip can't pin
+            delta off durably (the checkpoint is immortal). A cursor-configured
+            table never probes (cursor wins deterministically) so nothing is
+            stamped there. Explicit ``enabled``/``disabled`` stamps nothing and
+            scrubs an existing flag — the same non-``auto`` reset discipline as
+            the other persisted verdicts. Cost: a snapshot stream under an
+            explicit ``delta_tracking=auto`` pays one extra re-read on the
+            ``{}`` → ``{"delta_ok": False}`` transition, then quiesces as before
+            (the stamp is deterministic per batch)."""
+            records, offset = result
+            if not isinstance(offset, dict):
+                return result
+            if self._delta_setting(table_options) != "auto":
+                if "delta_ok" in offset:
+                    return records, {k: v for k, v in offset.items() if k != "delta_ok"}
+                return result
+            key = self._delta_cache_key(table_name, table_options)
+            if key in self._delta_capable and "delta_ok" not in offset:
+                return records, {**offset, "delta_ok": self._delta_capable[key]}
+            return result
+
+        def _seed_capability_caches(
+            self,
+            table_name: str,
+            table_options: dict | None,
+            start_offset: dict | None,
+        ) -> None:
             """Seed per-instance capability verdicts from the resume offset so a
             reader the framework recreates each microbatch skips re-probing.
 
@@ -5441,9 +9478,13 @@ def register_lakeflow_source(spark):
             **$batch** verdict (``batch_ok``, shared with the leaf-cursor path and
             the ``contained_fetch`` snapshot/stream walks), and the discovered
             **$batch chunk cap** (``batch_size_ok``, the working ops-per-request the
-            adaptive shrink settled on after a "too many parts" rejection). All are
-            server-wide, so a single cached value serves every table this instance
-            reads. Persisted back by :meth:`_merge_capability_caches`."""
+            adaptive shrink settled on after a "too many parts" rejection). Those
+            are server-wide, so a single cached value serves every table this
+            instance reads; ``expand_ok`` is PER TABLE and namespace-qualified
+            (nesting depths and namespaces verify differently), so it seeds only
+            under the offset's own :meth:`_expand_shared_key` — a scalar here
+            would hand table A's verdict to table B and then bake it into B's
+            offset. Persisted back by :meth:`_merge_capability_caches`."""
             off = start_offset or {}
             if "or_filter_ok" in off:
                 self.__dict__["_or_filter_ok"] = bool(off["or_filter_ok"])
@@ -5451,13 +9492,34 @@ def register_lakeflow_source(spark):
                 self.__dict__["_batch_supported"] = bool(off["batch_ok"])
             if "batch_size_ok" in off:
                 self.__dict__["_batch_size_cap"] = int(off["batch_size_ok"])
+            if off.get("expand_ok"):
+                # PASS verdicts only — by design the offset never carries a fail
+                # (see _merge_capability_caches), and a checkpoint poisoned with
+                # ``expand_ok: false`` by a pre-fix build must not seed a memo
+                # that skips the preflight forever; fails live in the 15-minute
+                # shared cache so a fixed server gets re-probed.
+                memo = self.__dict__.setdefault("_expand_supported", {})
+                memo[self._expand_shared_key(table_name, table_options)] = True
+            if isinstance(off.get("delta_ok"), bool) and self._delta_setting(table_options) == "auto":
+                # The stream's OWN persisted delta verdict wins over the shared
+                # cache and the probe: schema/read_table_metadata were frozen at
+                # setup from one verdict, and a re-probe that flips it (15-min
+                # shared cache expired + a Preference-Applied-flapping server)
+                # would emit synthetic columns the declared schema lacks — the
+                # framework parser drops them silently and a delta tombstone
+                # then MERGEs as a live all-null row. See _stamp_delta_verdict.
+                self._delta_capable[self._delta_cache_key(table_name, table_options)] = off["delta_ok"]
 
-        def _merge_capability_caches(self, offset: dict) -> dict:
+        def _merge_capability_caches(self, offset: dict, table_name: str | None = None) -> dict:
             """Thread the per-instance OR / $batch / batch-size verdicts into the
             returned offset so they survive the framework recreating the reader each
             microbatch.
             Only adds a flag once actually **determined** this instance (the probe
-            ran), and never overwrites one a read path already wrote. Excluded from
+            ran), and never overwrites one a read path already wrote. ``expand_ok``
+            is per-table (``table_name`` here is the namespace-qualified
+            :meth:`_expand_shared_key`): only THIS table's own memoized verdict may
+            ride its offset (another table's verdict baked in here would persist in
+            the checkpoint and skip this table's preflight forever). Excluded from
             the no-progress comparison (see ``_finalize_cursor_read``), so baking in
             a verdict never reads as forward progress."""
             if not isinstance(offset, dict):
@@ -5469,13 +9531,43 @@ def register_lakeflow_source(spark):
                 add["batch_ok"] = self.__dict__["_batch_supported"]
             if "_batch_size_cap" in self.__dict__ and "batch_size_ok" not in offset:
                 add["batch_size_ok"] = self.__dict__["_batch_size_cap"]
+            expand_memo = self.__dict__.get("_expand_supported") or {}
+            if expand_memo.get(table_name) is True and "expand_ok" not in offset:
+                # The PASS only. A fail baked into the checkpoint would be
+                # immortal (offsets never expire) and skip the preflight even
+                # after the server is fixed — fails belong in the 15-minute
+                # shared cache, exactly like ``cursor_probe_ok`` (the README's
+                # "the offset only ever carries the pass" contract).
+                add["expand_ok"] = True
             return {**offset, **add} if add else offset
+
+        def _cached_capability(self, key: str, table_name: str | None = None):
+            """The process/file-cached verdict for ``key`` (``None`` when
+            undetermined). Consulted by the ``_verify_*`` preflights AFTER the
+            offset flag and the instance cache, BEFORE probing — so a connector
+            instance the framework recreates each microbatch (or a forked batch
+            worker within the file-cache TTL) skips the probe even on paths
+            that carry no offset (contained snapshot streams, the batch
+            reader)."""
+            entry = _capability_cache_load(self.service_url)
+            value = entry.get(key)
+            if table_name is not None:
+                return value.get(table_name) if isinstance(value, dict) else None
+            return value
+
+        def _store_capability(self, key: str, value, table_name: str | None = None) -> None:
+            """Mirror a freshly determined DEFINITIVE verdict into the
+            process/file capability cache (see :data:`_CAPABILITY_CACHE`).
+            Callers keep the transient-vs-definitive discipline — a transient
+            outcome must record nothing anywhere, so it never reaches here."""
+            _capability_cache_store(self.service_url, key, value, table_name)
 
         def _scrub_nonauto_verdicts(self, offset: dict, table_options: dict | None) -> dict:
             """Drop persisted preflight verdicts whose governing option is **not**
             ``auto``, so re-selecting ``auto`` later re-runs the preflight instead of
             reusing a stale verdict. ``cursor_probe`` owns its nested-``$expand``
-            probe verdict (``cursor_probe_ok``). The ``$batch`` verdicts
+            probe verdict (``cursor_probe_ok``); ``expand_contained`` owns the
+            expand-read capability verdict (``expand_ok``). The ``$batch`` verdicts
             (``batch_ok`` / ``batch_size_ok``) are **shared**: ``contained_fetch``'s
             full walks AND the ``cursor_probe`` ``auto`` cascade's hydrate both read
             and refresh them — so they're kept while ANY auto-mode consumer is live
@@ -5493,6 +9585,21 @@ def register_lakeflow_source(spark):
             cp_mode = self._cursor_probe_mode(table_options)
             if cp_mode != "auto":
                 drop.add("cursor_probe_ok")
+            # ``expand_contained`` owns the nested-$expand verdict (``expand_ok``):
+            # an explicit ``true``/``false`` scrubs it so a later switch back to
+            # ``auto`` (the unset DEFAULT, which keeps the verdict) re-runs the
+            # preflight.
+            if self._expand_contained_mode(table_options) != "auto":
+                drop.add("expand_ok")
+            # ``pagination`` owns the OR-across-columns keyset verdict
+            # (``or_filter_ok``): an explicit mode that never CONSUMES it
+            # (``skip`` pages positionally, ``nextlink`` follows server links)
+            # scrubs it — this is also the user's only escape hatch for a
+            # wrongly-false verdict persisted by an old checkpoint (pin
+            # ``pagination=skip`` for one batch, then unpin), since the offset
+            # copy otherwise never expires.
+            if (table_options or {}).get("pagination", "").strip().lower() in ("skip", "nextlink"):
+                drop.add("or_filter_ok")
             batch_live = self._contained_fetch_is_auto(table_options) or (
                 cp_mode == "auto" and not self._contained_fetch_forces_single(table_options)
             )
@@ -5500,15 +9607,62 @@ def register_lakeflow_source(spark):
                 drop |= {"batch_ok", "batch_size_ok"}
             if not drop:
                 return offset
+            # Shared-cache reset for the SERVER-WIDE ``$batch`` verdicts only:
+            # a value actually present in the offset means the user just switched
+            # this option away from ``auto`` (the transition batch). These keys
+            # aren't table-scoped, so purge conservatively — transition-driven —
+            # to avoid churning a sibling table's live ``auto`` consumer. The
+            # per-table verdicts (``expand_ok`` / ``cursor_probe_ok``) are reset
+            # separately and unconditionally by ``_purge_nonauto_table_verdicts``
+            # (table-scoped, so it also safely covers the bare-offset snapshot /
+            # batch-reader paths this offset scrub can't see).
+            recorded_server_wide = drop & {"batch_ok", "batch_size_ok", "or_filter_ok"} & offset.keys()
+            if recorded_server_wide:
+                _capability_cache_drop(self.service_url, recorded_server_wide)
+            if "or_filter_ok" in drop:
+                # Also clear the instance memo so THIS read doesn't keep consuming
+                # the verdict it just scrubbed from the outgoing offset.
+                self.__dict__.pop("_or_filter_ok", None)
             return {k: v for k, v in offset.items() if k not in drop}
 
-        def _with_capabilities(self, result: tuple, table_options: dict | None = None) -> tuple:
+        def _purge_nonauto_table_verdicts(self, table_name: str, table_options: dict | None) -> None:
+            """Reset the per-table shared-cache verdicts (``expand_ok`` /
+            ``cursor_probe_ok``) whose governing option is pinned non-``auto``, so a
+            later switch back to ``auto`` re-runs the preflight rather than reusing
+            the cached verdict. Unlike the offset scrub, this runs on **every**
+            contained read — not just an offset-carrying transition — so it also
+            covers the contained snapshot stream and the batch reader, whose bare /
+            absent offsets can't trigger the scrub. Table-scoped (pinning one table
+            never disturbs a sibling's verdict) and idempotent (a no-op, no file
+            rewrite, once the entry is gone)."""
+            if self._expand_contained_mode(table_options) != "auto":
+                _capability_cache_drop(
+                    self.service_url,
+                    {"expand_ok"},
+                    table_name=self._expand_shared_key(table_name, table_options),
+                )
+            if self._cursor_probe_mode(table_options) != "auto":
+                segments = self._table_segments(table_name)
+                if segments is not None:
+                    key = self._cursor_probe_shared_key(
+                        segments, (table_options or {}).get("namespace")
+                    )
+                    _capability_cache_drop(self.service_url, {"cursor_probe_ok"}, table_name=key)
+
+        def _with_capabilities(
+            self,
+            result: tuple,
+            table_options: dict | None = None,
+            table_name: str | None = None,
+        ) -> tuple:
             """Wrap a ``(records, offset)`` read result, threading capability verdicts
-            into the offset (see :meth:`_merge_capability_caches`) and then scrubbing
-            any whose governing option is non-``auto`` (see
-            :meth:`_scrub_nonauto_verdicts`)."""
+            into the offset (see :meth:`_merge_capability_caches`; ``table_name``
+            scopes the per-table ``expand_ok`` merge via its namespace-qualified
+            key) and then scrubbing any whose governing option is non-``auto``
+            (see :meth:`_scrub_nonauto_verdicts`)."""
             records, offset = result
-            offset = self._merge_capability_caches(offset)
+            key = self._expand_shared_key(table_name, table_options) if table_name is not None else None
+            offset = self._merge_capability_caches(offset, key)
             return records, self._scrub_nonauto_verdicts(offset, table_options)
 
         # ------------------------------------------------------------------
@@ -5538,7 +9692,7 @@ def register_lakeflow_source(spark):
                 extra_filter=segment_filters.get(0),
                 order_by=pk_order or None,
             )
-            return self._fetch_pages(url), {}
+            return self._fetch_pages(url, self._edm_types_for_table(table_name, namespace)), {}
 
         def _read_incremental(
             self,
@@ -5572,7 +9726,13 @@ def register_lakeflow_source(spark):
             since = start_offset.get("cursor") if start_offset else None
             segment_filters = _resolve_segment_filters(table_options, [table_name])
             extra_filter = _combine_filters(
-                self._cursor_filter(cursor_field, since),
+                self._cursor_filter(
+                    cursor_field,
+                    since,
+                    edm_type=self._edm_types_for_table(
+                        table_name, (table_options or {}).get("namespace")
+                    ).get(cursor_field),
+                ),
                 segment_filters.get(0),
             )
             # Append primary-key columns as $orderby tie-breakers. Without a
@@ -5592,7 +9752,7 @@ def register_lakeflow_source(spark):
                 extra_filter=extra_filter,
                 order_by=",".join(order_terms),
             )
-            max_records = int(table_options.get("max_records_per_batch", "10000"))
+            max_records = _parse_max_records(table_options)
             # ``cursor_nulls`` policy: ``effective`` yields the value used for
             # filtering/trim/watermark (a synthetic floor for nulls under
             # ``coalesce``); ``skip_null`` drops null-cursor rows under
@@ -5604,11 +9764,15 @@ def register_lakeflow_source(spark):
 
             records: list[dict] = []
             truncated = False
-            for row in self._fetch_pages(url):
+            for row in self._fetch_pages(url, self._edm_types_for_table(table_name, namespace)):
                 if skip_null and row.get(cursor_field) is None:
                     continue
                 rec_cursor = effective(row)
-                if since is not None and rec_cursor is not None and rec_cursor <= since:
+                # Chronological, not lexical (``_cursor_le``): a server that
+                # renders fractional seconds value-dependently puts ``…00.5Z``
+                # lexically BEFORE ``…00Z`` — a raw ``<=`` would drop the newer
+                # row the server correctly returned, permanently.
+                if since is not None and rec_cursor is not None and _cursor_le(rec_cursor, since):
                     continue
                 records.append(row)
                 if len(records) >= max_records:
@@ -5691,7 +9855,7 @@ def register_lakeflow_source(spark):
             skip_null, _effective = self._make_cursor_resolver(
                 table_name, namespace, cursor_field, table_options
             )
-            for row in self._fetch_pages(url):
+            for row in self._fetch_pages(url, self._edm_types_for_table(table_name, namespace)):
                 if skip_null and row.get(cursor_field) is None:
                     continue
                 yield row
@@ -5735,7 +9899,7 @@ def register_lakeflow_source(spark):
 
             namespace = (table_options or {}).get("namespace")
             primary_keys = self._primary_keys_for(table_name, namespace)
-            max_records = int((table_options or {}).get("max_records_per_batch", "10000"))
+            max_records = _parse_max_records(table_options)
 
             records, new_delta_link, carry_next_link, rebootstrap = self._delta_walk_pages(
                 url=url,
@@ -5749,7 +9913,17 @@ def register_lakeflow_source(spark):
                 max_records=max_records,
             )
             if rebootstrap:
-                # 410 Gone surfaced during pagination → re-bootstrap from
+                if prev_next_link is not None and prev_delta_link is not None:
+                    # The parked mid-pagination link expired, but the offset
+                    # retained the prior delta_link exactly for this: replay the
+                    # changes-since window instead of re-reading the whole entity
+                    # set. Rows between the two links are re-fetched — dup-safe.
+                    # If THAT link 410s too, the recursion's next level has no
+                    # next_link and falls to the full re-bootstrap below.
+                    return self._read_incremental_delta(
+                        table_name, {"delta_link": prev_delta_link}, table_options
+                    )
+                # 410 Gone on the stored delta link → re-bootstrap from
                 # scratch. ``MERGE``-on-PK + ``_lc_sequence`` ordering
                 # reconciles re-fetched rows at the destination; no data
                 # loss, only HTTP cost.
@@ -5772,41 +9946,158 @@ def register_lakeflow_source(spark):
                     offset["delta_link"] = prev_delta_link
                 return iter(records), offset
 
-            if new_delta_link is None:
-                # Reached end of stream without a deltaLink. Server is
+            if new_delta_link is None and prev_delta_link is None:
+                # Bootstrap reached end of stream without a deltaLink. Server is
                 # misbehaving (spec requires the terminal page to carry one).
-                # Resume from the prior delta_link if we have one — better
-                # than losing the offset entirely.
-                if prev_delta_link is not None:
-                    return iter(records), {"delta_link": prev_delta_link}
                 raise RuntimeError(
                     f"OData delta bootstrap for {table_name!r} ended without an "
                     f"@odata.deltaLink. The server may have aborted change "
                     f"tracking. Set delta_tracking=disabled to fall back to "
                     f"snapshot or cursor-based reads."
                 )
-
+            if prev_delta_link is not None and (
+                new_delta_link is None or new_delta_link == prev_delta_link
+            ):
+                # ``records`` is non-empty here: the empty-record cases returned
+                # above (Graph-rotation guard / cap park). Change records with a
+                # change cursor that OMITTED the terminal link or did NOT advance
+                # both mean every future trigger re-fetches the SAME set forever
+                # (MERGE dedupes, but the stream churns without progressing).
+                # Mirror the cursor paths' no-progress raise instead of looping.
+                shape = (
+                    "no terminal @odata.deltaLink"
+                    if new_delta_link is None
+                    else "the SAME @odata.deltaLink as the prior batch"
+                )
+                raise RuntimeError(
+                    f"OData delta read for {table_name!r} returned {len(records)} "
+                    f"change records but {shape} — the server is not advancing "
+                    f"its change cursor, so the stream would re-read this change "
+                    f"set forever. Set delta_tracking=disabled and use "
+                    f"cursor-based incremental instead."
+                )
             return iter(records), {"delta_link": new_delta_link}
 
-        def _build_delta_record(self, item: dict, primary_keys: list[str]) -> dict:
+        def _build_delta_record(
+            self,
+            item: dict,
+            primary_keys: list[str],
+            *,
+            tombstone: bool | None = None,
+            key_types: dict[str, str] | None = None,
+            pad_fields: frozenset | None = None,
+            entity_set: str | None = None,
+        ) -> dict:
             """Translate one delta payload entry into the emitted record shape.
 
-            - ``@removed`` entries become tombstones: a record carrying the
-              primary-key fields plus ``_deleted=True``.
+            - Tombstones (``@removed`` entries, or v4.0-format ``$deletedEntity``
+              entries flagged by the caller) become a record carrying the
+              primary-key fields plus ``_deleted=True``. Keys are taken from the
+              INLINE properties when present (Graph style); otherwise parsed out
+              of the entry's ``@odata.id`` / ``id`` entity reference (the
+              v4.01/v4.0 spec shapes carry the key ONLY there). A tombstone whose
+              keys resolve to None raises — a keyless tombstone MERGEs against
+              nothing, silently losing the deletion. Every remaining schema
+              column (``pad_fields``) is padded with an EXPLICIT ``None``: the
+              framework parser rejects a non-nullable column that is *absent*
+              but accepts an explicit null, and a tombstone legitimately carries
+              nothing but its keys — without the padding the first delete on any
+              schema with a ``Nullable="false"`` non-key property kills the
+              batch.
             - Regular adds/changes pass through with all ``@odata.*`` control
               properties stripped and ``_deleted=False``.
 
             Every emitted record gets ``_lc_sequence`` — a strictly monotonic
             string — so apply_changes has a deterministic sequence_by column.
             """
-            if "@removed" in item:
+            is_tombstone = tombstone if tombstone is not None else "@removed" in item
+            if is_tombstone:
                 record: dict = {pk: item.get(pk) for pk in primary_keys}
+                if any(v is None for v in record.values()):
+                    id_text = item.get("@odata.id") or item.get("id")
+                    from_id = (
+                        self._tombstone_keys_from_id(
+                            id_text, primary_keys, key_types, entity_set=entity_set
+                        )
+                        if isinstance(id_text, str)
+                        else None
+                    )
+                    if from_id:
+                        for pk in primary_keys:
+                            if record.get(pk) is None:
+                                record[pk] = from_id.get(pk)
+                if primary_keys and any(record.get(pk) is None for pk in primary_keys):
+                    raise RuntimeError(
+                        f"OData delta tombstone carries no resolvable primary key "
+                        f"(need {primary_keys}, got inline keys "
+                        f"{ {pk: item.get(pk) for pk in primary_keys} }, entity "
+                        f"reference {item.get('@odata.id') or item.get('id')!r}). "
+                        f"A keyless tombstone would MERGE against nothing and the "
+                        f"deletion would be silently lost. If the server's "
+                        f"tombstone format differs, set delta_tracking=disabled "
+                        f"and use cursor/snapshot reads."
+                    )
+                for name in pad_fields or ():
+                    record.setdefault(name, None)
                 record[_DELETED_COL] = True
             else:
-                record = {k: v for k, v in item.items() if not k.startswith("@odata.")}
+                # Strip control information: bare annotations (``@odata.type``)
+                # AND property-scoped ones (``Prop@odata.type``) — the OData JSON
+                # format spells all control info with ``@``, and property names
+                # (CSDL SimpleIdentifiers) can never contain it.
+                record = {k: v for k, v in item.items() if "@" not in k}
                 record[_DELETED_COL] = False
             record[_SEQUENCE_COL] = _next_sequence()
             return record
+
+        def _tombstone_keys_from_id(
+            self,
+            id_text: str,
+            primary_keys: list[str],
+            key_types: dict[str, str] | None,
+            entity_set: str | None = None,
+        ) -> dict | None:
+            """Parse PK values out of a tombstone's entity reference — the
+            inverse of ``_format_key_predicate``, for ids like
+            ``Customers('ALFKI')``, ``…/Orders(OrderID=1,Lang='en')`` or a full
+            absolute URL. Returns ``None`` when no key predicate is found or the
+            shape doesn't match the PK list; values are coerced by declared Edm
+            type (quoted strings un-escaped, numerics parsed) so the emitted
+            tombstone MERGE-matches the upserts' JSON-decoded values.
+
+            When ``entity_set`` is given, the reference's collection segment must
+            NAME that set (exact, or as a dotted suffix for container-qualified
+            forms): a cross-set reference (``…/Suppliers(77)`` in a ``Customers``
+            feed — spec-unreachable, but the failure mode is a DELETE applied to
+            the wrong key, the worst destination-corruption class) is treated as
+            unresolvable, so the caller's loud keyless-tombstone raise fires
+            instead of a silent misapplied delete."""
+            path = id_text.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+            seg = path.rsplit("/", 1)[-1]
+            if "%" in seg:
+                seg = unquote(seg)
+            open_idx = seg.find("(")
+            if open_idx < 0 or not seg.endswith(")"):
+                return None
+            if entity_set:
+                coll = seg[:open_idx]
+                if coll != entity_set and not coll.endswith(f".{entity_set}"):
+                    return None
+            parts = _split_key_predicate(seg[open_idx + 1 : -1])
+            if not parts:
+                return None
+            types = key_types or {}
+            out: dict = {}
+            named = [p for p in parts if _KEY_EQ_RE.match(p)]
+            if len(named) == len(parts):
+                for part in parts:
+                    name, _, raw = part.partition("=")
+                    name = name.strip()
+                    out[name] = _coerce_key_literal(raw.strip(), types.get(name))
+                return out if set(out) >= set(primary_keys) else None
+            if len(parts) == 1 and len(primary_keys) == 1:
+                return {primary_keys[0]: _coerce_key_literal(parts[0], types.get(primary_keys[0]))}
+            return None
 
         def _delta_initial_request(
             self,
@@ -5826,9 +10117,19 @@ def register_lakeflow_source(spark):
             if prev_delta_link is not None:
                 return prev_delta_link, None
             segment_filters = _resolve_segment_filters(table_options, [table_name])
+            # No $top on the bootstrap URL — a total-result limit ends change
+            # tracking at page_size rows (see the delta dispatch branch). An
+            # explicit page_size rides the Prefer header as odata.maxpagesize,
+            # the spec's per-RESPONSE sizing hint, which servers may honor or
+            # ignore without affecting the result set's completeness.
+            opts_no_top = {k: v for k, v in (table_options or {}).items() if k != "page_size"}
+            prefer = _DELTA_PREFER
+            page_size = (table_options or {}).get("page_size")
+            if page_size:
+                prefer = f"{_DELTA_PREFER}, odata.maxpagesize={int(page_size)}"
             return (
-                self._build_url(table_name, table_options or {}, extra_filter=segment_filters.get(0)),
-                {"Prefer": _DELTA_PREFER},
+                self._build_url(table_name, opts_no_top, extra_filter=segment_filters.get(0)),
+                {"Prefer": prefer},
             )
 
         def _delta_walk_pages(
@@ -5862,30 +10163,39 @@ def register_lakeflow_source(spark):
             carry_next_link: str | None = None
             page_index = 0
             bootstrap_verified = not is_bootstrap
-            sparse_checked = False
+            expected_fields = self._delta_expected_fields(table_name, table_options)
+            # PK Edm types for entity-reference tombstones (typed literal
+            # coercion — see _tombstone_keys_from_id). Best-effort.
+            key_types = self._edm_types_for_table(table_name, (table_options or {}).get("namespace"))
             current_url: str | None = url
 
             while current_url:
                 headers = initial_headers if (page_index == 0 and initial_headers) else None
                 kwargs: dict[str, Any] = {"headers": headers} if headers else {}
-                resp = self._http_get(session, current_url, **kwargs)
-                if resp.status_code == 410 and (prev_delta_link or prev_next_link):
+                resp, payload = self._delta_fetch_page(
+                    session,
+                    current_url,
+                    kwargs,
+                    allow_410=bool(prev_delta_link or prev_next_link),
+                    # Only the walk's FIRST fetch hits the checkpoint-stored URL;
+                    # deeper pages follow links minted by THIS walk's responses,
+                    # so the expired-stored-token curation must not claim them.
+                    stored_link=bool(prev_delta_link or prev_next_link) and page_index == 0,
+                )
+                if resp is None:
                     return [], None, None, True
-                _raise_for_status_with_body(resp, current_url)
 
                 if not bootstrap_verified:
                     self._verify_delta_bootstrap(resp, table_name)
                     bootstrap_verified = True
 
-                payload = _decode_json_with_body(resp, current_url)
-                sparse_checked = self._delta_collect_page_records(
+                self._delta_collect_page_records(
                     payload=payload,
                     records=records,
                     primary_keys=primary_keys,
                     table_name=table_name,
-                    table_options=table_options,
-                    sparse_checked=sparse_checked,
-                    max_records=max_records,
+                    expected_fields=expected_fields,
+                    key_types=key_types,
                 )
                 fetched_url = resp.url
                 current_url, new_delta_link, carry_next_link = self._delta_advance_links(
@@ -5911,6 +10221,74 @@ def register_lakeflow_source(spark):
 
             return records, new_delta_link, carry_next_link, False
 
+        def _delta_fetch_page(
+            self,
+            session: requests.Session,
+            url: str,
+            kwargs: dict,
+            allow_410: bool,
+            stored_link: bool = False,
+        ) -> tuple[requests.Response | None, dict | None]:
+            """GET + decode one delta page, retrying corrupt-200 JSON bodies.
+
+            Mirrors :meth:`_fetch_page_payload`'s decode retry (some sources
+            emit 200s with truncated bodies under load — see there); the delta
+            walk can't reuse it directly because it needs per-page headers and
+            the 410 rebootstrap escape. Returns ``(None, None)`` when a 410
+            fired with a stored link to rebootstrap from.
+            """
+            for attempt in range(self.max_retries + 1):
+                resp = self._http_get(session, url, **kwargs)
+                if resp.status_code == 410 and allow_410:
+                    return None, None
+                if stored_link and 400 <= resp.status_code < 500:
+                    # A non-410 4xx on the STORED delta/next link itself (the
+                    # spec prescribes 410 for an expired token, but real
+                    # gateways answer 404/400 too). The checkpoint pins this
+                    # link, so a bare HTTPError would re-raise unexplained
+                    # every trigger forever — curate it instead. Deliberately
+                    # NOT an auto-rebootstrap: silently full-re-reading on any
+                    # 4xx would mask genuine config/auth errors; 410 stays the
+                    # only auto-recovery trigger. Fresh links minted mid-walk
+                    # keep the bare raise below — they aren't persisted
+                    # anywhere, so "run a full refresh" would be the wrong
+                    # remedy for what is a transient server anomaly.
+                    try:
+                        _raise_for_status_with_body(resp, url)
+                    except requests.HTTPError as exc:
+                        raise RuntimeError(
+                            f"The stored OData change-tracking link for this stream was "
+                            f"rejected with HTTP {resp.status_code} ({exc}). The delta "
+                            f"token has likely expired or been invalidated (the spec "
+                            f"prescribes 410 for this; some gateways answer "
+                            f"{resp.status_code}). The checkpoint pins this link, so the "
+                            f"stream cannot recover on its own: run a full refresh to "
+                            f"restart change tracking from a fresh bootstrap, or set "
+                            f"delta_tracking=disabled and use cursor/snapshot reads. "
+                            f"Note a re-bootstrap cannot recover deletions that happened "
+                            f"while the token was expired — see the delta docs."
+                        ) from exc
+                _raise_for_status_with_body(resp, url)
+                try:
+                    return resp, _decode_json_with_body(resp, url)
+                except json.JSONDecodeError as exc:
+                    if attempt >= self.max_retries:
+                        _LOG.error(
+                            "OData delta JSON decode failed after %d attempts on GET %s — %s",
+                            attempt + 1,
+                            url,
+                            exc.msg,
+                        )
+                        raise
+                    _LOG.warning(
+                        "OData delta JSON decode failed on GET %s (%s) — retrying (%d/%d)",
+                        url,
+                        exc.msg,
+                        attempt + 1,
+                        self.max_retries,
+                    )
+            raise AssertionError("unreachable: retry loop returns or raises")
+
         def _verify_delta_bootstrap(self, resp: requests.Response, table_name: str) -> None:
             """Confirm the server actually honored ``Prefer: odata.track-changes``."""
             applied = resp.headers.get("Preference-Applied", "")
@@ -5918,9 +10296,11 @@ def register_lakeflow_source(spark):
                 raise RuntimeError(
                     f"OData server did not honor 'Prefer: odata.track-changes' "
                     f"for {table_name!r} (response missing 'Preference-Applied' "
-                    f"header). The probe in delta_tracking=auto should have "
-                    f"caught this — your service may have inconsistent support. "
-                    f"Set delta_tracking=disabled and use cursor-based "
+                    f"header). Under delta_tracking=auto this means the probe's "
+                    f"acknowledgement was inconsistent (a flapping load "
+                    f"balancer?); under delta_tracking=enabled the server simply "
+                    f"doesn't support change tracking for this entity set. Set "
+                    f"delta_tracking=disabled (or auto) and use cursor-based "
                     f"incremental instead."
                 )
 
@@ -5931,24 +10311,81 @@ def register_lakeflow_source(spark):
             records: list[dict],
             primary_keys: list[str],
             table_name: str,
-            table_options: dict[str, str] | None,
-            sparse_checked: bool,
-            max_records: int,
-        ) -> bool:
-            """Append delta records from ``payload`` until cap or page exhaustion.
+            expected_fields: frozenset,
+            key_types: dict[str, str] | None = None,
+        ) -> None:
+            """Append every delta record from ``payload`` (one whole page).
 
-            Returns the updated ``sparse_checked`` flag so the caller can
-            continue to skip the check on later pages once it's already
-            passed for this call.
+            Tombstones come in two wire shapes: the v4.01 JSON format's
+            ``@removed`` control property, and the v4.0 format's
+            ``$deletedEntity``-context entry (``@odata.context`` ending in
+            ``/$deletedEntity``, key carried in ``id``, no ``@removed`` at
+            all). Both are routed to the tombstone branch — a v4.0 deleted
+            entry misread as a regular entity would trip the sparse-entity
+            guard with a misleading "partial updates" diagnosis.
+
+            Deliberately NOT capped mid-page: ``max_records_per_batch`` is
+            enforced at page boundaries by :meth:`_delta_advance_links`
+            (stop following ``@odata.nextLink`` once the cap is reached).
+            Breaking mid-page would silently drop the tail of the current
+            page — the persisted ``carry_next_link`` points at the NEXT
+            page, so the skipped rows would never be re-fetched (permanent
+            loss during bootstrap). The cap may therefore overshoot by at
+            most one server page; MERGE dedupes any overlap.
+
+            The sparse-entity guard runs on EVERY non-tombstone entry, not
+            just the first: mixed payloads are the norm for real delta
+            services (full entities for creates, changed-properties-only for
+            updates), so one full-bodied create at the head of the batch must
+            not wave the sparse updates behind it through to a NULL-writing
+            MERGE. ``expected_fields`` is precomputed once per walk, so the
+            per-item cost is one set difference.
             """
-            for item in payload.get("value", []):
-                if not sparse_checked and "@removed" not in item:
-                    self._check_no_sparse_entity(item, table_name, table_options)
-                    sparse_checked = True
-                records.append(self._build_delta_record(item, primary_keys))
-                if len(records) >= max_records:
-                    break
-            return sparse_checked
+            for item in payload.get("value") or []:
+                if not isinstance(item, dict):
+                    # Spec-invalid entry (null / scalar in the value array):
+                    # raise a precise error instead of an AttributeError deep
+                    # in the tombstone sniff.
+                    raise RuntimeError(
+                        f"OData delta response for {table_name!r} carried a "
+                        f"malformed entry in 'value': expected an object, got "
+                        f"{item!r}."
+                    )
+                context = str(item.get("@odata.context", "")).lower()
+                is_tombstone = "@removed" in item or "$deletedentity" in context
+                if not is_tombstone and (
+                    context.endswith("/$link") or context.endswith("/$deletedlink")
+                ):
+                    # v4.01 relationship-change entries (added/deleted LINKS,
+                    # carrying source/relationship/target — not entity rows).
+                    # This connector never ingests navigation properties on the
+                    # delta path, so relationship changes can't affect emitted
+                    # rows — skip them. Without this they fell into the regular-
+                    # entity branch and died in the sparse-entity guard with a
+                    # misleading "missing properties" diagnosis, blocking delta
+                    # entirely against servers that report link changes. A
+                    # contradictory entry carrying BOTH @removed and a link
+                    # context takes the tombstone branch instead (its keys
+                    # resolve-or-raise — loud, never a silently dropped delete).
+                    _LOG.debug(
+                        "OData delta for %r: skipping relationship-change entry "
+                        "(context %r) — navigation properties are not ingested.",
+                        table_name,
+                        item.get("@odata.context"),
+                    )
+                    continue
+                if not is_tombstone:
+                    self._check_no_sparse_entity(item, table_name, expected_fields)
+                records.append(
+                    self._build_delta_record(
+                        item,
+                        primary_keys,
+                        tombstone=is_tombstone,
+                        key_types=key_types,
+                        pad_fields=expected_fields,
+                        entity_set=table_name,
+                    )
+                )
 
         def _delta_advance_links(
             self,
@@ -5965,7 +10402,10 @@ def register_lakeflow_source(spark):
             Returns ``(next_url, new_delta_link, carry_next_link)``.
             ``next_url`` is ``None`` when pagination should stop (either we
             hit the cap, saw a terminal deltaLink, or the server omitted
-            both pagination links).
+            both pagination links). The cap check runs AFTER the page was
+            appended in full (see :meth:`_delta_collect_page_records`), so
+            ``carry_next_link`` — the link to the next page — never skips
+            rows: the cap overshoots by at most one server page instead.
             """
             raw_delta = payload.get("@odata.deltaLink")
             raw_next = payload.get("@odata.nextLink")
@@ -5984,16 +10424,46 @@ def register_lakeflow_source(spark):
 
             if raw_delta:
                 new_delta_link = urljoin(resp_url, raw_delta)
+                if raw_next:
+                    # Spec-violating page carrying BOTH links (they're mutually
+                    # exclusive per page). Prefer the continuation — stopping at
+                    # the deltaLink would silently drop every trailing page's
+                    # rows (absent until they next change, which the committed
+                    # delta cursor may consider already delivered) — and retain
+                    # the deltaLink like the cap-hit branch above does.
+                    return urljoin(resp_url, raw_next), new_delta_link, carry_next_link
                 return None, new_delta_link, carry_next_link
             if raw_next:
                 return urljoin(resp_url, raw_next), new_delta_link, carry_next_link
             return None, new_delta_link, carry_next_link
 
+        def _delta_expected_fields(
+            self, table_name: str, table_options: dict[str, str] | None
+        ) -> frozenset:
+            """The key set every non-tombstone delta entity must carry: the
+            declared schema for the table, less any selection imposed by
+            ``$select``, less the synthetic ``_deleted`` / ``_lc_sequence``
+            columns we add ourselves, and less any ``Edm.Stream`` properties —
+            stream values are media references the JSON payload NEVER carries
+            (§11.2.4), so demanding them would fail every healthy entity with
+            the sparse-entity error's wrong "partial updates" diagnosis.
+            Computed once per delta walk and passed into the per-item
+            :meth:`_check_no_sparse_entity`."""
+            namespace = (table_options or {}).get("namespace")
+            select = (table_options or {}).get("select")
+            if select:
+                expected = {c.strip() for c in select.split(",") if c.strip()}
+            else:
+                expected = {f.name for f in self._fields_for(table_name, namespace)}
+            edm_types = self._edm_types_for_table(table_name, namespace)
+            streams = {name for name, t in edm_types.items() if t == "Edm.Stream"}
+            return frozenset(expected - {_DELETED_COL, _SEQUENCE_COL} - streams)
+
         def _check_no_sparse_entity(
             self,
             item: dict,
             table_name: str,
-            table_options: dict[str, str] | None,
+            expected: frozenset,
         ) -> None:
             """Refuse silently-corrupting sparse delta responses.
 
@@ -6005,20 +10475,10 @@ def register_lakeflow_source(spark):
             and not recoverable from the destination table alone.
 
             We can't safely apply partial updates in v1, so refuse them up
-            front with an actionable error. Run only on the first
-            non-tombstone entry per call.
-
-            The expected key set is the declared schema for the table, less
-            any selection imposed by ``$select`` and less the synthetic
-            ``_deleted`` / ``_lc_sequence`` columns we add ourselves.
+            front with an actionable error. Runs on EVERY non-tombstone
+            entry (see :meth:`_delta_collect_page_records` for why first-
+            entry-only sampling is unsafe on mixed create/update payloads).
             """
-            select = (table_options or {}).get("select")
-            if select:
-                expected = {c.strip() for c in select.split(",") if c.strip()}
-            else:
-                namespace = (table_options or {}).get("namespace")
-                expected = {f.name for f in self._fields_for(table_name, namespace)}
-            expected -= {_DELETED_COL, _SEQUENCE_COL}
             actual = {k for k in item.keys() if not k.startswith("@odata.")}
             missing = expected - actual
             if missing:
@@ -6073,11 +10533,27 @@ def register_lakeflow_source(spark):
                  its own sequencing).
               3. ``cursor_field`` set + ``delta_tracking=auto`` → cursor wins;
                  delta is left dormant, no probe.
-              4. ``delta_tracking=enabled`` → assume support; a probe failure
+              4. no declared primary key → ``enabled`` raises, ``auto`` falls
+                 back without probing (delta rows MERGE on the key: a keyless
+                 tombstone would MERGE against nothing and the deletion would
+                 be silently lost — the per-tombstone raise in
+                 ``_build_delta_record`` can't fire with an empty key list, so
+                 the gate lives here, eagerly and curated).
+              5. ``delta_tracking=enabled`` → assume support; a probe failure
                  surfaces at read time rather than here.
-              5. ``delta_tracking=auto`` → probe once, cache, decide.
+              6. ``delta_tracking=auto`` → probe once, cache, decide.
             """
             setting = self._delta_setting(table_options)
+            if setting != "auto":
+                # Explicit pin (enabled/disabled): purge the shared ``auto``
+                # verdict so a later switch back to ``auto`` re-probes — the
+                # same reset discipline as ``expand_ok``/``cursor_probe_ok``.
+                # Idempotent and cheap (no file rewrite once the entry is
+                # gone), so running on every non-auto call is fine.
+                key = self._delta_cache_key(table_name, table_options)
+                self._delta_capable.pop(key, None)
+                shared_key = f"{key[0]}:{key[1]}" if key[0] else key[1]
+                _capability_cache_drop(self.service_url, {"delta_ok"}, table_name=shared_key)
             if setting == "disabled":
                 return False
             if (table_options or {}).get("cursor_field"):
@@ -6089,14 +10565,54 @@ def register_lakeflow_source(spark):
                         "delta_tracking=disabled to use cursor-based incremental."
                     )
                 return False
+            if not self._primary_keys_for(table_name, (table_options or {}).get("namespace")):
+                # Keyless entity type: every delta row (upsert or tombstone)
+                # MERGEs on the primary key, so keyless delta is silent loss by
+                # construction — and the per-tombstone raise is gated on a
+                # non-empty key list, so it can never fire here. Enabled →
+                # curated config error; auto → snapshot/cursor fallback with
+                # no probe (the read shape must be decided identically at
+                # schema-freeze and read time, and this decision is static).
+                if setting == "enabled":
+                    raise ValueError(
+                        f"delta_tracking=enabled requires a declared primary key on "
+                        f"{table_name!r}: delta upserts and tombstones MERGE on the "
+                        f"key, and the entity type declares none in $metadata — "
+                        f"deletions would be silently lost. Use "
+                        f"delta_tracking=disabled with cursor/snapshot reads."
+                    )
+                return False
             if setting == "enabled":
                 return True
             key = self._delta_cache_key(table_name, table_options)
             if key not in self._delta_capable:
-                self._delta_capable[key] = self._probe_delta_support(table_name, table_options)
+                # Shared (process + file, 15-min TTL) cache first: schema
+                # inference and the streaming read run in different forked
+                # workers, and an instance-only verdict lets a server that
+                # flaps its Preference-Applied ack between the two probes
+                # desync the declared schema from the emitted rows (synthetic
+                # columns declared-but-absent, or emitted-but-undeclared).
+                # One persisted verdict keeps every process on one answer.
+                shared_key = f"{key[0]}:{key[1]}" if key[0] else key[1]
+                shared = self._cached_capability("delta_ok", table_name=shared_key)
+                if isinstance(shared, bool):
+                    self._delta_capable[key] = shared
+                    return shared
+                verdict = self._probe_delta_support(table_name, table_options)
+                if verdict is None:
+                    # Transient failure — no verdict. Degrade THIS call to the
+                    # cursor/snapshot fallback and cache nothing, so the next
+                    # call re-probes instead of pinning delta off for the
+                    # instance's whole lifetime on a momentary blip (the same
+                    # definitive-only discipline as the other capability probes).
+                    return False
+                self._delta_capable[key] = verdict
+                self._store_capability("delta_ok", verdict, table_name=shared_key)
             return self._delta_capable[key]
 
-        def _probe_delta_support(self, table_name: str, table_options: dict[str, str] | None) -> bool:
+        def _probe_delta_support(
+            self, table_name: str, table_options: dict[str, str] | None
+        ) -> bool | None:
             """Light-touch capability probe.
 
             Sends a small GET against the entity set with the
@@ -6105,11 +10621,13 @@ def register_lakeflow_source(spark):
             header is the spec's positive acknowledgement that the server is
             honoring change tracking on this request.
 
-            Returns ``False`` for every failure mode (non-200, missing
-            header, malformed body, network error). The cache is populated
-            with that ``False`` so we don't retry the probe per call — the
-            connector falls back to whatever cursor/snapshot path the
-            user's options imply.
+            Returns a DEFINITIVE verdict only when the probe actually reached
+            the server: ``True`` on a 200 acknowledging the preference,
+            ``False`` when the server answered but didn't acknowledge (missing
+            header, or a non-transient non-200). Returns ``None`` — no verdict,
+            the caller caches nothing and re-probes next call — on a
+            transport/auth failure or an exhausted transient, matching the
+            definitive-only discipline of the other capability probes.
             """
             # Force ``$top=1`` for the probe so the response stays small even
             # against entity sets with millions of rows. We only care about
@@ -6124,7 +10642,13 @@ def register_lakeflow_source(spark):
                     headers={"Prefer": _DELTA_PREFER},
                 )
             except (requests.RequestException, ValueError, RuntimeError, PermissionError):
-                return False
+                return None  # transient/auth — no verdict, re-probe next call
+            if resp.status_code in _TRANSIENT_HTTP_STATUSES:
+                # Defensive: ``_http_get`` retries every transient status and
+                # raises after the budget (caught above), so nothing should
+                # reach here in practice — the membership test keeps the
+                # definitive/transient split in one place regardless.
+                return None  # transient status — no verdict, re-probe next call
             if resp.status_code != 200:
                 return False
             applied = resp.headers.get("Preference-Applied", "")
@@ -6164,7 +10688,14 @@ def register_lakeflow_source(spark):
             if opts.get("page_size"):
                 params.append(f"$top={opts['page_size']}")
             if opts.get("select"):
-                params.append(f"$select={opts['select']}")
+                # Strip per-column whitespace ("Id, Label" → "Id,Label") — the
+                # validation set and the expand-leaf merge both strip, and a
+                # strict server may 400 the padded wire form ($select=Id,%20Label).
+                # A select that strips to NOTHING (","," ") emits no $select at
+                # all rather than an empty param.
+                cols = ",".join(c.strip() for c in opts["select"].split(",") if c.strip())
+                if cols:
+                    params.append(f"$select={cols}")
             filters = [f for f in (opts.get("filter"), extra_filter) if f]
             if filters:
                 if len(filters) == 1:
@@ -6181,7 +10712,7 @@ def register_lakeflow_source(spark):
                 params.append(f"$orderby={order_by}")
             return "&".join(params)
 
-        def _fetch_pages(self, url: str) -> Iterator[dict]:
+        def _fetch_pages(self, url: str, edm_types: dict[str, str] | None = None) -> Iterator[dict]:
             """Walk a collection's pages, yielding raw JSON dicts (no coercion).
 
             Thin row-flattening wrapper over :meth:`_fetch_pages_with_links`,
@@ -6189,8 +10720,10 @@ def register_lakeflow_source(spark):
             auto). The whole collection is drained within this call: under the
             default ``auto`` a server that page-limits below ``$top`` without a
             continuation link is still fully drained (keep seeking until empty).
+            ``edm_types`` (the collection's declared property types, when the
+            caller has them) types the keyset-seek boundary literals.
             """
-            for page_rows, _ in self._fetch_pages_with_links(url):
+            for page_rows, _ in self._fetch_pages_with_links(url, edm_types):
                 yield from page_rows
 
         def _parse_pagination(self, table_options: dict[str, str] | None) -> str:
@@ -6214,7 +10747,54 @@ def register_lakeflow_source(spark):
                 )
             return raw
 
-        def _fetch_pages_with_links(self, url: str) -> Iterator[tuple[list[dict], str | None]]:
+        @staticmethod
+        def _page_fp_repeated(prev_fp, fp, page_rows: list, url: str, mode: str) -> bool:
+            """Period-1 no-progress check shared by both pagination loops: a
+            non-empty page whose raw-item fingerprint equals the previous page's
+            (server ignoring the seek/$skip, or a cyclic link handing back the
+            same rows). Logs the actionable warning and returns True to stop.
+            Complements :meth:`_page_url_cycled` — this catches SAME-page /
+            advancing-token, that catches REPEATED-url / alternating-token."""
+            if page_rows and prev_fp is not None and fp == prev_fp:
+                # The "switch to nextlink" advice only makes sense from the
+                # connector-driven modes; the nextlink loop is already on nextlink.
+                advice = (
+                    ""
+                    if mode == "nextlink"
+                    else " Use pagination=nextlink if the server pages correctly."
+                )
+                _LOG.warning(
+                    "pagination=%s made no progress on %r: an identical page came back "
+                    "(server ignoring the seek/$skip, or a cyclic @odata.nextLink). "
+                    "Stopping to avoid an infinite loop; some rows may be unread.%s",
+                    mode,
+                    url,
+                    advice,
+                )
+                return True
+            return False
+
+        @staticmethod
+        def _page_url_cycled(guard: "_PageCycleGuard", url: str, mode: str) -> bool:
+            """Bounded-window continuation-URL repeat check shared by both
+            pagination loops: logs the actionable warning and returns True when
+            ``url`` has already been fetched this drain (a period-N token cycle
+            the per-page fingerprint / self-reference guards miss). See
+            :class:`_PageCycleGuard`."""
+            if guard.seen_before(url):
+                _LOG.warning(
+                    "pagination=%s made no progress on %r: a continuation URL repeated "
+                    "(the server is cycling @odata.nextLink/seek tokens). Stopping to "
+                    "avoid an infinite loop; some rows may be unread.",
+                    mode,
+                    url,
+                )
+                return True
+            return False
+
+        def _fetch_pages_with_links(
+            self, url: str, edm_types: dict[str, str] | None = None
+        ) -> Iterator[tuple[list[dict], str | None]]:
             """Page-aware fetch: yields ``(page_rows, next_url)`` per response,
             where ``next_url`` resumes the next page (``None`` at the end).
 
@@ -6237,30 +10817,30 @@ def register_lakeflow_source(spark):
             """
             mode = getattr(self, "_pagination", "nextlink")
             if mode != "nextlink":
-                yield from self._client_paginate_pages(url, mode)
+                yield from self._client_paginate_pages(url, mode, edm_types)
                 return
             session = self._get_session()
             next_url: str | None = url
-            # No-progress guard: a server that hands back a self-referential or
+            # No-progress guards: a server that hands back a self-referential or
             # cyclic ``@odata.nextLink`` would loop forever. Stop if the resolved
             # link points back at the URL we just fetched, or if a non-empty page
-            # repeats the one before it.
+            # repeats the one before it (period-1) — or if ANY continuation URL
+            # repeats within a bounded window (period-N alternation, which the
+            # per-page checks miss). See :class:`_PageCycleGuard`.
             prev_fp: int | None = None
+            cycle = _PageCycleGuard()
             while next_url:
+                if self._page_url_cycled(cycle, next_url, "nextlink"):
+                    return
                 resp, payload = self._fetch_page_payload(session, next_url)
+                raw_items = payload.get("value") or []  # `or`: tolerate a spec-invalid null
                 page_rows = [
-                    {k: v for k, v in item.items() if not k.startswith("@odata.")}
-                    for item in payload.get("value", [])
+                    {k: v for k, v in item.items() if not k.startswith("@odata.")} for item in raw_items
                 ]
-                fp = _pg_page_fingerprint(page_rows)
-                if page_rows and prev_fp is not None and fp == prev_fp:
-                    _LOG.warning(
-                        "pagination=nextlink made no progress on %r: the server "
-                        "returned an identical page (cyclic @odata.nextLink). "
-                        "Stopping to avoid an infinite loop; some rows may be "
-                        "unread.",
-                        next_url,
-                    )
+                # Raw pre-strip fingerprint — see _client_paginate_pages for why
+                # (identical projected pages must not false-positive the guard).
+                fp = _pg_page_fingerprint(raw_items)
+                if self._page_fp_repeated(prev_fp, fp, page_rows, next_url, "nextlink"):
                     return
                 prev_fp = fp
                 raw_next = payload.get("@odata.nextLink")
@@ -6277,7 +10857,11 @@ def register_lakeflow_source(spark):
                 next_url = new_next
 
         def _verify_or_filter_support(
-            self, base_url: str, order_keys: list[str], sample_row: dict
+            self,
+            base_url: str,
+            order_keys: list[str],
+            sample_row: dict,
+            edm_types: dict[str, str] | None = None,
         ) -> bool:
             """One-shot, per-instance probe: does the server accept an
             OR-across-**different-columns** ``$filter`` — the composite keyset-seek
@@ -6285,41 +10869,62 @@ def register_lakeflow_source(spark):
 
             A single-key ``$orderby`` never builds an OR, so this short-circuits to
             ``True`` for ``len(order_keys) < 2``. For a composite seek it issues ONE
-            ``$top=1`` probe carrying the OR filter, built from ``sample_row`` so the
-            literals are correctly typed. A definitive **4xx** ⇒ the server rejects
-            OR across columns (e.g. Hexagon Smart API: "on different columns, only
-            AND operators are supported") and the caller falls back to ``$skip``
-            (pagination mode B). A transport error or any non-4xx outcome is **not**
-            evidence of non-support, so it fails **open** (assume supported) — the
-            real seek then runs and surfaces any genuine error itself. The verdict
-            is cached per instance (the capability is server-wide)."""
+            auth-aware ``$top=1`` probe carrying the OR filter, built from
+            ``sample_row`` so the literals are correctly typed. Mirrors the
+            batch/expand preflight discipline — only a **definitive** outcome is
+            cached/persisted (instance + shared process/file cache):
+
+            * definitive pass — a **2xx**: the server accepts OR across columns;
+            * definitive fail — a **non-transient 4xx** (e.g. Hexagon Smart API's
+              400 "on different columns, only AND operators are supported"): the
+              caller falls back to ``$skip`` (pagination mode B).
+
+            A transient status (429/5xx) or a transport/auth failure is **not**
+            evidence about OR support, so it fails **open** for this seek (assume
+            supported — the real seek then surfaces any genuine error) and records
+            **nothing**, so the next seek re-probes instead of durably pinning the
+            slower ``$skip`` walk on a momentary blip. Going through
+            :meth:`_http_get_once` (not a raw ``session.get``) means an expired
+            OAuth token is refreshed rather than misread as a ``401`` = "OR
+            unsupported"."""
             if len(order_keys) < 2:
                 return True
             cached = self.__dict__.get("_or_filter_ok")
             if cached is not None:
                 return cached
-            ok = True
-            seek = _pg_keyset_filter(order_keys, sample_row)
-            if seek is not None and " or " in seek:
-                probe = _pg_strip_query(
-                    _pg_set_query(
-                        _pg_keyset_seek_url(base_url, _pg_base_filter(base_url), seek),
-                        "$top",
-                        "1",
-                    ),
-                    "__pgbase",
-                )
-                try:
-                    resp = self._get_session().get(probe, timeout=self.timeout)
-                    if 400 <= resp.status_code < 500:
-                        ok = False  # server explicitly rejected the OR-across-columns filter
-                except Exception:  # transport error ≠ unsupported — defer to the real seek
-                    ok = True
+            cached = self._cached_capability("or_filter_ok")
+            if cached is not None:
+                self.__dict__["_or_filter_ok"] = cached
+                return cached
+            seek = _pg_keyset_filter(order_keys, sample_row, edm_types)
+            if seek is None or " or " not in seek:
+                return True  # no OR-across-columns built for this key set — nothing to probe
+            probe = _pg_strip_query(
+                _pg_set_query(
+                    _pg_keyset_seek_url(base_url, _pg_base_filter(base_url), seek),
+                    "$top",
+                    "1",
+                ),
+                "__pgbase",
+            )
+            try:
+                resp = self._http_get_once(self._get_session(), probe)
+            except Exception:  # transport error, or auth failure (PermissionError)
+                return True  # not OR evidence — fail open this seek, record nothing
+            # 408/429/5xx — transient, so a request timeout isn't misread as
+            # "OR rejected" and durably persisted. The verdict outlives the
+            # instance and its only reset is the explicit ``pagination=
+            # skip/nextlink`` scrub (``_scrub_nonauto_verdicts``) — the same
+            # discipline the _contained preflights follow.
+            if resp.status_code in _TRANSIENT_HTTP_STATUSES:
+                return True  # not OR evidence — fail open this seek, record nothing
+            ok = not 400 <= resp.status_code < 500  # a non-transient 4xx = OR rejected
             self.__dict__["_or_filter_ok"] = ok
+            self._store_capability("or_filter_ok", ok)
             return ok
 
         def _client_paginate_pages(
-            self, url: str, mode: str
+            self, url: str, mode: str, edm_types: dict[str, str] | None = None
         ) -> Iterator[tuple[list[dict], str | None]]:
             """Client-driven pagination for servers that don't (always) emit
             ``@odata.nextLink``. Yields ``(page_rows, next_url)`` like
@@ -6374,6 +10979,11 @@ def register_lakeflow_source(spark):
             # repeats the previous one — those rows were already emitted, so the
             # duplicate is dropped rather than re-yielded.
             prev_fp: int | None = None
+            # Period-N backstop (see _PageCycleGuard): the fingerprint guard below
+            # catches a server ignoring the seek (same page, advancing token); this
+            # catches a server CYCLING continuation URLs (alternating tokens), which
+            # the fingerprint misses because the alternating pages differ.
+            cycle = _PageCycleGuard()
             # ``auto`` only: did the server emit an @odata.nextLink at any point in
             # this walk? A server either drives pagination via the link or it
             # doesn't — mixing isn't a real pattern. So once we've seen a link, a
@@ -6385,22 +10995,21 @@ def register_lakeflow_source(spark):
             # request while still draining link-omitting servers fully.
             saw_next_link = False
             while cur_url is not None:
+                if self._page_url_cycled(cycle, cur_url, mode):
+                    return
                 resp, payload = self._fetch_page_payload(session, cur_url)
+                raw_items = payload.get("value") or []  # `or`: tolerate a spec-invalid null
                 page_rows = [
-                    {k: v for k, v in item.items() if not k.startswith("@odata.")}
-                    for item in payload.get("value", [])
+                    {k: v for k, v in item.items() if not k.startswith("@odata.")} for item in raw_items
                 ]
-                fp = _pg_page_fingerprint(page_rows)
-                if page_rows and prev_fp is not None and fp == prev_fp:
-                    _LOG.warning(
-                        "pagination=%s made no progress on %r: an identical page "
-                        "came back (server ignoring the seek/$skip, or a cyclic "
-                        "@odata.nextLink). Stopping this collection to avoid an "
-                        "infinite loop; some rows may be unread. Use "
-                        "pagination=nextlink if the server pages correctly.",
-                        mode,
-                        cur_url,
-                    )
+                # Fingerprint the RAW items (annotations included): with a
+                # low-cardinality $select two DISTINCT consecutive pages can be
+                # identical after the @odata.* strip, and stripping first would
+                # false-positive the guard and stop the walk with rows unread.
+                # Per-entity annotations (@odata.id / etag) disambiguate for free
+                # where the server emits them.
+                fp = _pg_page_fingerprint(raw_items)
+                if self._page_fp_repeated(prev_fp, fp, page_rows, cur_url, mode):
                     return
                 prev_fp = fp
                 fetched += len(page_rows)
@@ -6467,7 +11076,9 @@ def register_lakeflow_source(spark):
                 # no-progress guard above bounds a server that ignores the
                 # seek/$skip — auto then stops with this page's rows, exactly as the
                 # old short-page default did, minus the dropped duplicate.
-                if can_keyset and not self._verify_or_filter_support(url, order_keys, page_rows[-1]):
+                if can_keyset and not self._verify_or_filter_support(
+                    url, order_keys, page_rows[-1], edm_types
+                ):
                     # Composite keyset seek would build an OR-across-columns filter
                     # the server rejects (Hexagon Smart API). Drop to $skip (mode B)
                     # for the rest of this collection — and, via the cached verdict,
@@ -6482,7 +11093,7 @@ def register_lakeflow_source(spark):
                     )
                     can_keyset = False
                 if can_keyset:
-                    seek = _pg_keyset_filter(order_keys, page_rows[-1])
+                    seek = _pg_keyset_filter(order_keys, page_rows[-1], edm_types)
                     if seek is not None:
                         nxt = _pg_keyset_seek_url(url, base_filter, seek)
                     else:
@@ -6490,9 +11101,15 @@ def register_lakeflow_source(spark):
                         # commit to offset paging for the rest of this walk so
                         # keyset and skip positions can't interleave.
                         can_keyset = False
-                        nxt = _pg_set_query(url, "$skip", str(base_skip + fetched))
+                        # Strip any residual opaque token (a resumed foreign
+                        # continuation) like the keyset path does — a URL
+                        # carrying BOTH $skiptoken and $skip double-positions
+                        # on servers that apply both.
+                        nxt = _pg_set_query(
+                            _pg_strip_positional(url), "$skip", str(base_skip + fetched)
+                        )
                 else:
-                    nxt = _pg_set_query(url, "$skip", str(base_skip + fetched))
+                    nxt = _pg_set_query(_pg_strip_positional(url), "$skip", str(base_skip + fetched))
                 yield page_rows, nxt
                 cur_url = nxt
 
@@ -6713,29 +11330,105 @@ def register_lakeflow_source(spark):
             )
 
         def _backoff_delay(self, attempt: int) -> float:
-            """Exponential backoff capped at ``retry_max_delay_seconds``.
+            """Exponential backoff capped at ``retry_max_delay_seconds``,
+            jittered to 50–100 % of the capped value.
 
             Used for transient network failures where the server never
             sent a response, so there's no ``Retry-After`` to honour (the
             429/503 path prefers the server hint via
-            ``_retry_after_delay``).
+            ``_retry_after_delay``). The jitter de-synchronizes the
+            ``num_partitions`` executor tasks a throttling source knocked
+            back in the same instant — without it they all retry in
+            lockstep at 1, 2, 4 … s and re-trigger the throttle together.
             """
-            return min(float(2**attempt), float(self.retry_max_delay_seconds))
+            capped = min(float(2**attempt), float(self.retry_max_delay_seconds))
+            return capped * random.uniform(0.5, 1.0)
+
+        def _require_same_origin(self, url: str) -> None:
+            """Refuse to send the credential-bearing session off the
+            ``service_url`` origin. Every request funnels through here, so a
+            server-supplied ``@odata.nextLink`` (or any other URL the connector
+            follows) pointing at a different scheme/host/port raises instead of
+            leaking the ``Authorization`` header (or ``session.auth`` /
+            api-key header) to that host — the protection ``requests`` applies
+            to cross-host *redirects* (``rebuild_auth``) doesn't engage when
+            the connector builds the next request directly."""
+            origin = _url_origin(url)
+            if origin != self._service_origin:
+                raise PermissionError(
+                    f"OData connector refused to follow a URL to a different "
+                    f"origin than 'service_url'. The credentialed session may "
+                    f"only talk to {self._service_origin[0]}://"
+                    f"{self._service_origin[1]}"
+                    f"{'' if self._service_origin[2] is None else ':' + str(self._service_origin[2])}"
+                    f", but was asked to reach {origin[0]}://{origin[1]}"
+                    f"{'' if origin[2] is None else ':' + str(origin[2])} "
+                    f"(a server-supplied @odata.nextLink pointing off-host, or an "
+                    f"HTTP redirect Location). "
+                    f"Following it would send the Authorization header to that "
+                    f"host. If the service legitimately paginates across hosts, "
+                    f"this connector does not support it."
+                )
+
+        def _request_same_origin(
+            self, session: requests.Session, method: str, url: str, **kwargs: Any
+        ) -> requests.Response:
+            """Issue one request with ``allow_redirects=False`` and manually
+            follow only SAME-ORIGIN 3xx redirects (bounded), raising on the first
+            off-origin ``Location``.
+
+            ``requests``' auto-redirect would follow a cross-host ``Location``
+            with the session's credentials attached — and its ``rebuild_auth``
+            strips only ``Authorization``, leaving ``api_key`` / ``extra_headers``
+            exposed to the redirect target. The connector never needs
+            auto-redirect (every next URL is built explicitly from
+            ``@odata.nextLink``); same-origin redirects (server-side URL
+            normalization) are still followed here so a trailing-slash / case 301
+            keeps working."""
+            for _ in range(_MAX_SAME_ORIGIN_REDIRECTS + 1):
+                resp = session.request(
+                    method, url, timeout=self.timeout, allow_redirects=False, **kwargs
+                )
+                self._log_http_response(method, url, resp)
+                if not resp.is_redirect:
+                    if 300 <= resp.status_code < 400:
+                        # A 3xx the follow loop can't act on (no ``Location``
+                        # header, or a non-redirect 3xx like 300/304 — the
+                        # connector never sends conditional headers, so a 304 is
+                        # as anomalous as any other). Left to flow onward it dies
+                        # much later as a bare JSON/XML parse error on the empty
+                        # body with zero HTTP context; name the status here
+                        # instead.
+                        raise RuntimeError(
+                            f"OData request to {url!r} returned HTTP "
+                            f"{resp.status_code} without a followable same-origin "
+                            f"redirect Location — the connector cannot act on it. "
+                            f"Check the service URL and any proxy in front of "
+                            f"the service."
+                        )
+                    return resp
+                target = urljoin(url, resp.headers.get("Location", ""))
+                self._require_same_origin(target)  # off-origin → PermissionError
+                url = target
+                self._log_http_request(method, url)
+            raise RuntimeError(
+                f"OData request exceeded {_MAX_SAME_ORIGIN_REDIRECTS} same-origin "
+                f"redirects starting from {url!r} — likely a redirect loop."
+            )
 
         def _http_get_once(
             self, session: requests.Session, url: str, method: str = "GET", **kwargs: Any
         ) -> requests.Response:
             """One auth-aware request attempt; throttle handling lives in `_http_get`."""
+            self._require_same_origin(url)
             if self._should_preemptively_refresh():
                 session.headers["Authorization"] = f"Bearer {self._oauth2_token()}"
             self._log_http_request(method, url)
-            resp = session.request(method, url, timeout=self.timeout, **kwargs)
-            self._log_http_response(method, url, resp)
+            resp = self._request_same_origin(session, method, url, **kwargs)
             if resp.status_code == 401 and self._has_oauth_refresh_path():
                 session.headers["Authorization"] = f"Bearer {self._oauth2_token()}"
                 self._log_http_request(method, url)
-                resp = session.request(method, url, timeout=self.timeout, **kwargs)
-                self._log_http_response(method, url, resp)
+                resp = self._request_same_origin(session, method, url, **kwargs)
                 if resp.status_code == 401:
                     # We just minted a token straight from the OAuth provider
                     # and the source still rejected it — the access token isn't
@@ -6764,8 +11457,9 @@ def register_lakeflow_source(spark):
 
             Priority:
               1. ``Retry-After`` header — integer seconds or HTTP-date.
-              2. Exponential backoff: ``2**attempt`` seconds (1, 2, 4, 8,
-                 16 …).
+                 Honoured as-is (capped): the server picked the moment, so
+                 jittering it would retry too early.
+              2. Jittered exponential backoff via ``_backoff_delay``.
 
             Either way the value is capped at ``retry_max_delay_seconds``.
             """
@@ -6775,7 +11469,7 @@ def register_lakeflow_source(spark):
                 parsed = _parse_retry_after(header)
                 if parsed is not None:
                     return min(parsed, cap)
-            return min(float(2**attempt), cap)
+            return self._backoff_delay(attempt)
 
         def _transient_status_exhausted_error(
             self, resp: requests.Response, url: str, attempts: int
@@ -6787,6 +11481,11 @@ def register_lakeflow_source(spark):
             retry_after = resp.headers.get("Retry-After", "<none>")
             if status in (429, 503):
                 symptom = "server is throttling or temporarily unavailable"
+            elif status == 408:
+                symptom = (
+                    "server (or a proxy) timed out waiting on every attempt — "
+                    "consider raising 'timeout_seconds' or lowering 'page_size'"
+                )
             elif status == 500:
                 symptom = (
                     "server returned an internal error on every attempt — likely a "
@@ -6817,12 +11516,36 @@ def register_lakeflow_source(spark):
             triage from a pipeline log nearly impossible. This method picks
             the relevant remediation hints based on which auth mode is
             active on the connection.
+
+            403 gets its own message ahead of the per-mode 401 branches:
+            it is an *authorization* failure (the token/credentials were
+            accepted), so the token-expiry/refresh hints — and the "no
+            refresh path is configured" framing — don't apply.
             """
             status = resp.status_code
             body = _truncate(resp.text, 300) or "(empty body)"
             auth = (self.options.get("auth_type") or "").lower().strip()
             if not auth and self.options.get("token"):
                 auth = "bearer"
+            if status == 403:
+                # 403 means the request WAS authenticated but the principal is
+                # not authorized for this resource — a token refresh can't fix
+                # it (which is why the 401-refresh branch deliberately skips
+                # 403), and the "no refresh path is configured" prefix below
+                # would be false and misleading on a fully-configured oauth2
+                # connection. Say what actually needs fixing: permissions.
+                return (
+                    f"OData service returned 403 (Forbidden) for {url!r}. The "
+                    f"request was authenticated but the principal is not "
+                    f"authorized for this resource, so an automatic token "
+                    f"refresh cannot fix it. Grant the principal read access "
+                    f"to this entity set at the source (role/permission "
+                    f"assignment), or supply credentials whose scope covers it "
+                    f"(check 'oauth2_scope' and any required admin consent), "
+                    f"and confirm tenant/instance identifiers in 'service_url' "
+                    f"or 'extra_headers' match the credentials. "
+                    f"Server response: {body}"
+                )
             prefix = (
                 f"OData service returned {status} for {url!r} and no "
                 f"automatic token-refresh path is configured. "
@@ -6884,15 +11607,24 @@ def register_lakeflow_source(spark):
             """True iff a known-expiry token has hit its 60 s safety window."""
             if self._access_token_expires_at is None:
                 return False
-            return time.monotonic() >= self._access_token_expires_at
+            return time.time() >= self._access_token_expires_at
 
         def _has_oauth_refresh_path(self) -> bool:
-            """True iff `_oauth2_token()` can mint a fresh access token.
+            """True iff a 401 should be answered by minting a fresh OAuth2
+            access token: the session actually authenticates with our minted
+            bearer header (``auth_type=oauth2`` — the only branch that does),
+            AND `_oauth2_token()` has a grant to run (a refresh token for the
+            user flow, or client id + secret for client-credentials).
 
-            Either a refresh token is on hand (user flow) or
-            ``oauth2_client_id`` + ``oauth2_client_secret`` are present
-            for the client-credentials grant.
+            The ``auth_type`` gate matters: with ``auth_type=basic`` plus
+            leftover oauth2 options, minting a token sets an Authorization
+            header that ``session.auth`` overwrites at request-prepare time —
+            the retry re-sends the same rejected basic credentials and the
+            second 401 would blame "the refreshed OAuth2 token" for a basic
+            auth failure.
             """
+            if (self.options.get("auth_type") or "").lower().strip() != "oauth2":
+                return False
             if self.options.get("oauth2_refresh_token"):
                 return True
             return bool(
@@ -6920,7 +11652,19 @@ def register_lakeflow_source(spark):
                 for pair in extra_headers.split(","):
                     if ":" in pair:
                         k, v = pair.split(":", 1)
-                        session.headers[k.strip()] = v.strip()
+                        k = k.strip()
+                        # Same RFC 7230 token check as ``api_key_header`` below:
+                        # http.client's send-time regex tolerates interior spaces,
+                        # so a malformed name would otherwise go out on the wire
+                        # as-is and fail at a strict server/proxy with nothing
+                        # pointing at this option.
+                        if not re.fullmatch(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+", k):
+                            raise ValueError(
+                                f"Invalid header name {k!r} in extra_headers: not "
+                                f"a valid HTTP header name (letters, digits, and "
+                                f"!#$%&'*+-.^_`|~ only, no spaces)."
+                            )
+                        session.headers[k] = v.strip()
 
             auth_type = (self.options.get("auth_type") or "").lower().strip()
             if not auth_type and self.options.get("token"):
@@ -6934,7 +11678,18 @@ def register_lakeflow_source(spark):
                     _require(self.options, "password"),
                 )
             elif auth_type == "api_key":
-                header = self.options.get("api_key_header", "x-api-key")
+                # Strip and default-on-empty: a padded or explicitly-empty
+                # value would otherwise raise requests' uncurated
+                # ``InvalidHeader`` deep inside the first request. Validate the
+                # rest as an RFC 7230 header token so garbage fails here, with
+                # the option named, not at send time.
+                header = (self.options.get("api_key_header") or "").strip() or "x-api-key"
+                if not re.fullmatch(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+", header):
+                    raise ValueError(
+                        f"Invalid api_key_header={header!r}: not a valid HTTP "
+                        f"header name (letters, digits, and !#$%&'*+-.^_`|~ "
+                        f"only, no spaces)."
+                    )
                 session.headers[header] = _require(self.options, "api_key")
             elif auth_type == "oauth2":
                 # Two sub-modes share this branch:
@@ -6958,21 +11713,25 @@ def register_lakeflow_source(spark):
             self._session = session
             return session
 
-        def _oauth2_token(self) -> str:
-            """Mint an OAuth2 access token.
+        def _oauth2_grant_payload(self) -> tuple[dict, tuple[str, str, str] | None]:
+            """The token-endpoint form body + the rotation-stash key.
 
-            Picks the grant type from what's available in `self.options`:
-              * `oauth2_refresh_token` present -> `refresh_token` grant
-                (user-flow refresh). Client id/secret are required so the
-                token endpoint can authenticate the client.
-              * Otherwise -> `client_credentials` grant (server-to-server).
-
-            Some providers issue a rotated refresh token in the response;
-            when that happens, the new value is written back into
-            `self.options` so the next refresh uses it.
-            """
+            ``oauth2_refresh_token`` present → ``refresh_token`` grant, with
+            the latest process-wide rotation substituted for the supplied
+            value; otherwise the ``client_credentials`` grant (no rotation,
+            key ``None``). The stash key anchors on the FIRST token this
+            instance ever saw — the connection's supplied value, which every
+            recreated instance derives identically."""
             refresh_token = self.options.get("oauth2_refresh_token")
+            rotation_key: tuple[str, str, str] | None = None
             if refresh_token:
+                original = self.__dict__.setdefault("_original_refresh_token", refresh_token)
+                rotation_key = (
+                    _require(self.options, "oauth2_token_url"),
+                    _require(self.options, "oauth2_client_id"),
+                    original,
+                )
+                refresh_token = _ROTATED_REFRESH_TOKENS.get(rotation_key, refresh_token)
                 data = {
                     "grant_type": "refresh_token",
                     "refresh_token": refresh_token,
@@ -6988,12 +11747,74 @@ def register_lakeflow_source(spark):
             scope = self.options.get("oauth2_scope")
             if scope:
                 data["scope"] = scope
+            return data, rotation_key
+
+        def _oauth2_token(self) -> str:
+            """Mint an OAuth2 access token.
+
+            Picks the grant type from what's available in `self.options`:
+              * `oauth2_refresh_token` present -> `refresh_token` grant
+                (user-flow refresh). Client id/secret are required so the
+                token endpoint can authenticate the client.
+              * Otherwise -> `client_credentials` grant (server-to-server).
+
+            Some providers issue a rotated refresh token in the response;
+            when that happens, the new value is written back into
+            `self.options` AND the process-wide rotation stash (see
+            :data:`_ROTATED_REFRESH_TOKENS`) so recreated instances use it.
+            """
+            data, rotation_key = self._oauth2_grant_payload()
             token_url = _require(self.options, "oauth2_token_url")
-            resp = requests.post(
-                token_url,
-                data=data,
-                timeout=self.timeout,
-            )
+            # The token endpoint gets the same transient tolerance as the
+            # source itself: a 429/5xx or a network blip here would otherwise
+            # kill the whole read (including mid-read, via the 401-refresh and
+            # pre-emptive-refresh paths in `_http_get_once`) while the source
+            # requests around it enjoy the full retry budget.
+            for attempt in range(self.max_retries + 1):
+                try:
+                    resp = requests.post(
+                        token_url,
+                        data=data,
+                        timeout=self.timeout,
+                        # No auto-redirect: a 3xx from the token endpoint would
+                        # otherwise re-POST the ``client_secret`` body to the
+                        # redirect target (``requests`` re-sends the body on a
+                        # 307/308). The token URL is operator-configured, so a
+                        # redirect here is unexpected — surface it, don't follow.
+                        allow_redirects=False,
+                    )
+                except _TRANSIENT_NETWORK_ERRORS as exc:
+                    if attempt >= self.max_retries:
+                        raise type(exc)(
+                            f"{exc} (token endpoint {token_url!r}, after " f"{attempt + 1} attempts)"
+                        ) from exc
+                    time.sleep(self._backoff_delay(attempt))
+                    continue
+                if resp.status_code in _RETRYABLE_HTTP_STATUSES and attempt < self.max_retries:
+                    time.sleep(self._retry_after_delay(resp, attempt))
+                    continue
+                break
+            if 300 <= resp.status_code < 400:
+                # ``allow_redirects=False`` above surfaces the redirect here —
+                # following it would re-POST the ``client_secret`` body to the
+                # redirect target. Without this branch it falls past the >=400
+                # ladder into ``resp.json()`` on the (empty) redirect body and
+                # mis-diagnoses as "malformed JSON … escalate to the identity
+                # provider". The Location value is safe to print (a URL the
+                # provider chose to advertise; no credentials in it).
+                location = (resp.headers.get("Location") or "").strip()
+                raise ValueError(
+                    f"OAuth2 token endpoint {token_url!r} responded with a "
+                    f"redirect (HTTP {resp.status_code}"
+                    + (f" to {location!r}" if location else "")
+                    + "). The connector does not follow token-endpoint "
+                    "redirects — that would re-send the client credentials to "
+                    "the redirect target. Update 'oauth2_token_url' to the "
+                    "endpoint's canonical URL"
+                    + (f" (likely {location!r})" if location else "")
+                    + " and check for an http:// URL that the provider "
+                    "upgrades to https://."
+                )
             # Surface a precise, actionable error when the token endpoint
             # itself rejects the request. raise_for_status() would otherwise
             # produce a terse "401 Client Error: Unauthorized for url ..."
@@ -7009,7 +11830,14 @@ def register_lakeflow_source(spark):
                         f"client. Check that 'oauth2_refresh_token' was issued by "
                         f"the same 'oauth2_client_id' configured on this "
                         f"connection, and re-run the authorization-code flow if "
-                        f"needed. Server response: {hint}"
+                        f"needed. If the provider ROTATES refresh tokens "
+                        f"(single-use, e.g. Azure AD B2C or Okta with rotation "
+                        f"on) and this connection uses partitioned/parallel "
+                        f"reads, a parallel reader process may have consumed the "
+                        f"rotation this process never saw — use the "
+                        f"client_credentials flow (no refresh token) or "
+                        f"num_partitions=1 with such providers. Server "
+                        f"response: {hint}"
                     ) from None
                 raise ValueError(
                     f"OAuth2 token endpoint returned {resp.status_code} for the "
@@ -7017,14 +11845,47 @@ def register_lakeflow_source(spark):
                     f"'oauth2_client_secret', 'oauth2_token_url', and "
                     f"'oauth2_scope' on this connection. Server response: {hint}"
                 ) from None
-            resp.raise_for_status()
-            payload = _decode_json_with_body(resp, token_url)
+            if resp.status_code >= 400:
+                # 403 / retry-exhausted 5xx / anything else: same actionable shape
+                # as the 400/401 branches instead of raise_for_status()'s terse
+                # one-liner. The hint extractor is safe here — OAuth ERROR bodies
+                # carry error codes/descriptions, never live tokens (only 2xx
+                # bodies do, and those are handled below with the body withheld).
+                hint = _extract_oauth_error_hint(resp)
+                raise ValueError(
+                    f"OAuth2 token endpoint {token_url!r} returned "
+                    f"{resp.status_code}. Server response: {hint}"
+                ) from None
+            try:
+                payload = resp.json()
+            except ValueError:
+                # NEVER route this through ``_decode_json_with_body``: it bakes
+                # the response body into the exception message, and a truncated
+                # token response is exactly ``{"access_token": "<live secret>``
+                # cut mid-document — echoing it would put a working credential
+                # into pipeline logs. Diagnose with metadata only; ``from None``
+                # severs the chained decoder error, whose ``.doc`` attribute
+                # carries the full body.
+                raise RuntimeError(
+                    f"OAuth2 token endpoint returned malformed JSON "
+                    f"(HTTP {resp.status_code}, {len(resp.text or '')} chars) "
+                    f"from {token_url}. Response body withheld from this "
+                    f"message because token responses carry live credentials; "
+                    f"retry, and escalate to the identity provider if it "
+                    f"persists."
+                ) from None
             token = payload.get("access_token")
             if not token:
                 raise RuntimeError("OAuth2 token endpoint did not return access_token.")
             rotated_refresh = payload.get("refresh_token")
             if rotated_refresh:
+                # Instance-local for this run's requests AND process-wide so
+                # the fresh instance SDP builds for the next microbatch (from
+                # the connection's ORIGINAL options) finds the rotation
+                # instead of replaying a token the provider may have revoked.
                 self.options["oauth2_refresh_token"] = rotated_refresh
+                if rotation_key is not None:
+                    _ROTATED_REFRESH_TOKENS[rotation_key] = rotated_refresh
             # Track wall-clock deadline so `_http_get` can refresh the token
             # *before* the source returns 401. Subtract a 60 s safety margin
             # to cover clock skew + in-flight request latency. Absent
@@ -7033,7 +11894,12 @@ def register_lakeflow_source(spark):
             expires_in = payload.get("expires_in")
             if expires_in is not None:
                 try:
-                    self._access_token_expires_at = time.monotonic() + int(expires_in) - 60
+                    # Wall clock, NOT ``time.monotonic()`` — the deadline
+                    # rides the pickled connector to executors, where the
+                    # monotonic epoch is a different arbitrary origin on a
+                    # different host; wall clocks are comparable across
+                    # hosts (the 60 s margin absorbs ordinary skew).
+                    self._access_token_expires_at = time.time() + int(expires_in) - 60
                 except (TypeError, ValueError):
                     self._access_token_expires_at = None
             else:
@@ -7061,8 +11927,12 @@ def register_lakeflow_source(spark):
                the lookup methods see the same cached root + index.
             2. Module ``_METADATA_CACHE`` keyed by ``service_url`` — shared
                across all connector instances in the same Python process.
-               Stores ``(xml_text, root, index)`` so the index isn't
-               rebuilt per instance either.
+               Stores ``(xml_text, root, index, fetched_at)`` so the index
+               isn't rebuilt per instance either. Honours
+               ``metadata_cache_ttl_seconds`` exactly like layer 3: entries
+               past the TTL are refreshed, and a TTL of 0 skips the layer
+               entirely (read AND write) so ``$metadata`` is re-fetched per
+               instance as documented.
             3. On-disk pickle at ``_metadata_cache_path(service_url)`` —
                shared across forked ``pyspark.daemon`` workers (PySpark
                forks one per ``.load()`` schema inference). The pickle
@@ -7073,20 +11943,28 @@ def register_lakeflow_source(spark):
             """
             if self._metadata is not None:
                 return self._metadata
-            cached = _METADATA_CACHE.get(self.service_url)
+            ttl = self.metadata_cache_ttl_seconds
+            cached = _METADATA_CACHE.get(self.service_url) if ttl > 0 else None
             if cached is not None:
-                xml_text, root, index = cached
-                self._metadata = _MetadataState(root=root, index=index)
-                # ``xml_text`` is only needed for the write path; once
-                # cached, we don't carry it on the bundle.
-                del xml_text
-                return self._metadata
+                xml_text, root, index, fetched_at = cached
+                if time.time() - fetched_at <= ttl:
+                    self._metadata = _MetadataState(root=root, index=index)
+                    # ``xml_text`` is only needed for the write path; once
+                    # cached, we don't carry it on the bundle.
+                    del xml_text
+                    return self._metadata
+                # Expired — drop it so a concurrent reader doesn't race the
+                # refresh below against the stale entry.
+                _METADATA_CACHE.pop(self.service_url, None)
             file_cached = self._read_metadata_file_cache()
             if file_cached is not None:
-                xml_text, root = file_cached
+                xml_text, root, fetched_at = file_cached
                 index = _build_csdl_index(root)
                 self._metadata = _MetadataState(root=root, index=index)
-                _METADATA_CACHE[self.service_url] = (xml_text, root, index)
+                # Stamp with the FILE's fetch time (its mtime), not now() —
+                # the process entry must expire when the on-disk one would,
+                # or an old document gains a second TTL lease per process.
+                _metadata_cache_put(self.service_url, (xml_text, root, index, fetched_at))
                 return self._metadata
             session = self._get_session()
             url = _join_url(self.service_url, "$metadata")
@@ -7096,16 +11974,18 @@ def register_lakeflow_source(spark):
             root = ET.fromstring(xml_text)
             index = _build_csdl_index(root)
             self._metadata = _MetadataState(root=root, index=index)
-            _METADATA_CACHE[self.service_url] = (xml_text, root, index)
+            if ttl > 0:
+                _metadata_cache_put(self.service_url, (xml_text, root, index, time.time()))
             self._write_metadata_file_cache(xml_text, root)
             return self._metadata
 
-        def _read_metadata_file_cache(self) -> tuple[str, ET.Element] | None:
-            """Return the cached ``(xml_text, parsed_root)`` from the
-            on-disk pickle if it exists and is within the TTL. Returns
-            ``None`` for any miss (missing, expired, unreadable,
-            unpicklable). All failures are silent — the caller falls
-            through to the network."""
+        def _read_metadata_file_cache(self) -> tuple[str, ET.Element, float] | None:
+            """Return the cached ``(xml_text, parsed_root, fetched_at)`` from
+            the on-disk pickle if it exists and is within the TTL —
+            ``fetched_at`` is the file's mtime, i.e. when the writing process
+            fetched the document. Returns ``None`` for any miss (missing,
+            expired, unreadable, unpicklable). All failures are silent — the
+            caller falls through to the network."""
             if self.metadata_cache_ttl_seconds <= 0:
                 return None
             path = _metadata_cache_path(self.service_url)
@@ -7114,6 +11994,13 @@ def register_lakeflow_source(spark):
             except OSError:
                 return None
             if time.time() - mtime > self.metadata_cache_ttl_seconds:
+                return None
+            if not _cache_file_owned_by_us(path):
+                # NEVER unpickle a file another uid put at our (predictable)
+                # cache path — unpickling is arbitrary code execution, and the
+                # shape check below runs after the damage. The per-user filename
+                # already makes this unreachable in practice; this is the
+                # defense-in-depth backstop.
                 return None
             try:
                 with open(path, "rb") as fh:
@@ -7129,33 +12016,64 @@ def register_lakeflow_source(spark):
                 or not isinstance(payload[1], ET.Element)
             ):
                 return None
-            return payload
+            return payload[0], payload[1], mtime
 
         def _write_metadata_file_cache(self, xml_text: str, root: ET.Element) -> None:
             """Best-effort write of ``(xml_text, parsed_root)`` to the
-            on-disk pickle. Uses atomic rename so a concurrent reader
-            either sees the old file or the fully-written new one, never
-            a torn write."""
+            on-disk pickle via :func:`_replace_with_private_tmp` — atomic
+            rename (a concurrent reader sees the old file or the new one,
+            never a torn write) through an unpredictable ``O_EXCL`` temp
+            name, so a pre-planted symlink can't redirect the write. File
+            cache is purely an optimization: if anything goes wrong
+            (read-only tempdir, disk full, pickling failure) the connector
+            still works — just slower."""
             if self.metadata_cache_ttl_seconds <= 0:
                 return
-            path = _metadata_cache_path(self.service_url)
-            tmp_path = f"{path}.{os.getpid()}.tmp"
             try:
-                with open(tmp_path, "wb") as fh:
-                    pickle.dump((xml_text, root), fh, protocol=pickle.HIGHEST_PROTOCOL)
-                os.replace(tmp_path, path)
-            except (OSError, pickle.PicklingError):
-                # File cache is purely an optimization. If anything goes
-                # wrong (read-only tempdir, disk full, pickling failure)
-                # the connector still works — just slower.
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
+                data = pickle.dumps((xml_text, root), protocol=pickle.HIGHEST_PROTOCOL)
+            except (pickle.PicklingError, RecursionError):
+                # RecursionError: a pathologically deep CSDL tree can blow the
+                # pickler's stack — the cache is an optimization, never worth
+                # failing the read over.
+                return
+            _replace_with_private_tmp(_metadata_cache_path(self.service_url), data)
 
         def _entity_set_index(self) -> list[tuple[str, str]]:
             """All (schema_namespace, entity_set_name) pairs declared in $metadata."""
             return self._metadata_state().index.entity_set_pairs
+
+        def _table_segments(self, table_name: str) -> list[str] | None:
+            """:func:`parse_contained_path` with the declared-flat-set override:
+            the LONGEST prefix declared as a top-level entity set becomes
+            ``segments[0]``, even when it contains ``__``. CSDL
+            SimpleIdentifiers legally allow consecutive underscores, so
+            ``My__Set`` can be a real entity set — without the override
+            ``list_tables`` emits names (``My__Set``, and its contained
+            children like ``My__Set__Kids``) the read path then splits into a
+            nonexistent containment path and can never resolve. Longest-prefix
+            also pins the collision rule the README documents: a declared flat
+            set always shadows a containment-path spelling of the same name.
+            Every table-name split in the connector goes through here; the raw
+            parser is only for contexts with no metadata access."""
+            if _CONTAINED_PATH_SEP in table_name:
+                try:
+                    declared = self._metadata_state().index.entity_set_by_name
+                except Exception:  # noqa: BLE001 — let the parse/resolve error surface instead
+                    declared = None
+                if declared is not None:
+                    if table_name in declared:
+                        return None
+                    parts = table_name.split(_CONTAINED_PATH_SEP)
+                    # Longest declared ``__``-bearing prefix wins; the remainder
+                    # parses as the containment path under it. k=1 (a plain
+                    # single-segment head) is the raw parser's own result, and
+                    # empty remainder segments fall through so the parser raises
+                    # its precise empty-segment error.
+                    for k in range(len(parts) - 1, 1, -1):
+                        head = _CONTAINED_PATH_SEP.join(parts[:k])
+                        if head in declared and all(parts[k:]):
+                            return [head] + parts[k:]
+            return _parse_contained_path(table_name)
 
         def _entity_type_for(self, table_name: str, namespace: str | None = None) -> ET.Element:
             """Resolve flat names or contained paths (segment-by-segment via
@@ -7165,7 +12083,7 @@ def register_lakeflow_source(spark):
             cached = state.entity_type.get(cache_key)
             if cached is not None:
                 return cached
-            segments = _parse_contained_path(table_name) or [table_name]
+            segments = self._table_segments(table_name) or [table_name]
             et = self._flat_entity_type_for(segments[0], namespace)
             for idx, child_segment in enumerate(segments[1:], start=1):
                 nav_props = self._all_contained_nav_props(et)
@@ -7191,12 +12109,24 @@ def register_lakeflow_source(spark):
             """Resolve a top-level entity-set name to its EntityType element."""
             index = self._metadata_state().index
             candidates = index.entity_set_by_name.get(table_name) or []
+            requested_ns = namespace
             if namespace is not None:
+                # Accept the schema's ``Alias`` as well as its canonical
+                # ``Namespace`` — CSDL lets type references use either, so
+                # the table option should too. Error messages echo what the
+                # user actually passed (``requested_ns``), naming the
+                # canonical resolution when it differs.
+                namespace = index.alias_to_namespace.get(namespace, namespace)
                 matches = [(ns, ref) for ns, ref in candidates if ns == namespace]
             else:
                 matches = list(candidates)
             if not matches:
                 if namespace is not None:
+                    shown = (
+                        f"{requested_ns!r}"
+                        if requested_ns == namespace
+                        else f"{requested_ns!r} (alias of {namespace!r})"
+                    )
                     hint = sorted(index.entity_set_names_by_ns.get(namespace, []))
                     if not hint:
                         # The requested namespace has zero entity sets — common
@@ -7205,13 +12135,13 @@ def register_lakeflow_source(spark):
                         # the schema whose <EntityContainer> declares the sets.
                         raise ValueError(
                             f"Entity set {table_name!r} not found in namespace "
-                            f"{namespace!r}. Namespace {namespace!r} declares "
+                            f"{shown}. Namespace {shown} declares "
                             f"no entity sets (probably a type-only schema). "
                             f"Namespaces with entity sets: {sorted(index.namespaces_with_sets)}."
                         )
                     raise ValueError(
                         f"Entity set {table_name!r} not found in namespace "
-                        f"{namespace!r}. Available in this namespace: {hint}"
+                        f"{shown}. Available in this namespace: {hint}"
                     )
                 raise ValueError(
                     f"Entity set {table_name!r} not found in $metadata. "
@@ -7219,6 +12149,16 @@ def register_lakeflow_source(spark):
                 )
             if len(matches) > 1:
                 namespaces = sorted({m[0] for m in matches})
+                if len(namespaces) == 1:
+                    # Same name twice in ONE namespace (multiple containers in
+                    # one schema — malformed CSDL): 'namespace' can't
+                    # disambiguate, so don't suggest it.
+                    raise ValueError(
+                        f"Entity set {table_name!r} is declared more than once in "
+                        f"namespace {namespaces[0]!r} (malformed $metadata — "
+                        f"duplicate EntitySet declarations). The connector cannot "
+                        f"tell the declarations apart; fix the service metadata."
+                    )
                 raise ValueError(
                     f"Entity set {table_name!r} is declared in multiple namespaces: "
                     f"{namespaces}. Set 'namespace' in table_options to disambiguate."
@@ -7301,11 +12241,19 @@ def register_lakeflow_source(spark):
 
         def _fields_for(self, table_name: str, namespace: str | None = None) -> list[StructField]:
             state = self._metadata_state()
-            cache_key = (table_name, namespace)
+            # The result embeds the exclusion-FILTERED FK columns, so the
+            # current ``exclude_ancestor_columns`` set must be part of the key:
+            # a (table, namespace)-only key would freeze schema AND composite
+            # PK at the first call's exclusions while row stamping follows the
+            # current ones — hard parse failures one way, silent MERGE
+            # collisions the other (``_resolve_fk_columns`` itself caches
+            # unfiltered for exactly this reason).
+            excluded = getattr(self, "_excluded_ancestor_columns", frozenset())
+            cache_key = (table_name, namespace, excluded)
             cached = state.fields.get(cache_key)
             if cached is not None:
                 return cached
-            segments = _parse_contained_path(table_name) or [table_name]
+            segments = self._table_segments(table_name) or [table_name]
             own_fields = self._own_fields_for_et(self._entity_type_for(table_name, namespace))
             if len(segments) == 1:
                 state.fields[cache_key] = own_fields
@@ -7315,8 +12263,7 @@ def register_lakeflow_source(spark):
             fk_columns = self._resolve_fk_columns(segments, namespace)
             fk_fields: list[StructField] = []
             for idx in range(len(segments) - 1):
-                seg = segments[idx]
-                if not any(k[0] == seg for k in fk_columns):
+                if not any(k[0] == idx for k in fk_columns):
                     continue
                 ancestor_et = self._entity_type_for(
                     _CONTAINED_PATH_SEP.join(segments[: idx + 1]), namespace
@@ -7325,7 +12272,7 @@ def register_lakeflow_source(spark):
                 for pk in self._own_primary_keys_for_et(ancestor_et):
                     fk_fields.append(
                         StructField(
-                            fk_columns[(seg, pk)],
+                            fk_columns[(idx, pk)],
                             own.get(pk, StringType()),
                             False,
                         )
@@ -7351,11 +12298,28 @@ def register_lakeflow_source(spark):
                     if name in seen:
                         continue
                     seen.add(name)
+                    nullable = prop.get("Nullable", "true").lower() != "false"
+                    if prop.get("Type") == "Edm.Stream":
+                        # §11.2.4: stream values are media references the JSON
+                        # payload NEVER carries — honoring Nullable="false" here
+                        # would fail EVERY row of the table on the framework's
+                        # absent-non-nullable check. The column is always null.
+                        nullable = True
                     fields.append(
                         StructField(
                             name,
-                            _EDM_TO_SPARK.get(prop.get("Type", "Edm.String"), StringType()),
-                            prop.get("Nullable", "true").lower() != "false",
+                            # TypeDefinition-resolved: a property typed ``ta.Qty``
+                            # (UnderlyingType Edm.Int64) must map to LongType, not
+                            # the StringType fallback — the literal-rendering map
+                            # already resolves the same way, and a split verdict
+                            # silently degrades every TypeDefinition-backed column
+                            # (SAP uses them in production) to a string at the
+                            # destination.
+                            _spark_type_for_property(
+                                prop,
+                                self._resolve_underlying_type(prop.get("Type", "Edm.String")),
+                            ),
+                            nullable,
                         )
                     )
             state.own_fields[cache_key] = fields
@@ -7363,11 +12327,14 @@ def register_lakeflow_source(spark):
 
         def _primary_keys_for(self, table_name: str, namespace: str | None = None) -> list[str]:
             state = self._metadata_state()
-            cache_key = (table_name, namespace)
+            # Exclusion-aware key — same poisoning door as ``_fields_for``:
+            # the composite PK embeds the filtered FK columns.
+            excluded = getattr(self, "_excluded_ancestor_columns", frozenset())
+            cache_key = (table_name, namespace, excluded)
             cached = state.primary_keys.get(cache_key)
             if cached is not None:
                 return cached
-            segments = _parse_contained_path(table_name) or [table_name]
+            segments = self._table_segments(table_name) or [table_name]
             leaf_pks = self._own_primary_keys_for_et(self._entity_type_for(table_name, namespace))
             if len(segments) == 1:
                 state.primary_keys[cache_key] = leaf_pks
@@ -7376,14 +12343,13 @@ def register_lakeflow_source(spark):
             fk_columns = self._resolve_fk_columns(segments, namespace)
             composite: list[str] = []
             for idx in range(len(segments) - 1):
-                seg = segments[idx]
-                if not any(k[0] == seg for k in fk_columns):
+                if not any(k[0] == idx for k in fk_columns):
                     continue
                 ancestor_et = self._entity_type_for(
                     _CONTAINED_PATH_SEP.join(segments[: idx + 1]), namespace
                 )
                 for pk in self._own_primary_keys_for_et(ancestor_et):
-                    composite.append(fk_columns[(seg, pk)])
+                    composite.append(fk_columns[(idx, pk)])
             composite.extend(leaf_pks)
             state.primary_keys[cache_key] = composite
             return composite
@@ -7401,15 +12367,90 @@ def register_lakeflow_source(spark):
                 key = type_el.find(f"{_NS_EDM}Key")
                 if key is not None:
                     result = [ref.get("Name") for ref in key.findall(f"{_NS_EDM}PropertyRef")]
+                    if any("/" in (name or "") for name in result):
+                        # Complex-path key (<PropertyRef Name="Info/Code"
+                        # Alias="IC"/>). Neither the raw path NOR the alias is a
+                        # column the emitted rows carry (the value sits nested
+                        # inside the complex property's JSON), so reporting
+                        # either hands the destination a MERGE key no column
+                        # matches — a silent contract desync. No mainstream
+                        # service uses this key form; fail loudly and honestly.
+                        raise ValueError(
+                            f"Entity type {et.get('Name')!r} keys on a property "
+                            f"inside a complex type ({[n for n in result if '/' in (n or '')]}); "
+                            f"this connector maps complex properties to JSON "
+                            f"strings and cannot address or MERGE on nested "
+                            f"keys. Ingest a different entity set, or expose a "
+                            f"flattened key on the server."
+                        )
                     break
             state.own_pks[cache_key] = result
             return result
+
+        def _edm_types_for_et(self, et: ET.Element) -> dict[str, str]:
+            """Declared property → Edm-type map over the base-type chain
+            (closest-to-ROOT declaration wins, matching ``_own_fields_for_et``
+            — the SCHEMA resolver: the seek/predicate literal must be quoted
+            for the type the schema declares and the framework parser expects,
+            so on (spec-forbidden) redeclaring metadata the two must not
+            diverge).
+
+            Feeds ``odata_literal_typed`` at the key-predicate / keyset-seek
+            render sites: the OData JSON payload delivers ``Edm.Guid`` (and, on
+            IEEE754Compatible servers, ``Edm.Int64``/``Edm.Decimal``) values as
+            JSON strings, so only the declared type can decide whether the wire
+            literal is quoted. Missing/undeclared properties simply aren't in the
+            map — the renderer falls back to the value sniff for those."""
+            state = self._metadata_state()
+            cache_key = id(et)
+            cached = state.edm_types.get(cache_key)
+            if cached is not None:
+                return cached
+            result: dict[str, str] = {}
+            # ``reversed``: root-first, first declaration wins — the same
+            # direction ``_own_fields_for_et`` resolves the schema with.
+            for type_el in reversed(self._resolve_base_chain(et)):
+                for prop in type_el.findall(f"{_NS_EDM}Property"):
+                    name = prop.get("Name")
+                    if name and name not in result:
+                        result[name] = self._resolve_underlying_type(prop.get("Type", "Edm.String"))
+            state.edm_types[cache_key] = result
+            return result
+
+        def _resolve_underlying_type(self, type_ref: str) -> str:
+            """Resolve a ``<TypeDefinition>``-typed property reference to its
+            underlying ``Edm.*`` primitive; anything else passes through
+            verbatim. A definition backed by ``Edm.String`` must quote its
+            literals like any string — recording the definition name instead
+            would drop the property out of typed rendering and an ISO-looking
+            value would render bare (the exact misfire typed rendering
+            exists to prevent). Accepts alias- or namespace-qualified refs."""
+            if type_ref.startswith("Edm.") or "." not in type_ref:
+                return type_ref
+            index = self._metadata_state().index
+            prefix, type_name = type_ref.rsplit(".", 1)
+            target_ns = index.alias_to_namespace.get(prefix)
+            if target_ns is None:
+                return type_ref
+            return index.typedef_underlying.get(f"{target_ns}.{type_name}", type_ref)
+
+        def _edm_types_for_table(self, table_name: str, namespace: str | None) -> dict[str, str]:
+            """Best-effort :meth:`_edm_types_for_et` by table name / contained
+            path. Resolution failure returns ``{}`` (sniff-based literal
+            rendering) — typing seek literals must never break a read that
+            worked untyped."""
+            try:
+                return self._edm_types_for_et(self._entity_type_for(table_name, namespace))
+            except Exception:  # noqa: BLE001 — metadata gaps must not break reads
+                return {}
 
         # ------------------------------------------------------------------
         # Cursor filter formatting
         # ------------------------------------------------------------------
 
-        def _cursor_filter(self, cursor_field: str, since: Any) -> str | None:
+        def _cursor_filter(
+            self, cursor_field: str, since: Any, edm_type: str | None = None
+        ) -> str | None:
             """Build the `$filter` clause for an incremental fetch.
 
             Strict `cursor gt since` once the offset has advanced; `None` on
@@ -7418,10 +12459,18 @@ def register_lakeflow_source(spark):
             is no wall-clock ceiling, which is what makes continuous polling
             work and what keeps the connector type-agnostic over the cursor
             column.
+
+            ``edm_type`` (the cursor column's declared Edm type, when the
+            caller has it) steers literal quoting via ``odata_literal_typed``
+            — an IEEE754Compatible server renders an Edm.Int64 watermark as a
+            STRING, and the untyped sniff would quote it (``Seq gt '7000'``:
+            strict servers 400). Callers without CSDL in reach fall back to
+            the sniff, exactly as before.
             """
             if since is None:
                 return None
-            return f"{cursor_field} gt {_odata_literal(since)}"
+            literal = _odata_literal_typed(since, edm_type) if edm_type else _odata_literal(since)
+            return f"{cursor_field} gt {literal}"
 
         def _cursor_max_end_offset(self, cursors: list, since: Any) -> dict:
             """End offset for a natural-completion cursor batch: ``{"cursor": max}``
@@ -7432,9 +12481,17 @@ def register_lakeflow_source(spark):
             (``_read_contained_incremental_leaf_cursor``) reads. ``{"cursor": None}``
             must never be committed — it would advance ``{}`` → ``{"cursor": None}``
             on an all-null-cursor batch and then loop the no-progress guard — so a
-            null-only batch yields ``since`` (if carried) or ``{}``."""
+            null-only batch yields ``since`` (if carried) or ``{}``. The max is
+            CURSOR-ordered (chronological for ISO renderings — a lexical ``max``
+            prefers ``…00Z`` over the later ``…00.5Z``, regressing the watermark
+            behind emitted rows) and FLOORED at ``since``: with an active lookback
+            window the read filter sits below the committed watermark, and if the
+            watermark-defining row was deleted between batches the overlap's own
+            max lands below ``since`` — committing it would regress the watermark
+            (duplicate-safe, but the window re-reads grow and can repeat every
+            batch)."""
             if cursors:
-                return {"cursor": max(cursors)}
+                return {"cursor": _max_or(_cursor_max(cursors), since)}
             if since is not None:
                 return {"cursor": since}
             return {}
@@ -7493,7 +12550,12 @@ def register_lakeflow_source(spark):
                 raise ValueError(
                     f"Invalid cursor_lookback_factor={raw!r}; expected a positive number."
                 ) from exc
-            if val <= 0:
+            # NaN slips past every ``<=`` comparison (all NaN comparisons are
+            # False) and then poisons the resolved window — min/max keep it and
+            # the read dies at ``timedelta(seconds=nan)`` with an uncurated
+            # ValueError. The only ``float()``-based option parser, so the only
+            # place this check is needed (the int parsers reject "nan" upfront).
+            if val <= 0 or math.isnan(val):
                 raise ValueError(f"cursor_lookback_factor must be > 0; got {val}.")
             return val
 
@@ -7533,7 +12595,22 @@ def register_lakeflow_source(spark):
             mode = getattr(self, "_cursor_lookback", "auto")
             if mode != "auto":
                 return int(mode)
-            history = (start_offset or {}).get("lb_history") or []
+            raw_history = (start_offset or {}).get("lb_history") or []
+            # Connector-written entries are always positive finite floats (the
+            # append guards ``measured > 0`` and the clock-skew max), but the
+            # checkpoint is user-visible state: a hand-edited/corrupt entry
+            # ("abc", NaN, a negative) would otherwise crash the multiply /
+            # timedelta uncurated — or, worse for a negative, float the read
+            # filter ABOVE the watermark (a silent exclusion band). Same
+            # non-finite discipline as the cursor_lookback_factor parser.
+            history = [
+                v
+                for v in raw_history
+                if isinstance(v, (int, float))
+                and not isinstance(v, bool)
+                and math.isfinite(v)
+                and v > 0
+            ]
             if not history:
                 return 0
             factor = getattr(self, "_cursor_lookback_factor", _LOOKBACK_AUTO_DEFAULT_FACTOR)
@@ -7553,30 +12630,57 @@ def register_lakeflow_source(spark):
             ``_resolve_active_lookback`` sizes the window from its max.
 
             * In-flight (the walk spans more cap-resume batches): carry the prior
-              history unchanged so the read floor stays stable until completion.
+              history unchanged so the read floor stays stable until completion,
+              and stamp ``lb_cycle_started`` (wall-clock epoch, set once at the
+              cycle's first batch) so completion can measure the WHOLE cycle.
             * Idled (``out_offset is start_offset`` — quiescent overlap re-read):
               keep the prior history; a quiescent walk only re-reads the small
               overlap and would under-represent a real walk.
-            * Completed a progressing walk: append this batch's wall-clock
-              ``elapsed`` (rounded to nanoseconds, capped to the last N).
+            * Completed a progressing walk: append the cycle's wall-clock span —
+              ``now - lb_cycle_started`` when the walk spanned multiple capped
+              batches (the churn-exposure window of a capped cycle is the full
+              span INCLUDING the trigger intervals between batches, so sizing
+              from one batch's drain time alone under-covers it), else this
+              batch's ``elapsed`` (rounded to nanoseconds, capped to the last N).
               Sub-second walks ARE recorded — on a small/fast source the
               mid-walk-arrival window is itself sub-second, so a sub-second
               overlap is exactly what recovers rows that landed just below the
               committed watermark; the old whole-second rounding floored those to
               a zero window and stranded them. Idle/empty batches never reach
               here (``out_offset is start_offset``), so only real walks are
-              captured — never a no-op zero.
+              captured — never a no-op zero. A pathological multi-hour cycle
+              can't blow the window up: ``_resolve_active_lookback`` clamps to
+              ``cursor_lookback_max_seconds``.
             """
             if getattr(self, "_cursor_lookback", "auto") != "auto":
                 return out_offset
             if out_offset is start_offset:
                 return out_offset
             history = list((start_offset or {}).get("lb_history") or [])
-            if not in_flight:
-                measured = round(elapsed, 9)
-                if measured > 0:
-                    history.append(measured)
-                    history = history[-_LOOKBACK_AUTO_WINDOW:]
+            cycle_started = (start_offset or {}).get("lb_cycle_started")
+            if in_flight:
+                out = {k: v for k, v in out_offset.items() if k != "lb_cycle_started"}
+                if cycle_started is None:
+                    # First capped batch of a cycle: anchor at this batch's start
+                    # (wall clock; ``elapsed`` is a duration, safe to subtract).
+                    cycle_started = round(time.time() - elapsed, 3)
+                out["lb_cycle_started"] = cycle_started
+                if history:
+                    out["lb_history"] = history
+                return out
+            measured = round(elapsed, 9)
+            if cycle_started is not None:
+                try:
+                    # Multi-batch cycle: the exposure span is first-batch start to
+                    # now. ``max`` guards a skewed/stepped wall clock — never
+                    # record less than the final batch's own walk.
+                    measured = max(measured, round(time.time() - float(cycle_started), 9))
+                except (TypeError, ValueError):
+                    pass
+            if measured > 0:
+                history.append(measured)
+                history = history[-_LOOKBACK_AUTO_WINDOW:]
+            out_offset = {k: v for k, v in out_offset.items() if k != "lb_cycle_started"}
             if not history:
                 return out_offset
             return {**out_offset, "lb_history": history}
@@ -7586,11 +12690,10 @@ def register_lakeflow_source(spark):
 
             Unchanged when the active window is 0 or ``since`` is ``None`` (the
             first read stays unfiltered). For a positive window the cursor must be
-            a timestamp — ISO-8601 string or ``datetime``; the result is a
-            tz-aware ``datetime`` that ``_odata_literal`` renders to an OData
-            timestamp literal, so the server compares datetimes regardless of the
-            rendered format. The committed watermark is never floored — only the
-            read filter is — so the offset still advances to the true max seen.
+            a timestamp — ISO-8601 string or ``datetime``; the result is a BARE
+            ISO-8601 string (same value space as the rows' own cursor text). The
+            committed watermark is never floored — only the read filter is — so
+            the offset still advances to the true max seen.
 
             A non-timestamp cursor under ``auto`` is a no-op (auto is the default
             and must not break such tables); under an explicit window it raises."""
@@ -7600,7 +12703,7 @@ def register_lakeflow_source(spark):
             dt = since
             if isinstance(since, str):
                 try:
-                    dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+                    dt = _parse_iso8601(since)
                 except ValueError as exc:
                     if getattr(self, "_cursor_lookback", "auto") == "auto":
                         return since
@@ -7617,12 +12720,18 @@ def register_lakeflow_source(spark):
                     f"cursor_lookback_seconds={seconds} requires a datetime/"
                     f"timestamp cursor; got {type(since).__name__} {since!r}."
                 )
-            # Return the OData timestamp LITERAL (``...Z``), not a datetime: the
-            # leaf-cursor walk compares it client-side against the rows' own
-            # cursor strings (``rec_cursor <= chain_since``), which would raise on
-            # a str-vs-datetime mix. The string renders bare in the URL exactly as
-            # the datetime did, so the expand path's wire filter is unchanged.
-            return _odata_literal(dt - timedelta(seconds=seconds))
+            # Return the BARE ISO string (``...Z`` / ``...+10:00``), not a
+            # datetime and NOT ``_odata_literal(...)``: the leaf-cursor walk
+            # compares it client-side against the rows' own cursor strings
+            # (``rec_cursor <= chain_since``) — a NAIVE datetime would still
+            # raise through ``_cursor_le``'s raw fallback, and a pre-escaped
+            # literal would compare escaped-vs-raw text AND get re-fed through
+            # ``_odata_literal`` at the ``_cursor_filter`` URL build, where a
+            # non-UTC ``%2B`` offset fails the ISO sniff and double-escapes
+            # into a quoted garbage string on the wire. Raw value space here;
+            # the single escape happens at literal generation.
+            floored = (dt - timedelta(seconds=seconds)).isoformat()
+            return floored.replace("+00:00", "Z")
 
         # ------------------------------------------------------------------
         # Null-cursor policy (``cursor_nulls``)
@@ -7638,7 +12747,10 @@ def register_lakeflow_source(spark):
             (default ``2000``). The year suffix is only valid with
             ``coalesce``. Raises on an unrecognised mode or a malformed year.
             """
-            raw = (table_options or {}).get("cursor_nulls", "coalesce").strip().lower()
+            # ``or``-defaulting (not ``.get`` default) so an explicitly-empty
+            # value means "unset" — consistent with delta_tracking / pagination /
+            # expand_contained, which all treat "" as their default.
+            raw = ((table_options or {}).get("cursor_nulls") or "coalesce").strip().lower()
             mode, _, floor = raw.partition(":")
             mode = mode.strip()
             if mode not in ("coalesce", "error", "ignore"):
@@ -7905,22 +13017,80 @@ def register_lakeflow_source(spark):
         return val
 
 
-    # Re-export base64/binary helper for any downstream caller that wants
-    # to materialize Edm.Binary fields into Python bytes prior to Spark.
+    # Materialize an OData JSON ``Edm.Binary`` value into Python ``bytes``. The
+    # wire form is base64url (OData v4.01 JSON, ``-``/``_`` alphabet, padding
+    # optional); ``urlsafe_b64decode`` also accepts a standard-base64 string (its
+    # ``-_``→``+/`` translate leaves ``+/`` untouched), so both encodings decode.
+    # The framework's own parser only understands standard base64, so without this
+    # a base64url payload is silently corrupted.
     def _decode_binary(value: str) -> bytes:
-        return base64.b64decode(value)
+        return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
+    def _decode_binary_fields(row: dict, binary_fields: frozenset) -> dict:
+        """Decode base64url ``Edm.Binary`` string values in ``row`` to raw bytes.
+
+        Returns ``row`` unchanged when there are no binary columns or none carry a
+        string value (the common case — no copy). A clean base64url or standard
+        base64 payload always decodes correctly; a value that *raises* (e.g. an
+        invalid length) keeps its original form (the framework's lossy fallback
+        then runs, no worse than before). Note ``urlsafe_b64decode`` silently
+        drops stray non-alphabet characters rather than raising, so a garbage
+        payload that survives to a valid length decodes to whatever its valid
+        characters spell — but such inputs are already non-conformant and were
+        corrupted before this decode existed. Never mutates the caller's row —
+        lookback re-emits the same object, so an in-place edit would double-decode
+        on the second pass."""
+        if not binary_fields:
+            return row
+        out = None
+        for name in binary_fields:
+            value = row.get(name)
+            if isinstance(value, str):
+                try:
+                    decoded = _decode_binary(value)
+                except Exception:  # pylint: disable=broad-except
+                    continue
+                if out is None:
+                    out = dict(row)
+                out[name] = decoded
+        return out if out is not None else row
+
+
+    _cursor_le = cursor_le
+    _cursor_max = cursor_max
+    _cursor_newer = cursor_newer
+    _cursor_same_instant = cursor_same_instant
+    _cursor_same_rendering = cursor_same_rendering
     _max_or = max_or
+    _parse_max_records = parse_max_records
     _trim_to_distinct_cursor_boundary = trim_to_distinct_cursor_boundary
+    _url_origin = url_origin
+    _DELETED_COL = DELETED_COL
+    _SEQUENCE_COL = SEQUENCE_COL
+    _cursor_le = cursor_le
+    _jsonify_complex_values = jsonify_complex_values
+    _max_or = max_or
+    _DELETED_COL = DELETED_COL
+    _SEQUENCE_COL = SEQUENCE_COL
+    _cursor_le = cursor_le
+    _cursor_max = cursor_max
+    _jsonify_complex_values = jsonify_complex_values
+    _max_or = max_or
+    _pad_row_to_fields = pad_row_to_fields
+    _parse_iso8601 = parse_iso8601
+    _parse_max_records = parse_max_records
     _trim_to_distinct_cursor_boundary = trim_to_distinct_cursor_boundary
+    _url_origin = url_origin
     _CONTAINED_PATH_SEP = CONTAINED_PATH_SEP
     _DEFAULT_PAGE_SIZE = DEFAULT_PAGE_SIZE
     _combine_filters = combine_filters
     _join_url = join_url
     _odata_literal = odata_literal
+    _odata_literal_typed = odata_literal_typed
     _parse_contained_path = parse_contained_path
     _resolve_segment_filters = resolve_segment_filters
+    _validate_page_size = validate_page_size
 
 
     ########################################################
