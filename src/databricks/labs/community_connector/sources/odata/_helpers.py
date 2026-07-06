@@ -119,6 +119,36 @@ def cursor_newer(a: Any, b: Any) -> bool:
         return False
 
 
+def cursor_same_instant(a: Any, b: Any) -> bool:
+    """Whether ``a`` and ``b`` denote the SAME instant, tolerating rendering
+    differences (``…00Z`` vs ``…00.000Z`` vs ``…00+00:00``).
+
+    Identical values are trivially the same instant. Otherwise both must
+    parse as ISO-8601 (via :func:`cursor_sort_key`) to equal datetimes AND
+    carry equal zero-padded fraction digits — the fraction check restores
+    the sub-microsecond precision ``cursor_sort_key`` truncates, so two
+    chronologically distinct 100ns cursors (SQL Server ``datetime2(7)``)
+    never count as the same instant. Anything non-ISO (or mixed-shape)
+    is the same instant only if raw-equal.
+
+    Used by the ancestor-walk park identity: a parked parent whose cursor
+    TEXT changed but instant didn't (a mixed-version load balancer
+    alternating renderings per request) hasn't been modified — resuming its
+    parked link is safe and makes progress, where treating every text
+    mismatch as a change re-walks from page 1 each batch and livelocks for
+    as long as the alternation lasts."""
+    if a == b:
+        return True
+    key_a, key_b = cursor_sort_key(a), cursor_sort_key(b)
+    if not isinstance(key_a, datetime) or not isinstance(key_b, datetime):
+        return False
+    if key_a != key_b:
+        return False
+    frac_a, frac_b = _fraction_digits(a), _fraction_digits(b)
+    width = max(len(frac_a), len(frac_b))
+    return frac_a.ljust(width, "0") == frac_b.ljust(width, "0")
+
+
 def cursor_le(a: Any, b: Any) -> bool:
     """Whether ``a <= b`` in cursor order — the exact complement of
     :func:`cursor_newer` under its strict total order (including the

@@ -268,6 +268,8 @@ The no-refresh-path row's remediation depends on the configured auth mode:
 | `verbose_http_log_body_chars` | 500     | When `verbose_http_logging` is on, the maximum number of response-body characters logged per request (truncated beyond this). Only consulted when verbose logging is enabled. |
 | `extra_headers`               | (none)  | Comma-separated `Name: value` pairs added to every request's headers (e.g. `"X-Env: prod, Accept-Language: en"`). Values containing commas can't be expressed (the list splits on `,`). Applied before auth headers; a pair without `:` is ignored. |
 
+Note: `service_url` must be a bare service root — no query string or fragment (a curated error rejects them at setup, since the connector appends entity paths to the root). For SAP Gateway client selection (`?sap-client=NNN`), pass the client as a header instead: `extra_headers="sap-client: NNN"`.
+
 ## Pipeline (ingest.py)
 
 ```python

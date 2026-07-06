@@ -54,6 +54,7 @@ from databricks.labs.community_connector.interface.supports_partition import (
     SupportsPartitionedStream,
 )
 from databricks.labs.community_connector.sources.odata._contained import (
+    CONTAINED_PATH_SEP,
     DEFAULT_PAGE_SIZE,
     _ancestor_pk_order_by,
     _is_vanished_error,
@@ -253,10 +254,13 @@ class PartitionMixin(SupportsPartitionedStream):
             # $top to size pages): default page_size so a $top is sent.
             # Snapshot + nextlink leaves it unset → no $top.
             opts = {**opts, "page_size": opts.get("page_size", DEFAULT_PAGE_SIZE)}
-        # ``cursor_lower`` is "what we've already read up to" — used
-        # by read_partition as ``cursor gt cursor_lower``. ``end`` is
-        # the previously-probed fence; we stamp it onto each row's
-        # cursor column so the next batch's ``cursor_lower`` matches.
+        # ``cursor_lower`` is "what we've already read up to" — used by
+        # read_partition as ``cursor gt cursor_lower``. There is NO upper
+        # fence filter: rows landing above the previously-probed fence are
+        # read now AND re-read next batch (``latest_offset`` commits the
+        # probed fence, not the rows' max) — duplicate-safe by design, and
+        # each row keeps its REAL cursor value. ``end_offset`` is consumed
+        # only by the ``start == end`` quiescence check below.
         cursor_lower = (start_offset or {}).get("cursor")
         if cursor_field:
             # Mirror the serial reads: floor the READ boundary by the
@@ -578,10 +582,21 @@ class PartitionMixin(SupportsPartitionedStream):
                 f"cursor_field {cursor_field!r} is not a property on "
                 f"the contained path or any of its ancestors."
             )
-        # Partition activation requires cursor at level 0 for the
-        # streaming probe to make sense; this branch is the only one
-        # reached in practice. We still go through the with-cursor
-        # iterator so the cursor column is stamped onto leaf rows.
+        # STREAMING partition activation requires cursor at level 0, but the
+        # BATCH reader plans partitions without consulting ``is_partitioned``
+        # — so the leaf-cursor branch below IS reached on partitioned batch
+        # reads and must match the serial paths row-for-row. In particular
+        # the ``cursor_nulls`` policy: every other path applies
+        # ``skip_null`` from ``_make_cursor_resolver``; without it here a
+        # partitioned batch read emits null-cursor rows the user configured
+        # ``cursor_nulls=ignore`` to drop — and nondeterministically so,
+        # since the framework silently falls back to the (correct) serial
+        # read on any planning exception.
+        skip_null = False
+        if cursor_level == len(segments) - 1:
+            skip_null, _effective = self._make_cursor_resolver(
+                CONTAINED_PATH_SEP.join(segments), namespace, cursor_field, table_options
+            )
         chains_iter = self._iter_parent_chains_with_cursor(
             segments,
             namespace,
@@ -602,11 +617,10 @@ class PartitionMixin(SupportsPartitionedStream):
                     # Leaf-cursor mode: filter per row by ``cursor gt
                     # cursor_lower`` — chronological via ``_cursor_le``,
                     # never lexical (``.5Z`` vs ``Z`` renderings invert
-                    # under string order). (Server-side filter would be
-                    # cheaper, but partition activation gates this to
-                    # cursor_level==0; this branch exists for
-                    # completeness only.)
+                    # under string order).
                     rec = row.get(cursor_field)
+                    if skip_null and rec is None:
+                        continue
                     if (
                         cursor_lower is not None
                         and rec is not None

@@ -38,6 +38,7 @@ from databricks.labs.community_connector.sources.odata._helpers import (
     cursor_le as _cursor_le,
     cursor_max as _cursor_max,
     cursor_newer as _cursor_newer,
+    cursor_same_instant as _cursor_same_instant,
     max_or as _max_or,
     parse_iso8601,
     parse_max_records as _parse_max_records,
@@ -384,8 +385,15 @@ def odata_literal(value: Any) -> str:
             # Decimal NaN with ``>`` raises InvalidOperation.)
             nan = value.is_nan() if isinstance(value, Decimal) else math.isnan(value)
             return "NaN" if nan else ("INF" if value > 0 else "-INF")
-        # ``str(1e20)`` renders ``1e+20`` — the exponent's ``+`` must be
-        # escaped like any literal ``+`` (form-decoding servers read a raw
+        if isinstance(value, Decimal):
+            # OData's ``decimalValue`` ABNF has NO exponent form —
+            # ``str(Decimal("1.5E+7"))`` keeps the exponent and a strict
+            # server 400s. ``format(…, 'f')`` renders the exact value in
+            # plain positional notation.
+            return _escape_literal_text(format(value, "f"))
+        # ``str(1e20)`` renders ``1e+20`` — valid for Edm.Double, whose
+        # ABNF allows exponents, but the exponent's ``+`` must be escaped
+        # like any literal ``+`` (form-decoding servers read a raw
         # query-string ``+`` as a space → malformed number → 400).
         return _escape_literal_text(str(value))
     s = str(value)
@@ -3463,9 +3471,15 @@ class ContainedNavMixin:
         queue exactly as the drainer does. No ``max_records`` cap and no
         cross-page accumulation: peak memory is one response's flattened
         cross-product (bounded by the ``page_size`` budget) plus the queue
-        of pending fetch descriptors (URLs + chains, not rows). Emission
-        order matches the drainer's ``emitted`` order — inline rows first,
-        deferred continuations processed when their queue item is popped."""
+        of pending fetch descriptors (URLs + chains, not rows). Unlike the
+        drainer, the queue here has NO ``_MAX_PENDING_FETCHES`` ceiling —
+        the drainer's cap bounds what gets PARKED INTO THE OFFSET (a
+        checkpoint-size concern), while this queue never persists and its
+        items are small descriptors; a server deferring every inner
+        collection grows it to one descriptor per parent, modest even at
+        100k parents. Emission order matches the drainer's ``emitted``
+        order — inline rows first, deferred continuations processed when
+        their queue item is popped."""
         queue: list[dict] = list(initial_queue)
         cur_field, cur_level, _ = ctx or (None, -1, None)
         while queue:
@@ -5199,28 +5213,34 @@ class ContainedNavMixin:
             use_link = False
             if parked_key is not None:
                 if seeking:
-                    # Park identity is PK **and** cursor: a parked parent whose
-                    # cursor advanced between batches is NOT "the parked chain"
-                    # any more — it re-enumerates at its new (later) position
-                    # and must be re-walked in full there, because the server
-                    # is saying its subtree changed since we drained it. PK-only
-                    # matching would skip it (exclusive park) or resume its
-                    # STALE mid-page link (link park), and either way this
-                    # batch's ``running_max`` then commits past its new cursor,
-                    # so ``cursor gt <watermark>`` locks the update out forever.
-                    # Cursor renderings compare as raw text — a mismatch from a
-                    # rendering change (not a real update) just costs a
-                    # duplicate-safe re-walk.
+                    # Park identity is PK **and** cursor INSTANT: a parked
+                    # parent whose cursor advanced between batches is NOT "the
+                    # parked chain" any more — it re-enumerates at its new
+                    # (later) position and must be re-walked in full there,
+                    # because the server is saying its subtree changed since
+                    # we drained it. PK-only matching would skip it (exclusive
+                    # park) or resume its STALE mid-page link (link park), and
+                    # either way this batch's ``running_max`` then commits
+                    # past its new cursor, so ``cursor gt <watermark>`` locks
+                    # the update out forever. Same-INSTANT rendering changes
+                    # (``…00Z`` vs ``…00.000Z`` — a mixed-version load
+                    # balancer can alternate them PER REQUEST) still count as
+                    # parked: the parent didn't change, so resuming its link
+                    # is safe — and treating every text mismatch as a change
+                    # would re-walk from page 1 each batch for as long as the
+                    # alternation lasts, a livelock the no-progress guard
+                    # can't see (the offset text alternates, reading as
+                    # progress).
                     pk_match = chain == parked_chain
-                    at_parked = pk_match and ancestor_cursor == parked_cursor
+                    at_parked = pk_match and _cursor_same_instant(ancestor_cursor, parked_cursor)
                     # A PK-matched chain must NEVER take the strictly-before
-                    # skip: when its cursor text changed AND sorts before the
-                    # parked key (same-instant rendering flip, or a genuine
-                    # regression), the generic skip would drop the chain — and
-                    # its parked link — losing the collection's undrained
-                    # remainder while running_max commits past it. Ending the
-                    # seek here re-walks it in full instead: duplicate-safe in
-                    # BOTH mismatch directions, as promised above.
+                    # skip: when its cursor genuinely changed AND sorts before
+                    # the parked key (a regression), the generic skip would
+                    # drop the chain — and its parked link — losing the
+                    # collection's undrained remainder while running_max
+                    # commits past it. Ending the seek here re-walks it in
+                    # full instead: duplicate-safe in BOTH mismatch
+                    # directions, as promised above.
                     if not pk_match and _chain_strictly_before(
                         _chain_resume_key(chain, ancestor_cursor, cursor_level), parked_key
                     ):

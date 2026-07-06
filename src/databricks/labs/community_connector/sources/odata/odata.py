@@ -379,11 +379,19 @@ def _metadata_cache_put(
 ) -> None:
     """Insert into :data:`_METADATA_CACHE`, evicting the oldest entries
     (by their ``fetched_at`` stamp) beyond :data:`_METADATA_CACHE_MAX_SERVICES`.
-    Same lock-free discipline as the cache itself — a racing double-evict
-    just costs the loser a re-fetch."""
+    The just-inserted key is exempt from eviction: the file-cache-hit path
+    stamps entries with the FILE's mtime, which can be older than every
+    cached entry — evicting the newcomer itself would make that service
+    re-parse its pickle on every fresh instance while 16 idle services
+    stay cached, the exact thrash this cache exists to avoid. Same
+    lock-free discipline as the cache itself — a racing double-evict just
+    costs the loser a re-fetch."""
     _METADATA_CACHE[service_url] = entry
     while len(_METADATA_CACHE) > _METADATA_CACHE_MAX_SERVICES:
-        oldest = min(_METADATA_CACHE, key=lambda k: _METADATA_CACHE[k][3])
+        oldest = min(
+            (k for k in _METADATA_CACHE if k != service_url),
+            key=lambda k: _METADATA_CACHE[k][3],
+        )
         _METADATA_CACHE.pop(oldest, None)
 
 
@@ -1068,6 +1076,24 @@ class ODataLakeflowConnect(
                 "in logs and error messages on every request. Use "
                 "auth_type=basic with the 'username' / 'password' "
                 "connection options instead."
+            )
+        if parsed_root.query or parsed_root.fragment:
+            # Every URL builder appends '/<path>' to the root, so a query-
+            # carrying root (the SAP Gateway '?sap-client=100' form) would
+            # put the entity path INSIDE the query string on every request
+            # — the first symptom is the $metadata fetch dying in the XML
+            # parser with no hint the URL was malformed. Fail at
+            # construction with the working alternative instead.
+            trailing = f"?{parsed_root.query}" if parsed_root.query else f"#{parsed_root.fragment}"
+            raise ValueError(
+                f"service_url must not carry a query string or fragment "
+                f"(got {trailing!r}); the connector appends entity paths "
+                f"to it, which would land inside the query. For SAP "
+                f"Gateway client selection ('?sap-client=NNN'), pass the "
+                f"client as a header instead: "
+                f"extra_headers='sap-client: NNN' — SAP accepts the "
+                f"header form. Other root query parameters have no "
+                f"equivalent; such services are not supported."
             )
         # Default 180s (3 min). Deep ``expand_contained=true`` chains
         # (3+ segments) materialise a large cross-product server-side
@@ -2734,7 +2760,11 @@ class ODataLakeflowConnect(
         if opts.get("page_size"):
             params.append(f"$top={opts['page_size']}")
         if opts.get("select"):
-            params.append(f"$select={opts['select']}")
+            # Strip per-column whitespace ("Id, Label" → "Id,Label") — the
+            # validation set and the expand-leaf merge both strip, and a
+            # strict server may 400 the padded wire form ($select=Id,%20Label).
+            cols = ",".join(c.strip() for c in opts["select"].split(",") if c.strip())
+            params.append(f"$select={cols}")
         filters = [f for f in (opts.get("filter"), extra_filter) if f]
         if filters:
             if len(filters) == 1:

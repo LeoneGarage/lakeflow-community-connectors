@@ -721,6 +721,36 @@ def register_lakeflow_source(spark):
             return False
 
 
+    def cursor_same_instant(a: Any, b: Any) -> bool:
+        """Whether ``a`` and ``b`` denote the SAME instant, tolerating rendering
+        differences (``…00Z`` vs ``…00.000Z`` vs ``…00+00:00``).
+
+        Identical values are trivially the same instant. Otherwise both must
+        parse as ISO-8601 (via :func:`cursor_sort_key`) to equal datetimes AND
+        carry equal zero-padded fraction digits — the fraction check restores
+        the sub-microsecond precision ``cursor_sort_key`` truncates, so two
+        chronologically distinct 100ns cursors (SQL Server ``datetime2(7)``)
+        never count as the same instant. Anything non-ISO (or mixed-shape)
+        is the same instant only if raw-equal.
+
+        Used by the ancestor-walk park identity: a parked parent whose cursor
+        TEXT changed but instant didn't (a mixed-version load balancer
+        alternating renderings per request) hasn't been modified — resuming its
+        parked link is safe and makes progress, where treating every text
+        mismatch as a change re-walks from page 1 each batch and livelocks for
+        as long as the alternation lasts."""
+        if a == b:
+            return True
+        key_a, key_b = cursor_sort_key(a), cursor_sort_key(b)
+        if not isinstance(key_a, datetime) or not isinstance(key_b, datetime):
+            return False
+        if key_a != key_b:
+            return False
+        frac_a, frac_b = _fraction_digits(a), _fraction_digits(b)
+        width = max(len(frac_a), len(frac_b))
+        return frac_a.ljust(width, "0") == frac_b.ljust(width, "0")
+
+
     def cursor_le(a: Any, b: Any) -> bool:
         """Whether ``a <= b`` in cursor order — the exact complement of
         :func:`cursor_newer` under its strict total order (including the
@@ -1203,8 +1233,15 @@ def register_lakeflow_source(spark):
                 # Decimal NaN with ``>`` raises InvalidOperation.)
                 nan = value.is_nan() if isinstance(value, Decimal) else math.isnan(value)
                 return "NaN" if nan else ("INF" if value > 0 else "-INF")
-            # ``str(1e20)`` renders ``1e+20`` — the exponent's ``+`` must be
-            # escaped like any literal ``+`` (form-decoding servers read a raw
+            if isinstance(value, Decimal):
+                # OData's ``decimalValue`` ABNF has NO exponent form —
+                # ``str(Decimal("1.5E+7"))`` keeps the exponent and a strict
+                # server 400s. ``format(…, 'f')`` renders the exact value in
+                # plain positional notation.
+                return _escape_literal_text(format(value, "f"))
+            # ``str(1e20)`` renders ``1e+20`` — valid for Edm.Double, whose
+            # ABNF allows exponents, but the exponent's ``+`` must be escaped
+            # like any literal ``+`` (form-decoding servers read a raw
             # query-string ``+`` as a space → malformed number → 400).
             return _escape_literal_text(str(value))
         s = str(value)
@@ -4282,9 +4319,15 @@ def register_lakeflow_source(spark):
             queue exactly as the drainer does. No ``max_records`` cap and no
             cross-page accumulation: peak memory is one response's flattened
             cross-product (bounded by the ``page_size`` budget) plus the queue
-            of pending fetch descriptors (URLs + chains, not rows). Emission
-            order matches the drainer's ``emitted`` order — inline rows first,
-            deferred continuations processed when their queue item is popped."""
+            of pending fetch descriptors (URLs + chains, not rows). Unlike the
+            drainer, the queue here has NO ``_MAX_PENDING_FETCHES`` ceiling —
+            the drainer's cap bounds what gets PARKED INTO THE OFFSET (a
+            checkpoint-size concern), while this queue never persists and its
+            items are small descriptors; a server deferring every inner
+            collection grows it to one descriptor per parent, modest even at
+            100k parents. Emission order matches the drainer's ``emitted``
+            order — inline rows first, deferred continuations processed when
+            their queue item is popped."""
             queue: list[dict] = list(initial_queue)
             cur_field, cur_level, _ = ctx or (None, -1, None)
             while queue:
@@ -6018,28 +6061,34 @@ def register_lakeflow_source(spark):
                 use_link = False
                 if parked_key is not None:
                     if seeking:
-                        # Park identity is PK **and** cursor: a parked parent whose
-                        # cursor advanced between batches is NOT "the parked chain"
-                        # any more — it re-enumerates at its new (later) position
-                        # and must be re-walked in full there, because the server
-                        # is saying its subtree changed since we drained it. PK-only
-                        # matching would skip it (exclusive park) or resume its
-                        # STALE mid-page link (link park), and either way this
-                        # batch's ``running_max`` then commits past its new cursor,
-                        # so ``cursor gt <watermark>`` locks the update out forever.
-                        # Cursor renderings compare as raw text — a mismatch from a
-                        # rendering change (not a real update) just costs a
-                        # duplicate-safe re-walk.
+                        # Park identity is PK **and** cursor INSTANT: a parked
+                        # parent whose cursor advanced between batches is NOT "the
+                        # parked chain" any more — it re-enumerates at its new
+                        # (later) position and must be re-walked in full there,
+                        # because the server is saying its subtree changed since
+                        # we drained it. PK-only matching would skip it (exclusive
+                        # park) or resume its STALE mid-page link (link park), and
+                        # either way this batch's ``running_max`` then commits
+                        # past its new cursor, so ``cursor gt <watermark>`` locks
+                        # the update out forever. Same-INSTANT rendering changes
+                        # (``…00Z`` vs ``…00.000Z`` — a mixed-version load
+                        # balancer can alternate them PER REQUEST) still count as
+                        # parked: the parent didn't change, so resuming its link
+                        # is safe — and treating every text mismatch as a change
+                        # would re-walk from page 1 each batch for as long as the
+                        # alternation lasts, a livelock the no-progress guard
+                        # can't see (the offset text alternates, reading as
+                        # progress).
                         pk_match = chain == parked_chain
-                        at_parked = pk_match and ancestor_cursor == parked_cursor
+                        at_parked = pk_match and _cursor_same_instant(ancestor_cursor, parked_cursor)
                         # A PK-matched chain must NEVER take the strictly-before
-                        # skip: when its cursor text changed AND sorts before the
-                        # parked key (same-instant rendering flip, or a genuine
-                        # regression), the generic skip would drop the chain — and
-                        # its parked link — losing the collection's undrained
-                        # remainder while running_max commits past it. Ending the
-                        # seek here re-walks it in full instead: duplicate-safe in
-                        # BOTH mismatch directions, as promised above.
+                        # skip: when its cursor genuinely changed AND sorts before
+                        # the parked key (a regression), the generic skip would
+                        # drop the chain — and its parked link — losing the
+                        # collection's undrained remainder while running_max
+                        # commits past it. Ending the seek here re-walks it in
+                        # full instead: duplicate-safe in BOTH mismatch
+                        # directions, as promised above.
                         if not pk_match and _chain_strictly_before(
                             _chain_resume_key(chain, ancestor_cursor, cursor_level), parked_key
                         ):
@@ -6334,10 +6383,13 @@ def register_lakeflow_source(spark):
                 # $top to size pages): default page_size so a $top is sent.
                 # Snapshot + nextlink leaves it unset → no $top.
                 opts = {**opts, "page_size": opts.get("page_size", DEFAULT_PAGE_SIZE)}
-            # ``cursor_lower`` is "what we've already read up to" — used
-            # by read_partition as ``cursor gt cursor_lower``. ``end`` is
-            # the previously-probed fence; we stamp it onto each row's
-            # cursor column so the next batch's ``cursor_lower`` matches.
+            # ``cursor_lower`` is "what we've already read up to" — used by
+            # read_partition as ``cursor gt cursor_lower``. There is NO upper
+            # fence filter: rows landing above the previously-probed fence are
+            # read now AND re-read next batch (``latest_offset`` commits the
+            # probed fence, not the rows' max) — duplicate-safe by design, and
+            # each row keeps its REAL cursor value. ``end_offset`` is consumed
+            # only by the ``start == end`` quiescence check below.
             cursor_lower = (start_offset or {}).get("cursor")
             if cursor_field:
                 # Mirror the serial reads: floor the READ boundary by the
@@ -6659,10 +6711,21 @@ def register_lakeflow_source(spark):
                     f"cursor_field {cursor_field!r} is not a property on "
                     f"the contained path or any of its ancestors."
                 )
-            # Partition activation requires cursor at level 0 for the
-            # streaming probe to make sense; this branch is the only one
-            # reached in practice. We still go through the with-cursor
-            # iterator so the cursor column is stamped onto leaf rows.
+            # STREAMING partition activation requires cursor at level 0, but the
+            # BATCH reader plans partitions without consulting ``is_partitioned``
+            # — so the leaf-cursor branch below IS reached on partitioned batch
+            # reads and must match the serial paths row-for-row. In particular
+            # the ``cursor_nulls`` policy: every other path applies
+            # ``skip_null`` from ``_make_cursor_resolver``; without it here a
+            # partitioned batch read emits null-cursor rows the user configured
+            # ``cursor_nulls=ignore`` to drop — and nondeterministically so,
+            # since the framework silently falls back to the (correct) serial
+            # read on any planning exception.
+            skip_null = False
+            if cursor_level == len(segments) - 1:
+                skip_null, _effective = self._make_cursor_resolver(
+                    CONTAINED_PATH_SEP.join(segments), namespace, cursor_field, table_options
+                )
             chains_iter = self._iter_parent_chains_with_cursor(
                 segments,
                 namespace,
@@ -6683,11 +6746,10 @@ def register_lakeflow_source(spark):
                         # Leaf-cursor mode: filter per row by ``cursor gt
                         # cursor_lower`` — chronological via ``_cursor_le``,
                         # never lexical (``.5Z`` vs ``Z`` renderings invert
-                        # under string order). (Server-side filter would be
-                        # cheaper, but partition activation gates this to
-                        # cursor_level==0; this branch exists for
-                        # completeness only.)
+                        # under string order).
                         rec = row.get(cursor_field)
+                        if skip_null and rec is None:
+                            continue
                         if (
                             cursor_lower is not None
                             and rec is not None
@@ -7002,11 +7064,19 @@ def register_lakeflow_source(spark):
     ) -> None:
         """Insert into :data:`_METADATA_CACHE`, evicting the oldest entries
         (by their ``fetched_at`` stamp) beyond :data:`_METADATA_CACHE_MAX_SERVICES`.
-        Same lock-free discipline as the cache itself — a racing double-evict
-        just costs the loser a re-fetch."""
+        The just-inserted key is exempt from eviction: the file-cache-hit path
+        stamps entries with the FILE's mtime, which can be older than every
+        cached entry — evicting the newcomer itself would make that service
+        re-parse its pickle on every fresh instance while 16 idle services
+        stay cached, the exact thrash this cache exists to avoid. Same
+        lock-free discipline as the cache itself — a racing double-evict just
+        costs the loser a re-fetch."""
         _METADATA_CACHE[service_url] = entry
         while len(_METADATA_CACHE) > _METADATA_CACHE_MAX_SERVICES:
-            oldest = min(_METADATA_CACHE, key=lambda k: _METADATA_CACHE[k][3])
+            oldest = min(
+                (k for k in _METADATA_CACHE if k != service_url),
+                key=lambda k: _METADATA_CACHE[k][3],
+            )
             _METADATA_CACHE.pop(oldest, None)
 
 
@@ -7691,6 +7761,24 @@ def register_lakeflow_source(spark):
                     "in logs and error messages on every request. Use "
                     "auth_type=basic with the 'username' / 'password' "
                     "connection options instead."
+                )
+            if parsed_root.query or parsed_root.fragment:
+                # Every URL builder appends '/<path>' to the root, so a query-
+                # carrying root (the SAP Gateway '?sap-client=100' form) would
+                # put the entity path INSIDE the query string on every request
+                # — the first symptom is the $metadata fetch dying in the XML
+                # parser with no hint the URL was malformed. Fail at
+                # construction with the working alternative instead.
+                trailing = f"?{parsed_root.query}" if parsed_root.query else f"#{parsed_root.fragment}"
+                raise ValueError(
+                    f"service_url must not carry a query string or fragment "
+                    f"(got {trailing!r}); the connector appends entity paths "
+                    f"to it, which would land inside the query. For SAP "
+                    f"Gateway client selection ('?sap-client=NNN'), pass the "
+                    f"client as a header instead: "
+                    f"extra_headers='sap-client: NNN' — SAP accepts the "
+                    f"header form. Other root query parameters have no "
+                    f"equivalent; such services are not supported."
                 )
             # Default 180s (3 min). Deep ``expand_contained=true`` chains
             # (3+ segments) materialise a large cross-product server-side
@@ -9357,7 +9445,11 @@ def register_lakeflow_source(spark):
             if opts.get("page_size"):
                 params.append(f"$top={opts['page_size']}")
             if opts.get("select"):
-                params.append(f"$select={opts['select']}")
+                # Strip per-column whitespace ("Id, Label" → "Id,Label") — the
+                # validation set and the expand-leaf merge both strip, and a
+                # strict server may 400 the padded wire form ($select=Id,%20Label).
+                cols = ",".join(c.strip() for c in opts["select"].split(",") if c.strip())
+                params.append(f"$select={cols}")
             filters = [f for f in (opts.get("filter"), extra_filter) if f]
             if filters:
                 if len(filters) == 1:
@@ -11572,6 +11664,7 @@ def register_lakeflow_source(spark):
     _cursor_le = cursor_le
     _cursor_max = cursor_max
     _cursor_newer = cursor_newer
+    _cursor_same_instant = cursor_same_instant
     _max_or = max_or
     _parse_max_records = parse_max_records
     _trim_to_distinct_cursor_boundary = trim_to_distinct_cursor_boundary

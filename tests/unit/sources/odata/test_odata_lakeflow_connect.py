@@ -15626,3 +15626,202 @@ def test_metadata_cache_capped_eviction():
     finally:
         odata_mod._METADATA_CACHE.clear()
         odata_mod._METADATA_CACHE.update(saved)
+
+
+# ---------------------------------------------------------------------------
+# Round 38 — same-instant park identity, partitioned cursor_nulls parity,
+# service_url query rejection, wire hygiene, metadata cache eviction
+# ---------------------------------------------------------------------------
+
+
+def test_cursor_same_instant_helper():
+    from databricks.labs.community_connector.sources.odata._helpers import cursor_same_instant
+
+    # Rendering variants of one instant.
+    assert cursor_same_instant("2024-01-01T00:00:00Z", "2024-01-01T00:00:00.000Z")
+    assert cursor_same_instant("2024-01-01T00:00:00Z", "2024-01-01T00:00:00+00:00")
+    assert cursor_same_instant("2024-01-01T00:00:00.5Z", "2024-01-01T00:00:00.500Z")
+    # Genuinely different instants — including sub-microsecond (7-digit).
+    assert not cursor_same_instant("2024-01-01T00:00:00Z", "2024-01-01T00:00:01Z")
+    assert not cursor_same_instant("2024-01-01T00:00:00.0000001Z", "2024-01-01T00:00:00.0000002Z")
+    # Non-ISO values: same instant only when raw-equal.
+    assert cursor_same_instant(5, 5) and not cursor_same_instant(5, 6)
+    assert not cursor_same_instant("abc", "abd")
+    assert cursor_same_instant(None, None)
+
+
+@responses.activate
+def test_ancestor_parked_link_resumes_under_sustained_rendering_alternation():
+    """A load balancer alternating same-instant renderings PER REQUEST
+    (…00Z ↔ …00.000Z during a rolling deploy) must not livelock the capped
+    ancestor walk. Round 37 treated every parked-cursor text mismatch as a
+    change and re-walked from page 1 each batch — with per-request
+    alternation the text NEVER matched, page 1 was re-fetched forever, and
+    the alternating offset blinded the no-progress guard. Same-instant
+    renderings now count as parked: the link resumes and the walk
+    progresses."""
+    _mock_nested_metadata()
+    renders = ["2024-01-01T00:00:00Z", "2024-01-01T00:00:00.000Z"]
+    call_n = {"n": 0}
+    page1 = [{"Id": 101, "Label": "a"}, {"Id": 102, "Label": "b"}]
+    page2 = [{"Id": 103, "Label": "c"}, {"Id": 104, "Label": "d"}]
+
+    def _parents_cb(_req):
+        call_n["n"] += 1
+        rows = [
+            {"Id": 10, "Name": renders[call_n["n"] % 2]},  # alternates every request
+            {"Id": 20, "Name": "2024-06-01T00:00:00Z"},
+        ]
+        return (200, {}, json.dumps({"value": rows}))
+
+    def _children10_cb(req):
+        if "skiptoken=abc" in req.url:
+            return (200, {}, json.dumps({"value": page2}))
+        return (
+            200,
+            {},
+            json.dumps(
+                {
+                    "value": page1,
+                    "@odata.nextLink": f"{SERVICE_URL}Parents(10)/Children?$skiptoken=abc",
+                }
+            ),
+        )
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents_cb)
+    responses.add_callback(
+        responses.GET, f"{SERVICE_URL}Parents(10)/Children", callback=_children10_cb
+    )
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(20)/Children",
+        callback=lambda _r: (200, {}, json.dumps({"value": [{"Id": 201, "Label": "e"}]})),
+    )
+    c = _make()
+    opts = {
+        "cursor_field": "Name",
+        "max_records_per_batch": "2",
+        "pagination": "nextlink",
+        "expand_contained": "false",
+    }
+    emitted = []
+    offset = {}
+    completed = False
+    for _ in range(6):
+        recs, offset = c.read_table("Parents__Children", offset, opts)
+        emitted.extend(recs)
+        if set(offset) - {"lb_history", "lb_cycle_started"} == {"cursor"}:
+            completed = True
+            break
+    assert completed, f"walk never completed under alternation; last offset {offset}"
+    ids = {r["Id"] for r in emitted}
+    assert {101, 102, 103, 104, 201} <= ids
+
+
+@responses.activate
+def test_partitioned_batch_leaf_cursor_respects_cursor_nulls_ignore():
+    """The partitioned BATCH path (LakeflowBatchReader plans partitions
+    without consulting is_partitioned, so leaf-cursor tables DO reach it)
+    must apply the cursor_nulls policy like every other path — it used to
+    emit null-cursor rows the user configured ``ignore`` to drop, and
+    nondeterministically so (the framework silently falls back to the
+    correct serial read on any planning exception)."""
+    _mock_nested_metadata()
+    children = [
+        {"Id": 101, "Label": "a", "ModifiedAt": "2024-01-01T00:00:00Z"},
+        {"Id": 102, "Label": "b", "ModifiedAt": None},  # ignore must drop it
+    ]
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents",
+        callback=lambda _r: (200, {}, json.dumps({"value": [{"Id": 1}]})),
+    )
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children",
+        callback=lambda _r: (200, {}, json.dumps({"value": children})),
+    )
+    opts = {
+        "cursor_field": "ModifiedAt",  # LEAF-level cursor
+        "cursor_nulls": "ignore",
+        "pagination": "nextlink",
+        "expand_contained": "false",
+        "contained_fetch": "single",
+        "cursor_probe": "false",
+    }
+    c = _make()
+    serial_rows, _ = c.read_table("Parents__Children", None, opts)
+    serial_ids = sorted(r["Id"] for r in serial_rows)
+    parts = c.get_partitions("Parents__Children", opts)
+    part_ids = sorted(
+        r["Id"] for p in parts for r in c.read_partition("Parents__Children", p, opts)
+    )
+    assert serial_ids == part_ids == [101]
+
+
+def test_service_url_query_or_fragment_rejected():
+    """A query-carrying service root (SAP Gateway '?sap-client=100') breaks
+    every built URL (the entity path lands inside the query) and used to die
+    as a bare $metadata ParseError. It must fail at construction with the
+    header-form alternative named."""
+    with pytest.raises(ValueError, match="sap-client"):
+        _make({"service_url": "https://example.com/odata?sap-client=100"})
+    with pytest.raises(ValueError, match="query string or fragment"):
+        _make({"service_url": "https://example.com/odata#frag"})
+
+
+def test_metadata_cache_put_never_evicts_new_entry():
+    """Inserting an entry whose fetched_at is OLDER than everything cached
+    (the file-cache-hit path stamps entries with the file's mtime) must not
+    evict the just-inserted entry itself — that service would re-parse its
+    pickle on every fresh instance while idle services stay cached."""
+    from databricks.labs.community_connector.sources.odata import odata as odata_mod
+
+    saved = dict(odata_mod._METADATA_CACHE)
+    odata_mod._METADATA_CACHE.clear()
+    try:
+        cap = odata_mod._METADATA_CACHE_MAX_SERVICES
+        for i in range(cap):
+            odata_mod._metadata_cache_put(f"https://svc{i}/", ("x", None, None, 1000.0 + i))
+        # Newcomer with the OLDEST stamp: must survive; an existing oldest
+        # entry is evicted instead.
+        odata_mod._metadata_cache_put("https://old-file/", ("x", None, None, 1.0))
+        assert "https://old-file/" in odata_mod._METADATA_CACHE
+        assert len(odata_mod._METADATA_CACHE) == cap
+        assert "https://svc0/" not in odata_mod._METADATA_CACHE  # oldest other
+    finally:
+        odata_mod._METADATA_CACHE.clear()
+        odata_mod._METADATA_CACHE.update(saved)
+
+
+@responses.activate
+def test_flat_select_whitespace_stripped_on_wire():
+    """User whitespace in ``select`` ("Id, ModifiedAt") is stripped on the
+    flat wire path — the validation set and the expand-leaf merge already
+    strip, and a strict server may 400 the padded $select=Id,%20ModifiedAt
+    form."""
+    _mock_metadata()
+    responses.get(f"{SERVICE_URL}Customers", json={"value": []}, match_querystring=False)
+    c = _make({"token": "t"})
+    rows, _ = c.read_table("Customers", None, {"select": "Id, ModifiedAt"})
+    list(rows)
+    data_urls = [call.request.url for call in responses.calls if "Customers" in call.request.url]
+    assert data_urls
+    for u in data_urls:
+        select_param = u.split("$select=")[1].split("&")[0]
+        assert select_param == "Id,ModifiedAt"
+
+
+def test_decimal_literal_never_carries_exponent():
+    """OData's decimalValue ABNF has no exponent form — Decimal literals
+    render in plain positional notation (Edm.Double floats keep their
+    spec-valid exponent)."""
+    from decimal import Decimal
+
+    from databricks.labs.community_connector.sources.odata._contained import odata_literal
+
+    assert odata_literal(Decimal("1.5E+7")) == "15000000"
+    assert odata_literal(Decimal("1E-6")) == "0.000001"
+    assert odata_literal(Decimal("-2.5")) == "-2.5"
+    # Floats (Edm.Double) legitimately keep exponents; '+' stays escaped.
+    assert "e" in odata_literal(1e20).lower()
