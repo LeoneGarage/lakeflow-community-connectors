@@ -3938,6 +3938,480 @@ def test_expand_cursor_lookback_floors_read_filter_not_offset():
 
 
 @responses.activate
+def test_lookback_dedup_suppresses_unchanged_overlap_re_emits():
+    """``cursor_lookback_dedup=on``: rows re-fetched by the overlap window
+    that were already delivered UNCHANGED are suppressed; the offset carries
+    the exact ``lb_seen`` map. A pure-overlap follow-up batch emits nothing
+    and idles (offset echo), exactly like today's pure-overlap batch."""
+    _mock_nested_metadata()
+    children = [
+        {"Id": 11, "Label": "a", "ModifiedAt": "2024-01-02T12:00:00Z"},
+        {"Id": 12, "Label": "b", "ModifiedAt": "2024-01-03T00:00:00Z"},
+    ]
+
+    def _parents(req):
+        from urllib.parse import unquote
+
+        if "Id gt" in unquote(req.url):  # top-level auto drain probe
+            return (200, {}, json.dumps({"value": []}))
+        return (200, {}, json.dumps({"value": [{"Id": 1, "Children": list(children)}]}))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents)
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children",
+        callback=lambda r: (200, {}, json.dumps({"value": []})),
+    )
+    c = _make()
+    opts = {
+        "expand_contained": "true",
+        "cursor_field": "ModifiedAt",
+        "cursor_lookback_seconds": "3600",
+        "cursor_lookback_dedup": "on",
+    }
+    records, offset = c.read_table("Parents__Children", {"cursor": "2024-01-02T00:00:00Z"}, opts)
+    assert [r["Id"] for r in records] == [11, 12]
+    assert offset["cursor"] == "2024-01-03T00:00:00Z"
+    assert len(offset["lb_seen"]) == 2  # both delivered rows tracked
+    # Batch 2: the same rows come back through the 1h overlap — all suppressed.
+    records2, offset2 = c.read_table("Parents__Children", offset, opts)
+    assert list(records2) == []
+    assert offset2 == offset  # idle echo; lb_seen preserved
+
+
+@responses.activate
+def test_lookback_dedup_reemits_changed_row_same_cursor():
+    """A row whose NON-CURSOR column changed between batches (cursor
+    untouched — a source that updates without advancing the cursor) must be
+    re-emitted: the content hash differs. The unchanged sibling stays
+    suppressed. This is the hazard that keying on (PK, cursor) alone would
+    silently swallow."""
+    _mock_nested_metadata()
+    children = [
+        {"Id": 11, "Label": "a", "ModifiedAt": "2024-01-02T12:00:00Z"},
+        {"Id": 12, "Label": "b", "ModifiedAt": "2024-01-03T00:00:00Z"},
+    ]
+
+    def _parents(req):
+        from urllib.parse import unquote
+
+        if "Id gt" in unquote(req.url):
+            return (200, {}, json.dumps({"value": []}))
+        return (200, {}, json.dumps({"value": [{"Id": 1, "Children": list(children)}]}))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents)
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children",
+        callback=lambda r: (200, {}, json.dumps({"value": []})),
+    )
+    c = _make()
+    opts = {
+        "expand_contained": "true",
+        "cursor_field": "ModifiedAt",
+        "cursor_lookback_seconds": "3600",
+        "cursor_lookback_dedup": "on",
+    }
+    _, offset = c.read_table("Parents__Children", {"cursor": "2024-01-02T00:00:00Z"}, opts)
+    children[0] = {"Id": 11, "Label": "CHANGED", "ModifiedAt": "2024-01-02T12:00:00Z"}
+    records2, offset2 = c.read_table("Parents__Children", offset, opts)
+    got = [(r["Id"], r["Label"]) for r in records2]
+    assert got == [(11, "CHANGED")]  # changed row re-emitted, sibling suppressed
+    # The changed row's new hash replaces its entry (batch 3 suppresses it).
+    records3, _ = c.read_table("Parents__Children", offset2, opts)
+    assert list(records3) == []
+
+
+@responses.activate
+def test_lookback_dedup_cap_overflow_keeps_newest_and_reemits_rest():
+    """Above the entry cap, the highest-cursor entries are kept and the
+    evicted rows degrade to plain re-emits — the pre-dedup behavior, never
+    loss. cap=1 over two in-window rows: the newer row stays suppressed;
+    the evicted older row follows the pre-dedup idle rule (deferred on a
+    quiescent trigger, re-emitted on the next PROGRESSING batch)."""
+    _mock_nested_metadata()
+    children = [
+        {"Id": 11, "Label": "a", "ModifiedAt": "2024-01-02T12:00:00Z"},
+        {"Id": 12, "Label": "b", "ModifiedAt": "2024-01-03T00:00:00Z"},
+    ]
+
+    def _parents(req):
+        from urllib.parse import unquote
+
+        if "Id gt" in unquote(req.url):
+            return (200, {}, json.dumps({"value": []}))
+        return (200, {}, json.dumps({"value": [{"Id": 1, "Children": list(children)}]}))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents)
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children",
+        callback=lambda r: (200, {}, json.dumps({"value": []})),
+    )
+    c = _make()
+    opts = {
+        "expand_contained": "true",
+        "cursor_field": "ModifiedAt",
+        "cursor_lookback_seconds": "3600",
+        "cursor_lookback_dedup": "1",
+    }
+    _, offset = c.read_table("Parents__Children", {"cursor": "2024-01-02T00:00:00Z"}, opts)
+    assert len(offset["lb_seen"]) == 1  # capped; newest (Id 12) kept
+    # Quiescent trigger: the evicted row's re-read produces no lb_seen delta,
+    # so the pre-dedup idle rule holds — deferred, not replayed per trigger.
+    records2, offset2 = c.read_table("Parents__Children", offset, opts)
+    assert list(records2) == []
+    # A PROGRESSING batch (new row 13) delivers the evicted re-read alongside
+    # the new row; the capped entry (Id 12) stays suppressed.
+    children.append({"Id": 13, "Label": "c", "ModifiedAt": "2024-01-04T00:00:00Z"})
+    records3, offset3 = c.read_table("Parents__Children", offset2, opts)
+    assert sorted(r["Id"] for r in records3) == [11, 13]
+    assert offset3["cursor"] == "2024-01-04T00:00:00Z"
+    assert len(offset3["lb_seen"]) == 1  # still capped; newest (Id 13) kept
+
+
+@responses.activate
+def test_lookback_dedup_explicit_off_reemits_overlap():
+    """``cursor_lookback_dedup=off`` restores the pre-dedup behavior:
+    overlap rows re-flow every batch (idled on quiescent triggers) and no
+    ``lb_seen`` rides the offset."""
+    _mock_nested_metadata()
+
+    def _parents(req):
+        from urllib.parse import unquote
+
+        if "Id gt" in unquote(req.url):
+            return (200, {}, json.dumps({"value": []}))
+        return (
+            200,
+            {},
+            json.dumps(
+                {
+                    "value": [
+                        {
+                            "Id": 1,
+                            "Children": [
+                                {"Id": 11, "Label": "a", "ModifiedAt": "2024-01-02T12:00:00Z"}
+                            ],
+                        }
+                    ]
+                }
+            ),
+        )
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents)
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children",
+        callback=lambda r: (200, {}, json.dumps({"value": []})),
+    )
+    c = _make()
+    opts = {
+        "expand_contained": "true",
+        "cursor_field": "ModifiedAt",
+        "cursor_lookback_seconds": "3600",
+        "cursor_lookback_dedup": "off",
+    }
+    _, offset = c.read_table("Parents__Children", {"cursor": "2024-01-02T00:00:00Z"}, opts)
+    assert "lb_seen" not in offset
+    records2, offset2 = c.read_table("Parents__Children", offset, opts)
+    # Pure-overlap batch: the row was re-FETCHED and flowed through the
+    # pre-existing suppressed-idle rule (returns [] with lookback on, echoes
+    # the offset) — the pre-dedup semantics hold, no lb_seen rides.
+    assert list(records2) == []
+    assert offset2 == offset
+    assert "lb_seen" not in offset2
+
+
+def test_lookback_dedup_parse_modes():
+    """Option grammar: absent/empty → the DEFAULT cap (dedup is on by
+    default); off/false/0 → 0; on/true → default cap (the boolean
+    spellings match the connector's other flag options); positive int →
+    that cap; garbage and non-positive raise curated errors."""
+    from databricks.labs.community_connector.sources.odata._helpers import (
+        LOOKBACK_DEDUP_DEFAULT_CAP,
+        parse_lookback_dedup,
+    )
+
+    assert parse_lookback_dedup({}) == LOOKBACK_DEDUP_DEFAULT_CAP
+    assert parse_lookback_dedup(None) == LOOKBACK_DEDUP_DEFAULT_CAP
+    assert parse_lookback_dedup({"cursor_lookback_dedup": ""}) == LOOKBACK_DEDUP_DEFAULT_CAP
+    assert parse_lookback_dedup({"cursor_lookback_dedup": "off"}) == 0
+    assert parse_lookback_dedup({"cursor_lookback_dedup": "false"}) == 0
+    assert parse_lookback_dedup({"cursor_lookback_dedup": "0"}) == 0
+    assert parse_lookback_dedup({"cursor_lookback_dedup": "on"}) == LOOKBACK_DEDUP_DEFAULT_CAP
+    assert parse_lookback_dedup({"cursor_lookback_dedup": "true"}) == LOOKBACK_DEDUP_DEFAULT_CAP
+    assert parse_lookback_dedup({"cursor_lookback_dedup": "250"}) == 250
+    with pytest.raises(ValueError, match="cursor_lookback_dedup"):
+        parse_lookback_dedup({"cursor_lookback_dedup": "sometimes"})
+    with pytest.raises(ValueError, match="cursor_lookback_dedup"):
+        parse_lookback_dedup({"cursor_lookback_dedup": "-3"})
+
+
+@responses.activate
+def test_lookback_dedup_quiescent_delta_keeps_auto_history():
+    """A quiescent trigger whose only offset movement is ``lb_seen``
+    bookkeeping (the dedup delta-delivery branch) must NOT record its
+    overlap-only walk duration into the ``auto`` lookback history —
+    ``_LOOKBACK_AUTO_WINDOW`` such triggers in a row would flush every
+    real walk duration out of the rolling window and shrink the ``auto``
+    window below the walks it must cover."""
+    _mock_nested_metadata()
+
+    def _parents(req):
+        from urllib.parse import unquote
+
+        if "Id gt" in unquote(req.url):  # top-level auto drain probe
+            return (200, {}, json.dumps({"value": []}))
+        return (
+            200,
+            {},
+            json.dumps(
+                {
+                    "value": [
+                        {
+                            "Id": 1,
+                            "Children": [
+                                {"Id": 11, "Label": "a", "ModifiedAt": "2024-01-02T12:00:00Z"},
+                                {"Id": 12, "Label": "b", "ModifiedAt": "2024-01-03T00:00:00Z"},
+                            ],
+                        }
+                    ]
+                }
+            ),
+        )
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents)
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children",
+        callback=lambda r: (200, {}, json.dumps({"value": []})),
+    )
+    c = _make()
+    opts = {
+        "expand_contained": "true",
+        "cursor_field": "ModifiedAt",
+        "cursor_lookback_seconds": "auto",
+        "cursor_lookback_dedup": "on",
+    }
+    # Batch 1 (progressing): records a real walk duration. The auto window
+    # was still 0 during it (no history yet), so dedup stayed inert.
+    _, offset = c.read_table("Parents__Children", {"cursor": "2024-01-02T00:00:00Z"}, opts)
+    history = offset["lb_history"]
+    assert len(history) == 1
+    assert "lb_seen" not in offset
+    # Batch 2 (quiescent): the window is active now; the overlap re-reads
+    # enter tracking for the first time — a one-time lb_seen delta delivery
+    # with NO cursor progress. The history must carry through UNCHANGED.
+    records2, offset2 = c.read_table("Parents__Children", offset, opts)
+    assert sorted(r["Id"] for r in records2) == [11, 12]
+    assert offset2["lb_history"] == history  # not polluted by the re-read
+    assert len(offset2["lb_seen"]) == 2
+    # Batch 3 (quiescent, tracked): fully suppressed — identity idle.
+    records3, offset3 = c.read_table("Parents__Children", offset2, opts)
+    assert list(records3) == []
+    assert offset3 == offset2
+
+
+@responses.activate
+def test_lookback_dedup_cap_eviction_deterministic_on_cursor_ties():
+    """Cap eviction breaks cursor ties by PK key, not fetch order: an
+    order-unstable server must not flap the surviving cap-set between
+    batches — each flap would be an ``lb_seen`` delta that re-emits the
+    newly evicted (already-delivered) row on every quiescent trigger."""
+    _mock_nested_metadata()
+    children = [
+        {"Id": 11, "Label": "a", "ModifiedAt": "2024-01-02T12:00:00Z"},
+        {"Id": 12, "Label": "b", "ModifiedAt": "2024-01-02T12:00:00Z"},  # cursor TIE
+    ]
+
+    def _parents(req):
+        from urllib.parse import unquote
+
+        if "Id gt" in unquote(req.url):
+            return (200, {}, json.dumps({"value": []}))
+        return (200, {}, json.dumps({"value": [{"Id": 1, "Children": list(children)}]}))
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents)
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children",
+        callback=lambda r: (200, {}, json.dumps({"value": []})),
+    )
+    c = _make()
+    opts = {
+        "expand_contained": "true",
+        "cursor_field": "ModifiedAt",
+        "cursor_lookback_seconds": "3600",
+        "cursor_lookback_dedup": "1",
+    }
+    _, offset = c.read_table("Parents__Children", {"cursor": "2024-01-02T00:00:00Z"}, opts)
+    assert len(offset["lb_seen"]) == 1
+    # Deterministic winner: the tie broke on the PK key (Id 12), not on
+    # the fetch order that happened to put Id 11 first.
+    assert "12" in next(iter(offset["lb_seen"]))
+    # Quiescent trigger with the server returning the tie in the OPPOSITE
+    # order: the same entry must survive (no lb_seen delta), so the batch
+    # idles instead of re-emitting the flapped-out row every trigger.
+    children.reverse()
+    records2, offset2 = c.read_table("Parents__Children", offset, opts)
+    assert list(records2) == []
+    assert offset2 == offset
+
+
+@responses.activate
+def test_lookback_dedup_tolerates_corrupt_lb_seen_state():
+    """``lb_seen`` rides the user-visible checkpoint (same discipline as
+    the ``lb_history`` validation in ``_resolve_active_lookback``): a
+    hand-edited/corrupt shape must degrade to plain re-emits — never a
+    crash and never suppression — and the entry is rebuilt well-formed."""
+    _mock_nested_metadata()
+
+    def _parents(req):
+        from urllib.parse import unquote
+
+        if "Id gt" in unquote(req.url):
+            return (200, {}, json.dumps({"value": []}))
+        return (
+            200,
+            {},
+            json.dumps(
+                {
+                    "value": [
+                        {
+                            "Id": 1,
+                            "Children": [
+                                {"Id": 11, "Label": "a", "ModifiedAt": "2024-01-02T12:00:00Z"},
+                                {"Id": 12, "Label": "b", "ModifiedAt": "2024-01-03T00:00:00Z"},
+                            ],
+                        }
+                    ]
+                }
+            ),
+        )
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents)
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children",
+        callback=lambda r: (200, {}, json.dumps({"value": []})),
+    )
+    c = _make()
+    opts = {
+        "expand_contained": "true",
+        "cursor_field": "ModifiedAt",
+        "cursor_lookback_seconds": "3600",
+        "cursor_lookback_dedup": "on",
+    }
+    # "[1, 11]" is Id 11's real composite-PK key, so the corrupt entry IS
+    # looked up; non-dict lb_seen exercises the container guard instead.
+    for corrupt in (
+        "garbage",
+        ["not", "a", "dict"],
+        {"[1, 11]": []},
+        {"[1, 11]": 42},
+        {"[1, 11]": ["x"]},
+    ):
+        records, offset = c.read_table(
+            "Parents__Children",
+            {"cursor": "2024-01-02T00:00:00Z", "lb_seen": corrupt},
+            opts,
+        )
+        assert sorted(r["Id"] for r in records) == [11, 12], corrupt
+        assert offset["cursor"] == "2024-01-03T00:00:00Z"
+        assert len(offset["lb_seen"]) == 2  # rebuilt exact and well-formed
+        assert all(isinstance(v, list) and len(v) == 2 for v in offset["lb_seen"].values())
+
+
+@responses.activate
+def test_lookback_dedup_cap_eviction_non_timestamp_cursor_no_crash():
+    """Cap eviction must not assume a timestamp cursor: the connector
+    supports any server-orderable cursor (integer IDs, GUIDs, strings —
+    see ``_read_incremental``), and a bare ``parse_iso8601`` on such a
+    value would crash the read at the first cap overflow. Non-ISO cursors
+    fall back to best-effort classes; ties break on the PK key."""
+    _mock_nested_metadata()
+
+    def _parents(req):
+        from urllib.parse import unquote
+
+        if "Id gt" in unquote(req.url):
+            return (200, {}, json.dumps({"value": []}))
+        return (
+            200,
+            {},
+            json.dumps(
+                {
+                    "value": [
+                        {
+                            "Id": 1,
+                            "Children": [
+                                {"Id": 11, "Label": "a", "ModifiedAt": "2024-01-02T12:00:00Z"},
+                                {"Id": 12, "Label": "b", "ModifiedAt": "2024-01-03T00:00:00Z"},
+                            ],
+                        }
+                    ]
+                }
+            ),
+        )
+
+    responses.add_callback(responses.GET, f"{SERVICE_URL}Parents", callback=_parents)
+    responses.add_callback(
+        responses.GET,
+        f"{SERVICE_URL}Parents(1)/Children",
+        callback=lambda r: (200, {}, json.dumps({"value": []})),
+    )
+    c = _make()
+    opts = {
+        "expand_contained": "true",
+        "cursor_field": "Label",  # Edm.String — never ISO-parses
+        "cursor_lookback_seconds": "3600",
+        "cursor_lookback_dedup": "1",
+    }
+    # First streaming batch (no floor): both rows emitted, the 1-entry cap
+    # overflows, and eviction sorts the non-ISO cursors — no crash. "a" and
+    # "b" tie in the length-fallback class, so the PK key decides,
+    # deterministically.
+    records, offset = c.read_table("Parents__Children", {}, opts)
+    assert sorted(r["Id"] for r in records) == [11, 12]
+    assert offset["cursor"] == "b"
+    assert len(offset["lb_seen"]) == 1
+    assert "12" in next(iter(offset["lb_seen"]))  # PK tiebreak, fetch-order-free
+
+
+def test_lb_seen_order_key_never_raises_and_orders():
+    """Eviction order-key contract: never raises (non-timestamp cursors
+    are supported, and the cursor slot rides the user-visible checkpoint)
+    and orders ISO timestamps chronologically, numerics numerically, and
+    everything else by string length, with ``None`` at the very bottom."""
+    from databricks.labs.community_connector.sources.odata._contained import (
+        _lb_seen_order_key as key,
+    )
+
+    # Never raises: non-ISO strings, GUIDs, non-str shapes, nan/inf, empty.
+    for v in (
+        None,
+        "a",
+        "12345",
+        "550e8400-e29b-41d4-a716-446655440000",
+        {"weird": 1},
+        ["x"],
+        "nan",
+        "inf",
+        "",
+    ):
+        key(v)
+    # Numerics: exact magnitude order (lexical order would invert this).
+    assert key("99") < key("100")
+    # Timestamps: chronological, and ranked above every non-ISO class.
+    assert key("2024-01-01T00:00:00Z") < key("2024-01-02T00:00:00Z")
+    assert key("100") < key("2024-01-01T00:00:00Z")
+    # Fallback class: longer string wins; None sorts at the very bottom.
+    assert key("ab") < key("abc")
+    assert key(None) < key("a")
+
+
+@responses.activate
 def test_cursor_lookback_non_utc_watermark_single_escape_on_wire():
     """The lookback floor returns a BARE ISO string; the single percent-escape
     happens at literal generation (``_cursor_filter`` → ``odata_literal``). A
@@ -4009,8 +4483,11 @@ def test_apply_cursor_lookback_returns_bare_iso_string():
 def test_expand_cursor_lookback_idles_on_no_progress_instead_of_raising():
     """Quiescent re-read: the floored filter re-returns the overlap rows
     (cursor <= committed) but no row exceeds the watermark. With lookback
-    this idles (empty, offset unchanged) instead of raising the no-progress
-    error — which is what the plain ``cursor gt`` path would do."""
+    this never raises the no-progress error (which is what the plain
+    ``cursor gt`` path would do): under default-on dedup the FIRST such
+    batch delivers the overlap rows once (they enter ``lb_seen`` tracking
+    — real offset progress), and every later quiescent trigger idles
+    (empty, offset unchanged)."""
     from urllib.parse import unquote
 
     _mock_nested_metadata()
@@ -4052,8 +4529,23 @@ def test_expand_cursor_lookback_idles_on_no_progress_instead_of_raising():
             "cursor_lookback_seconds": "3600",
         },
     )
-    assert list(records) == []  # overlap re-read suppressed
-    assert _drop_lb(offset) == start  # idled, no advance, no RuntimeError
+    # First quiescent batch: the overlap row enters dedup tracking and is
+    # delivered once (lb_seen delta = offset progress) — still no raise.
+    assert [r["Id"] for r in records] == [11]
+    assert _drop_lb(offset) == start  # cursor did not advance
+    assert len(offset["lb_seen"]) == 1
+    # Second quiescent batch: tracked and unchanged — idles.
+    records2, offset2 = c.read_table(
+        "Parents__Children",
+        offset,
+        {
+            "expand_contained": "true",
+            "cursor_field": "ModifiedAt",
+            "cursor_lookback_seconds": "3600",
+        },
+    )
+    assert list(records2) == []
+    assert offset2 == offset  # idled, no advance, no RuntimeError
 
 
 @responses.activate
@@ -4278,7 +4770,18 @@ def test_contained_expand_cursor_drains_capped_inner_collection_multi_parent():
     while b < 50:
         b += 1
         recs, new = c.read_table(
-            "Parents__Children", offset, {"cursor_field": "ModifiedAt", "expand_contained": "true"}
+            "Parents__Children",
+            offset,
+            {
+                "cursor_field": "ModifiedAt",
+                "expand_contained": "true",
+                # Dedup off: this test pins the DRAIN's strict exactly-once
+                # resume guarantee. Default-on dedup re-delivers the overlap
+                # once after a capped cycle (its lb_seen shrank to the last
+                # slice) — a documented, MERGE-idempotent re-emit that would
+                # read as duplicates here.
+                "cursor_lookback_dedup": "off",
+            },
         )
         got = [(r["Parents_Id"], r["Id"]) for r in recs]
         for k in got:
@@ -9814,6 +10317,10 @@ def test_cursor_probe_resumes_across_cap_with_dirty_chain_iterator():
         "cursor_probe": "nested-expand",
         "pagination": "nextlink",
         "max_records_per_batch": "1",
+        # Dedup off: this test pins the probe walk's strict exactly-once
+        # capped-resume guarantee; default-on dedup re-delivers the overlap
+        # once after a capped cycle (documented MERGE-idempotent re-emit).
+        "cursor_lookback_dedup": "off",
     }
     offset = {"cursor": since}
     seen = []
