@@ -161,8 +161,8 @@ These are passed to the connector via the pipeline's `table_configuration` block
 The table above covers the core options only. The full allowlisted set also
 includes `pagination`, `cursor_probe`, `contained_fetch`, `num_partitions`,
 `cursor_nulls`, `filter_at_*`, `exclude_ancestor_columns`,
-`cursor_lookback_seconds`, `cursor_lookback_factor`, and
-`cursor_lookback_max_seconds` — the **authoritative, complete option
+`cursor_lookback_seconds`, `cursor_lookback_factor`,
+`cursor_lookback_max_seconds`, and `cursor_lookback_dedup` — the **authoritative, complete option
 reference is the [README's Per-table options section](README.md)**.
 
 `namespace` is consumed by the connector before the request is built; the rest all influence the URL, the per-batch loop, or the request semantics.

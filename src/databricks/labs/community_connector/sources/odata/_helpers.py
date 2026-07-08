@@ -418,6 +418,64 @@ def parse_max_records(table_options: dict | None) -> int:
     return value
 
 
+# One-time-set capability markers persisted on the offset (baked-in
+# verdicts, not progress). Shared by the no-progress comparison in
+# ``_finalize_cursor_read`` and the quiescence check in
+# ``_attach_lookback_state`` so the two can never drift: a key one strips
+# and the other doesn't turns a quiescent overlap re-read into a fake
+# "real walk" measurement (or vice versa).
+OFFSET_CAPABILITY_FLAGS = frozenset(
+    {"cursor_probe_ok", "batch_ok", "batch_size_ok", "or_filter_ok", "expand_ok", "delta_ok"}
+)
+
+
+def offset_progress_view(off: dict | None) -> dict:
+    """The offset's cursor/continuation progress state only: strips the
+    ``lb_*`` lookback bookkeeping (its measurement fluctuates batch to
+    batch without representing real cursor progress) and the one-time
+    capability flags (:data:`OFFSET_CAPABILITY_FLAGS`) — otherwise a batch
+    that merely baked in a flag would read as forward progress."""
+    return {
+        k: v
+        for k, v in (off or {}).items()
+        if not k.startswith("lb_") and k not in OFFSET_CAPABILITY_FLAGS
+    }
+
+
+LOOKBACK_DEDUP_DEFAULT_CAP = 5000
+
+
+def parse_lookback_dedup(table_options: dict | None) -> int:
+    """Parse the ``cursor_lookback_dedup`` table option into a seen-set
+    entry cap: ``off``/``false`` (default) -> 0 (disabled), ``on``/``true``
+    -> the default cap, a positive integer -> that cap (the boolean
+    spellings match the connector's other flag options, e.g.
+    ``expand_contained``). The seen-set must be EXACT — a
+    probabilistic structure (e.g. a Bloom filter) can report a
+    never-emitted row as seen and suppress it (silent loss) — so the only
+    size control offered is a hard entry cap; above it the read degrades
+    to plain overlap re-emits (MERGE-idempotent at the destination),
+    never loss."""
+    raw = str((table_options or {}).get("cursor_lookback_dedup", "off")).strip().lower()
+    if raw in ("off", "false", "0", ""):
+        return 0
+    if raw in ("on", "true"):
+        return LOOKBACK_DEDUP_DEFAULT_CAP
+    try:
+        cap = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"Invalid cursor_lookback_dedup={raw!r}. Expected one of: off, on, "
+            f"or a positive integer entry cap."
+        ) from None
+    if cap < 1:
+        raise ValueError(
+            f"Invalid cursor_lookback_dedup={raw!r}: the entry cap must be >= 1 "
+            f"(use 'off' to disable)."
+        )
+    return cap
+
+
 def max_or(a: Any, b: Any) -> Any:
     """Max of two values in CURSOR order (see :func:`cursor_newer`) where
     either may be ``None``. Returns the other when one is ``None``; ``None``

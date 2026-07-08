@@ -167,7 +167,7 @@ w.api_client.do(
                 "delta_tracking,expand_contained,num_partitions,pagination,"
                 "exclude_ancestor_columns,cursor_lookback_seconds,"
                 "cursor_lookback_factor,cursor_lookback_max_seconds,"
-                "cursor_probe,contained_fetch"
+                "cursor_lookback_dedup,cursor_probe,contained_fetch"
             ),
         },
     },
@@ -192,7 +192,7 @@ the matching OAuth2 keys. Client credentials:
         "delta_tracking,expand_contained,num_partitions,pagination,"
         "exclude_ancestor_columns,cursor_lookback_seconds,"
         "cursor_lookback_factor,cursor_lookback_max_seconds,"
-        "cursor_probe,contained_fetch"
+        "cursor_lookback_dedup,cursor_probe,contained_fetch"
     ),
 }
 ```
@@ -342,6 +342,7 @@ links to its detail subsection.
 | [`cursor_probe`](#cursor_probe) | `auto` | Change-probe acceleration for deep leaf-cursor N+1 reads. |
 | [`num_partitions`](#num_partitions) | `4` | Spark-parallel reads of contained N+1 paths. |
 | [`cursor_lookback_seconds`](#cursor_lookback_seconds-cursor_lookback_factor-cursor_lookback_max_seconds) | `auto` | Overlap window re-scanning rows that landed mid-walk (with `cursor_lookback_factor`, `cursor_lookback_max_seconds`). |
+| [`cursor_lookback_dedup`](#cursor_lookback_dedup) | `off` | Suppress redundant overlap re-emits via an exact, capped seen-set. |
 | [`exclude_ancestor_columns`](#exclude_ancestor_columns) | — | Drop synthetic ancestor-FK columns from a contained table. |
 
 ### select
@@ -1096,6 +1097,70 @@ be > 0; values < 1 risk under-covering (dropped rows). Ignored unless
 **`cursor_lookback_max_seconds`** (default 3600) — `auto`-mode only:
 ceiling clamp (runaway backstop) on the computed window, in seconds.
 Must be > 0. Ignored unless `cursor_lookback_seconds=auto`.
+
+### cursor_lookback_dedup
+
+Suppresses the redundant re-upserts a lookback window produces. With a
+window active, every row still inside it is re-fetched **and re-emitted**
+each batch — correct (the destination MERGE is idempotent) but
+write-amplifying: for SCD_TYPE_1 an identical-values MERGE still rewrites
+Delta files. (SCD_TYPE_2 already absorbs most of this via its change
+detection.) The re-fetch itself cannot be avoided — the server-side
+filter is `cursor gt <floored value>` — so this option saves the
+downstream emit/parse/MERGE, not HTTP.
+
+Values: **`off`** (default — current behavior), **`on`** (dedup with the
+default 5000-entry cap), or a **positive integer** (dedup with that
+entry cap). `true`/`false` are accepted aliases for `on`/`off`, matching
+the connector's other flag options.
+
+When enabled, the offset carries `lb_seen`: an **exact** map of
+`{composite-PK → [cursor, content-hash]}` for the rows delivered from
+the current window. A re-fetched row whose key **and full content hash**
+match its entry was already delivered unchanged and is dropped from the
+batch. Hashing the whole row — not just PK+cursor — means a source that
+updates columns *without* advancing the cursor still gets its in-window
+change delivered, exactly as the blind re-emit would have.
+
+Mechanics and guarantees:
+
+- **Self-pruning**: the set is rebuilt each batch from the rows actually
+  fetched — every in-window row is re-fetched every batch by definition,
+  so the current fetch *is* the next window's candidate population.
+  Aged-out and source-deleted rows drop out with no window arithmetic.
+- **Bounded offset**: above the entry cap the highest-cursor entries are
+  kept (they stay in the window longest) and the remainder degrade to
+  plain re-emits — the pre-dedup behavior — with a one-time warning.
+  Entries cost roughly 60–100 bytes each; size the cap against your
+  checkpoint-size budget.
+- **Exactness is mandatory**: every failure direction (capped-out entry,
+  mid-cycle resume shrinkage, downgrade to a build without the option)
+  is a redundant re-emit, never suppression of an undelivered row. A
+  probabilistic structure (e.g. a Bloom filter) is ruled out because a
+  false positive would suppress a never-emitted row — silent loss.
+- **No semantics shift**: suppressed rows always sit at-or-below the
+  committed watermark, so suppression cannot affect watermark
+  progression, `max_records_per_batch` accounting (overlap rows are
+  already excluded from the cap), or the no-progress guard (`lb_seen`
+  is `lb_`-prefixed bookkeeping, stripped from the progress
+  comparison). A batch whose rows are all suppressed idles exactly like
+  today's pure-overlap batch. One deliberate improvement over the blind
+  re-emit: a **genuine in-window change is delivered promptly even on a
+  quiescent trigger** — the `lb_seen` delta carries the offset progress —
+  where the pre-dedup idle rule deferred all overlap rows to the next
+  progressing batch.
+- **Scope**: the four non-atomic contained cursor walks — the only
+  paths a lookback window applies to (see
+  [the lookback options](#cursor_lookback_seconds-cursor_lookback_factor-cursor_lookback_max_seconds))
+  — whenever the window is active. Inert when the window resolves to 0,
+  on flat top-level cursor reads (no lookback, so nothing to dedup),
+  and on partitioned streams (per-partition emits share no seen-set;
+  their explicit window re-emits the overlap every batch). Only useful
+  with a **timestamp** cursor — the only shape that gets an overlap
+  window: under `auto` a non-timestamp cursor's read floor is a
+  deliberate no-op, so dedup would track rows without ever having a
+  re-read to suppress (harmless, but pure offset weight — leave it
+  `off` there).
 
 ### exclude_ancestor_columns
 

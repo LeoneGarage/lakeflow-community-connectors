@@ -95,8 +95,10 @@ from databricks.labs.community_connector.sources.odata._helpers import (
     cursor_max as _cursor_max,
     jsonify_complex_values as _jsonify_complex_values,
     max_or as _max_or,
+    offset_progress_view as _offset_progress_view,
     pad_row_to_fields as _pad_row_to_fields,
     parse_iso8601 as _parse_iso8601,
+    parse_lookback_dedup as _parse_lookback_dedup,
     parse_max_records as _parse_max_records,
     trim_to_distinct_cursor_boundary as _trim_to_distinct_cursor_boundary,
     url_origin as _url_origin,
@@ -1623,6 +1625,13 @@ class ODataLakeflowConnect(
         # ``auto`` tuning knobs (ignored for static/off modes).
         self._cursor_lookback_factor = self._parse_cursor_lookback_factor(opts)
         self._cursor_lookback_max_seconds = self._parse_cursor_lookback_ceiling(opts)
+        # Overlap-dedup seen-set cap (0 = off, the default). Consumed by
+        # ``_apply_lookback_dedup`` inside ``_finalize_cursor_read``; the
+        # namespace rides along for composite-PK resolution there. Validated
+        # eagerly so a bad value fails the read up front even when the
+        # lookback window is inactive.
+        self._lookback_dedup_cap = _parse_lookback_dedup(opts)
+        self._lookback_dedup_ns = (opts or {}).get("namespace")
         # Resolved per-read by each contained cursor-read path; stays 0 for
         # every other read.
         self._active_lookback_seconds = 0
@@ -5113,9 +5122,11 @@ class ODataLakeflowConnect(
           history unchanged so the read floor stays stable until completion,
           and stamp ``lb_cycle_started`` (wall-clock epoch, set once at the
           cycle's first batch) so completion can measure the WHOLE cycle.
-        * Idled (``out_offset is start_offset`` — quiescent overlap re-read):
-          keep the prior history; a quiescent walk only re-reads the small
-          overlap and would under-represent a real walk.
+        * Idled (``out_offset is start_offset`` — quiescent overlap re-read)
+          or advanced only ``lb_*`` bookkeeping (a ``cursor_lookback_dedup``
+          delta delivery — see ``_finalize_cursor_read``): keep the prior
+          history; a quiescent walk only re-reads the small overlap and
+          would under-represent a real walk.
         * Completed a progressing walk: append the cycle's wall-clock span —
           ``now - lb_cycle_started`` when the walk spanned multiple capped
           batches (the churn-exposure window of a capped cycle is the full
@@ -5138,6 +5149,24 @@ class ODataLakeflowConnect(
             return out_offset
         history = list((start_offset or {}).get("lb_history") or [])
         cycle_started = (start_offset or {}).get("lb_cycle_started")
+
+        if _offset_progress_view(out_offset) == _offset_progress_view(start_offset):
+            # Progress-equal under the SAME view ``_finalize_cursor_read``
+            # uses (shared helper — the stripped-key sets can never drift):
+            # the batch advanced only ``lb_*`` bookkeeping, a
+            # ``cursor_lookback_dedup`` delta delivery that returns a NEW
+            # offset dict the identity check above can't catch. Still a
+            # quiescent overlap re-read, not a real walk: appending its
+            # overlap-only duration would, ``_LOOKBACK_AUTO_WINDOW`` such
+            # triggers later, flush every real walk out of the rolling
+            # history and shrink the ``auto`` window below the walks it must
+            # cover. Carry the prior measurement state unchanged instead.
+            out = dict(out_offset)
+            if history:
+                out.setdefault("lb_history", history)
+            if cycle_started is not None:
+                out.setdefault("lb_cycle_started", cycle_started)
+            return out
         if in_flight:
             out = {k: v for k, v in out_offset.items() if k != "lb_cycle_started"}
             if cycle_started is None:

@@ -20,6 +20,8 @@ against the concrete class.
 # cap; splitting it further would fragment one tightly-coupled feature.
 # pylint: disable=too-many-lines
 
+import hashlib
+import json
 import logging
 import math
 import re
@@ -36,6 +38,7 @@ from requests.utils import requote_uri
 
 from databricks.labs.community_connector.sources.odata._helpers import (
     _as_exact_number,
+    offset_progress_view,
     parse_iso8601,
 )
 from databricks.labs.community_connector.sources.odata._helpers import (
@@ -89,6 +92,38 @@ MAX_CONTAINED_DEPTH = 10
 # overhead dominates; smaller chunks also amplify the
 # ``@odata.nextLink`` chase at every level.
 MIN_DYNAMIC_TOP = 5
+
+
+def _lb_seen_order_key(raw_cursor):
+    """Cursor-order sort key for ``lb_seen`` cap eviction: ISO timestamps
+    sort chronologically, numeric cursors numerically, anything else by
+    string length (a coarse largest-last proxy — non-negative integers
+    without leading zeros still order by magnitude). ``None``/unparseable
+    values sort below every parsed one (evicted first). Never raises: the
+    connector supports non-timestamp cursors (integer IDs, GUIDs — see
+    ``_read_incremental``), and a checkpoint entry's cursor slot is
+    user-visible state, so both must degrade, not crash. A table's
+    cursors are homogeneous, so the class ranks never actually interleave;
+    eviction is best-effort regardless — a dropped entry only costs one
+    redundant MERGE re-emit, never loss."""
+    if raw_cursor is None:
+        return (0, 0.0)
+    raw = str(raw_cursor)
+    # ``looks_like_iso8601`` (not a bare parse) so the verdict is uniform
+    # across Python versions and non-ISO input can't raise.
+    if looks_like_iso8601(raw):
+        return (2, parse_iso8601(raw).timestamp())
+    try:
+        num = float(raw)
+    except ValueError:
+        return (0, float(len(raw)))
+    # Same non-finite discipline as the ``lb_history`` validation: a
+    # nan/inf cursor drops to the length class instead of poisoning the
+    # sort.
+    if math.isfinite(num):
+        return (1, num)
+    return (0, float(len(raw)))
+
 
 # Default ``page_size`` applied to **cursor-based** reads (cursor_field
 # or delta) when the user didn't set one, so a ``$top`` is still sent.
@@ -5112,6 +5147,104 @@ class ContainedNavMixin:
             f"cursor."
         )
 
+    def _apply_lookback_dedup(
+        self,
+        start_offset: dict | None,
+        end_offset: dict,
+        emitted: list[dict],
+        table_name: str,
+        cursor_field: str,
+    ) -> tuple[list[dict], dict]:
+        """Suppress lookback-overlap re-emits via an exact, capped seen-set
+        (``cursor_lookback_dedup``; off by default).
+
+        With a lookback window active, every row still inside the window
+        is re-fetched on every batch and re-emitted - correct
+        (MERGE-idempotent) but write-amplifying at the destination. When
+        enabled, the offset carries ``lb_seen``: an EXACT map of
+        ``{composite-PK key: [cursor, content-hash]}`` for the rows
+        delivered from the current window. A fetched row whose key AND
+        full content hash match its entry has already been delivered
+        unchanged - it is dropped from the batch. Hashing the whole row
+        (not just PK+cursor) means a source that updates columns WITHOUT
+        advancing the cursor still gets its in-window change delivered,
+        exactly as the blind re-emit would have.
+
+        The set is REBUILT each batch from the rows actually fetched:
+        every in-window row is re-fetched every batch by definition, so
+        the current fetch IS the next window's candidate population - no
+        window arithmetic, aged-out and deleted rows drop out naturally.
+        (A capped mid-cycle resume batch fetches only its continuation
+        slice, shrinking the set to it - later re-emits, never loss.)
+        Above the entry cap, the highest-cursor entries are kept (they
+        stay in the window longest) and the remainder degrade to plain
+        re-emits - the pre-dedup behavior. Every failure direction is
+        re-emit, never suppression of an undelivered row, which is why
+        the set must be exact and a probabilistic structure is ruled
+        out. Suppressed rows always sit at-or-below the committed
+        watermark (a changed row hashes differently), so suppression can
+        never affect watermark progression, the batch cap (overlap rows
+        are already excluded from it), or the no-progress guard
+        (``lb_seen`` is ``lb_``-prefixed and stripped by
+        ``offset_progress_view``)."""
+        cap = getattr(self, "_lookback_dedup_cap", 0)
+        if not cap or not emitted or getattr(self, "_active_lookback_seconds", 0) <= 0:
+            return emitted, end_offset
+        prior = (start_offset or {}).get("lb_seen") or {}
+        if not isinstance(prior, dict):
+            # The checkpoint is user-visible state (same discipline as the
+            # ``lb_history`` validation in ``_resolve_active_lookback``): a
+            # hand-edited/corrupt ``lb_seen`` degrades to "nothing seen" —
+            # plain re-emits, never a crash and never suppression.
+            prior = {}
+        pks = self._primary_keys_for(table_name, getattr(self, "_lookback_dedup_ns", None))
+        new_seen: dict[str, list] = {}
+        kept: list[dict] = []
+        for row in emitted:
+            key = json.dumps([row.get(k) for k in pks], default=str)
+            digest = hashlib.sha1(
+                json.dumps(row, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()[:16]
+            entry = prior.get(key)
+            # The shape check mirrors the ``prior`` guard above: a corrupt
+            # entry never matches, so the row re-emits and its entry is
+            # rebuilt well-formed.
+            if isinstance(entry, (list, tuple)) and len(entry) == 2 and entry[1] == digest:
+                # Delivered unchanged in a prior batch - suppress, but keep
+                # the entry alive for as long as the row stays in-window.
+                new_seen[key] = entry
+                continue
+            kept.append(row)
+            cur = row.get(cursor_field)
+            new_seen[key] = [None if cur is None else str(cur), digest]
+        if len(new_seen) > cap:
+            if not getattr(self, "_warned_lb_dedup_cap", False):
+                _LOG.warning(
+                    "cursor_lookback_dedup: window population (%s rows) exceeds "
+                    "the entry cap (%s) on %r - keeping the newest %s and "
+                    "re-emitting the rest (MERGE-idempotent; raise the cap or "
+                    "shrink the lookback window to restore full dedup).",
+                    len(new_seen),
+                    cap,
+                    table_name,
+                    cap,
+                )
+                self._warned_lb_dedup_cap = True
+            # The PK-key tiebreak makes eviction DETERMINISTIC across
+            # batches. Broken by fetch order instead, cursor ties on an
+            # order-unstable server flap the surviving set, and every flap
+            # is an ``lb_seen`` delta that re-emits the newly evicted rows
+            # on each trigger of an otherwise-quiescent source.
+            ordered = sorted(
+                new_seen.items(),
+                key=lambda kv: (_lb_seen_order_key(kv[1][0]), kv[0]),
+                reverse=True,
+            )
+            new_seen = dict(ordered[:cap])
+        out = dict(end_offset)
+        out["lb_seen"] = new_seen
+        return kept, out
+
     def _finalize_cursor_read(
         self,
         start_offset: dict | None,
@@ -5135,30 +5268,17 @@ class ContainedNavMixin:
         the raise branch."""
         if start_offset is None:
             return iter(emitted), end_offset
+        emitted, end_offset = self._apply_lookback_dedup(
+            start_offset, end_offset, emitted, table_name, cursor_field
+        )
 
-        # Compare progress on the cursor/continuation state only. Strip the
-        # ``lb_*`` auto-lookback bookkeeping (its measurement fluctuates batch
-        # to batch without representing real cursor progress) and the persisted
-        # ``cursor_probe_ok`` / ``batch_ok`` capability flags (one-time-set
-        # markers, not progress) — otherwise a batch that merely bakes in a flag
-        # would read as forward progress and bypass the no-progress guard.
-        def _progress_view(off: dict | None) -> dict:
-            return {
-                k: v
-                for k, v in (off or {}).items()
-                if not k.startswith("lb_")
-                and k
-                not in (
-                    "cursor_probe_ok",
-                    "batch_ok",
-                    "batch_size_ok",
-                    "or_filter_ok",
-                    "expand_ok",
-                    "delta_ok",
-                )
-            }
-
-        if _progress_view(start_offset) == _progress_view(end_offset):
+        # Compare progress on the cursor/continuation state only — see
+        # ``offset_progress_view`` (shared with ``_attach_lookback_state``'s
+        # quiescence check so the two stripped-key sets can never drift):
+        # ``lb_*`` bookkeeping and the one-time capability flags are not
+        # progress, and a batch that merely bakes in a flag must not bypass
+        # the no-progress guard.
+        if offset_progress_view(start_offset) == offset_progress_view(end_offset):
             if emitted:
                 # With cursor_lookback the read floor lags the committed
                 # watermark by the overlap window, so a quiescent trigger
@@ -5172,6 +5292,19 @@ class ContainedNavMixin:
                 # the next PROGRESSING batch, when end_offset advances past
                 # the prior watermark.
                 if getattr(self, "_active_lookback_seconds", 0) > 0:
+                    # With dedup active, the surviving rows are GENUINELY new
+                    # content (changed hash or first delivery) — the blind
+                    # re-reads were already filtered out — and the ``lb_seen``
+                    # delta gives the framework real offset progress, so the
+                    # next batch suppresses these rows instead of looping.
+                    # A surviving row WITHOUT an lb_seen delta is a
+                    # cap-evicted re-read: keep today's idle for it (it
+                    # re-emits on the next progressing batch), otherwise an
+                    # unchanged offset + rows would replay every trigger.
+                    if (end_offset.get("lb_seen") or {}) != (
+                        (start_offset or {}).get("lb_seen") or {}
+                    ) and "lb_seen" in end_offset:
+                        return iter(emitted), end_offset
                     return iter([]), start_offset
                 raise self._no_progress_cursor_error(table_name, cursor_field, len(emitted))
             return iter([]), start_offset
