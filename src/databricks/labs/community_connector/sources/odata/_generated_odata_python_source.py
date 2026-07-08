@@ -1044,30 +1044,37 @@ def register_lakeflow_source(spark):
 
     def parse_lookback_dedup(table_options: dict | None) -> int:
         """Parse the ``cursor_lookback_dedup`` table option into a seen-set
-        entry cap: ``off``/``false`` (default) -> 0 (disabled), ``on``/``true``
-        -> the default cap, a positive integer -> that cap (the boolean
-        spellings match the connector's other flag options, e.g.
-        ``expand_contained``). The seen-set must be EXACT — a
+        entry cap: ``on``/``true`` (the default) -> the default cap,
+        ``off``/``false``/``0`` -> 0 (disabled), a positive integer -> that
+        cap (the boolean spellings match the connector's other flag options,
+        e.g. ``expand_contained``). Defaulting on is safe: dedup only
+        engages when a lookback window is active, every failure direction is
+        a redundant MERGE re-emit (the pre-dedup behavior), and a
+        pre-existing offset without ``lb_seen`` just re-emits one overlap
+        before tracking engages. The seen-set must be EXACT — a
         probabilistic structure (e.g. a Bloom filter) can report a
         never-emitted row as seen and suppress it (silent loss) — so the only
         size control offered is a hard entry cap; above it the read degrades
         to plain overlap re-emits (MERGE-idempotent at the destination),
         never loss."""
-        raw = str((table_options or {}).get("cursor_lookback_dedup", "off")).strip().lower()
-        if raw in ("off", "false", "0", ""):
+        raw = (table_options or {}).get("cursor_lookback_dedup")
+        if raw is None or str(raw).strip() == "":
+            return LOOKBACK_DEDUP_DEFAULT_CAP
+        norm = str(raw).strip().lower()
+        if norm in ("off", "false", "0"):
             return 0
-        if raw in ("on", "true"):
+        if norm in ("on", "true"):
             return LOOKBACK_DEDUP_DEFAULT_CAP
         try:
-            cap = int(raw)
+            cap = int(norm)
         except ValueError:
             raise ValueError(
-                f"Invalid cursor_lookback_dedup={raw!r}. Expected one of: off, on, "
+                f"Invalid cursor_lookback_dedup={norm!r}. Expected one of: on, off, "
                 f"or a positive integer entry cap."
             ) from None
         if cap < 1:
             raise ValueError(
-                f"Invalid cursor_lookback_dedup={raw!r}: the entry cap must be >= 1 "
+                f"Invalid cursor_lookback_dedup={norm!r}: the entry cap must be >= 1 "
                 f"(use 'off' to disable)."
             )
         return cap
@@ -6175,7 +6182,8 @@ def register_lakeflow_source(spark):
             cursor_field: str,
         ) -> tuple[list[dict], dict]:
             """Suppress lookback-overlap re-emits via an exact, capped seen-set
-            (``cursor_lookback_dedup``; off by default).
+            (``cursor_lookback_dedup``; ON by default — ``off`` restores the
+            blind re-emit).
 
             With a lookback window active, every row still inside the window
             is re-fetched on every batch and re-emitted - correct
@@ -9306,7 +9314,7 @@ def register_lakeflow_source(spark):
             # ``auto`` tuning knobs (ignored for static/off modes).
             self._cursor_lookback_factor = self._parse_cursor_lookback_factor(opts)
             self._cursor_lookback_max_seconds = self._parse_cursor_lookback_ceiling(opts)
-            # Overlap-dedup seen-set cap (0 = off, the default). Consumed by
+            # Overlap-dedup seen-set cap (on by default; 0 = off). Consumed by
             # ``_apply_lookback_dedup`` inside ``_finalize_cursor_read``; the
             # namespace rides along for composite-PK resolution there. Validated
             # eagerly so a bad value fails the read up front even when the

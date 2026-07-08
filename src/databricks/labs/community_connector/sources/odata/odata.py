@@ -1625,7 +1625,7 @@ class ODataLakeflowConnect(
         # ``auto`` tuning knobs (ignored for static/off modes).
         self._cursor_lookback_factor = self._parse_cursor_lookback_factor(opts)
         self._cursor_lookback_max_seconds = self._parse_cursor_lookback_ceiling(opts)
-        # Overlap-dedup seen-set cap (0 = off, the default). Consumed by
+        # Overlap-dedup seen-set cap (on by default; 0 = off). Consumed by
         # ``_apply_lookback_dedup`` inside ``_finalize_cursor_read``; the
         # namespace rides along for composite-PK resolution there. Validated
         # eagerly so a bad value fails the read up front even when the

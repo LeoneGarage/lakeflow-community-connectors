@@ -4071,9 +4071,10 @@ def test_lookback_dedup_cap_overflow_keeps_newest_and_reemits_rest():
 
 
 @responses.activate
-def test_lookback_dedup_off_by_default_reemits_overlap():
-    """Without the option, overlap rows re-emit every batch (current
-    behavior) and no ``lb_seen`` rides the offset."""
+def test_lookback_dedup_explicit_off_reemits_overlap():
+    """``cursor_lookback_dedup=off`` restores the pre-dedup behavior:
+    overlap rows re-flow every batch (idled on quiescent triggers) and no
+    ``lb_seen`` rides the offset."""
     _mock_nested_metadata()
 
     def _parents(req):
@@ -4109,20 +4110,22 @@ def test_lookback_dedup_off_by_default_reemits_overlap():
         "expand_contained": "true",
         "cursor_field": "ModifiedAt",
         "cursor_lookback_seconds": "3600",
+        "cursor_lookback_dedup": "off",
     }
     _, offset = c.read_table("Parents__Children", {"cursor": "2024-01-02T00:00:00Z"}, opts)
     assert "lb_seen" not in offset
     records2, offset2 = c.read_table("Parents__Children", offset, opts)
     # Pure-overlap batch: the row was re-FETCHED and flowed through the
     # pre-existing suppressed-idle rule (returns [] with lookback on, echoes
-    # the offset) — the pre-dedup semantics are unchanged, no lb_seen rides.
+    # the offset) — the pre-dedup semantics hold, no lb_seen rides.
     assert list(records2) == []
     assert offset2 == offset
     assert "lb_seen" not in offset2
 
 
 def test_lookback_dedup_parse_modes():
-    """Option grammar: off/false/0 → 0; on/true → default cap (the boolean
+    """Option grammar: absent/empty → the DEFAULT cap (dedup is on by
+    default); off/false/0 → 0; on/true → default cap (the boolean
     spellings match the connector's other flag options); positive int →
     that cap; garbage and non-positive raise curated errors."""
     from databricks.labs.community_connector.sources.odata._helpers import (
@@ -4130,7 +4133,9 @@ def test_lookback_dedup_parse_modes():
         parse_lookback_dedup,
     )
 
-    assert parse_lookback_dedup({}) == 0
+    assert parse_lookback_dedup({}) == LOOKBACK_DEDUP_DEFAULT_CAP
+    assert parse_lookback_dedup(None) == LOOKBACK_DEDUP_DEFAULT_CAP
+    assert parse_lookback_dedup({"cursor_lookback_dedup": ""}) == LOOKBACK_DEDUP_DEFAULT_CAP
     assert parse_lookback_dedup({"cursor_lookback_dedup": "off"}) == 0
     assert parse_lookback_dedup({"cursor_lookback_dedup": "false"}) == 0
     assert parse_lookback_dedup({"cursor_lookback_dedup": "0"}) == 0
@@ -4478,8 +4483,11 @@ def test_apply_cursor_lookback_returns_bare_iso_string():
 def test_expand_cursor_lookback_idles_on_no_progress_instead_of_raising():
     """Quiescent re-read: the floored filter re-returns the overlap rows
     (cursor <= committed) but no row exceeds the watermark. With lookback
-    this idles (empty, offset unchanged) instead of raising the no-progress
-    error — which is what the plain ``cursor gt`` path would do."""
+    this never raises the no-progress error (which is what the plain
+    ``cursor gt`` path would do): under default-on dedup the FIRST such
+    batch delivers the overlap rows once (they enter ``lb_seen`` tracking
+    — real offset progress), and every later quiescent trigger idles
+    (empty, offset unchanged)."""
     from urllib.parse import unquote
 
     _mock_nested_metadata()
@@ -4521,8 +4529,23 @@ def test_expand_cursor_lookback_idles_on_no_progress_instead_of_raising():
             "cursor_lookback_seconds": "3600",
         },
     )
-    assert list(records) == []  # overlap re-read suppressed
-    assert _drop_lb(offset) == start  # idled, no advance, no RuntimeError
+    # First quiescent batch: the overlap row enters dedup tracking and is
+    # delivered once (lb_seen delta = offset progress) — still no raise.
+    assert [r["Id"] for r in records] == [11]
+    assert _drop_lb(offset) == start  # cursor did not advance
+    assert len(offset["lb_seen"]) == 1
+    # Second quiescent batch: tracked and unchanged — idles.
+    records2, offset2 = c.read_table(
+        "Parents__Children",
+        offset,
+        {
+            "expand_contained": "true",
+            "cursor_field": "ModifiedAt",
+            "cursor_lookback_seconds": "3600",
+        },
+    )
+    assert list(records2) == []
+    assert offset2 == offset  # idled, no advance, no RuntimeError
 
 
 @responses.activate
@@ -4747,7 +4770,18 @@ def test_contained_expand_cursor_drains_capped_inner_collection_multi_parent():
     while b < 50:
         b += 1
         recs, new = c.read_table(
-            "Parents__Children", offset, {"cursor_field": "ModifiedAt", "expand_contained": "true"}
+            "Parents__Children",
+            offset,
+            {
+                "cursor_field": "ModifiedAt",
+                "expand_contained": "true",
+                # Dedup off: this test pins the DRAIN's strict exactly-once
+                # resume guarantee. Default-on dedup re-delivers the overlap
+                # once after a capped cycle (its lb_seen shrank to the last
+                # slice) — a documented, MERGE-idempotent re-emit that would
+                # read as duplicates here.
+                "cursor_lookback_dedup": "off",
+            },
         )
         got = [(r["Parents_Id"], r["Id"]) for r in recs]
         for k in got:
@@ -10283,6 +10317,10 @@ def test_cursor_probe_resumes_across_cap_with_dirty_chain_iterator():
         "cursor_probe": "nested-expand",
         "pagination": "nextlink",
         "max_records_per_batch": "1",
+        # Dedup off: this test pins the probe walk's strict exactly-once
+        # capped-resume guarantee; default-on dedup re-delivers the overlap
+        # once after a capped cycle (documented MERGE-idempotent re-emit).
+        "cursor_lookback_dedup": "off",
     }
     offset = {"cursor": since}
     seen = []

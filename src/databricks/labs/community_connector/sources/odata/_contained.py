@@ -5156,7 +5156,8 @@ class ContainedNavMixin:
         cursor_field: str,
     ) -> tuple[list[dict], dict]:
         """Suppress lookback-overlap re-emits via an exact, capped seen-set
-        (``cursor_lookback_dedup``; off by default).
+        (``cursor_lookback_dedup``; ON by default — ``off`` restores the
+        blind re-emit).
 
         With a lookback window active, every row still inside the window
         is re-fetched on every batch and re-emitted - correct

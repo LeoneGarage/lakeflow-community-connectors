@@ -342,7 +342,7 @@ links to its detail subsection.
 | [`cursor_probe`](#cursor_probe) | `auto` | Change-probe acceleration for deep leaf-cursor N+1 reads. |
 | [`num_partitions`](#num_partitions) | `4` | Spark-parallel reads of contained N+1 paths. |
 | [`cursor_lookback_seconds`](#cursor_lookback_seconds-cursor_lookback_factor-cursor_lookback_max_seconds) | `auto` | Overlap window re-scanning rows that landed mid-walk (with `cursor_lookback_factor`, `cursor_lookback_max_seconds`). |
-| [`cursor_lookback_dedup`](#cursor_lookback_dedup) | `off` | Suppress redundant overlap re-emits via an exact, capped seen-set. |
+| [`cursor_lookback_dedup`](#cursor_lookback_dedup) | `on` | Suppress redundant overlap re-emits via an exact, capped seen-set. |
 | [`exclude_ancestor_columns`](#exclude_ancestor_columns) | — | Drop synthetic ancestor-FK columns from a contained table. |
 
 ### select
@@ -1109,10 +1109,13 @@ detection.) The re-fetch itself cannot be avoided — the server-side
 filter is `cursor gt <floored value>` — so this option saves the
 downstream emit/parse/MERGE, not HTTP.
 
-Values: **`off`** (default — current behavior), **`on`** (dedup with the
-default 5000-entry cap), or a **positive integer** (dedup with that
-entry cap). `true`/`false` are accepted aliases for `on`/`off`, matching
-the connector's other flag options.
+Values: **`on`** (the default — dedup with the default 5000-entry cap),
+**`off`** (restore the blind re-emit), or a **positive integer** (dedup
+with that entry cap). `true`/`false` are accepted aliases for
+`on`/`off`, matching the connector's other flag options. Upgrading an
+existing pipeline is seamless: a checkpoint without `lb_seen` just
+re-emits one overlap's worth of rows (the pre-dedup behavior) and
+tracking engages from that batch on.
 
 When enabled, the offset carries `lb_seen`: an **exact** map of
 `{composite-PK → [cursor, content-hash]}` for the rows delivered from
@@ -1144,7 +1147,7 @@ Mechanics and guarantees:
   already excluded from the cap), or the no-progress guard (`lb_seen`
   is `lb_`-prefixed bookkeeping, stripped from the progress
   comparison). A batch whose rows are all suppressed idles exactly like
-  today's pure-overlap batch. One deliberate improvement over the blind
+  a pre-dedup pure-overlap batch. One deliberate improvement over the blind
   re-emit: a **genuine in-window change is delivered promptly even on a
   quiescent trigger** — the `lb_seen` delta carries the offset progress —
   where the pre-dedup idle rule deferred all overlap rows to the next
@@ -1159,7 +1162,7 @@ Mechanics and guarantees:
   with a **timestamp** cursor — the only shape that gets an overlap
   window: under `auto` a non-timestamp cursor's read floor is a
   deliberate no-op, so dedup would track rows without ever having a
-  re-read to suppress (harmless, but pure offset weight — leave it
+  re-read to suppress (harmless, but pure offset weight — set it
   `off` there).
 
 ### exclude_ancestor_columns
