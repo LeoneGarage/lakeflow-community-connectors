@@ -186,6 +186,18 @@ def cursor_newer(a: Any, b: Any) -> bool:
             return False
     if a == b:
         return False
+    # Key tie between two NUMERIC renderings: compare as exact Decimals so
+    # numerically-equal texts ("5000.0" vs "5000") read as the same instant
+    # in BOTH directions (the lexical fallback below would call one of them
+    # strictly newer — duplicate-safe, but not antisymmetric, so a server
+    # that alternates renderings could flap the watermark text batch to
+    # batch). Distinct values beyond float precision (Int64 cursors past
+    # 2^53 tie on the float sort key) also order truly here. ISO timestamp
+    # texts never Decimal-parse, so their sub-microsecond fraction
+    # tie-break below is untouched.
+    num_a, num_b = _as_exact_number(a), _as_exact_number(b)
+    if num_a is not None and num_b is not None:
+        return num_a > num_b
     # Exact-key tie with different texts: sub-microsecond digits (or two
     # renderings of one instant). Compare fractions numerically first.
     frac_a, frac_b = _fraction_digits(a), _fraction_digits(b)

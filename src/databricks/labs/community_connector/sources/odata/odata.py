@@ -1635,6 +1635,9 @@ class ODataLakeflowConnect(
         # Resolved per-read by each contained cursor-read path; stays 0 for
         # every other read.
         self._active_lookback_seconds = 0
+        # Streaming dedup filter — armed per-read by ``_arm_lookback_dedup``
+        # on the contained cursor paths; None everywhere else.
+        self._lb_dedup_filter = None
         # Only an EXPLICIT positive window is validated against the read
         # config — the default ``auto`` is a no-op outside the expand-cursor
         # path, so leaving it on for flat / N+1 / snapshot tables must not

@@ -1091,7 +1091,11 @@ Trade-off: a non-zero window re-**fetches** the trailing overlap each
 batch — `auto` keeps that HTTP cost proportional to the actual walk
 time. The downstream cost (re-emitting and re-MERGing unchanged rows)
 is absorbed by [`cursor_lookback_dedup`](#cursor_lookback_dedup),
-which is on by default; only genuine changes reach the destination.
+which is on by default and filters as rows stream in — so peak memory
+scales with genuinely-changed rows, not window size. With dedup `off`
+every in-window row is delivered (and buffered) each batch; on
+high-churn sources size the window via `cursor_lookback_max_seconds`
+with that in mind.
 
 **`cursor_lookback_factor`** (default 1.5) — `auto`-mode only:
 multiplier applied to the max recent walk duration when sizing the
@@ -1136,6 +1140,20 @@ Mechanics and guarantees:
   fetched — every in-window row is re-fetched every batch by definition,
   so the current fetch *is* the next window's candidate population.
   Aged-out and source-deleted rows drop out with no window arithmetic.
+- **Streaming memory bound**: suppression happens **at emit time**, as
+  rows stream off the wire — a proven-unchanged overlap row never
+  materializes in the batch buffer, only its ~100-byte seen-entry does.
+  Peak memory therefore scales with the rows actually delivered
+  (genuine changes + new rows — the irreducible floor, since the
+  offset requires a full batch scan), not with the window's total
+  churn. With dedup `off` the whole window's rows are delivered every
+  batch by contract, so memory tracks window churn — size the window
+  (`cursor_lookback_max_seconds`, or an explicit value) accordingly.
+  (A future refinement could additionally cap *delivered* overlap rows
+  per batch with park/resume — sound only on top of the seen-set,
+  whose committed entries are what let a paged cycle converge instead
+  of re-delivering forever; not built until a real workload churns an
+  entire window per trigger.)
 - **Bounded offset**: above the entry cap the highest-cursor entries are
   kept (they stay in the window longest) and the remainder degrade to
   plain re-emits — the pre-dedup behavior — with a one-time warning.

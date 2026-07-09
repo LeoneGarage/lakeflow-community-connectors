@@ -94,6 +94,56 @@ MAX_CONTAINED_DEPTH = 10
 MIN_DYNAMIC_TOP = 5
 
 
+def _lb_row_key(row: dict, pks: list[str]) -> str:
+    """Composite-PK identity key for the ``lb_seen`` dedup map."""
+    return json.dumps([row.get(k) for k in pks], default=str)
+
+
+def _lb_row_digest(row: dict) -> str:
+    """Whole-row content hash for the ``lb_seen`` dedup map. Hashing the
+    full row (not PK+cursor) is what lets a source update columns WITHOUT
+    advancing the cursor and still get its in-window change delivered."""
+    return hashlib.sha1(json.dumps(row, sort_keys=True, default=str).encode("utf-8")).hexdigest()[
+        :16
+    ]
+
+
+class _LookbackDedupFilter:
+    """Streaming half of ``cursor_lookback_dedup``: drop already-delivered
+    unchanged overlap rows AT EMIT TIME, so they never materialize in the
+    batch buffer — peak memory scales with rows actually delivered (plus
+    ~100 bytes/entry of bookkeeping), not with the lookback window's
+    churn. Armed per cursor read by ``_arm_lookback_dedup``; consumed by
+    ``_apply_lookback_dedup`` in the finalize step.
+
+    A suppressed row contributes only its carried ``lb_seen`` entry (kept
+    alive for as long as the row stays in-window). Entries for DELIVERED
+    rows are deliberately NOT recorded here — the finalize step computes
+    them from the FINAL batch buffer, after the boundary trim, so a row
+    that was admitted but later trimmed (not delivered) can never leave
+    behind an entry that would suppress its future re-fetch (silent
+    loss). Corrupt checkpoint entries (non-list / wrong arity) never
+    match, so the row re-emits and its entry is rebuilt well-formed —
+    same discipline as the ``lb_history`` validation."""
+
+    __slots__ = ("prior", "pks", "carried")
+
+    def __init__(self, prior: dict, pks: list[str]):
+        self.prior = prior
+        self.pks = pks
+        self.carried: dict[str, list] = {}
+
+    def admit(self, row: dict) -> bool:
+        """True → deliver the row; False → proven already-delivered
+        unchanged, drop it (its entry is carried forward)."""
+        key = _lb_row_key(row, self.pks)
+        entry = self.prior.get(key)
+        if isinstance(entry, (list, tuple)) and len(entry) == 2 and entry[1] == _lb_row_digest(row):
+            self.carried[key] = entry
+            return False
+        return True
+
+
 def _lb_seen_order_key(raw_cursor):
     """Cursor-order sort key for ``lb_seen`` cap eviction: ISO timestamps
     sort chronologically, numeric cursors numerically, anything else by
@@ -2790,7 +2840,16 @@ class ContainedNavMixin:
                     # the same sub-response.
                     by_id = {str(r.get("id")): r for r in subs if isinstance(r, dict)}
                     sub = by_id.get("0")
-                    sub_status = int(sub.get("status", 0) or 0) if sub else None
+                    # No default for a MISSING ``status``: mapping it to 0
+                    # would read as ``0 < 400`` — a definitive PASS minted
+                    # from a malformed envelope. Missing/None flows to the
+                    # ``sub_status is None`` branch below (definitive fail,
+                    # same as an id-less envelope): the real hydrate treats
+                    # a status-less sub-response as bad and re-issues plain
+                    # GETs, so pinning ``batch_ok`` would just prepend a
+                    # doomed ``$batch`` POST to every hydrate.
+                    raw_status = sub.get("status") if sub else None
+                    sub_status = int(raw_status) if raw_status is not None else None
                 except Exception:
                     sub_status = None
                 if sub_status is None:
@@ -3418,6 +3477,7 @@ class ContainedNavMixin:
         # ``auto`` measurement carried in the offset) before building the
         # cursor clause — ``_apply_cursor_lookback`` reads it off ``self``.
         self._active_lookback_seconds = self._resolve_active_lookback(start_offset)
+        self._arm_lookback_dedup(start_offset, table_name)
         cursor_level, cursor_filter, cursor_order, cursor_select = self._cursor_expand_clause(
             segments, namespace, cursor_field, (start_offset or {}).get("cursor")
         )
@@ -3623,6 +3683,7 @@ class ContainedNavMixin:
         """
         cur_field, cur_level, _ = ctx or (None, -1, None)
         countable = 0
+        lb_filter = getattr(self, "_lb_dedup_filter", None)
 
         def _count_new(rows_slice: list[dict]) -> int:
             if count_floor is None or cur_field is None:
@@ -3862,6 +3923,16 @@ class ContainedNavMixin:
                 self._emit_leaf_row(
                     row, segments, frame["chain"], fk_columns, emitted, cur_field, row_cur_val
                 )
+                # Streaming dedup on the FINAL emitted shape (annotations
+                # stripped, FKs tagged, cursor stamped — what the hash must
+                # match). The transient append/del keeps per-row memory O(1).
+                if (
+                    lb_filter is not None
+                    and len(emitted) > prev_len
+                    and not lb_filter.admit(emitted[-1])
+                ):
+                    del emitted[-1]
+                    continue
                 countable += _count_new(emitted[prev_len:])
                 continue
             # Non-leaf: descend depth-first. Push the truncated-tail
@@ -4756,6 +4827,9 @@ class ContainedNavMixin:
         # completes and hits the suppressed-idle rule. The cap may overshoot
         # by the overlap size (bounded by the user's lookback window).
         countable = 0
+        # Streaming overlap dedup (see ``_LookbackDedupFilter``): consulted
+        # at the emit point so suppressed rows never join ``emitted``.
+        lb_filter = getattr(self, "_lb_dedup_filter", None)
         parked_chain_out: list | None = None
         chain_next_link_out: str | None = None
         truncated_chain_cursor_out: Any = None
@@ -4864,6 +4938,8 @@ class ContainedNavMixin:
                     ):
                         continue
                     self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
+                    if lb_filter is not None and not lb_filter.admit(row):
+                        continue  # already delivered unchanged — never buffered
                     emitted.append(row)
                     if count_floor is None or (
                         rec_cursor is not None and _cursor_newer(rec_cursor, count_floor)
@@ -4999,6 +5075,7 @@ class ContainedNavMixin:
         parent_idx = 0
         # New-rows-only cap accounting — see _walk_contained_with_cursor.
         countable = 0
+        lb_filter = getattr(self, "_lb_dedup_filter", None)
         group: list[list[dict[str, Any]]] = []
         # Drop ``page_size`` so the per-leaf-parent sub-requests carry NO ``$top``
         # — the server drives paging and emits ``@odata.nextLink`` for any
@@ -5059,6 +5136,8 @@ class ContainedNavMixin:
                             continue
                         clean = {k: v for k, v in row.items() if not k.startswith("@odata.")}
                         self._tag_with_ancestor_fks(clean, segments, chain, fk_columns)
+                        if lb_filter is not None and not lb_filter.admit(clean):
+                            continue  # already delivered unchanged
                         emitted.append(clean)
                         if count_floor is None or (
                             rec_cursor is not None and _cursor_newer(rec_cursor, count_floor)
@@ -5147,6 +5226,32 @@ class ContainedNavMixin:
             f"cursor."
         )
 
+    def _arm_lookback_dedup(self, start_offset: dict | None, table_name: str) -> None:
+        """Arm (or disarm) the streaming dedup filter for THIS cursor read.
+
+        Called by each contained cursor entry right after it resolves
+        ``_active_lookback_seconds``; the walks consult the armed filter at
+        their emit points so suppressed overlap rows never join the batch
+        buffer, and ``_apply_lookback_dedup`` consumes it in finalize.
+        Always assigns — a read that doesn't qualify (dedup off, window
+        inactive, batch-reader ``start_offset=None``) disarms, so a filter
+        can never leak across reads on a shared connector instance."""
+        flt = None
+        if (
+            getattr(self, "_lookback_dedup_cap", 0)
+            and getattr(self, "_active_lookback_seconds", 0) > 0
+            and start_offset is not None
+        ):
+            prior = (start_offset or {}).get("lb_seen") or {}
+            if not isinstance(prior, dict):
+                # The checkpoint is user-visible state (same discipline as
+                # the ``lb_history`` validation): corrupt ``lb_seen``
+                # degrades to "nothing seen" — re-emits, never a crash.
+                prior = {}
+            pks = self._primary_keys_for(table_name, getattr(self, "_lookback_dedup_ns", None))
+            flt = _LookbackDedupFilter(prior, pks)
+        self._lb_dedup_filter = flt
+
     def _apply_lookback_dedup(
         self,
         start_offset: dict | None,
@@ -5155,14 +5260,20 @@ class ContainedNavMixin:
         table_name: str,
         cursor_field: str,
     ) -> tuple[list[dict], dict]:
-        """Suppress lookback-overlap re-emits via an exact, capped seen-set
-        (``cursor_lookback_dedup``; ON by default — ``off`` restores the
-        blind re-emit).
+        """Finalize step of ``cursor_lookback_dedup`` (ON by default —
+        ``off`` restores the blind re-emit): consume the streaming filter
+        armed by ``_arm_lookback_dedup``, fold its carried entries with
+        entries computed from the FINAL (post-trim) buffer, cap-evict, and
+        attach ``lb_seen`` to the offset.
 
         With a lookback window active, every row still inside the window
         is re-fetched on every batch and re-emitted - correct
-        (MERGE-idempotent) but write-amplifying at the destination. When
-        enabled, the offset carries ``lb_seen``: an EXACT map of
+        (MERGE-idempotent) but write-amplifying at the destination — and,
+        pre-filtering, memory-amplifying here: suppression now happens AT
+        EMIT TIME (see ``_LookbackDedupFilter``), so peak memory scales
+        with rows actually delivered plus ~100 bytes per suppressed entry,
+        not with the window's churn. When enabled, the offset carries
+        ``lb_seen``: an EXACT map of
         ``{composite-PK key: [cursor, content-hash]}`` for the rows
         delivered from the current window. A fetched row whose key AND
         full content hash match its entry has already been delivered
@@ -5189,35 +5300,53 @@ class ContainedNavMixin:
         (``lb_seen`` is ``lb_``-prefixed and stripped by
         ``offset_progress_view``)."""
         cap = getattr(self, "_lookback_dedup_cap", 0)
-        if not cap or not emitted or getattr(self, "_active_lookback_seconds", 0) <= 0:
+        flt = getattr(self, "_lb_dedup_filter", None)
+        self._lb_dedup_filter = None  # consume once; never leaks across reads
+        if not cap or getattr(self, "_active_lookback_seconds", 0) <= 0:
             return emitted, end_offset
-        prior = (start_offset or {}).get("lb_seen") or {}
-        if not isinstance(prior, dict):
-            # The checkpoint is user-visible state (same discipline as the
-            # ``lb_history`` validation in ``_resolve_active_lookback``): a
-            # hand-edited/corrupt ``lb_seen`` degrades to "nothing seen" —
-            # plain re-emits, never a crash and never suppression.
-            prior = {}
-        pks = self._primary_keys_for(table_name, getattr(self, "_lookback_dedup_ns", None))
-        new_seen: dict[str, list] = {}
-        kept: list[dict] = []
-        for row in emitted:
-            key = json.dumps([row.get(k) for k in pks], default=str)
-            digest = hashlib.sha1(
-                json.dumps(row, sort_keys=True, default=str).encode("utf-8")
-            ).hexdigest()[:16]
-            entry = prior.get(key)
-            # The shape check mirrors the ``prior`` guard above: a corrupt
-            # entry never matches, so the row re-emits and its entry is
-            # rebuilt well-formed.
-            if isinstance(entry, (list, tuple)) and len(entry) == 2 and entry[1] == digest:
-                # Delivered unchanged in a prior batch - suppress, but keep
-                # the entry alive for as long as the row stays in-window.
-                new_seen[key] = entry
-                continue
-            kept.append(row)
-            cur = row.get(cursor_field)
-            new_seen[key] = [None if cur is None else str(cur), digest]
+        if flt is not None:
+            # Streaming mode (the normal path): suppressed rows were dropped
+            # at emit time — they never materialized in ``emitted`` — and
+            # their entries were carried on the filter. Entries for the
+            # DELIVERED rows are computed HERE, from the FINAL buffer (post
+            # boundary-trim), so an admitted-then-trimmed row can never
+            # leave an entry that would suppress its future re-fetch.
+            if not emitted and not flt.carried:
+                return emitted, end_offset
+            kept = emitted
+            new_seen: dict[str, list] = dict(flt.carried)
+            for row in emitted:
+                cur = row.get(cursor_field)
+                new_seen[_lb_row_key(row, flt.pks)] = [
+                    None if cur is None else str(cur),
+                    _lb_row_digest(row),
+                ]
+        else:
+            # Post-hoc fallback for a cursor path that reached finalize with
+            # the window active but never armed the filter (none today; the
+            # failure direction of NOT arming is plain re-emits, never loss).
+            if not emitted:
+                return emitted, end_offset
+            prior = (start_offset or {}).get("lb_seen") or {}
+            if not isinstance(prior, dict):
+                # Corrupt checkpoint state degrades to "nothing seen" —
+                # re-emits, never a crash (``lb_history`` discipline).
+                prior = {}
+            pks = self._primary_keys_for(table_name, getattr(self, "_lookback_dedup_ns", None))
+            new_seen = {}
+            kept = []
+            for row in emitted:
+                key = _lb_row_key(row, pks)
+                digest = _lb_row_digest(row)
+                entry = prior.get(key)
+                # Shape check mirrors the ``prior`` guard: a corrupt entry
+                # never matches — the row re-emits, entry rebuilt well-formed.
+                if isinstance(entry, (list, tuple)) and len(entry) == 2 and entry[1] == digest:
+                    new_seen[key] = entry
+                    continue
+                kept.append(row)
+                cur = row.get(cursor_field)
+                new_seen[key] = [None if cur is None else str(cur), digest]
         if len(new_seen) > cap:
             if not getattr(self, "_warned_lb_dedup_cap", False):
                 _LOG.warning(
@@ -5389,6 +5518,7 @@ class ContainedNavMixin:
             # branch) so it never bleeds into the ancestor-cursor path. See
             # ``_read_contained_incremental_leaf_cursor`` for the read-side use.
             self._active_lookback_seconds = self._resolve_active_lookback(start_offset)
+            self._arm_lookback_dedup(start_offset, table_name)
             read_since = self._apply_cursor_lookback((start_offset or {}).get("cursor"))
             # Engage the probe only where it pays off (``probe_applicable``):
             # the leaf-parent must itself be a cursor-bearing collection, so
@@ -5823,6 +5953,7 @@ class ContainedNavMixin:
         namespace = (table_options or {}).get("namespace")
         since = (start_offset or {}).get("cursor")
         self._active_lookback_seconds = self._resolve_active_lookback(start_offset)
+        self._arm_lookback_dedup(start_offset, table_name)
         read_since = self._apply_cursor_lookback(since)
         walk_start = time.monotonic()
         chains_iter = self._iter_parent_chains_with_cursor(
@@ -5904,6 +6035,7 @@ class ContainedNavMixin:
         emitted: list[dict] = []
         truncated = False
         countable = 0
+        lb_filter = getattr(self, "_lb_dedup_filter", None)
         chain_next_link_out: str | None = None
         parked_chain_out: list | None = None
         parked_cursor_out: Any = None
@@ -5996,6 +6128,8 @@ class ContainedNavMixin:
                 for row in page_rows:
                     self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                     row[cursor_field] = ancestor_cursor
+                    if lb_filter is not None and not lb_filter.admit(row):
+                        continue  # already delivered unchanged
                     emitted.append(row)
                     if count_floor is None or (
                         ancestor_cursor is not None and _cursor_newer(ancestor_cursor, count_floor)

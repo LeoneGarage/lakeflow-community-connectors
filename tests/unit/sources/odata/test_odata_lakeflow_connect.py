@@ -4411,6 +4411,80 @@ def test_lb_seen_order_key_never_raises_and_orders():
     assert key(None) < key("a")
 
 
+def test_lookback_dedup_filter_streams_suppression():
+    """The streaming half of ``cursor_lookback_dedup``: a proven-unchanged
+    overlap row is rejected AT EMIT TIME (never buffered) with its entry
+    carried; changed/new rows are admitted and deliberately leave NO entry
+    on the filter — finalize computes delivered-row entries from the final
+    post-trim buffer, so an admitted-then-trimmed row can't poison
+    ``lb_seen``. Corrupt checkpoint entries never match."""
+    from databricks.labs.community_connector.sources.odata._contained import (
+        _lb_row_digest,
+        _lb_row_key,
+        _LookbackDedupFilter,
+    )
+
+    row = {"Id": 1, "Label": "a"}
+    prior = {_lb_row_key(row, ["Id"]): ["c1", _lb_row_digest(row)]}
+    flt = _LookbackDedupFilter(prior, ["Id"])
+    assert flt.admit(dict(row)) is False  # unchanged → suppressed, unbuffered
+    assert flt.carried == prior  # entry carried forward
+    assert flt.admit({"Id": 1, "Label": "B"}) is True  # changed → delivered
+    assert flt.admit({"Id": 2, "Label": "x"}) is True  # new → delivered
+    assert set(flt.carried) == set(prior)  # delivered rows left no entry
+    for bad in ([], 42, ["x"], "junk"):  # corrupt entries never match
+        f2 = _LookbackDedupFilter({_lb_row_key(row, ["Id"]): bad}, ["Id"])
+        assert f2.admit(dict(row)) is True
+
+
+def test_cursor_newer_numeric_rendering_symmetry():
+    """Numerically-equal but textually-different cursor renderings must be
+    the same instant in BOTH directions ("5000.0" vs "5000" — the lexical
+    tie fallback called one strictly newer), and Int64 values beyond float
+    precision (tied float sort keys) must order truly via exact Decimal."""
+    from databricks.labs.community_connector.sources.odata._helpers import cursor_newer
+
+    assert cursor_newer("5000.0", "5000") is False
+    assert cursor_newer("5000", "5000.0") is False
+    assert cursor_newer("9007199254740993", "9007199254740992") is True  # > 2^53
+    assert cursor_newer("9007199254740992", "9007199254740993") is False
+    # Timestamp semantics untouched (ISO text never Decimal-parses).
+    assert cursor_newer("2024-01-02T00:00:00.5Z", "2024-01-02T00:00:00Z") is True
+    assert cursor_newer("2024-01-02T00:00:00Z", "2024-01-02T00:00:00.5Z") is False
+
+
+def test_bin_pack_hits_requested_partition_count():
+    """Balanced ``divmod`` sizing yields every partition the user asked for
+    (uniform ``ceil(n/p)`` slicing collapsed n=9,p=4 to 3 bins), with
+    exactly-once contiguous coverage and no empty bins."""
+    from databricks.labs.community_connector.sources.odata._partition import _bin_pack
+
+    rows = [{"Id": i} for i in range(9)]
+    parts = _bin_pack(rows, 4, None)
+    assert [len(p["top_parent_rows"]) for p in parts] == [3, 2, 2, 2]
+    assert [r["Id"] for p in parts for r in p["top_parent_rows"]] == list(range(9))
+    assert len(_bin_pack([{"Id": i} for i in range(10)], 6, None)) == 6
+    assert len(_bin_pack([{"Id": 1}, {"Id": 2}], 5, None)) == 2  # never empty bins
+    assert _bin_pack([], 4, None) == []
+
+
+@responses.activate
+def test_batch_probe_missing_substatus_is_definitive_fail():
+    """A 2xx ``$batch`` envelope whose sub-response omits ``status`` is a
+    malformed envelope, not a pass: the old ``.get("status", 0)`` read it
+    as ``0 < 400`` and minted a definitive ``batch_ok=True`` from garbage
+    (every hydrate then pays a doomed ``$batch`` POST before degrading to
+    per-op GETs). Same discipline as the id-less envelope: definitive
+    FAIL, hydrate goes straight to plain GETs."""
+    responses.post(
+        f"{SERVICE_URL}$batch",
+        json={"responses": [{"id": "0", "body": {"value": []}}]},  # no status
+    )
+    c = _make()
+    assert c._verify_batch_support(["Roots"], {}) is False
+    assert c.__dict__["_batch_supported"] is False  # pinned definitively
+
+
 @responses.activate
 def test_cursor_lookback_non_utc_watermark_single_escape_on_wire():
     """The lookback floor returns a BARE ISO string; the single percent-escape

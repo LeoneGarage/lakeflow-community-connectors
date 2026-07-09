@@ -753,24 +753,33 @@ def _parse_num_partitions(opts: dict) -> int:
 
 
 def _bin_pack(rows: list[dict], num_partitions: int, cursor_lower) -> list[dict]:
-    """Split ``rows`` into ``num_partitions`` partition descriptors.
+    """Split ``rows`` into ``min(num_partitions, len(rows))`` partition
+    descriptors.
 
     Each partition carries a contiguous slice — keeps cursor ordering
     stable within a partition (the ``_discover_top_parent_rows`` caller
-    sorts by cursor when one is set). Empty bins are dropped so the
-    framework doesn't spawn no-op executors.
+    sorts by cursor when one is set). Balanced ``divmod`` sizing (the
+    first ``len(rows) % bins`` slices carry one extra row) delivers every
+    partition the user asked for: a uniform ``ceil(n/p)`` slice width
+    yields only ``ceil(n / ceil(n/p))`` bins — fewer than requested for
+    many inputs (n=9, p=4 → 3 bins of 3) — silently costing parallelism.
+    Bins are non-empty by construction, so no no-op executors spawn.
     """
     if not rows:
         return []
-    bin_size = max(1, (len(rows) + num_partitions - 1) // num_partitions)
+    bins = min(num_partitions, len(rows))
+    base, extra = divmod(len(rows), bins)
     partitions: list[dict] = []
-    for i in range(0, len(rows), bin_size):
+    start = 0
+    for i in range(bins):
+        size = base + (1 if i < extra else 0)
         partitions.append(
             {
-                "top_parent_rows": rows[i : i + bin_size],
+                "top_parent_rows": rows[start : start + size],
                 "cursor_lower": cursor_lower,
             }
         )
+        start += size
     return partitions
 
 
