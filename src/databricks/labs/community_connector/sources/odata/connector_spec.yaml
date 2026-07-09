@@ -45,6 +45,42 @@ connection:
           required: false
           description: Header name to carry the API key. Default ``x-api-key``.
 
+    - name: oauth
+      description: >
+        OAuth 2.0 via a Unity Catalog COMMUNITY connection
+        (``community_oauth_flow=m2m``/``u2m``). The connection layer runs
+        the flow, refreshes tokens server-side, and injects a fresh
+        ``access_token`` at query time; the connector treats it as an
+        opaque bearer token and never reads these parameters itself.
+      parameters:
+        - name: client_id
+          type: string
+          required: true
+          secret: true
+          description: >
+            OAuth app client id used by the connection layer to run the
+            flow and refresh tokens server-side.
+        - name: client_secret
+          type: string
+          required: true
+          secret: true
+          description: >
+            OAuth app client secret issued alongside ``client_id``.
+        - name: token_endpoint
+          type: string
+          required: true
+          description: >
+            OAuth token endpoint URL. Per-connection because OData is
+            generic: every provider has its own endpoint (Azure AD tenant
+            URL, SAP XSUAA, a Databricks App's ``/oidc/v1/token``, ...).
+            For the ``u2m`` browser flow also supply
+            ``authorization_endpoint``.
+        - name: oauth_scope
+          type: string
+          required: false
+          description: >
+            Optional space-separated OAuth scopes requested by the
+            connection layer's flow.
 
   # ---------------------------------------------------------------------------
   # OAuth 2.0 — handled by the Unity Catalog COMMUNITY connection.
@@ -74,37 +110,6 @@ connection:
         OData v4 service root URL, e.g.
         ``https://services.odata.org/V4/Northwind/Northwind.svc/``.
 
-    - name: client_id
-      type: string
-      required: false
-      secret: true
-      description: >
-        OAuth app client id — only for the OAuth (COMMUNITY
-        ``community_oauth_flow=m2m``/``u2m``) connection mode. The
-        connection layer uses it to run the flow and refresh tokens
-        server-side; the connector itself never reads it.
-    - name: client_secret
-      type: string
-      required: false
-      secret: true
-      description: >
-        OAuth app client secret issued alongside ``client_id`` — only for
-        the OAuth connection mode.
-    - name: token_endpoint
-      type: string
-      required: false
-      description: >
-        OAuth token endpoint URL — only for the OAuth connection mode.
-        Per-connection because OData is generic: every provider has its
-        own endpoint (Azure AD tenant URL, SAP XSUAA, a Databricks App's
-        ``/oidc/v1/token``, ...). For the ``u2m`` browser flow also supply
-        ``authorization_endpoint``.
-    - name: oauth_scope
-      type: string
-      required: false
-      description: >
-        Optional space-separated OAuth scopes requested by the connection
-        layer's flow — only for the OAuth connection mode.
     - name: timeout_seconds
       type: string
       required: false

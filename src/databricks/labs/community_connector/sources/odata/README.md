@@ -136,12 +136,41 @@ w.api_client.do(
 )
 ```
 
-For UC-managed OAuth, prefer the CLI (Option A) — it runs the flow
-and sets `community_oauth_flow` on the connection. Via raw REST,
-replace the `"token"` line with the OAuth connection options
-(`community_oauth_flow: "m2m"`, `client_id`, `client_secret`,
-`token_endpoint`, optionally `oauth_scope`); UC then injects
-`access_token` into the connector at query time.
+For UC-managed OAuth (`community_oauth_flow`), prefer the CLI
+(Option A) — it validates the options against the connector spec and
+derives the flow from it. Via the SDK, replace the `"token"` line
+with the OAuth connection options; the `community_oauth_flow`
+discriminator is what makes UC run the client-credentials flow,
+refresh the token server-side, and inject a fresh `access_token`
+into the connector at query time:
+
+```python
+w.api_client.do(
+    "POST",
+    "/api/2.1/unity-catalog/connections",
+    body={
+        "name": "odata_oauth_connection",
+        "connection_type": "COMMUNITY",
+        "comment": f"service_url={service_url}",
+        "options": {
+            "sourceName": "odata",
+            "service_url": service_url,
+            "community_oauth_flow": "m2m",
+            "client_id": client_id,          # load from a secret store,
+            "client_secret": client_secret,  # never inline literals
+            "token_endpoint": "https://login.example.com/oauth/token",
+            "oauth_scope": "read:everything",  # optional
+            "externalOptionsAllowList": "...",  # same value as above
+        },
+    },
+)
+```
+
+Do **not** include `auth_type`, `access_token`, or `refresh_token` in
+the options — the tokens are minted by the flow and injected at
+runtime. For the browser-based `u2m` flow the CLI is required (it
+runs the loopback authorization-code flow at creation time); the raw
+REST path only works for `m2m`.
 
 The `externalOptionsAllowList` must match the connector spec's
 `external_options_allowlist`. The CLI in Option A reads the spec and
