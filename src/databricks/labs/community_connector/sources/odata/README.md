@@ -18,8 +18,11 @@ automatically from the service's `$metadata` endpoint.
   ancestor FK columns synthesized for global uniqueness. Read via a
   single nested `$expand` or an N+1 traversal — the default `auto`
   preflights the server and picks per table.
-- **Four auth methods**: bearer, basic, api_key, oauth2 (client
-  credentials *and* authorization-code with refresh-token rotation).
+- **Auth**: bearer, basic, api_key (static credentials), plus
+  **UC-managed OAuth** — the COMMUNITY connection runs the OAuth flow
+  (`community_oauth_flow=m2m`/`u2m`), refreshes tokens server-side, and
+  injects a fresh `access_token` into the connector at query time; the
+  connector holds no OAuth code at all.
 - **Parallel reads** for contained tables via
   `SupportsPartitionedStream` (bin-packed top-level parents across
   Spark tasks).
@@ -55,88 +58,47 @@ For other auth methods, swap `token` for the relevant fields:
 | `bearer` | `token` | |
 | `basic` | `username`, `password` | |
 | `api_key` | `api_key` (optionally `api_key_header`) | |
-| `oauth2` (client credentials) | `oauth2_token_url`, `oauth2_client_id`, `oauth2_client_secret` (optionally `oauth2_scope`) | Server-to-server. Mints a fresh access token at session start; re-mints pre-emptively when `expires_in` is exhausted (60 s safety buffer). Client credentials are sent in the POST body (`client_secret_post`); providers that require HTTP-Basic on the token endpoint (`client_secret_basic` — e.g. Okta's default) are not supported. |
-| `oauth2` (authorization code) | Same as above **plus** `oauth2_refresh_token` (and optionally `oauth2_access_token`) | User-delegated. The pre-issued access token is used directly, then refreshed via `grant_type=refresh_token` either pre-emptively when the deadline approaches or reactively on a 401 from the source. Rotated refresh tokens are tracked automatically. |
+| OAuth (UC-managed) | `client_id`, `client_secret`, `token_endpoint` (optionally `oauth_scope`; `authorization_endpoint` for the browser flow) — plus the connection's `community_oauth_flow` set to `m2m` or `u2m` | The connection layer runs the flow, refreshes tokens **server-side**, and injects a fresh `access_token` into the connector at query time. No `auth_type` is set; the connector treats the injected token as an opaque bearer credential. |
 
-#### OAuth2 — client credentials (server-to-server)
+#### OAuth — UC-managed (`community_oauth_flow`)
 
-Use when the connector authenticates as itself (a service principal /
-machine identity). The connector mints a fresh access token at session
-start by POSTing `grant_type=client_credentials` to the token endpoint
-and re-mints pre-emptively when `expires_in` runs out (60 s safety
-buffer).
+OAuth is owned by the connection layer, not the connector: the UC
+COMMUNITY connection (or the labs CLI for local dev) runs the OAuth
+flow, refreshes the token **server-side**, and injects a fresh
+`access_token` into the connector's options at query time. The
+connector never sees your client secret and contains no token-minting
+or refresh code — a design shared by every OAuth connector in this
+repo.
+
+Because OData is generic, no provider URLs are baked into the spec —
+you supply your provider's `token_endpoint` on the connection. The CLI
+derives the flow (`m2m`, client credentials) from the connector spec:
 
 ```bash
 community-connector create_connection odata odata_connection \
   -o '{
         "service_url": "https://your-host/odata/v4/",
-        "auth_type": "oauth2",
-        "oauth2_token_url": "https://login.example.com/oauth/token",
-        "oauth2_client_id": "<client-id>",
-        "oauth2_client_secret": "<client-secret>",
-        "oauth2_scope": "read:everything"
+        "client_id": "<client-id>",
+        "client_secret": "<client-secret>",
+        "token_endpoint": "https://login.example.com/oauth/token",
+        "oauth_scope": "read:everything"
       }' \
   --spec ./src/databricks/labs/community_connector/sources/odata/connector_spec.yaml
 ```
 
-`oauth2_scope` is optional — include it only when the token endpoint
-requires (or accepts) a `scope` parameter for client_credentials. For
-Azure AD / Entra ID flows the value is typically `<resource>/.default`
-(e.g. `https://graph.microsoft.com/.default`).
+`oauth_scope` is optional — include it only when the token endpoint
+requires (or accepts) a `scope` for client_credentials. For Azure AD /
+Entra ID the value is typically `<resource>/.default`.
 
-For OAuth2 you must set `auth_type=oauth2` explicitly. Only `bearer` is
-auto-inferred (from a bare `token`); `oauth2`, `basic`, and `api_key` are
-**not** auto-detected from credential presence, so without `auth_type` the
-connector applies no auth at all.
+For a **user-delegated** source, create the connection with
+`--auth-type u2m` and additionally supply `authorization_endpoint`;
+the CLI runs the browser consent flow at connection creation and UC
+handles refresh (including rotated refresh tokens) from then on.
 
-#### OAuth2 — authorization code (user-delegated, refresh-token rotation)
-
-Use when the source enforces per-user access and you've already run an
-interactive consent flow to obtain a refresh token. The connector uses
-the pre-issued access token (if provided) until it expires, then
-refreshes it via `grant_type=refresh_token`. Rotated refresh tokens
-returned in the refresh response are tracked in memory automatically.
-
-```bash
-community-connector create_connection odata odata_connection \
-  -o '{
-        "service_url": "https://graph.microsoft.com/v1.0/",
-        "auth_type": "oauth2",
-        "oauth2_token_url": "https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token",
-        "oauth2_client_id": "<app-client-id>",
-        "oauth2_client_secret": "<app-client-secret>",
-        "oauth2_scope": "https://graph.microsoft.com/.default offline_access",
-        "oauth2_refresh_token": "<long-lived-refresh-token>",
-        "oauth2_access_token": "<optional-pre-issued-access-token>"
-      }' \
-  --spec ./src/databricks/labs/community_connector/sources/odata/connector_spec.yaml
-```
-
-Notes:
-
-- `oauth2_access_token` is optional. When omitted the connector calls
-  the refresh endpoint immediately at session start to mint the first
-  access token.
-- `offline_access` (or the provider's equivalent) must be in
-  `oauth2_scope` if your provider gates refresh-token issuance on it.
-- The refresh token isn't persisted back to the UC connection — if your
-  provider rotates refresh tokens on each refresh and the connector
-  restarts, you may need to obtain a fresh refresh token interactively.
-  Most providers accept the same refresh token repeatedly until it's
-  explicitly revoked or expires.
-- ⚠️ **Single-use rotation + parallel reads don't mix.** The rotation
-  tracking is per-process, but partitioned reads (`num_partitions` on
-  contained N+1 paths) run in separate executor processes that each
-  carry the connection's original refresh token. With a provider that
-  rotates on every refresh *and revokes the prior token* (Azure AD B2C,
-  Okta with rotation enabled), the first process to refresh mid-run
-  invalidates the token every other process holds, and the next refresh
-  elsewhere kills the stream with a token-endpoint 400/401. Use the
-  client-credentials flow (no refresh token) or `num_partitions=1` with
-  such providers.
-
-For the Python SDK form of any OAuth2 variant, see
-[Option B](#option-b--python-sdk) below.
+Do **not** set `auth_type` for OAuth connections, and never supply
+`access_token`/`refresh_token` yourself — they are minted by the flow
+and injected at runtime. (The old connector-side `auth_type=oauth2`
+mode is retired; using it raises an error with these migration steps.)
 
 ### Option B — Python SDK
 
@@ -174,31 +136,12 @@ w.api_client.do(
 )
 ```
 
-For OAuth2, replace the `"token": "<bearer-token>"` line above with
-the matching OAuth2 keys. Client credentials:
-
-```python
-"options": {
-    "sourceName": "odata",
-    "service_url": service_url,
-    "auth_type": "oauth2",
-    "oauth2_token_url": "https://login.example.com/oauth/token",
-    "oauth2_client_id": "<client-id>",
-    "oauth2_client_secret": "<client-secret>",
-    "oauth2_scope": "read:everything",
-    "externalOptionsAllowList": (
-        "namespace,cursor_field,select,filter,"
-        "filter_at_*,page_size,max_records_per_batch,cursor_nulls,"
-        "delta_tracking,expand_contained,num_partitions,pagination,"
-        "exclude_ancestor_columns,cursor_lookback_seconds,"
-        "cursor_lookback_factor,cursor_lookback_max_seconds,"
-        "cursor_lookback_dedup,cursor_probe,contained_fetch"
-    ),
-}
-```
-
-For the authorization-code variant, add `oauth2_refresh_token` (and
-optionally `oauth2_access_token`) to the block above.
+For UC-managed OAuth, prefer the CLI (Option A) — it runs the flow
+and sets `community_oauth_flow` on the connection. Via raw REST,
+replace the `"token"` line with the OAuth connection options
+(`community_oauth_flow: "m2m"`, `client_id`, `client_secret`,
+`token_endpoint`, optionally `oauth_scope`); UC then injects
+`access_token` into the connector at query time.
 
 The `externalOptionsAllowList` must match the connector spec's
 `external_options_allowlist`. The CLI in Option A reads the spec and
@@ -206,12 +149,13 @@ sets this automatically; with the SDK you set it explicitly — keep
 it in sync with the spec or table-level options like
 `delta_tracking` get silently stripped at runtime.
 
-The connector reads its auth credentials directly from these option
-keys. Only **`bearer`** is auto-inferred — from the presence of `token`.
-For `basic`, `api_key`, and `oauth2` you must set `auth_type` explicitly;
-if it is omitted (and no `token` is present) the connector builds the
-session with **no auth applied** — which is what anonymous services such
-as the public Northwind reference service want.
+The connector reads its static auth credentials directly from these
+option keys. Two auto-detections apply when `auth_type` is omitted: a
+UC-injected `access_token` (the OAuth connection mode) is used as an
+opaque bearer token, and a bare `token` implies `bearer`. `basic` and
+`api_key` require an explicit `auth_type`; with none of the above the
+connector builds the session with **no auth applied** — which is what
+anonymous services such as the public Northwind reference service want.
 
 ### Verifying the connection
 
@@ -235,26 +179,23 @@ lands in pipeline logs. Five classes:
 
 | Symptom | Exception | Remediation hint in the message |
 |---|---|---|
-| Token-endpoint 400/401 during an OAuth grant (refresh-token or client-credentials) | `ValueError` | Re-check `oauth2_refresh_token` + `oauth2_client_id`; the OAuth `error` / `error_description` is echoed verbatim. |
-| Token-endpoint 403 / retry-exhausted 5xx / any other non-2xx | `ValueError` | Status + the OAuth `error` hint from the body (error bodies carry codes/descriptions, never live tokens). A 403 usually means an IdP policy block (IP allowlist, conditional access) rather than bad credentials. |
-| Source 401 *after* a successful OAuth refresh | `PermissionError` | The access token isn't the problem — check `oauth2_scope`, the principal's permissions, and any tenant/instance identifier in `service_url`. |
-| Token-endpoint 200 with a malformed/truncated JSON body | `RuntimeError` | Body deliberately **withheld** (it may carry live credentials); status + byte count + URL are included. Retry; escalate to the identity provider if persistent. |
-| Source 401/403 with no refresh path available | `PermissionError` | Per auth mode (see below). |
+| Source 401 under a UC-injected `access_token` | `PermissionError` | The connection layer refreshes the token at query start, so a mid-read 401 usually means the token expired during a long read (retry — the next query gets a fresh token), the OAuth principal lacks access, or the connection's `oauth_scope` is too narrow. |
+| Source 403 (any auth mode) | `PermissionError` | Authenticated but not authorized — permissions/scope at the source, not a token problem. |
+| `auth_type=oauth2` configured | `ValueError` at session build | Retired mode; the message carries the migration steps to the UC OAuth connection. |
+| Source 401 with static credentials | `PermissionError` | Per auth mode (see below). |
 
-The no-refresh-path row's remediation depends on the configured auth mode:
+The static-credential 401 remediation depends on the configured mode:
 
 - **`bearer`** — pre-acquired tokens have no refresh path. The error
-  suggests replacing `token` with a fresh value, or upgrading to
-  `auth_type=oauth2` with `oauth2_client_id` + `oauth2_client_secret`
-  so the connector mints and refreshes tokens automatically.
+  suggests replacing `token` with a fresh value, or switching to a UC
+  COMMUNITY OAuth connection so tokens are refreshed server-side and
+  injected fresh every query.
 - **`basic`** — names `username` / `password` and the principal's
   permissions at the source.
 - **`api_key`** — names `api_key` (may have been rotated) and
   `api_key_header` (some services expect a non-default header).
-- **`oauth2`** with no client credentials and no refresh token —
-  names the missing parameter pairs that would enable auto-refresh,
-  plus `oauth2_scope`.
-- **No `auth_type` set** — names the four valid `auth_type` values.
+- **No `auth_type` set** — names the static `auth_type` values and the
+  UC-managed OAuth alternative.
 
 ### Optional connection options
 

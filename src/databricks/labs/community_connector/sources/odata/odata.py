@@ -2,17 +2,24 @@
 
 Implements the LakeflowConnect interface for any OData v4 service. The
 connector discovers tables and schemas from the service's ``$metadata``
-endpoint, supports four auth methods (bearer / basic / api_key /
-oauth2), and ingests each entity set either as a snapshot, an
-incremental CDC stream keyed off a user-supplied cursor field, or
-(when the service supports it) a server-driven delta query stream.
+endpoint, supports static auth (bearer / basic / api_key) plus
+UC-managed OAuth (the COMMUNITY connection runs the flow, refreshes
+server-side, and injects ``access_token`` at query time), and ingests
+each entity set either as a snapshot, an incremental CDC stream keyed
+off a user-supplied cursor field, or (when the service supports it) a
+server-driven delta query stream.
 
 Connection options (set on the UC connection):
     service_url   required   OData service root, e.g.
                              https://services.odata.org/V4/Northwind/Northwind.svc/
-    auth_type     optional   bearer | basic | api_key | oauth2
-    token, username, password, api_key, api_key_header,
-    oauth2_token_url, oauth2_client_id, oauth2_client_secret, oauth2_scope
+    auth_type     optional   bearer | basic | api_key (omit for the
+                             UC-managed OAuth connection mode)
+    token, username, password, api_key, api_key_header
+    access_token  runtime-injected by a UC COMMUNITY OAuth connection
+                  (community_oauth_flow=m2m/u2m) — never set by hand;
+                  the connection is created with client_id,
+                  client_secret, token_endpoint (and oauth_scope /
+                  authorization_endpoint as the flow requires)
 
 Per-table options (allowlisted via externalOptionsAllowList):
     cursor_field          column to drive incremental reads; absent → snapshot
@@ -434,17 +441,6 @@ def _metadata_cache_put(
 # upstream schema changes; per-trigger we still pay one fresh fetch.
 _METADATA_FILE_CACHE_TTL_SECONDS = 60
 
-# Rotated OAuth2 refresh tokens, keyed by
-# ``(token_url, client_id, ORIGINAL refresh token as supplied on the
-# connection)``. Providers with single-use rotation revoke the old token
-# on every refresh — but SDP constructs a FRESH connector from the
-# connection's original options on every load/microbatch, so an
-# instance-local write-back would replay the revoked original next batch
-# and hard-fail the stream. Keying by the original supplied value lets
-# every recreated instance find the latest rotation; chained rotations
-# update the same entry. Plain dict ops (GIL-atomic) — worst race is two
-# refreshes where one rotation wins, exactly the provider-side reality.
-_ROTATED_REFRESH_TOKENS: dict[tuple[str, str, str], str] = {}
 
 # Network-level exceptions treated as transient by ``_http_get``'s retry
 # loop. ``ConnectionError`` covers TCP resets, DNS failures, and remote
@@ -942,13 +938,6 @@ def _clear_capability_cache() -> None:
         pass
 
 
-def _clear_rotated_refresh_tokens() -> None:
-    """Clear the process-wide rotated-refresh-token stash. Tests use this
-    between cases that reuse the same token endpoint / client id with
-    different mocked rotation behaviours."""
-    _ROTATED_REFRESH_TOKENS.clear()
-
-
 @dataclass
 class _CsdlIndex:
     """One-time index of a parsed CSDL document.
@@ -1271,7 +1260,6 @@ class ODataLakeflowConnect(
         # Set when the token endpoint returns ``expires_in``; `None` means we
         # don't know the expiry (user-supplied access token without metadata)
         # so we fall through to the 401-retry path only.
-        self._access_token_expires_at: float | None = None
         # Delta-tracking capability cache, keyed by (namespace_or_empty,
         # table_name). Populated lazily by ``_probe_delta_support`` on the
         # first metadata-resolution call for each table in ``auto`` mode.
@@ -3911,35 +3899,16 @@ class ODataLakeflowConnect(
     def _http_get_once(
         self, session: requests.Session, url: str, method: str = "GET", **kwargs: Any
     ) -> requests.Response:
-        """One auth-aware request attempt; throttle handling lives in `_http_get`."""
+        """One auth-aware request attempt; throttle handling lives in `_http_get`.
+
+        No token-refresh path lives here (or anywhere in the connector):
+        OAuth tokens are minted and refreshed by the Unity Catalog
+        COMMUNITY connection layer, which injects a fresh ``access_token``
+        at query time. A 401/403 is therefore always terminal for this
+        read and surfaces the per-auth-mode remediation."""
         self._require_same_origin(url)
-        if self._should_preemptively_refresh():
-            session.headers["Authorization"] = f"Bearer {self._oauth2_token()}"
         self._log_http_request(method, url)
         resp = self._request_same_origin(session, method, url, **kwargs)
-        if resp.status_code == 401 and self._has_oauth_refresh_path():
-            session.headers["Authorization"] = f"Bearer {self._oauth2_token()}"
-            self._log_http_request(method, url)
-            resp = self._request_same_origin(session, method, url, **kwargs)
-            if resp.status_code == 401:
-                # We just minted a token straight from the OAuth provider
-                # and the source still rejected it — the access token isn't
-                # the problem. Most likely the principal lacks read access
-                # to this entity set, the scope is insufficient, or the
-                # tenant is mis-mapped. Surface that explicitly so the user
-                # doesn't chase a non-existent token issue.
-                raise PermissionError(
-                    f"OData service returned 401 for {url!r} even after "
-                    f"refreshing the OAuth2 access token. The new token "
-                    f"reached the server, so the access token itself is "
-                    f"not the problem. Check that the OAuth principal has "
-                    f"read access to this entity set, that 'oauth2_scope' "
-                    f"grants the right permissions, and that any "
-                    f"tenant/instance identifier in 'service_url' or "
-                    f"'extra_headers' matches the credentials. Server "
-                    f"response: {_truncate(resp.text, 300)}"
-                )
-            return resp
         if resp.status_code in (401, 403):
             raise PermissionError(self._no_refresh_auth_error(resp, url))
         return resp
@@ -4017,26 +3986,36 @@ class ODataLakeflowConnect(
         status = resp.status_code
         body = _truncate(resp.text, 300) or "(empty body)"
         auth = (self.options.get("auth_type") or "").lower().strip()
-        if not auth and self.options.get("token"):
+        injected = not auth and bool(self.options.get("access_token"))
+        if not auth and not injected and self.options.get("token"):
             auth = "bearer"
         if status == 403:
             # 403 means the request WAS authenticated but the principal is
-            # not authorized for this resource — a token refresh can't fix
-            # it (which is why the 401-refresh branch deliberately skips
-            # 403), and the "no refresh path is configured" prefix below
-            # would be false and misleading on a fully-configured oauth2
-            # connection. Say what actually needs fixing: permissions.
+            # not authorized for this resource — a fresh token can't fix it,
+            # and the "no refresh path" prefix below would be misleading.
+            # Say what actually needs fixing: permissions.
             return (
                 f"OData service returned 403 (Forbidden) for {url!r}. The "
                 f"request was authenticated but the principal is not "
-                f"authorized for this resource, so an automatic token "
-                f"refresh cannot fix it. Grant the principal read access "
-                f"to this entity set at the source (role/permission "
-                f"assignment), or supply credentials whose scope covers it "
-                f"(check 'oauth2_scope' and any required admin consent), "
-                f"and confirm tenant/instance identifiers in 'service_url' "
-                f"or 'extra_headers' match the credentials. "
-                f"Server response: {body}"
+                f"authorized for this resource, so a fresh token cannot "
+                f"fix it. Grant the principal read access to this entity "
+                f"set at the source (role/permission assignment), or use "
+                f"credentials whose scope covers it (for an OAuth "
+                f"connection, check the connection's 'oauth_scope' and any "
+                f"required admin consent), and confirm tenant/instance "
+                f"identifiers in 'service_url' or 'extra_headers' match "
+                f"the credentials. Server response: {body}"
+            )
+        if injected:
+            return (
+                f"OData service returned {status} for {url!r} using the "
+                f"access token injected by the Unity Catalog OAuth "
+                f"connection. The connection layer refreshes the token at "
+                f"query start, so a 401 here usually means the token "
+                f"expired mid-read (retry — the next query gets a fresh "
+                f"token), the OAuth principal lacks read access to this "
+                f"entity set, or the connection's 'oauth_scope' is too "
+                f"narrow. Server response: {body}"
             )
         prefix = (
             f"OData service returned {status} for {url!r} and no "
@@ -4045,14 +4024,14 @@ class ODataLakeflowConnect(
         if auth == "bearer":
             return (
                 f"{prefix}"
-                f"With auth_type=bearer the pre-acquired access token cannot "
-                f"be refreshed by the connector — either it has expired "
-                f"(typical lifetime ~1 h), or the principal that issued it "
-                f"lacks read access to this entity set. Fixes: replace "
-                f"'token' on the connection with a fresh one; or switch to "
-                f"auth_type=oauth2 with 'oauth2_client_id' + "
-                f"'oauth2_client_secret' so the connector mints and "
-                f"refreshes tokens automatically. For Microsoft Graph "
+                f"With auth_type=bearer the pre-acquired static token cannot "
+                f"be refreshed — either it has expired (typical lifetime "
+                f"~1 h), or the principal that issued it lacks read access "
+                f"to this entity set. Fixes: replace 'token' on the "
+                f"connection with a fresh one; or switch to a Unity Catalog "
+                f"COMMUNITY OAuth connection (community_oauth_flow=m2m/u2m), "
+                f"which refreshes tokens server-side and injects a fresh "
+                f"'access_token' every query. For Microsoft Graph "
                 f"high-privilege endpoints (identityProviders, auditLogs, "
                 f"etc.), ensure the token carries the required scope and "
                 f"admin consent. Server response: {body}"
@@ -4075,52 +4054,14 @@ class ODataLakeflowConnect(
                 f"non-default header name). Confirm the key's scope "
                 f"includes this entity set. Server response: {body}"
             )
-        if auth == "oauth2":
-            return (
-                f"{prefix}"
-                f"With auth_type=oauth2 but no refresh path available "
-                f"(missing 'oauth2_client_id' / 'oauth2_client_secret' "
-                f"for client-credentials, and no 'oauth2_refresh_token' "
-                f"for user-flow refresh), the connector can't mint a "
-                f"fresh access token. Provide one of those pairs, or "
-                f"replace 'oauth2_access_token' with a fresh value. "
-                f"Also confirm 'oauth2_scope' grants read on this entity "
-                f"set. Server response: {body}"
-            )
         return (
             f"{prefix}"
             f"No authentication is configured on this connection but the "
             f"OData service requires it. Set 'auth_type' to one of: "
-            f"bearer, basic, api_key, oauth2 (with the matching parameter "
-            f"set). Server response: {body}"
-        )
-
-    def _should_preemptively_refresh(self) -> bool:
-        """True iff a known-expiry token has hit its 60 s safety window."""
-        if self._access_token_expires_at is None:
-            return False
-        return time.time() >= self._access_token_expires_at
-
-    def _has_oauth_refresh_path(self) -> bool:
-        """True iff a 401 should be answered by minting a fresh OAuth2
-        access token: the session actually authenticates with our minted
-        bearer header (``auth_type=oauth2`` — the only branch that does),
-        AND `_oauth2_token()` has a grant to run (a refresh token for the
-        user flow, or client id + secret for client-credentials).
-
-        The ``auth_type`` gate matters: with ``auth_type=basic`` plus
-        leftover oauth2 options, minting a token sets an Authorization
-        header that ``session.auth`` overwrites at request-prepare time —
-        the retry re-sends the same rejected basic credentials and the
-        second 401 would blame "the refreshed OAuth2 token" for a basic
-        auth failure.
-        """
-        if (self.options.get("auth_type") or "").lower().strip() != "oauth2":
-            return False
-        if self.options.get("oauth2_refresh_token"):
-            return True
-        return bool(
-            self.options.get("oauth2_client_id") and self.options.get("oauth2_client_secret")
+            f"bearer, basic, api_key (with the matching parameter set), "
+            f"or use a Unity Catalog COMMUNITY OAuth connection "
+            f"(community_oauth_flow=m2m/u2m), which injects "
+            f"'access_token' at query time. Server response: {body}"
         )
 
     # ------------------------------------------------------------------
@@ -4159,6 +4100,17 @@ class ODataLakeflowConnect(
                     session.headers[k] = v.strip()
 
         auth_type = (self.options.get("auth_type") or "").lower().strip()
+        if not auth_type and self.options.get("access_token"):
+            # UC COMMUNITY OAuth connection (``community_oauth_flow`` =
+            # m2m / u2m / u2m_per_user): the connection layer ran the OAuth
+            # flow, refreshes the token SERVER-SIDE, and injects a fresh
+            # ``access_token`` into the options at query time. Opaque here —
+            # no client credentials, no minting, no refresh code. A mid-read
+            # expiry surfaces as 401 → ``_no_refresh_auth_error`` (the next
+            # query start gets a freshly injected token).
+            session.headers["Authorization"] = f"Bearer {self.options['access_token']}"
+            self._session = session
+            return session
         if not auth_type and self.options.get("token"):
             auth_type = "bearer"
 
@@ -4184,219 +4136,30 @@ class ODataLakeflowConnect(
                 )
             session.headers[header] = _require(self.options, "api_key")
         elif auth_type == "oauth2":
-            # Two sub-modes share this branch:
-            #  * **User flow** — `oauth2_refresh_token` is set. A
-            #    pre-supplied `oauth2_access_token` is used as-is if
-            #    present (avoids an unnecessary round-trip); otherwise
-            #    `_oauth2_token()` runs the refresh-token grant to
-            #    mint one. Expired tokens mid-run are caught in
-            #    `_http_get` and refreshed once.
-            #  * **Client-credentials flow** — no refresh token; the
-            #    connector mints a fresh access token via
-            #    `client_credentials` at session start.
-            initial_token = self.options.get("oauth2_access_token") or self._oauth2_token()
-            session.headers["Authorization"] = f"Bearer {initial_token}"
+            # Retired: connector-side OAuth (token minting + refresh) moved
+            # to the Unity Catalog COMMUNITY connection, which owns the flow
+            # and injects a fresh ``access_token`` at query time.
+            raise ValueError(
+                "auth_type=oauth2 has been retired. OAuth is handled by the "
+                "Unity Catalog COMMUNITY connection: create the connection "
+                "with community_oauth_flow=m2m (client credentials) or u2m "
+                "(authorization code), supplying 'client_id', "
+                "'client_secret', 'token_endpoint' (and, for u2m, "
+                "'authorization_endpoint'; optionally 'oauth_scope'). The "
+                "connection layer runs the flow, refreshes the token "
+                "server-side, and injects 'access_token' into the connector "
+                "at query time — remove auth_type and the oauth2_* options."
+            )
         elif auth_type:
             raise ValueError(
-                f"Unknown auth_type {auth_type!r}. "
-                f"Expected one of: bearer, basic, api_key, oauth2."
+                f"Unknown auth_type {auth_type!r}. Expected one of: bearer, "
+                f"basic, api_key — or omit auth_type entirely and use a "
+                f"Unity Catalog COMMUNITY OAuth connection, which injects "
+                f"'access_token' at query time."
             )
 
         self._session = session
         return session
-
-    def _oauth2_grant_payload(self) -> tuple[dict, tuple[str, str, str] | None]:
-        """The token-endpoint form body + the rotation-stash key.
-
-        ``oauth2_refresh_token`` present → ``refresh_token`` grant, with
-        the latest process-wide rotation substituted for the supplied
-        value; otherwise the ``client_credentials`` grant (no rotation,
-        key ``None``). The stash key anchors on the FIRST token this
-        instance ever saw — the connection's supplied value, which every
-        recreated instance derives identically."""
-        refresh_token = self.options.get("oauth2_refresh_token")
-        rotation_key: tuple[str, str, str] | None = None
-        if refresh_token:
-            original = self.__dict__.setdefault("_original_refresh_token", refresh_token)
-            rotation_key = (
-                _require(self.options, "oauth2_token_url"),
-                _require(self.options, "oauth2_client_id"),
-                original,
-            )
-            refresh_token = _ROTATED_REFRESH_TOKENS.get(rotation_key, refresh_token)
-            data = {
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id": _require(self.options, "oauth2_client_id"),
-                "client_secret": _require(self.options, "oauth2_client_secret"),
-            }
-        else:
-            data = {
-                "grant_type": "client_credentials",
-                "client_id": _require(self.options, "oauth2_client_id"),
-                "client_secret": _require(self.options, "oauth2_client_secret"),
-            }
-        scope = self.options.get("oauth2_scope")
-        if scope:
-            data["scope"] = scope
-        return data, rotation_key
-
-    def _oauth2_token(self) -> str:
-        """Mint an OAuth2 access token.
-
-        Picks the grant type from what's available in `self.options`:
-          * `oauth2_refresh_token` present -> `refresh_token` grant
-            (user-flow refresh). Client id/secret are required so the
-            token endpoint can authenticate the client.
-          * Otherwise -> `client_credentials` grant (server-to-server).
-
-        Some providers issue a rotated refresh token in the response;
-        when that happens, the new value is written back into
-        `self.options` AND the process-wide rotation stash (see
-        :data:`_ROTATED_REFRESH_TOKENS`) so recreated instances use it.
-        """
-        data, rotation_key = self._oauth2_grant_payload()
-        token_url = _require(self.options, "oauth2_token_url")
-        # The token endpoint gets the same transient tolerance as the
-        # source itself: a 429/5xx or a network blip here would otherwise
-        # kill the whole read (including mid-read, via the 401-refresh and
-        # pre-emptive-refresh paths in `_http_get_once`) while the source
-        # requests around it enjoy the full retry budget.
-        for attempt in range(self.max_retries + 1):
-            try:
-                resp = requests.post(
-                    token_url,
-                    data=data,
-                    timeout=self.timeout,
-                    # No auto-redirect: a 3xx from the token endpoint would
-                    # otherwise re-POST the ``client_secret`` body to the
-                    # redirect target (``requests`` re-sends the body on a
-                    # 307/308). The token URL is operator-configured, so a
-                    # redirect here is unexpected — surface it, don't follow.
-                    allow_redirects=False,
-                )
-            except _TRANSIENT_NETWORK_ERRORS as exc:
-                if attempt >= self.max_retries:
-                    raise type(exc)(
-                        f"{exc} (token endpoint {token_url!r}, after " f"{attempt + 1} attempts)"
-                    ) from exc
-                time.sleep(self._backoff_delay(attempt))
-                continue
-            if resp.status_code in _RETRYABLE_HTTP_STATUSES and attempt < self.max_retries:
-                time.sleep(self._retry_after_delay(resp, attempt))
-                continue
-            break
-        if 300 <= resp.status_code < 400:
-            # ``allow_redirects=False`` above surfaces the redirect here —
-            # following it would re-POST the ``client_secret`` body to the
-            # redirect target. Without this branch it falls past the >=400
-            # ladder into ``resp.json()`` on the (empty) redirect body and
-            # mis-diagnoses as "malformed JSON … escalate to the identity
-            # provider". The Location value is safe to print (a URL the
-            # provider chose to advertise; no credentials in it).
-            location = (resp.headers.get("Location") or "").strip()
-            raise ValueError(
-                f"OAuth2 token endpoint {token_url!r} responded with a "
-                f"redirect (HTTP {resp.status_code}"
-                + (f" to {location!r}" if location else "")
-                + "). The connector does not follow token-endpoint "
-                "redirects — that would re-send the client credentials to "
-                "the redirect target. Update 'oauth2_token_url' to the "
-                "endpoint's canonical URL"
-                + (f" (likely {location!r})" if location else "")
-                + " and check for an http:// URL that the provider "
-                "upgrades to https://."
-            )
-        # Surface a precise, actionable error when the token endpoint
-        # itself rejects the request. raise_for_status() would otherwise
-        # produce a terse "401 Client Error: Unauthorized for url ..."
-        # that doesn't tell the user *which* credential is the problem.
-        if resp.status_code in (400, 401):
-            grant = data["grant_type"]
-            hint = _extract_oauth_error_hint(resp)
-            if grant == "refresh_token":
-                raise ValueError(
-                    f"OAuth2 token endpoint returned {resp.status_code} when "
-                    f"refreshing the access token. The refresh token may be "
-                    f"expired, revoked, or paired with a different OAuth "
-                    f"client. Check that 'oauth2_refresh_token' was issued by "
-                    f"the same 'oauth2_client_id' configured on this "
-                    f"connection, and re-run the authorization-code flow if "
-                    f"needed. If the provider ROTATES refresh tokens "
-                    f"(single-use, e.g. Azure AD B2C or Okta with rotation "
-                    f"on) and this connection uses partitioned/parallel "
-                    f"reads, a parallel reader process may have consumed the "
-                    f"rotation this process never saw — use the "
-                    f"client_credentials flow (no refresh token) or "
-                    f"num_partitions=1 with such providers. Server "
-                    f"response: {hint}"
-                ) from None
-            raise ValueError(
-                f"OAuth2 token endpoint returned {resp.status_code} for the "
-                f"client_credentials grant. Check 'oauth2_client_id', "
-                f"'oauth2_client_secret', 'oauth2_token_url', and "
-                f"'oauth2_scope' on this connection. Server response: {hint}"
-            ) from None
-        if resp.status_code >= 400:
-            # 403 / retry-exhausted 5xx / anything else: same actionable shape
-            # as the 400/401 branches instead of raise_for_status()'s terse
-            # one-liner. The hint extractor is safe here — OAuth ERROR bodies
-            # carry error codes/descriptions, never live tokens (only 2xx
-            # bodies do, and those are handled below with the body withheld).
-            hint = _extract_oauth_error_hint(resp)
-            raise ValueError(
-                f"OAuth2 token endpoint {token_url!r} returned "
-                f"{resp.status_code}. Server response: {hint}"
-            ) from None
-        try:
-            payload = resp.json()
-        except ValueError:
-            # NEVER route this through ``_decode_json_with_body``: it bakes
-            # the response body into the exception message, and a truncated
-            # token response is exactly ``{"access_token": "<live secret>``
-            # cut mid-document — echoing it would put a working credential
-            # into pipeline logs. Diagnose with metadata only; ``from None``
-            # severs the chained decoder error, whose ``.doc`` attribute
-            # carries the full body.
-            raise RuntimeError(
-                f"OAuth2 token endpoint returned malformed JSON "
-                f"(HTTP {resp.status_code}, {len(resp.text or '')} chars) "
-                f"from {token_url}. Response body withheld from this "
-                f"message because token responses carry live credentials; "
-                f"retry, and escalate to the identity provider if it "
-                f"persists."
-            ) from None
-        token = payload.get("access_token")
-        if not token:
-            raise RuntimeError("OAuth2 token endpoint did not return access_token.")
-        rotated_refresh = payload.get("refresh_token")
-        if rotated_refresh:
-            # Instance-local for this run's requests AND process-wide so
-            # the fresh instance SDP builds for the next microbatch (from
-            # the connection's ORIGINAL options) finds the rotation
-            # instead of replaying a token the provider may have revoked.
-            self.options["oauth2_refresh_token"] = rotated_refresh
-            if rotation_key is not None:
-                _ROTATED_REFRESH_TOKENS[rotation_key] = rotated_refresh
-        # Track wall-clock deadline so `_http_get` can refresh the token
-        # *before* the source returns 401. Subtract a 60 s safety margin
-        # to cover clock skew + in-flight request latency. Absent
-        # `expires_in` means the provider didn't tell us — fall back to
-        # the lazy 401-retry path.
-        expires_in = payload.get("expires_in")
-        if expires_in is not None:
-            try:
-                # Wall clock, NOT ``time.monotonic()`` — the deadline
-                # rides the pickled connector to executors, where the
-                # monotonic epoch is a different arbitrary origin on a
-                # different host; wall clocks are comparable across
-                # hosts (the 60 s margin absorbs ordinary skew).
-                self._access_token_expires_at = time.time() + int(expires_in) - 60
-            except (TypeError, ValueError):
-                self._access_token_expires_at = None
-        else:
-            self._access_token_expires_at = None
-        return token
 
     # ------------------------------------------------------------------
     # $metadata caching + parsing
@@ -5402,30 +5165,6 @@ def _synthetic_pk_ordinal(row: dict, pk_names: list[str]) -> int:
     keys on the real PK)."""
     key = "\x1f".join(str(row.get(p)) for p in pk_names) if pk_names else repr(sorted(row.items()))
     return int(hashlib.sha1(key.encode("utf-8")).hexdigest()[:8], 16) % 1_000_000
-
-
-def _extract_oauth_error_hint(resp: requests.Response) -> str:
-    """Pull the most informative error description out of an OAuth2 response.
-
-    Token endpoints conventionally return JSON with ``error`` (machine code,
-    e.g. ``invalid_grant``) and often ``error_description`` (human-readable).
-    Fall back to the raw body when the response isn't JSON, and truncate so
-    we never dump a 50 KB error page into a user-facing message.
-    """
-    try:
-        payload = resp.json()
-    except ValueError:
-        return _truncate(resp.text, 300) or "Unauthorized"
-    if isinstance(payload, dict):
-        description = payload.get("error_description")
-        code = payload.get("error")
-        if description and code:
-            return f"{code}: {description}"
-        if description:
-            return str(description)
-        if code:
-            return str(code)
-    return _truncate(resp.text, 300) or "Unauthorized"
 
 
 def _parse_retry_after(header: str) -> float | None:
