@@ -12,6 +12,7 @@ import fnmatch
 import importlib
 import re
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from typing import Any, Callable, Iterator, Protocol, Sequence
 
 from databricks.labs.community_connector.interface import LakeflowConnect
@@ -362,7 +363,7 @@ def _bridge_config(options: dict[str, str]) -> dict[str, Any]:
         "ca_file": options.get("ssl.ca.file"),
         "pad_varchar": options.get("padVarchar", "false").lower() in {"1", "true", "yes"},
         "cdc_timeout": int(options.get("cdc.timeout", "5")),
-        "cdc_max_records": int(options.get("cdc.max.records", "4096")),
+        "cdc_max_records": int(options.get("cdc.max.records", "64")),
         "stop_logging_on_close": False,
     }
 
@@ -537,10 +538,12 @@ class InformixLakeflowConnect(LakeflowConnect):
             ("snapshot.page.size", "1000", 1),
             ("max.records.per.batch", "1000", 1),
             ("cdc.timeout", "5", 0),
-            ("cdc.max.records", "4096", 1),
+            ("cdc.max.records", "64", 1),
         ):
             if int(options.get(name, default)) < minimum:
                 raise ValueError(f"Option '{name}' must be >= {minimum}")
+        if int(options.get("cdc.max.records", "64")) > 256:
+            raise ValueError("Option 'cdc.max.records' must be <= 256")
         self._bridge_instance: InformixBridge | None = None
         self._tables: dict[str, Table] | None = None
         self._snapshot_high_water: dict[str, int] = {}
@@ -684,7 +687,7 @@ class InformixLakeflowConnect(LakeflowConnect):
             [_capture_descriptor(table)],
             restart,
             int(options.get("cdc.timeout", self.options.get("cdc.timeout", "5"))),
-            int(options.get("cdc.max.records", self.options.get("cdc.max.records", "4096"))),
+            int(options.get("cdc.max.records", self.options.get("cdc.max.records", "64"))),
         )
         committed = _committed_transactions(raw_records)
         recovered = _recover(committed, checkpoint)
@@ -1041,7 +1044,7 @@ def _key(row: dict[str, Any] | None, table: Table) -> tuple[Any, ...]:
 def _shape_change(row, record, tx, op):
     if row is None:
         raise InformixError("CDC upsert has no after image")
-    result = dict(row)
+    result = _framework_row(row)
     result.update(
         {CURSOR: str(_lsn(record)), COMMIT_LSN: str(tx.commit_lsn), TX_ID: tx.tx_id, OP: op}
     )
@@ -1055,7 +1058,7 @@ def _shape_delete(row, table, record, tx):
     for pk in table.primary_keys:
         if row.get(pk) is None:
             raise InformixError(f"CDC delete has no primary-key value for {pk}")
-        result[pk] = row[pk]
+        result[pk] = _framework_value(row[pk])
     result.update(
         {CURSOR: str(_lsn(record)), COMMIT_LSN: str(tx.commit_lsn), TX_ID: tx.tx_id, OP: "d"}
     )
@@ -1063,9 +1066,21 @@ def _shape_delete(row, table, record, tx):
 
 
 def _shape_snapshot(row: dict[str, Any], lsn: int) -> dict[str, Any]:
-    result = dict(row)
+    result = _framework_row(row)
     result.update({CURSOR: str(lsn), COMMIT_LSN: str(lsn), TX_ID: None, OP: "r"})
     return result
+
+
+def _framework_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {name: _framework_value(value) for name, value in row.items()}
+
+
+def _framework_value(value: Any) -> Any:
+    # The shared Spark Python Data Source parser accepts ISO strings for DateType
+    # and TimestampType, but rejects a native datetime.date.  Normalize both
+    # temporal Python objects at the connector boundary for consistent snapshot
+    # and CDC behavior.
+    return value.isoformat() if isinstance(value, (date, datetime)) else value
 
 
 def _offset(commit: int, change: int, begin: int, tx_id: int | None, phase: str) -> dict:

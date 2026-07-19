@@ -47,7 +47,7 @@ The connector enables full-row logging for captured tables and leaves it enabled
 | `snapshot.max.rows` | No | `100000` | Maximum rows in a one-shot snapshot-only read. The connector fails instead of returning a partial table. |
 | `max.records.per.batch` | No | `1000` | Target maximum projected CDC rows; minimum `1`. A complete transaction may exceed it. |
 | `cdc.timeout` | No | `5` | CDC idle-read timeout in seconds; minimum `0`. |
-| `cdc.max.records` | No | `4096` | Maximum native records requested from a CDC session; minimum `1`. |
+| `cdc.max.records` | No | `64` | Maximum native records requested from a CDC session; range `1`–`256`. |
 | `cdc.max.frame.bytes` | No | `16777216` | Maximum accepted native CDC frame size (16 MiB by default; minimum `16`). |
 | `cdc.max.transaction.records` | No | `100000` | Maximum records buffered in an open transaction. Exceeding it fails without emitting uncommitted data. |
 | `cdc.read.bytes` | No | `32000` | Bytes requested in each SmartLOB CDC read. |

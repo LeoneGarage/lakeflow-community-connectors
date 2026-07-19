@@ -243,7 +243,7 @@ connection:
     - name: cdc.max.records
       type: string
       required: false
-      description: Maximum native records requested from a CDC session. Default `4096`; minimum `1`.
+      description: Maximum native records requested from a CDC session. Default `64`; range `1`–`256`.
 
     - name: cdc.max.frame.bytes
       type: string

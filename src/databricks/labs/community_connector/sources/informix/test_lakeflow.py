@@ -7,6 +7,7 @@ import sys
 import threading
 import types
 import unittest
+from datetime import date, datetime
 
 # The connector's production API uses PySpark type objects, but protocol/unit
 # environments intentionally do not install the large PySpark distribution.
@@ -57,6 +58,7 @@ from databricks.labs.community_connector.sources.informix.informix import (  # n
     LogRetentionError,
     UnsupportedChangeError,
     _catalog_column,
+    _framework_value,
 )
 
 
@@ -132,6 +134,18 @@ class LakeflowContractTests(unittest.TestCase):
         restored = pickle.loads(pickle.dumps(connector))
         self.assertIsNone(restored._bridge_instance)
         self.assertEqual(restored.options, connector.options)
+
+    def test_framework_temporal_values_are_iso_strings(self):
+        self.assertEqual(_framework_value(date(2008, 6, 16)), "2008-06-16")
+        self.assertEqual(
+            _framework_value(datetime(2026, 7, 20, 1, 2, 3, 456000)),
+            "2026-07-20T01:02:03.456000",
+        )
+
+    def test_cdc_max_records_matches_live_informix_boundary(self):
+        self.connector(**{"cdc.max.records": "256"})
+        with self.assertRaisesRegex(ValueError, "must be <= 256"):
+            self.connector(**{"cdc.max.records": "257"})
 
     def test_discovery_filter_schema_and_metadata(self):
         connector = self.connector(table_include_list="ignored")
