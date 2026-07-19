@@ -181,6 +181,15 @@ class LakeflowContractTests(unittest.TestCase):
             "ingestion_type": "cdc_with_deletes",
         })
 
+    def test_qualified_source_table_maps_logical_to_owner_qualified_name(self):
+        connector = self.connector()
+        schema = connector.get_table_schema(
+            "orders", {"qualified_source_table": "app.orders"}
+        )
+        self.assertEqual(schema.fields[0].name, "id")
+        with self.assertRaisesRegex(ValueError, "Unknown or excluded"):
+            connector.get_table_schema("orders", {"source_table": "app.orders"})
+
     def test_snapshot_paging_and_independent_channel_high_water(self):
         bridge = FakeBridge()
         connector = self.connector(bridge, **{"snapshot.page.size": "1"})

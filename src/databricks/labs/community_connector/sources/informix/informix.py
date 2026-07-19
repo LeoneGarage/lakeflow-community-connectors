@@ -746,7 +746,7 @@ class InformixLakeflowConnect(LakeflowConnect):
         ) and not any(fnmatch.fnmatchcase(n, p) for n in names for p in exclude)
 
     def _table(self, name: str, options: dict[str, str], refresh: bool = False) -> Table:
-        exposed = options.get("source_table", name)
+        exposed = options.get("qualified_source_table", name)
         tables = self._table_map(refresh)
         if exposed not in tables:
             raise ValueError(f"Unknown or excluded Informix table '{exposed}'")

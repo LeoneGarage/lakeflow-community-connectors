@@ -55,7 +55,7 @@ The connector enables full-row logging for captured tables and leaves it enabled
 Because per-table options are supported, configure the Unity Catalog connection with this exact `externalOptionsAllowList`:
 
 ```text
-source_table,snapshot.page.size,snapshot.max.rows,max.records.per.batch,cdc.timeout,cdc.max.records
+qualified_source_table,snapshot.page.size,snapshot.max.rows,max.records.per.batch,cdc.timeout,cdc.max.records
 ```
 
 Create the connection from the Lakeflow Community Connector flow on the **Add Data** page, with the Databricks CLI, or with the Databricks SDK for Python. The Unity Catalog connection type must be `COMMUNITY`, and `sourceName` must be `informix`.
@@ -82,7 +82,7 @@ databricks connections create --json "$(jq -n \
       password: $password,
       server: "informix_prod",
       encrypt: "true",
-      externalOptionsAllowList: "source_table,snapshot.page.size,snapshot.max.rows,max.records.per.batch,cdc.timeout,cdc.max.records"
+      externalOptionsAllowList: "qualified_source_table,snapshot.page.size,snapshot.max.rows,max.records.per.batch,cdc.timeout,cdc.max.records"
     }
   }')"
 
@@ -121,7 +121,7 @@ connection = w.connections.create(
         "server": "informix_prod",
         "encrypt": "true",
         "externalOptionsAllowList": (
-            "source_table,snapshot.page.size,snapshot.max.rows,"
+            "qualified_source_table,snapshot.page.size,snapshot.max.rows,"
             "max.records.per.batch,cdc.timeout,cdc.max.records"
         ),
     },
@@ -246,9 +246,10 @@ An idle timeout returns no rows and leaves the checkpoint unchanged. Incomplete 
     "object": [
       {
         "table": {
-          "source_table": "informix.orders",
+          "source_table": "orders",
           "destination_table": "orders",
           "table_configuration": {
+            "qualified_source_table": "informix.orders",
             "snapshot.page.size": "2000",
             "max.records.per.batch": "2000",
             "sequence_by": "_informix_change_lsn"
@@ -260,7 +261,7 @@ An idle timeout returns no rows and leaves the checkpoint unchanged. Incomplete 
 }
 ```
 
-Supported source-specific table options are `snapshot.page.size`, `snapshot.max.rows`, `max.records.per.batch`, `cdc.timeout`, and `cdc.max.records`. Standard destination, SCD, key, sequence, and clustering options remain available.
+Supported source-specific table options are `qualified_source_table`, `snapshot.page.size`, `snapshot.max.rows`, `max.records.per.batch`, `cdc.timeout`, and `cdc.max.records`. `qualified_source_table` maps the pipeline's logical table name to an Informix `owner.table` name. Standard destination, SCD, key, sequence, and clustering options remain available.
 
 ## Operational guidance
 

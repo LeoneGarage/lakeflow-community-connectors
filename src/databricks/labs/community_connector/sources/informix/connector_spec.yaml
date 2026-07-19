@@ -266,6 +266,6 @@ connection:
       required: false
       description: Bytes requested from each Informix SmartLOB CDC read. Default `32000`.
 
-# Exact per-table overrides consumed by the connector. `source_table` maps a
+# Exact per-table overrides consumed by the connector. `qualified_source_table` maps a
 # pipeline table to a dynamically discovered exposed name (`owner.table`).
-external_options_allowlist: "source_table,snapshot.page.size,snapshot.max.rows,max.records.per.batch,cdc.timeout,cdc.max.records"
+external_options_allowlist: "qualified_source_table,snapshot.page.size,snapshot.max.rows,max.records.per.batch,cdc.timeout,cdc.max.records"
