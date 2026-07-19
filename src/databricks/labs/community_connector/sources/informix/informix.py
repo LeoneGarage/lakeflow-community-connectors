@@ -288,7 +288,13 @@ class PurePythonInformixBridge:
             max_transaction_records = int(self.options.get("cdc.max.transaction.records", "100000"))
             requested = int(self.options.get("cdc.read.bytes", "32000"))
             empty_reads = 0
-            while (len(records) < max_records or open_transactions) and empty_reads < 1:
+            timed_out = False
+            # Bound every native poll even when its final transaction is still
+            # open. The projection layer emits only complete transactions and
+            # leaves the checkpoint unchanged, so the next poll safely replays
+            # that transaction from its checkpointed begin LSN. Waiting here
+            # for COMMIT can keep a triggered pipeline alive indefinitely.
+            while len(records) < max_records and empty_reads < 1 and not timed_out:
                 chunk = self.transport.read_lodata(session, requested)
                 if not chunk:
                     empty_reads += 1
@@ -296,6 +302,12 @@ class PurePythonInformixBridge:
                 empty_reads = 0
                 for frame in parser.feed(chunk):
                     record = decode_frame(frame, labels)
+                    if record["op"] == "TIMEOUT":
+                        # Informix represents an idle CDC timeout as a real,
+                        # non-empty protocol frame. Treat it as the terminal
+                        # condition for this finite poll instead of waiting for
+                        # max_records timeout frames.
+                        timed_out = True
                     label = record.get("label", record.get("capture_label"))
                     if record["op"] == "METADATA" and label in labels:
                         descriptors = {column.name: column for column in labels[label]}
@@ -530,8 +542,8 @@ class TransactionBuffer:
 class InformixLakeflowConnect(LakeflowConnect):
     """Pure-Python connector live-validated on disposable Informix 15.
 
-    Normal auth, queries, discovery, snapshots, and core transactional CDC have
-    been exercised; an actual serverless Lakeflow pipeline run remains pending.
+    Normal auth, queries, discovery, snapshots, transactional CDC, and
+    serverless Lakeflow pipeline execution have been exercised.
     """
 
     def __init__(self, options: dict[str, str]) -> None:
@@ -550,6 +562,13 @@ class InformixLakeflowConnect(LakeflowConnect):
         self._bridge_instance: InformixBridge | None = None
         self._tables: dict[str, Table] | None = None
         self._snapshot_high_water: dict[str, int] = {}
+        self._stream_high_water: dict[tuple[str, bool], int] = {}
+        self._trigger_available_now = False
+
+    def prepare_for_trigger_available_now(self) -> None:
+        """Freeze stream high-water marks when Spark selects AvailableNow."""
+
+        self._trigger_available_now = True
 
     def __getstate__(self) -> dict[str, Any]:
         """Exclude live SQLI state when Spark serializes the data source.
@@ -683,6 +702,16 @@ class InformixLakeflowConnect(LakeflowConnect):
     def _read_stream(self, table: Table, start: dict, options: dict[str, str], deletes: bool):
         checkpoint = _validated_offset(start)
         restart = int(checkpoint.get("begin_lsn") or checkpoint["commit_lsn"])
+        stop_lsn: int | None = None
+        if self._trigger_available_now:
+            high_water_key = (table.identity, deletes)
+            if high_water_key not in self._stream_high_water:
+                self._stream_high_water[high_water_key] = (
+                    self._snapshot_high_water[table.identity]
+                    if table.identity in self._snapshot_high_water
+                    else self._bridge.current_lsn()
+                )
+            stop_lsn = self._stream_high_water[high_water_key]
         minimum = self._bridge.minimum_lsn()
         if restart < minimum:
             raise LogRetentionError(
@@ -706,6 +735,8 @@ class InformixLakeflowConnect(LakeflowConnect):
         output: list[dict[str, Any]] = []
         end = start
         for tx in recovered:
+            if stop_lsn is not None and tx.commit_lsn > stop_lsn:
+                break
             projected = _project_transaction(tx, table, deletes)
             # Never split a transaction.  A single large transaction is
             # accepted; subsequent complete transactions wait for next poll.

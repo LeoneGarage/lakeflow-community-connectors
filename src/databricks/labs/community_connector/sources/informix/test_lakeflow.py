@@ -206,6 +206,7 @@ class LakeflowContractTests(unittest.TestCase):
 
     def test_insert_update_delete_pk_change_rollback_discard_and_controls(self):
         bridge = FakeBridge()
+        bridge.now = 200
         bridge.changes = [
             {"op": "METADATA"}, {"op": "TIMEOUT", "lsn": 89},
             {"op": "BEGIN", "tx_id": 1, "lsn": 100},
@@ -240,13 +241,64 @@ class LakeflowContractTests(unittest.TestCase):
         with self.assertRaises(LogRetentionError):
             connector.read_table("app.orders", _stream_offset(), {})
         bridge.minimum = 1
+        bridge.now = 200
         bridge.changes = [
             {"op": "BEGIN", "tx_id": 1, "lsn": 100},
             {"op": "TRUNCATE", "tx_id": 1, "lsn": 101, "table": "app.orders"},
             {"op": "COMMIT", "tx_id": 1, "lsn": 102},
         ]
+        connector = self.connector(bridge)
         with self.assertRaises(UnsupportedChangeError):
             connector.read_table("app.orders", _stream_offset(), {})
+
+    def test_incomplete_transaction_emits_nothing_and_does_not_advance(self):
+        bridge = FakeBridge()
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 100},
+            {"op": "INSERT", "tx_id": 7, "lsn": 101,
+             "row": {"id": 1, "value": "pending"}},
+        ]
+        start = _stream_offset()
+        connector = self.connector(bridge)
+
+        changes, end = connector.read_table("app.orders", start, {})
+
+        self.assertEqual(list(changes), [])
+        self.assertEqual(end, start)
+
+    def test_triggered_stream_stops_at_initial_high_water(self):
+        bridge = FakeBridge()
+        bridge.now = 105
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 8, "lsn": 106},
+            {"op": "INSERT", "tx_id": 8, "lsn": 107,
+             "row": {"id": 1, "value": "later"}},
+            {"op": "COMMIT", "tx_id": 8, "lsn": 110},
+        ]
+        start = _stream_offset(100)
+        connector = self.connector(bridge)
+        connector.prepare_for_trigger_available_now()
+
+        changes, end = connector.read_table("app.orders", start, {})
+
+        self.assertEqual(list(changes), [])
+        self.assertEqual(end, start)
+
+    def test_continuous_stream_does_not_freeze_high_water(self):
+        bridge = FakeBridge()
+        bridge.now = 105
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 9, "lsn": 106},
+            {"op": "INSERT", "tx_id": 9, "lsn": 107,
+             "row": {"id": 1, "value": "later"}},
+            {"op": "COMMIT", "tx_id": 9, "lsn": 110},
+        ]
+        connector = self.connector(bridge)
+
+        changes, end = connector.read_table("app.orders", _stream_offset(100), {})
+
+        self.assertEqual([row["id"] for row in changes], [1])
+        self.assertEqual(end["commit_lsn"], "110")
 
 
 if __name__ == "__main__":
