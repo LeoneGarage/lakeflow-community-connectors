@@ -95,6 +95,37 @@ Use `--profile <profile-name>` when the CLI should use a non-default Databricks 
 databricks connections get informix_sales
 ```
 
+### Update a connection with the Databricks CLI
+
+Pass the complete desired `options` map when updating a connection; do not assume omitted options will be preserved. This TLS example again uses `jq` to keep the password out of the literal command:
+
+```bash
+export INFORMIX_PASSWORD='<secret>'
+export DATABRICKS_PROFILE='<profile-name>'
+
+databricks connections update informix_sales --json "$(jq -n \
+  --arg password "$INFORMIX_PASSWORD" \
+  '{
+    options: {
+      sourceName: "informix",
+      hostname: "informix.example.internal",
+      port: "9089",
+      server: "informix_prod",
+      database: "sales",
+      user: "cdc_service",
+      password: $password,
+      encrypt: "true",
+      "ssl.ca.file": "/Volumes/catalog/schema/artifacts/informix-ca.pem",
+      externalOptionsAllowList: "qualified_source_table,snapshot.page.size,snapshot.max.rows,max.records.per.batch,cdc.timeout,cdc.max.records"
+    }
+  }')" \
+  --profile "$DATABRICKS_PROFILE"
+
+unset INFORMIX_PASSWORD DATABRICKS_PROFILE
+```
+
+The CA path must be readable by the serverless pipeline. Use the TLS listener's DNS hostname rather than its IP address when certificate hostname verification requires it.
+
 ### Create a connection with the Python API
 
 Install or upgrade the Databricks SDK, configure its normal authentication environment, and call the Unity Catalog Connections API:
@@ -262,6 +293,29 @@ An idle timeout returns no rows and leaves the checkpoint unchanged. Incomplete 
 ```
 
 Supported source-specific table options are `qualified_source_table`, `snapshot.page.size`, `snapshot.max.rows`, `max.records.per.batch`, `cdc.timeout`, and `cdc.max.records`. `qualified_source_table` maps the pipeline's logical table name to an Informix `owner.table` name. Standard destination, SCD, key, sequence, and clustering options remain available.
+
+### SCD Type 2 sequencing and validity columns
+
+Set `scd_type` to `SCD_TYPE_2` to retain row history. Lakeflow derives the types and values of `__START_AT` and `__END_AT` from `sequence_by`. The default `_informix_change_lsn` sequence is the safest ordering value, but it produces string validity columns containing decimal LSNs:
+
+```json
+{
+  "scd_type": "SCD_TYPE_2",
+  "sequence_by": "_informix_change_lsn"
+}
+```
+
+To produce timestamp validity columns, sequence on a non-null source timestamp instead:
+
+```json
+{
+  "qualified_source_table": "informix.members",
+  "scd_type": "SCD_TYPE_2",
+  "sequence_by": "updated_at"
+}
+```
+
+This changes Lakeflow Auto CDC ordering and deduplication to `updated_at`; it does not merely change the display type. The connector continues using Informix LSNs for native CDC reads, recovery, and source checkpoints. Use a timestamp only when it is updated for every source change and has enough precision to order repeated changes to the same key. Otherwise retain `_informix_change_lsn`. Changing an existing SCD2 target between LSN and timestamp sequencing changes the validity-column schema and requires recreating or fully refreshing that target. A null `__END_AT` is expected for the currently active version.
 
 ## Operational guidance
 
