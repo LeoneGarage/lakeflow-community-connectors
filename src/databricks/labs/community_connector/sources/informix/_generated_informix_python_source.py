@@ -47,7 +47,6 @@ from pyspark.sql.types import (
     IntegerType,
     LongType,
     MapType,
-    ShortType,
     StringType,
     StructField,
     StructType,
@@ -3338,7 +3337,9 @@ def register_lakeflow_source(spark):
     def _spark_type(column: Column):
         name = column.type_name.split("(", 1)[0].strip()
         if name in {"SMALLINT", "INT2"}:
-            return ShortType()
+            # The framework row converter does not support Spark ShortType. Widen
+            # Informix's signed 16-bit value to IntegerType without losing data.
+            return IntegerType()
         if name in {"INTEGER", "INT", "SERIAL"}:
             return IntegerType()
         if name in {"BIGINT", "INT8", "BIGSERIAL", "SERIAL8"}:

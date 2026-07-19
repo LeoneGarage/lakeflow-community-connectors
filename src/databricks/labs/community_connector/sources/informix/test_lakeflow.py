@@ -56,12 +56,14 @@ from databricks.labs.community_connector.sources.informix.informix import (  # n
     _DEFAULT_MAX_RECORDS_PER_BATCH,
     _DEFAULT_SNAPSHOT_PAGE_SIZE,
     CURSOR,
+    Column,
     InformixLakeflowConnect,
     LogRetentionError,
     UnsupportedChangeError,
     _bridge_config,
     _catalog_column,
     _framework_value,
+    _spark_type,
 )
 
 
@@ -160,6 +162,11 @@ class LakeflowContractTests(unittest.TestCase):
     def test_batch_size_defaults(self):
         self.assertEqual(_DEFAULT_SNAPSHOT_PAGE_SIZE, 10000)
         self.assertEqual(_DEFAULT_MAX_RECORDS_PER_BATCH, 10000)
+
+    def test_smallint_schema_uses_framework_supported_integer_type(self):
+        for type_name in ("SMALLINT", "INT2"):
+            spark_type = _spark_type(Column(name="flag", type_name=type_name))
+            self.assertEqual(type(spark_type).__name__, "IntegerType")
 
     def test_discovery_filter_schema_and_metadata(self):
         connector = self.connector(table_include_list="ignored")
