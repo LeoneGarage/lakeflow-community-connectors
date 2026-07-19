@@ -43,9 +43,9 @@ The connector enables full-row logging for captured tables and leaves it enabled
 | `table.include.list` | No | all eligible tables | Comma-separated shell-style table patterns. |
 | `tables` | No | | Alias for `table.include.list`; ignored when that option is set. |
 | `table.exclude.list` | No | none | Comma-separated shell-style patterns excluded after inclusion filtering. |
-| `snapshot.page.size` | No | `1000` | Rows per deterministic snapshot page for CDC-capable tables; minimum `1`. |
+| `snapshot.page.size` | No | `10000` | Rows per deterministic snapshot page for CDC-capable tables; minimum `1`. |
 | `snapshot.max.rows` | No | `100000` | Maximum rows in a one-shot snapshot-only read. The connector fails instead of returning a partial table. |
-| `max.records.per.batch` | No | `1000` | Target maximum projected CDC rows; minimum `1`. A complete transaction may exceed it. |
+| `max.records.per.batch` | No | `10000` | Target maximum projected CDC rows; minimum `1`. A complete transaction may exceed it. |
 | `cdc.timeout` | No | `5` | CDC idle-read timeout in seconds; minimum `0`. |
 | `cdc.max.records` | No | `64` | Maximum native records requested from a CDC session; range `1`–`256`. |
 | `cdc.max.frame.bytes` | No | `16777216` | Maximum accepted native CDC frame size (16 MiB by default; minimum `16`). |

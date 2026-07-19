@@ -53,6 +53,8 @@ if "pyspark.sql.types" not in sys.modules:
     )
 
 from databricks.labs.community_connector.sources.informix.informix import (  # noqa: E402
+    _DEFAULT_MAX_RECORDS_PER_BATCH,
+    _DEFAULT_SNAPSHOT_PAGE_SIZE,
     CURSOR,
     InformixLakeflowConnect,
     LogRetentionError,
@@ -154,6 +156,10 @@ class LakeflowContractTests(unittest.TestCase):
         )
         self.assertEqual(config["db_locale"], "en_US.819")
         self.assertEqual(config["client_locale"], "en_US.utf8")
+
+    def test_batch_size_defaults(self):
+        self.assertEqual(_DEFAULT_SNAPSHOT_PAGE_SIZE, 10000)
+        self.assertEqual(_DEFAULT_MAX_RECORDS_PER_BATCH, 10000)
 
     def test_discovery_filter_schema_and_metadata(self):
         connector = self.connector(table_include_list="ignored")

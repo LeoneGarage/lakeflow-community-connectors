@@ -2490,6 +2490,8 @@ def register_lakeflow_source(spark):
     _INTERNAL_COLUMNS = (CURSOR, COMMIT_LSN, TX_ID, OP)
     _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
     _DATA_OPS = {"INSERT", "BEFORE_UPDATE", "AFTER_UPDATE", "DELETE", "TRUNCATE"}
+    _DEFAULT_SNAPSHOT_PAGE_SIZE = 10000
+    _DEFAULT_MAX_RECORDS_PER_BATCH = 10000
 
 
     class InformixError(RuntimeError):
@@ -2975,8 +2977,8 @@ def register_lakeflow_source(spark):
             super().__init__(options)
             # Validate numeric configuration without opening a connection.
             for name, default, minimum in (
-                ("snapshot.page.size", "1000", 1),
-                ("max.records.per.batch", "1000", 1),
+                ("snapshot.page.size", str(_DEFAULT_SNAPSHOT_PAGE_SIZE), 1),
+                ("max.records.per.batch", str(_DEFAULT_MAX_RECORDS_PER_BATCH), 1),
                 ("cdc.timeout", "5", 0),
                 ("cdc.max.records", "64", 1),
             ):
@@ -3071,7 +3073,10 @@ def register_lakeflow_source(spark):
 
         def _read_snapshot(self, table: Table, start: dict | None, options: dict[str, str]):
             page_size = int(
-                options.get("snapshot.page.size", self.options.get("snapshot.page.size", "1000"))
+                options.get(
+                    "snapshot.page.size",
+                    self.options.get("snapshot.page.size", str(_DEFAULT_SNAPSHOT_PAGE_SIZE)),
+                )
             )
             if start:
                 high_water = int(start["snapshot_lsn"])
@@ -3132,7 +3137,10 @@ def register_lakeflow_source(spark):
             committed = _committed_transactions(raw_records)
             recovered = _recover(committed, checkpoint)
             max_rows = int(
-                options.get("max.records.per.batch", self.options.get("max.records.per.batch", "1000"))
+                options.get(
+                    "max.records.per.batch",
+                    self.options.get("max.records.per.batch", str(_DEFAULT_MAX_RECORDS_PER_BATCH)),
+                )
             )
             output: list[dict[str, Any]] = []
             end = start

@@ -221,7 +221,7 @@ connection:
     - name: snapshot.page.size
       type: string
       required: false
-      description: Snapshot rows per page for CDC-capable tables. Default `1000`; minimum `1`.
+      description: Snapshot rows per page for CDC-capable tables. Default `10000`; minimum `1`.
 
     - name: snapshot.max.rows
       type: string
@@ -234,7 +234,7 @@ connection:
       type: string
       required: false
       description: >
-        Target maximum projected rows per CDC batch. Default `1000`; minimum
+        Target maximum projected rows per CDC batch. Default `10000`; minimum
         `1`. A single complete transaction may exceed this value.
 
     - name: cdc.timeout
