@@ -1778,12 +1778,19 @@ def register_lakeflow_source(spark):
             value = struct.unpack(">q", data[:8])[0]
             return None if value == -(1 << 63) else value
         if kind == 10:
-            # Unlike DECIMAL, DATETIME's start/end qualifier is carried in the
-            # descriptor's extended-id field.  encoded_length describes its packed
-            # storage and must not be truncated into a synthetic qualifier.
+            # Some descriptors carry the start/end qualifier in extended_id.  Live
+            # Informix 15 ordinary SELECT descriptors instead use extended_id=0
+            # and the syscolumns.collength layout in encoded_length: packed width
+            # in the high byte, qualifier nibbles in the low byte (0x130f for YEAR
+            # TO FRACTION(5)).  Normalize that fallback to the CDC/JDBC extended-id
+            # layout expected by the shared DATETIME decoder.
+            qualifier = column.extended_id
+            if qualifier == 0:
+                encoded_qualifier = column.encoded_length & 0xFF
+                qualifier = ((encoded_qualifier >> 4) << 8) | (encoded_qualifier & 0x0F)
             value, _ = decode_value(
                 memoryview(data),
-                ColumnDescriptor("datetime", "DATETIME", length=column.extended_id),
+                ColumnDescriptor("datetime", "DATETIME", length=qualifier),
             )
             return value
         if kind == 23:

@@ -209,6 +209,14 @@ class FrameTests(unittest.TestCase):
             "HOUR=12:MINUTE=34:SECOND=56",
         )
 
+    def test_live_ordinary_datetime_uses_encoded_length_qualifier_fallback(self):
+        column = ResultColumn("updated_at", 0, 266, 0, 0x130F)
+        raw = bytes([0xC0, 20, 26, 7, 19, 12, 34, 56, 12, 34, 50])
+        self.assertEqual(
+            _decode_result_value(raw, column, "utf-8"),
+            datetime(2026, 7, 19, 12, 34, 56, 123450),
+        )
+
 
 class LoDataTests(unittest.TestCase):
     def test_verified_read_body(self):
