@@ -2,7 +2,7 @@
 
 This connector discovers Informix user tables, takes an initial snapshot, and then captures committed changes through the Informix CDC API. The SQLI client, SmartLOB framing, CDC decoding, transaction handling, and checkpoint recovery are implemented in Python. It requires no JVM, JDBC driver, Debezium runtime, JAR staging, or native Informix client and is intended to run on serverless Lakeflow Connect compute.
 
-The pure-Python protocol implementation has completed authentication, query, discovery, snapshot, and end-to-end transactional INSERT/UPDATE/DELETE CDC validation against a disposable Informix 15 fixture. A run in an actual serverless Lakeflow Connect pipeline is still pending, so treat the connector as pre-production and validate it against your Informix environment before broader use.
+The pure-Python protocol implementation has completed authentication, query, discovery, snapshot, and end-to-end transactional INSERT/UPDATE/DELETE CDC validation against a disposable Informix 15 fixture. It has also completed a serverless Lakeflow Connect pipeline run over TLS, including multi-table discovery, snapshots, checkpointed CDC flow execution, deletes, and SCD Type 2 materialization. Validate it against your Informix version, topology, security policy, and workload before broader use.
 
 ## Prerequisites
 
@@ -222,7 +222,7 @@ A secret-free redirect configuration shape is:
 }
 ```
 
-GSS/Kerberos, private-server authentication, and automatic server-name or locale discovery remain unsupported. PAM and the full redirect/reconnect security path have live integration coverage. The redirect test uses a deterministic ASF type-13 responder rather than a redirect emitted by IDS/HDR itself, and an actual serverless Lakeflow Connect pipeline run remains pending.
+GSS/Kerberos, private-server authentication, and automatic server-name or locale discovery remain unsupported. PAM and the full redirect/reconnect security path have live integration coverage. The redirect test uses a deterministic ASF type-13 responder rather than a redirect emitted by IDS/HDR itself. Serverless Lakeflow Connect execution over an Informix TLS listener has been validated separately.
 
 The fixture at `/Users/leon.eller/work/dev/informix-cdc` live-tests PAM against an Informix listener at `localhost:9090`. Its deterministic redirect responder listens at `localhost:9191`, emits ASF session type 13, and redirects to `127.0.0.1:9088`; the test then proves a fresh, allow-listed, TLS-revalidated login and query on the target. This validates the connector's complete redirect parsing, policy, reset, and reconnect path, but is not evidence that IDS/HDR emits redirects itself. Client-side `sqlhosts` failover is likewise not redirect coverage. Fixture credentials are disposable test data and are intentionally not repeated here.
 
@@ -320,7 +320,7 @@ This changes Lakeflow Auto CDC ordering and deduplication to `updated_at`; it do
 ## Operational guidance
 
 - Start with one small table and verify snapshot, insert, update, delete, restart, rollback, idle timeout, and retention-expiry behavior against the target Informix version before broader use.
-- Disposable Informix 15 testing has validated normal-password and PAM authentication, queries, discovery, snapshots, and committed INSERT/UPDATE/DELETE transactions through `syscdcv1`. A deterministic ASF type-13 responder has validated the complete redirect/reconnect security path through a successful target query. Validate TLS trust, locale behavior, permissions, schemas, data-type boundaries, restart behavior, retention, and IDS/HDR-emitted redirects against the target environment. An actual serverless Lakeflow Connect pipeline run remains pending.
+- Disposable Informix 15 testing has validated normal-password and PAM authentication, queries, discovery, snapshots, and committed INSERT/UPDATE/DELETE transactions through `syscdcv1`. A deterministic ASF type-13 responder has validated the complete redirect/reconnect security path through a successful target query. A serverless Lakeflow Connect pipeline has validated TLS, multi-table snapshots, checkpointed CDC flows, deletes, and SCD Type 2 materialization. Validate TLS trust, locale behavior, permissions, schemas, data-type boundaries, restart behavior, retention, and IDS/HDR-emitted redirects against the target environment.
 - Authentication errors commonly indicate a wrong `server`/locale, unsupported authentication mode or redirect, an untrusted/mismatched TLS certificate, or insufficient `syscdcv1` privileges.
 - Schema changes that alter captured column layout are not guaranteed to be safe during active capture. Restart and validate at a clean LSN boundary.
 - Ensure source log retention covers downtime and the oldest checkpoint. Otherwise resnapshotting is required.
