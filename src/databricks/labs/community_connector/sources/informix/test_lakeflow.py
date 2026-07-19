@@ -54,6 +54,7 @@ from databricks.labs.community_connector.sources.informix.informix import (  # n
     InformixLakeflowConnect,
     LogRetentionError,
     UnsupportedChangeError,
+    _catalog_column,
 )
 
 
@@ -116,6 +117,12 @@ class LakeflowContractTests(unittest.TestCase):
         connector = InformixLakeflowConnect({"database": "demo", **options})
         connector._bridge_instance = bridge or FakeBridge()
         return connector
+
+    def test_live_catalog_datetime_qualifier_is_normalized_for_cdc(self):
+        column = _catalog_column(
+            {"colname": "updated_at", "coltype": 10, "collength": 0x130F, "colno": 2}
+        )
+        self.assertEqual(column["length"], 0x000F)
 
     def test_discovery_filter_schema_and_metadata(self):
         connector = self.connector(table_include_list="ignored")

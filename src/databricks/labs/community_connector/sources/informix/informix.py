@@ -796,6 +796,14 @@ def _catalog_column(row: Any) -> dict[str, Any]:
     type_name = _CATALOG_TYPES.get(base_type)
     if type_name is None:
         raise InformixError(f"Unsupported Informix catalog coltype {base_type} for {name}")
+    if type_name == "DATETIME":
+        # syscolumns.collength stores the packed width in its high byte and
+        # start/end qualifier nibbles in its low byte.  CDC descriptors use
+        # the JDBC extended-id layout instead: start in bits 8..11 and end in
+        # bits 0..3.  For example, live YEAR TO FRACTION(5) is 0x130f in the
+        # catalog and must become 0x000f for the native row decoder.
+        encoded_qualifier = length & 0xFF
+        length = ((encoded_qualifier >> 4) << 8) | (encoded_qualifier & 0x0F)
     precision = scale = None
     if type_name in {"DECIMAL", "MONEY"}:
         precision, scale = (length >> 8) & 0xFF, length & 0xFF
