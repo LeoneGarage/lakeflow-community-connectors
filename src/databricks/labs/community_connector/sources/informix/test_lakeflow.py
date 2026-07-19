@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import pickle
 import sys
+import threading
 import types
 import unittest
 
@@ -123,6 +125,13 @@ class LakeflowContractTests(unittest.TestCase):
             {"colname": "updated_at", "coltype": 10, "collength": 0x130F, "colno": 2}
         )
         self.assertEqual(column["length"], 0x000F)
+
+    def test_spark_serialization_discards_live_bridge_state(self):
+        connector = self.connector()
+        connector._bridge_instance.unpicklable_lock = threading.Lock()
+        restored = pickle.loads(pickle.dumps(connector))
+        self.assertIsNone(restored._bridge_instance)
+        self.assertEqual(restored.options, connector.options)
 
     def test_discovery_filter_schema_and_metadata(self):
         connector = self.connector(table_include_list="ignored")

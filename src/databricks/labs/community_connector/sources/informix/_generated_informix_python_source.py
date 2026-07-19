@@ -2976,6 +2976,20 @@ def register_lakeflow_source(spark):
             self._tables: dict[str, Table] | None = None
             self._snapshot_high_water: dict[str, int] = {}
 
+        def __getstate__(self) -> dict[str, Any]:
+            """Exclude live SQLI state when Spark serializes the data source.
+
+            Schema and metadata discovery run before Spark ships the reader to a
+            Python worker, so ``_bridge_instance`` can contain a socket, buffered
+            streams, and a thread lock.  None of those objects is transferable or
+            valid in another process.  The worker reconstructs a fresh bridge from
+            the immutable connection options on its first source operation.
+            """
+
+            state = self.__dict__.copy()
+            state["_bridge_instance"] = None
+            return state
+
         @property
         def _bridge(self) -> InformixBridge:
             if self._bridge_instance is None:
