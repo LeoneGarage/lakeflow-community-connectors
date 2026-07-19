@@ -86,17 +86,19 @@ connection:
 
     - name: DB_LOCALE
       type: string
-      required: true
+      required: false
       description: >
-        Informix database locale sent during SQLI authentication, for example
-        `en_US.utf8`. Locale discovery is not implemented.
+        Informix database locale sent during SQLI authentication. Default
+        `en_US.819`. Set it explicitly when the database uses another locale;
+        locale discovery is not implemented.
 
     - name: CLIENT_LOCALE
       type: string
-      required: true
+      required: false
       description: >
-        Informix client locale sent during SQLI authentication, for example
-        `en_US.utf8`. Its codeset selects Python row decoding.
+        Informix client locale sent during SQLI authentication. Default
+        `en_US.utf8`. Its codeset selects Python row decoding; set it explicitly
+        when another client encoding is required.
 
     - name: encrypt
       type: string

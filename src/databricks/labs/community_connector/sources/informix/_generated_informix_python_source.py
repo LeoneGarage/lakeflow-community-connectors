@@ -1824,8 +1824,8 @@ def register_lakeflow_source(spark):
         user: str
         password: str
         server_name: str | None = None
-        db_locale: str | None = None
-        client_locale: str | None = None
+        db_locale: str | None = "en_US.819"
+        client_locale: str | None = "en_US.utf8"
         tls: bool = True
         ssl_context: ssl.SSLContext | None = None
         ca_file: str | None = None
@@ -1854,10 +1854,11 @@ def register_lakeflow_source(spark):
                     "Normal Informix ASC authentication sends the password directly; "
                     "the pure-Python client requires TLS"
                 )
-            if not self.server_name or not self.db_locale or not self.client_locale:
+            if not self.server_name:
                 raise SqliUnsupportedAuthentication(
-                    "server_name, DB_LOCALE and CLIENT_LOCALE are required; locale discovery, "
-                    "GSS and private-server authentication are unsupported"
+                    "server_name is required; DB_LOCALE defaults to en_US.819 and CLIENT_LOCALE "
+                    "defaults to en_US.utf8; locale discovery, GSS and private-server "
+                    "authentication are unsupported"
                 )
             deadline = time.monotonic() + self.login_timeout
             host, port, server = self.hostname, self.port, self.server_name
@@ -2794,8 +2795,10 @@ def register_lakeflow_source(spark):
             "user": options["user"],
             "password": options["password"],
             "server": options.get("server"),
-            "db_locale": options.get("DB_LOCALE") or options.get("db.locale"),
-            "client_locale": options.get("CLIENT_LOCALE") or options.get("client.locale"),
+            "db_locale": options.get("DB_LOCALE") or options.get("db.locale") or "en_US.819",
+            "client_locale": (
+                options.get("CLIENT_LOCALE") or options.get("client.locale") or "en_US.utf8"
+            ),
             "tls": options.get("encrypt", "true").lower() in {"1", "true", "yes"},
             "ca_file": options.get("ssl.ca.file"),
             "pad_varchar": options.get("padVarchar", "false").lower() in {"1", "true", "yes"},

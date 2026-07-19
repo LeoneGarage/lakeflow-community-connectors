@@ -57,6 +57,7 @@ from databricks.labs.community_connector.sources.informix.informix import (  # n
     InformixLakeflowConnect,
     LogRetentionError,
     UnsupportedChangeError,
+    _bridge_config,
     _catalog_column,
     _framework_value,
 )
@@ -146,6 +147,13 @@ class LakeflowContractTests(unittest.TestCase):
         self.connector(**{"cdc.max.records": "256"})
         with self.assertRaisesRegex(ValueError, "must be <= 256"):
             self.connector(**{"cdc.max.records": "257"})
+
+    def test_locale_defaults(self):
+        config = _bridge_config(
+            {"hostname": "host", "database": "db", "user": "user", "password": "secret"}
+        )
+        self.assertEqual(config["db_locale"], "en_US.819")
+        self.assertEqual(config["client_locale"], "en_US.utf8")
 
     def test_discovery_filter_schema_and_metadata(self):
         connector = self.connector(table_include_list="ignored")

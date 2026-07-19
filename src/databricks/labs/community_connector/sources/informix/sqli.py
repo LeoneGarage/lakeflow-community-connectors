@@ -824,8 +824,8 @@ class InformixSqliClient:
     user: str
     password: str
     server_name: str | None = None
-    db_locale: str | None = None
-    client_locale: str | None = None
+    db_locale: str | None = "en_US.819"
+    client_locale: str | None = "en_US.utf8"
     tls: bool = True
     ssl_context: ssl.SSLContext | None = None
     ca_file: str | None = None
@@ -854,10 +854,11 @@ class InformixSqliClient:
                 "Normal Informix ASC authentication sends the password directly; "
                 "the pure-Python client requires TLS"
             )
-        if not self.server_name or not self.db_locale or not self.client_locale:
+        if not self.server_name:
             raise SqliUnsupportedAuthentication(
-                "server_name, DB_LOCALE and CLIENT_LOCALE are required; locale discovery, "
-                "GSS and private-server authentication are unsupported"
+                "server_name is required; DB_LOCALE defaults to en_US.819 and CLIENT_LOCALE "
+                "defaults to en_US.utf8; locale discovery, GSS and private-server "
+                "authentication are unsupported"
             )
         deadline = time.monotonic() + self.login_timeout
         host, port, server = self.hostname, self.port, self.server_name

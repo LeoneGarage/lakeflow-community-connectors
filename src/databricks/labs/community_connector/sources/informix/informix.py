@@ -357,8 +357,10 @@ def _bridge_config(options: dict[str, str]) -> dict[str, Any]:
         "user": options["user"],
         "password": options["password"],
         "server": options.get("server"),
-        "db_locale": options.get("DB_LOCALE") or options.get("db.locale"),
-        "client_locale": options.get("CLIENT_LOCALE") or options.get("client.locale"),
+        "db_locale": options.get("DB_LOCALE") or options.get("db.locale") or "en_US.819",
+        "client_locale": (
+            options.get("CLIENT_LOCALE") or options.get("client.locale") or "en_US.utf8"
+        ),
         "tls": options.get("encrypt", "true").lower() in {"1", "true", "yes"},
         "ca_file": options.get("ssl.ca.file"),
         "pad_varchar": options.get("padVarchar", "false").lower() in {"1", "true", "yes"},

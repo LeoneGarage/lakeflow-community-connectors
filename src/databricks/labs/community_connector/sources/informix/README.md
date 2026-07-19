@@ -11,7 +11,7 @@ The pure-Python protocol implementation has completed authentication, query, dis
 - Transaction logging enabled for the source database. Retained logical logs must extend back to the oldest connector checkpoint.
 - The Informix CDC API installed by an administrator. Run `$INFORMIXDIR/etc/syscdcv1.sql` (commonly with `dbaccess sysadmin`) to create the `syscdcv1` database and `cdc_*` routines.
 - A normal username/password account that can read source catalog metadata and selected tables, use the required `syscdcv1` routines, and enable full-row logging. The validated reference setup grants DBA-level access to `syscdcv1`.
-- The exact `INFORMIXSERVER`, database locale, and client locale values. The connector does not discover these values.
+- The exact `INFORMIXSERVER` value. `DB_LOCALE` defaults to `en_US.819` and `CLIENT_LOCALE` defaults to `en_US.utf8`; override either when the source requires another locale because the connector does not discover them.
 
 The connector enables full-row logging for captured tables and leaves it enabled when a finite poll ends, avoiding capture gaps between polls. Ensure this operational change is acceptable on the source system.
 
@@ -26,8 +26,8 @@ The connector enables full-row logging for captured tables and leaves it enabled
 | `user` | Yes | | Informix normal-auth user with metadata, snapshot, and CDC privileges. |
 | `password` | Yes | | Password for `user`; store it as a secret. |
 | `server` | Yes | | Exact `INFORMIXSERVER` name sent during SQLI authentication. |
-| `DB_LOCALE` | Yes | | Database locale, for example `en_US.utf8`. |
-| `CLIENT_LOCALE` | Yes | | Client locale, for example `en_US.utf8`. Its codeset controls Python row decoding. |
+| `DB_LOCALE` | No | `en_US.819` | Database locale. Set it explicitly when the database uses another locale. |
+| `CLIENT_LOCALE` | No | `en_US.utf8` | Client locale. Its codeset controls Python row decoding. |
 | `port` | No | `9088` | Informix SQLI port. |
 | `encrypt` | No | `true` | Enables TLS. Truthy values are `1`, `true`, and `yes`, case-insensitively. Disabling TLS fails closed. |
 | `ssl.ca.file` | No | system CA store | Path to a PEM CA bundle available on the pipeline worker. Hostname verification remains enabled. |
@@ -81,8 +81,6 @@ databricks connections create --json "$(jq -n \
       user: "cdc_service",
       password: $password,
       server: "informix_prod",
-      DB_LOCALE: "en_US.utf8",
-      CLIENT_LOCALE: "en_US.utf8",
       encrypt: "true",
       externalOptionsAllowList: "source_table,snapshot.page.size,snapshot.max.rows,max.records.per.batch,cdc.timeout,cdc.max.records"
     }
@@ -121,8 +119,6 @@ connection = w.connections.create(
         "user": "cdc_service",
         "password": os.environ["INFORMIX_PASSWORD"],
         "server": "informix_prod",
-        "DB_LOCALE": "en_US.utf8",
-        "CLIENT_LOCALE": "en_US.utf8",
         "encrypt": "true",
         "externalOptionsAllowList": (
             "source_table,snapshot.page.size,snapshot.max.rows,"
@@ -144,8 +140,6 @@ Do not hard-code production credentials in scripts, notebooks, pipeline JSON, or
   "port": "9088",
   "database": "sales",
   "server": "informix_prod",
-  "DB_LOCALE": "en_US.utf8",
-  "CLIENT_LOCALE": "en_US.utf8",
   "encrypt": "true",
   "table.include.list": "sales.informix.orders,sales.informix.order_items"
 }
@@ -172,8 +166,6 @@ Keep `password` and `authentication.pam.echo.response` in secret-backed connecti
   "server": "informix_prod_pam",
   "database": "sales",
   "user": "cdc_service",
-  "DB_LOCALE": "en_US.utf8",
-  "CLIENT_LOCALE": "en_US.utf8",
   "authentication.mode": "pam",
   "authentication.pam.max.rounds": "8"
 }
@@ -192,8 +184,6 @@ A secret-free redirect configuration shape is:
   "server": "g_informix",
   "database": "sales",
   "user": "cdc_service",
-  "DB_LOCALE": "en_US.utf8",
-  "CLIENT_LOCALE": "en_US.utf8",
   "redirect.enabled": "true",
   "redirect.allowlist": "informix-a.example.internal:9091,10.20.30.40:9091",
   "redirect.max": "2",
