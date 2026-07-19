@@ -43,6 +43,7 @@ Thumbs.db
 
 # Claude
 .claude/agent-memory-local/
+agents.md
 
 # Git worktrees
 .worktrees/

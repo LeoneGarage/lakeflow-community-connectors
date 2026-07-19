@@ -1,0 +1,269 @@
+# Informix Community Connector Spec
+#
+# Pure-Python, serverless-capable SQLI connector. No JVM, JDBC jars, Debezium
+# runtime, pydbzengine, or native client installation is required. A disposable
+# Informix 15 instance has validated SQLI discovery/snapshot and the native CDC
+# lifecycle for INSERT, UPDATE, and DELETE. Validation in an actual serverless
+# Lakeflow Connect pipeline is still pending, so this is not yet production-ready.
+#
+# The Informix CDC API (`syscdcv1.sql`) must be installed, transaction logging
+# enabled, and retained logical logs must cover the checkpoint. The user needs
+# source metadata/snapshot access and permission to use the syscdcv1 routines
+# and enable full-row logging.
+#
+# Authentication and TLS limitations:
+#   - Informix ASC username/password and non-interactive PAM authentication are
+#     implemented. PAM is validated against a live PAM-enabled Informix fixture.
+#     Redirect reconnect/security behavior is validated with a deterministic
+#     ASF type-13 redirect responder; a genuine IDS/HDR-issued redirect remains
+#     unvalidated. Validation in an actual serverless pipeline is also pending.
+#   - GSS, locale discovery, and private-server authentication remain rejected.
+#   - TLS is mandatory because normal authentication sends the password in the
+#     ASC payload. `encrypt=false` is accepted as an option but fails closed.
+#   - TLS uses Python hostname verification and either system CA trust or a PEM
+#     CA file supplied with `ssl.ca.file`. There is no insecure-skip-verify mode.
+#
+# CDC-capable tables require a primary key and only supported CDC columns.
+# Supported CDC column types are SMALLINT, INTEGER/INT, SERIAL, FLOAT/DOUBLE,
+# REAL/SMALLFLOAT, DECIMAL, MONEY, DATE, BOOLEAN, CHAR/NCHAR,
+# VARCHAR/NVARCHAR, LVARCHAR, INT8/SERIAL8, and supported DATETIME qualifiers.
+# INT8/SERIAL8 use the complete ten-byte CDC signed-magnitude representation;
+# there is no trailer-discard compatibility option. DATETIME values containing
+# YEAR/MONTH/DAY are emitted as naive source calendar values and interpreted by
+# Spark as timestamps; partial qualifiers are deterministic labeled strings and
+# never acquire a current date. BYTE, TEXT, BLOB, CLOB, INTERVAL, and complex or
+# opaque types remain outside IBM's native capture-column API and make a table
+# snapshot-only. Unknown catalog types fail discovery rather than being decoded
+# speculatively. Ordinary TEXT/BYTE fetch framing has a bounded internal helper,
+# but content materialization and limits are not exposed by this connector.
+# Generated metadata, snapshot, and CDC lifecycle statements use a deliberately
+# narrow typed-bind implementation (INTEGER/BIGINT/VARCHAR and explicit internal
+# typed nulls). It is not a user-query or arbitrary prepared-statement API.
+#
+# CDC-capable tables receive a deterministic primary-key snapshot followed by
+# CDC from the pre-snapshot high-water LSN. Delivery is at-least-once and a
+# transaction is never split. INSERT/UPDATE rows and DELETE before-images use
+# independently checkpointed channels. TRUNCATE is unsupported by Lakeflow's
+# row-delete contract and fails explicitly. Expired log retention requires a
+# resnapshot. PK-less or CDC-unsupported tables use a bounded one-shot snapshot.
+
+display_name: Informix
+connection:
+  parameters:
+    - name: hostname
+      type: string
+      required: true
+      description: Informix SQLI hostname or IP address used for TLS hostname verification.
+
+    - name: port
+      type: string
+      required: false
+      description: Informix SQLI port. Default `9088`.
+
+    - name: database
+      type: string
+      required: true
+      description: Informix database to discover, snapshot, and capture.
+
+    - name: user
+      type: string
+      required: true
+      description: Informix normal-auth user with metadata, snapshot, and CDC privileges.
+
+    - name: password
+      type: string
+      required: true
+      secret: true
+      description: Password used by Informix ASC normal username/password authentication.
+
+    - name: server
+      type: string
+      required: true
+      description: >
+        INFORMIXSERVER name sent during SQLI authentication. The pure-Python
+        client requires this value and does not perform server-name discovery.
+        An enabled, allow-listed redirect may replace it during a fresh login.
+
+    - name: DB_LOCALE
+      type: string
+      required: true
+      description: >
+        Informix database locale sent during SQLI authentication, for example
+        `en_US.utf8`. Locale discovery is not implemented.
+
+    - name: CLIENT_LOCALE
+      type: string
+      required: true
+      description: >
+        Informix client locale sent during SQLI authentication, for example
+        `en_US.utf8`. Its codeset selects Python row decoding.
+
+    - name: encrypt
+      type: string
+      required: false
+      description: >
+        Enables TLS for SQLI. Default `true`; truthy values are `1`, `true`,
+        and `yes` (case-insensitive). Any other value disables TLS, which the
+        normal-password client rejects. System CA trust and hostname
+        verification are always used. Set `ssl.ca.file` to replace system trust
+        with PEM trust anchors; insecure certificate verification is unavailable.
+
+    - name: ssl.ca.file
+      type: string
+      required: false
+      description: >
+        Path to a PEM CA bundle available on the serverless worker. Python loads
+        it into a verified TLS context and still enforces hostname verification.
+        If absent, the platform system CA store is used.
+
+    - name: authentication.mode
+      type: string
+      required: false
+      description: >
+        Authentication mode: `password` or `pam`. Default `password`. PAM is
+        non-interactive and requires TLS plus either a provider factory or the
+        configured secret response/password fallback. Other modes fail closed.
+
+    - name: authentication.provider.factory
+      type: string
+      required: false
+      description: >
+        Optional trusted Python factory in `module:callable` form. The callable
+        receives all connection options and returns the non-interactive PAM
+        response provider. This imports and executes code in the pipeline;
+        configure only an administrator-reviewed, installed module. When
+        absent, the built-in password provider is used.
+
+    - name: authentication.pam.echo.response
+      type: string
+      required: false
+      secret: true
+      description: >
+        Optional secret response for PAM echo-on prompts. The built-in provider
+        uses `password` for echo-off prompts and this value for echo-on prompts;
+        when absent, `password` is the fallback for both prompt styles. Ignored
+        by a custom authentication provider factory.
+
+    - name: authentication.pam.max.rounds
+      type: string
+      required: false
+      description: >
+        Maximum PAM challenge rounds before authentication fails closed.
+        Default `16`. PAM responses are additionally bounded to 512 encoded
+        bytes by the protocol implementation.
+
+    - name: authentication.login.timeout
+      type: string
+      required: false
+      description: >
+        Overall login deadline in seconds, shared by initial connection,
+        authentication, and every redirect/reconnect attempt. Default `30`.
+
+    - name: redirect.enabled
+      type: string
+      required: false
+      description: >
+        Enables Informix protocol redirects. Default `false`; truthy values are
+        `1`, `true`, and `yes` (case-insensitive). Redirects remain fail-closed
+        unless every destination is present in `redirect.allowlist`.
+
+    - name: redirect.allowlist
+      type: string
+      required: false
+      description: >
+        Comma-separated exact `host:numeric-port` destinations permitted for
+        redirects; service names, wildcards, and omitted ports are rejected.
+        A hostname must resolve to exactly one stable address. If that address
+        is private, loopback, link-local, multicast, or otherwise non-public,
+        its exact `IP:numeric-port` must also be listed. Each redirected socket
+        starts a fresh login and revalidates TLS against the redirected hostname.
+
+    - name: redirect.max
+      type: string
+      required: false
+      description: >
+        Maximum redirects permitted within the overall login deadline. Default
+        `3`. Revisited server/address/port destinations are rejected as loops.
+
+    - name: padVarchar
+      type: string
+      required: false
+      description: >
+        Selects fixed-width padded decoding for ordinary SQL VARCHAR/NVARCHAR
+        snapshot and metadata results. Default `false`; truthy values are `1`,
+        `true`, and `yes` (case-insensitive). It does not change native CDC
+        VARCHAR framing. Use only when the server negotiates padded tuples.
+
+    - name: table.include.list
+      type: string
+      required: false
+      description: >
+        Optional comma-separated shell-style patterns selecting discovered
+        tables. Patterns match `database.owner.table`, `owner.table`, or
+        Informix `database:owner.table`. Alias `tables` is also supported.
+
+    - name: tables
+      type: string
+      required: false
+      description: >
+        Alias for `table.include.list`; ignored when `table.include.list` is
+        set. If neither is set, all eligible discovered user tables are used.
+
+    - name: table.exclude.list
+      type: string
+      required: false
+      description: >
+        Optional comma-separated shell-style patterns excluding discovered
+        tables after inclusion filtering.
+
+    - name: snapshot.page.size
+      type: string
+      required: false
+      description: Snapshot rows per page for CDC-capable tables. Default `1000`; minimum `1`.
+
+    - name: snapshot.max.rows
+      type: string
+      required: false
+      description: >
+        Maximum rows allowed in a one-shot snapshot-only table read. Default
+        `100000`; exceeding it fails instead of returning a partial snapshot.
+
+    - name: max.records.per.batch
+      type: string
+      required: false
+      description: >
+        Target maximum projected rows per CDC batch. Default `1000`; minimum
+        `1`. A single complete transaction may exceed this value.
+
+    - name: cdc.timeout
+      type: string
+      required: false
+      description: Informix CDC idle-read timeout in seconds. Default `5`; minimum `0`.
+
+    - name: cdc.max.records
+      type: string
+      required: false
+      description: Maximum native records requested from a CDC session. Default `4096`; minimum `1`.
+
+    - name: cdc.max.frame.bytes
+      type: string
+      required: false
+      description: >
+        Maximum accepted native CDC frame size in bytes. Default `16777216`
+        (16 MiB); values below `16` fail when the frame parser is created.
+
+    - name: cdc.max.transaction.records
+      type: string
+      required: false
+      description: >
+        Maximum buffered records while a CDC transaction remains open. Default
+        `100000`. Exceeding the bound fails rather than emitting uncommitted data.
+
+    - name: cdc.read.bytes
+      type: string
+      required: false
+      description: Bytes requested from each Informix SmartLOB CDC read. Default `32000`.
+
+# Exact per-table overrides consumed by the connector. `source_table` maps a
+# pipeline table to a dynamically discovered exposed name (`owner.table`).
+external_options_allowlist: "source_table,snapshot.page.size,snapshot.max.rows,max.records.per.batch,cdc.timeout,cdc.max.records"

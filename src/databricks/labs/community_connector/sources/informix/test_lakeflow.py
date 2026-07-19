@@ -1,0 +1,193 @@
+"""Source-local Lakeflow contract regressions using an in-memory bridge."""
+
+from __future__ import annotations
+
+import sys
+import types
+import unittest
+
+# The connector's production API uses PySpark type objects, but protocol/unit
+# environments intentionally do not install the large PySpark distribution.
+if "pyspark.sql.types" not in sys.modules:
+    pyspark = types.ModuleType("pyspark")
+    sql = types.ModuleType("pyspark.sql")
+    spark_types = types.ModuleType("pyspark.sql.types")
+
+    class _Type:
+        pass
+
+    class StructField:
+        def __init__(self, name, data_type, nullable=True):
+            self.name, self.dataType, self.nullable = name, data_type, nullable
+
+    class StructType:
+        def __init__(self, fields=()):
+            self.fields = list(fields)
+
+    for name in (
+        "BinaryType",
+        "BooleanType",
+        "DateType",
+        "DoubleType",
+        "FloatType",
+        "IntegerType",
+        "LongType",
+        "ShortType",
+        "StringType",
+        "TimestampType",
+    ):
+        setattr(spark_types, name, type(name, (_Type,), {}))
+
+    class DecimalType(_Type):
+        def __init__(self, precision=10, scale=0):
+            self.precision, self.scale = precision, scale
+
+    spark_types.DecimalType = DecimalType
+    spark_types.StructField = StructField
+    spark_types.StructType = StructType
+    sys.modules.update(
+        {"pyspark": pyspark, "pyspark.sql": sql, "pyspark.sql.types": spark_types}
+    )
+
+from databricks.labs.community_connector.sources.informix.informix import (  # noqa: E402
+    CURSOR,
+    InformixLakeflowConnect,
+    LogRetentionError,
+    UnsupportedChangeError,
+)
+
+
+def _table(owner="app", name="orders", cdc=True):
+    return {
+        "database": "demo",
+        "owner": owner,
+        "name": name,
+        "columns": [
+            {"name": "id", "type_name": "INTEGER", "nullable": False},
+            {"name": "value", "type_name": "VARCHAR", "length": 20,
+             "cdc_supported": cdc},
+        ],
+        "primary_keys": ["id"],
+    }
+
+
+class FakeBridge:
+    def __init__(self):
+        self.tables = [_table(), _table("sysadmin", "hidden"), _table(name="audit")]
+        self.rows = [{"id": 1, "value": "a"}, {"id": 2, "value": "b"}]
+        self.changes = []
+        self.now, self.minimum = 90, 1
+        self.snapshot_calls = []
+
+    def list_tables(self):
+        return self.tables
+
+    def get_table(self, identity):
+        return next(t for t in self.tables if identity.endswith(f".{t['owner']}.{t['name']}"))
+
+    def current_lsn(self):
+        return self.now
+
+    def minimum_lsn(self):
+        return self.minimum
+
+    def snapshot_page(self, identity, columns, primary_keys, after, limit):
+        self.snapshot_calls.append((identity, tuple(columns), tuple(primary_keys), after, limit))
+        rows = self.rows
+        if after is not None:
+            if len(after) != len(primary_keys):
+                raise AssertionError("snapshot continuation arity changed")
+            rows = [row for row in rows if row[primary_keys[0]] > after[0]]
+        return rows[:limit]
+
+    def read_changes(self, tables, start_lsn, timeout_seconds, max_records):
+        return list(self.changes)
+
+
+def _stream_offset(lsn=90):
+    return {
+        "commit_lsn": str(lsn), "change_lsn": str(lsn),
+        "begin_lsn": str(lsn), "tx_id": None, "phase": "stream",
+    }
+
+
+class LakeflowContractTests(unittest.TestCase):
+    def connector(self, bridge=None, **options):
+        connector = InformixLakeflowConnect({"database": "demo", **options})
+        connector._bridge_instance = bridge or FakeBridge()
+        return connector
+
+    def test_discovery_filter_schema_and_metadata(self):
+        connector = self.connector(table_include_list="ignored")
+        connector.options["table.include.list"] = "app.*"
+        connector.options["table.exclude.list"] = "*.audit"
+        self.assertEqual(connector.list_tables(), ["app.orders"])
+        schema = connector.get_table_schema("app.orders", {})
+        self.assertEqual([field.name for field in schema.fields][-4:],
+                         [CURSOR, "_informix_commit_lsn", "_informix_tx_id", "_informix_op"])
+        self.assertEqual(connector.read_table_metadata("app.orders", {}), {
+            "primary_keys": ["id"], "cursor_field": CURSOR,
+            "ingestion_type": "cdc_with_deletes",
+        })
+
+    def test_snapshot_paging_and_independent_channel_high_water(self):
+        bridge = FakeBridge()
+        connector = self.connector(bridge, **{"snapshot.page.size": "1"})
+        first, offset = connector.read_table("app.orders", {}, {})
+        self.assertEqual([row["id"] for row in first], [1])
+        self.assertEqual(offset["snapshot"]["last_pk"], [1])
+        second, end = connector.read_table("app.orders", offset, {})
+        self.assertEqual([row["id"] for row in second], [2])
+        self.assertEqual(end["phase"], "stream")
+        deletes, delete_offset = connector.read_table_deletes("app.orders", {}, {})
+        self.assertEqual(list(deletes), [])
+        self.assertEqual(delete_offset["commit_lsn"], "90")
+        self.assertEqual(bridge.snapshot_calls[1][3], [1])
+
+    def test_insert_update_delete_pk_change_rollback_discard_and_controls(self):
+        bridge = FakeBridge()
+        bridge.changes = [
+            {"op": "METADATA"}, {"op": "TIMEOUT", "lsn": 89},
+            {"op": "BEGIN", "tx_id": 1, "lsn": 100},
+            {"op": "INSERT", "tx_id": 1, "lsn": 101, "row": {"id": 1, "value": "a"}},
+            {"op": "BEFORE_UPDATE", "tx_id": 1, "lsn": 102,
+             "row": {"id": 1, "value": "a"}},
+            {"op": "AFTER_UPDATE", "tx_id": 1, "lsn": 103,
+             "row": {"id": 2, "value": "b"}},
+            {"op": "DELETE", "tx_id": 1, "lsn": 104,
+             "row": {"id": 2, "value": "b"}},
+            {"op": "COMMIT", "tx_id": 1, "lsn": 110},
+            {"op": "BEGIN", "tx_id": 2, "lsn": 120},
+            {"op": "INSERT", "tx_id": 2, "lsn": 121, "row": {"id": 9, "value": "x"}},
+            {"op": "DISCARD", "tx_id": 2, "lsn": 121},
+            {"op": "COMMIT", "tx_id": 2, "lsn": 122},
+            {"op": "BEGIN", "tx_id": 3, "lsn": 130},
+            {"op": "INSERT", "tx_id": 3, "lsn": 131, "row": {"id": 8, "value": "x"}},
+            {"op": "ROLLBACK", "tx_id": 3, "lsn": 132},
+        ]
+        connector = self.connector(bridge)
+        changes, _ = connector.read_table("app.orders", _stream_offset(), {})
+        self.assertEqual(
+            [(row["id"], row["_informix_op"]) for row in changes], [(1, "c"), (2, "u")]
+        )
+        deletes, _ = connector.read_table_deletes("app.orders", _stream_offset(), {})
+        self.assertEqual([row["id"] for row in deletes], [1, 2])
+
+    def test_retention_and_truncate_fail_explicitly(self):
+        bridge = FakeBridge()
+        bridge.minimum = 91
+        connector = self.connector(bridge)
+        with self.assertRaises(LogRetentionError):
+            connector.read_table("app.orders", _stream_offset(), {})
+        bridge.minimum = 1
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 1, "lsn": 100},
+            {"op": "TRUNCATE", "tx_id": 1, "lsn": 101, "table": "app.orders"},
+            {"op": "COMMIT", "tx_id": 1, "lsn": 102},
+        ]
+        with self.assertRaises(UnsupportedChangeError):
+            connector.read_table("app.orders", _stream_offset(), {})
+
+
+if __name__ == "__main__":
+    unittest.main()
