@@ -3,8 +3,8 @@
 # Pure-Python, serverless-capable SQLI connector. No JVM, JDBC jars, Debezium
 # runtime, pydbzengine, or native client installation is required. A disposable
 # Informix 15 instance has validated SQLI discovery/snapshot and the native CDC
-# lifecycle for INSERT, UPDATE, and DELETE. Validation in an actual serverless
-# Lakeflow Connect pipeline is still pending, so this is not yet production-ready.
+# lifecycle for INSERT, UPDATE, and DELETE. Triggered and continuous serverless
+# Lakeflow Connect pipelines have also been validated.
 #
 # The Informix CDC API (`syscdcv1.sql`) must be installed, transaction logging
 # enabled, and retained logical logs must cover the checkpoint. The user needs
@@ -16,7 +16,7 @@
 #     implemented. PAM is validated against a live PAM-enabled Informix fixture.
 #     Redirect reconnect/security behavior is validated with a deterministic
 #     ASF type-13 redirect responder; a genuine IDS/HDR-issued redirect remains
-#     unvalidated. Validation in an actual serverless pipeline is also pending.
+#     unvalidated.
 #   - GSS, locale discovery, and private-server authentication remain rejected.
 #   - TLS is mandatory because normal authentication sends the password in the
 #     ASC payload. `encrypt=false` is accepted as an option but fails closed.
@@ -25,15 +25,15 @@
 #
 # CDC-capable tables require a primary key and only supported CDC columns.
 # Supported CDC column types are SMALLINT, INTEGER/INT, SERIAL, FLOAT/DOUBLE,
-# REAL/SMALLFLOAT, DECIMAL, MONEY, DATE, BOOLEAN, CHAR/NCHAR,
-# VARCHAR/NVARCHAR, LVARCHAR, INT8/SERIAL8, and supported DATETIME qualifiers.
+# REAL/SMALLFLOAT, DECIMAL, MONEY, DATE, BOOLEAN, CHAR,
+# VARCHAR/NVARCHAR, INT8/SERIAL8, BIGINT/BIGSERIAL, and supported DATETIME qualifiers.
 # INT8/SERIAL8 use the complete ten-byte CDC signed-magnitude representation;
 # there is no trailer-discard compatibility option. DATETIME values containing
 # YEAR/MONTH/DAY are emitted as naive source calendar values and interpreted by
 # Spark as timestamps; partial qualifiers are deterministic labeled strings and
-# never acquire a current date. BYTE, TEXT, BLOB, CLOB, INTERVAL, and complex or
-# opaque types remain outside IBM's native capture-column API and make a table
-# snapshot-only. Unknown catalog types fail discovery rather than being decoded
+# never acquire a current date. BYTE, TEXT, BLOB, CLOB, INTERVAL, LVARCHAR, NCHAR, and
+# complex or opaque types lack end-to-end snapshot/CDC materialization and cause
+# an explicit metadata error. Unknown catalog types fail discovery rather than being decoded
 # speculatively. Ordinary TEXT/BYTE fetch framing has a bounded internal helper,
 # but content materialization and limits are not exposed by this connector.
 # Generated metadata, snapshot, and CDC lifecycle statements use a deliberately
@@ -43,9 +43,12 @@
 # CDC-capable tables receive a deterministic primary-key snapshot followed by
 # CDC from the pre-snapshot high-water LSN. Delivery is at-least-once and a
 # transaction is never split. INSERT/UPDATE rows and DELETE before-images use
-# independently checkpointed channels. TRUNCATE is unsupported by Lakeflow's
+# independently checkpointed channels. Types without ordinary SQLI snapshot
+# materialization fail metadata discovery rather than using snapshot-only mode.
+# TRUNCATE is unsupported by Lakeflow's
 # row-delete contract and fails explicitly. Expired log retention requires a
-# resnapshot. PK-less or CDC-unsupported tables use a bounded one-shot snapshot.
+# resnapshot. PK-less tables whose column types are materializable use a bounded
+# one-shot snapshot.
 
 display_name: Informix
 connection:
@@ -58,7 +61,7 @@ connection:
     - name: port
       type: string
       required: false
-      description: Informix SQLI port. Default `9088`.
+      description: Informix SQLI port. Default `9088`; range `1`–`65535`.
 
     - name: database
       type: string
@@ -227,8 +230,25 @@ connection:
       type: string
       required: false
       description: >
-        Maximum rows allowed in a one-shot snapshot-only table read. Default
-        `100000`; exceeding it fails instead of returning a partial snapshot.
+        Maximum rows retained by a transactional CDC snapshot or one-shot
+        snapshot-only table read. Default `100000`; exceeding it fails instead
+        of returning a partial snapshot.
+
+    - name: snapshot.max.bytes
+      type: string
+      required: false
+      description: >
+        Maximum estimated decoded Python bytes retained by one snapshot query.
+        Default `268435456` (256 MiB). Set `0` to disable the limit and byte
+        accounting. The SQLI fetch loop otherwise fails incrementally.
+
+    - name: metadata.max.bytes
+      type: string
+      required: false
+      description: >
+        Maximum estimated decoded Python bytes retained by an individual catalog
+        query and by the complete accumulated discovery result. Default `67108864`
+        (64 MiB). Set `0` to disable the limit and byte accounting.
 
     - name: max.records.per.batch
       type: string
@@ -240,7 +260,33 @@ connection:
     - name: cdc.timeout
       type: string
       required: false
-      description: Informix CDC idle-read timeout in seconds. Default `5`; minimum `0`.
+      description: Informix CDC idle-read timeout in seconds. Default `5`; minimum `1`.
+
+    - name: cdc.initial.lsn
+      type: string
+      required: false
+      description: >
+        Exact first-run LSN shared by snapshot/upsert and delete streams. Required
+        when using CDC with deletes. Enable full-row logging before this retained
+        position. The connector rejects positions outside the retained/current
+        range and preflights it through native CDC activation before snapshot rows
+        are returned. Minimum `1`. Remove or update it after initial checkpoints
+        before a future full refresh.
+
+    - name: cdc.initial.fullrow.logging.enabled
+      type: string
+      required: false
+      description: >
+        Required acknowledgement when cdc.initial.lsn is configured. Set `true`
+        only after enabling full-row logging before that LSN. Default `false`.
+
+    - name: cdc.initial.prepared.tables
+      type: string
+      required: false
+      description: >
+        JSON list of native database:owner.table identities returned by
+        prepare_initial_capture(). Required with cdc.initial.lsn; every CDC table
+        used by the connection must be present.
 
     - name: cdc.max.records
       type: string
@@ -259,7 +305,24 @@ connection:
       required: false
       description: >
         Maximum buffered records while a CDC transaction remains open. Default
-        `100000`. Exceeding the bound fails rather than emitting uncommitted data.
+        `100000`. `cdc.max.records` is a soft target while a transaction is open;
+        exceeding this safety bound fails rather than emitting uncommitted data.
+
+    - name: cdc.max.poll.records
+      type: string
+      required: false
+      description: >
+        Hard bound on all decoded records retained by one native CDC poll,
+        including committed transactions interleaved with an open transaction.
+        Default `200000`; minimum `1`.
+
+    - name: cdc.max.poll.bytes
+      type: string
+      required: false
+      description: >
+        Optional estimated retained-byte bound per poll, counting native frames
+        and recursively sized decoded Python values. Default `0`, which disables
+        the bound and byte accounting.
 
     - name: cdc.read.bytes
       type: string

@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import io
 import ipaddress
+import math
 import os
 import re
 import socket
 import ssl
 import struct
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -74,6 +76,26 @@ class SqliProtocolError(RuntimeError):
     pass
 
 
+def informix_locale_encoding(locale: str | None) -> str:
+    """Return the verified Python codec for an Informix locale codeset."""
+
+    codeset = (locale or "en_US.utf8").rsplit(".", 1)[-1].lower()
+    aliases = {
+        "819": "iso8859-1",
+        "iso8859-1": "iso8859-1",
+        "iso-8859-1": "iso8859-1",
+        "utf8": "utf-8",
+        "utf-8": "utf-8",
+        "57372": "utf-8",
+    }
+    try:
+        return aliases[codeset]
+    except KeyError as exc:
+        raise SqliProtocolError(
+            f"Unsupported Informix locale codeset {codeset!r}; configure a verified alias"
+        ) from exc
+
+
 class SqliUnsupportedAuthentication(SqliProtocolError):
     pass
 
@@ -86,6 +108,33 @@ class SqliRedirect(SqliUnsupportedAuthentication):
 
 class SqliDescriptorNotImplemented(SqliProtocolError):
     pass
+
+
+class _DeadlineReader:
+    """Apply one absolute login deadline to every underlying stream read."""
+
+    def __init__(
+        self, stream: BinaryIO, connection: socket.socket, deadline: float, maximum: float
+    ) -> None:
+        self._stream = stream
+        self._connection = connection
+        self._deadline: float | None = deadline
+        self._maximum = maximum
+
+    def read(self, size: int = -1) -> bytes:
+        if self._deadline is not None:
+            remaining = self._deadline - time.monotonic()
+            if remaining <= 0:
+                raise SqliUnsupportedAuthentication("Informix login deadline exceeded")
+            self._connection.settimeout(min(self._maximum, remaining))
+        return self._stream.read(size)
+
+    def finish(self) -> None:
+        self._deadline = None
+        self._connection.settimeout(self._maximum)
+
+    def close(self) -> None:
+        self._stream.close()
 
 
 # Backward-compatible precise name used by callers from the first pure port.
@@ -130,7 +179,11 @@ class ResultDescription:
 
 
 class CdcTransport(Protocol):
-    def execute(self, sql: str, parameters: tuple = ()) -> list[tuple]: ...
+    def execute(
+        self, sql: str, parameters: tuple = (), max_result_bytes: int | None = None
+    ) -> list[tuple]: ...
+
+    def execute_command(self, sql: str) -> None: ...
 
     def read_lodata(self, descriptor: int, requested: int) -> bytes: ...
 
@@ -422,11 +475,9 @@ def encode_normal_auth_prefix(
     database: str,
     encoding: str = "utf-8",
 ) -> bytes:
-    """Encode the fully recovered fixed ASC normal-password portion.
+    """Encode the fixed ASC normal-password portion before the recovered ASC tail.
 
-    The returned bytes stop immediately before SQ_ASCENV because the exact
-    ASCPINFO/ASCMISC tail remains unrecovered. Password bytes are plaintext;
-    callers must place this packet inside TLS.
+    Password bytes are plaintext; callers must place this packet inside TLS.
     """
 
     out = io.BytesIO()
@@ -573,7 +624,7 @@ def encode_variable_fetch(description: ResultDescription, buffer_size: int = 327
     )
     for column in description.columns:
         kind = column.type_code & 0xFF
-        if kind > 18 and kind not in {23, 52, 53}:
+        if kind > 18 and kind not in {23, 45, 52, 53}:
             raise SqliDescriptorNotImplemented(
                 f"variable result type {kind} requires an extended SQ_RET_TYPE name"
             )
@@ -702,6 +753,26 @@ def read_int32(stream: BinaryIO) -> int:
     return struct.unpack(">i", read_exact(stream, 4))[0]
 
 
+def _retained_size(value: object, seen: set[int] | None = None) -> int:
+    """Estimate retained decoded-result memory without double counting objects."""
+
+    if seen is None:
+        seen = set()
+    identity = id(value)
+    if identity in seen:
+        return 0
+    seen.add(identity)
+    size = sys.getsizeof(value)
+    if isinstance(value, dict):
+        return size + sum(
+            _retained_size(key, seen) + _retained_size(item, seen)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return size + sum(_retained_size(item, seen) for item in value)
+    return size
+
+
 def _connector_sql(sql: str, parameters: tuple) -> str:
     """Bind only connector-owned scalar values using strict SQL literals."""
 
@@ -743,7 +814,7 @@ def _decode_result_value(
 ) -> object:
     kind = column.type_code & 0xFF
     if kind == 0:  # CHAR
-        return data[: column.encoded_length].decode(encoding).rstrip()
+        return data[: column.encoded_length].decode(encoding).rstrip(" ")
     if kind == 1:
         value = struct.unpack(">h", data[:2])[0]
         return None if value == -(1 << 15) else value
@@ -773,8 +844,18 @@ def _decode_result_value(
         size = data[0]
         if size + 1 > len(data):
             raise SqliProtocolError("VARCHAR length exceeds tuple column")
+        if size == 1 and data[1] == 0:
+            return None
         return data[1 : size + 1].decode(encoding)
     if kind in {17, 18}:
+        type_name = "INT8" if kind == 17 else "SERIAL8"
+        value, consumed = decode_value(
+            memoryview(data), ColumnDescriptor(column.name, type_name)
+        )
+        if consumed != 10:
+            raise SqliProtocolError(f"{type_name} decoder consumed {consumed} bytes")
+        return value
+    if kind in {52, 53}:
         value = struct.unpack(">q", data[:8])[0]
         return None if value == -(1 << 63) else value
     if kind == 10:
@@ -793,16 +874,32 @@ def _decode_result_value(
             ColumnDescriptor("datetime", "DATETIME", length=qualifier),
         )
         return value
-    if kind == 23:
+    if kind in {23, 45}:
         if not data:
             raise SqliProtocolError("truncated BOOLEAN result")
-        return bool(data[0])
+        marker = struct.unpack_from(">b", data, 1 if len(data) >= 2 else 0)[0]
+        if marker == -1:
+            return None
+        if marker not in {0, 1}:
+            raise SqliProtocolError(f"invalid BOOLEAN result marker {marker}")
+        return bool(marker)
     raise SqliDescriptorNotImplemented(f"ordinary Informix result type {kind} is unsupported")
 
 
 def _fixed_result_size(column: ResultColumn, remaining: bytes) -> int:
     kind = column.type_code & 0xFF
-    widths = {1: 2, 2: 4, 3: 8, 4: 4, 6: 4, 7: 4, 17: 8, 18: 8, 23: 1}
+    widths = {
+        1: 2,
+        2: 4,
+        3: 8,
+        4: 4,
+        6: 4,
+        7: 4,
+        17: 10,
+        18: 10,
+        52: 8,
+        53: 8,
+    }
     if kind == 0:
         return column.encoded_length
     if kind in widths:
@@ -813,6 +910,12 @@ def _fixed_result_size(column: ResultColumn, remaining: bytes) -> int:
     if kind == 10:
         total, fraction = (column.encoded_length >> 8) & 0xFF, column.encoded_length & 0xFF
         return (total + (fraction & 1) + 3) // 2
+    if kind in {23, 45}:
+        if column.encoded_length not in {1, 2}:
+            raise SqliProtocolError(
+                f"BOOLEAN result width must be 1 or 2, got {column.encoded_length}"
+            )
+        return column.encoded_length
     raise SqliDescriptorNotImplemented(f"ordinary Informix result type {kind} is unsupported")
 
 
@@ -915,7 +1018,12 @@ class InformixSqliClient:
         raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         context = self.ssl_context or ssl.create_default_context(cafile=self.ca_file)
         self._socket = context.wrap_socket(raw, server_hostname=host)
-        self._input = self._socket.makefile("rb", buffering=4096)
+        self._input = _DeadlineReader(
+            self._socket.makefile("rb", buffering=4096),
+            self._socket,
+            deadline,
+            self.socket_timeout,
+        )
         self._output = self._socket.makefile("wb", buffering=4096)
         self.state = ConnectionState.SOCKET_OPEN
         properties = {
@@ -963,6 +1071,8 @@ class InformixSqliClient:
             self._output.write(encode_dbopen(self.database, self._encoding))
             self._output.flush()
             self._read_status_group(require_done=True)
+            if isinstance(self._input, _DeadlineReader):
+                self._input.finish()
             self.state = ConnectionState.DATABASE_OPEN
         except SqliRedirect:
             raise
@@ -1053,21 +1163,7 @@ class InformixSqliClient:
 
     @property
     def _encoding(self) -> str:
-        locale = (self.client_locale or "en_US.utf8").rsplit(".", 1)[-1].lower()
-        aliases = {
-            "819": "iso8859-1",
-            "iso8859-1": "iso8859-1",
-            "iso-8859-1": "iso8859-1",
-            "utf8": "utf-8",
-            "utf-8": "utf-8",
-            "57372": "utf-8",
-        }
-        try:
-            return aliases[locale]
-        except KeyError as exc:
-            raise SqliProtocolError(
-                f"Unsupported Informix locale codeset {locale!r}; configure a verified alias"
-            ) from exc
+        return informix_locale_encoding(self.client_locale)
 
     def _require_open(self) -> tuple[BinaryIO, BinaryIO]:
         if (
@@ -1077,6 +1173,15 @@ class InformixSqliClient:
         ):
             raise SqliProtocolError("SQLI database session is not open")
         return self._input, self._output
+
+    def set_socket_timeout(self, timeout: float) -> None:
+        """Update the timeout used by the live SQLI socket."""
+
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("socket timeout must be finite and positive")
+        self.socket_timeout = timeout
+        if self._socket is not None:
+            self._socket.settimeout(timeout)
 
     def _read_protocol_offer(self) -> bytes:
         if self._input is None:
@@ -1102,7 +1207,7 @@ class InformixSqliClient:
             code = read_smallint(self._input)
             if code == SQ_EOT:
                 if require_done and not saw_done:
-                    raise SqliProtocolError("DBOPEN response reached EOT without SQ_DONE")
+                    raise SqliProtocolError("status response reached EOT without SQ_DONE")
                 return
             if code == 55:  # SQ_COST
                 read_int32(self._input)
@@ -1124,9 +1229,7 @@ class InformixSqliClient:
                         f"Informix SQL error {error[0]}/{error[1]} at {error[2]}: {error[3]}"
                     )
                 continue
-            raise SqliDescriptorNotImplemented(
-                f"status response message {code} requires an unrecovered handler body"
-            )
+            raise SqliProtocolError(f"unknown status response message {code}")
 
     def _read_done(self) -> tuple[int, int, int, int]:
         if self._input is None:
@@ -1149,7 +1252,9 @@ class InformixSqliClient:
         message = "" if sqlcode == -368 else decode_char(self._input, self._encoding)
         return sqlcode, isamcode, statement_offset, message
 
-    def execute(self, sql: str, parameters: tuple = ()) -> list[tuple]:
+    def execute(
+        self, sql: str, parameters: tuple = (), max_result_bytes: int | None = None
+    ) -> list[tuple]:
         _, output_stream = self._require_open()
         # Connector queries are fixed templates. Literalizing their bounded scalar
         # values avoids depending on the separate input-parameter descriptor that
@@ -1163,12 +1268,30 @@ class InformixSqliClient:
                 )
                 output_stream.flush()
                 description, rows, _ = self._read_query_group(None)
+                retained_bytes = (
+                    _retained_size(rows) if max_result_bytes is not None else 0
+                )
+
+                def append_batch(batch: list[dict[str, object]]) -> None:
+                    nonlocal retained_bytes
+                    if max_result_bytes is not None:
+                        retained_bytes += _retained_size(batch)
+                    if max_result_bytes is not None and retained_bytes > max_result_bytes:
+                        raise SqliProtocolError(
+                            f"SQLI result exceeded max_result_bytes={max_result_bytes}"
+                        )
+                    rows.extend(batch)
+
+                if max_result_bytes is not None and retained_bytes > max_result_bytes:
+                    raise SqliProtocolError(
+                        f"SQLI result exceeded max_result_bytes={max_result_bytes}"
+                    )
                 if description is None:
                     return rows
                 cursor_name = f"lc_{description.statement_id}"
                 binds = encode_bind(typed, self._encoding) if typed else b""
                 variable = not self.pad_varchar and any(
-                    (column.type_code & 0xFF) in {13, 16, 40, 41, 43, 45, 46}
+                    (column.type_code & 0xFF) in {13, 16, 40, 41, 43, 46}
                     for column in description.columns
                 )
                 if variable:
@@ -1182,7 +1305,7 @@ class InformixSqliClient:
                     output_stream.write(encode_variable_fetch(description))
                     output_stream.flush()
                     _, batch, exhausted = self._read_query_group(description)
-                    rows.extend(batch)
+                    append_batch(batch)
                     if exhausted:
                         return self._close_query(description, rows, output_stream)
                 else:
@@ -1197,14 +1320,14 @@ class InformixSqliClient:
                     )
                     output_stream.flush()
                     _, batch, exhausted = self._read_query_group(description)
-                    rows.extend(batch)
+                    append_batch(batch)
                     if exhausted:
                         return self._close_query(description, rows, output_stream)
                 while True:
                     output_stream.write(encode_fetch(description.statement_id))
                     output_stream.flush()
                     _, batch, exhausted = self._read_query_group(description)
-                    rows.extend(batch)
+                    append_batch(batch)
                     if exhausted:
                         break
                 output_stream.write(encode_close_release(description.statement_id))
@@ -1214,6 +1337,21 @@ class InformixSqliClient:
                 output_stream.flush()
                 self._read_query_group(description)
                 return rows
+            except Exception:
+                self._poison()
+                raise
+
+    def execute_command(self, sql: str) -> None:
+        """Execute a connector-owned non-row SQL statement through SQ_COMMAND."""
+
+        _, output_stream = self._require_open()
+        with self._lock:
+            try:
+                output_stream.write(
+                    encode_simple_command(sql, self._encoding, self.remove_64k_limit)
+                )
+                output_stream.flush()
+                self._read_status_group(require_done=True)
             except Exception:
                 self._poison()
                 raise
@@ -1333,7 +1471,7 @@ class InformixSqliClient:
             read_exact(self._input, 1)
         result = {}
         variable_layout = not self.pad_varchar and any(
-            (column.type_code & 0xFF) in {13, 16, 40, 41, 43, 45, 46}
+            (column.type_code & 0xFF) in {13, 16, 40, 41, 43, 46}
             for column in description.columns
         )
         cursor = 0
@@ -1407,8 +1545,10 @@ class InformixSqliClient:
                             remaining -= chunk_size
                         continue
                     if code == SQ_ERR:
-                        raise SqliDescriptorNotImplemented(
-                            "SQ_ERR received; exact error-body decoder is not yet recovered"
+                        error = self._read_error()
+                        raise SqliProtocolError(
+                            f"Informix SQL error {error[0]}/{error[1]} "
+                            f"at {error[2]} during LODATA: {error[3]}"
                         )
                     raise SqliProtocolError(f"unexpected SQLI message {code} during LODATA")
             except Exception:

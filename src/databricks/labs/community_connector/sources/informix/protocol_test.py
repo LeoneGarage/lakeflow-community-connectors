@@ -5,7 +5,7 @@ import struct
 import unittest
 from datetime import datetime
 from decimal import Decimal
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from databricks.labs.community_connector.sources.informix.cdc_protocol import (
     CdcFrameParser,
@@ -27,6 +27,7 @@ from databricks.labs.community_connector.sources.informix.sqli import (
     SqliProtocolError,
     SqliUnsupportedAuthentication,
     TypedBind,
+    _DeadlineReader,
     _decode_result_value,
     decode_asc_accept,
     decode_asc_response,
@@ -87,6 +88,12 @@ class FrameTests(unittest.TestCase):
         self.assertEqual(
             metadata_column_names(b"id serial, amount decimal(12,2), name varchar(60,0)\0"),
             ("id", "amount", "name"),
+        )
+
+    def test_metadata_uses_negotiated_client_encoding(self):
+        self.assertEqual(
+            metadata_column_names("café varchar(20)".encode("iso8859-1"), "iso8859-1"),
+            ("café",),
         )
 
     def test_operation_primitive_row(self):
@@ -160,6 +167,12 @@ class FrameTests(unittest.TestCase):
         self.assertEqual(tracker.buffered, 0)
         self.assertFalse(tracker)
 
+    def test_open_record_bound_rejects_duplicate_begin(self):
+        tracker = OpenTransactionRecords()
+        tracker.begin(1)
+        with self.assertRaisesRegex(CdcProtocolError, "duplicate CDC BEGIN"):
+            tracker.begin(1)
+
     def test_snapshot_continuation_arity(self):
         validate_snapshot_arity([1, 2], ["a", "b"])
         with self.assertRaises(CdcProtocolError):
@@ -171,6 +184,13 @@ class FrameTests(unittest.TestCase):
         self.assertEqual(decode_value(memoryview(b"\0" * 10), int8), (None, 10))
         with self.assertRaises(CdcProtocolError):
             decode_value(memoryview(struct.pack(">hII", 2, 1, 0)), int8)
+        snapshot_int8 = ResultColumn("i", 0, 17, 0, 10)
+        snapshot_serial8 = ResultColumn("s", 0, 18, 0, 10)
+        self.assertEqual(
+            _decode_result_value(struct.pack(">hII", -1, 7, 0), snapshot_int8, "utf-8"),
+            -7,
+        )
+        self.assertIsNone(_decode_result_value(b"\0" * 10, snapshot_serial8, "utf-8"))
         temporal = ColumnDescriptor("t", "DATETIME", length=0x000F)
         raw = bytes([0xC0, 20, 24, 1, 2, 3, 4, 5, 12, 34, 50])
         self.assertEqual(
@@ -217,6 +237,40 @@ class FrameTests(unittest.TestCase):
             datetime(2026, 7, 19, 12, 34, 56, 123450),
         )
 
+    def test_native_boolean_and_bigint_result_ids(self):
+        boolean = ResultColumn("enabled", 0, 45, 0, 1)
+        bigint = ResultColumn("count", 0, 52, 0, 8)
+        bigserial = ResultColumn("serial", 0, 53, 0, 8)
+        self.assertTrue(_decode_result_value(b"\x01", boolean, "utf-8"))
+        self.assertEqual(
+            _decode_result_value(struct.pack(">q", 1 << 40), bigint, "utf-8"), 1 << 40
+        )
+        self.assertEqual(
+            _decode_result_value(struct.pack(">q", 123), bigserial, "utf-8"), 123
+        )
+
+    def test_ordinary_boolean_null_and_marker_validation(self):
+        one_byte = ResultColumn("enabled", 0, 45, 0, 1)
+        two_byte = ResultColumn("enabled", 0, 45, 0, 2)
+        self.assertIsNone(_decode_result_value(b"\xff", one_byte, "utf-8"))
+        self.assertIsNone(_decode_result_value(b"\x00\xff", two_byte, "utf-8"))
+        with self.assertRaisesRegex(SqliProtocolError, "invalid BOOLEAN"):
+            _decode_result_value(b"\x02", one_byte, "utf-8")
+
+    def test_ordinary_char_strips_only_space_padding(self):
+        column = ResultColumn("value", 0, 0, 0, 4)
+        self.assertEqual(_decode_result_value(b"a\t  ", column, "utf-8"), "a\t")
+
+    def test_snapshot_and_cdc_char_use_the_same_padding_normalization(self):
+        column = ColumnDescriptor("value", "CHAR", length=4)
+        self.assertEqual(decode_value(memoryview(b"a   "), column), ("a", 4))
+
+    def test_ordinary_varchar_null_sentinel(self):
+        for type_code in (13, 16):
+            with self.subTest(type_code=type_code):
+                column = ResultColumn("value", 0, type_code, 0, 20)
+                self.assertIsNone(_decode_result_value(b"\x01\x00", column, "utf-8"))
+
 
 class LoDataTests(unittest.TestCase):
     def test_verified_read_body(self):
@@ -239,6 +293,83 @@ class LoDataTests(unittest.TestCase):
 
 
 class SqliPacketTests(unittest.TestCase):
+    def test_unbounded_execute_skips_decoded_byte_accounting(self):
+        client = InformixSqliClient("host", 9088, "db", "user", "password")
+        output = io.BytesIO()
+
+        with patch.object(
+            client, "_require_open", return_value=(io.BytesIO(), output)
+        ), patch.object(
+            client, "_read_query_group", return_value=(None, [], False)
+        ), patch(
+            "databricks.labs.community_connector.sources.informix.sqli._retained_size",
+            side_effect=AssertionError("must not account"),
+        ):
+            self.assertEqual(client.execute("SET EXPLAIN OFF"), [])
+
+    def test_non_row_command_uses_sq_command_execute_release_path(self):
+        client = InformixSqliClient("host", 9088, "db", "user", "password")
+        output = io.BytesIO()
+        transcript = (
+            struct.pack(">hhhh", 99, 1, 2, 1)
+            + struct.pack(">hhiii", 15, 0, 0, 0, 0)
+            + struct.pack(">h", 12)
+        )
+        client._input = io.BytesIO(transcript)
+
+        with patch.object(client, "_require_open", return_value=(client._input, output)):
+            client.execute_command("BEGIN WORK")
+
+        self.assertEqual(
+            output.getvalue(),
+            encode_simple_command("BEGIN WORK", "utf-8", long_sql_length=False),
+        )
+        self.assertEqual(client._input.tell(), len(transcript))
+
+    def test_execute_enforces_incremental_decoded_result_byte_bound(self):
+        client = InformixSqliClient("host", 9088, "db", "user", "password")
+        description = ResultDescription(
+            2, 7, 4, (ResultColumn("value", 0, 2, 0, 4),)
+        )
+        responses = (
+            (description, [], False),
+            (description, [{"value": 1}], True),
+        )
+        output = io.BytesIO()
+
+        with patch.object(
+            client, "_require_open", return_value=(io.BytesIO(), output)
+        ), patch.object(client, "_read_query_group", side_effect=responses), patch.object(
+            client, "_poison"
+        ), self.assertRaisesRegex(
+            SqliProtocolError, "max_result_bytes=1"
+        ):
+            client.execute("SELECT value FROM t", max_result_bytes=1)
+
+    def test_login_deadline_reader_recomputes_remaining_time_per_read(self):
+        connection = Mock()
+        reader = _DeadlineReader(io.BytesIO(b"ab"), connection, deadline=10.0, maximum=30.0)
+
+        with patch(
+            "databricks.labs.community_connector.sources.informix.sqli.time.monotonic",
+            side_effect=(2.0, 7.0),
+        ):
+            self.assertEqual(reader.read(1), b"a")
+            self.assertEqual(reader.read(1), b"b")
+
+        self.assertEqual(connection.settimeout.call_args_list[0].args, (8.0,))
+        self.assertEqual(connection.settimeout.call_args_list[1].args, (3.0,))
+        reader.finish()
+        self.assertEqual(connection.settimeout.call_args.args, (30.0,))
+
+    def test_login_deadline_reader_fails_after_absolute_deadline(self):
+        reader = _DeadlineReader(io.BytesIO(b"a"), Mock(), deadline=10.0, maximum=30.0)
+        with patch(
+            "databricks.labs.community_connector.sources.informix.sqli.time.monotonic",
+            return_value=10.0,
+        ), self.assertRaisesRegex(SqliUnsupportedAuthentication, "deadline exceeded"):
+            reader.read(1)
+
     def test_informix_locale_codec_aliases_are_strict(self):
         client = InformixSqliClient(
             "host", 9088, "db", "user", "password", client_locale="en_US.819"
@@ -539,6 +670,19 @@ class SqliPacketTests(unittest.TestCase):
             client._output = io.BytesIO()
             with self.assertRaises(SqliProtocolError):
                 client.read_lodata(4, 10)
+
+    def test_lodata_decodes_informix_error_body(self):
+        client = InformixSqliClient("host", 9088, "db", "user", "password")
+        client.state = ConnectionState.DATABASE_OPEN
+        client._input = io.BytesIO(
+            struct.pack(">hhhh", 13, -23197, -255, 7) + encode_char("TLS login failed")
+        )
+        client._output = io.BytesIO()
+
+        with self.assertRaisesRegex(
+            SqliProtocolError, r"-23197/-255 at 7 during LODATA: TLS login failed"
+        ):
+            client.read_lodata(4, 10)
 
     def test_describe_and_tuple_query_group(self):
         def descriptor(position, type_code, length):

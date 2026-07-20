@@ -42,10 +42,10 @@ def cdc_routine(name: str) -> str:
     return f"{CDC_ROUTINE_DATABASE}:informix.{name}"
 
 
-def metadata_column_names(payload: bytes) -> tuple[str, ...]:
+def metadata_column_names(payload: bytes, encoding: str = "utf-8") -> tuple[str, ...]:
     """Extract CDC metadata column names while ignoring commas in type arguments."""
 
-    text = payload.rstrip(b"\0 \t\r\n").decode("utf-8")
+    text = payload.rstrip(b"\0 \t\r\n").decode(encoding)
     fields: list[str] = []
     start = depth = 0
     for index, character in enumerate(text):
@@ -89,6 +89,8 @@ class OpenTransactionRecords:
         return sum(len(values) for values in self._sequences.values())
 
     def begin(self, tx_id: int) -> None:
+        if tx_id in self._sequences:
+            raise CdcProtocolError(f"duplicate CDC BEGIN for transaction {tx_id}")
         self._sequences[tx_id] = []
 
     def append(self, tx_id: int, lsn: int) -> None:
@@ -263,7 +265,7 @@ def decode_value(data: memoryview, column: ColumnDescriptor) -> tuple[Any, int]:
         return bool(marker), 2
     if kind in {"CHAR", "NCHAR"}:
         _need(data, column.length)
-        return bytes(data[: column.length]).decode(column.encoding), column.length
+        return bytes(data[: column.length]).decode(column.encoding).rstrip(" "), column.length
     if kind in {"VARCHAR", "NVARCHAR"}:
         _need(data, 1)
         length = int(data[0])

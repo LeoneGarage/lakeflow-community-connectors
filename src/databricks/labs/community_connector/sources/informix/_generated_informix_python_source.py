@@ -24,6 +24,7 @@ import io
 import json
 import os
 import re
+import sys
 import time
 
 from pyspark.sql import Row
@@ -56,8 +57,10 @@ from pyspark.sql.types import (
 )
 import base64
 import fnmatch
+import hashlib
 import importlib
 import ipaddress
+import math
 import socket
 import ssl
 import struct
@@ -640,10 +643,10 @@ def register_lakeflow_source(spark):
         return f"{CDC_ROUTINE_DATABASE}:informix.{name}"
 
 
-    def metadata_column_names(payload: bytes) -> tuple[str, ...]:
+    def metadata_column_names(payload: bytes, encoding: str = "utf-8") -> tuple[str, ...]:
         """Extract CDC metadata column names while ignoring commas in type arguments."""
 
-        text = payload.rstrip(b"\0 \t\r\n").decode("utf-8")
+        text = payload.rstrip(b"\0 \t\r\n").decode(encoding)
         fields: list[str] = []
         start = depth = 0
         for index, character in enumerate(text):
@@ -687,6 +690,8 @@ def register_lakeflow_source(spark):
             return sum(len(values) for values in self._sequences.values())
 
         def begin(self, tx_id: int) -> None:
+            if tx_id in self._sequences:
+                raise CdcProtocolError(f"duplicate CDC BEGIN for transaction {tx_id}")
             self._sequences[tx_id] = []
 
         def append(self, tx_id: int, lsn: int) -> None:
@@ -861,7 +866,7 @@ def register_lakeflow_source(spark):
             return bool(marker), 2
         if kind in {"CHAR", "NCHAR"}:
             _need(data, column.length)
-            return bytes(data[: column.length]).decode(column.encoding), column.length
+            return bytes(data[: column.length]).decode(column.encoding).rstrip(" "), column.length
         if kind in {"VARCHAR", "NVARCHAR"}:
             _need(data, 1)
             length = int(data[0])
@@ -1073,6 +1078,26 @@ def register_lakeflow_source(spark):
         pass
 
 
+    def informix_locale_encoding(locale: str | None) -> str:
+        """Return the verified Python codec for an Informix locale codeset."""
+
+        codeset = (locale or "en_US.utf8").rsplit(".", 1)[-1].lower()
+        aliases = {
+            "819": "iso8859-1",
+            "iso8859-1": "iso8859-1",
+            "iso-8859-1": "iso8859-1",
+            "utf8": "utf-8",
+            "utf-8": "utf-8",
+            "57372": "utf-8",
+        }
+        try:
+            return aliases[codeset]
+        except KeyError as exc:
+            raise SqliProtocolError(
+                f"Unsupported Informix locale codeset {codeset!r}; configure a verified alias"
+            ) from exc
+
+
     class SqliUnsupportedAuthentication(SqliProtocolError):
         pass
 
@@ -1085,6 +1110,33 @@ def register_lakeflow_source(spark):
 
     class SqliDescriptorNotImplemented(SqliProtocolError):
         pass
+
+
+    class _DeadlineReader:
+        """Apply one absolute login deadline to every underlying stream read."""
+
+        def __init__(
+            self, stream: BinaryIO, connection: socket.socket, deadline: float, maximum: float
+        ) -> None:
+            self._stream = stream
+            self._connection = connection
+            self._deadline: float | None = deadline
+            self._maximum = maximum
+
+        def read(self, size: int = -1) -> bytes:
+            if self._deadline is not None:
+                remaining = self._deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SqliUnsupportedAuthentication("Informix login deadline exceeded")
+                self._connection.settimeout(min(self._maximum, remaining))
+            return self._stream.read(size)
+
+        def finish(self) -> None:
+            self._deadline = None
+            self._connection.settimeout(self._maximum)
+
+        def close(self) -> None:
+            self._stream.close()
 
 
     # Backward-compatible precise name used by callers from the first pure port.
@@ -1129,7 +1181,11 @@ def register_lakeflow_source(spark):
 
 
     class CdcTransport(Protocol):
-        def execute(self, sql: str, parameters: tuple = ()) -> list[tuple]: ...
+        def execute(
+            self, sql: str, parameters: tuple = (), max_result_bytes: int | None = None
+        ) -> list[tuple]: ...
+
+        def execute_command(self, sql: str) -> None: ...
 
         def read_lodata(self, descriptor: int, requested: int) -> bytes: ...
 
@@ -1421,11 +1477,9 @@ def register_lakeflow_source(spark):
         database: str,
         encoding: str = "utf-8",
     ) -> bytes:
-        """Encode the fully recovered fixed ASC normal-password portion.
+        """Encode the fixed ASC normal-password portion before the recovered ASC tail.
 
-        The returned bytes stop immediately before SQ_ASCENV because the exact
-        ASCPINFO/ASCMISC tail remains unrecovered. Password bytes are plaintext;
-        callers must place this packet inside TLS.
+        Password bytes are plaintext; callers must place this packet inside TLS.
         """
 
         out = io.BytesIO()
@@ -1572,7 +1626,7 @@ def register_lakeflow_source(spark):
         )
         for column in description.columns:
             kind = column.type_code & 0xFF
-            if kind > 18 and kind not in {23, 52, 53}:
+            if kind > 18 and kind not in {23, 45, 52, 53}:
                 raise SqliDescriptorNotImplemented(
                     f"variable result type {kind} requires an extended SQ_RET_TYPE name"
                 )
@@ -1701,6 +1755,26 @@ def register_lakeflow_source(spark):
         return struct.unpack(">i", read_exact(stream, 4))[0]
 
 
+    def _retained_size(value: object, seen: set[int] | None = None) -> int:
+        """Estimate retained decoded-result memory without double counting objects."""
+
+        if seen is None:
+            seen = set()
+        identity = id(value)
+        if identity in seen:
+            return 0
+        seen.add(identity)
+        size = sys.getsizeof(value)
+        if isinstance(value, dict):
+            return size + sum(
+                _retained_size(key, seen) + _retained_size(item, seen)
+                for key, item in value.items()
+            )
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return size + sum(_retained_size(item, seen) for item in value)
+        return size
+
+
     def _connector_sql(sql: str, parameters: tuple) -> str:
         """Bind only connector-owned scalar values using strict SQL literals."""
 
@@ -1742,7 +1816,7 @@ def register_lakeflow_source(spark):
     ) -> object:
         kind = column.type_code & 0xFF
         if kind == 0:  # CHAR
-            return data[: column.encoded_length].decode(encoding).rstrip()
+            return data[: column.encoded_length].decode(encoding).rstrip(" ")
         if kind == 1:
             value = struct.unpack(">h", data[:2])[0]
             return None if value == -(1 << 15) else value
@@ -1772,8 +1846,18 @@ def register_lakeflow_source(spark):
             size = data[0]
             if size + 1 > len(data):
                 raise SqliProtocolError("VARCHAR length exceeds tuple column")
+            if size == 1 and data[1] == 0:
+                return None
             return data[1 : size + 1].decode(encoding)
         if kind in {17, 18}:
+            type_name = "INT8" if kind == 17 else "SERIAL8"
+            value, consumed = decode_value(
+                memoryview(data), ColumnDescriptor(column.name, type_name)
+            )
+            if consumed != 10:
+                raise SqliProtocolError(f"{type_name} decoder consumed {consumed} bytes")
+            return value
+        if kind in {52, 53}:
             value = struct.unpack(">q", data[:8])[0]
             return None if value == -(1 << 63) else value
         if kind == 10:
@@ -1792,16 +1876,32 @@ def register_lakeflow_source(spark):
                 ColumnDescriptor("datetime", "DATETIME", length=qualifier),
             )
             return value
-        if kind == 23:
+        if kind in {23, 45}:
             if not data:
                 raise SqliProtocolError("truncated BOOLEAN result")
-            return bool(data[0])
+            marker = struct.unpack_from(">b", data, 1 if len(data) >= 2 else 0)[0]
+            if marker == -1:
+                return None
+            if marker not in {0, 1}:
+                raise SqliProtocolError(f"invalid BOOLEAN result marker {marker}")
+            return bool(marker)
         raise SqliDescriptorNotImplemented(f"ordinary Informix result type {kind} is unsupported")
 
 
     def _fixed_result_size(column: ResultColumn, remaining: bytes) -> int:
         kind = column.type_code & 0xFF
-        widths = {1: 2, 2: 4, 3: 8, 4: 4, 6: 4, 7: 4, 17: 8, 18: 8, 23: 1}
+        widths = {
+            1: 2,
+            2: 4,
+            3: 8,
+            4: 4,
+            6: 4,
+            7: 4,
+            17: 10,
+            18: 10,
+            52: 8,
+            53: 8,
+        }
         if kind == 0:
             return column.encoded_length
         if kind in widths:
@@ -1812,6 +1912,12 @@ def register_lakeflow_source(spark):
         if kind == 10:
             total, fraction = (column.encoded_length >> 8) & 0xFF, column.encoded_length & 0xFF
             return (total + (fraction & 1) + 3) // 2
+        if kind in {23, 45}:
+            if column.encoded_length not in {1, 2}:
+                raise SqliProtocolError(
+                    f"BOOLEAN result width must be 1 or 2, got {column.encoded_length}"
+                )
+            return column.encoded_length
         raise SqliDescriptorNotImplemented(f"ordinary Informix result type {kind} is unsupported")
 
 
@@ -1914,7 +2020,12 @@ def register_lakeflow_source(spark):
             raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             context = self.ssl_context or ssl.create_default_context(cafile=self.ca_file)
             self._socket = context.wrap_socket(raw, server_hostname=host)
-            self._input = self._socket.makefile("rb", buffering=4096)
+            self._input = _DeadlineReader(
+                self._socket.makefile("rb", buffering=4096),
+                self._socket,
+                deadline,
+                self.socket_timeout,
+            )
             self._output = self._socket.makefile("wb", buffering=4096)
             self.state = ConnectionState.SOCKET_OPEN
             properties = {
@@ -1962,6 +2073,8 @@ def register_lakeflow_source(spark):
                 self._output.write(encode_dbopen(self.database, self._encoding))
                 self._output.flush()
                 self._read_status_group(require_done=True)
+                if isinstance(self._input, _DeadlineReader):
+                    self._input.finish()
                 self.state = ConnectionState.DATABASE_OPEN
             except SqliRedirect:
                 raise
@@ -2052,21 +2165,7 @@ def register_lakeflow_source(spark):
 
         @property
         def _encoding(self) -> str:
-            locale = (self.client_locale or "en_US.utf8").rsplit(".", 1)[-1].lower()
-            aliases = {
-                "819": "iso8859-1",
-                "iso8859-1": "iso8859-1",
-                "iso-8859-1": "iso8859-1",
-                "utf8": "utf-8",
-                "utf-8": "utf-8",
-                "57372": "utf-8",
-            }
-            try:
-                return aliases[locale]
-            except KeyError as exc:
-                raise SqliProtocolError(
-                    f"Unsupported Informix locale codeset {locale!r}; configure a verified alias"
-                ) from exc
+            return informix_locale_encoding(self.client_locale)
 
         def _require_open(self) -> tuple[BinaryIO, BinaryIO]:
             if (
@@ -2076,6 +2175,15 @@ def register_lakeflow_source(spark):
             ):
                 raise SqliProtocolError("SQLI database session is not open")
             return self._input, self._output
+
+        def set_socket_timeout(self, timeout: float) -> None:
+            """Update the timeout used by the live SQLI socket."""
+
+            if not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError("socket timeout must be finite and positive")
+            self.socket_timeout = timeout
+            if self._socket is not None:
+                self._socket.settimeout(timeout)
 
         def _read_protocol_offer(self) -> bytes:
             if self._input is None:
@@ -2101,7 +2209,7 @@ def register_lakeflow_source(spark):
                 code = read_smallint(self._input)
                 if code == SQ_EOT:
                     if require_done and not saw_done:
-                        raise SqliProtocolError("DBOPEN response reached EOT without SQ_DONE")
+                        raise SqliProtocolError("status response reached EOT without SQ_DONE")
                     return
                 if code == 55:  # SQ_COST
                     read_int32(self._input)
@@ -2123,9 +2231,7 @@ def register_lakeflow_source(spark):
                             f"Informix SQL error {error[0]}/{error[1]} at {error[2]}: {error[3]}"
                         )
                     continue
-                raise SqliDescriptorNotImplemented(
-                    f"status response message {code} requires an unrecovered handler body"
-                )
+                raise SqliProtocolError(f"unknown status response message {code}")
 
         def _read_done(self) -> tuple[int, int, int, int]:
             if self._input is None:
@@ -2148,7 +2254,9 @@ def register_lakeflow_source(spark):
             message = "" if sqlcode == -368 else decode_char(self._input, self._encoding)
             return sqlcode, isamcode, statement_offset, message
 
-        def execute(self, sql: str, parameters: tuple = ()) -> list[tuple]:
+        def execute(
+            self, sql: str, parameters: tuple = (), max_result_bytes: int | None = None
+        ) -> list[tuple]:
             _, output_stream = self._require_open()
             # Connector queries are fixed templates. Literalizing their bounded scalar
             # values avoids depending on the separate input-parameter descriptor that
@@ -2162,12 +2270,30 @@ def register_lakeflow_source(spark):
                     )
                     output_stream.flush()
                     description, rows, _ = self._read_query_group(None)
+                    retained_bytes = (
+                        _retained_size(rows) if max_result_bytes is not None else 0
+                    )
+
+                    def append_batch(batch: list[dict[str, object]]) -> None:
+                        nonlocal retained_bytes
+                        if max_result_bytes is not None:
+                            retained_bytes += _retained_size(batch)
+                        if max_result_bytes is not None and retained_bytes > max_result_bytes:
+                            raise SqliProtocolError(
+                                f"SQLI result exceeded max_result_bytes={max_result_bytes}"
+                            )
+                        rows.extend(batch)
+
+                    if max_result_bytes is not None and retained_bytes > max_result_bytes:
+                        raise SqliProtocolError(
+                            f"SQLI result exceeded max_result_bytes={max_result_bytes}"
+                        )
                     if description is None:
                         return rows
                     cursor_name = f"lc_{description.statement_id}"
                     binds = encode_bind(typed, self._encoding) if typed else b""
                     variable = not self.pad_varchar and any(
-                        (column.type_code & 0xFF) in {13, 16, 40, 41, 43, 45, 46}
+                        (column.type_code & 0xFF) in {13, 16, 40, 41, 43, 46}
                         for column in description.columns
                     )
                     if variable:
@@ -2181,7 +2307,7 @@ def register_lakeflow_source(spark):
                         output_stream.write(encode_variable_fetch(description))
                         output_stream.flush()
                         _, batch, exhausted = self._read_query_group(description)
-                        rows.extend(batch)
+                        append_batch(batch)
                         if exhausted:
                             return self._close_query(description, rows, output_stream)
                     else:
@@ -2196,14 +2322,14 @@ def register_lakeflow_source(spark):
                         )
                         output_stream.flush()
                         _, batch, exhausted = self._read_query_group(description)
-                        rows.extend(batch)
+                        append_batch(batch)
                         if exhausted:
                             return self._close_query(description, rows, output_stream)
                     while True:
                         output_stream.write(encode_fetch(description.statement_id))
                         output_stream.flush()
                         _, batch, exhausted = self._read_query_group(description)
-                        rows.extend(batch)
+                        append_batch(batch)
                         if exhausted:
                             break
                     output_stream.write(encode_close_release(description.statement_id))
@@ -2213,6 +2339,21 @@ def register_lakeflow_source(spark):
                     output_stream.flush()
                     self._read_query_group(description)
                     return rows
+                except Exception:
+                    self._poison()
+                    raise
+
+        def execute_command(self, sql: str) -> None:
+            """Execute a connector-owned non-row SQL statement through SQ_COMMAND."""
+
+            _, output_stream = self._require_open()
+            with self._lock:
+                try:
+                    output_stream.write(
+                        encode_simple_command(sql, self._encoding, self.remove_64k_limit)
+                    )
+                    output_stream.flush()
+                    self._read_status_group(require_done=True)
                 except Exception:
                     self._poison()
                     raise
@@ -2332,7 +2473,7 @@ def register_lakeflow_source(spark):
                 read_exact(self._input, 1)
             result = {}
             variable_layout = not self.pad_varchar and any(
-                (column.type_code & 0xFF) in {13, 16, 40, 41, 43, 45, 46}
+                (column.type_code & 0xFF) in {13, 16, 40, 41, 43, 46}
                 for column in description.columns
             )
             cursor = 0
@@ -2406,8 +2547,10 @@ def register_lakeflow_source(spark):
                                 remaining -= chunk_size
                             continue
                         if code == SQ_ERR:
-                            raise SqliDescriptorNotImplemented(
-                                "SQ_ERR received; exact error-body decoder is not yet recovered"
+                            error = self._read_error()
+                            raise SqliProtocolError(
+                                f"Informix SQL error {error[0]}/{error[1]} "
+                                f"at {error[2]} during LODATA: {error[3]}"
                             )
                         raise SqliProtocolError(f"unexpected SQLI message {code} during LODATA")
                 except Exception:
@@ -2487,10 +2630,54 @@ def register_lakeflow_source(spark):
     TX_ID = "_informix_tx_id"
     OP = "_informix_op"
     _INTERNAL_COLUMNS = (CURSOR, COMMIT_LSN, TX_ID, OP)
+    _LSN_DECIMAL_WIDTH = 20
+    _OFFSET_VERSION = 2
     _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
     _DATA_OPS = {"INSERT", "BEFORE_UPDATE", "AFTER_UPDATE", "DELETE", "TRUNCATE"}
     _DEFAULT_SNAPSHOT_PAGE_SIZE = 10000
     _DEFAULT_MAX_RECORDS_PER_BATCH = 10000
+
+    def _informix_available_now_base(base: type) -> type:
+        """Wrap the generated reader base without changing the shared adapter source."""
+
+        class InformixAvailableNowBase(base):
+            _informix_available_now_wrapper = True
+
+            def __init_subclass__(cls, **kwargs):
+                super().__init_subclass__(**kwargs)
+                if cls.__name__ != "LakeflowStreamReader":
+                    return
+
+                def prepare_for_trigger(reader) -> None:
+                    prepare = getattr(
+                        reader.lakeflow_connect, "prepare_for_trigger_available_now", None
+                    )
+                    if prepare is not None:
+                        prepare()
+
+                cls.prepareForTriggerAvailableNow = prepare_for_trigger
+
+        return InformixAvailableNowBase
+
+
+    # In the deployable merged module the shared trigger base has already been
+    # defined and the shared reader is defined after this connector. Shadow its base
+    # with an Informix-owned wrapper that installs the callback at class creation.
+    # In normal package imports that global is absent, so this block is inert.
+    try:
+        # This name is local to register_lakeflow_source() after merging; globals()
+        # cannot see it. In a normal package import it is intentionally undefined.
+        _generated_trigger_base = SupportsTriggerAvailableNow  # type: ignore[name-defined]  # noqa: F821
+    except NameError:
+        _generated_trigger_base = None
+    else:
+        # Avoid assigning this name in register_lakeflow_source(): doing so would
+        # make the imported PySpark base an uninitialized local throughout that
+        # function. Replace the generated module global instead.
+        if not getattr(_generated_trigger_base, "_informix_available_now_wrapper", False):
+            globals()["SupportsTriggerAvailableNow"] = _informix_available_now_base(
+                _generated_trigger_base
+            )
 
 
     class InformixError(RuntimeError):
@@ -2516,6 +2703,10 @@ def register_lakeflow_source(spark):
 
         def minimum_lsn(self) -> int: ...
 
+        def prepare_initial_capture(self, identities: Sequence[str]) -> int: ...
+
+        def validate_initial_lsn(self, capture: dict[str, Any], start_lsn: int) -> None: ...
+
         def snapshot_page(
             self,
             identity: str,
@@ -2523,7 +2714,18 @@ def register_lakeflow_source(spark):
             primary_keys: Sequence[str],
             after: Sequence[Any] | None,
             limit: int,
+            max_bytes: int | None = None,
         ) -> list[dict[str, Any]]: ...
+
+        def consistent_snapshot(
+            self,
+            identity: str,
+            columns: Sequence[str],
+            primary_keys: Sequence[str],
+            page_size: int,
+            max_rows: int,
+            max_bytes: int,
+        ) -> tuple[int, list[dict[str, Any]]]: ...
 
         def read_changes(
             self,
@@ -2538,8 +2740,7 @@ def register_lakeflow_source(spark):
         """Pure-Python SQLI/CDC bridge validated against disposable Informix 15.
 
         Tests can inject ``transport.factory=module:callable`` without changing
-        Lakeflow or CDC decoding code. Serverless Lakeflow pipeline validation is
-        still pending.
+        Lakeflow or CDC decoding code.
         """
 
         def __init__(self, options: dict[str, str]) -> None:
@@ -2587,15 +2788,29 @@ def register_lakeflow_source(spark):
                 connect()
 
         def list_tables(self) -> list[dict[str, Any]]:
+            maximum = int(self.options.get("metadata.max.bytes", str(64 << 20)))
             rows = self.transport.execute(
                 "SELECT owner, tabname FROM systables "
                 "WHERE tabtype = 'T' AND owner NOT MATCHES 'sys*' "
-                "AND tabname NOT MATCHES 'sys*' ORDER BY owner, tabname"
+                "AND tabname NOT MATCHES 'sys*' ORDER BY owner, tabname",
+                max_result_bytes=maximum or None,
             )
-            return [
-                self._describe_table(str(_field(row, "owner", 0)), str(_field(row, "tabname", 1)))
-                for row in rows
+            identities = [
+                (str(_field(row, "owner", 0)), str(_field(row, "tabname", 1))) for row in rows
             ]
+            del rows
+            result = []
+            retained_bytes = _deep_size(result) + _deep_size(identities) if maximum else 0
+            for owner, name in identities:
+                table = self._describe_table(owner, name)
+                if maximum:
+                    retained_bytes += _deep_size(table)
+                if maximum and retained_bytes > maximum:
+                    raise InformixError(
+                        f"Informix metadata discovery exceeded metadata.max.bytes={maximum}"
+                    )
+                result.append(table)
+            return result
 
         def get_table(self, identity: str) -> dict[str, Any]:
             parts = identity.split(".")
@@ -2603,20 +2818,59 @@ def register_lakeflow_source(spark):
                 raise InformixError(f"Invalid logical table identity {identity!r}")
             return self._describe_table(parts[1], parts[2])
 
+        def _assert_capture_layout(self, capture: dict[str, Any], encoding: str) -> None:
+            """Fail before decoding rows when catalog metadata changed mid-session."""
+
+            native = str(capture["identity"])
+            try:
+                database, qualified = native.split(":", 1)
+                owner, name = qualified.split(".", 1)
+            except ValueError as error:
+                raise InformixError(f"Invalid native table identity {native!r}") from error
+            refreshed = _capture_descriptor(
+                Table.parse(self._describe_table(owner, name), database), encoding
+            )
+
+            def layout(value: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
+                return {
+                    str(column["name"]): (
+                        str(column["type_name"]),
+                        int(column.get("length") or 0),
+                        column.get("precision"),
+                        column.get("scale"),
+                        str(column.get("encoding") or "utf-8"),
+                    )
+                    for column in value["descriptors"]
+                }
+
+            if set(refreshed["columns"]) != set(capture["columns"]) or layout(
+                refreshed
+            ) != layout(capture):
+                raise InformixError(
+                    f"Informix schema changed for {native!r} during CDC; "
+                    "run a full refresh before decoding additional records"
+                )
+
         def _describe_table(self, owner: str, name: str) -> dict[str, Any]:
             columns = self.transport.execute(
                 "SELECT c.colname, c.coltype, c.collength, c.colno "
                 "FROM systables t JOIN syscolumns c ON t.tabid = c.tabid "
                 "WHERE t.owner = ? AND t.tabname = ? ORDER BY c.colno",
                 (owner, name),
+                max_result_bytes=(
+                    int(self.options.get("metadata.max.bytes", str(64 << 20))) or None
+                ),
             )
             keys = self.transport.execute(
                 "SELECT i.part1,i.part2,i.part3,i.part4,i.part5,i.part6,i.part7,i.part8,"
                 "i.part9,i.part10,i.part11,i.part12,i.part13,i.part14,i.part15,i.part16 "
                 "FROM systables t JOIN sysconstraints x ON t.tabid=x.tabid "
-                "JOIN sysindexes i ON x.idxname=i.idxname "
+                "JOIN sysindexes i ON x.idxname=i.idxname AND x.tabid=i.tabid "
                 "WHERE x.constrtype='P' AND t.owner=? AND t.tabname=?",
                 (owner, name),
+                max_result_bytes=(
+                    int(self.options.get("metadata.max.bytes", str(64 << 20))) or None
+                ),
             )
             parsed_columns = [_catalog_column(row) for row in columns]
             for column in parsed_columns:
@@ -2656,7 +2910,98 @@ def register_lakeflow_source(spark):
             row = self.transport.execute("SELECT MIN(uniqid) AS uniqid FROM sysmaster:syslogs")[0]
             return int(_field(row, "uniqid", 0)) << 32
 
-        def snapshot_page(self, identity, columns, primary_keys, after, limit):
+        def prepare_initial_capture(self, identities: Sequence[str]) -> int:
+            """Enable full-row logging for every table, then capture one shared LSN."""
+
+            if not identities:
+                raise InformixError("Initial CDC preparation requires at least one table")
+            enabled = []
+            try:
+                for identity in identities:
+                    _expect_zero(
+                        self.transport.execute(
+                            f"EXECUTE FUNCTION {cdc_routine('cdc_set_fullrowlogging')}(?, 1)",
+                            (identity,),
+                        ),
+                        f"cdc_set_fullrowlogging({identity})",
+                    )
+                    enabled.append(identity)
+            except Exception as error:
+                raise InformixError(
+                    "Initial CDC preparation was partially applied; full-row logging remains "
+                    f"enabled for {enabled!r}. Correct the failure and rerun preparation."
+                ) from error
+            return self.current_lsn()
+
+        def validate_initial_lsn(self, capture: dict[str, Any], start_lsn: int) -> None:
+            """Validate CDC registration/activation without reading LODATA records."""
+
+            server_row = self.transport.execute(
+                "SELECT env_value FROM sysmaster:sysenv WHERE env_name='INFORMIXSERVER'"
+            )[0]
+            server = str(_field(server_row, "env_value", 0))
+            session_row = self.transport.execute(
+                f"EXECUTE FUNCTION {cdc_routine('cdc_opensess')}(?, 1, 1, 1, 1)",
+                (server,),
+            )[0]
+            session = int(_field(session_row, "session_id", 0))
+            if session < 0:
+                raise InformixError(f"cdc_opensess failed with Informix error {session}")
+            native = capture["identity"]
+            started = False
+            primary_error: BaseException | None = None
+            try:
+                _expect_zero(
+                    self.transport.execute(
+                        f"EXECUTE FUNCTION {cdc_routine('cdc_startcapture')}(?, 0, ?, ?, ?)",
+                        (session, native, ",".join(capture["columns"]), 1),
+                    ),
+                    "cdc_startcapture",
+                )
+                started = True
+                _expect_zero(
+                    self.transport.execute(
+                        f"EXECUTE FUNCTION {cdc_routine('cdc_activatesess')}(?, ?)",
+                        (session, start_lsn),
+                    ),
+                    "cdc_activatesess",
+                )
+            except BaseException as error:
+                primary_error = error
+                raise
+            finally:
+                cleanup_errors = []
+                if started:
+                    try:
+                        _expect_zero(
+                            self.transport.execute(
+                                f"EXECUTE FUNCTION {cdc_routine('cdc_endcapture')}(?, 0, ?)",
+                                (session, native),
+                            ),
+                            "cdc_endcapture",
+                        )
+                    except Exception as error:
+                        cleanup_errors.append(error)
+                try:
+                    _expect_zero(
+                        self.transport.execute(
+                            f"EXECUTE FUNCTION {cdc_routine('cdc_closesess')}(?)", (session,)
+                        ),
+                        "cdc_closesess",
+                    )
+                except Exception as error:
+                    cleanup_errors.append(error)
+                if cleanup_errors and primary_error is None:
+                    raise InformixError("Initial CDC validation cleanup failed") from cleanup_errors[0]
+                if cleanup_errors and primary_error is not None and hasattr(primary_error, "add_note"):
+                    for error in cleanup_errors:
+                        primary_error.add_note(
+                            f"Initial Informix CDC validation cleanup also failed: {error}"
+                        )
+
+        def snapshot_page(
+            self, identity, columns, primary_keys, after, limit, max_bytes=None
+        ):
             database, owner, name = identity.split(".")
             for identifier in (database, owner, name, *columns, *primary_keys):
                 if not _IDENTIFIER.fullmatch(identifier):
@@ -2673,13 +3018,94 @@ def register_lakeflow_source(spark):
                 sql += " WHERE " + " OR ".join(clauses)
             if primary_keys:
                 sql += " ORDER BY " + ",".join(primary_keys)
-            rows = self.transport.execute(sql, tuple(parameters))
+            rows = self.transport.execute(
+                sql,
+                tuple(parameters),
+                max_result_bytes=(
+                    (max_bytes or None)
+                    if max_bytes is not None
+                    else (int(self.options.get("snapshot.max.bytes", str(256 << 20))) or None)
+                ),
+            )
             return [
                 dict(row) if isinstance(row, dict) else dict(zip(columns, row, strict=True))
                 for row in rows
             ]
 
+        def consistent_snapshot(
+            self, identity, columns, primary_keys, page_size, max_rows, max_bytes
+        ):
+            """Read one bounded point-in-time snapshot in a repeatable-read transaction."""
+
+            execute_command = getattr(self.transport, "execute_command", self.transport.execute)
+            ansi_rows = self.transport.execute(
+                "SELECT is_ansi FROM sysmaster:sysdatabases WHERE name = ?",
+                (self.config["database"],),
+            )
+            if len(ansi_rows) != 1:
+                raise InformixError(
+                    f"Could not determine transaction mode for database {self.config['database']!r}"
+                )
+            is_ansi = bool(int(_field(ansi_rows[0], "is_ansi", 0)))
+            if is_ansi:
+                # The catalog SELECT starts an implicit transaction in an ANSI
+                # database. End it before establishing the snapshot isolation.
+                execute_command("COMMIT WORK")
+            execute_command("SET ISOLATION TO REPEATABLE READ")
+            if not is_ansi:
+                execute_command("BEGIN WORK")
+            try:
+                snapshot_lsn = self.current_lsn()
+                rows: list[dict[str, Any]] = []
+                retained_bytes = _deep_size(rows) if max_bytes else 0
+                after = None
+                while True:
+                    remaining_rows = max_rows - len(rows)
+                    page_capacity = min(page_size, remaining_rows)
+                    remaining_bytes = max_bytes - retained_bytes if max_bytes else None
+                    if remaining_bytes is not None and remaining_bytes <= 0:
+                        raise InformixError(
+                            f"Initial snapshot exceeds snapshot.max.bytes={max_bytes}"
+                        )
+                    page = self.snapshot_page(
+                        identity,
+                        columns,
+                        primary_keys,
+                        after,
+                        page_capacity + 1,
+                        remaining_bytes,
+                    )
+                    has_more = len(page) > page_capacity
+                    if has_more and remaining_rows == 0:
+                        raise InformixError(
+                            f"Initial snapshot exceeds snapshot.max.rows={max_rows}"
+                        )
+                    accepted = page[:page_capacity]
+                    if max_bytes:
+                        retained_bytes += _deep_size(accepted)
+                    if max_bytes and retained_bytes > max_bytes:
+                        raise InformixError(
+                            f"Initial snapshot exceeds snapshot.max.bytes={max_bytes}"
+                        )
+                    rows.extend(accepted)
+                    if not has_more:
+                        break
+                    after = [rows[-1][key] for key in primary_keys]
+                execute_command("COMMIT WORK")
+                return snapshot_lsn, rows
+            except BaseException as primary_error:
+                try:
+                    execute_command("ROLLBACK WORK")
+                except Exception as cleanup_error:
+                    if hasattr(primary_error, "add_note"):
+                        primary_error.add_note(
+                            f"Informix snapshot rollback also failed: {cleanup_error}"
+                        )
+                raise
+
         def read_changes(self, tables, start_lsn, timeout_seconds, max_records):
+            set_socket_timeout = getattr(self.transport, "set_socket_timeout", None)
+            previous_socket_timeout = getattr(self.transport, "socket_timeout", None)
             server_row = self.transport.execute(
                 "SELECT env_value FROM sysmaster:sysenv WHERE env_name='INFORMIXSERVER'"
             )[0]
@@ -2694,6 +3120,10 @@ def register_lakeflow_source(spark):
             labels: dict[int, tuple[ColumnDescriptor, ...]] = {}
             captures = []
             try:
+                if set_socket_timeout is not None:
+                    set_socket_timeout(
+                        max(float(previous_socket_timeout or 30), timeout_seconds + 5.0)
+                    )
                 for label, capture in enumerate(tables, 1):
                     native = capture["identity"]
                     columns = tuple(capture["columns"])
@@ -2722,17 +3152,25 @@ def register_lakeflow_source(spark):
                 )
                 parser = CdcFrameParser(int(self.options.get("cdc.max.frame.bytes", str(16 << 20))))
                 records = []
+                budget_records = 0
                 open_transactions = OpenTransactionRecords()
                 max_transaction_records = int(self.options.get("cdc.max.transaction.records", "100000"))
+                max_poll_records = int(self.options.get("cdc.max.poll.records", "200000"))
+                max_poll_bytes = int(self.options.get("cdc.max.poll.bytes", "0"))
                 requested = int(self.options.get("cdc.read.bytes", "32000"))
                 empty_reads = 0
                 timed_out = False
-                # Bound every native poll even when its final transaction is still
-                # open. The projection layer emits only complete transactions and
-                # leaves the checkpoint unchanged, so the next poll safely replays
-                # that transaction from its checkpointed begin LSN. Waiting here
-                # for COMMIT can keep a triggered pipeline alive indefinitely.
-                while len(records) < max_records and empty_reads < 1 and not timed_out:
+                retained_bytes = 0
+                metadata_labels: set[int] = set()
+                # cdc.max.records is a soft boundary: once crossed, finish every
+                # transaction already observed so a transaction larger than the
+                # native boundary can make progress. An idle open transaction is
+                # still bounded by Informix's TIMEOUT control frame.
+                while (
+                    (budget_records < max_records or open_transactions)
+                    and empty_reads < 1
+                    and not timed_out
+                ):
                     chunk = self.transport.read_lodata(session, requested)
                     if not chunk:
                         empty_reads += 1
@@ -2740,6 +3178,14 @@ def register_lakeflow_source(spark):
                     empty_reads = 0
                     for frame in parser.feed(chunk):
                         record = decode_frame(frame, labels)
+                        if max_poll_bytes:
+                            retained_bytes += len(frame) + _deep_size(record)
+                        if max_poll_bytes and retained_bytes > max_poll_bytes:
+                            raise InformixError(
+                                "A CDC poll exceeded "
+                                f"cdc.max.poll.bytes={max_poll_bytes} while completing "
+                                "interleaved transactions"
+                            )
                         if record["op"] == "TIMEOUT":
                             # Informix represents an idle CDC timeout as a real,
                             # non-empty protocol frame. Treat it as the terminal
@@ -2748,17 +3194,33 @@ def register_lakeflow_source(spark):
                             timed_out = True
                         label = record.get("label", record.get("capture_label"))
                         if record["op"] == "METADATA" and label in labels:
+                            if label in metadata_labels:
+                                raise InformixError(
+                                    f"Informix emitted a second CDC metadata layout for capture "
+                                    f"label {label}; run a full refresh before continuing"
+                                )
                             descriptors = {column.name: column for column in labels[label]}
-                            names = metadata_column_names(record["metadata"])
+                            encoding = next(iter(descriptors.values())).encoding
+                            names = metadata_column_names(record["metadata"], encoding)
                             if set(names) != set(descriptors):
                                 raise InformixError(
                                     f"CDC metadata for capture label {label} does not match "
                                     "the requested columns"
                                 )
+                            self._assert_capture_layout(tables[label - 1], encoding)
                             labels[label] = tuple(descriptors[name] for name in names)
+                            metadata_labels.add(label)
                         if label and 1 <= label <= len(tables):
                             record["table"] = tables[label - 1]["logical_identity"]
                         records.append(record)
+                        if record["op"] not in {"METADATA", "TIMEOUT"}:
+                            budget_records += 1
+                        if len(records) > max_poll_records:
+                            raise InformixError(
+                                "A CDC poll exceeded "
+                                f"cdc.max.poll.records={max_poll_records} while completing "
+                                "interleaved transactions"
+                            )
                         if record["op"] == "BEGIN":
                             open_transactions.begin(int(record["tx_id"]))
                         elif record["op"] in _DATA_OPS:
@@ -2772,18 +3234,50 @@ def register_lakeflow_source(spark):
                                 "An open CDC transaction exceeded "
                                 f"cdc.max.transaction.records={max_transaction_records}"
                             )
-                if parser.buffered_bytes:
+                        if timed_out:
+                            # Ignore anything following the terminal timeout in this
+                            # session. The checkpoint remains at the last complete
+                            # transaction, so a later poll safely replays it.
+                            break
+                if parser.buffered_bytes and not timed_out:
                     raise InformixError("CDC read ended with an incomplete native frame")
                 return records
             finally:
+                cleanup_errors = []
                 for native in captures:
-                    self.transport.execute(
-                        f"EXECUTE FUNCTION {cdc_routine('cdc_endcapture')}(?, 0, ?)",
-                        (session, native),
+                    try:
+                        _expect_zero(
+                            self.transport.execute(
+                                f"EXECUTE FUNCTION {cdc_routine('cdc_endcapture')}(?, 0, ?)",
+                                (session, native),
+                            ),
+                            "cdc_endcapture",
+                        )
+                    except Exception as error:  # preserve an active CDC failure
+                        cleanup_errors.append(error)
+                try:
+                    _expect_zero(
+                        self.transport.execute(
+                            f"EXECUTE FUNCTION {cdc_routine('cdc_closesess')}(?)", (session,)
+                        ),
+                        "cdc_closesess",
                     )
-                self.transport.execute(
-                    f"EXECUTE FUNCTION {cdc_routine('cdc_closesess')}(?)", (session,)
-                )
+                except Exception as error:  # preserve an active CDC failure
+                    cleanup_errors.append(error)
+                if set_socket_timeout is not None and previous_socket_timeout is not None:
+                    try:
+                        set_socket_timeout(float(previous_socket_timeout))
+                    except Exception as error:
+                        cleanup_errors.append(error)
+                active_error = sys.exc_info()[1]
+                if cleanup_errors:
+                    if active_error is None:
+                        raise InformixError(
+                            "Informix CDC session cleanup failed"
+                        ) from cleanup_errors[0]
+                    if hasattr(active_error, "add_note"):
+                        for error in cleanup_errors:
+                            active_error.add_note(f"Informix CDC cleanup also failed: {error}")
 
 
     _bridge_factory: Callable[[dict[str, str]], InformixBridge] = PurePythonInformixBridge
@@ -2797,7 +3291,7 @@ def register_lakeflow_source(spark):
 
 
     def _bridge_config(options: dict[str, str]) -> dict[str, Any]:
-        required = ("hostname", "database", "user", "password")
+        required = ("hostname", "database", "user", "password", "server")
         missing = [name for name in required if not options.get(name)]
         if missing:
             raise ValueError(f"Missing required Informix option(s): {', '.join(missing)}")
@@ -2824,6 +3318,26 @@ def register_lakeflow_source(spark):
     def _option_bool(options: dict[str, str], name: str, default: bool) -> bool:
         value = options.get(name)
         return default if value is None else value.lower() in {"1", "true", "yes"}
+
+
+    def _prepared_initial_tables(options: dict[str, str]) -> frozenset[str]:
+        raw = options.get("cdc.initial.prepared.tables", "")
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise InformixError(
+                "cdc.initial.prepared.tables must be the JSON list returned by "
+                "prepare_initial_capture()"
+            ) from error
+        if not isinstance(decoded, list) or not decoded or not all(
+            isinstance(identity, str) and identity for identity in decoded
+        ):
+            raise InformixError(
+                "cdc.initial.prepared.tables must be a non-empty JSON list of table identities"
+            )
+        if len(decoded) != len(set(decoded)):
+            raise InformixError("cdc.initial.prepared.tables contains duplicate identities")
+        return frozenset(decoded)
 
 
     def _redirect_allowlist(value: str) -> frozenset[tuple[str, int]]:
@@ -2889,6 +3403,25 @@ def register_lakeflow_source(spark):
                     raise InformixError(f"Unsafe Informix identifier returned by metadata: {part!r}")
             columns = tuple(Column.parse(c) for c in raw.get("columns", ()))
             pks = tuple(str(v) for v in raw.get("primary_keys", ()))
+            column_names = tuple(column.name for column in columns)
+            for column_name in column_names:
+                if not _IDENTIFIER.fullmatch(column_name):
+                    raise InformixError(
+                        f"Unsafe Informix column identifier returned by metadata: {column_name!r}"
+                    )
+            normalized_names = tuple(column_name.casefold() for column_name in column_names)
+            if len(normalized_names) != len(set(normalized_names)):
+                raise InformixError(f"Duplicate column names for {database}.{owner}.{name}")
+            reserved = {column.casefold() for column in _INTERNAL_COLUMNS}
+            collisions = sorted(
+                column_name for column_name in column_names if column_name.casefold() in reserved
+            )
+            if collisions:
+                raise InformixError(
+                    f"Source columns collide with reserved Informix metadata columns: {collisions!r}"
+                )
+            if len(pks) != len(set(pks)):
+                raise InformixError(f"Duplicate primary-key columns for {database}.{owner}.{name}")
             known = {c.name for c in columns}
             if not columns or any(pk not in known for pk in pks):
                 raise InformixError(f"Invalid metadata for {database}.{owner}.{name}")
@@ -2901,8 +3434,22 @@ def register_lakeflow_source(spark):
         begin_lsn: int
         records: list[dict[str, Any]] = field(default_factory=list)
         pending_before: dict[str, Any] | None = None
+        last_lsn: int = field(init=False)
+
+        def __post_init__(self) -> None:
+            self.last_lsn = self.begin_lsn
+
+        def advance(self, record: dict[str, Any]) -> int:
+            lsn = _lsn(record)
+            if lsn < self.last_lsn:
+                raise InformixError(
+                    f"CDC LSN regressed in transaction {self.tx_id}: {lsn} < {self.last_lsn}"
+                )
+            self.last_lsn = lsn
+            return lsn
 
         def append(self, record: dict[str, Any]) -> None:
+            self.advance(record)
             op = _operation(record)
             if op == "BEFORE_UPDATE":
                 if self.pending_before is not None:
@@ -2924,6 +3471,8 @@ def register_lakeflow_source(spark):
             self.records.append(record)
 
         def discard(self, lsn: int) -> None:
+            # DISCARD carries the rollback cutoff, not the forward position of the
+            # DISCARD control record. It may legitimately precede the latest data LSN.
             self.records = [r for r in self.records if _lsn(r) < lsn]
             if self.pending_before is not None and _lsn(self.pending_before) >= lsn:
                 self.pending_before = None
@@ -2950,9 +3499,15 @@ def register_lakeflow_source(spark):
             if op in {"TIMEOUT", "METADATA"}:
                 return None
             if op == "ERROR":
-                raise InformixError(str(record.get("message") or "Informix CDC error record"))
+                detail = record.get("message") or record.get("payload") or ""
+                raise InformixError(
+                    f"Informix CDC error {record.get('error', 'unknown')} "
+                    f"with flags {record.get('flags', 'unknown')}: {detail}"
+                )
             tx_id = _tx_id(record)
             if op == "BEGIN":
+                if tx_id in self.open:
+                    raise InformixError(f"Duplicate CDC BEGIN for transaction {tx_id}")
                 self.open[tx_id] = Transaction(tx_id, _lsn(record))
                 return None
             tx = self.open.get(tx_id)
@@ -2965,14 +3520,15 @@ def register_lakeflow_source(spark):
                 tx.discard(_lsn(record))
                 return None
             if op == "ROLLBACK":
+                tx.advance(record)
                 del self.open[tx_id]
                 return None
             if op != "COMMIT":
                 raise InformixError(f"Unknown Informix CDC operation {op!r}")
             if tx.pending_before is not None:
                 raise InformixError(f"Transaction {tx_id} committed with unpaired BEFORE_UPDATE")
+            end = tx.advance(record)
             del self.open[tx_id]
-            end = _lsn(record)
             restart = min((item.begin_lsn for item in self.open.values()), default=end)
             return CommittedTransaction(tx_id, tx.begin_lsn, end, restart, tuple(tx.records))
 
@@ -2989,24 +3545,116 @@ def register_lakeflow_source(spark):
             # Validate numeric configuration without opening a connection.
             for name, default, minimum in (
                 ("snapshot.page.size", str(_DEFAULT_SNAPSHOT_PAGE_SIZE), 1),
+                ("snapshot.max.rows", "100000", 1),
+                ("snapshot.max.bytes", str(256 << 20), 0),
+                ("metadata.max.bytes", str(64 << 20), 0),
                 ("max.records.per.batch", str(_DEFAULT_MAX_RECORDS_PER_BATCH), 1),
-                ("cdc.timeout", "5", 0),
+                ("cdc.timeout", "5", 1),
+                ("cdc.initial.lsn", "1", 1),
                 ("cdc.max.records", "64", 1),
+                ("cdc.max.frame.bytes", str(16 << 20), 16),
+                ("cdc.max.transaction.records", "100000", 1),
+                ("cdc.max.poll.records", "200000", 1),
+                ("cdc.max.poll.bytes", "0", 0),
+                ("cdc.read.bytes", "32000", 1),
+                ("authentication.pam.max.rounds", "16", 1),
+                ("redirect.max", "3", 0),
             ):
                 if int(options.get(name, default)) < minimum:
                     raise ValueError(f"Option '{name}' must be >= {minimum}")
             if int(options.get("cdc.max.records", "64")) > 256:
                 raise ValueError("Option 'cdc.max.records' must be <= 256")
+            if int(options.get("cdc.read.bytes", "32000")) > 32767:
+                raise ValueError("Option 'cdc.read.bytes' must be <= 32767")
+            port = int(options.get("port", "9088"))
+            if not 1 <= port <= 65535:
+                raise ValueError("Option 'port' must be between 1 and 65535")
+            login_timeout = float(options.get("authentication.login.timeout", "30"))
+            if not math.isfinite(login_timeout) or login_timeout <= 0:
+                raise ValueError("Option 'authentication.login.timeout' must be > 0")
             self._bridge_instance: InformixBridge | None = None
             self._tables: dict[str, Table] | None = None
             self._snapshot_high_water: dict[str, int] = {}
-            self._stream_high_water: dict[tuple[str, bool], int] = {}
             self._trigger_available_now = False
+            self._trigger_high_water: int | None = None
 
         def prepare_for_trigger_available_now(self) -> None:
             """Freeze stream high-water marks when Spark selects AvailableNow."""
 
             self._trigger_available_now = True
+            if self._trigger_high_water is None:
+                self._trigger_high_water = self._bridge.current_lsn()
+
+        def prepare_initial_capture(
+            self, table_names: Sequence[str] | None = None
+        ) -> dict[str, str]:
+            """Prepare selected CDC tables and return first-run connection options.
+
+            This must run once before the first full refresh. Full-row logging is
+            enabled for every requested table before a single shared LSN is read.
+            """
+
+            tables = self._table_map(refresh=True)
+            requested = tuple(sorted(tables) if table_names is None else table_names)
+            if not requested:
+                raise InformixError("Initial CDC preparation requires at least one selected table")
+            if len(requested) != len(set(requested)):
+                raise InformixError("Initial CDC preparation contains duplicate table names")
+            selected = []
+            for name in requested:
+                table = self._table(name, {})
+                _ensure_materializable(table)
+                if not _cdc_capable(table):
+                    raise InformixError(
+                        f"Table '{name}' is snapshot-only and cannot be prepared for CDC"
+                    )
+                selected.append(table)
+            identities = [table.native_identity for table in selected]
+            lsn = self._bridge.prepare_initial_capture(identities)
+            try:
+                minimum = self._bridge.minimum_lsn()
+                current = self._bridge.current_lsn()
+                if not minimum <= lsn <= current:
+                    raise InformixError(
+                        f"Prepared initial LSN {lsn} is outside retained/current range "
+                        f"[{minimum}, {current}]"
+                    )
+            except Exception as error:
+                raise InformixError(
+                    "Initial CDC preparation enabled full-row logging for "
+                    f"{identities!r}, but LSN validation failed. Logging remains enabled; "
+                    "correct the failure and rerun preparation."
+                ) from error
+            return {
+                "cdc.initial.lsn": str(lsn),
+                "cdc.initial.fullrow.logging.enabled": "true",
+                "cdc.initial.prepared.tables": json.dumps(
+                    sorted(table.native_identity for table in selected), separators=(",", ":")
+                ),
+            }
+
+        def close(self) -> None:
+            """Close the live SQLI transport, if one was opened."""
+
+            if self._bridge_instance is not None:
+                transport = getattr(self._bridge_instance, "transport", None)
+                close = getattr(transport, "close", None)
+                if close is not None:
+                    close()
+                self._bridge_instance = None
+
+        def __enter__(self) -> "InformixLakeflowConnect":
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback) -> None:
+            if exc_value is None:
+                self.close()
+                return
+            try:
+                self.close()
+            except Exception as close_error:
+                if hasattr(exc_value, "add_note"):
+                    exc_value.add_note(f"Informix cleanup also failed: {close_error}")
 
         def __getstate__(self) -> dict[str, Any]:
             """Exclude live SQLI state when Spark serializes the data source.
@@ -3035,6 +3683,7 @@ def register_lakeflow_source(spark):
 
         def get_table_schema(self, table_name: str, table_options: dict[str, str]) -> StructType:
             table = self._table(table_name, table_options, refresh=True)
+            _ensure_materializable(table)
             fields = [
                 StructField(column.name, _spark_type(column), column.nullable)
                 for column in table.columns
@@ -3050,7 +3699,8 @@ def register_lakeflow_source(spark):
             return StructType(fields)
 
         def read_table_metadata(self, table_name: str, table_options: dict[str, str]) -> dict:
-            table = self._table(table_name, table_options)
+            table = self._table(table_name, table_options, refresh=True)
+            _ensure_materializable(table)
             if not _cdc_capable(table):
                 return {"primary_keys": [], "cursor_field": None, "ingestion_type": "snapshot"}
             return {
@@ -3063,6 +3713,7 @@ def register_lakeflow_source(spark):
             self, table_name: str, start_offset: dict, table_options: dict[str, str]
         ) -> tuple[Iterator[dict], dict]:
             table = self._table(table_name, table_options)
+            _ensure_materializable(table)
             if not _cdc_capable(table):
                 return self._read_snapshot_only(table, start_offset, table_options)
             if not start_offset or start_offset.get("phase", "snapshot") == "snapshot":
@@ -3073,35 +3724,81 @@ def register_lakeflow_source(spark):
             self, table_name: str, start_offset: dict, table_options: dict[str, str]
         ) -> tuple[Iterator[dict], dict]:
             table = self._table(table_name, table_options)
+            _ensure_materializable(table)
             if not _cdc_capable(table):
                 raise ValueError(
                     f"Table '{table_name}' lacks a primary key or has columns unsupported "
                     "by Informix CDC and is snapshot-only"
                 )
-            # The delete channel has no snapshot rows, but it must start at the
-            # same pre-snapshot high-water mark.  Lakeflow checkpoints this method
-            # independently from read_table().
+            # Lakeflow checkpoints this independently from read_table() and does
+            # not pass the snapshot LSN into the delete flow. Require the explicit
+            # connection-level boundary used by the snapshot/upsert reader.
             if not start_offset:
+                if not self.options.get("cdc.initial.lsn"):
+                    raise InformixError(
+                        "An exact first CDC delete capture requires connection option "
+                        "'cdc.initial.lsn'. Enable full-row logging, record a retained current "
+                        "LSN, configure it on the connection, and restart with a full refresh."
+                    )
                 high_water = self._initial_lsn(table)
-                return iter(()), _offset(high_water, high_water, high_water, None, "stream")
+                return iter(()), _offset(
+                    high_water, high_water, high_water, None, "stream", table
+                )
             if start_offset.get("phase") == "snapshot":
+                snapshot_checkpoint = _validated_offset(start_offset)
+                expected = snapshot_checkpoint.get("schema_fingerprint")
+                if expected is None:
+                    raise InformixError(
+                        f"Informix delete checkpoint for '{table.exposed_name}' predates "
+                        "schema-safe offsets; run a full refresh"
+                    )
+                table = self._refresh_table_schema(table, expected)
                 high_water = int(start_offset.get("snapshot_lsn", start_offset.get("commit_lsn", 0)))
-                start_offset = _offset(high_water, high_water, high_water, None, "stream")
+                start_offset = _offset(high_water, high_water, high_water, None, "stream", table)
             return self._read_stream(table, start_offset, table_options, deletes=True)
 
         def _read_snapshot(self, table: Table, start: dict | None, options: dict[str, str]):
-            page_size = int(
-                options.get(
-                    "snapshot.page.size",
-                    self.options.get("snapshot.page.size", str(_DEFAULT_SNAPSHOT_PAGE_SIZE)),
+            checkpoint = _validated_offset(start) if start else None
+            if checkpoint and checkpoint.get("schema_fingerprint") is None:
+                raise InformixError(
+                    f"Informix snapshot checkpoint for '{table.exposed_name}' predates "
+                    "schema-safe offsets; run a full refresh"
                 )
+            expected_fingerprint = checkpoint.get("schema_fingerprint") if checkpoint else None
+            table = self._refresh_table_schema(table, expected_fingerprint)
+            if not _cdc_capable(table):
+                raise InformixError(
+                    f"Table '{table.exposed_name}' is no longer CDC-capable after metadata refresh; "
+                    "run a full refresh after restoring its primary key and supported schema"
+                )
+            page_size = self._table_int_option(
+                options, "snapshot.page.size", _DEFAULT_SNAPSHOT_PAGE_SIZE, minimum=1
             )
-            if start:
-                high_water = int(start["snapshot_lsn"])
-                last_pk = start.get("snapshot", {}).get("last_pk")
+            if checkpoint:
+                high_water = int(checkpoint["snapshot_lsn"])
+                last_pk = checkpoint["snapshot"]["last_pk"]
             else:
                 high_water = self._initial_lsn(table)
                 last_pk = None
+                consistent_snapshot = getattr(self._bridge, "consistent_snapshot", None)
+                if consistent_snapshot is not None:
+                    max_rows = self._table_int_option(
+                        options, "snapshot.max.rows", 100000, minimum=1
+                    )
+                    snapshot_lsn, rows = consistent_snapshot(
+                        table.identity,
+                        [c.name for c in table.columns],
+                        table.primary_keys,
+                        page_size,
+                        max_rows,
+                        self._table_int_option(
+                            options, "snapshot.max.bytes", 256 << 20, minimum=0
+                        ),
+                    )
+                    table = self._refresh_table_schema(table, _schema_fingerprint(table))
+                    return iter(_shape_snapshot(row, snapshot_lsn) for row in rows), _offset(
+                        high_water, high_water, high_water, None, "stream", table
+                    )
             rows = self._bridge.snapshot_page(
                 table.identity,
                 [c.name for c in table.columns],
@@ -3109,27 +3806,30 @@ def register_lakeflow_source(spark):
                 last_pk,
                 page_size + 1,
             )
+            table = self._refresh_table_schema(table, _schema_fingerprint(table))
             page, has_more = rows[:page_size], len(rows) > page_size
             shaped = [_shape_snapshot(row, high_water) for row in page]
             if has_more:
                 if not page:
                     raise InformixError("Snapshot bridge returned an invalid empty continuation page")
                 last = [page[-1][pk] for pk in table.primary_keys]
-                end = _offset(high_water, high_water, high_water, None, "snapshot")
+                end = _offset(high_water, high_water, high_water, None, "snapshot", table)
                 end.update({"snapshot_lsn": str(high_water), "snapshot": {"last_pk": last}})
             else:
-                end = _offset(high_water, high_water, high_water, None, "stream")
+                end = _offset(high_water, high_water, high_water, None, "stream", table)
             return iter(shaped), end
 
         def _read_snapshot_only(self, table: Table, start: dict | None, options: dict[str, str]):
+            _ensure_materializable(table)
+            table = self._refresh_table_schema(table, None)
+            fingerprint = _schema_fingerprint(table)
             # PK-less tables cannot be seek-paginated safely.  Read exactly once;
             # returning None signals non-checkpointable full refresh semantics.
-            limit = int(
-                options.get("snapshot.max.rows", self.options.get("snapshot.max.rows", "100000"))
-            )
+            limit = self._table_int_option(options, "snapshot.max.rows", 100000, minimum=1)
             rows = self._bridge.snapshot_page(
                 table.identity, [c.name for c in table.columns], (), None, limit + 1
             )
+            table = self._refresh_table_schema(table, fingerprint)
             if len(rows) > limit:
                 raise InformixError(
                     f"Snapshot-only table {table.exposed_name} exceeds snapshot.max.rows={limit}"
@@ -3139,17 +3839,28 @@ def register_lakeflow_source(spark):
 
         def _read_stream(self, table: Table, start: dict, options: dict[str, str], deletes: bool):
             checkpoint = _validated_offset(start)
+            table = self._refresh_table_schema(table, checkpoint.get("schema_fingerprint"))
+            fingerprint = _schema_fingerprint(table)
+            checkpoint_fingerprint = checkpoint.get("schema_fingerprint")
+            if checkpoint_fingerprint is None:
+                raise InformixError(
+                    f"Informix checkpoint for '{table.exposed_name}' predates schema-safe offsets; "
+                    "run a full refresh before resuming CDC"
+                )
+            if checkpoint_fingerprint != fingerprint:
+                raise InformixError(
+                    f"Informix schema changed for '{table.exposed_name}' since its CDC checkpoint; "
+                    "run a full refresh so retained records are not decoded with a new layout"
+                )
             restart = int(checkpoint.get("begin_lsn") or checkpoint["commit_lsn"])
+            max_rows = self._table_int_option(
+                options, "max.records.per.batch", _DEFAULT_MAX_RECORDS_PER_BATCH, minimum=1
+            )
             stop_lsn: int | None = None
             if self._trigger_available_now:
-                high_water_key = (table.identity, deletes)
-                if high_water_key not in self._stream_high_water:
-                    self._stream_high_water[high_water_key] = (
-                        self._snapshot_high_water[table.identity]
-                        if table.identity in self._snapshot_high_water
-                        else self._bridge.current_lsn()
-                    )
-                stop_lsn = self._stream_high_water[high_water_key]
+                if self._trigger_high_water is None:
+                    self._trigger_high_water = self._bridge.current_lsn()
+                stop_lsn = self._trigger_high_water
             minimum = self._bridge.minimum_lsn()
             if restart < minimum:
                 raise LogRetentionError(
@@ -3157,19 +3868,14 @@ def register_lakeflow_source(spark):
                     f"{minimum}; resnapshot required"
                 )
             raw_records = self._bridge.read_changes(
-                [_capture_descriptor(table)],
+                [_capture_descriptor(table, _client_encoding(self.options))],
                 restart,
-                int(options.get("cdc.timeout", self.options.get("cdc.timeout", "5"))),
-                int(options.get("cdc.max.records", self.options.get("cdc.max.records", "64"))),
+                self._table_int_option(options, "cdc.timeout", 5, minimum=1),
+                self._table_int_option(options, "cdc.max.records", 64, minimum=1, maximum=256),
             )
+            table = self._refresh_table_schema(table, fingerprint)
             committed = _committed_transactions(raw_records)
             recovered = _recover(committed, checkpoint)
-            max_rows = int(
-                options.get(
-                    "max.records.per.batch",
-                    self.options.get("max.records.per.batch", str(_DEFAULT_MAX_RECORDS_PER_BATCH)),
-                )
-            )
             output: list[dict[str, Any]] = []
             end = start
             for tx in recovered:
@@ -3181,16 +3887,82 @@ def register_lakeflow_source(spark):
                 if output and len(output) + len(projected) > max_rows:
                     break
                 output.extend(projected)
-                end = _offset(tx.commit_lsn, tx.commit_lsn, tx.restart_lsn, tx.tx_id, "stream")
+                end = _offset(
+                    tx.commit_lsn, tx.commit_lsn, tx.restart_lsn, tx.tx_id, "stream", table
+                )
                 if len(output) >= max_rows:
                     break
             return iter(output), end
 
+        def _refresh_table_schema(
+            self, table: Table, expected_fingerprint: str | None
+        ) -> Table:
+            refreshed = Table.parse(self._bridge.get_table(table.identity), table.database)
+            _ensure_materializable(refreshed)
+            fingerprint = _schema_fingerprint(refreshed)
+            if expected_fingerprint is not None and expected_fingerprint != fingerprint:
+                raise InformixError(
+                    f"Informix schema changed for '{table.exposed_name}' during ingestion; "
+                    "run a full refresh before reading additional snapshot or CDC records"
+                )
+            if self._tables is not None:
+                self._tables[table.exposed_name] = refreshed
+            return refreshed
+
+        def _table_int_option(
+            self,
+            table_options: dict[str, str],
+            name: str,
+            default: int,
+            *,
+            minimum: int,
+            maximum: int | None = None,
+        ) -> int:
+            value = int(table_options.get(name, self.options.get(name, str(default))))
+            if value < minimum:
+                raise ValueError(f"Option '{name}' must be >= {minimum}")
+            if maximum is not None and value > maximum:
+                raise ValueError(f"Option '{name}' must be <= {maximum}")
+            return value
+
         def _initial_lsn(self, table: Table) -> int:
-            """Share the pre-snapshot high-water mark between upsert/delete channels."""
+            """Return a configured cross-reader boundary or an instance-local high water."""
 
             if table.identity not in self._snapshot_high_water:
-                self._snapshot_high_water[table.identity] = self._bridge.current_lsn()
+                configured = self.options.get("cdc.initial.lsn")
+                value = int(configured) if configured else self._bridge.current_lsn()
+                minimum = self._bridge.minimum_lsn()
+                if value < minimum:
+                    raise LogRetentionError(
+                        f"Configured initial LSN {value} is older than minimum retained LSN "
+                        f"{minimum}; choose a retained boundary after enabling full-row logging"
+                    )
+                current = self._bridge.current_lsn()
+                if value > current:
+                    raise InformixError(
+                        f"Configured initial LSN {value} is newer than current Informix LSN "
+                        f"{current}; choose a position captured after enabling full-row logging"
+                    )
+                if configured:
+                    if not _option_bool(
+                        self.options, "cdc.initial.fullrow.logging.enabled", False
+                    ):
+                        raise InformixError(
+                            "Option 'cdc.initial.fullrow.logging.enabled=true' is required with "
+                            "cdc.initial.lsn to acknowledge that full-row logging was enabled "
+                            "before the configured position"
+                        )
+                    prepared_tables = _prepared_initial_tables(self.options)
+                    if table.native_identity not in prepared_tables:
+                        raise InformixError(
+                            f"Table '{table.native_identity}' is absent from "
+                            "cdc.initial.prepared.tables; rerun prepare_initial_capture() "
+                            "for every table used by this connection"
+                        )
+                    self._bridge.validate_initial_lsn(
+                        _capture_descriptor(table, _client_encoding(self.options)), value
+                    )
+                self._snapshot_high_water[table.identity] = value
             return self._snapshot_high_water[table.identity]
 
         def _table_map(self, refresh: bool = False) -> dict[str, Table]:
@@ -3216,7 +3988,9 @@ def register_lakeflow_source(spark):
 
         def _table(self, name: str, options: dict[str, str], refresh: bool = False) -> Table:
             exposed = options.get("qualified_source_table", name)
-            tables = self._table_map(refresh)
+            tables = self._table_map()
+            if exposed not in tables and refresh:
+                tables = self._table_map(refresh=True)
             if exposed not in tables:
                 raise ValueError(f"Unknown or excluded Informix table '{exposed}'")
             table = tables[exposed]
@@ -3262,10 +4036,19 @@ def register_lakeflow_source(spark):
         16: "NVARCHAR",
         17: "INT8",
         18: "SERIAL8",
-        20: "LVARCHAR",
-        21: "BLOB",
-        22: "CLOB",
-        23: "BOOLEAN",
+        19: "SET",
+        20: "MULTISET",
+        21: "LIST",
+        22: "ROW",
+        23: "COLLECTION",
+        40: "UDT_VAR",
+        41: "UDT_FIXED",
+        43: "LVARCHAR",
+        45: "BOOLEAN",
+        52: "BIGINT",
+        53: "BIGSERIAL",
+        101: "BLOB",
+        102: "CLOB",
     }
 
 
@@ -3311,6 +4094,15 @@ def register_lakeflow_source(spark):
             "BLOB",
             "CLOB",
             "INTERVAL",
+            "LVARCHAR",
+            "NCHAR",
+            "SET",
+            "MULTISET",
+            "LIST",
+            "ROW",
+            "COLLECTION",
+            "UDT_VAR",
+            "UDT_FIXED",
         }
         return {
             "name": name,
@@ -3365,6 +4157,49 @@ def register_lakeflow_source(spark):
         return bool(table.primary_keys) and all(column.cdc_supported for column in table.columns)
 
 
+    def _snapshot_unsupported_columns(table: Table) -> tuple[Column, ...]:
+        """Return types whose ordinary SQLI row representation is not implemented."""
+
+        unsupported = {
+            "BYTE",
+            "TEXT",
+            "BLOB",
+            "CLOB",
+            "INTERVAL",
+            "LVARCHAR",
+            "NCHAR",
+            "SET",
+            "MULTISET",
+            "LIST",
+            "ROW",
+            "COLLECTION",
+            "UDT_VAR",
+            "UDT_FIXED",
+        }
+        return tuple(column for column in table.columns if column.type_name in unsupported)
+
+
+    def _ensure_materializable(table: Table) -> None:
+        unsupported = _snapshot_unsupported_columns(table)
+        if unsupported:
+            details = ", ".join(f"{column.name} ({column.type_name})" for column in unsupported)
+            raise InformixError(
+                f"Table '{table.exposed_name}' contains columns that the pure-Python SQLI "
+                f"snapshot decoder cannot materialize: {details}"
+            )
+        for column in table.columns:
+            if column.type_name in {"DECIMAL", "NUMERIC", "MONEY"} and (
+                column.precision is None
+                or column.scale is None
+                or not 1 <= column.precision <= 38
+                or not 0 <= column.scale <= column.precision
+            ):
+                raise InformixError(
+                    f"Table '{table.exposed_name}' has invalid {column.type_name} metadata for "
+                    f"column {column.name}: precision={column.precision}, scale={column.scale}"
+                )
+
+
     def _spark_type(column: Column):
         name = column.type_name.split("(", 1)[0].strip()
         if name in {"SMALLINT", "INT2"}:
@@ -3405,7 +4240,10 @@ def register_lakeflow_source(spark):
         value = record.get("lsn", record.get("sequence", record.get("sequence_id")))
         if value is None:
             raise InformixError(f"CDC record has no LSN: {record!r}")
-        return int(value)
+        result = int(value)
+        if result < 0:
+            raise InformixError(f"CDC record has a negative LSN: {record!r}")
+        return result
 
 
     def _tx_id(record: dict[str, Any]) -> int:
@@ -3428,7 +4266,13 @@ def register_lakeflow_source(spark):
     def _committed_transactions(records: Sequence[dict[str, Any]]) -> list[CommittedTransaction]:
         buffer = TransactionBuffer()
         result = []
+        last_lsn: int | None = None
         for record in records:
+            if _operation(record) not in {"METADATA", "ERROR", "DISCARD"}:
+                lsn = _lsn(record)
+                if last_lsn is not None and lsn < last_lsn:
+                    raise InformixError(f"CDC stream LSN regressed globally: {lsn} < {last_lsn}")
+                last_lsn = lsn
             committed = buffer.feed(record)
             if committed is not None:
                 result.append(committed)
@@ -3441,27 +4285,19 @@ def register_lakeflow_source(spark):
         transactions: Sequence[CommittedTransaction], checkpoint: dict[str, Any]
     ) -> list[CommittedTransaction]:
         commit = int(checkpoint["commit_lsn"])
-        change = int(checkpoint["change_lsn"])
-        recovering = int(checkpoint.get("begin_lsn") or commit) < commit
-        output = []
-        for tx in transactions:
-            if tx.commit_lsn < commit:
-                continue
-            if tx.commit_lsn == commit and change == commit:
-                continue
-            records = tx.records
-            if tx.commit_lsn == commit or recovering:
-                records = tuple(record for record in records if _lsn(record) > change)
-            if records or tx.commit_lsn > commit:
-                output.append(
-                    CommittedTransaction(tx.tx_id, tx.begin_lsn, tx.commit_lsn, tx.restart_lsn, records)
-                )
-            if tx.commit_lsn > commit:
-                recovering = False
-        return output
+        # Offsets are transaction-atomic. Replaying from the oldest open BEGIN can
+        # reproduce transactions already checkpointed, but records from a newly
+        # committed transaction must never be filtered using another transaction's
+        # commit/change LSN.
+        return [tx for tx in transactions if tx.commit_lsn > commit]
 
 
-    def _capture_descriptor(table: Table) -> dict[str, Any]:
+    def _client_encoding(options: dict[str, str]) -> str:
+        locale = options.get("CLIENT_LOCALE") or options.get("client.locale") or "en_US.utf8"
+        return informix_locale_encoding(locale)
+
+
+    def _capture_descriptor(table: Table, encoding: str = "utf-8") -> dict[str, Any]:
         return {
             "identity": table.native_identity,
             "logical_identity": table.identity,
@@ -3473,7 +4309,7 @@ def register_lakeflow_source(spark):
                     "length": column.length or column.precision or 0,
                     "precision": column.precision,
                     "scale": column.scale,
-                    "encoding": "utf-8",
+                    "encoding": encoding,
                 }
                 for column in table.columns
                 if column.cdc_supported
@@ -3526,7 +4362,12 @@ def register_lakeflow_source(spark):
             raise InformixError("CDC upsert has no after image")
         result = _framework_row(row)
         result.update(
-            {CURSOR: str(_lsn(record)), COMMIT_LSN: str(tx.commit_lsn), TX_ID: tx.tx_id, OP: op}
+            {
+                CURSOR: _sortable_lsn(_lsn(record)),
+                COMMIT_LSN: _sortable_lsn(tx.commit_lsn),
+                TX_ID: tx.tx_id,
+                OP: op,
+            }
         )
         return result
 
@@ -3540,15 +4381,29 @@ def register_lakeflow_source(spark):
                 raise InformixError(f"CDC delete has no primary-key value for {pk}")
             result[pk] = _framework_value(row[pk])
         result.update(
-            {CURSOR: str(_lsn(record)), COMMIT_LSN: str(tx.commit_lsn), TX_ID: tx.tx_id, OP: "d"}
+            {
+                CURSOR: _sortable_lsn(_lsn(record)),
+                COMMIT_LSN: _sortable_lsn(tx.commit_lsn),
+                TX_ID: tx.tx_id,
+                OP: "d",
+            }
         )
         return result
 
 
     def _shape_snapshot(row: dict[str, Any], lsn: int) -> dict[str, Any]:
         result = _framework_row(row)
-        result.update({CURSOR: str(lsn), COMMIT_LSN: str(lsn), TX_ID: None, OP: "r"})
+        result.update(
+            {CURSOR: _sortable_lsn(lsn), COMMIT_LSN: _sortable_lsn(lsn), TX_ID: None, OP: "r"}
+        )
         return result
+
+
+    def _sortable_lsn(value: int) -> str:
+        lsn = int(value)
+        if not 0 <= lsn < 1 << 64:
+            raise InformixError(f"Informix LSN {lsn} is outside the unsigned 64-bit decimal domain")
+        return f"{lsn:0{_LSN_DECIMAL_WIDTH}d}"
 
 
     def _framework_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -3563,24 +4418,109 @@ def register_lakeflow_source(spark):
         return value.isoformat() if isinstance(value, (date, datetime)) else value
 
 
-    def _offset(commit: int, change: int, begin: int, tx_id: int | None, phase: str) -> dict:
+    def _deep_size(value: Any, seen: set[int] | None = None) -> int:
+        """Estimate retained Python container/value memory without double counting."""
+
+        if seen is None:
+            seen = set()
+        identity = id(value)
+        if identity in seen:
+            return 0
+        seen.add(identity)
+        size = sys.getsizeof(value)
+        if isinstance(value, dict):
+            return size + sum(
+                _deep_size(key, seen) + _deep_size(item, seen) for key, item in value.items()
+            )
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return size + sum(_deep_size(item, seen) for item in value)
+        return size
+
+
+    def _offset(
+        commit: int,
+        change: int,
+        begin: int,
+        tx_id: int | None,
+        phase: str,
+        table: Table,
+    ) -> dict:
         return {
+            "version": _OFFSET_VERSION,
             "commit_lsn": str(commit),
             "change_lsn": str(change),
             "begin_lsn": str(begin),
             "tx_id": tx_id,
             "phase": phase,
+            "schema_fingerprint": _schema_fingerprint(table),
         }
+
+
+    def _schema_fingerprint(table: Table) -> str:
+        layout = repr(
+            (
+                table.database,
+                table.owner,
+                table.name,
+                table.primary_keys,
+                tuple(
+                    (
+                        column.name,
+                        column.type_name,
+                        column.nullable,
+                        column.length,
+                        column.precision,
+                        column.scale,
+                        column.cdc_supported,
+                    )
+                    for column in table.columns
+                ),
+            )
+        ).encode("utf-8")
+        return hashlib.sha256(layout).hexdigest()
 
 
     def _validated_offset(offset: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(offset, dict):
             raise ValueError("Informix offset must be a dictionary")
         result = dict(offset)
+        if result.get("version") != _OFFSET_VERSION:
+            raise ValueError(
+                f"Informix offset version {result.get('version')!r} is unsupported; "
+                "run a full refresh with this connector version"
+            )
+        values = {}
         for key in ("commit_lsn", "change_lsn", "begin_lsn"):
             if key not in result:
                 raise ValueError(f"Informix stream offset is missing '{key}'")
-            int(result[key])
+            values[key] = int(result[key])
+            if values[key] < 0:
+                raise ValueError(f"Informix offset '{key}' must be non-negative")
+            if values[key] >= 1 << 64:
+                raise ValueError(f"Informix offset '{key}' exceeds the unsigned 64-bit LSN domain")
+        if not values["begin_lsn"] <= values["change_lsn"] <= values["commit_lsn"]:
+            raise ValueError("Informix offset must satisfy begin_lsn <= change_lsn <= commit_lsn")
+        phase = result.get("phase")
+        if phase not in {"snapshot", "stream"}:
+            raise ValueError("Informix offset phase must be 'snapshot' or 'stream'")
+        fingerprint = result.get("schema_fingerprint")
+        if fingerprint is not None and (
+            not isinstance(fingerprint, str)
+            or len(fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in fingerprint)
+        ):
+            raise ValueError("Informix offset has an invalid schema_fingerprint")
+        if phase == "snapshot":
+            if "snapshot_lsn" not in result or int(result["snapshot_lsn"]) < 0:
+                raise ValueError("Informix snapshot offset has an invalid snapshot_lsn")
+            if any(values[key] != int(result["snapshot_lsn"]) for key in values):
+                raise ValueError(
+                    "Informix snapshot offset requires snapshot_lsn, begin_lsn, "
+                    "change_lsn, and commit_lsn to be equal"
+                )
+            snapshot = result.get("snapshot")
+            if not isinstance(snapshot, dict) or not isinstance(snapshot.get("last_pk"), list):
+                raise ValueError("Informix snapshot offset is missing snapshot.last_pk")
         return result
 
 
@@ -3708,13 +4648,8 @@ def register_lakeflow_source(spark):
             return self.read(start)[0]
 
         def prepareForTriggerAvailableNow(self) -> None:
-            # Inform the connector that Spark selected a finite AvailableNow
-            # trigger. Continuous execution never invokes this callback.
-            prepare = getattr(
-                self.lakeflow_connect, "prepare_for_trigger_available_now", None
-            )
-            if prepare is not None:
-                prepare()
+            # No need to do anything special here. Everything is handled in the __init__ method.
+            pass
 
 
     class LakeflowPartitionedStreamReader(DataSourceStreamReader, SupportsTriggerAvailableNow):
