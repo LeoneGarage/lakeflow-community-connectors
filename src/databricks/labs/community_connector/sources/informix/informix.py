@@ -12,8 +12,10 @@ import hashlib
 import importlib
 import json
 import math
+import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Callable, Iterator, Protocol, Sequence
@@ -59,6 +61,9 @@ _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 _DATA_OPS = {"INSERT", "BEFORE_UPDATE", "AFTER_UPDATE", "DELETE", "TRUNCATE"}
 _DEFAULT_SNAPSHOT_PAGE_SIZE = 10000
 _DEFAULT_MAX_RECORDS_PER_BATCH = 10000
+_SHARED_STATE_VERSION = 1
+_SHARED_STATE_WAIT_SECONDS = 300
+_SHARED_STATE_LOCK_STALE_SECONDS = 600
 
 def _informix_available_now_base(base: type) -> type:
     """Wrap the generated reader base without changing the shared adapter source."""
@@ -364,7 +369,7 @@ class PurePythonInformixBridge:
         )[0]
         server = str(_field(server_row, "env_value", 0))
         session_row = self.transport.execute(
-            f"EXECUTE FUNCTION {cdc_routine('cdc_opensess')}(?, 1, 1, 1, 1)",
+            f"EXECUTE FUNCTION {cdc_routine('cdc_opensess')}(?, 0, 1, 1, 1, 1)",
             (server,),
         )[0]
         session = int(_field(session_row, "session_id", 0))
@@ -743,24 +748,13 @@ def _option_bool(options: dict[str, str], name: str, default: bool) -> bool:
     return default if value is None else value.lower() in {"1", "true", "yes"}
 
 
-def _prepared_initial_tables(options: dict[str, str]) -> frozenset[str]:
-    raw = options.get("cdc.initial.prepared.tables", "")
-    try:
-        decoded = json.loads(raw)
-    except json.JSONDecodeError as error:
-        raise InformixError(
-            "cdc.initial.prepared.tables must be the JSON list returned by "
-            "prepare_initial_capture()"
-        ) from error
-    if not isinstance(decoded, list) or not decoded or not all(
-        isinstance(identity, str) and identity for identity in decoded
-    ):
-        raise InformixError(
-            "cdc.initial.prepared.tables must be a non-empty JSON list of table identities"
-        )
-    if len(decoded) != len(set(decoded)):
-        raise InformixError("cdc.initial.prepared.tables contains duplicate identities")
-    return frozenset(decoded)
+def _shared_state_location(options: dict[str, str]) -> str:
+    location = options.get("cdc.shared.state.location", "").strip()
+    if not location:
+        raise ValueError("Missing required Informix option: cdc.shared.state.location")
+    if not os.path.isabs(location):
+        raise ValueError("Option 'cdc.shared.state.location' must be an absolute path")
+    return location.rstrip("/")
 
 
 def _redirect_allowlist(value: str) -> frozenset[tuple[str, int]]:
@@ -965,6 +959,7 @@ class InformixLakeflowConnect(LakeflowConnect):
 
     def __init__(self, options: dict[str, str]) -> None:
         super().__init__(options)
+        self._shared_state_location = _shared_state_location(options)
         # Validate numeric configuration without opening a connection.
         for name, default, minimum in (
             ("snapshot.page.size", str(_DEFAULT_SNAPSHOT_PAGE_SIZE), 1),
@@ -973,7 +968,6 @@ class InformixLakeflowConnect(LakeflowConnect):
             ("metadata.max.bytes", str(64 << 20), 0),
             ("max.records.per.batch", str(_DEFAULT_MAX_RECORDS_PER_BATCH), 1),
             ("cdc.timeout", "5", 1),
-            ("cdc.initial.lsn", "1", 1),
             ("cdc.max.records", "64", 1),
             ("cdc.max.frame.bytes", str(16 << 20), 16),
             ("cdc.max.transaction.records", "100000", 1),
@@ -982,6 +976,8 @@ class InformixLakeflowConnect(LakeflowConnect):
             ("cdc.read.bytes", "32000", 1),
             ("authentication.pam.max.rounds", "16", 1),
             ("redirect.max", "3", 0),
+            ("cdc.shared.state.wait.seconds", str(_SHARED_STATE_WAIT_SECONDS), 1),
+            ("cdc.shared.state.lock.stale.seconds", str(_SHARED_STATE_LOCK_STALE_SECONDS), 1),
         ):
             if int(options.get(name, default)) < minimum:
                 raise ValueError(f"Option '{name}' must be >= {minimum}")
@@ -1007,54 +1003,6 @@ class InformixLakeflowConnect(LakeflowConnect):
         self._trigger_available_now = True
         if self._trigger_high_water is None:
             self._trigger_high_water = self._bridge.current_lsn()
-
-    def prepare_initial_capture(
-        self, table_names: Sequence[str] | None = None
-    ) -> dict[str, str]:
-        """Prepare selected CDC tables and return first-run connection options.
-
-        This must run once before the first full refresh. Full-row logging is
-        enabled for every requested table before a single shared LSN is read.
-        """
-
-        tables = self._table_map(refresh=True)
-        requested = tuple(sorted(tables) if table_names is None else table_names)
-        if not requested:
-            raise InformixError("Initial CDC preparation requires at least one selected table")
-        if len(requested) != len(set(requested)):
-            raise InformixError("Initial CDC preparation contains duplicate table names")
-        selected = []
-        for name in requested:
-            table = self._table(name, {})
-            _ensure_materializable(table)
-            if not _cdc_capable(table):
-                raise InformixError(
-                    f"Table '{name}' is snapshot-only and cannot be prepared for CDC"
-                )
-            selected.append(table)
-        identities = [table.native_identity for table in selected]
-        lsn = self._bridge.prepare_initial_capture(identities)
-        try:
-            minimum = self._bridge.minimum_lsn()
-            current = self._bridge.current_lsn()
-            if not minimum <= lsn <= current:
-                raise InformixError(
-                    f"Prepared initial LSN {lsn} is outside retained/current range "
-                    f"[{minimum}, {current}]"
-                )
-        except Exception as error:
-            raise InformixError(
-                "Initial CDC preparation enabled full-row logging for "
-                f"{identities!r}, but LSN validation failed. Logging remains enabled; "
-                "correct the failure and rerun preparation."
-            ) from error
-        return {
-            "cdc.initial.lsn": str(lsn),
-            "cdc.initial.fullrow.logging.enabled": "true",
-            "cdc.initial.prepared.tables": json.dumps(
-                sorted(table.native_identity for table in selected), separators=(",", ":")
-            ),
-        }
 
     def close(self) -> None:
         """Close the live SQLI transport, if one was opened."""
@@ -1153,17 +1101,11 @@ class InformixLakeflowConnect(LakeflowConnect):
                 f"Table '{table_name}' lacks a primary key or has columns unsupported "
                 "by Informix CDC and is snapshot-only"
             )
-        # Lakeflow checkpoints this independently from read_table() and does
-        # not pass the snapshot LSN into the delete flow. Require the explicit
-        # connection-level boundary used by the snapshot/upsert reader.
+        # Lakeflow checkpoints this independently from read_table(). The
+        # upsert reader owns initialization and publishes the table boundary
+        # through durable shared state; delete readers only consume it.
         if not start_offset:
-            if not self.options.get("cdc.initial.lsn"):
-                raise InformixError(
-                    "An exact first CDC delete capture requires connection option "
-                    "'cdc.initial.lsn'. Enable full-row logging, record a retained current "
-                    "LSN, configure it on the connection, and restart with a full refresh."
-                )
-            high_water = self._initial_lsn(table)
+            high_water = self._initial_lsn(table, owner=False)
             return iter(()), _offset(
                 high_water, high_water, high_water, None, "stream", table
             )
@@ -1348,12 +1290,11 @@ class InformixLakeflowConnect(LakeflowConnect):
             raise ValueError(f"Option '{name}' must be <= {maximum}")
         return value
 
-    def _initial_lsn(self, table: Table) -> int:
-        """Return a configured cross-reader boundary or an instance-local high water."""
+    def _initial_lsn(self, table: Table, *, owner: bool = True) -> int:
+        """Return one durable per-table boundary shared by upsert and delete readers."""
 
         if table.identity not in self._snapshot_high_water:
-            configured = self.options.get("cdc.initial.lsn")
-            value = int(configured) if configured else self._bridge.current_lsn()
+            value = self._shared_table_lsn(table, owner=owner)
             minimum = self._bridge.minimum_lsn()
             if value < minimum:
                 raise LogRetentionError(
@@ -1366,27 +1307,138 @@ class InformixLakeflowConnect(LakeflowConnect):
                     f"Configured initial LSN {value} is newer than current Informix LSN "
                     f"{current}; choose a position captured after enabling full-row logging"
                 )
-            if configured:
-                if not _option_bool(
-                    self.options, "cdc.initial.fullrow.logging.enabled", False
-                ):
-                    raise InformixError(
-                        "Option 'cdc.initial.fullrow.logging.enabled=true' is required with "
-                        "cdc.initial.lsn to acknowledge that full-row logging was enabled "
-                        "before the configured position"
-                    )
-                prepared_tables = _prepared_initial_tables(self.options)
-                if table.native_identity not in prepared_tables:
-                    raise InformixError(
-                        f"Table '{table.native_identity}' is absent from "
-                        "cdc.initial.prepared.tables; rerun prepare_initial_capture() "
-                        "for every table used by this connection"
-                    )
-                self._bridge.validate_initial_lsn(
-                    _capture_descriptor(table, _client_encoding(self.options)), value
-                )
             self._snapshot_high_water[table.identity] = value
         return self._snapshot_high_water[table.identity]
+
+    def _shared_table_lsn(self, table: Table, *, owner: bool) -> int:
+        directory, state_path, lock_path = self._shared_table_state_paths(table)
+        deadline = time.monotonic() + int(
+            self.options.get(
+                "cdc.shared.state.wait.seconds", str(_SHARED_STATE_WAIT_SECONDS)
+            )
+        )
+        while True:
+            state = self._read_shared_table_state(state_path, table)
+            if state is not None:
+                value = int(state["lsn"])
+                if self._bridge.minimum_lsn() <= value <= self._bridge.current_lsn():
+                    self._bridge.validate_initial_lsn(
+                        _capture_descriptor(table, _client_encoding(self.options)), value
+                    )
+                    return value
+                if not owner:
+                    state = None
+            if owner and self._acquire_shared_state_lock(directory, lock_path):
+                try:
+                    state = self._read_shared_table_state(state_path, table)
+                    if state is not None:
+                        value = int(state["lsn"])
+                        if self._bridge.minimum_lsn() <= value <= self._bridge.current_lsn():
+                            return value
+                    value = self._bridge.prepare_initial_capture([table.native_identity])
+                    self._bridge.validate_initial_lsn(
+                        _capture_descriptor(table, _client_encoding(self.options)), value
+                    )
+                    self._write_shared_table_state(state_path, table, value)
+                    return value
+                finally:
+                    try:
+                        os.unlink(lock_path)
+                    except FileNotFoundError:
+                        pass
+            if time.monotonic() >= deadline:
+                role = "upsert initialization" if owner else "the table's upsert reader"
+                raise InformixError(
+                    f"Timed out waiting for {role} to publish shared CDC state for "
+                    f"'{table.exposed_name}' at '{state_path}'"
+                )
+            time.sleep(0.1)
+
+    def _shared_table_state_paths(self, table: Table) -> tuple[str, str, str]:
+        namespace = "\0".join(
+            (
+                self.options.get("hostname", ""),
+                self.options.get("server", ""),
+                self.options.get("database", ""),
+            )
+        )
+        connection_key = hashlib.sha256(namespace.encode()).hexdigest()[:24]
+        table_key = hashlib.sha256(table.native_identity.encode()).hexdigest()[:24]
+        directory = os.path.join(self._shared_state_location, connection_key)
+        state_path = os.path.join(directory, f"{table_key}.json")
+        return directory, state_path, f"{state_path}.lock"
+
+    def _read_shared_table_state(
+        self, path: str, table: Table
+    ) -> dict[str, object] | None:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                state = json.load(handle)
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError) as error:
+            raise InformixError(f"Cannot read Informix shared CDC state '{path}'") from error
+        if not isinstance(state, dict):
+            raise InformixError(f"Invalid Informix shared CDC state object in '{path}'")
+        if state.get("version") != _SHARED_STATE_VERSION:
+            raise InformixError(f"Unsupported Informix shared CDC state version in '{path}'")
+        if state.get("table") != table.native_identity:
+            raise InformixError(f"Informix shared CDC state table mismatch in '{path}'")
+        try:
+            if int(state["lsn"]) < 1:
+                raise ValueError
+        except (KeyError, TypeError, ValueError) as error:
+            raise InformixError(f"Invalid Informix shared CDC LSN in '{path}'") from error
+        return state
+
+    def _acquire_shared_state_lock(self, directory: str, lock_path: str) -> bool:
+        try:
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                age = time.time() - os.stat(lock_path).st_mtime
+                stale = int(
+                    self.options.get(
+                        "cdc.shared.state.lock.stale.seconds",
+                        str(_SHARED_STATE_LOCK_STALE_SECONDS),
+                    )
+                )
+                if age > stale:
+                    os.unlink(lock_path)
+            except FileNotFoundError:
+                pass
+            return False
+        except OSError as error:
+            raise InformixError(
+                f"Cannot create Informix shared CDC state lock '{lock_path}'"
+            ) from error
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump({"created_at": time.time()}, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return True
+
+    def _write_shared_table_state(self, path: str, table: Table, lsn: int) -> None:
+        temporary = f"{path}.{os.getpid()}.tmp"
+        state = {
+            "version": _SHARED_STATE_VERSION,
+            "table": table.native_identity,
+            "lsn": str(lsn),
+            "created_at": time.time(),
+        }
+        try:
+            with open(temporary, "x", encoding="utf-8") as handle:
+                json.dump(state, handle, separators=(",", ":"), sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        except OSError as error:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise InformixError(f"Cannot publish Informix shared CDC state '{path}'") from error
 
     def _table_map(self, refresh: bool = False) -> dict[str, Table]:
         if self._tables is None or refresh:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import pickle
 import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -211,19 +212,31 @@ def _stream_offset(lsn=90):
     }
 
 
-def _initial_options(lsn):
-    return {
-        "cdc.initial.lsn": str(lsn),
-        "cdc.initial.fullrow.logging.enabled": "true",
-        "cdc.initial.prepared.tables": '["demo:app.orders"]',
-    }
-
-
 class LakeflowContractTests(unittest.TestCase):
+    def setUp(self):
+        self._shared_state = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._shared_state.cleanup()
+
     def connector(self, bridge=None, **options):
-        connector = InformixLakeflowConnect({"database": "demo", **options})
+        connector = InformixLakeflowConnect(
+            {
+                "database": "demo",
+                "cdc.shared.state.location": self._shared_state.name,
+                **options,
+            }
+        )
         connector._bridge_instance = bridge or FakeBridge()
         return connector
+
+    def test_shared_state_location_is_mandatory_and_absolute(self):
+        with self.assertRaisesRegex(ValueError, "cdc.shared.state.location"):
+            InformixLakeflowConnect({"database": "demo"})
+        with self.assertRaisesRegex(ValueError, "absolute path"):
+            InformixLakeflowConnect(
+                {"database": "demo", "cdc.shared.state.location": "relative"}
+            )
 
     def test_live_catalog_datetime_qualifier_is_normalized_for_cdc(self):
         column = _catalog_column(
@@ -580,49 +593,6 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(config["db_locale"], "en_US.819")
         self.assertEqual(config["client_locale"], "en_US.utf8")
 
-    def test_prepare_initial_capture_enables_all_tables_before_shared_lsn(self):
-        bridge = FakeBridge()
-        bridge.tables = [_table(), _table(owner="app", name="customers")]
-        bridge.now = 123
-        connector = self.connector(bridge)
-
-        prepared = connector.prepare_initial_capture()
-
-        self.assertEqual(
-            bridge.prepared_identities,
-            ["demo:app.customers", "demo:app.orders"],
-        )
-        self.assertEqual(
-            prepared,
-            {
-                "cdc.initial.lsn": "123",
-                "cdc.initial.fullrow.logging.enabled": "true",
-                "cdc.initial.prepared.tables": (
-                    '["demo:app.customers","demo:app.orders"]'
-                ),
-            },
-        )
-
-    def test_prepare_initial_capture_rejects_explicit_empty_selection(self):
-        connector = self.connector(FakeBridge())
-
-        with self.assertRaisesRegex(InformixError, "at least one selected table"):
-            connector.prepare_initial_capture([])
-
-    def test_prepare_initial_capture_rejects_duplicate_selection(self):
-        connector = self.connector(FakeBridge())
-
-        with self.assertRaisesRegex(InformixError, "duplicate table names"):
-            connector.prepare_initial_capture(["app.orders", "app.orders"])
-
-    def test_prepare_initial_capture_rejects_snapshot_only_table(self):
-        bridge = FakeBridge()
-        bridge.tables = [_table(cdc=False)]
-        connector = self.connector(bridge)
-
-        with self.assertRaisesRegex(InformixError, "snapshot-only"):
-            connector.prepare_initial_capture()
-
     def test_partial_preparation_reports_tables_left_enabled(self):
         class PartialTransport:
             def execute(self, sql, parameters=()):
@@ -669,6 +639,9 @@ class LakeflowContractTests(unittest.TestCase):
         bridge.validate_initial_lsn(capture, 80)
 
         self.assertTrue(any("cdc_activatesess" in sql for sql in transport.sql))
+        self.assertTrue(
+            any("cdc_opensess(?, 0, 1, 1, 1, 1)" in sql for sql in transport.sql)
+        )
 
     def test_initial_lsn_validation_attaches_cleanup_failure_to_primary_error(self):
         class FailedValidationTransport:
@@ -703,7 +676,6 @@ class LakeflowContractTests(unittest.TestCase):
             "snapshot.max.rows": "0",
             "cdc.timeout": "0",
             "cdc.max.frame.bytes": "15",
-            "cdc.initial.lsn": "-1",
             "cdc.max.transaction.records": "0",
             "cdc.max.poll.records": "0",
             "cdc.max.poll.bytes": "-1",
@@ -714,15 +686,26 @@ class LakeflowContractTests(unittest.TestCase):
         }
         for name, value in invalid.items():
             with self.subTest(name=name), self.assertRaises(ValueError):
-                InformixLakeflowConnect({"database": "demo", name: value})
+                InformixLakeflowConnect(
+                    {
+                        "database": "demo",
+                        "cdc.shared.state.location": self._shared_state.name,
+                        name: value,
+                    }
+                )
         for value in ("nan", "inf", "-inf"):
             with self.subTest(login_timeout=value), self.assertRaises(ValueError):
                 InformixLakeflowConnect(
-                    {"database": "demo", "authentication.login.timeout": value}
+                    {
+                        "database": "demo",
+                        "cdc.shared.state.location": self._shared_state.name,
+                        "authentication.login.timeout": value,
+                    }
                 )
         InformixLakeflowConnect(
             {
                 "database": "demo",
+                "cdc.shared.state.location": self._shared_state.name,
                 "snapshot.max.bytes": "0",
                 "metadata.max.bytes": "0",
                 "cdc.max.poll.bytes": "0",
@@ -1100,7 +1083,7 @@ class LakeflowContractTests(unittest.TestCase):
         bridge = FakeBridge()
         connector = self.connector(
             bridge,
-            **{"snapshot.page.size": "1", **_initial_options(90)},
+            **{"snapshot.page.size": "1"},
         )
         first, offset = connector.read_table("app.orders", {}, {})
         self.assertEqual([row["id"] for row in first], [1])
@@ -1113,7 +1096,7 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(delete_offset["commit_lsn"], "90")
         self.assertEqual(bridge.snapshot_calls[1][3], [1])
 
-    def test_delete_reader_requires_exact_initial_boundary(self):
+    def test_delete_reader_uses_boundary_published_by_upsert_reader(self):
         snapshot_bridge = FakeBridge()
         snapshot_connector = self.connector(snapshot_bridge)
         list(snapshot_connector.read_table("app.orders", {}, {})[0])
@@ -1121,33 +1104,49 @@ class LakeflowContractTests(unittest.TestCase):
         delete_bridge = FakeBridge()
         delete_bridge.now = 120
         delete_connector = self.connector(delete_bridge)
-        with self.assertRaisesRegex(InformixError, "cdc.initial.lsn"):
-            delete_connector.read_table_deletes("app.orders", {}, {})
+        _, offset = delete_connector.read_table_deletes("app.orders", {}, {})
 
-    def test_configured_initial_lsn_is_shared_across_separate_readers(self):
+        self.assertEqual(offset["commit_lsn"], "90")
+        self.assertEqual(snapshot_bridge.prepared_identities, ["demo:app.orders"])
+        self.assertEqual(delete_bridge.prepared_identities, [])
+
+    def test_delete_reader_waits_for_upsert_reader_to_publish_boundary(self):
+        delete_connector = self.connector(FakeBridge())
+        result = []
+
+        def read_deletes():
+            result.append(delete_connector.read_table_deletes("app.orders", {}, {})[1])
+
+        thread = threading.Thread(target=read_deletes)
+        thread.start()
         snapshot_bridge = FakeBridge()
-        snapshot_bridge.now = 120
-        initial = _initial_options(80)
-        snapshot_connector = self.connector(snapshot_bridge, **initial)
-        snapshot_rows, _ = snapshot_connector.read_table("app.orders", {}, {})
+        list(self.connector(snapshot_bridge).read_table("app.orders", {}, {})[0])
+        thread.join(2)
 
-        delete_bridge = FakeBridge()
-        delete_bridge.now = 140
-        delete_connector = self.connector(delete_bridge, **initial)
-        _, delete_offset = delete_connector.read_table_deletes("app.orders", {}, {})
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result[0]["commit_lsn"], "90")
 
-        self.assertEqual({row[CURSOR] for row in snapshot_rows}, {"00000000000000000080"})
-        self.assertEqual(delete_offset["commit_lsn"], "80")
-        self.assertEqual(snapshot_bridge.validated_initial, [("demo:app.orders", 80)])
-        self.assertEqual(delete_bridge.validated_initial, [("demo:app.orders", 80)])
+    def test_upsert_reader_rotates_expired_shared_boundary(self):
+        list(self.connector(FakeBridge()).read_table("app.orders", {}, {})[0])
+        replacement = FakeBridge()
+        replacement.minimum = 100
+        replacement.now = 120
 
-    def test_connector_context_manager_closes_preparation_transport(self):
+        list(self.connector(replacement).read_table("app.orders", {}, {})[0])
+        _, delete_offset = self.connector(replacement).read_table_deletes(
+            "app.orders", {}, {}
+        )
+
+        self.assertEqual(replacement.prepared_identities, ["demo:app.orders"])
+        self.assertEqual(delete_offset["commit_lsn"], "120")
+
+    def test_connector_context_manager_closes_transport(self):
         bridge = FakeBridge()
         bridge.transport = mock.Mock()
         connector = self.connector(bridge)
 
         with connector:
-            connector.prepare_initial_capture(["app.orders"])
+            pass
 
         bridge.transport.close.assert_called_once_with()
         self.assertIsNone(connector._bridge_instance)
@@ -1164,49 +1163,6 @@ class LakeflowContractTests(unittest.TestCase):
 
         if hasattr(caught.exception, "__notes__"):
             self.assertIn("close failed", " ".join(caught.exception.__notes__))
-
-    def test_configured_initial_lsn_must_still_be_retained(self):
-        bridge = FakeBridge()
-        bridge.minimum = 81
-        connector = self.connector(
-            bridge,
-            **_initial_options(80),
-        )
-
-        with self.assertRaisesRegex(LogRetentionError, "Configured initial LSN 80"):
-            connector.read_table("app.orders", {}, {})
-
-    def test_configured_initial_lsn_requires_fullrow_logging_acknowledgement(self):
-        connector = self.connector(FakeBridge(), **{"cdc.initial.lsn": "80"})
-
-        with self.assertRaisesRegex(
-            InformixError, "cdc.initial.fullrow.logging.enabled=true"
-        ):
-            connector.read_table("app.orders", {}, {})
-
-    def test_configured_initial_lsn_requires_prepared_table_membership(self):
-        connector = self.connector(
-            FakeBridge(),
-            **{
-                "cdc.initial.lsn": "80",
-                "cdc.initial.fullrow.logging.enabled": "true",
-                "cdc.initial.prepared.tables": '["demo:app.other"]',
-            },
-        )
-
-        with self.assertRaisesRegex(InformixError, "absent from cdc.initial.prepared.tables"):
-            connector.read_table("app.orders", {}, {})
-
-    def test_configured_initial_lsn_cannot_be_in_the_future(self):
-        bridge = FakeBridge()
-        bridge.now = 100
-        connector = self.connector(
-            bridge,
-            **_initial_options(101),
-        )
-
-        with self.assertRaisesRegex(InformixError, "newer than current Informix LSN"):
-            connector.read_table("app.orders", {}, {})
 
     def test_stream_offset_rejects_schema_changes_and_legacy_offsets(self):
         bridge = FakeBridge()

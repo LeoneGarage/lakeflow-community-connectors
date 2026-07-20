@@ -262,31 +262,27 @@ connection:
       required: false
       description: Informix CDC idle-read timeout in seconds. Default `5`; minimum `1`.
 
-    - name: cdc.initial.lsn
+    - name: cdc.shared.state.location
       type: string
-      required: false
+      required: true
       description: >
-        Exact first-run LSN shared by snapshot/upsert and delete streams. Required
-        when using CDC with deletes. Enable full-row logging before this retained
-        position. The connector rejects positions outside the retained/current
-        range and preflights it through native CDC activation before snapshot rows
-        are returned. Minimum `1`. Remove or update it after initial checkpoints
-        before a future full refresh.
+        Absolute writable Unity Catalog Volume directory shared by all pipeline
+        workers. The upsert reader atomically publishes a per-table initial LSN
+        here and the independently checkpointed delete reader consumes it.
 
-    - name: cdc.initial.fullrow.logging.enabled
+    - name: cdc.shared.state.wait.seconds
       type: string
       required: false
       description: >
-        Required acknowledgement when cdc.initial.lsn is configured. Set `true`
-        only after enabling full-row logging before that LSN. Default `false`.
+        Maximum seconds a reader waits for per-table initialization state.
+        Default `300`; minimum `1`.
 
-    - name: cdc.initial.prepared.tables
+    - name: cdc.shared.state.lock.stale.seconds
       type: string
       required: false
       description: >
-        JSON list of native database:owner.table identities returned by
-        prepare_initial_capture(). Required with cdc.initial.lsn; every CDC table
-        used by the connection must be present.
+        Age in seconds after which an abandoned initialization lock can be
+        reclaimed. Default `600`; minimum `1`.
 
     - name: cdc.max.records
       type: string

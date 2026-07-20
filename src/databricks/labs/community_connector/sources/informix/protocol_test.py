@@ -326,6 +326,21 @@ class SqliPacketTests(unittest.TestCase):
         )
         self.assertEqual(client._input.tell(), len(transcript))
 
+    def test_non_row_command_consumes_zero_column_description(self):
+        client = InformixSqliClient("host", 9088, "db", "user", "password")
+        output = io.BytesIO()
+        transcript = (
+            struct.pack(">hhhihhi", 8, 0, 7, 0, 0, 0, 0)
+            + struct.pack(">hhiii", 15, 0, 0, 0, 0)
+            + struct.pack(">h", 12)
+        )
+        client._input = io.BytesIO(transcript)
+
+        with patch.object(client, "_require_open", return_value=(client._input, output)):
+            client.execute_command("SET ISOLATION TO REPEATABLE READ")
+
+        self.assertEqual(client._input.tell(), len(transcript))
+
     def test_execute_enforces_incremental_decoded_result_byte_bound(self):
         client = InformixSqliClient("host", 9088, "db", "user", "password")
         description = ResultDescription(

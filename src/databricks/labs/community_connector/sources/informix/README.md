@@ -15,38 +15,12 @@ The pure-Python protocol implementation has completed authentication, query, dis
 
 The connector enables full-row logging for captured tables and leaves it enabled when a finite poll ends, avoiding capture gaps between polls. Ensure this operational change is acceptable on the source system.
 
-Before the first full refresh, use the connector preparation API. It enables
-full-row logging for every selected CDC table first and captures one shared LSN
-afterward:
-
-```python
-from databricks.labs.community_connector.sources.informix.informix import (
-    InformixLakeflowConnect,
-)
-
-with InformixLakeflowConnect(
-    {
-        "hostname": "informix.example.com",
-        "port": "9089",
-        "database": "testdb",
-        "server": "informix",
-        "user": "cdc_user",
-        "password": "...",
-        "ssl.ca.file": "/Volumes/catalog/schema/artifacts/informix-ca.pem",
-    }
-) as connector:
-    initial_options = connector.prepare_initial_capture()
-# {
-#   "cdc.initial.lsn": "...",
-#   "cdc.initial.fullrow.logging.enabled": "true",
-#   "cdc.initial.prepared.tables": '["testdb:informix.members"]',
-# }
-```
-
-Add the returned values to the Unity Catalog connection before starting the
-first full refresh. Pass exposed table names such as `informix.members` to
-`prepare_initial_capture([...])` to prepare a subset. Repeat preparation and
-replace the values before any later full refresh.
+Initial CDC preparation is automatic. For each table, its upsert reader enables
+full-row logging, captures one LSN, and atomically publishes it under
+`cdc.shared.state.location`. The independently scheduled delete reader waits
+for and uses that exact LSN. The location must be a writable Unity Catalog
+Volume directory shared by all serverless workers and dedicated to this
+connector deployment.
 
 ## Setup
 
@@ -59,6 +33,7 @@ replace the values before any later full refresh.
 | `user` | Yes | | Informix normal-auth user with metadata, snapshot, and CDC privileges. |
 | `password` | Yes | | Password for `user`; store it as a secret. |
 | `server` | Yes | | Exact `INFORMIXSERVER` name sent during SQLI authentication. |
+| `cdc.shared.state.location` | Yes | | Writable shared directory on a Unity Catalog Volume, for example `/Volumes/main/informix_cdc/state`. Stores atomic per-table initialization records used by independently checkpointed upsert and delete readers. |
 | `DB_LOCALE` | No | `en_US.819` | Database locale. Set it explicitly when the database uses another locale. |
 | `CLIENT_LOCALE` | No | `en_US.utf8` | Client locale. Its codeset controls Python row decoding. |
 | `port` | No | `9088` | Informix SQLI port; range `1`–`65535`. |
@@ -82,9 +57,8 @@ replace the values before any later full refresh.
 | `metadata.max.bytes` | No | `67108864` | Maximum estimated decoded Python bytes retained by an individual catalog query and by complete discovery. Set `0` to disable the limit and byte accounting. |
 | `max.records.per.batch` | No | `10000` | Target maximum projected CDC rows; minimum `1`. A complete transaction may exceed it. |
 | `cdc.timeout` | No | `5` | CDC idle-read timeout in seconds; minimum `1`. Zero is rejected because it can select an unbounded native wait. |
-| `cdc.initial.lsn` | CDC with deletes | — | Exact common first-run LSN used by snapshot/upsert and delete streams. Must be retained, non-future, and captured after enabling full-row logging. |
-| `cdc.initial.fullrow.logging.enabled` | With `cdc.initial.lsn` | `false` | Required acknowledgement that full-row logging was enabled before the configured LSN. The connector also preflights the LSN through a native capture/activation session before returning snapshot rows. |
-| `cdc.initial.prepared.tables` | With `cdc.initial.lsn` | — | JSON list of native `database:owner.table` identities returned by `prepare_initial_capture()`. Each CDC table must be present. |
+| `cdc.shared.state.wait.seconds` | No | `300` | Maximum time a delete reader waits for its table's upsert reader to publish automatic initialization state. |
+| `cdc.shared.state.lock.stale.seconds` | No | `600` | Age after which an abandoned per-table initialization lock may be reclaimed. |
 | `cdc.max.records` | No | `64` | Soft native record target per CDC session; range `1`–`256`. Once reached, records continue until every transaction already observed commits, rolls back, or Informix returns TIMEOUT. |
 | `cdc.max.frame.bytes` | No | `16777216` | Maximum accepted native CDC frame size (16 MiB by default; minimum `16`). |
 | `cdc.max.transaction.records` | No | `100000` | Maximum records buffered in an open transaction. Exceeding it fails without emitting uncommitted data. |
@@ -122,6 +96,7 @@ databricks connections create --json "$(jq -n \
       password: $password,
       server: "informix_prod",
       encrypt: "true",
+      "cdc.shared.state.location": "/Volumes/main/informix_cdc/state",
       externalOptionsAllowList: "qualified_source_table,snapshot.page.size,snapshot.max.rows,max.records.per.batch,cdc.timeout,cdc.max.records"
     }
   }')"
@@ -142,13 +117,9 @@ Pass the complete desired `options` map when updating a connection; do not assum
 ```bash
 export INFORMIX_PASSWORD='<secret>'
 export DATABRICKS_PROFILE='<profile-name>'
-export INFORMIX_INITIAL_LSN='<value returned by prepare_initial_capture>'
-export INFORMIX_PREPARED_TABLES='["sales:informix.orders"]'
 
 databricks connections update informix_sales --json "$(jq -n \
   --arg password "$INFORMIX_PASSWORD" \
-  --arg initial_lsn "$INFORMIX_INITIAL_LSN" \
-  --arg prepared_tables "$INFORMIX_PREPARED_TABLES" \
   '{
     options: {
       sourceName: "informix",
@@ -160,15 +131,13 @@ databricks connections update informix_sales --json "$(jq -n \
       password: $password,
       encrypt: "true",
       "ssl.ca.file": "/Volumes/catalog/schema/artifacts/informix-ca.pem",
-      "cdc.initial.lsn": $initial_lsn,
-      "cdc.initial.fullrow.logging.enabled": "true",
-      "cdc.initial.prepared.tables": $prepared_tables,
+      "cdc.shared.state.location": "/Volumes/main/informix_cdc/state",
       externalOptionsAllowList: "qualified_source_table,snapshot.page.size,snapshot.max.rows,max.records.per.batch,cdc.timeout,cdc.max.records"
     }
   }')" \
   --profile "$DATABRICKS_PROFILE"
 
-unset INFORMIX_PASSWORD DATABRICKS_PROFILE INFORMIX_INITIAL_LSN INFORMIX_PREPARED_TABLES
+unset INFORMIX_PASSWORD DATABRICKS_PROFILE
 ```
 
 The CA path must be readable by the serverless pipeline. Use the TLS listener's DNS hostname rather than its IP address when certificate hostname verification requires it.
@@ -198,6 +167,7 @@ connection = w.connections.create(
         "password": os.environ["INFORMIX_PASSWORD"],
         "server": "informix_prod",
         "encrypt": "true",
+        "cdc.shared.state.location": "/Volumes/main/informix_cdc/state",
         "externalOptionsAllowList": (
             "qualified_source_table,snapshot.page.size,snapshot.max.rows,"
             "max.records.per.batch,cdc.timeout,cdc.max.records"
@@ -305,9 +275,9 @@ For a CDC-capable table, the production SQLI bridge records the prepared CDC bou
 
 To validate the ANSI transaction sequence against a live ANSI-mode database, supply the standard `CONNECTOR_TEST_CONFIG_JSON` or `CONNECTOR_TEST_CONFIG_PATH` configuration with `ansi.live.validation=true` and `ansi.test.table=owner.table`, then run `ansi_live_test.py`. The selected table must have a primary key and no more than 10,000 rows.
 
-Only complete committed transactions are emitted. Inserts and update after-images go to the data channel; deletes go to an independently checkpointed delete channel using the required first-run `cdc.initial.lsn`. Delete output contains the primary-key fields and connector metadata. A primary-key update emits the new row and deletes the old key. Rollbacks are suppressed. Transactions are never split: `cdc.max.records` and `max.records.per.batch` are soft targets, and a transaction already observed is read through commit/rollback unless Informix returns TIMEOUT. CDC metadata and timeout control frames do not consume the `cdc.max.records` budget. Record and estimated retained-memory bounds limit each poll. Replay is transaction-atomic: another transaction's checkpoint never removes earlier records from a newly committed interleaved transaction. When Spark prepares a triggered AvailableNow run, each independently checkpointed flow freezes its own startup LSN. Upsert and delete boundaries can differ slightly, so a primary-key update at that edge can become fully visible on the following triggered update; no changes are lost. Continuous runs follow new commits without a mode-specific option.
+Only complete committed transactions are emitted. Inserts and update after-images go to the data channel; deletes go to an independently checkpointed delete channel. Delete output contains the primary-key fields and connector metadata. A primary-key update emits the new row and deletes the old key. Rollbacks are suppressed. Transactions are never split: `cdc.max.records` and `max.records.per.batch` are soft targets, and a transaction already observed is read through commit/rollback unless Informix returns TIMEOUT. CDC metadata and timeout control frames do not consume the `cdc.max.records` budget. Record and estimated retained-memory bounds limit each poll. Replay is transaction-atomic: another transaction's checkpoint never removes earlier records from a newly committed interleaved transaction. Continuous runs follow new commits without a mode-specific option.
 
-The framework does not pass the snapshot LSN to its independently instantiated delete stream. `prepare_initial_capture()` enables full-row logging for every selected table before capturing one shared LSN. Add all three returned values—including the table-scoped `cdc.initial.prepared.tables` list—to the connection before the first full refresh. The pipeline verifies table membership, retained/current bounds, and activation without reading CDC records before returning snapshot rows. Both streams use the same LSN. Delete initialization fails closed when preparation is absent. After initial checkpoints commit, remove these options if desired; repeat preparation and update them before a future full refresh.
+The framework does not pass snapshot offsets to independently instantiated delete streams. The connector therefore coordinates automatically through atomic per-table JSON records in `cdc.shared.state.location`. Only the upsert reader may enable full-row logging and publish a boundary; its delete reader waits and consumes that boundary. A retained record is safely reused after a full refresh. If it has fallen outside Informix log retention, the upsert reader atomically replaces it with a newly prepared boundary while delete readers wait. Corrupt, mismatched, partial, or inaccessible state fails closed.
 
 Regenerate the deployable file with `bash src/databricks/labs/community_connector/sources/informix/generate_source.sh`. Informix-owned code wraps the generated reader base and installs the AvailableNow callback at class creation, so this output is identical to the repository's canonical merge command and needs no post-generation patch. The source-local tests use `*_test.py` names so the standard merger excludes them.
 

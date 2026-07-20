@@ -1203,6 +1203,7 @@ class InformixSqliClient:
         if self._input is None:
             raise SqliProtocolError("SQLI input is unavailable")
         saw_done = False
+        saw_description = False
         while True:
             code = read_smallint(self._input)
             if code == SQ_EOT:
@@ -1215,6 +1216,16 @@ class InformixSqliClient:
                 continue
             if code == 99:  # SQ_XACTSTAT
                 read_exact(self._input, 6)
+                continue
+            if code == 8:  # SQ_DESCRIBE
+                if saw_description:
+                    raise SqliProtocolError("duplicate SQ_DESCRIBE in status response")
+                description = self._read_description()
+                if description.columns:
+                    raise SqliProtocolError(
+                        "non-row command returned a row-producing SQ_DESCRIBE"
+                    )
+                saw_description = True
                 continue
             if code == SQ_DONE:
                 self._read_done()
@@ -1450,7 +1461,11 @@ class InformixSqliClient:
         names_raw = read_exact(self._input, name_size)
         if name_size & 1:
             read_exact(self._input, 1)
-        names = [item.decode(self._encoding) for item in names_raw.rstrip(b"\0").split(b"\0")]
+        names = (
+            []
+            if count == 0 and not names_raw
+            else [item.decode(self._encoding) for item in names_raw.rstrip(b"\0").split(b"\0")]
+        )
         if len(names) != count or len(set(names)) != count:
             raise SqliProtocolError("descriptor names do not match column count")
         columns = tuple(ResultColumn(name, *descriptor) for name, descriptor in zip(names, raw))
