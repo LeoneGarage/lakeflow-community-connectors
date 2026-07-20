@@ -266,9 +266,14 @@ connection:
       type: string
       required: true
       description: >
-        Absolute writable Unity Catalog Volume directory shared by all pipeline
-        workers. The upsert reader atomically publishes a per-table initial LSN
-        here and the independently checkpointed delete reader consumes it.
+        Absolute writable `/Volumes/<catalog>/<schema>/<volume>/...` directory
+        without traversal components, shared by all pipeline workers. The upsert
+        reader atomically publishes per-table LSN and schema state here and the
+        independently checkpointed delete reader consumes it. A worker crash can
+        leave a `.lock` directory; stop all pipelines using the connection before
+        removing that directory. Each worker runs a bounded client-side probe of
+        exclusive directory creation and rename visibility before first use;
+        deployment validation must still exercise concurrent serverless workers.
 
     - name: cdc.shared.state.wait.seconds
       type: string
@@ -276,13 +281,6 @@ connection:
       description: >
         Maximum seconds a reader waits for per-table initialization state.
         Default `300`; minimum `1`.
-
-    - name: cdc.shared.state.lock.stale.seconds
-      type: string
-      required: false
-      description: >
-        Age in seconds after which an abandoned initialization lock can be
-        reclaimed. Default `600`; minimum `1`.
 
     - name: cdc.max.records
       type: string

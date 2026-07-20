@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import importlib
+import json
 import pickle
 import sys
 import tempfile
@@ -117,8 +120,13 @@ from databricks.labs.community_connector.sources.informix.informix import (  # n
     _informix_available_now_base,
     _recover,
     _schema_fingerprint,
+    _schema_state,
     _sortable_lsn,
     _spark_type,
+    _upgrade_legacy_schema_state,
+    _validate_schema_history,
+    _validate_shared_state_filesystem,
+    recover_shared_state_lock,
 )
 
 
@@ -209,6 +217,8 @@ def _stream_offset(lsn=90):
         "commit_lsn": str(lsn), "change_lsn": str(lsn),
         "begin_lsn": str(lsn), "tx_id": None, "phase": "stream",
         "schema_fingerprint": _schema_fingerprint(Table.parse(_table(), "demo")),
+        "schema_id": "1" * 32,
+        "pipeline_scope": hashlib.sha256(b"test-pipeline").hexdigest()[:32],
     }
 
 
@@ -224,6 +234,8 @@ class LakeflowContractTests(unittest.TestCase):
             {
                 "database": "demo",
                 "cdc.shared.state.location": self._shared_state.name,
+                "pipeline.id": "test-pipeline",
+                "pipeline.update.id": "test-update",
                 **options,
             }
         )
@@ -236,6 +248,60 @@ class LakeflowContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "absolute path"):
             InformixLakeflowConnect(
                 {"database": "demo", "cdc.shared.state.location": "relative"}
+            )
+        with self.assertRaisesRegex(ValueError, "Unity Catalog Volume"):
+            InformixLakeflowConnect(
+                {
+                    "database": "demo",
+                    "hostname": "host",
+                    "cdc.shared.state.location": self._shared_state.name,
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "traversal"):
+            InformixLakeflowConnect(
+                {
+                    "database": "demo",
+                    "hostname": "host",
+                    "cdc.shared.state.location": "/Volumes/catalog/schema/volume/../other",
+                }
+            )
+
+    def test_shared_state_connection_key_includes_port(self):
+        table = Table.parse(_table(), "demo")
+        first = self.connector(FakeBridge(), port="9088")
+        second = self.connector(FakeBridge(), port="9089")
+
+        self.assertNotEqual(
+            first._shared_table_state_paths(table)[1],
+            second._shared_table_state_paths(table)[1],
+        )
+        equivalent = self.connector(FakeBridge())
+        equivalent.options.update(
+            hostname="EXAMPLE.COM.", port="09088", server="demo", database="demo"
+        )
+        canonical = self.connector(FakeBridge())
+        canonical.options.update(
+            hostname="example.com", port="9088", server="demo", database="demo"
+        )
+        self.assertEqual(
+            equivalent._shared_table_state_paths(table)[1],
+            canonical._shared_table_state_paths(table)[1],
+        )
+        distinct_case = self.connector(FakeBridge())
+        distinct_case.options.update(
+            hostname="example.com", port="9088", server="DEMO", database="DEMO"
+        )
+        self.assertNotEqual(
+            distinct_case._shared_table_state_paths(table)[1],
+            canonical._shared_table_state_paths(table)[1],
+        )
+        with self.assertRaisesRegex(ValueError, "Unity Catalog Volume"):
+            InformixLakeflowConnect(
+                {
+                    "database": "demo",
+                    "hostname": "host",
+                    "cdc.shared.state.location": "/Volumes/catalog-only",
+                }
             )
 
     def test_live_catalog_datetime_qualifier_is_normalized_for_cdc(self):
@@ -1018,7 +1084,13 @@ class LakeflowContractTests(unittest.TestCase):
                 self.sql.append(sql)
                 if "syscolumns" in sql:
                     return [
-                        {"colname": "id", "coltype": 2, "collength": 4, "colno": 1}
+                        {
+                            "colname": "id",
+                            "coltype": 2,
+                            "collength": 4,
+                            "colno": 1,
+                            "tabid": 42,
+                        }
                     ]
                 return []
 
@@ -1030,6 +1102,23 @@ class LakeflowContractTests(unittest.TestCase):
         bridge._describe_table("app", "orders")
 
         self.assertIn("x.tabid=i.tabid", bridge.transport.sql[1])
+
+    def test_live_catalog_requires_positive_table_incarnation(self):
+        class CatalogTransport:
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                if "syscolumns" in sql:
+                    return [
+                        {"colname": "id", "coltype": 2, "collength": 4, "colno": 1}
+                    ]
+                return []
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.config = {"database": "demo"}
+        bridge.transport = CatalogTransport()
+
+        with self.assertRaisesRegex(InformixError, "missing tabid"):
+            bridge._describe_table("app", "orders")
 
     def test_invalid_decimal_metadata_fails_before_ingestion(self):
         bridge = FakeBridge()
@@ -1095,6 +1184,51 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(list(deletes), [])
         self.assertEqual(delete_offset["commit_lsn"], "90")
         self.assertEqual(bridge.snapshot_calls[1][3], [1])
+
+    def test_consistent_snapshot_publishes_fresh_resume_lsn_to_both_readers(self):
+        bridge = FakeBridge()
+
+        def consistent_snapshot(*args, **kwargs):
+            bridge.now = 150
+            return 150, list(bridge.rows)
+
+        bridge.consistent_snapshot = consistent_snapshot
+        changes, upsert_offset = self.connector(bridge).read_table("app.orders", {}, {})
+        delete_connector = self.connector(bridge)
+        deletes, delete_offset = delete_connector.read_table_deletes(
+            "app.orders", {}, {}
+        )
+
+        self.assertEqual([row["id"] for row in changes], [1, 2])
+        self.assertEqual(upsert_offset["commit_lsn"], "150")
+        self.assertEqual(list(deletes), [])
+        self.assertEqual(delete_offset["commit_lsn"], "150")
+
+    def test_concurrent_full_refreshes_use_pipeline_scoped_snapshot_boundaries(self):
+        def snapshot_connector(pipeline_id, snapshot_lsn):
+            bridge = FakeBridge()
+
+            def consistent_snapshot(*args, **kwargs):
+                bridge.now = snapshot_lsn
+                return snapshot_lsn, list(bridge.rows)
+
+            bridge.consistent_snapshot = consistent_snapshot
+            connector = self.connector(bridge, **{"pipeline.id": pipeline_id})
+            _, offset = connector.read_table("app.orders", {}, {})
+            return bridge, offset
+
+        bridge_a, offset_a = snapshot_connector("pipeline-a", 120)
+        bridge_b, offset_b = snapshot_connector("pipeline-b", 150)
+        _, delete_a = self.connector(
+            bridge_a, **{"pipeline.id": "pipeline-a"}
+        ).read_table_deletes("app.orders", {}, {})
+        _, delete_b = self.connector(
+            bridge_b, **{"pipeline.id": "pipeline-b"}
+        ).read_table_deletes("app.orders", {}, {})
+
+        self.assertEqual(offset_a["commit_lsn"], delete_a["commit_lsn"])
+        self.assertEqual(offset_b["commit_lsn"], delete_b["commit_lsn"])
+        self.assertNotEqual(delete_a["commit_lsn"], delete_b["commit_lsn"])
 
     def test_delete_reader_uses_boundary_published_by_upsert_reader(self):
         snapshot_bridge = FakeBridge()
@@ -1174,8 +1308,454 @@ class LakeflowContractTests(unittest.TestCase):
 
         changed = _stream_offset()
         changed["schema_fingerprint"] = "0" * 64
-        with self.assertRaisesRegex(InformixError, "schema changed"):
+        with self.assertRaisesRegex(InformixError, "Shared CDC state is missing"):
             connector.read_table("app.orders", changed, {})
+
+    def test_restart_transitions_appended_nullable_column_without_snapshot(self):
+        bridge = FakeBridge()
+        connector = self.connector(bridge)
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        previous_fingerprint = checkpoint["schema_fingerprint"]
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+
+        restarted = self.connector(bridge)
+        rows, transitioned = restarted.read_table("app.orders", checkpoint, {})
+
+        self.assertEqual(list(rows), [])
+        self.assertEqual(transitioned["commit_lsn"], "120")
+        self.assertNotEqual(transitioned["schema_fingerprint"], previous_fingerprint)
+
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 121},
+            {
+                "op": "INSERT",
+                "tx_id": 7,
+                "lsn": 122,
+                "row": {"id": 3, "value": "c", "added": 42},
+            },
+            {"op": "COMMIT", "tx_id": 7, "lsn": 123},
+        ]
+        rows, end = restarted.read_table("app.orders", transitioned, {})
+
+        self.assertEqual(list(rows)[0]["added"], 42)
+        self.assertEqual(end["commit_lsn"], "123")
+
+    def test_pre_transition_batch_retains_previous_schema_fingerprint(self):
+        bridge = FakeBridge()
+        _, checkpoint = self.connector(bridge).read_table("app.orders", {}, {})
+        previous_fingerprint = checkpoint["schema_fingerprint"]
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 120
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 100},
+            {"op": "INSERT", "tx_id": 7, "lsn": 101, "row": {"id": 3, "value": "c"}},
+            {"op": "COMMIT", "tx_id": 7, "lsn": 102},
+        ]
+
+        _, end = self.connector(bridge).read_table("app.orders", checkpoint, {})
+
+        self.assertEqual(end["commit_lsn"], "102")
+        self.assertEqual(end["schema_fingerprint"], previous_fingerprint)
+
+    def test_post_transition_transaction_advances_boundary_without_stalling(self):
+        bridge = FakeBridge()
+        _, checkpoint = self.connector(bridge).read_table("app.orders", {}, {})
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 120
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 8, "lsn": 121},
+            {
+                "op": "INSERT",
+                "tx_id": 8,
+                "lsn": 122,
+                "row": {"id": 4, "value": "d", "added": 9},
+            },
+            {"op": "COMMIT", "tx_id": 8, "lsn": 123},
+        ]
+        connector = self.connector(bridge)
+
+        rows, transitioned = connector.read_table("app.orders", checkpoint, {})
+        self.assertEqual(list(rows), [])
+        self.assertEqual(transitioned["commit_lsn"], "120")
+
+        rows, end = connector.read_table("app.orders", transitioned, {})
+        self.assertEqual(list(rows)[0]["added"], 9)
+        self.assertEqual(end["commit_lsn"], "123")
+
+    def test_transaction_spanning_schema_transition_fails_closed(self):
+        bridge = FakeBridge()
+        _, checkpoint = self.connector(bridge).read_table("app.orders", {}, {})
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 120
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 9, "lsn": 119},
+            {"op": "INSERT", "tx_id": 9, "lsn": 121, "row": {"id": 5, "value": "e"}},
+            {"op": "COMMIT", "tx_id": 9, "lsn": 123},
+        ]
+
+        with self.assertRaisesRegex(InformixError, "spans schema transition"):
+            self.connector(bridge).read_table("app.orders", checkpoint, {})
+
+    def test_available_now_does_not_advance_past_frozen_transition_boundary(self):
+        bridge = FakeBridge()
+        _, checkpoint = self.connector(bridge).read_table("app.orders", {}, {})
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+        connector = self.connector(bridge)
+        connector._trigger_available_now = True
+        connector._trigger_high_water = 110
+        connector._trigger_generation = "a" * 32
+
+        _, end = connector.read_table("app.orders", checkpoint, {})
+
+        self.assertEqual(end["commit_lsn"], checkpoint["commit_lsn"])
+
+    def test_lock_release_does_not_remove_replacement_owner(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        directory, _, lock_path = connector._shared_table_state_paths(table)
+        first = connector._acquire_shared_state_lock(directory, lock_path)
+        self.assertIsNotNone(first)
+        owner_path = informix_module.os.path.join(lock_path, "owner.json")
+        with open(owner_path, "w", encoding="utf-8") as handle:
+            json.dump({"created_at": 1, "token": "replacement"}, handle)
+
+        connector._release_shared_state_lock(lock_path, first)
+        self.assertTrue(informix_module.os.path.exists(lock_path))
+        connector._release_shared_state_lock(lock_path, "replacement")
+        self.assertFalse(informix_module.os.path.exists(lock_path))
+
+    def test_crashed_worker_lock_fails_closed_until_operator_recovery(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        directory, _, lock_path = connector._shared_table_state_paths(table)
+        token = connector._acquire_shared_state_lock(directory, lock_path)
+        self.assertIsNotNone(token)
+
+        contender = connector._acquire_shared_state_lock(directory, lock_path)
+
+        self.assertIsNone(contender)
+        connector._release_shared_state_lock(lock_path, token)
+
+    def test_stale_temporary_state_file_does_not_block_publication(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        directory, state_path, _ = connector._shared_table_state_paths(table)
+        informix_module.os.makedirs(directory, exist_ok=True)
+        stale = f"{state_path}.{informix_module.os.getpid()}.tmp"
+        with open(stale, "w", encoding="utf-8") as handle:
+            handle.write("stale")
+
+        connector._write_shared_table_state(state_path, table, 90)
+
+        self.assertTrue(informix_module.os.path.exists(state_path))
+
+    def test_abandoned_shared_state_artifacts_are_cleaned(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        directory, state_path, lock_path = connector._shared_table_state_paths(table)
+        informix_module.os.makedirs(directory, exist_ok=True)
+        temporary = f"{state_path}.old.tmp"
+        released = f"{lock_path}.old.released"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write("old")
+        informix_module.os.mkdir(released)
+        with open(
+            informix_module.os.path.join(released, "owner.json"), "w", encoding="utf-8"
+        ) as handle:
+            json.dump({"token": "old"}, handle)
+        old = informix_module.time.time() - 7200
+        informix_module.os.utime(temporary, (old, old))
+        informix_module.os.utime(released, (old, old))
+
+        token = connector._acquire_shared_state_lock(directory, lock_path)
+
+        self.assertFalse(informix_module.os.path.exists(temporary))
+        self.assertFalse(informix_module.os.path.exists(released))
+        connector._release_shared_state_lock(lock_path, token)
+
+    def test_lock_timeout_diagnostic_contains_recovery_details(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        directory, _, lock_path = connector._shared_table_state_paths(table)
+        token = connector._acquire_shared_state_lock(directory, lock_path)
+
+        detail = connector._lock_recovery_detail(lock_path)
+
+        self.assertIn(" pid ", detail)
+        self.assertIn(token, detail)
+        self.assertIn("stop every pipeline", detail)
+        connector._release_shared_state_lock(lock_path, token)
+
+    def test_abandoned_lock_recovery_requires_acknowledgement_and_owner_token(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        directory, _, lock_path = connector._shared_table_state_paths(table)
+        token = connector._acquire_shared_state_lock(directory, lock_path)
+
+        with self.assertRaisesRegex(ValueError, "acknowledgement"):
+            recover_shared_state_lock(
+                self._shared_state.name,
+                lock_path,
+                token,
+                acknowledge_pipelines_stopped=False,
+            )
+        with self.assertRaisesRegex(InformixError, "token changed"):
+            recover_shared_state_lock(
+                self._shared_state.name,
+                lock_path,
+                "f" * 32,
+                acknowledge_pipelines_stopped=True,
+            )
+        recover_shared_state_lock(
+            self._shared_state.name,
+            lock_path,
+            token,
+            acknowledge_pipelines_stopped=True,
+        )
+        self.assertFalse(informix_module.os.path.exists(lock_path))
+
+    def test_shared_state_probe_thread_start_failure_is_bounded(self):
+        location = self._shared_state.name
+        informix_module._VALIDATED_STATE_LOCATIONS.discard(location)
+        with mock.patch.object(
+            informix_module.threading.Thread,
+            "start",
+            side_effect=RuntimeError("thread unavailable"),
+        ):
+            with self.assertRaisesRegex(InformixError, "exclusive directory creation"):
+                _validate_shared_state_filesystem(location)
+
+    def test_unsupported_volume_directory_open_does_not_fail_publication(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        directory, state_path, _ = connector._shared_table_state_paths(table)
+        informix_module.os.makedirs(directory, exist_ok=True)
+        real_open = informix_module.os.open
+
+        def volume_open(path, flags, *args, **kwargs):
+            if path == directory and flags == informix_module.os.O_RDONLY:
+                raise OSError(errno.EACCES, "directory handles unsupported")
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(informix_module.os, "open", side_effect=volume_open):
+            connector._write_shared_table_state(state_path, table, 90)
+
+        self.assertTrue(informix_module.os.path.exists(state_path))
+
+    def test_future_schema_transition_state_fails_closed(self):
+        bridge = FakeBridge()
+        connector = self.connector(bridge)
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+        connector.read_table("app.orders", checkpoint, {})
+        table = Table.parse(bridge.tables[0], "demo")
+        _, state_path, _ = connector._shared_table_state_paths(table)
+        with open(state_path, encoding="utf-8") as handle:
+            state = json.load(handle)
+        state["schemas"][-1]["start_lsn"] = "999"
+        connector._write_shared_state(state_path, state)
+
+        with self.assertRaisesRegex(InformixError, "outside retained/current range"):
+            self.connector(bridge).read_table("app.orders", checkpoint, {})
+
+    def test_lagging_checkpoint_advances_one_schema_version_at_a_time(self):
+        bridge = FakeBridge()
+        _, checkpoint_a = self.connector(bridge).read_table("app.orders", {}, {})
+        bridge.tables[0]["columns"].append(
+            {"name": "added_b", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+        _, checkpoint_b = self.connector(bridge).read_table(
+            "app.orders", checkpoint_a, {}
+        )
+        bridge.tables[0]["columns"].append(
+            {"name": "added_c", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 140
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 140}]
+        _, checkpoint_c = self.connector(bridge).read_table(
+            "app.orders", checkpoint_b, {}
+        )
+
+        _, lagging_b = self.connector(bridge).read_table("app.orders", checkpoint_a, {})
+        _, lagging_c = self.connector(bridge).read_table("app.orders", lagging_b, {})
+
+        self.assertEqual(lagging_b["schema_fingerprint"], checkpoint_b["schema_fingerprint"])
+        self.assertEqual(lagging_b["commit_lsn"], "120")
+        self.assertEqual(lagging_c["schema_fingerprint"], checkpoint_c["schema_fingerprint"])
+        self.assertEqual(lagging_c["commit_lsn"], "140")
+
+    def test_incompatible_full_refresh_creates_independent_schema_generation(self):
+        bridge = FakeBridge()
+        _, old_checkpoint = self.connector(bridge).read_table("app.orders", {}, {})
+        bridge.tables[0]["columns"][1]["type_name"] = "INTEGER"
+        bridge.now = 150
+
+        refreshed = self.connector(bridge)
+        _, new_checkpoint = refreshed.read_table("app.orders", {}, {})
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 150}]
+        refreshed.read_table("app.orders", new_checkpoint, {})
+        refreshed.read_table("app.orders", new_checkpoint, {})
+
+        self.assertEqual(new_checkpoint["commit_lsn"], "150")
+        self.assertEqual(bridge.prepared_identities, ["demo:app.orders"])
+        table = Table.parse(bridge.tables[0], "demo")
+        _, state_path, _ = refreshed._shared_table_state_paths(table)
+        with open(state_path, encoding="utf-8") as handle:
+            generations = json.load(handle)["schemas"]
+        self.assertEqual([schema.get("predecessor") for schema in generations], [None, None])
+        with self.assertRaisesRegex(InformixError, "not an additive.*full refresh"):
+            self.connector(bridge).read_table("app.orders", old_checkpoint, {})
+
+    def test_full_refresh_of_evolved_layout_uses_its_transition_lsn(self):
+        bridge = FakeBridge()
+        _, checkpoint_a = self.connector(bridge).read_table("app.orders", {}, {})
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+        _, checkpoint_b = self.connector(bridge).read_table(
+            "app.orders", checkpoint_a, {}
+        )
+
+        _, refreshed_b = self.connector(bridge).read_table("app.orders", {}, {})
+
+        self.assertEqual(checkpoint_b["commit_lsn"], "120")
+        self.assertEqual(refreshed_b["commit_lsn"], "120")
+        self.assertEqual(refreshed_b["schema_id"], checkpoint_b["schema_id"])
+
+    def test_repeated_layout_creates_a_distinct_full_refresh_generation(self):
+        bridge = FakeBridge()
+        original = json.loads(json.dumps(bridge.tables[0]))
+        _, checkpoint_a1 = self.connector(bridge).read_table("app.orders", {}, {})
+        bridge.tables[0]["columns"][1]["type_name"] = "INTEGER"
+        bridge.now = 150
+        _, checkpoint_d = self.connector(bridge).read_table("app.orders", {}, {})
+        bridge.tables[0] = original
+        bridge.now = 200
+
+        _, checkpoint_a2 = self.connector(bridge).read_table("app.orders", {}, {})
+
+        self.assertEqual(
+            checkpoint_a2["schema_fingerprint"], checkpoint_a1["schema_fingerprint"]
+        )
+        self.assertNotEqual(checkpoint_a2["schema_id"], checkpoint_a1["schema_id"])
+        self.assertNotEqual(checkpoint_a2["schema_id"], checkpoint_d["schema_id"])
+        self.assertEqual(checkpoint_a2["commit_lsn"], "200")
+
+    def test_same_layout_new_table_incarnation_creates_new_generation(self):
+        bridge = FakeBridge()
+        bridge.tables[0]["incarnation"] = "101"
+        _, first = self.connector(bridge).read_table("app.orders", {}, {})
+        bridge.tables[0]["incarnation"] = "202"
+        bridge.now = 200
+
+        _, recreated = self.connector(bridge).read_table("app.orders", {}, {})
+
+        self.assertNotEqual(first["schema_fingerprint"], recreated["schema_fingerprint"])
+        self.assertNotEqual(first["schema_id"], recreated["schema_id"])
+        self.assertEqual(recreated["commit_lsn"], "200")
+
+    def test_legacy_migration_preserves_explicit_independent_roots(self):
+        table_a = Table.parse(_table(), "demo")
+        changed = _table()
+        changed["columns"][1]["type_name"] = "INTEGER"
+        table_d = Table.parse(changed, "demo")
+        legacy = {
+            "version": 1,
+            "schemas": [
+                {key: value for key, value in _schema_state(table_a, 90).items() if key != "id"},
+                {key: value for key, value in _schema_state(table_d, 150).items() if key != "id"},
+            ],
+        }
+
+        upgraded = _upgrade_legacy_schema_state(legacy)
+
+        self.assertIsNone(upgraded["schemas"][0]["predecessor"])
+        self.assertIsNone(upgraded["schemas"][1]["predecessor"])
+
+    def test_schema_history_is_not_limited_to_128_nodes(self):
+        table = Table.parse(_table(), "demo")
+        state = {
+            "schemas": [_schema_state(table, 90 + index) for index in range(129)]
+        }
+
+        _validate_schema_history(state, table)
+
+    def test_schema_history_seeding_retries_lock_contention(self):
+        bridge = FakeBridge()
+        connector = self.connector(bridge)
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        table = Table.parse(bridge.tables[0], "demo")
+        _, state_path, _ = connector._shared_table_state_paths(table)
+        with open(state_path, encoding="utf-8") as handle:
+            state = json.load(handle)
+        state["schemas"] = []
+        connector._write_shared_state(state_path, state)
+
+        acquire = connector._acquire_shared_state_lock
+        attempts = iter((False, True))
+
+        def contend_once(directory, lock_path):
+            return acquire(directory, lock_path) if next(attempts) else None
+
+        with mock.patch.object(
+            connector, "_acquire_shared_state_lock", side_effect=contend_once
+        ), mock.patch.object(informix_module.time, "sleep"):
+            connector.read_table("app.orders", checkpoint, {})
+
+        with open(state_path, encoding="utf-8") as handle:
+            seeded = json.load(handle)
+        self.assertEqual(
+            seeded["schemas"][0]["fingerprint"], checkpoint["schema_fingerprint"]
+        )
+
+    def test_upsert_reader_rebuilds_missing_shared_schema_state(self):
+        bridge = FakeBridge()
+        connector = self.connector(bridge)
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        table = Table.parse(bridge.tables[0], "demo")
+        _, state_path, _ = connector._shared_table_state_paths(table)
+        informix_module.os.unlink(state_path)
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 90}]
+
+        connector.read_table("app.orders", checkpoint, {})
+
+        with open(state_path, encoding="utf-8") as handle:
+            rebuilt = json.load(handle)
+        self.assertEqual(rebuilt["lsn"], checkpoint["commit_lsn"])
+        self.assertEqual(
+            rebuilt["schemas"][0]["fingerprint"], checkpoint["schema_fingerprint"]
+        )
+
+    def test_restart_rejects_non_additive_schema_change(self):
+        bridge = FakeBridge()
+        connector = self.connector(bridge)
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        bridge.tables[0]["columns"][1]["type_name"] = "INTEGER"
+
+        with self.assertRaisesRegex(InformixError, "not an additive.*full refresh"):
+            self.connector(bridge).read_table("app.orders", checkpoint, {})
 
     def test_stream_offset_rejects_previous_connector_format(self):
         connector = self.connector(FakeBridge())
@@ -1184,6 +1764,15 @@ class LakeflowContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "offset version.*full refresh"):
             connector.read_table("app.orders", legacy, {})
+
+        version_three = _stream_offset()
+        version_three["version"] = 3
+        with self.assertRaisesRegex(ValueError, "offset version 3.*full refresh"):
+            connector.read_table("app.orders", version_three, {})
+        version_four = _stream_offset()
+        version_four["version"] = 4
+        with self.assertRaisesRegex(ValueError, "offset version 4.*full refresh"):
+            connector.read_table("app.orders", version_four, {})
 
     def test_snapshot_continuation_rejects_schema_change_between_pages(self):
         bridge = FakeBridge()
@@ -1388,6 +1977,11 @@ class LakeflowContractTests(unittest.TestCase):
         reader = LakeflowStreamReader()
         reader.prepareForTriggerAvailableNow()
         reader.lakeflow_connect.prepare_for_trigger_available_now.assert_called_once_with()
+        first_scope = reader.lakeflow_connect.set_registration_scope.call_args.args[0]
+        second = LakeflowStreamReader()
+        second_scope = second.lakeflow_connect.set_registration_scope.call_args.args[0]
+        self.assertRegex(first_scope, r"^[0-9a-f]{32}$")
+        self.assertEqual(first_scope, second_scope)
 
     def test_canonically_generated_reader_executes_available_now_callback(self):
         generated = importlib.import_module(
@@ -1493,30 +2087,97 @@ class LakeflowContractTests(unittest.TestCase):
         changes, end = connector.read_table("app.orders", start, {})
 
         self.assertEqual(list(changes), [])
-        self.assertEqual(end, start)
+        self.assertEqual(end["commit_lsn"], start["commit_lsn"])
+        self.assertRegex(end["trigger_generation"], r"^[0-9a-f]{32}$")
 
-    def test_triggered_readers_freeze_independent_high_waters(self):
+    def test_triggered_readers_share_one_high_water(self):
         first_bridge = FakeBridge()
         first_bridge.now = 105
         second_bridge = FakeBridge()
         second_bridge.now = 110
-        common = {"hostname": "shared-boundary-test", "port": "9089", "user": "alice"}
+        common = {"port": "9089", "user": "alice"}
         first = self.connector(
             first_bridge, **common, tableName="app.orders", isDeleteFlow="false"
         )
         second = self.connector(
             second_bridge, **common, tableName="app.orders", isDeleteFlow="true"
         )
+        _, checkpoint = first.read_table("app.orders", {}, {})
         first.prepare_for_trigger_available_now()
+        first.read_table("app.orders", checkpoint, {})
         self.assertEqual(first._trigger_high_water, 105)
         second.prepare_for_trigger_available_now()
+        second.read_table_deletes("app.orders", checkpoint, {})
 
-        self.assertEqual(second._trigger_high_water, 110)
+        self.assertEqual(second._trigger_high_water, 105)
+        self.assertEqual(second._trigger_generation, first._trigger_generation)
         self.assertEqual(second_bridge.validated_initial, [])
 
         second_bridge.now = 120
         second.prepare_for_trigger_available_now()
-        self.assertEqual(second._trigger_high_water, 110)
+        self.assertEqual(second._trigger_high_water, 105)
+
+    def test_concurrent_pipelines_keep_trigger_boundaries_isolated(self):
+        seed_bridge = FakeBridge()
+        _, seed = self.connector(seed_bridge).read_table("app.orders", {}, {})
+        checkpoint_a = {**seed, "trigger_generation": "a" * 32}
+        checkpoint_b = {**seed, "trigger_generation": "b" * 32}
+
+        upsert_a_bridge = FakeBridge()
+        upsert_a_bridge.now = 105
+        upsert_a = self.connector(upsert_a_bridge, **{"pipeline.id": "pipeline-a"})
+        upsert_a.prepare_for_trigger_available_now()
+        upsert_a.read_table("app.orders", checkpoint_a, {})
+
+        upsert_b_bridge = FakeBridge()
+        upsert_b_bridge.now = 110
+        upsert_b = self.connector(upsert_b_bridge, **{"pipeline.id": "pipeline-b"})
+        upsert_b.prepare_for_trigger_available_now()
+        upsert_b.read_table("app.orders", checkpoint_b, {})
+
+        delete_a = self.connector(FakeBridge(), **{"pipeline.id": "pipeline-a"})
+        delete_a.prepare_for_trigger_available_now()
+        delete_a.read_table_deletes("app.orders", checkpoint_a, {})
+        delete_b = self.connector(FakeBridge(), **{"pipeline.id": "pipeline-b"})
+        delete_b.prepare_for_trigger_available_now()
+        delete_b.read_table_deletes("app.orders", checkpoint_b, {})
+
+        self.assertEqual(delete_a._trigger_high_water, 105)
+        self.assertEqual(delete_b._trigger_high_water, 110)
+        self.assertNotEqual(delete_a._trigger_generation, delete_b._trigger_generation)
+
+    def test_divergent_channel_checkpoints_share_current_update_boundary(self):
+        bridge = FakeBridge()
+        _, seed = self.connector(bridge).read_table("app.orders", {}, {})
+        upsert_checkpoint = {**seed, "trigger_generation": "a" * 32}
+        delete_checkpoint = {**seed, "trigger_generation": "b" * 32}
+        bridge.now = 125
+        upsert = self.connector(bridge)
+        upsert.prepare_for_trigger_available_now()
+        upsert.read_table("app.orders", upsert_checkpoint, {})
+        delete = self.connector(FakeBridge())
+        delete.prepare_for_trigger_available_now()
+        delete.read_table_deletes("app.orders", delete_checkpoint, {})
+
+        self.assertEqual(delete._trigger_high_water, 125)
+        self.assertEqual(delete._trigger_generation, upsert._trigger_generation)
+
+    def test_atomic_coordination_does_not_require_runtime_pipeline_update_identity(self):
+        bridge = FakeBridge()
+        bridge.now = 105
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 8, "lsn": 106},
+            {"op": "INSERT", "tx_id": 8, "lsn": 107, "row": {"id": 1}},
+            {"op": "COMMIT", "tx_id": 8, "lsn": 110},
+        ]
+        connector = self.connector(bridge)
+        connector.options.pop("pipeline.id")
+        connector.options.pop("pipeline.update.id")
+        connector.prepare_for_trigger_available_now()
+
+        _, checkpoint = connector.read_table("app.orders", _stream_offset(), {})
+
+        self.assertRegex(checkpoint["trigger_generation"], r"^[0-9a-f]{32}$")
 
     def test_continuous_stream_does_not_freeze_high_water(self):
         bridge = FakeBridge()

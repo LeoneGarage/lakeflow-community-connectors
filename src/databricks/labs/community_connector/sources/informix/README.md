@@ -58,7 +58,6 @@ connector deployment.
 | `max.records.per.batch` | No | `10000` | Target maximum projected CDC rows; minimum `1`. A complete transaction may exceed it. |
 | `cdc.timeout` | No | `5` | CDC idle-read timeout in seconds; minimum `1`. Zero is rejected because it can select an unbounded native wait. |
 | `cdc.shared.state.wait.seconds` | No | `300` | Maximum time a delete reader waits for its table's upsert reader to publish automatic initialization state. |
-| `cdc.shared.state.lock.stale.seconds` | No | `600` | Age after which an abandoned per-table initialization lock may be reclaimed. |
 | `cdc.max.records` | No | `64` | Soft native record target per CDC session; range `1`–`256`. Once reached, records continue until every transaction already observed commits, rolls back, or Informix returns TIMEOUT. |
 | `cdc.max.frame.bytes` | No | `16777216` | Maximum accepted native CDC frame size (16 MiB by default; minimum `16`). |
 | `cdc.max.transaction.records` | No | `100000` | Maximum records buffered in an open transaction. Exceeding it fails without emitting uncommitted data. |
@@ -279,6 +278,53 @@ Only complete committed transactions are emitted. Inserts and update after-image
 
 The framework does not pass snapshot offsets to independently instantiated delete streams. The connector therefore coordinates automatically through atomic per-table JSON records in `cdc.shared.state.location`. Only the upsert reader may enable full-row logging and publish a boundary; its delete reader waits and consumes that boundary. A retained record is safely reused after a full refresh. If it has fallen outside Informix log retention, the upsert reader atomically replaces it with a newly prepared boundary while delete readers wait. Corrupt, mismatched, partial, or inaccessible state fails closed.
 
+Shared-state locks use atomic lock directories and fail closed rather than
+reclaiming ownership on elapsed wall-clock time. This avoids two workers
+publishing state concurrently after a pause or clock skew. If a worker terminates
+while holding a lock, stop every pipeline using the connection, remove the
+reported `.lock` directory, and restart. Never remove it while a pipeline is active.
+Before its first lock, each worker runs a bounded, concurrent client-side probe
+of exclusive directory creation and rename visibility and fails before capture
+if those primitives are unavailable. This verifies that worker's mounted Volume
+client; deployment validation must still exercise concurrent serverless workers.
+Timeout errors include lock owner age, PID, path,
+and recovery instructions. Abandoned temporary and released-lock artifacts older
+than one hour are removed during later lock acquisition.
+
+Validate the same Volume from multiple Spark Python worker hosts before
+production use:
+
+```python
+from databricks.labs.community_connector.sources.informix.volume_concurrency_validation import (
+    validate_volume_concurrency,
+)
+
+validate_volume_concurrency(
+    spark,
+    "/Volumes/catalog/schema/volume/informix-state",
+)
+```
+
+The validator fails unless exactly one worker wins the shared `mkdir`, at least
+two worker hosts participate, and the subsequent rename is immediately visible.
+
+After stopping every pipeline using the connection, an abandoned lock can be
+removed with ownership verification using the exact path and token from the
+timeout error:
+
+```python
+from databricks.labs.community_connector.sources.informix.informix import (
+    recover_shared_state_lock,
+)
+
+recover_shared_state_lock(
+    "/Volumes/catalog/schema/volume/informix-state",
+    "/Volumes/catalog/schema/volume/informix-state/.../table.json.lock",
+    "<32-character-token-from-error>",
+    acknowledge_pipelines_stopped=True,
+)
+```
+
 Regenerate the deployable file with `bash src/databricks/labs/community_connector/sources/informix/generate_source.sh`. Informix-owned code wraps the generated reader base and installs the AvailableNow callback at class creation, so this output is identical to the repository's canonical merge command and needs no post-generation patch. The source-local tests use `*_test.py` names so the standard merger excludes them.
 
 Delivery is at least once. A failure after rows are returned but before Lakeflow commits its checkpoint can replay them. `TRUNCATE` cannot be represented by keyed Lakeflow deletes and fails explicitly. Snapshot-only tables are fully reread and fail when they exceed `snapshot.max.rows`.
@@ -287,9 +333,54 @@ The connector adds `_informix_change_lsn`, `_informix_commit_lsn`, `_informix_tx
 
 ### Checkpoints and log retention
 
-During snapshot, Lakeflow checkpoints the connector offset version, pre-snapshot LSN, last primary-key values, and a source-schema fingerprint. Streaming checkpoints the version, `commit_lsn`, `change_lsn`, the oldest required `begin_lsn`, and the fingerprint; retaining the begin position is necessary for interleaved transactions. Data and delete channels have separate checkpoints and replay the source independently. A missing/unsupported offset version or a missing/changed fingerprint fails closed and requires a full refresh. This connector intentionally does not resume checkpoints written before offset version 2.
+During snapshot, Lakeflow checkpoints the connector offset version, snapshot LSN, last primary-key values, a source-schema fingerprint, a generation-specific schema node ID, and a pipeline scope. A completed consistent snapshot publishes its fresh resume LSN for both independently instantiated channels, so a full refresh never replays older retained transactions or historical `TRUNCATE` records. Streaming checkpoints the version, `commit_lsn`, `change_lsn`, the oldest required `begin_lsn`, fingerprint, schema node ID, pipeline scope, and triggered-update generation; retaining the begin position is necessary for interleaved transactions. Triggered upsert and delete readers use one atomically published per-table high-water LSN rather than sampling independently. The generated source creates one random registration scope before Spark serializes its readers. Every upsert and delete reader receives that same value, records it in its first offset, and thereafter prefers the durable checkpoint value across driver and worker restarts. Snapshot and trigger records are keyed by this scope, isolating concurrently registered pipelines without requiring Lakeflow to expose pipeline or update IDs to Python workers. The node ID distinguishes separate table generations that happen to have identical layouts. Data and delete channels have separate checkpoints and replay the source independently. A missing or unsupported offset version fails closed and requires a full refresh. A changed fingerprint enters the additive schema transition described below. Offset version 6 introduces the durable registration scope; earlier checkpoints require a full refresh. Shared-state version 5 removes boundaries from earlier unscoped formats while preserving schema history.
 
 An idle timeout returns no rows and leaves the checkpoint unchanged. Incomplete or open transactions do not advance it. If the restart LSN predates the minimum retained logical log in `sysmaster:syslogs`, continuation fails and the table must be resnapshotted. Every CDC session validates its initial METADATA frame against a fresh catalog layout before decoding later records; another METADATA frame in that session fails immediately and requires a full refresh.
+
+### Additive schema evolution without full refresh
+
+A normal pipeline restart can evolve an existing CDC table when nullable,
+CDC-supported columns are appended at the end of the Informix table. Existing
+columns must retain their names, order, types, nullability, widths, precision,
+and scale, and the primary key must remain unchanged. Drops, renames, reorders,
+type changes, non-nullable additions, unsupported types, and primary-key changes
+still require a full refresh.
+
+Informix rejects `ALTER TABLE` while full-row logging is enabled. Stop every
+pipeline using this connection, then quiesce source writes before the DDL
+sequence and keep them quiesced until the restarted Lakeflow update completes
+its schema transition. Disable full-row logging,
+apply the additive DDL, immediately re-enable logging, and restart the pipeline
+normally—do not request a full refresh. For example:
+
+```sql
+EXECUTE FUNCTION syscdcv1:cdc_set_fullrowlogging(
+  'testdb:informix.members', 0
+);
+ALTER TABLE informix.members ADD new_nullable_column VARCHAR(64);
+EXECUTE FUNCTION syscdcv1:cdc_set_fullrowlogging(
+  'testdb:informix.members', 1
+);
+```
+
+The shared Volume state stores predecessor-linked schema generations, the
+Informix catalog table ID for incarnation detection, and one
+transition LSN per additive step. Lagging pipelines advance one recorded schema
+at a time instead of skipping intermediate layouts. An incompatible full
+refresh creates a new root generation while retaining older descriptors for
+other pipelines. Both upsert and delete readers drain the previous descriptor,
+checkpoint the transition, and then capture with the expanded descriptor.
+Lakeflow retains its checkpoints and Delta adds the new column.
+Rows captured through the old descriptor are emitted with `NULL` for the new
+column. Resume source writes only after the transition update completes, then
+update or backfill the new column if existing rows need values. A transaction
+that spans the transition fails closed. Run the connector once after upgrading from a version without
+schema history and before applying DDL so the current checkpoint descriptor is
+seeded in shared state.
+
+History is bounded by the one-MiB serialized state limit rather than a fixed
+number of schema nodes. If that limit is reached, stop all pipelines using the
+connection, configure a new shared-state location, and perform full refreshes.
 
 ## Table configuration
 

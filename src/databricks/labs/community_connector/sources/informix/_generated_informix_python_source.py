@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal, localcontext
@@ -56,11 +57,13 @@ from pyspark.sql.types import (
     VariantVal,
 )
 import base64
+import errno
 import fnmatch
 import hashlib
 import importlib
 import ipaddress
 import math
+import secrets
 import socket
 import ssl
 import struct
@@ -2637,6 +2640,121 @@ def register_lakeflow_source(spark):
 
 
     ########################################################
+    # src/databricks/labs/community_connector/sources/informix/volume_concurrency_validation.py
+    ########################################################
+
+    def validate_volume_concurrency(
+        spark: Any, location: str, *, workers: int = 16, minimum_hosts: int = 2
+    ) -> list[dict[str, object]]:
+        """Require one mkdir winner across multiple Spark Python worker hosts.
+
+        Run this from a Databricks compute environment that matches the target
+        pipeline. The supplied location must be a writable Unity Catalog Volume.
+        """
+
+        if workers < 2:
+            raise ValueError("workers must be >= 2")
+        root = os.path.join(location.rstrip("/"), f".informix-distributed-{secrets.token_hex(8)}")
+        contender = os.path.join(root, "exclusive")
+        renamed = os.path.join(root, "renamed")
+        os.makedirs(root, mode=0o700)
+        def compete(batches: Iterator[Any]) -> Iterator[Any]:
+            import pandas as pd
+
+            rows = []
+            for batch in batches:
+                for task_id in batch["task_id"]:
+                    try:
+                        os.mkdir(contender, mode=0o700)
+                        won = True
+                    except FileExistsError:
+                        won = False
+                    rows.append(
+                        {
+                            "host": socket.gethostname(),
+                            "pid": os.getpid(),
+                            "task_id": int(task_id),
+                            "won": won,
+                        }
+                    )
+            yield pd.DataFrame(rows)
+
+        try:
+            frame = spark.createDataFrame([(index,) for index in range(workers)], ["task_id"])
+            result = (
+                frame.repartition(workers)
+                .mapInPandas(
+                    compete,
+                    "host string, pid long, task_id long, won boolean",
+                )
+                .collect()
+            )
+            records = [row.asDict(recursive=True) for row in result]
+            winners = [record for record in records if record["won"]]
+            hosts = {str(record["host"]) for record in records}
+            if len(winners) != 1:
+                raise RuntimeError(
+                    f"Volume exclusive mkdir had {len(winners)} winners across {len(records)} tasks"
+                )
+            if len(hosts) < minimum_hosts:
+                raise RuntimeError(
+                    f"Validation used {len(hosts)} worker host(s), fewer than {minimum_hosts}"
+                )
+            os.rename(contender, renamed)
+            if os.path.exists(contender) or not os.path.isdir(renamed):
+                raise RuntimeError("Volume rename was not immediately visible to the driver")
+            marker = os.path.join(renamed, "visible")
+            with open(marker, "x", encoding="utf-8") as handle:
+                handle.write("visible")
+
+            def observe(batches: Iterator[Any]) -> Iterator[Any]:
+                import pandas as pd
+
+                rows = []
+                for batch in batches:
+                    for task_id in batch["task_id"]:
+                        rows.append(
+                            {
+                                "host": socket.gethostname(),
+                                "task_id": int(task_id),
+                                "visible": (
+                                    not os.path.exists(contender)
+                                    and os.path.isdir(renamed)
+                                    and os.path.isfile(marker)
+                                ),
+                            }
+                        )
+                yield pd.DataFrame(rows)
+
+            observed = (
+                frame.repartition(workers)
+                .mapInPandas(observe, "host string, task_id long, visible boolean")
+                .collect()
+            )
+            if not observed or any(not row["visible"] for row in observed):
+                raise RuntimeError("Volume rename was not immediately visible to every worker")
+            observed_hosts = {str(row["host"]) for row in observed}
+            if len(observed_hosts) < minimum_hosts:
+                raise RuntimeError(
+                    "Rename validation did not execute on the required number of worker hosts"
+                )
+            return records
+        finally:
+            try:
+                os.unlink(os.path.join(renamed, "visible"))
+            except OSError:
+                pass
+            for path in (renamed, contender, root):
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    pass
+
+
+    __all__ = ["validate_volume_concurrency"]
+
+
+    ########################################################
     # src/databricks/labs/community_connector/sources/informix/informix.py
     ########################################################
 
@@ -2646,17 +2764,21 @@ def register_lakeflow_source(spark):
     OP = "_informix_op"
     _INTERNAL_COLUMNS = (CURSOR, COMMIT_LSN, TX_ID, OP)
     _LSN_DECIMAL_WIDTH = 20
-    _OFFSET_VERSION = 2
+    _OFFSET_VERSION = 6
     _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
     _DATA_OPS = {"INSERT", "BEFORE_UPDATE", "AFTER_UPDATE", "DELETE", "TRUNCATE"}
     _DEFAULT_SNAPSHOT_PAGE_SIZE = 10000
     _DEFAULT_MAX_RECORDS_PER_BATCH = 10000
-    _SHARED_STATE_VERSION = 1
+    _SHARED_STATE_VERSION = 5
     _SHARED_STATE_WAIT_SECONDS = 300
-    _SHARED_STATE_LOCK_STALE_SECONDS = 600
+    _MAX_SHARED_STATE_BYTES = 1 << 20
+    _ARTIFACT_RETENTION_SECONDS = 3600
+    _VALIDATED_STATE_LOCATIONS: set[str] = set()
 
     def _informix_available_now_base(base: type) -> type:
         """Wrap the generated reader base without changing the shared adapter source."""
+
+        registration_scope = secrets.token_hex(16)
 
         class InformixAvailableNowBase(base):
             _informix_available_now_wrapper = True
@@ -2666,6 +2788,14 @@ def register_lakeflow_source(spark):
                 if cls.__name__ != "LakeflowStreamReader":
                     return
 
+                original_init = cls.__init__
+
+                def initialize(reader, *args, **kwargs) -> None:
+                    original_init(reader, *args, **kwargs)
+                    setter = getattr(reader.lakeflow_connect, "set_registration_scope", None)
+                    if setter is not None:
+                        setter(registration_scope)
+
                 def prepare_for_trigger(reader) -> None:
                     prepare = getattr(
                         reader.lakeflow_connect, "prepare_for_trigger_available_now", None
@@ -2674,6 +2804,7 @@ def register_lakeflow_source(spark):
                         prepare()
 
                 cls.prepareForTriggerAvailableNow = prepare_for_trigger
+                cls.__init__ = initialize
 
         return InformixAvailableNowBase
 
@@ -2861,9 +2992,18 @@ def register_lakeflow_source(spark):
                     for column in value["descriptors"]
                 }
 
-            if set(refreshed["columns"]) != set(capture["columns"]) or layout(
-                refreshed
-            ) != layout(capture):
+            capture_columns = list(capture["columns"])
+            refreshed_columns = list(refreshed["columns"])
+            refreshed_layout = layout(refreshed)
+            capture_layout = layout(capture)
+            prefix_is_unchanged = (
+                refreshed_columns[: len(capture_columns)] == capture_columns
+                and all(
+                    refreshed_layout.get(column) == capture_layout[column]
+                    for column in capture_columns
+                )
+            )
+            if not prefix_is_unchanged:
                 raise InformixError(
                     f"Informix schema changed for {native!r} during CDC; "
                     "run a full refresh before decoding additional records"
@@ -2871,7 +3011,7 @@ def register_lakeflow_source(spark):
 
         def _describe_table(self, owner: str, name: str) -> dict[str, Any]:
             columns = self.transport.execute(
-                "SELECT c.colname, c.coltype, c.collength, c.colno "
+                "SELECT c.colname, c.coltype, c.collength, c.colno, t.tabid "
                 "FROM systables t JOIN syscolumns c ON t.tabid = c.tabid "
                 "WHERE t.owner = ? AND t.tabname = ? ORDER BY c.colno",
                 (owner, name),
@@ -2910,12 +3050,23 @@ def register_lakeflow_source(spark):
                     column_number = int(_field(keys[0], f"part{position + 1}", position))
                     if column_number > 0:
                         primary_keys.append(by_number[column_number])
+            try:
+                tabid = int(_field(columns[0], "tabid", 4))
+            except (IndexError, KeyError, TypeError, ValueError) as error:
+                raise InformixError(
+                    f"Informix catalog metadata for {owner}.{name} is missing tabid"
+                ) from error
+            if tabid <= 0:
+                raise InformixError(
+                    f"Informix catalog metadata for {owner}.{name} has invalid tabid {tabid}"
+                )
             return {
                 "database": self.config["database"],
                 "owner": owner,
                 "name": name,
                 "columns": parsed_columns,
                 "primary_keys": primary_keys,
+                "incarnation": str(tabid),
             }
 
         def current_lsn(self) -> int:
@@ -3344,7 +3495,151 @@ def register_lakeflow_source(spark):
             raise ValueError("Missing required Informix option: cdc.shared.state.location")
         if not os.path.isabs(location):
             raise ValueError("Option 'cdc.shared.state.location' must be an absolute path")
-        return location.rstrip("/")
+        normalized = os.path.normpath(location)
+        if normalized != location.rstrip("/") or any(
+            part in {".", ".."} for part in location.split("/")
+        ):
+            raise ValueError("Option 'cdc.shared.state.location' must not contain traversal")
+        if options.get("hostname"):
+            parts = normalized.split("/")
+            if len(parts) < 5 or parts[1] != "Volumes" or any(not part for part in parts[2:5]):
+                raise ValueError(
+                    "Option 'cdc.shared.state.location' must be a Unity Catalog Volume path under "
+                    "/Volumes/<catalog>/<schema>/<volume>"
+                )
+        return normalized
+
+
+    def _validate_shared_state_filesystem(location: str) -> None:
+        """Probe the filesystem primitives required for cross-reader coordination once."""
+
+        if location in _VALIDATED_STATE_LOCATIONS:
+            return
+        _cleanup_probe_artifacts(location)
+        probe_root = os.path.join(location, f".informix-probe-{secrets.token_hex(8)}")
+        contender = os.path.join(probe_root, "exclusive")
+        renamed = os.path.join(probe_root, "renamed")
+        try:
+            os.makedirs(probe_root, mode=0o700)
+            barrier = threading.Barrier(8, timeout=5)
+            winners: list[int] = []
+            failures: list[BaseException] = []
+
+            def compete(index: int) -> None:
+                try:
+                    barrier.wait()
+                    os.mkdir(contender, mode=0o700)
+                    winners.append(index)
+                except FileExistsError:
+                    return
+                except BaseException as error:  # surfaced on the caller thread
+                    failures.append(error)
+
+            threads = [
+                threading.Thread(target=compete, args=(index,), daemon=True)
+                for index in range(8)
+            ]
+            started: list[threading.Thread] = []
+            try:
+                for thread in threads:
+                    thread.start()
+                    started.append(thread)
+            except RuntimeError as error:
+                barrier.abort()
+                failures.append(error)
+            for thread in started:
+                thread.join(timeout=6)
+            if any(thread.is_alive() for thread in started):
+                barrier.abort()
+                raise InformixError("Informix shared-state filesystem probe timed out")
+            if failures or len(winners) != 1:
+                raise InformixError(
+                    "cdc.shared.state.location does not provide exclusive directory creation"
+                ) from (failures[0] if failures else None)
+            os.rename(contender, renamed)
+            if os.path.exists(contender) or not os.path.isdir(renamed):
+                raise InformixError(
+                    "cdc.shared.state.location does not provide atomic directory rename"
+                )
+            # A duplicate concurrent probe is harmless because every probe uses a
+            # unique directory. Avoid retaining a process lock in the generated
+            # source closure: Spark must pickle the DataSource class for workers.
+            _VALIDATED_STATE_LOCATIONS.add(location)
+        except OSError as error:
+            raise InformixError(
+                f"Cannot validate Informix shared-state filesystem at '{location}'"
+            ) from error
+        finally:
+            for path in (renamed, contender, probe_root):
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    pass
+
+
+    def _cleanup_probe_artifacts(location: str) -> None:
+        cutoff = time.time() - _ARTIFACT_RETENTION_SECONDS
+        try:
+            entries = list(os.scandir(location))
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise InformixError(
+                f"Cannot inspect Informix shared-state location '{location}'"
+            ) from error
+        for entry in entries:
+            try:
+                if (
+                    not entry.name.startswith(".informix-probe-")
+                    or not entry.is_dir(follow_symlinks=False)
+                    or entry.stat(follow_symlinks=False).st_mtime > cutoff
+                ):
+                    continue
+                for child_name in ("exclusive", "renamed"):
+                    try:
+                        os.rmdir(os.path.join(entry.path, child_name))
+                    except FileNotFoundError:
+                        pass
+                os.rmdir(entry.path)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise InformixError(
+                    f"Cannot clean abandoned Informix probe '{entry.path}'"
+                ) from error
+
+
+    def recover_shared_state_lock(
+        state_location: str,
+        lock_path: str,
+        expected_token: str,
+        *,
+        acknowledge_pipelines_stopped: bool,
+    ) -> None:
+        """Remove one abandoned lock after explicit, ownership-checked operator recovery."""
+
+        location = os.path.normpath(state_location)
+        path = os.path.normpath(lock_path)
+        if not acknowledge_pipelines_stopped:
+            raise ValueError("Lock recovery requires acknowledgement that all pipelines are stopped")
+        if os.path.commonpath((location, path)) != location or not path.endswith(".lock"):
+            raise ValueError("Lock path must be a .lock directory under the shared-state location")
+        if not re.fullmatch(r"[0-9a-f]{32}", expected_token):
+            raise ValueError("expected_token must be the 32-character owner token")
+        owner_path = os.path.join(path, "owner.json")
+        try:
+            with open(owner_path, encoding="utf-8") as handle:
+                owner = json.load(handle)
+            if not isinstance(owner, dict) or owner.get("token") != expected_token:
+                raise InformixError("Shared-state lock owner token changed; recovery aborted")
+            tombstone = f"{path}.{expected_token}.recovered"
+            os.rename(path, tombstone)
+            os.unlink(os.path.join(tombstone, "owner.json"))
+            os.rmdir(tombstone)
+        except FileNotFoundError as error:
+            raise InformixError(f"Shared-state lock '{path}' no longer exists") from error
+        except (OSError, json.JSONDecodeError) as error:
+            raise InformixError(f"Cannot recover shared-state lock '{path}'") from error
 
 
     def _redirect_allowlist(value: str) -> frozenset[tuple[str, int]]:
@@ -3387,6 +3682,7 @@ def register_lakeflow_source(spark):
         name: str
         columns: tuple[Column, ...]
         primary_keys: tuple[str, ...]
+        incarnation: str | None = None
 
         @property
         def exposed_name(self) -> str:
@@ -3432,7 +3728,9 @@ def register_lakeflow_source(spark):
             known = {c.name for c in columns}
             if not columns or any(pk not in known for pk in pks):
                 raise InformixError(f"Invalid metadata for {database}.{owner}.{name}")
-            return cls(database, owner, name, columns, pks)
+            incarnation_value = raw.get("incarnation")
+            incarnation = None if incarnation_value is None else str(incarnation_value)
+            return cls(database, owner, name, columns, pks, incarnation)
 
 
     @dataclass
@@ -3567,7 +3865,6 @@ def register_lakeflow_source(spark):
                 ("authentication.pam.max.rounds", "16", 1),
                 ("redirect.max", "3", 0),
                 ("cdc.shared.state.wait.seconds", str(_SHARED_STATE_WAIT_SECONDS), 1),
-                ("cdc.shared.state.lock.stale.seconds", str(_SHARED_STATE_LOCK_STALE_SECONDS), 1),
             ):
                 if int(options.get(name, default)) < minimum:
                     raise ValueError(f"Option '{name}' must be >= {minimum}")
@@ -3584,15 +3881,35 @@ def register_lakeflow_source(spark):
             self._bridge_instance: InformixBridge | None = None
             self._tables: dict[str, Table] | None = None
             self._snapshot_high_water: dict[str, int] = {}
+            self._snapshot_schema_ids: dict[str, str] = {}
             self._trigger_available_now = False
             self._trigger_high_water: int | None = None
+            self._trigger_generation: str | None = None
+            configured_scope = str(options.get("pipeline.id", ""))
+            self._registration_scope = (
+                hashlib.sha256(configured_scope.encode()).hexdigest()[:32]
+                if configured_scope
+                else None
+            )
+
+        def set_registration_scope(self, scope: str) -> None:
+            """Install the UUID shared by every reader serialized from one registration."""
+
+            if not re.fullmatch(r"[0-9a-f]{32}", scope):
+                raise ValueError("Informix registration scope must be a 32-character UUID")
+            self._registration_scope = scope
+
+        def _pipeline_scope(self, checkpoint: dict[str, Any] | None = None) -> str:
+            scope = checkpoint.get("pipeline_scope") if checkpoint else None
+            scope = scope or self._registration_scope
+            if not isinstance(scope, str) or not re.fullmatch(r"[0-9a-f]{32}", scope):
+                raise InformixError("Informix reader has no registration or checkpoint scope")
+            return scope
 
         def prepare_for_trigger_available_now(self) -> None:
             """Freeze stream high-water marks when Spark selects AvailableNow."""
 
             self._trigger_available_now = True
-            if self._trigger_high_water is None:
-                self._trigger_high_water = self._bridge.current_lsn()
 
         def close(self) -> None:
             """Close the live SQLI transport, if one was opened."""
@@ -3697,7 +4014,14 @@ def register_lakeflow_source(spark):
             if not start_offset:
                 high_water = self._initial_lsn(table, owner=False)
                 return iter(()), _offset(
-                    high_water, high_water, high_water, None, "stream", table
+                    high_water,
+                    high_water,
+                    high_water,
+                    None,
+                    "stream",
+                    table,
+                    self._snapshot_schema_ids[table.identity],
+                    self._pipeline_scope(),
                 )
             if start_offset.get("phase") == "snapshot":
                 snapshot_checkpoint = _validated_offset(start_offset)
@@ -3709,11 +4033,21 @@ def register_lakeflow_source(spark):
                     )
                 table = self._refresh_table_schema(table, expected)
                 high_water = int(start_offset.get("snapshot_lsn", start_offset.get("commit_lsn", 0)))
-                start_offset = _offset(high_water, high_water, high_water, None, "stream", table)
+                start_offset = _offset(
+                    high_water,
+                    high_water,
+                    high_water,
+                    None,
+                    "stream",
+                    table,
+                    str(snapshot_checkpoint["schema_id"]),
+                    self._pipeline_scope(snapshot_checkpoint),
+                )
             return self._read_stream(table, start_offset, table_options, deletes=True)
 
         def _read_snapshot(self, table: Table, start: dict | None, options: dict[str, str]):
             checkpoint = _validated_offset(start) if start else None
+            pipeline_scope = self._pipeline_scope(checkpoint)
             if checkpoint and checkpoint.get("schema_fingerprint") is None:
                 raise InformixError(
                     f"Informix snapshot checkpoint for '{table.exposed_name}' predates "
@@ -3731,9 +4065,11 @@ def register_lakeflow_source(spark):
             )
             if checkpoint:
                 high_water = int(checkpoint["snapshot_lsn"])
+                schema_id = str(checkpoint["schema_id"])
                 last_pk = checkpoint["snapshot"]["last_pk"]
             else:
                 high_water = self._initial_lsn(table)
+                schema_id = self._snapshot_schema_ids[table.identity]
                 last_pk = None
                 consistent_snapshot = getattr(self._bridge, "consistent_snapshot", None)
                 if consistent_snapshot is not None:
@@ -3751,9 +4087,22 @@ def register_lakeflow_source(spark):
                         ),
                     )
                     table = self._refresh_table_schema(table, _schema_fingerprint(table))
-                    return iter(_shape_snapshot(row, snapshot_lsn) for row in rows), _offset(
-                        high_water, high_water, high_water, None, "stream", table
+                    self._publish_snapshot_boundary(
+                        table, schema_id, high_water, snapshot_lsn, pipeline_scope
                     )
+                    return iter(_shape_snapshot(row, snapshot_lsn) for row in rows), _offset(
+                        snapshot_lsn,
+                        snapshot_lsn,
+                        snapshot_lsn,
+                        None,
+                        "stream",
+                        table,
+                        schema_id,
+                        pipeline_scope,
+                    )
+                self._publish_snapshot_boundary(
+                    table, schema_id, high_water, high_water, pipeline_scope
+                )
             rows = self._bridge.snapshot_page(
                 table.identity,
                 [c.name for c in table.columns],
@@ -3768,10 +4117,28 @@ def register_lakeflow_source(spark):
                 if not page:
                     raise InformixError("Snapshot bridge returned an invalid empty continuation page")
                 last = [page[-1][pk] for pk in table.primary_keys]
-                end = _offset(high_water, high_water, high_water, None, "snapshot", table)
+                end = _offset(
+                    high_water,
+                    high_water,
+                    high_water,
+                    None,
+                    "snapshot",
+                    table,
+                    schema_id,
+                    pipeline_scope,
+                )
                 end.update({"snapshot_lsn": str(high_water), "snapshot": {"last_pk": last}})
             else:
-                end = _offset(high_water, high_water, high_water, None, "stream", table)
+                end = _offset(
+                    high_water,
+                    high_water,
+                    high_water,
+                    None,
+                    "stream",
+                    table,
+                    schema_id,
+                    pipeline_scope,
+                )
             return iter(shaped), end
 
         def _read_snapshot_only(self, table: Table, start: dict | None, options: dict[str, str]):
@@ -3794,47 +4161,84 @@ def register_lakeflow_source(spark):
 
         def _read_stream(self, table: Table, start: dict, options: dict[str, str], deletes: bool):
             checkpoint = _validated_offset(start)
-            table = self._refresh_table_schema(table, checkpoint.get("schema_fingerprint"))
+            pipeline_scope = self._pipeline_scope(checkpoint)
+            table = self._refresh_table_schema(table, None)
             fingerprint = _schema_fingerprint(table)
             checkpoint_fingerprint = checkpoint.get("schema_fingerprint")
+            checkpoint_schema_id = str(checkpoint["schema_id"])
             if checkpoint_fingerprint is None:
                 raise InformixError(
                     f"Informix checkpoint for '{table.exposed_name}' predates schema-safe offsets; "
                     "run a full refresh before resuming CDC"
                 )
-            if checkpoint_fingerprint != fingerprint:
-                raise InformixError(
-                    f"Informix schema changed for '{table.exposed_name}' since its CDC checkpoint; "
-                    "run a full refresh so retained records are not decoded with a new layout"
-                )
             restart = int(checkpoint.get("begin_lsn") or checkpoint["commit_lsn"])
-            max_rows = self._table_int_option(
-                options, "max.records.per.batch", _DEFAULT_MAX_RECORDS_PER_BATCH, minimum=1
-            )
-            stop_lsn: int | None = None
-            if self._trigger_available_now:
-                if self._trigger_high_water is None:
-                    self._trigger_high_water = self._bridge.current_lsn()
-                stop_lsn = self._trigger_high_water
             minimum = self._bridge.minimum_lsn()
             if restart < minimum:
                 raise LogRetentionError(
                     f"Restart LSN {restart} is older than minimum retained LSN "
                     f"{minimum}; resnapshot required"
                 )
+            capture_table = table
+            transition_table = table
+            transition_lsn: int | None = None
+            capture_schema_id = checkpoint_schema_id
+            transition_schema_id = checkpoint_schema_id
+            if checkpoint_fingerprint != fingerprint:
+                (
+                    capture_table,
+                    transition_table,
+                    transition_lsn,
+                    transition_schema_id,
+                ) = self._schema_transition(
+                    table,
+                    checkpoint_schema_id,
+                    int(checkpoint["commit_lsn"]),
+                    owner=not deletes,
+                )
+            else:
+                self._record_current_schema(
+                    table,
+                    int(checkpoint["commit_lsn"]),
+                    checkpoint_schema_id,
+                    owner=not deletes,
+                )
+            max_rows = self._table_int_option(
+                options, "max.records.per.batch", _DEFAULT_MAX_RECORDS_PER_BATCH, minimum=1
+            )
+            stop_lsn: int | None = None
+            trigger_generation: str | None = None
+            if self._trigger_available_now:
+                stop_lsn, trigger_generation = self._shared_trigger_boundary(
+                    table, checkpoint, owner=not deletes
+                )
+            if transition_lsn is not None:
+                stop_lsn = transition_lsn if stop_lsn is None else min(stop_lsn, transition_lsn)
             raw_records = self._bridge.read_changes(
-                [_capture_descriptor(table, _client_encoding(self.options))],
+                [_capture_descriptor(capture_table, _client_encoding(self.options))],
                 restart,
                 self._table_int_option(options, "cdc.timeout", 5, minimum=1),
                 self._table_int_option(options, "cdc.max.records", 64, minimum=1, maximum=256),
             )
             table = self._refresh_table_schema(table, fingerprint)
-            committed = _committed_transactions(raw_records)
+            committed, caught_up, open_begin = _transaction_batch(raw_records)
             recovered = _recover(committed, checkpoint)
             output: list[dict[str, Any]] = []
             end = start
+            consumed = 0
+            crossed_transition = False
+            crossed_trigger_boundary = False
             for tx in recovered:
+                if transition_lsn is not None and tx.commit_lsn > transition_lsn:
+                    if tx.begin_lsn < transition_lsn:
+                        raise InformixError(
+                            f"Transaction {tx.tx_id} spans schema transition LSN "
+                            f"{transition_lsn} for '{table.exposed_name}'; keep source writes "
+                            "quiesced until schema transition completes or run a full refresh"
+                        )
+                    crossed_transition = True
+                    break
                 if stop_lsn is not None and tx.commit_lsn > stop_lsn:
+                    crossed_trigger_boundary = True
                     break
                 projected = _project_transaction(tx, table, deletes)
                 # Never split a transaction.  A single large transaction is
@@ -3842,12 +4246,374 @@ def register_lakeflow_source(spark):
                 if output and len(output) + len(projected) > max_rows:
                     break
                 output.extend(projected)
+                consumed += 1
                 end = _offset(
-                    tx.commit_lsn, tx.commit_lsn, tx.restart_lsn, tx.tx_id, "stream", table
+                    tx.commit_lsn,
+                    tx.commit_lsn,
+                    tx.restart_lsn,
+                    tx.tx_id,
+                    "stream",
+                    capture_table,
+                    capture_schema_id,
+                    pipeline_scope,
+                    trigger_generation=checkpoint.get("trigger_generation"),
                 )
                 if len(output) >= max_rows:
                     break
+            if (
+                transition_lsn is not None
+                and crossed_transition
+                and open_begin is not None
+                and open_begin < transition_lsn
+            ):
+                raise InformixError(
+                    f"An open transaction beginning at LSN {open_begin} spans schema transition "
+                    f"LSN {transition_lsn} for '{table.exposed_name}'; keep source writes "
+                    "quiesced until schema transition completes or run a full refresh"
+                )
+            if (
+                transition_lsn is not None
+                and (self._trigger_high_water is None or transition_lsn <= self._trigger_high_water)
+                and (
+                    (caught_up and consumed == len(recovered))
+                    or (
+                        crossed_transition
+                        and (open_begin is None or open_begin >= transition_lsn)
+                    )
+                )
+            ):
+                end = _offset(
+                    transition_lsn,
+                    transition_lsn,
+                    transition_lsn,
+                    None,
+                    "stream",
+                    transition_table,
+                    transition_schema_id,
+                    pipeline_scope,
+                    trigger_generation=checkpoint.get("trigger_generation"),
+                )
+            reached_trigger_boundary = trigger_generation is not None and (
+                crossed_trigger_boundary or (caught_up and consumed == len(recovered))
+            )
+            if reached_trigger_boundary:
+                end = dict(end)
+                end["trigger_generation"] = trigger_generation
             return iter(output), end
+
+        def _record_current_schema(
+            self,
+            table: Table,
+            checkpoint_lsn: int,
+            checkpoint_schema_id: str,
+            *,
+            owner: bool,
+        ) -> None:
+            directory, state_path, lock_path = self._shared_table_state_paths(table)
+            if not owner:
+                return
+            deadline = time.monotonic() + int(
+                self.options.get(
+                    "cdc.shared.state.wait.seconds", str(_SHARED_STATE_WAIT_SECONDS)
+                )
+            )
+            while True:
+                state = self._read_shared_table_state(state_path, table)
+                if state is not None and _state_schema(
+                    state, _schema_fingerprint(table), schema_id=checkpoint_schema_id
+                ) is not None:
+                    return
+                lock_token = self._acquire_shared_state_lock(directory, lock_path)
+                if lock_token is not None:
+                    try:
+                        state = self._read_shared_table_state(state_path, table)
+                        if state is None:
+                            minimum, current = (
+                                self._bridge.minimum_lsn(),
+                                self._bridge.current_lsn(),
+                            )
+                            if not minimum <= checkpoint_lsn <= current:
+                                raise InformixError(
+                                    f"Cannot rebuild shared schema state for "
+                                    f"'{table.exposed_name}' from checkpoint LSN {checkpoint_lsn}; "
+                                    f"retained/current range is [{minimum}, {current}]"
+                                )
+                            self._bridge.validate_initial_lsn(
+                                _capture_descriptor(table, _client_encoding(self.options)),
+                                checkpoint_lsn,
+                            )
+                            node = _schema_state(
+                                table, checkpoint_lsn, schema_id=checkpoint_schema_id
+                            )
+                            self._renew_shared_state_lock(lock_path, lock_token)
+                            self._write_shared_table_state(
+                                state_path, table, checkpoint_lsn, node
+                            )
+                            return
+                        if _state_schema(
+                            state,
+                            _schema_fingerprint(table),
+                            schema_id=checkpoint_schema_id,
+                        ) is not None:
+                            return
+                        schemas = list(state.get("schemas", []))
+                        schemas.append(
+                            _schema_state(
+                                table, checkpoint_lsn, schema_id=checkpoint_schema_id
+                            )
+                        )
+                        state["schemas"] = schemas
+                        state["active_schema_id"] = checkpoint_schema_id
+                        self._renew_shared_state_lock(lock_path, lock_token)
+                        self._write_shared_state(state_path, state)
+                        return
+                    finally:
+                        self._release_shared_state_lock(lock_path, lock_token)
+                if time.monotonic() >= deadline:
+                    raise InformixError(
+                        f"Timed out seeding schema history for '{table.exposed_name}'. "
+                        f"{self._lock_recovery_detail(lock_path)}"
+                    )
+                time.sleep(0.1)
+
+        def _shared_trigger_boundary(
+            self, table: Table, checkpoint: dict[str, Any], *, owner: bool
+        ) -> tuple[int, str]:
+            if self._trigger_high_water is not None and self._trigger_generation is not None:
+                return self._trigger_high_water, self._trigger_generation
+            directory, state_path, lock_path = self._shared_table_state_paths(table)
+            # Both independently checkpointed readers present the same predecessor
+            # after every successfully coordinated trigger. Keying the next boundary
+            # by that durable predecessor avoids relying on Lakeflow runtime IDs,
+            # which are not exposed to Python data-source workers.
+            predecessor = str(checkpoint.get("trigger_generation", "initial"))
+            scope = self._pipeline_scope(checkpoint)
+            boundary_key = hashlib.sha256(
+                "\0".join(
+                    (
+                        scope,
+                        str(checkpoint.get("schema_id", "")),
+                        str(checkpoint.get("commit_lsn", "0")),
+                        predecessor,
+                    )
+                ).encode()
+            ).hexdigest()
+            deadline = time.monotonic() + int(
+                self.options.get(
+                    "cdc.shared.state.wait.seconds", str(_SHARED_STATE_WAIT_SECONDS)
+                )
+            )
+            while True:
+                state = self._read_shared_table_state(state_path, table)
+                boundaries = state.get("trigger_boundaries", {}) if state is not None else {}
+                trigger = boundaries.get(boundary_key) if isinstance(boundaries, dict) else None
+                if trigger is None and not owner and isinstance(boundaries, dict):
+                    candidates = [
+                        value
+                        for value in boundaries.values()
+                        if isinstance(value, dict)
+                        and value.get("scope") == scope
+                        and value.get("generation") != predecessor
+                        and int(value.get("high_water", 0))
+                        >= int(checkpoint.get("commit_lsn", 0))
+                    ]
+                    if candidates:
+                        trigger = max(
+                            candidates, key=lambda value: float(value.get("created_at", 0))
+                        )
+                if isinstance(trigger, dict):
+                    generation = trigger.get("generation")
+                    try:
+                        high_water = int(trigger["high_water"])
+                    except (KeyError, TypeError, ValueError) as error:
+                        raise InformixError(
+                            f"Invalid shared trigger boundary for '{table.exposed_name}'"
+                        ) from error
+                    if not isinstance(generation, str) or not re.fullmatch(
+                        r"[0-9a-f]{32}", generation
+                    ):
+                        raise InformixError(
+                            f"Invalid shared trigger generation for '{table.exposed_name}'"
+                        )
+                    self._trigger_high_water = high_water
+                    self._trigger_generation = generation
+                    return high_water, generation
+                token = self._acquire_shared_state_lock(directory, lock_path) if owner else None
+                if token is not None:
+                    try:
+                        state = self._read_shared_table_state(state_path, table)
+                        if state is None:
+                            raise InformixError(
+                                f"Shared CDC state is missing for '{table.exposed_name}'"
+                            )
+                        boundaries = state.get("trigger_boundaries", {})
+                        if not isinstance(boundaries, dict):
+                            raise InformixError(
+                                f"Invalid shared trigger boundaries for '{table.exposed_name}'"
+                            )
+                        existing = boundaries.get(boundary_key)
+                        if isinstance(existing, dict):
+                            high_water = int(existing["high_water"])
+                            generation = str(existing["generation"])
+                            self._trigger_high_water = high_water
+                            self._trigger_generation = generation
+                            return high_water, generation
+                        high_water = self._bridge.current_lsn()
+                        if high_water < int(checkpoint["commit_lsn"]):
+                            raise InformixError(
+                                f"Current LSN {high_water} precedes checkpoint LSN "
+                                f"{checkpoint['commit_lsn']} for '{table.exposed_name}'"
+                            )
+                        generation = secrets.token_hex(16)
+                        boundaries[boundary_key] = {
+                            "created_at": time.time(),
+                            "generation": generation,
+                            "high_water": str(high_water),
+                            "predecessor": predecessor,
+                            "scope": scope,
+                        }
+                        state["trigger_boundaries"] = boundaries
+                        self._renew_shared_state_lock(lock_path, token)
+                        self._write_shared_state(state_path, state)
+                        self._trigger_high_water = high_water
+                        self._trigger_generation = generation
+                        return high_water, generation
+                    finally:
+                        self._release_shared_state_lock(lock_path, token)
+                if time.monotonic() >= deadline:
+                    role = "upsert reader" if owner else "the table's upsert reader"
+                    raise InformixError(
+                        f"Timed out waiting for {role} to publish a triggered boundary for "
+                        f"'{table.exposed_name}'. {self._lock_recovery_detail(lock_path)}"
+                    )
+                time.sleep(0.1)
+
+        def _schema_transition(
+            self,
+            table: Table,
+            checkpoint_schema_id: str,
+            checkpoint_lsn: int,
+            *,
+            owner: bool,
+        ) -> tuple[Table, Table, int, str]:
+            directory, state_path, lock_path = self._shared_table_state_paths(table)
+            deadline = time.monotonic() + int(
+                self.options.get(
+                    "cdc.shared.state.wait.seconds", str(_SHARED_STATE_WAIT_SECONDS)
+                )
+            )
+            while True:
+                state = self._read_shared_table_state(state_path, table)
+                if state is None:
+                    raise InformixError(
+                        f"Shared CDC state is missing for schema transition on "
+                        f"'{table.exposed_name}'"
+                    )
+                previous = _state_schema(state, schema_id=checkpoint_schema_id)
+                if previous is None:
+                    raise InformixError(
+                        f"Schema history for checkpoint node {checkpoint_schema_id} is missing for "
+                        f"'{table.exposed_name}'; run a full refresh"
+                    )
+                previous_table = _table_from_schema_state(previous, table.database)
+                _ensure_additive_schema_change(previous_table, table)
+                current = _active_descendant_schema(
+                    state, checkpoint_schema_id, _schema_fingerprint(table)
+                )
+                if current is not None:
+                    target = _next_schema_transition(
+                        state, checkpoint_schema_id, str(current["id"])
+                    )
+                    target_table, transition = self._validate_schema_transition(
+                        state, previous, target, table, checkpoint_lsn
+                    )
+                    return previous_table, target_table, transition, str(target["id"])
+                lock_token = self._acquire_shared_state_lock(directory, lock_path) if owner else None
+                if lock_token is not None:
+                    try:
+                        state = self._read_shared_table_state(state_path, table)
+                        if state is None:
+                            raise InformixError(
+                                f"Shared CDC state disappeared for '{table.exposed_name}'"
+                            )
+                        current = _active_descendant_schema(
+                            state, checkpoint_schema_id, _schema_fingerprint(table)
+                        )
+                        if current is None:
+                            transition = self._bridge.current_lsn()
+                            if transition < checkpoint_lsn:
+                                raise InformixError(
+                                    f"Current LSN {transition} precedes checkpoint LSN "
+                                    f"{checkpoint_lsn} for '{table.exposed_name}'"
+                                )
+                            self._bridge.validate_initial_lsn(
+                                _capture_descriptor(table, _client_encoding(self.options)),
+                                transition,
+                            )
+                            schemas = list(state.get("schemas", []))
+                            node = _schema_state(
+                                table,
+                                transition,
+                                predecessor=checkpoint_schema_id,
+                            )
+                            schemas.append(node)
+                            state["schemas"] = schemas
+                            state["active_schema_id"] = node["id"]
+                            self._renew_shared_state_lock(lock_path, lock_token)
+                            self._write_shared_state(state_path, state)
+                            return previous_table, table, transition, str(node["id"])
+                        target = _next_schema_transition(
+                            state, checkpoint_schema_id, str(current["id"])
+                        )
+                        target_table, transition = self._validate_schema_transition(
+                            state,
+                            previous,
+                            target,
+                            table,
+                            checkpoint_lsn,
+                        )
+                        return previous_table, target_table, transition, str(target["id"])
+                    finally:
+                        self._release_shared_state_lock(lock_path, lock_token)
+                if time.monotonic() >= deadline:
+                    raise InformixError(
+                        f"Timed out waiting for the upsert reader to publish schema transition "
+                        f"state for '{table.exposed_name}'. "
+                        f"{self._lock_recovery_detail(lock_path)}"
+                    )
+                time.sleep(0.1)
+
+        def _validate_schema_transition(
+            self,
+            state: dict[str, object],
+            previous: dict[str, object],
+            current: dict[str, object],
+            table: Table,
+            checkpoint_lsn: int,
+        ) -> tuple[Table, int]:
+            _validate_schema_history(state, table)
+            previous_lsn = int(previous["start_lsn"])
+            transition = int(current["start_lsn"])
+            target_table = _table_from_schema_state(current, table.database)
+            _ensure_additive_schema_change(
+                _table_from_schema_state(previous, table.database), target_table
+            )
+            if transition <= previous_lsn:
+                raise InformixError(
+                    f"Schema transition for '{table.exposed_name}' is not monotonic"
+                )
+            minimum, now = self._bridge.minimum_lsn(), self._bridge.current_lsn()
+            if not minimum <= transition <= now:
+                raise InformixError(
+                    f"Schema transition LSN {transition} for '{table.exposed_name}' is outside "
+                    f"retained/current range [{minimum}, {now}]"
+                )
+            if transition < checkpoint_lsn:
+                raise InformixError(
+                    f"Schema transition LSN {transition} precedes checkpoint LSN "
+                    f"{checkpoint_lsn} for '{table.exposed_name}'"
+                )
+            return target_table, transition
 
         def _refresh_table_schema(
             self, table: Table, expected_fingerprint: str | None
@@ -3884,7 +4650,7 @@ def register_lakeflow_source(spark):
             """Return one durable per-table boundary shared by upsert and delete readers."""
 
             if table.identity not in self._snapshot_high_water:
-                value = self._shared_table_lsn(table, owner=owner)
+                value, schema_id = self._shared_table_lsn(table, owner=owner)
                 minimum = self._bridge.minimum_lsn()
                 if value < minimum:
                     raise LogRetentionError(
@@ -3898,9 +4664,10 @@ def register_lakeflow_source(spark):
                         f"{current}; choose a position captured after enabling full-row logging"
                     )
                 self._snapshot_high_water[table.identity] = value
+                self._snapshot_schema_ids[table.identity] = schema_id
             return self._snapshot_high_water[table.identity]
 
-        def _shared_table_lsn(self, table: Table, *, owner: bool) -> int:
+        def _shared_table_lsn(self, table: Table, *, owner: bool) -> tuple[int, str]:
             directory, state_path, lock_path = self._shared_table_state_paths(table)
             deadline = time.monotonic() + int(
                 self.options.get(
@@ -3910,47 +4677,153 @@ def register_lakeflow_source(spark):
             while True:
                 state = self._read_shared_table_state(state_path, table)
                 if state is not None:
-                    value = int(state["lsn"])
-                    if self._bridge.minimum_lsn() <= value <= self._bridge.current_lsn():
+                    active = _state_schema(
+                        state, schema_id=str(state.get("active_schema_id"))
+                    )
+                    schema_known = (
+                        active is not None
+                        and active.get("fingerprint") == _schema_fingerprint(table)
+                    )
+                    value = int(active["start_lsn"]) if schema_known else 0
+                    if not owner and schema_known:
+                        snapshots = state.get("snapshot_boundaries", {})
+                        snapshot_key = hashlib.sha256(
+                            "\0".join(
+                                (
+                                    self._pipeline_scope(),
+                                    str(active.get("id")),
+                                )
+                            ).encode()
+                        ).hexdigest()
+                        snapshot = (
+                            snapshots.get(snapshot_key)
+                            if isinstance(snapshots, dict)
+                            else None
+                        )
+                        if (
+                            isinstance(snapshot, dict)
+                            and snapshot.get("schema_id") == active.get("id")
+                        ):
+                            value = int(snapshot["snapshot_lsn"])
+                        else:
+                            schema_known = False
+                    if (
+                        schema_known
+                        and self._bridge.minimum_lsn() <= value <= self._bridge.current_lsn()
+                    ):
                         self._bridge.validate_initial_lsn(
                             _capture_descriptor(table, _client_encoding(self.options)), value
                         )
-                        return value
+                        return value, str(active["id"])
                     if not owner:
                         state = None
-                if owner and self._acquire_shared_state_lock(directory, lock_path):
+                lock_token = self._acquire_shared_state_lock(directory, lock_path) if owner else None
+                if lock_token is not None:
                     try:
                         state = self._read_shared_table_state(state_path, table)
                         if state is not None:
-                            value = int(state["lsn"])
-                            if self._bridge.minimum_lsn() <= value <= self._bridge.current_lsn():
-                                return value
+                            active = _state_schema(
+                                state, schema_id=str(state.get("active_schema_id"))
+                            )
+                            schema_known = (
+                                active is not None
+                                and active.get("fingerprint") == _schema_fingerprint(table)
+                            )
+                            value = int(active["start_lsn"]) if schema_known else 0
+                            if (
+                                schema_known
+                                and self._bridge.minimum_lsn()
+                                <= value
+                                <= self._bridge.current_lsn()
+                            ):
+                                return value, str(active["id"])
                         value = self._bridge.prepare_initial_capture([table.native_identity])
                         self._bridge.validate_initial_lsn(
                             _capture_descriptor(table, _client_encoding(self.options)), value
                         )
-                        self._write_shared_table_state(state_path, table, value)
-                        return value
+                        node = _schema_state(table, value)
+                        self._renew_shared_state_lock(lock_path, lock_token)
+                        if state is None or not state.get("schemas"):
+                            self._write_shared_table_state(state_path, table, value, node)
+                        else:
+                            schemas = list(state["schemas"])
+                            schemas.append(node)
+                            state["schemas"] = schemas
+                            state["lsn"] = str(value)
+                            state["active_schema_id"] = node["id"]
+                            state["created_at"] = time.time()
+                            self._write_shared_state(state_path, state)
+                        return value, str(node["id"])
                     finally:
-                        try:
-                            os.unlink(lock_path)
-                        except FileNotFoundError:
-                            pass
+                        self._release_shared_state_lock(lock_path, lock_token)
                 if time.monotonic() >= deadline:
                     role = "upsert initialization" if owner else "the table's upsert reader"
                     raise InformixError(
                         f"Timed out waiting for {role} to publish shared CDC state for "
-                        f"'{table.exposed_name}' at '{state_path}'"
+                        f"'{table.exposed_name}' at '{state_path}'. "
+                        f"{self._lock_recovery_detail(lock_path)}"
+                    )
+                time.sleep(0.1)
+
+        def _publish_snapshot_boundary(
+            self,
+            table: Table,
+            schema_id: str,
+            initial_lsn: int,
+            snapshot_lsn: int,
+            pipeline_scope: str,
+        ) -> None:
+            directory, state_path, lock_path = self._shared_table_state_paths(table)
+            deadline = time.monotonic() + int(
+                self.options.get(
+                    "cdc.shared.state.wait.seconds", str(_SHARED_STATE_WAIT_SECONDS)
+                )
+            )
+            while True:
+                token = self._acquire_shared_state_lock(directory, lock_path)
+                if token is not None:
+                    try:
+                        state = self._read_shared_table_state(state_path, table)
+                        if state is None:
+                            raise InformixError(
+                                f"Shared CDC state disappeared for '{table.exposed_name}'"
+                            )
+                        snapshots = state.get("snapshot_boundaries", {})
+                        if not isinstance(snapshots, dict):
+                            raise InformixError(
+                                f"Invalid shared snapshot boundaries for '{table.exposed_name}'"
+                            )
+                        snapshot_key = hashlib.sha256(
+                            "\0".join(
+                                (pipeline_scope, schema_id)
+                            ).encode()
+                        ).hexdigest()
+                        snapshots[snapshot_key] = {
+                            "created_at": time.time(),
+                            "initial_lsn": str(initial_lsn),
+                            "schema_id": schema_id,
+                            "snapshot_lsn": str(snapshot_lsn),
+                        }
+                        state["snapshot_boundaries"] = snapshots
+                        self._renew_shared_state_lock(lock_path, token)
+                        self._write_shared_state(state_path, state)
+                        return
+                    finally:
+                        self._release_shared_state_lock(lock_path, token)
+                if time.monotonic() >= deadline:
+                    raise InformixError(
+                        f"Timed out publishing snapshot boundary for '{table.exposed_name}'. "
+                        f"{self._lock_recovery_detail(lock_path)}"
                     )
                 time.sleep(0.1)
 
         def _shared_table_state_paths(self, table: Table) -> tuple[str, str, str]:
+            hostname = self.options.get("hostname", "").strip().rstrip(".").casefold()
+            port = str(int(self.options.get("port", "9088")))
+            server = self.options.get("server", "").strip()
+            database = self.options.get("database", "").strip()
             namespace = "\0".join(
-                (
-                    self.options.get("hostname", ""),
-                    self.options.get("server", ""),
-                    self.options.get("database", ""),
-                )
+                ("v2", hostname, port, server, database)
             )
             connection_key = hashlib.sha256(namespace.encode()).hexdigest()[:24]
             table_key = hashlib.sha256(table.native_identity.encode()).hexdigest()[:24]
@@ -3962,15 +4835,35 @@ def register_lakeflow_source(spark):
             self, path: str, table: Table
         ) -> dict[str, object] | None:
             try:
+                if os.stat(path).st_size > _MAX_SHARED_STATE_BYTES:
+                    raise InformixError(
+                        f"Informix shared CDC state '{path}' exceeds "
+                        f"{_MAX_SHARED_STATE_BYTES} bytes"
+                    )
                 with open(path, encoding="utf-8") as handle:
-                    state = json.load(handle)
+                    payload = handle.read(_MAX_SHARED_STATE_BYTES + 1)
+                if len(payload.encode("utf-8")) > _MAX_SHARED_STATE_BYTES:
+                    raise InformixError(
+                        f"Informix shared CDC state '{path}' exceeds "
+                        f"{_MAX_SHARED_STATE_BYTES} bytes"
+                    )
+                state = json.loads(payload)
             except FileNotFoundError:
                 return None
             except (OSError, json.JSONDecodeError) as error:
                 raise InformixError(f"Cannot read Informix shared CDC state '{path}'") from error
             if not isinstance(state, dict):
                 raise InformixError(f"Invalid Informix shared CDC state object in '{path}'")
-            if state.get("version") != _SHARED_STATE_VERSION:
+            if state.get("version") == 1:
+                state = _upgrade_legacy_schema_state(state)
+            elif state.get("version") in (2, 3, 4):
+                state = dict(state)
+                state["version"] = _SHARED_STATE_VERSION
+                state.pop("snapshot_boundary", None)
+                state.pop("trigger", None)
+                state.pop("snapshot_boundaries", None)
+                state.pop("trigger_boundaries", None)
+            elif state.get("version") != _SHARED_STATE_VERSION:
                 raise InformixError(f"Unsupported Informix shared CDC state version in '{path}'")
             if state.get("table") != table.native_identity:
                 raise InformixError(f"Informix shared CDC state table mismatch in '{path}'")
@@ -3979,50 +4872,249 @@ def register_lakeflow_source(spark):
                     raise ValueError
             except (KeyError, TypeError, ValueError) as error:
                 raise InformixError(f"Invalid Informix shared CDC LSN in '{path}'") from error
+            schemas = state.get("schemas", [])
+            if not isinstance(schemas, list):
+                raise InformixError(f"Invalid Informix shared CDC schema history in '{path}'")
+            if schemas:
+                _validate_schema_history(state, table)
+                active_schema_id = state.get("active_schema_id")
+                if not isinstance(active_schema_id, str) or _state_schema(
+                    state, schema_id=active_schema_id
+                ) is None:
+                    raise InformixError(
+                        f"Invalid Informix shared CDC active schema in '{path}'"
+                    )
+            snapshots = state.get("snapshot_boundaries", {})
+            if not isinstance(snapshots, dict):
+                raise InformixError(f"Invalid Informix shared snapshot boundaries in '{path}'")
+            for key, snapshot in snapshots.items():
+                try:
+                    if (
+                        not isinstance(key, str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", key)
+                        or not isinstance(snapshot, dict)
+                        or not isinstance(snapshot["schema_id"], str)
+                        or int(snapshot["initial_lsn"]) < 1
+                        or int(snapshot["snapshot_lsn"]) < int(snapshot["initial_lsn"])
+                        or not math.isfinite(float(snapshot["created_at"]))
+                    ):
+                        raise ValueError
+                except (KeyError, TypeError, ValueError) as error:
+                    raise InformixError(
+                        f"Invalid Informix shared snapshot boundary in '{path}'"
+                    ) from error
+            boundaries = state.get("trigger_boundaries", {})
+            if not isinstance(boundaries, dict):
+                raise InformixError(f"Invalid Informix shared trigger boundaries in '{path}'")
+            for key, trigger in boundaries.items():
+                try:
+                    if (
+                        not isinstance(key, str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", key)
+                        or not isinstance(trigger, dict)
+                        or not isinstance(trigger["generation"], str)
+                        or not re.fullmatch(r"[0-9a-f]{32}", trigger["generation"])
+                        or int(trigger["high_water"]) < 1
+                        or not math.isfinite(float(trigger["created_at"]))
+                        or not isinstance(trigger["predecessor"], str)
+                        or not isinstance(trigger["scope"], str)
+                        or not re.fullmatch(r"[0-9a-f]{32}", trigger["scope"])
+                    ):
+                        raise ValueError
+                except (KeyError, TypeError, ValueError) as error:
+                    raise InformixError(
+                        f"Invalid Informix shared trigger boundary in '{path}'"
+                    ) from error
             return state
 
-        def _acquire_shared_state_lock(self, directory: str, lock_path: str) -> bool:
+        def _acquire_shared_state_lock(self, directory: str, lock_path: str) -> str | None:
+            _validate_shared_state_filesystem(self._shared_state_location)
+            token = secrets.token_hex(16)
             try:
                 os.makedirs(directory, mode=0o700, exist_ok=True)
-                descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                os.mkdir(lock_path, mode=0o700)
             except FileExistsError:
-                try:
-                    age = time.time() - os.stat(lock_path).st_mtime
-                    stale = int(
-                        self.options.get(
-                            "cdc.shared.state.lock.stale.seconds",
-                            str(_SHARED_STATE_LOCK_STALE_SECONDS),
-                        )
-                    )
-                    if age > stale:
-                        os.unlink(lock_path)
-                except FileNotFoundError:
-                    pass
-                return False
+                return None
             except OSError as error:
                 raise InformixError(
                     f"Cannot create Informix shared CDC state lock '{lock_path}'"
                 ) from error
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump({"created_at": time.time()}, handle)
-                handle.flush()
-                os.fsync(handle.fileno())
-            return True
+            owner_path = os.path.join(lock_path, "owner.json")
+            temporary = os.path.join(lock_path, f"owner.{token}.tmp")
+            try:
+                with open(temporary, "x", encoding="utf-8") as handle:
+                    json.dump(
+                        {
+                            "created_at": time.time(),
+                            "host": socket.gethostname(),
+                            "pid": os.getpid(),
+                            "token": token,
+                        },
+                        handle,
+                    )
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, owner_path)
+            except OSError as error:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+                try:
+                    os.rmdir(lock_path)
+                except OSError:
+                    pass
+                raise InformixError(
+                    f"Cannot initialize Informix shared CDC state lock '{lock_path}'"
+                ) from error
+            try:
+                self._cleanup_shared_state_artifacts(directory, lock_path)
+            except Exception:
+                self._release_shared_state_lock(lock_path, token)
+                raise
+            return token
 
-        def _write_shared_table_state(self, path: str, table: Table, lsn: int) -> None:
-            temporary = f"{path}.{os.getpid()}.tmp"
+        def _cleanup_shared_state_artifacts(self, directory: str, lock_path: str) -> None:
+            cutoff = time.time() - _ARTIFACT_RETENTION_SECONDS
+            state_name = os.path.basename(lock_path.removesuffix(".lock"))
+            try:
+                entries = list(os.scandir(directory))
+            except FileNotFoundError:
+                return
+            except OSError as error:
+                raise InformixError(
+                    f"Cannot inspect Informix shared-state directory '{directory}'"
+                ) from error
+            for entry in entries:
+                try:
+                    if entry.stat(follow_symlinks=False).st_mtime > cutoff:
+                        continue
+                    if entry.is_file(follow_symlinks=False) and (
+                        entry.name.startswith(f"{state_name}.") and entry.name.endswith(".tmp")
+                    ):
+                        os.unlink(entry.path)
+                    elif entry.is_dir(follow_symlinks=False) and (
+                        entry.name.startswith(f"{state_name}.lock.")
+                        and entry.name.endswith(".released")
+                    ):
+                        try:
+                            os.unlink(os.path.join(entry.path, "owner.json"))
+                        except FileNotFoundError:
+                            pass
+                        os.rmdir(entry.path)
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    raise InformixError(
+                        f"Cannot clean abandoned Informix shared-state artifact '{entry.path}'"
+                    ) from error
+
+        def _release_shared_state_lock(self, lock_path: str, token: str) -> None:
+            owner_path = os.path.join(lock_path, "owner.json")
+            try:
+                with open(owner_path, encoding="utf-8") as handle:
+                    owner = json.load(handle)
+                if not isinstance(owner, dict) or owner.get("token") != token:
+                    return
+                tombstone = f"{lock_path}.{token}.released"
+                os.rename(lock_path, tombstone)
+                os.unlink(os.path.join(tombstone, "owner.json"))
+                os.rmdir(tombstone)
+            except FileNotFoundError:
+                return
+            except (OSError, json.JSONDecodeError) as error:
+                raise InformixError(
+                    f"Cannot release Informix shared CDC state lock '{lock_path}'"
+                ) from error
+
+        def _lock_recovery_detail(self, lock_path: str) -> str:
+            owner_path = os.path.join(lock_path, "owner.json")
+            try:
+                with open(owner_path, encoding="utf-8") as handle:
+                    owner = json.load(handle)
+                created_at = float(owner["created_at"])
+                host = str(owner["host"])
+                pid = int(owner["pid"])
+                token = str(owner["token"])
+                age = max(0, int(time.time() - created_at))
+                owner_detail = f"owner {host} pid {pid}, age {age}s, token {token}"
+            except (FileNotFoundError, OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                owner_detail = "owner metadata unavailable"
+            return (
+                f"Lock '{lock_path}' is held ({owner_detail}). If its worker terminated, stop "
+                "every pipeline using this connection, remove that .lock directory, and restart"
+            )
+
+        def _renew_shared_state_lock(self, lock_path: str, token: str) -> None:
+            """Assert ownership immediately before publishing shared state."""
+
+            owner_path = os.path.join(lock_path, "owner.json")
+            try:
+                with open(owner_path, encoding="utf-8") as handle:
+                    owner = json.load(handle)
+                    if not isinstance(owner, dict) or owner.get("token") != token:
+                        raise InformixError(
+                            f"Lost Informix shared CDC state lock '{lock_path}'"
+                        )
+            except FileNotFoundError as error:
+                raise InformixError(
+                    f"Lost Informix shared CDC state lock '{lock_path}'"
+                ) from error
+            except (OSError, json.JSONDecodeError) as error:
+                raise InformixError(
+                    f"Cannot renew Informix shared CDC state lock '{lock_path}'"
+                ) from error
+
+        def _write_shared_table_state(
+            self,
+            path: str,
+            table: Table,
+            lsn: int,
+            node: dict[str, object] | None = None,
+        ) -> None:
+            schema = node or _schema_state(table, lsn)
             state = {
                 "version": _SHARED_STATE_VERSION,
                 "table": table.native_identity,
                 "lsn": str(lsn),
+                "active_schema_id": schema["id"],
                 "created_at": time.time(),
+                "schemas": [schema],
             }
+            self._write_shared_state(path, state)
+
+        def _write_shared_state(self, path: str, state: dict[str, object]) -> None:
+            payload = json.dumps(state, separators=(",", ":"), sort_keys=True)
+            if len(payload.encode("utf-8")) > _MAX_SHARED_STATE_BYTES:
+                raise InformixError(
+                    f"Informix shared CDC state '{path}' exceeds {_MAX_SHARED_STATE_BYTES} bytes; "
+                    "stop all pipelines using this connection, configure a new shared-state "
+                    "location, and perform full refreshes"
+                )
+            temporary = f"{path}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
             try:
                 with open(temporary, "x", encoding="utf-8") as handle:
-                    json.dump(state, handle, separators=(",", ":"), sort_keys=True)
+                    handle.write(payload)
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.replace(temporary, path)
+                try:
+                    directory_descriptor = os.open(os.path.dirname(path), os.O_RDONLY)
+                except OSError as error:
+                    if error.errno in {errno.EINVAL, errno.ENOTSUP, errno.EACCES}:
+                        directory_descriptor = None
+                    else:
+                        raise
+                try:
+                    if directory_descriptor is not None:
+                        try:
+                            os.fsync(directory_descriptor)
+                        except OSError as error:
+                            if error.errno not in {errno.EINVAL, errno.ENOTSUP}:
+                                raise
+                finally:
+                    if directory_descriptor is not None:
+                        os.close(directory_descriptor)
             except OSError as error:
                 try:
                     os.unlink(temporary)
@@ -4329,10 +5421,19 @@ def register_lakeflow_source(spark):
 
 
     def _committed_transactions(records: Sequence[dict[str, Any]]) -> list[CommittedTransaction]:
+        return _transaction_batch(records)[0]
+
+
+    def _transaction_batch(
+        records: Sequence[dict[str, Any]],
+    ) -> tuple[list[CommittedTransaction], bool, int | None]:
         buffer = TransactionBuffer()
         result = []
         last_lsn: int | None = None
+        timed_out = False
         for record in records:
+            if _operation(record) == "TIMEOUT":
+                timed_out = True
             if _operation(record) not in {"METADATA", "ERROR", "DISCARD"}:
                 lsn = _lsn(record)
                 if last_lsn is not None and lsn < last_lsn:
@@ -4343,7 +5444,8 @@ def register_lakeflow_source(spark):
                 result.append(committed)
         # Open transactions are intentionally discarded.  The returned offset
         # remains before their BEGIN so a finite next call safely replays them.
-        return result
+        open_begin = min((tx.begin_lsn for tx in buffer.open.values()), default=None)
+        return result, timed_out and not buffer.open, open_begin
 
 
     def _recover(
@@ -4509,6 +5611,10 @@ def register_lakeflow_source(spark):
         tx_id: int | None,
         phase: str,
         table: Table,
+        schema_id: str,
+        pipeline_scope: str,
+        *,
+        trigger_generation: str | None = None,
     ) -> dict:
         return {
             "version": _OFFSET_VERSION,
@@ -4518,6 +5624,9 @@ def register_lakeflow_source(spark):
             "tx_id": tx_id,
             "phase": phase,
             "schema_fingerprint": _schema_fingerprint(table),
+            "schema_id": schema_id,
+            "pipeline_scope": pipeline_scope,
+            "trigger_generation": trigger_generation,
         }
 
 
@@ -4527,6 +5636,7 @@ def register_lakeflow_source(spark):
                 table.database,
                 table.owner,
                 table.name,
+                table.incarnation,
                 table.primary_keys,
                 tuple(
                     (
@@ -4543,6 +5653,269 @@ def register_lakeflow_source(spark):
             )
         ).encode("utf-8")
         return hashlib.sha256(layout).hexdigest()
+
+
+    def _schema_state(
+        table: Table,
+        start_lsn: int,
+        predecessor: str | None = None,
+        *,
+        schema_id: str | None = None,
+    ) -> dict[str, object]:
+        return {
+            "id": schema_id or secrets.token_hex(16),
+            "fingerprint": _schema_fingerprint(table),
+            "start_lsn": str(start_lsn),
+            "predecessor": predecessor,
+            "table": {
+                "database": table.database,
+                "owner": table.owner,
+                "name": table.name,
+                "incarnation": table.incarnation,
+                "primary_keys": list(table.primary_keys),
+                "columns": [
+                    {
+                        "name": column.name,
+                        "type_name": column.type_name,
+                        "nullable": column.nullable,
+                        "length": column.length,
+                        "precision": column.precision,
+                        "scale": column.scale,
+                        "cdc_supported": column.cdc_supported,
+                    }
+                    for column in table.columns
+                ],
+            },
+        }
+
+
+    def _state_schema(
+        state: dict[str, object], fingerprint: str | None = None, *, schema_id: str | None = None
+    ) -> dict[str, object] | None:
+        schemas = state.get("schemas", [])
+        if not isinstance(schemas, list):
+            raise InformixError("Informix shared CDC schemas must be a list")
+        if fingerprint is None and schema_id is None:
+            raise InformixError("Informix shared CDC schema lookup requires an id or fingerprint")
+        matches = [schema for schema in schemas if isinstance(schema, dict)]
+        if schema_id is not None:
+            matches = [schema for schema in matches if schema.get("id") == schema_id]
+        if fingerprint is not None:
+            matches = [schema for schema in matches if schema.get("fingerprint") == fingerprint]
+        if len(matches) > 1:
+            raise InformixError(
+                f"Ambiguous Informix shared CDC schema lookup id={schema_id!r}, "
+                f"fingerprint={fingerprint!r}"
+            )
+        return matches[0] if matches else None
+
+
+    def _table_from_schema_state(state: dict[str, object], default_database: str) -> Table:
+        raw = state.get("table")
+        if not isinstance(raw, dict):
+            raise InformixError("Informix shared CDC schema is missing table metadata")
+        try:
+            start_lsn = int(state["start_lsn"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise InformixError("Informix shared CDC schema has an invalid start LSN") from error
+        if start_lsn < 1:
+            raise InformixError("Informix shared CDC schema has an invalid start LSN")
+        table = Table.parse(raw, default_database)
+        if _schema_fingerprint(table) != state.get("fingerprint"):
+            raise InformixError("Informix shared CDC schema fingerprint does not match metadata")
+        return table
+
+
+    def _upgrade_legacy_schema_state(state: dict[str, object]) -> dict[str, object]:
+        """Normalize version-1 fingerprint-linked history for a version-4 full refresh."""
+
+        schemas = state.get("schemas", [])
+        if not isinstance(schemas, list):
+            raise InformixError("Informix shared CDC schemas must be a list")
+        upgraded = dict(state)
+        upgraded_schemas: list[dict[str, object]] = []
+        fingerprint_ids: dict[str, str] = {}
+        for index, raw in enumerate(schemas):
+            if not isinstance(raw, dict):
+                raise InformixError("Informix shared CDC schema history contains a non-object")
+            schema = dict(raw)
+            fingerprint = str(schema.get("fingerprint", ""))
+            identity = hashlib.sha256(
+                f"legacy\0{index}\0{fingerprint}\0{schema.get('start_lsn')}".encode()
+            ).hexdigest()[:32]
+            has_predecessor = "predecessor" in schema
+            predecessor = schema.get("predecessor")
+            if not has_predecessor and index:
+                predecessor_id = str(upgraded_schemas[-1]["id"])
+            elif predecessor is None:
+                predecessor_id = None
+            else:
+                predecessor_id = fingerprint_ids.get(str(predecessor))
+                if predecessor_id is None:
+                    raise InformixError(
+                        "Informix legacy shared CDC schema predecessor is missing"
+                    )
+            schema["id"] = identity
+            schema["predecessor"] = predecessor_id
+            upgraded_schemas.append(schema)
+            fingerprint_ids[fingerprint] = identity
+        upgraded["version"] = _SHARED_STATE_VERSION
+        upgraded["schemas"] = upgraded_schemas
+        if upgraded_schemas:
+            upgraded["active_schema_id"] = upgraded_schemas[-1]["id"]
+        return upgraded
+
+
+    def _validate_schema_history(state: dict[str, object], expected_table: Table) -> None:
+        schemas = state.get("schemas", [])
+        if not isinstance(schemas, list):
+            raise InformixError("Informix shared CDC schema history has invalid bounds")
+        validated: dict[str, tuple[Table, int]] = {}
+        for index, schema in enumerate(schemas):
+            if not isinstance(schema, dict):
+                raise InformixError("Informix shared CDC schema history contains a non-object")
+            table = _table_from_schema_state(schema, expected_table.database)
+            if table.native_identity != expected_table.native_identity:
+                raise InformixError("Informix shared CDC schema history table identity mismatch")
+            schema_id = schema.get("id")
+            if not isinstance(schema_id, str) or not re.fullmatch(r"[0-9a-f]{32}", schema_id):
+                raise InformixError("Informix shared CDC schema has an invalid id")
+            if schema_id in validated:
+                raise InformixError(f"Duplicate Informix shared CDC schema id {schema_id}")
+            start_lsn = int(schema["start_lsn"])
+            predecessor = _schema_predecessor(schemas, index)
+            if predecessor is not None:
+                if predecessor not in validated:
+                    raise InformixError(
+                        f"Informix shared CDC schema predecessor {predecessor} is missing"
+                    )
+                previous_table, previous_lsn = validated[predecessor]
+                if start_lsn <= previous_lsn:
+                    raise InformixError(
+                        "Informix shared CDC schema transition LSN is not monotonic"
+                    )
+                _ensure_additive_schema_change(previous_table, table)
+            validated[schema_id] = (table, start_lsn)
+
+
+    def _schema_predecessor(
+        schemas: list[object], index: int
+    ) -> str | None:
+        schema = schemas[index]
+        if not isinstance(schema, dict):
+            raise InformixError("Informix shared CDC schema history contains a non-object")
+        if "predecessor" in schema:
+            predecessor = schema["predecessor"]
+            if predecessor is not None and not isinstance(predecessor, str):
+                raise InformixError("Informix shared CDC schema predecessor is invalid")
+            return predecessor
+        # Migrate the original linear history representation in place logically:
+        # its first entry is a root and every later entry follows the previous one.
+        if index == 0:
+            return None
+        previous = schemas[index - 1]
+        if not isinstance(previous, dict) or not isinstance(previous.get("id"), str):
+            raise InformixError("Informix shared CDC schema predecessor is invalid")
+        return previous["id"]
+
+
+    def _next_schema_transition(
+        state: dict[str, object], checkpoint_schema_id: str, current_schema_id: str
+    ) -> dict[str, object]:
+        schemas = state.get("schemas", [])
+        if not isinstance(schemas, list):
+            raise InformixError("Informix shared CDC schemas must be a list")
+        by_id = {
+            str(schema.get("id")): (index, schema)
+            for index, schema in enumerate(schemas)
+            if isinstance(schema, dict)
+        }
+        if current_schema_id not in by_id:
+            raise InformixError(f"Current Informix schema node {current_schema_id} is missing")
+        path: list[dict[str, object]] = []
+        cursor = current_schema_id
+        while True:
+            index, schema = by_id[cursor]
+            path.append(schema)
+            if cursor == checkpoint_schema_id:
+                break
+            predecessor = _schema_predecessor(schemas, index)
+            if predecessor is None or predecessor not in by_id:
+                raise InformixError(
+                    "Current Informix schema is in a different history generation; "
+                    "run a full refresh for this pipeline"
+                )
+            cursor = predecessor
+        path.reverse()
+        if len(path) < 2:
+            raise InformixError("Schema transition path has no successor")
+        return path[1]
+
+
+    def _active_descendant_schema(
+        state: dict[str, object], ancestor_id: str, fingerprint: str
+    ) -> dict[str, object] | None:
+        """Return the active schema only when it descends from the checkpoint node."""
+
+        schemas = state.get("schemas", [])
+        if not isinstance(schemas, list):
+            raise InformixError("Informix shared CDC schemas must be a list")
+        active_id = state.get("active_schema_id")
+        if not isinstance(active_id, str):
+            raise InformixError("Informix shared CDC state has an invalid active schema id")
+        by_id = {
+            str(schema.get("id")): (index, schema)
+            for index, schema in enumerate(schemas)
+            if isinstance(schema, dict)
+        }
+        if active_id not in by_id:
+            raise InformixError("Informix shared CDC active schema is missing")
+        cursor = active_id
+        while True:
+            index, schema = by_id[cursor]
+            if cursor == ancestor_id:
+                active = by_id[active_id][1]
+                return active if active.get("fingerprint") == fingerprint else None
+            predecessor = _schema_predecessor(schemas, index)
+            if predecessor is None or predecessor not in by_id:
+                return None
+            cursor = predecessor
+
+
+    def _ensure_additive_schema_change(previous: Table, current: Table) -> None:
+        if (
+            previous.database,
+            previous.owner,
+            previous.name,
+            previous.incarnation,
+            previous.primary_keys,
+        ) != (
+            current.database,
+            current.owner,
+            current.name,
+            current.incarnation,
+            current.primary_keys,
+        ):
+            raise InformixError(
+                f"Informix schema change for '{current.exposed_name}' changed table identity or "
+                "primary keys; run a full refresh"
+            )
+        if len(current.columns) <= len(previous.columns):
+            raise InformixError(
+                f"Informix schema change for '{current.exposed_name}' is not an additive column "
+                "change; run a full refresh"
+            )
+        if current.columns[: len(previous.columns)] != previous.columns:
+            raise InformixError(
+                f"Informix schema change for '{current.exposed_name}' modified, removed, or "
+                "reordered existing columns; run a full refresh"
+            )
+        additions = current.columns[len(previous.columns) :]
+        if any(not column.nullable or not column.cdc_supported for column in additions):
+            raise InformixError(
+                f"Informix schema change for '{current.exposed_name}' added a non-nullable or "
+                "CDC-unsupported column; run a full refresh"
+            )
 
 
     def _validated_offset(offset: dict[str, Any]) -> dict[str, Any]:
@@ -4575,6 +5948,26 @@ def register_lakeflow_source(spark):
             or any(character not in "0123456789abcdef" for character in fingerprint)
         ):
             raise ValueError("Informix offset has an invalid schema_fingerprint")
+        schema_id = result.get("schema_id")
+        if not isinstance(schema_id, str) or not re.fullmatch(r"[0-9a-f]{32}", schema_id):
+            raise ValueError(
+                "Informix offset has an invalid schema_id; run a full refresh with this "
+                "connector version"
+            )
+        pipeline_scope = result.get("pipeline_scope")
+        if not isinstance(pipeline_scope, str) or not re.fullmatch(
+            r"[0-9a-f]{32}", pipeline_scope
+        ):
+            raise ValueError(
+                "Informix offset has an invalid pipeline_scope; run a full refresh with this "
+                "connector version"
+            )
+        trigger_generation = result.get("trigger_generation")
+        if trigger_generation is not None and (
+            not isinstance(trigger_generation, str)
+            or not re.fullmatch(r"[0-9a-f]{32}", trigger_generation)
+        ):
+            raise ValueError("Informix offset has an invalid trigger_generation")
         if phase == "snapshot":
             if "snapshot_lsn" not in result or int(result["snapshot_lsn"]) < 0:
                 raise ValueError("Informix snapshot offset has an invalid snapshot_lsn")
@@ -4598,6 +5991,7 @@ def register_lakeflow_source(spark):
         "LogRetentionError",
         "TransactionBuffer",
         "UnsupportedChangeError",
+        "recover_shared_state_lock",
         "set_bridge_factory",
     ]
 
