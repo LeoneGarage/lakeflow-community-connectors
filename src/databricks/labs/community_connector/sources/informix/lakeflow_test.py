@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import copy
 import errno
 import hashlib
 import importlib
 import json
+import os
 import pickle
 import sys
 import tempfile
@@ -124,10 +124,7 @@ from databricks.labs.community_connector.sources.informix.informix import (  # n
     _schema_state,
     _sortable_lsn,
     _spark_type,
-    _upgrade_legacy_schema_state,
-    _validate_schema_history,
     _validate_shared_state_filesystem,
-    recover_shared_state_lock,
 )
 
 
@@ -275,8 +272,8 @@ class LakeflowContractTests(unittest.TestCase):
         second = self.connector(FakeBridge(), port="9089")
 
         self.assertNotEqual(
-            first._shared_table_state_paths(table)[1],
-            second._shared_table_state_paths(table)[1],
+            first._shared_table_state_root(table),
+            second._shared_table_state_root(table),
         )
         equivalent = self.connector(FakeBridge())
         equivalent.options.update(
@@ -287,16 +284,16 @@ class LakeflowContractTests(unittest.TestCase):
             hostname="example.com", port="9088", server="demo", database="demo"
         )
         self.assertEqual(
-            equivalent._shared_table_state_paths(table)[1],
-            canonical._shared_table_state_paths(table)[1],
+            equivalent._shared_table_state_root(table),
+            canonical._shared_table_state_root(table),
         )
         distinct_case = self.connector(FakeBridge())
         distinct_case.options.update(
             hostname="example.com", port="9088", server="DEMO", database="DEMO"
         )
         self.assertNotEqual(
-            distinct_case._shared_table_state_paths(table)[1],
-            canonical._shared_table_state_paths(table)[1],
+            distinct_case._shared_table_state_root(table),
+            canonical._shared_table_state_root(table),
         )
         with self.assertRaisesRegex(ValueError, "Unity Catalog Volume"):
             InformixLakeflowConnect(
@@ -1355,8 +1352,14 @@ class LakeflowContractTests(unittest.TestCase):
         replacement.minimum = 100
         replacement.now = 120
 
-        list(self.connector(replacement).read_table("app.orders", {}, {})[0])
-        _, delete_offset = self.connector(replacement).read_table_deletes(
+        list(
+            self.connector(replacement, registration_scope="replacement").read_table(
+                "app.orders", {}, {}
+            )[0]
+        )
+        _, delete_offset = self.connector(
+            replacement, registration_scope="replacement"
+        ).read_table_deletes(
             "app.orders", {}, {}
         )
 
@@ -1397,7 +1400,7 @@ class LakeflowContractTests(unittest.TestCase):
 
         changed = _stream_offset()
         changed["schema_fingerprint"] = "0" * 64
-        with self.assertRaisesRegex(InformixError, "Shared CDC state is missing"):
+        with self.assertRaisesRegex(InformixError, "Schema history.*missing"):
             connector.read_table("app.orders", changed, {})
 
     def test_restart_transitions_appended_nullable_column_without_snapshot(self):
@@ -1505,117 +1508,12 @@ class LakeflowContractTests(unittest.TestCase):
         bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
         connector = self.connector(bridge)
         connector._trigger_available_now = True
-        connector._trigger_high_water = 110
-        connector._trigger_generation = "a" * 32
+        connector._trigger_boundaries["demo.app.orders"] = (110, "a" * 32)
 
         _, end = connector.read_table("app.orders", checkpoint, {})
 
         self.assertEqual(end["commit_lsn"], checkpoint["commit_lsn"])
 
-    def test_lock_release_does_not_remove_replacement_owner(self):
-        connector = self.connector(FakeBridge())
-        table = Table.parse(_table(), "demo")
-        directory, _, lock_path = connector._shared_table_state_paths(table)
-        first = connector._acquire_shared_state_lock(directory, lock_path)
-        self.assertIsNotNone(first)
-        owner_path = informix_module.os.path.join(lock_path, "owner.json")
-        with open(owner_path, "w", encoding="utf-8") as handle:
-            json.dump({"created_at": 1, "token": "replacement"}, handle)
-
-        connector._release_shared_state_lock(lock_path, first)
-        self.assertTrue(informix_module.os.path.exists(lock_path))
-        connector._release_shared_state_lock(lock_path, "replacement")
-        self.assertFalse(informix_module.os.path.exists(lock_path))
-
-    def test_crashed_worker_lock_fails_closed_until_operator_recovery(self):
-        connector = self.connector(FakeBridge())
-        table = Table.parse(_table(), "demo")
-        directory, _, lock_path = connector._shared_table_state_paths(table)
-        token = connector._acquire_shared_state_lock(directory, lock_path)
-        self.assertIsNotNone(token)
-
-        contender = connector._acquire_shared_state_lock(directory, lock_path)
-
-        self.assertIsNone(contender)
-        connector._release_shared_state_lock(lock_path, token)
-
-    def test_stale_temporary_state_file_does_not_block_publication(self):
-        connector = self.connector(FakeBridge())
-        table = Table.parse(_table(), "demo")
-        directory, state_path, _ = connector._shared_table_state_paths(table)
-        informix_module.os.makedirs(directory, exist_ok=True)
-        stale = f"{state_path}.{informix_module.os.getpid()}.tmp"
-        with open(stale, "w", encoding="utf-8") as handle:
-            handle.write("stale")
-
-        connector._write_shared_table_state(state_path, table, 90)
-
-        self.assertTrue(informix_module.os.path.exists(state_path))
-
-    def test_abandoned_shared_state_artifacts_are_cleaned(self):
-        connector = self.connector(FakeBridge())
-        table = Table.parse(_table(), "demo")
-        directory, state_path, lock_path = connector._shared_table_state_paths(table)
-        informix_module.os.makedirs(directory, exist_ok=True)
-        temporary = f"{state_path}.old.tmp"
-        released = f"{lock_path}.old.released"
-        with open(temporary, "w", encoding="utf-8") as handle:
-            handle.write("old")
-        informix_module.os.mkdir(released)
-        with open(
-            informix_module.os.path.join(released, "owner.json"), "w", encoding="utf-8"
-        ) as handle:
-            json.dump({"token": "old"}, handle)
-        old = informix_module.time.time() - 7200
-        informix_module.os.utime(temporary, (old, old))
-        informix_module.os.utime(released, (old, old))
-
-        token = connector._acquire_shared_state_lock(directory, lock_path)
-
-        self.assertFalse(informix_module.os.path.exists(temporary))
-        self.assertFalse(informix_module.os.path.exists(released))
-        connector._release_shared_state_lock(lock_path, token)
-
-    def test_lock_timeout_diagnostic_contains_recovery_details(self):
-        connector = self.connector(FakeBridge())
-        table = Table.parse(_table(), "demo")
-        directory, _, lock_path = connector._shared_table_state_paths(table)
-        token = connector._acquire_shared_state_lock(directory, lock_path)
-
-        detail = connector._lock_recovery_detail(lock_path)
-
-        self.assertIn(" pid ", detail)
-        self.assertIn(token, detail)
-        self.assertIn("stop every pipeline", detail)
-        connector._release_shared_state_lock(lock_path, token)
-
-    def test_abandoned_lock_recovery_requires_acknowledgement_and_owner_token(self):
-        connector = self.connector(FakeBridge())
-        table = Table.parse(_table(), "demo")
-        directory, _, lock_path = connector._shared_table_state_paths(table)
-        token = connector._acquire_shared_state_lock(directory, lock_path)
-
-        with self.assertRaisesRegex(ValueError, "acknowledgement"):
-            recover_shared_state_lock(
-                self._shared_state.name,
-                lock_path,
-                token,
-                acknowledge_pipelines_stopped=False,
-            )
-        with self.assertRaisesRegex(InformixError, "token changed"):
-            recover_shared_state_lock(
-                self._shared_state.name,
-                lock_path,
-                "f" * 32,
-                acknowledge_pipelines_stopped=True,
-            )
-        recover_shared_state_lock(
-            self._shared_state.name,
-            lock_path,
-            token,
-            acknowledge_pipelines_stopped=True,
-        )
-        self.assertFalse(informix_module.os.path.exists(lock_path))
 
     def test_shared_state_probe_thread_start_failure_is_bounded(self):
         location = self._shared_state.name
@@ -1628,232 +1526,39 @@ class LakeflowContractTests(unittest.TestCase):
             with self.assertRaisesRegex(InformixError, "exclusive directory creation"):
                 _validate_shared_state_filesystem(location)
 
+    def test_stale_populated_probe_artifacts_are_recovered(self):
+        root = os.path.join(self._shared_state.name, ".informix-probe-crashed")
+        os.mkdir(root)
+        for name in ("exclusive", "renamed", "occupied"):
+            child = os.path.join(root, name)
+            os.mkdir(child)
+            if name != "exclusive":
+                with open(
+                    os.path.join(child, "record.json"), "w", encoding="utf-8"
+                ) as handle:
+                    handle.write(name)
+        os.utime(root, (1, 1))
+
+        informix_module._cleanup_probe_artifacts(self._shared_state.name)
+
+        self.assertFalse(os.path.exists(root))
+
     def test_unsupported_volume_directory_open_does_not_fail_publication(self):
         connector = self.connector(FakeBridge())
         table = Table.parse(_table(), "demo")
-        directory, state_path, _ = connector._shared_table_state_paths(table)
-        informix_module.os.makedirs(directory, exist_ok=True)
+        namespace = connector._immutable_namespace(table, "probe", "directory-open")
         real_open = informix_module.os.open
 
         def volume_open(path, flags, *args, **kwargs):
-            if path == directory and flags == informix_module.os.O_RDONLY:
+            if informix_module.os.path.isdir(path) and flags == informix_module.os.O_RDONLY:
                 raise OSError(errno.EACCES, "directory handles unsupported")
             return real_open(path, flags, *args, **kwargs)
 
         with mock.patch.object(informix_module.os, "open", side_effect=volume_open):
-            connector._write_shared_table_state(state_path, table, 90)
+            connector._publish_immutable_head(namespace, {"value": 90})
 
-        self.assertTrue(informix_module.os.path.exists(state_path))
+        self.assertEqual(connector._read_immutable_head(namespace)["value"], 90)
 
-    def test_sweep_fails_closed_on_invalid_table_state(self):
-        connector = self.connector(FakeBridge())
-        table = Table.parse(_table(), "demo")
-        directory, state_path, _ = connector._shared_table_state_paths(table)
-        informix_module.os.makedirs(directory, exist_ok=True)
-        with open(state_path, "w", encoding="utf-8") as handle:
-            handle.write("{not-json")
-
-        with self.assertRaisesRegex(InformixError, "during cleanup"):
-            connector._sweep_table_state_file(directory, state_path, 3600)
-
-    def test_sweep_fails_closed_on_unsupported_state_version(self):
-        connector = self.connector(FakeBridge())
-        table = Table.parse(_table(), "demo")
-        directory, state_path, _ = connector._shared_table_state_paths(table)
-        informix_module.os.makedirs(directory, exist_ok=True)
-        with open(state_path, "w", encoding="utf-8") as handle:
-            json.dump({"version": 999}, handle)
-
-        with self.assertRaisesRegex(InformixError, "version 999"):
-            connector._sweep_table_state_file(directory, state_path, 3600)
-
-    def test_connection_sweep_logs_but_skips_invalid_unrelated_table_state(self):
-        connector = self.connector(FakeBridge())
-        table = Table.parse(_table(), "demo")
-        directory, state_path, _ = connector._shared_table_state_paths(table)
-        informix_module.os.makedirs(directory, exist_ok=True)
-        connector._write_shared_table_state(
-            state_path,
-            table,
-            90,
-            pipeline_scope=connector._pipeline_scope(),
-        )
-        unrelated = informix_module.os.path.join(directory, f"{'f' * 24}.json")
-        with open(unrelated, "w", encoding="utf-8") as handle:
-            handle.write("{not-json")
-        informix_module._LAST_STATE_SWEEP.pop(directory, None)
-
-        with self.assertLogs(informix_module.__name__, level="ERROR") as captured:
-            connector._maybe_sweep_connection_state(
-                directory,
-                protected_path=state_path,
-                protected_scope=connector._pipeline_scope(),
-            )
-
-        self.assertTrue(any(unrelated in message for message in captured.output))
-        self.assertTrue(informix_module.os.path.exists(unrelated))
-
-    def test_connection_sweep_propagates_unrelated_storage_failure(self):
-        connector = self.connector(FakeBridge())
-        table = Table.parse(_table(), "demo")
-        directory, state_path, _ = connector._shared_table_state_paths(table)
-        informix_module.os.makedirs(directory, exist_ok=True)
-        connector._write_shared_table_state(state_path, table, 90)
-        unrelated = informix_module.os.path.join(directory, f"{'e' * 24}.json")
-        connector._write_shared_table_state(unrelated, table, 90)
-        informix_module._LAST_STATE_SWEEP.pop(directory, None)
-        original = connector._sweep_table_state_file
-
-        def fail_storage(directory_arg, path, retention, **kwargs):
-            if path == unrelated:
-                raise InformixError("volume unavailable")
-            return original(directory_arg, path, retention, **kwargs)
-
-        with mock.patch.object(
-            connector, "_sweep_table_state_file", side_effect=fail_storage
-        ), self.assertRaisesRegex(InformixError, "volume unavailable"):
-            connector._maybe_sweep_connection_state(
-                directory,
-                protected_path=state_path,
-                protected_scope=connector._pipeline_scope(),
-            )
-        self.assertFalse(
-            informix_module.os.path.exists(
-                informix_module.os.path.join(directory, ".informix-sweep.json")
-            )
-        )
-
-    def test_sweep_normalizes_legacy_state_before_cleanup(self):
-        connector = self.connector(FakeBridge())
-        table = Table.parse(_table(), "demo")
-        directory, state_path, _ = connector._shared_table_state_paths(table)
-        informix_module.os.makedirs(directory, exist_ok=True)
-        connector._write_shared_table_state(state_path, table, 90)
-        with open(state_path, encoding="utf-8") as handle:
-            state = json.load(handle)
-        state["version"] = 5
-        connector._write_shared_state(state_path, state)
-
-        connector._sweep_table_state_file(directory, state_path, 3600)
-
-        with open(state_path, encoding="utf-8") as handle:
-            normalized = json.load(handle)
-        self.assertEqual(normalized["version"], informix_module._SHARED_STATE_VERSION)
-
-    def test_schema_pruning_classifies_missing_reference_as_validation_error(self):
-        connector = self.connector(FakeBridge())
-        table = Table.parse(_table(), "demo")
-        directory, state_path, _ = connector._shared_table_state_paths(table)
-        informix_module.os.makedirs(directory, exist_ok=True)
-        connector._write_shared_table_state(state_path, table, 90)
-        with open(state_path, encoding="utf-8") as handle:
-            state = json.load(handle)
-        state["snapshot_boundaries"] = {
-            "f" * 64: {
-                "created_at": informix_module.time.time(),
-                "initial_lsn": "90",
-                "scope": "e" * 32,
-                "schema_id": "d" * 32,
-                "snapshot_lsn": "90",
-            }
-        }
-        connector._write_shared_state(state_path, state)
-
-        with self.assertRaises(informix_module.SharedStateValidationError):
-            connector._sweep_table_state_file(directory, state_path, 3600)
-
-    def test_invalid_file_cleanup_candidate_is_a_validation_error(self):
-        connector = self.connector(FakeBridge())
-        table = Table.parse(_table(), "demo")
-        directory, state_path, _ = connector._shared_table_state_paths(table)
-        informix_module.os.makedirs(directory, exist_ok=True)
-        connector._write_shared_table_state(state_path, table, 90)
-        with open(state_path, encoding="utf-8") as handle:
-            state = json.load(handle)
-        for candidate in (True, "not-a-time", -1, informix_module.time.time() + 7200):
-            with self.subTest(candidate=candidate):
-                state["file_cleanup_candidate_at"] = candidate
-                connector._write_shared_state(state_path, state)
-                with self.assertRaises(informix_module.SharedStateValidationError):
-                    connector._sweep_table_state_file(directory, state_path, 3600)
-
-    def test_shared_state_rejects_oversized_lsns_and_invalid_generations(self):
-        connector = self.connector(FakeBridge())
-        table = Table.parse(_table(), "demo")
-        directory, state_path, _ = connector._shared_table_state_paths(table)
-        informix_module.os.makedirs(directory, exist_ok=True)
-        scope = connector._pipeline_scope()
-        connector._write_shared_table_state(
-            state_path, table, 90, pipeline_scope=scope
-        )
-        with open(state_path, encoding="utf-8") as handle:
-            baseline = json.load(handle)
-
-        legacy_none = copy.deepcopy(baseline)
-        legacy_none["trigger_boundaries"] = {
-            "e" * 64: {
-                "created_at": informix_module.time.time(),
-                "generation": "a" * 32,
-                "high_water": "90",
-                "predecessor": "None",
-                "scope": scope,
-            }
-        }
-        connector._write_shared_state(state_path, legacy_none)
-        migrated = connector._read_shared_table_state(state_path, table)
-        self.assertEqual(
-            migrated["trigger_boundaries"]["e" * 64]["predecessor"], "initial"
-        )
-
-        corruptions = []
-        oversized = copy.deepcopy(baseline)
-        oversized["lsn"] = str(1 << 64)
-        corruptions.append(oversized)
-        bad_ack = copy.deepcopy(baseline)
-        bad_ack["scopes"][scope]["upsert"] = {
-            "commit_lsn": True,
-            "phase": "stream",
-            "schema_id": baseline["active_schema_id"],
-            "seen_at": informix_module.time.time(),
-            "trigger_generation": "not-a-generation",
-        }
-        corruptions.append(bad_ack)
-        bad_trigger = copy.deepcopy(baseline)
-        bad_trigger["trigger_boundaries"] = {
-            "f" * 64: {
-                "created_at": informix_module.time.time(),
-                "generation": "a" * 32,
-                "high_water": "90",
-                "predecessor": "not-a-generation",
-                "scope": scope,
-            }
-        }
-        corruptions.append(bad_trigger)
-
-        for state in corruptions:
-            connector._write_shared_state(state_path, state)
-            with self.assertRaises(informix_module.SharedStateValidationError):
-                connector._sweep_table_state_file(directory, state_path, 3600)
-
-    def test_future_schema_transition_state_fails_closed(self):
-        bridge = FakeBridge()
-        connector = self.connector(bridge)
-        _, checkpoint = connector.read_table("app.orders", {}, {})
-        bridge.tables[0]["columns"].append(
-            {"name": "added", "type_name": "INTEGER", "nullable": True}
-        )
-        bridge.now = 120
-        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
-        connector.read_table("app.orders", checkpoint, {})
-        table = Table.parse(bridge.tables[0], "demo")
-        _, state_path, _ = connector._shared_table_state_paths(table)
-        with open(state_path, encoding="utf-8") as handle:
-            state = json.load(handle)
-        state["schemas"][-1]["start_lsn"] = "999"
-        connector._write_shared_state(state_path, state)
-
-        with self.assertRaisesRegex(InformixError, "outside retained/current range"):
-            self.connector(bridge).read_table("app.orders", checkpoint, {})
 
     def test_lagging_checkpoint_advances_one_schema_version_at_a_time(self):
         bridge = FakeBridge()
@@ -1883,13 +1588,103 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(lagging_c["schema_fingerprint"], checkpoint_c["schema_fingerprint"])
         self.assertEqual(lagging_c["commit_lsn"], "140")
 
+    def test_future_immutable_schema_transition_fails_closed(self):
+        bridge = FakeBridge()
+        connector = self.connector(bridge)
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        table = Table.parse(bridge.tables[0], "demo")
+        future = _schema_state(
+            table,
+            999,
+            predecessor=checkpoint["schema_id"],
+        )
+        connector._publish_immutable_head(
+            connector._immutable_namespace(
+                table, "schemas", checkpoint["schema_id"]
+            ),
+            {
+                "created_at": informix_module.time.time(),
+                "schema": future,
+            },
+            record_type="schema-transition",
+        )
+
+        with self.assertRaisesRegex(InformixError, "outside retained/current range"):
+            connector.read_table("app.orders", checkpoint, {})
+        self.assertIsNone(
+            connector._read_immutable_head(
+                connector._immutable_namespace(
+                    table, "schema-nodes", str(future["id"])
+                )
+            )
+        )
+
+    def test_conflicting_additive_schema_transition_branch_fails_closed(self):
+        bridge = FakeBridge()
+        connector = self.connector(bridge)
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        conflicting_raw = json.loads(json.dumps(bridge.tables[0]))
+        conflicting_raw["columns"].append(
+            {"name": "branch_a", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.tables[0]["columns"].append(
+            {"name": "branch_b", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 120
+        current = Table.parse(bridge.tables[0], "demo")
+        conflicting = Table.parse(conflicting_raw, "demo")
+        connector._publish_immutable_head(
+            connector._immutable_namespace(
+                current, "schemas", checkpoint["schema_id"]
+            ),
+            {
+                "created_at": informix_module.time.time(),
+                "schema": _schema_state(
+                    conflicting, 120, predecessor=checkpoint["schema_id"]
+                ),
+            },
+            record_type="schema-transition",
+        )
+
+        with self.assertRaisesRegex(InformixError, "not an additive column change"):
+            connector.read_table("app.orders", checkpoint, {})
+
+    def test_schema_transition_rejects_predecessor_after_checkpoint(self):
+        bridge = FakeBridge()
+        connector = self.connector(bridge)
+        table = Table.parse(_table(), "demo")
+        checkpoint = _stream_offset(100)
+        connector._publish_immutable_head(
+            connector._immutable_namespace(
+                table, "schema-nodes", checkpoint["schema_id"]
+            ),
+            {
+                "created_at": 1.0,
+                "schema": _schema_state(
+                    table, 110, schema_id=checkpoint["schema_id"]
+                ),
+                "scope": checkpoint["pipeline_scope"],
+            },
+            record_type="schema-node",
+        )
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 120
+
+        with self.assertRaisesRegex(InformixError, "follows checkpoint"):
+            connector.read_table("app.orders", checkpoint, {})
+
     def test_incompatible_full_refresh_creates_independent_schema_generation(self):
         bridge = FakeBridge()
         _, old_checkpoint = self.connector(bridge).read_table("app.orders", {}, {})
         bridge.tables[0]["columns"][1]["type_name"] = "INTEGER"
         bridge.now = 150
 
-        refreshed = self.connector(bridge)
+        refreshed = self.connector(bridge, registration_scope="new-layout")
         _, new_checkpoint = refreshed.read_table("app.orders", {}, {})
         bridge.changes = [{"op": "TIMEOUT", "lsn": 150}]
         refreshed.read_table("app.orders", new_checkpoint, {})
@@ -1897,11 +1692,6 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(new_checkpoint["commit_lsn"], "150")
         self.assertEqual(bridge.prepared_identities, ["demo:app.orders"])
-        table = Table.parse(bridge.tables[0], "demo")
-        _, state_path, _ = refreshed._shared_table_state_paths(table)
-        with open(state_path, encoding="utf-8") as handle:
-            generations = json.load(handle)["schemas"]
-        self.assertEqual([schema.get("predecessor") for schema in generations], [None, None])
         with self.assertRaisesRegex(InformixError, "not an additive.*full refresh"):
             self.connector(bridge).read_table("app.orders", old_checkpoint, {})
 
@@ -1917,11 +1707,16 @@ class LakeflowContractTests(unittest.TestCase):
             "app.orders", checkpoint_a, {}
         )
 
-        _, refreshed_b = self.connector(bridge).read_table("app.orders", {}, {})
+        _, refreshed_b = self.connector(
+            bridge, registration_scope="evolved-refresh"
+        ).read_table("app.orders", {}, {})
 
         self.assertEqual(checkpoint_b["commit_lsn"], "120")
         self.assertEqual(refreshed_b["commit_lsn"], "120")
-        self.assertEqual(refreshed_b["schema_id"], checkpoint_b["schema_id"])
+        self.assertEqual(
+            refreshed_b["schema_fingerprint"], checkpoint_b["schema_fingerprint"]
+        )
+        self.assertNotEqual(refreshed_b["schema_id"], checkpoint_b["schema_id"])
 
     def test_repeated_layout_creates_a_distinct_full_refresh_generation(self):
         bridge = FakeBridge()
@@ -1929,11 +1724,15 @@ class LakeflowContractTests(unittest.TestCase):
         _, checkpoint_a1 = self.connector(bridge).read_table("app.orders", {}, {})
         bridge.tables[0]["columns"][1]["type_name"] = "INTEGER"
         bridge.now = 150
-        _, checkpoint_d = self.connector(bridge).read_table("app.orders", {}, {})
+        _, checkpoint_d = self.connector(
+            bridge, registration_scope="layout-d"
+        ).read_table("app.orders", {}, {})
         bridge.tables[0] = original
         bridge.now = 200
 
-        _, checkpoint_a2 = self.connector(bridge).read_table("app.orders", {}, {})
+        _, checkpoint_a2 = self.connector(
+            bridge, registration_scope="layout-a2"
+        ).read_table("app.orders", {}, {})
 
         self.assertEqual(
             checkpoint_a2["schema_fingerprint"], checkpoint_a1["schema_fingerprint"]
@@ -1949,87 +1748,16 @@ class LakeflowContractTests(unittest.TestCase):
         bridge.tables[0]["incarnation"] = "202"
         bridge.now = 200
 
-        _, recreated = self.connector(bridge).read_table("app.orders", {}, {})
+        _, recreated = self.connector(
+            bridge, registration_scope="incarnation-202"
+        ).read_table("app.orders", {}, {})
 
         self.assertNotEqual(first["schema_fingerprint"], recreated["schema_fingerprint"])
         self.assertNotEqual(first["schema_id"], recreated["schema_id"])
         self.assertEqual(recreated["commit_lsn"], "200")
 
-    def test_legacy_migration_preserves_explicit_independent_roots(self):
-        table_a = Table.parse(_table(), "demo")
-        changed = _table()
-        changed["columns"][1]["type_name"] = "INTEGER"
-        table_d = Table.parse(changed, "demo")
-        legacy = {
-            "version": 1,
-            "schemas": [
-                {key: value for key, value in _schema_state(table_a, 90).items() if key != "id"},
-                {key: value for key, value in _schema_state(table_d, 150).items() if key != "id"},
-            ],
-        }
 
-        upgraded = _upgrade_legacy_schema_state(legacy)
 
-        self.assertIsNone(upgraded["schemas"][0]["predecessor"])
-        self.assertIsNone(upgraded["schemas"][1]["predecessor"])
-
-    def test_schema_history_is_not_limited_to_128_nodes(self):
-        table = Table.parse(_table(), "demo")
-        state = {
-            "schemas": [_schema_state(table, 90 + index) for index in range(129)]
-        }
-
-        _validate_schema_history(state, table)
-
-    def test_schema_history_seeding_retries_lock_contention(self):
-        bridge = FakeBridge()
-        connector = self.connector(bridge)
-        _, checkpoint = connector.read_table("app.orders", {}, {})
-        table = Table.parse(bridge.tables[0], "demo")
-        _, state_path, _ = connector._shared_table_state_paths(table)
-        with open(state_path, encoding="utf-8") as handle:
-            state = json.load(handle)
-        state["schemas"] = []
-        connector._write_shared_state(state_path, state)
-
-        acquire = connector._acquire_shared_state_lock
-        attempts = iter((False, True))
-
-        def contend_once(directory, lock_path):
-            try:
-                should_acquire = next(attempts)
-            except StopIteration:
-                should_acquire = True
-            return acquire(directory, lock_path) if should_acquire else None
-
-        with mock.patch.object(
-            connector, "_acquire_shared_state_lock", side_effect=contend_once
-        ), mock.patch.object(informix_module.time, "sleep"):
-            connector.read_table("app.orders", checkpoint, {})
-
-        with open(state_path, encoding="utf-8") as handle:
-            seeded = json.load(handle)
-        self.assertEqual(
-            seeded["schemas"][0]["fingerprint"], checkpoint["schema_fingerprint"]
-        )
-
-    def test_upsert_reader_rebuilds_missing_shared_schema_state(self):
-        bridge = FakeBridge()
-        connector = self.connector(bridge)
-        _, checkpoint = connector.read_table("app.orders", {}, {})
-        table = Table.parse(bridge.tables[0], "demo")
-        _, state_path, _ = connector._shared_table_state_paths(table)
-        informix_module.os.unlink(state_path)
-        bridge.changes = [{"op": "TIMEOUT", "lsn": 90}]
-
-        connector.read_table("app.orders", checkpoint, {})
-
-        with open(state_path, encoding="utf-8") as handle:
-            rebuilt = json.load(handle)
-        self.assertEqual(rebuilt["lsn"], checkpoint["commit_lsn"])
-        self.assertEqual(
-            rebuilt["schemas"][0]["fingerprint"], checkpoint["schema_fingerprint"]
-        )
 
     def test_restart_rejects_non_additive_schema_change(self):
         bridge = FakeBridge()
@@ -2427,289 +2155,45 @@ class LakeflowContractTests(unittest.TestCase):
         _, checkpoint = first.read_table("app.orders", {}, {})
         first.prepare_for_trigger_available_now()
         first.read_table("app.orders", checkpoint, {})
-        self.assertEqual(first._trigger_high_water, 105)
+        self.assertEqual(first._trigger_boundaries["demo.app.orders"][0], 105)
         second.prepare_for_trigger_available_now()
         second.read_table_deletes("app.orders", checkpoint, {})
 
-        self.assertEqual(second._trigger_high_water, 105)
-        self.assertEqual(second._trigger_generation, first._trigger_generation)
+        self.assertEqual(second._trigger_boundaries["demo.app.orders"][0], 105)
+        self.assertEqual(
+            second._trigger_boundaries["demo.app.orders"][1],
+            first._trigger_boundaries["demo.app.orders"][1],
+        )
         self.assertEqual(second_bridge.validated_initial, [])
 
         second_bridge.now = 120
         second.prepare_for_trigger_available_now()
-        self.assertEqual(second._trigger_high_water, 105)
+        self.assertNotIn("demo.app.orders", second._trigger_boundaries)
 
-    def test_acknowledged_snapshot_and_trigger_boundaries_are_pruned(self):
+    def test_reused_reader_captures_new_boundary_for_next_available_now_update(self):
         bridge = FakeBridge()
-        upsert = self.connector(bridge)
-        _, upsert_checkpoint = upsert.read_table("app.orders", {}, {})
-        delete = self.connector(FakeBridge())
-        _, delete_checkpoint = delete.read_table_deletes("app.orders", {}, {})
-        table = Table.parse(bridge.tables[0], "demo")
-        _, state_path, _ = upsert._shared_table_state_paths(table)
-
-        bridge.changes = [{"op": "TIMEOUT", "lsn": bridge.now}]
-        upsert.read_table("app.orders", upsert_checkpoint, {})
-        with open(state_path, encoding="utf-8") as handle:
-            self.assertTrue(json.load(handle)["snapshot_boundaries"])
-        delete.read_table_deletes("app.orders", delete_checkpoint, {})
-        with open(state_path, encoding="utf-8") as handle:
-            self.assertEqual(json.load(handle)["snapshot_boundaries"], {})
-
-        upsert = self.connector(bridge)
-        delete_bridge = FakeBridge()
-        delete_bridge.changes = [{"op": "TIMEOUT", "lsn": delete_bridge.now}]
-        delete = self.connector(delete_bridge)
-        upsert.prepare_for_trigger_available_now()
-        delete.prepare_for_trigger_available_now()
-        _, upsert_end = upsert.read_table("app.orders", upsert_checkpoint, {})
-        _, delete_end = delete.read_table_deletes("app.orders", delete_checkpoint, {})
-        self.assertEqual(upsert_end["trigger_generation"], delete_end["trigger_generation"])
-        upsert.read_table("app.orders", upsert_end, {})
-        delete.read_table_deletes("app.orders", delete_end, {})
-        with open(state_path, encoding="utf-8") as handle:
-            self.assertEqual(json.load(handle)["trigger_boundaries"], {})
-
-    def test_expired_scope_is_pruned_and_cannot_restart(self):
-        bridge = FakeBridge()
-        connector = self.connector(bridge)
-        _, checkpoint = connector.read_table("app.orders", {}, {})
-        table = Table.parse(bridge.tables[0], "demo")
-        _, state_path, _ = connector._shared_table_state_paths(table)
-        with open(state_path, encoding="utf-8") as handle:
-            state = json.load(handle)
-        expired_scope = "e" * 32
-        state["scopes"][expired_scope] = {
-            "cleanup_candidate_at": 1.0,
-            "created_at": 1.0,
-            "last_seen": 1.0,
-        }
-        state["snapshot_boundaries"]["f" * 64] = {
-            "created_at": 1.0,
-            "initial_lsn": "90",
-            "scope": expired_scope,
-            "schema_id": checkpoint["schema_id"],
-            "snapshot_lsn": "90",
-        }
-        connector._write_shared_state(state_path, state)
-        bridge.changes = [{"op": "TIMEOUT", "lsn": bridge.now}]
-
-        connector.read_table("app.orders", checkpoint, {})
-
-        with open(state_path, encoding="utf-8") as handle:
-            cleaned = json.load(handle)
-        self.assertNotIn(expired_scope, cleaned["scopes"])
-        self.assertNotIn("f" * 64, cleaned["snapshot_boundaries"])
-        cleaned["scopes"].pop(checkpoint["pipeline_scope"])
-        connector._write_shared_state(state_path, cleaned)
-        with self.assertRaisesRegex(InformixError, "removed.*full refresh"):
-            self.connector(bridge).read_table("app.orders", checkpoint, {})
-
-    def test_returned_end_offset_is_not_acknowledged_before_commit(self):
-        bridge = FakeBridge()
+        bridge.now = 105
         connector = self.connector(bridge)
         _, checkpoint = connector.read_table("app.orders", {}, {})
         connector.prepare_for_trigger_available_now()
-        bridge.changes = [{"op": "TIMEOUT", "lsn": bridge.now}]
-
-        _, uncommitted_end = connector.read_table("app.orders", checkpoint, {})
-
-        table = Table.parse(bridge.tables[0], "demo")
-        _, state_path, _ = connector._shared_table_state_paths(table)
-        with open(state_path, encoding="utf-8") as handle:
-            state = json.load(handle)
-        scope_state = state["scopes"][checkpoint["pipeline_scope"]]
-        self.assertIsNone(scope_state["upsert"]["trigger_generation"])
-        self.assertTrue(state["trigger_boundaries"])
-        self.assertIsNotNone(uncommitted_end["trigger_generation"])
-
-    def test_unchanged_acknowledgement_skips_volume_lock(self):
-        bridge = FakeBridge()
-        connector = self.connector(bridge)
-        _, checkpoint = connector.read_table("app.orders", {}, {})
-        bridge.changes = [{"op": "TIMEOUT", "lsn": bridge.now}]
-        connector.read_table("app.orders", checkpoint, {})
-
-        with mock.patch.object(
-            connector,
-            "_acquire_shared_state_lock",
-            side_effect=AssertionError("unchanged acknowledgement acquired lock"),
-        ):
-            connector.read_table("app.orders", checkpoint, {})
-
-    def test_advancing_checkpoint_updates_shared_acknowledgement(self):
-        bridge = FakeBridge()
-        connector = self.connector(bridge)
-        _, checkpoint = connector.read_table("app.orders", {}, {})
-        table = Table.parse(bridge.tables[0], "demo")
-        connector._acknowledge_scope(table, checkpoint, deletes=False)
-        advanced = dict(checkpoint)
-        advanced.update(commit_lsn="91", change_lsn="91", begin_lsn="91")
-
-        connector._acknowledge_scope(table, advanced, deletes=False)
-
-        _, state_path, _ = connector._shared_table_state_paths(table)
-        with open(state_path, encoding="utf-8") as handle:
-            state = json.load(handle)
-        scope = state["scopes"][checkpoint["pipeline_scope"]]
-        self.assertEqual(scope["upsert"]["commit_lsn"], "91")
-
-    def test_scope_expiration_requires_two_stale_observations(self):
-        connector = self.connector(FakeBridge())
-        current_scope = connector._pipeline_scope()
-        stale_scope = "e" * 32
-        state = {
-            "scopes": {
-                current_scope: {"created_at": 1.0, "last_seen": 1.0},
-                stale_scope: {"created_at": 1.0, "last_seen": 1.0},
-            },
-            "snapshot_boundaries": {},
-            "trigger_boundaries": {},
-        }
-        retention = int(
-            connector.options.get(
-                "cdc.shared.state.scope.retention.seconds", str(30 * 24 * 60 * 60)
-            )
-        )
-
-        connector._prune_shared_boundaries(state, current_scope, retention + 2.0)
-
-        self.assertIn(stale_scope, state["scopes"])
-        self.assertEqual(
-            state["scopes"][stale_scope]["cleanup_candidate_at"], retention + 2.0
-        )
-
-    def test_connection_sweep_deletes_expired_table_state_file(self):
-        connector = self.connector(FakeBridge())
-        raw = _table()
-        raw["name"] = "retired_orders"
-        table = Table.parse(raw, "demo")
-        directory, state_path, _ = connector._shared_table_state_paths(table)
-        informix_module.os.makedirs(directory, exist_ok=True)
-        scope = "e" * 32
-        connector._write_shared_table_state(
-            state_path, table, 90, pipeline_scope=scope
-        )
-        with open(state_path, encoding="utf-8") as handle:
-            state = json.load(handle)
-        state["scopes"][scope].update(
-            {"cleanup_candidate_at": 1.0, "last_seen": 1.0}
-        )
-        state["file_cleanup_candidate_at"] = 1.0
-        connector._write_shared_state(state_path, state)
-
-        connector._sweep_table_state_file(directory, state_path, 3600)
-
-        self.assertFalse(informix_module.os.path.exists(state_path))
-
-    def test_schema_sweep_keeps_referenced_paths_and_prunes_orphans(self):
-        table = Table.parse(_table(), "demo")
-        root = _schema_state(table, 90, schema_id="1" * 32)
-        active = _schema_state(
-            table, 100, predecessor="1" * 32, schema_id="2" * 32
-        )
-        orphan = _schema_state(table, 110, schema_id="3" * 32)
-        scope = "a" * 32
-        state = {
-            "active_schema_id": "2" * 32,
-            "schemas": [root, active, orphan],
-            "scopes": {
-                scope: {
-                    "created_at": 1.0,
-                    "last_seen": 1.0,
-                    "upsert": {
-                        "phase": "stream",
-                        "schema_id": "1" * 32,
-                        "seen_at": 1.0,
-                    },
-                }
-            },
-            "snapshot_boundaries": {},
-            "trigger_boundaries": {},
+        _, first_end = connector.read_table("app.orders", checkpoint, {})
+        first_generation = connector._trigger_boundaries["demo.app.orders"][1]
+        next_checkpoint = {
+            **first_end,
+            "begin_lsn": "105",
+            "change_lsn": "105",
+            "commit_lsn": "105",
+            "trigger_generation": first_generation,
         }
 
-        connector = self.connector(FakeBridge())
-        connector._prune_schema_history(state)
+        bridge.now = 120
+        connector.prepare_for_trigger_available_now()
+        connector.read_table("app.orders", next_checkpoint, {})
 
-        self.assertEqual(
-            [schema["id"] for schema in state["schemas"]],
-            ["1" * 32, "2" * 32],
+        self.assertEqual(connector._trigger_boundaries["demo.app.orders"][0], 120)
+        self.assertNotEqual(
+            connector._trigger_boundaries["demo.app.orders"][1], first_generation
         )
-
-    def test_active_table_sweeps_retired_table_in_same_connection(self):
-        connector = self.connector(FakeBridge())
-        _, checkpoint = connector.read_table("app.orders", {}, {})
-        current = Table.parse(_table(), "demo")
-        directory, current_path, _ = connector._shared_table_state_paths(current)
-        retired_raw = _table()
-        retired_raw["name"] = "retired_orders"
-        retired = Table.parse(retired_raw, "demo")
-        _, retired_path, _ = connector._shared_table_state_paths(retired)
-        retired_scope = "e" * 32
-        connector._write_shared_table_state(
-            retired_path, retired, 90, pipeline_scope=retired_scope
-        )
-        with open(retired_path, encoding="utf-8") as handle:
-            retired_state = json.load(handle)
-        retired_state["scopes"][retired_scope].update(
-            {"cleanup_candidate_at": 1.0, "last_seen": 1.0}
-        )
-        retired_state["file_cleanup_candidate_at"] = 1.0
-        connector._write_shared_state(retired_path, retired_state)
-        informix_module._LAST_STATE_SWEEP.pop(directory, None)
-
-        connector._maybe_sweep_connection_state(
-            directory,
-            protected_path=current_path,
-            protected_scope=checkpoint["pipeline_scope"],
-        )
-
-        self.assertTrue(informix_module.os.path.exists(current_path))
-        self.assertFalse(informix_module.os.path.exists(retired_path))
-
-        # Simulate another worker whose process-local throttle is empty.  The
-        # shared marker still prevents a duplicate connection scan.
-        informix_module._LAST_STATE_SWEEP.pop(directory, None)
-        other_worker = self.connector(FakeBridge())
-        with mock.patch.object(
-            other_worker,
-            "_sweep_table_state_file",
-            side_effect=AssertionError("shared sweep marker was ignored"),
-        ):
-            other_worker._maybe_sweep_connection_state(
-                directory,
-                protected_path=current_path,
-                protected_scope=checkpoint["pipeline_scope"],
-            )
-
-    def test_connection_sweep_rejects_oversized_and_future_markers(self):
-        connector = self.connector(FakeBridge())
-        _, checkpoint = connector.read_table("app.orders", {}, {})
-        table = Table.parse(_table(), "demo")
-        directory, state_path, _ = connector._shared_table_state_paths(table)
-        marker_path = informix_module.os.path.join(directory, ".informix-sweep.json")
-        cases = (
-            "x" * (informix_module._MAX_SWEEP_MARKER_BYTES + 1),
-            json.dumps({"completed_at": True}),
-            json.dumps(
-                {
-                    "completed_at": informix_module.time.time()
-                    + informix_module._STATE_SWEEP_INTERVAL_SECONDS
-                    + 60
-                }
-            ),
-        )
-        for payload in cases:
-            with self.subTest(payload_size=len(payload)):
-                with open(marker_path, "w", encoding="utf-8") as handle:
-                    handle.write(payload)
-                informix_module._LAST_STATE_SWEEP.pop(directory, None)
-                with self.assertRaisesRegex(InformixError, "sweep marker"):
-                    connector._maybe_sweep_connection_state(
-                        directory,
-                        protected_path=state_path,
-                        protected_scope=checkpoint["pipeline_scope"],
-                    )
 
     def test_concurrent_pipelines_keep_trigger_boundaries_isolated(self):
         seed_bridge = FakeBridge()
@@ -2736,11 +2220,14 @@ class LakeflowContractTests(unittest.TestCase):
         delete_b.prepare_for_trigger_available_now()
         delete_b.read_table_deletes("app.orders", checkpoint_b, {})
 
-        self.assertEqual(delete_a._trigger_high_water, 105)
-        self.assertEqual(delete_b._trigger_high_water, 110)
-        self.assertNotEqual(delete_a._trigger_generation, delete_b._trigger_generation)
+        self.assertEqual(delete_a._trigger_boundaries["demo.app.orders"][0], 105)
+        self.assertEqual(delete_b._trigger_boundaries["demo.app.orders"][0], 110)
+        self.assertNotEqual(
+            delete_a._trigger_boundaries["demo.app.orders"][1],
+            delete_b._trigger_boundaries["demo.app.orders"][1],
+        )
 
-    def test_divergent_channel_checkpoints_share_current_update_boundary(self):
+    def test_divergent_trigger_predecessors_fail_closed(self):
         bridge = FakeBridge()
         _, seed = self.connector(bridge).read_table("app.orders", {}, {})
         upsert_checkpoint = {**seed, "trigger_generation": "a" * 32}
@@ -2751,10 +2238,30 @@ class LakeflowContractTests(unittest.TestCase):
         upsert.read_table("app.orders", upsert_checkpoint, {})
         delete = self.connector(FakeBridge())
         delete.prepare_for_trigger_available_now()
+        with self.assertRaisesRegex(InformixError, "Ambiguous immutable trigger"):
+            delete.read_table_deletes("app.orders", delete_checkpoint, {})
+
+    def test_trigger_boundary_allows_divergent_channel_lsns(self):
+        bridge = FakeBridge()
+        _, upsert_checkpoint = self.connector(bridge).read_table("app.orders", {}, {})
+        delete_checkpoint = {
+            **upsert_checkpoint,
+            "begin_lsn": "80",
+            "change_lsn": "80",
+            "commit_lsn": "80",
+        }
+        bridge.now = 125
+        upsert = self.connector(bridge)
+        upsert.prepare_for_trigger_available_now()
+        upsert.read_table("app.orders", upsert_checkpoint, {})
+        delete = self.connector(FakeBridge())
+        delete.prepare_for_trigger_available_now()
         delete.read_table_deletes("app.orders", delete_checkpoint, {})
 
-        self.assertEqual(delete._trigger_high_water, 125)
-        self.assertEqual(delete._trigger_generation, upsert._trigger_generation)
+        self.assertEqual(
+            delete._trigger_boundaries["demo.app.orders"],
+            upsert._trigger_boundaries["demo.app.orders"],
+        )
 
     def test_atomic_coordination_does_not_require_runtime_pipeline_update_identity(self):
         bridge = FakeBridge()
@@ -2786,6 +2293,548 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual([row["id"] for row in changes], [1])
         self.assertEqual(end["commit_lsn"], "110")
+
+    def test_continuous_stream_invokes_throttled_candidate_cleanup(self):
+        bridge = FakeBridge()
+        connector = self.connector(bridge)
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        bridge.changes = [{"op": "TIMEOUT", "lsn": bridge.now}]
+
+        with mock.patch.object(
+            informix_module, "_maybe_cleanup_immutable_candidates"
+        ) as cleanup:
+            connector.read_table("app.orders", checkpoint, {})
+
+        cleanup.assert_called_with(self._shared_state.name)
+
+    def test_immutable_head_elects_one_complete_winner(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        namespace = connector._immutable_namespace(table, "probe", "one")
+        barrier = threading.Barrier(2)
+        results = []
+
+        def publish(value):
+            barrier.wait()
+            results.append(connector._publish_immutable_head(namespace, {"value": value}))
+
+        threads = [threading.Thread(target=publish, args=(value,)) for value in (1, 2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(results[0], results[1])
+        self.assertIn(results[0]["value"], {1, 2})
+        self.assertEqual(
+            os.listdir(os.path.join(namespace, "head")), ["record.json"]
+        )
+
+    def test_immutable_head_never_replaces_winner(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        namespace = connector._immutable_namespace(table, "probe", "stable")
+
+        first = connector._publish_immutable_head(namespace, {"value": "first"})
+        second = connector._publish_immutable_head(namespace, {"value": "second"})
+
+        self.assertEqual(first["value"], "first")
+        self.assertEqual(second, first)
+
+    def test_malformed_initialization_winner_fails_before_use(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        scope = connector._pipeline_scope()
+        connector._publish_immutable_head(
+            connector._immutable_namespace(table, "initialization", scope),
+            {
+                "created_at": 1.0,
+                "initial_lsn": "90",
+                "schema": {**_schema_state(table, 90), "id": "invalid"},
+                "scope": scope,
+                "table": table.native_identity,
+            },
+            record_type="initialization",
+        )
+
+        with self.assertRaisesRegex(InformixError, "initialization schema"):
+            connector._shared_table_lsn(table, owner=True)
+
+    def test_schema_node_namespace_rejects_wrong_embedded_id(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        checkpoint = _stream_offset()
+        connector._publish_immutable_head(
+            connector._immutable_namespace(
+                table, "schema-nodes", checkpoint["schema_id"]
+            ),
+            {
+                "created_at": 1.0,
+                "schema": _schema_state(table, 100, schema_id="2" * 32),
+                "scope": checkpoint["pipeline_scope"],
+            },
+            record_type="schema-node",
+        )
+
+        with self.assertRaisesRegex(InformixError, "conflicts with immutable history"):
+            connector.read_table("app.orders", checkpoint, {})
+
+    def test_existing_schema_node_rejects_start_after_checkpoint(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        checkpoint = _stream_offset(100)
+        connector._publish_immutable_head(
+            connector._immutable_namespace(
+                table, "schema-nodes", checkpoint["schema_id"]
+            ),
+            {
+                "created_at": 1.0,
+                "schema": _schema_state(
+                    table, 110, schema_id=checkpoint["schema_id"]
+                ),
+                "scope": checkpoint["pipeline_scope"],
+            },
+            record_type="schema-node",
+        )
+
+        with self.assertRaisesRegex(InformixError, "Invalid immutable schema-node"):
+            connector.read_table("app.orders", checkpoint, {})
+
+    def test_initialization_rejects_conflicting_schema_node_election_winner(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        publish = connector._publish_immutable_head
+
+        def conflicting_winner(namespace, record, *, record_type="generic"):
+            winner = publish(namespace, record, record_type=record_type)
+            if record_type == "schema-node":
+                return {
+                    **winner,
+                    "schema": {**winner["schema"], "id": "f" * 32},
+                }
+            return winner
+
+        with mock.patch.object(
+            connector,
+            "_publish_immutable_head",
+            side_effect=conflicting_winner,
+        ):
+            with self.assertRaisesRegex(InformixError, "Conflicting immutable schema-node"):
+                connector._shared_table_lsn(table, owner=True)
+
+    def test_initialization_schema_node_is_pipeline_scope_independent(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        _, schema_id = connector._shared_table_lsn(table, owner=True)
+        node = connector._read_immutable_head(
+            connector._immutable_namespace(table, "schema-nodes", schema_id)
+        )
+        self.assertNotIn("scope", node)
+
+    def test_abandoned_candidate_is_not_committed_or_reclaimed_automatically(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        namespace = connector._immutable_namespace(table, "probe", "abandoned")
+        os.makedirs(namespace)
+        candidate = os.path.join(namespace, "candidate-" + "a" * 32)
+        os.mkdir(candidate)
+        with open(os.path.join(candidate, "record.json"), "w", encoding="utf-8") as handle:
+            handle.write("partial")
+        os.utime(candidate, (1, 1))
+
+        self.assertIsNone(connector._read_immutable_head(namespace))
+        self.assertTrue(os.path.exists(candidate))
+
+        with self.assertRaisesRegex(ValueError, "pipelines are stopped"):
+            informix_module.cleanup_abandoned_immutable_candidates(
+                self._shared_state.name,
+                acknowledge_pipelines_stopped=False,
+            )
+        with self.assertRaisesRegex(ValueError, "/Volumes"):
+            informix_module.cleanup_abandoned_immutable_candidates(
+                self._shared_state.name,
+                acknowledge_pipelines_stopped=True,
+            )
+        with mock.patch.object(
+            informix_module,
+            "_validated_volume_state_location",
+            return_value=self._shared_state.name,
+        ):
+            removed = informix_module.cleanup_abandoned_immutable_candidates(
+                "/Volumes/catalog/schema/volume/state",
+                acknowledge_pipelines_stopped=True,
+            )
+        self.assertEqual(removed, 1)
+        self.assertFalse(os.path.exists(candidate))
+
+    def test_candidate_cleanup_ignores_symlinked_candidate_directory(self):
+        target = os.path.join(self._shared_state.name, "target")
+        os.mkdir(target)
+        record = os.path.join(target, "record.json")
+        with open(record, "w", encoding="utf-8") as handle:
+            handle.write("keep")
+        link = os.path.join(self._shared_state.name, "candidate-" + "b" * 32)
+        os.symlink(target, link)
+
+        removed = informix_module._cleanup_immutable_candidates(
+            self._shared_state.name, headless_cutoff=float("inf")
+        )
+
+        self.assertEqual(removed, 0)
+        self.assertTrue(os.path.exists(record))
+
+    def test_candidate_cleanup_cannot_publish_an_empty_head_during_rename_race(self):
+        namespace = os.path.join(self._shared_state.name, "namespace")
+        candidate = os.path.join(namespace, "candidate-" + "e" * 32)
+        os.makedirs(candidate)
+        with open(os.path.join(candidate, "record.json"), "w", encoding="utf-8") as handle:
+            handle.write("complete")
+        os.utime(candidate, (1, 1))
+        real_rename = informix_module.os.rename
+
+        def publisher_wins(source, target):
+            if source == candidate and ".candidate-gc-" in target:
+                real_rename(candidate, os.path.join(namespace, "head"))
+                raise FileNotFoundError(candidate)
+            return real_rename(source, target)
+
+        with mock.patch.object(informix_module.os, "rename", side_effect=publisher_wins):
+            removed = informix_module._cleanup_immutable_candidates(
+                self._shared_state.name, headless_cutoff=float("inf")
+            )
+
+        self.assertEqual(removed, 0)
+        with open(
+            os.path.join(namespace, "head", "record.json"), encoding="utf-8"
+        ) as handle:
+            self.assertEqual(handle.read(), "complete")
+
+    def test_running_cleanup_collects_only_old_headless_candidates(self):
+        old = os.path.join(self._shared_state.name, "candidate-" + "c" * 32)
+        recent = os.path.join(self._shared_state.name, "candidate-" + "d" * 32)
+        for path in (old, recent):
+            os.mkdir(path)
+            with open(os.path.join(path, "record.json"), "w", encoding="utf-8") as handle:
+                handle.write("candidate")
+        os.utime(old, (1, 1))
+        informix_module._LAST_CANDIDATE_CLEANUP.pop(self._shared_state.name, None)
+
+        informix_module._maybe_cleanup_immutable_candidates(self._shared_state.name)
+
+        self.assertFalse(os.path.exists(old))
+        self.assertTrue(os.path.exists(recent))
+
+    def test_failed_running_cleanup_is_not_retried_within_daily_bucket(self):
+        location = self._shared_state.name
+        informix_module._LAST_CANDIDATE_CLEANUP.pop(location, None)
+        with mock.patch.object(
+            informix_module,
+            "_cleanup_immutable_candidates",
+            side_effect=InformixError("temporary"),
+        ) as cleanup, mock.patch.object(
+            informix_module, "_publish_candidate_cleanup_completion"
+        ):
+            informix_module._maybe_cleanup_immutable_candidates(location)
+            informix_module._maybe_cleanup_immutable_candidates(location)
+
+        self.assertEqual(cleanup.call_count, 1)
+
+    def test_cleanup_completion_marker_is_versioned_and_validated(self):
+        location = self._shared_state.name
+        bucket = int(
+            informix_module.time.time()
+            // informix_module._CANDIDATE_CLEANUP_INTERVAL_SECONDS
+        )
+        informix_module._publish_candidate_cleanup_completion(location, bucket)
+        marker = informix_module._read_cleanup_marker(
+            informix_module._candidate_cleanup_completion_path(location, bucket),
+            "candidate-cleanup-completion",
+            bucket,
+        )
+        self.assertEqual(marker["format_version"], 1)
+        self.assertEqual(marker["record_type"], "candidate-cleanup-completion")
+
+    def test_offline_cleanup_rejects_nonexistent_volume_location(self):
+        with self.assertRaisesRegex(ValueError, "does not exist"):
+            informix_module.cleanup_abandoned_immutable_candidates(
+                "/Volumes/missing_catalog/missing_schema/missing_volume/state",
+                acknowledge_pipelines_stopped=True,
+            )
+
+    def test_malformed_cleanup_completion_is_quarantined_before_scan(self):
+        location = self._shared_state.name
+        bucket = int(
+            informix_module.time.time()
+            // informix_module._CANDIDATE_CLEANUP_INTERVAL_SECONDS
+        )
+        marker = informix_module._candidate_cleanup_completion_path(location, bucket)
+        os.makedirs(os.path.dirname(marker))
+        with open(marker, "w", encoding="utf-8") as handle:
+            handle.write("not-json")
+        informix_module._LAST_CANDIDATE_CLEANUP.pop(location, None)
+        with mock.patch.object(informix_module, "_cleanup_immutable_candidates") as cleanup:
+            informix_module._maybe_cleanup_immutable_candidates(location)
+        cleanup.assert_called_once()
+        self.assertEqual(
+            informix_module._read_cleanup_marker(
+                marker, "candidate-cleanup-completion", bucket
+            )["bucket"],
+            bucket,
+        )
+
+    def test_symlinked_cleanup_completion_is_quarantined_before_scan(self):
+        location = self._shared_state.name
+        bucket = int(
+            informix_module.time.time()
+            // informix_module._CANDIDATE_CLEANUP_INTERVAL_SECONDS
+        )
+        marker = informix_module._candidate_cleanup_completion_path(location, bucket)
+        os.makedirs(os.path.dirname(marker))
+        target = os.path.join(location, "marker-target")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write("{}")
+        os.symlink(target, marker)
+        informix_module._LAST_CANDIDATE_CLEANUP.pop(location, None)
+        with mock.patch.object(informix_module, "_cleanup_immutable_candidates") as cleanup:
+            informix_module._maybe_cleanup_immutable_candidates(location)
+        cleanup.assert_called_once()
+        self.assertFalse(os.path.islink(marker))
+        self.assertEqual(
+            informix_module._read_cleanup_marker(
+                marker, "candidate-cleanup-completion", bucket
+            )["bucket"],
+            bucket,
+        )
+
+    def test_cleanup_election_prevents_duplicate_scan(self):
+        location = self._shared_state.name
+        informix_module._LAST_CANDIDATE_CLEANUP.pop(location, None)
+        with mock.patch.object(informix_module, "_cleanup_immutable_candidates") as cleanup:
+            informix_module._maybe_cleanup_immutable_candidates(location)
+            informix_module._LAST_CANDIDATE_CLEANUP.pop(location, None)
+            informix_module._maybe_cleanup_immutable_candidates(location)
+        self.assertEqual(cleanup.call_count, 1)
+
+    def test_malformed_cleanup_election_fails_closed(self):
+        location = self._shared_state.name
+        bucket = int(
+            informix_module.time.time()
+            // informix_module._CANDIDATE_CLEANUP_INTERVAL_SECONDS
+        )
+        marker = informix_module._candidate_cleanup_election_path(location, bucket)
+        os.makedirs(os.path.dirname(marker))
+        with open(marker, "w", encoding="utf-8") as handle:
+            handle.write("not-json")
+        informix_module._LAST_CANDIDATE_CLEANUP.pop(location, None)
+        with mock.patch.object(informix_module, "_cleanup_immutable_candidates") as cleanup:
+            informix_module._maybe_cleanup_immutable_candidates(location)
+        cleanup.assert_not_called()
+
+    def test_cleanup_throttle_cache_is_bounded(self):
+        informix_module._LAST_CANDIDATE_CLEANUP.clear()
+        limit = informix_module._MAX_CANDIDATE_CLEANUP_THROTTLES
+        for index in range(limit + 3):
+            informix_module._remember_candidate_cleanup(f"location-{index}", float(index))
+        self.assertEqual(len(informix_module._LAST_CANDIDATE_CLEANUP), limit)
+        self.assertNotIn("location-0", informix_module._LAST_CANDIDATE_CLEANUP)
+
+    def test_cleanup_prunes_old_marker_buckets(self):
+        location = self._shared_state.name
+        current = 100
+        old = informix_module._candidate_cleanup_completion_path(location, 1)
+        os.makedirs(os.path.dirname(old))
+        with open(old, "w", encoding="utf-8") as handle:
+            handle.write("old")
+        informix_module._prune_candidate_cleanup_markers(location, current)
+        self.assertFalse(os.path.exists(os.path.join(location, ".informix-candidate-cleanup", "1")))
+
+    def test_cleanup_retains_exactly_seven_daily_buckets(self):
+        location = self._shared_state.name
+        current = 100
+        root = os.path.join(location, ".informix-candidate-cleanup")
+        for bucket in range(current - 7, current + 1):
+            os.makedirs(os.path.join(root, str(bucket)))
+        informix_module._prune_candidate_cleanup_markers(location, current)
+        retained = sorted(int(name) for name in os.listdir(root))
+        self.assertEqual(retained, list(range(current - 6, current + 1)))
+
+    def test_immutable_head_rejects_symlinked_record(self):
+        namespace = os.path.join(self._shared_state.name, "symlink-record")
+        head = os.path.join(namespace, "head")
+        os.makedirs(head)
+        target = os.path.join(namespace, "target.json")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write('{}')
+        os.symlink(target, os.path.join(head, "record.json"))
+        with self.assertRaisesRegex(InformixError, "Invalid Informix immutable record"):
+            informix_module.InformixLakeflowConnect._read_immutable_head(namespace)
+
+    def test_immutable_head_rejects_symlinked_head_directory(self):
+        namespace = os.path.join(self._shared_state.name, "symlink-head")
+        target = os.path.join(self._shared_state.name, "head-target")
+        os.makedirs(target)
+        with open(os.path.join(target, "record.json"), "w", encoding="utf-8") as handle:
+            handle.write('{}')
+        os.makedirs(namespace)
+        os.symlink(target, os.path.join(namespace, "head"))
+        with self.assertRaisesRegex(InformixError, "Invalid Informix immutable head"):
+            informix_module.InformixLakeflowConnect._read_immutable_head(namespace)
+
+    def test_oversized_immutable_record_does_not_leak_candidate(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        namespace = connector._immutable_namespace(table, "probe", "oversized")
+
+        with self.assertRaisesRegex(InformixError, "too large"):
+            connector._publish_immutable_head(
+                namespace, {"value": "x" * (informix_module._MAX_SHARED_STATE_BYTES + 1)}
+            )
+
+        self.assertEqual(os.listdir(namespace), [])
+
+    def test_malformed_snapshot_lsn_raises_connector_error(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        scope = connector._pipeline_scope()
+        schema_id = "1" * 32
+        connector._publish_immutable_head(
+            connector._immutable_namespace(table, "snapshots", scope, schema_id),
+            {
+                "created_at": 1.0,
+                "initial_lsn": "not-an-lsn",
+                "scope": scope,
+                "schema_id": schema_id,
+                "snapshot_lsn": "90",
+            },
+            record_type="snapshot",
+        )
+
+        with self.assertRaisesRegex(InformixError, "Invalid initial_lsn"):
+            connector._publish_snapshot_boundary(table, schema_id, 90, 90, scope)
+
+    def test_publication_wraps_filesystem_creation_error(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        namespace = connector._immutable_namespace(table, "probe", "mkdir-error")
+        _validate_shared_state_filesystem(self._shared_state.name)
+        with mock.patch.object(
+            informix_module.os,
+            "makedirs",
+            side_effect=OSError(errno.EIO, "failed"),
+        ):
+            with self.assertRaisesRegex(InformixError, "Cannot create"):
+                connector._publish_immutable_head(namespace, {"value": 1})
+
+    def test_ambiguous_trigger_fallback_fails_closed(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        checkpoint = _stream_offset()
+        scope = checkpoint["pipeline_scope"]
+        for index in (1, 2):
+            connector._publish_immutable_head(
+                connector._immutable_namespace(table, "triggers", f"candidate-{index}"),
+                {
+                    "created_at": float(index),
+                    "checkpoint_lsn": checkpoint["commit_lsn"],
+                    "generation": f"{index:032x}",
+                    "high_water": "120",
+                    "predecessor": "f" * 32,
+                    "schema_id": checkpoint["schema_id"],
+                    "scope": scope,
+                },
+                record_type="trigger",
+            )
+
+        with self.assertRaisesRegex(InformixError, "Ambiguous immutable trigger"):
+            connector._shared_trigger_boundary(table, checkpoint, owner=False)
+
+    def test_malformed_trigger_winner_fails_before_caching(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        checkpoint = _stream_offset()
+        scope = checkpoint["pipeline_scope"]
+        predecessor = "initial"
+        key = hashlib.sha256(
+            "\0".join(
+                (
+                    scope,
+                    checkpoint["schema_id"],
+                    predecessor,
+                )
+            ).encode()
+        ).hexdigest()
+        connector._publish_immutable_head(
+            connector._immutable_namespace(table, "triggers", key),
+            {
+                "checkpoint_lsn": checkpoint["commit_lsn"],
+                "generation": "invalid",
+                "high_water": "120",
+                "predecessor": predecessor,
+                "schema_id": checkpoint["schema_id"],
+                "scope": scope,
+            },
+            record_type="trigger",
+        )
+
+        with self.assertRaisesRegex(InformixError, "trigger generation"):
+            connector._shared_trigger_boundary(table, checkpoint, owner=True)
+        self.assertNotIn(table.identity, connector._trigger_boundaries)
+
+    def test_trigger_winner_rejects_wrong_predecessor_and_invalid_lsn(self):
+        for predecessor, high_water, message in (
+            ("f" * 32, "120", "trigger identity"),
+            ("initial", "not-an-lsn", "trigger boundary"),
+        ):
+            with self.subTest(predecessor=predecessor, high_water=high_water):
+                connector = self.connector(FakeBridge())
+                table = Table.parse(_table(), "demo")
+                checkpoint = _stream_offset()
+                checkpoint["pipeline_scope"] = hashlib.sha256(
+                    high_water.encode()
+                ).hexdigest()[:32]
+                scope = checkpoint["pipeline_scope"]
+                key = hashlib.sha256(
+                    "\0".join(
+                        (scope, checkpoint["schema_id"], "initial")
+                    ).encode()
+                ).hexdigest()
+                connector._publish_immutable_head(
+                    connector._immutable_namespace(table, "triggers", key),
+                    {
+                        "checkpoint_lsn": checkpoint["commit_lsn"],
+                        "generation": "a" * 32,
+                        "high_water": high_water,
+                        "predecessor": predecessor,
+                        "schema_id": checkpoint["schema_id"],
+                        "scope": scope,
+                    },
+                    record_type="trigger",
+                )
+
+                with self.assertRaisesRegex(InformixError, message):
+                    connector._shared_trigger_boundary(table, checkpoint, owner=True)
+
+
+
+    def test_trigger_cache_is_isolated_per_table(self):
+        bridge = FakeBridge()
+        connector = self.connector(bridge)
+        first = Table.parse(_table(name="orders"), "demo")
+        second = Table.parse(_table(name="members"), "demo")
+        checkpoint = _stream_offset(90)
+
+        bridge.now = 105
+        first_boundary = connector._shared_trigger_boundary(
+            first, checkpoint, owner=True
+        )
+        bridge.now = 120
+        second_boundary = connector._shared_trigger_boundary(
+            second, checkpoint, owner=True
+        )
+
+        self.assertEqual(first_boundary[0], 105)
+        self.assertEqual(second_boundary[0], 120)
+        self.assertEqual(len(connector._trigger_boundaries), 2)
 
 
 if __name__ == "__main__":
