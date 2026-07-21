@@ -26,12 +26,14 @@
 # CDC-capable tables require a primary key and only supported CDC columns.
 # Supported CDC column types are SMALLINT, INTEGER/INT, SERIAL, FLOAT/DOUBLE,
 # REAL/SMALLFLOAT, DECIMAL, MONEY, DATE, BOOLEAN, CHAR,
-# VARCHAR/NVARCHAR, INT8/SERIAL8, BIGINT/BIGSERIAL, and supported DATETIME qualifiers.
+# VARCHAR/NVARCHAR, BIGINT/BIGSERIAL, INT8/SERIAL8, LVARCHAR, and supported
+# DATETIME qualifiers. INT8, SERIAL8, DATETIME, LVARCHAR, and BOOLEAN have
+# dedicated snapshot/CDC live coverage against Informix 15 over TLS.
 # INT8/SERIAL8 use the complete ten-byte CDC signed-magnitude representation;
 # there is no trailer-discard compatibility option. DATETIME values containing
 # YEAR/MONTH/DAY are emitted as naive source calendar values and interpreted by
 # Spark as timestamps; partial qualifiers are deterministic labeled strings and
-# never acquire a current date. BYTE, TEXT, BLOB, CLOB, INTERVAL, LVARCHAR, NCHAR, and
+# never acquire a current date. BYTE, TEXT, BLOB, CLOB, INTERVAL, NCHAR, and
 # complex or opaque types lack end-to-end snapshot/CDC materialization and cause
 # an explicit metadata error. Unknown catalog types fail discovery rather than being decoded
 # speculatively. Ordinary TEXT/BYTE fetch framing has a bounded internal helper,
@@ -281,6 +283,16 @@ connection:
       description: >
         Maximum seconds a reader waits for per-table initialization state.
         Default `300`; minimum `1`.
+
+    - name: cdc.shared.state.scope.retention.seconds
+      type: string
+      required: false
+      description: >
+        Stale-observation interval for inactive checkpoint scopes. Default
+        `2592000` (30 days); minimum `3600`. Cleanup marks a scope after one
+        interval and removes it only after it remains stale for a second interval,
+        protecting against a single clock-skewed observation. Restarting a removed
+        scope fails closed and requires a full refresh.
 
     - name: cdc.max.records
       type: string

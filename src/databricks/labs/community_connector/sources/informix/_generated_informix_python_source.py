@@ -62,6 +62,7 @@ import fnmatch
 import hashlib
 import importlib
 import ipaddress
+import logging
 import math
 import secrets
 import socket
@@ -775,7 +776,7 @@ def register_lakeflow_source(spark):
         record: dict[str, Any] = {"op": op, "reserved": reserved}
         if kind in _OP_TYPES:
             _require_header(header, 16, op)
-            lsn, tx_id, label = struct.unpack_from(">qii", header)
+            lsn, tx_id, label = struct.unpack_from(">Qii", header)
             record.update(lsn=lsn, tx_id=tx_id, label=label)
             columns = columns_by_label.get(label)
             if columns is None:
@@ -783,26 +784,26 @@ def register_lakeflow_source(spark):
             record["row"] = decode_row(payload, columns)
         elif kind == 1:
             _require_header(header, 24, op)
-            lsn, tx_id, timestamp, user_id = struct.unpack_from(">qiqi", header)
+            lsn, tx_id, timestamp, user_id = struct.unpack_from(">Qiqi", header)
             record.update(lsn=lsn, tx_id=tx_id, timestamp=timestamp, user_id=user_id)
         elif kind == 2:
             _require_header(header, 20, op)
-            lsn, tx_id, timestamp = struct.unpack_from(">qiq", header)
+            lsn, tx_id, timestamp = struct.unpack_from(">Qiq", header)
             record.update(lsn=lsn, tx_id=tx_id, timestamp=timestamp)
         elif kind in {3, 62}:
             _require_header(header, 12, op)
-            lsn, tx_id = struct.unpack_from(">qi", header)
+            lsn, tx_id = struct.unpack_from(">Qi", header)
             record.update(lsn=lsn, tx_id=tx_id)
         elif kind == 119:
             _require_header(header, 16, op)
-            lsn, tx_id, label = struct.unpack_from(">qii", header)
+            lsn, tx_id, label = struct.unpack_from(">Qii", header)
             record.update(lsn=lsn, tx_id=tx_id, user_id=label, capture_label=label)
         elif kind == 200:
             _require_header(header, 4, op)
             record.update(label=struct.unpack_from(">i", header)[0], metadata=bytes(payload))
         elif kind == 201:
             _require_header(header, 8, op)
-            record["lsn"] = struct.unpack_from(">q", header)[0]
+            record["lsn"] = struct.unpack_from(">Q", header)[0]
         elif kind == 202:
             _require_header(header, 8, op)
             record["flags"], record["error"] = struct.unpack_from(">ii", header)
@@ -861,9 +862,12 @@ def register_lakeflow_source(spark):
             return value, 4
         if kind in {"BOOLEAN", "BOOL"}:
             _need(data, 2)
+            null_flag = data[0]
             marker = struct.unpack_from(">b", data, 1)[0]
-            if marker == -1:
+            if null_flag == 1:
                 return None, 2
+            if null_flag != 0:
+                raise CdcProtocolError(f"invalid boolean null flag {null_flag}")
             if marker not in {0, 1}:
                 raise CdcProtocolError(f"invalid boolean marker {marker}")
             return bool(marker), 2
@@ -1056,6 +1060,7 @@ def register_lakeflow_source(spark):
     SQ_EXIT = 56
     SQ_LODATA = 97
     SQ_RET_TYPE = 100
+    SQ_INSERTDONE = 94
     SQ_ASSOC = 100
     SQ_ASCBINARY = 101
     SQ_ASCENV = 106
@@ -1173,6 +1178,8 @@ def register_lakeflow_source(spark):
         type_code: int
         extended_id: int
         encoded_length: int
+        extended_owner: str = ""
+        extended_name: str = ""
 
 
     @dataclass(frozen=True)
@@ -1617,7 +1624,20 @@ def register_lakeflow_source(spark):
         return struct.pack(">hhhihh", SQ_ID, statement_id, SQ_NFETCH, buffer_size, 0, SQ_EOT)
 
 
-    def encode_variable_fetch(description: ResultDescription, buffer_size: int = 32767) -> bytes:
+    def _effective_result_kind(column: ResultColumn) -> int:
+        kind = column.type_code & 0xFF
+        extended_owner = column.extended_owner.strip().upper()
+        extended_name = column.extended_name.strip().upper()
+        if kind == 40 and (extended_owner, extended_name) == ("INFORMIX", "LVARCHAR"):
+            return 43
+        if kind == 41 and (extended_owner, extended_name) == ("INFORMIX", "BOOLEAN"):
+            return 45
+        return kind
+
+
+    def encode_variable_fetch(
+        description: ResultDescription, buffer_size: int = 32767, encoding: str = "utf-8"
+    ) -> bytes:
         """Encode JDBC's two-phase variable-row RET_TYPE + NFETCH request."""
 
         if not 1 <= buffer_size <= 32767:
@@ -1628,12 +1648,24 @@ def register_lakeflow_source(spark):
             )
         )
         for column in description.columns:
-            kind = column.type_code & 0xFF
-            if kind > 18 and kind not in {23, 45, 52, 53}:
+            native_kind = column.type_code & 0xFF
+            kind = _effective_result_kind(column)
+            if kind > 18 and kind not in {23, 43, 45, 52, 53}:
                 raise SqliDescriptorNotImplemented(
                     f"variable result type {kind} requires an extended SQ_RET_TYPE name"
                 )
-            result.extend(struct.pack(">hi", kind, column.encoded_length))
+            result.extend(struct.pack(">h", kind))
+            if kind == 43:
+                result.extend(encode_char("", encoding))
+                result.extend(encode_char("", encoding))
+            elif native_kind in {40, 41} and column.extended_id:
+                if not column.extended_owner or not column.extended_name:
+                    raise SqliDescriptorNotImplemented(
+                        f"extended result type {native_kind} is missing owner/type metadata"
+                    )
+                result.extend(encode_char(column.extended_owner, encoding))
+                result.extend(encode_char(column.extended_name, encoding))
+            result.extend(struct.pack(">i", column.encoded_length))
         result.extend(struct.pack(">hihh", SQ_NFETCH, buffer_size, 0, SQ_EOT))
         return bytes(result)
 
@@ -1781,11 +1813,48 @@ def register_lakeflow_source(spark):
     def _connector_sql(sql: str, parameters: tuple) -> str:
         """Bind only connector-owned scalar values using strict SQL literals."""
 
-        if sql.count("?") != len(parameters):
-            raise ValueError("SQL placeholder count does not match parameters")
-        pieces = sql.split("?")
-        result = [pieces[0]]
-        for value, suffix in zip(parameters, pieces[1:]):
+        result: list[str] = []
+        parameter_index = 0
+        index = 0
+        quote = None
+        while index < len(sql):
+            character = sql[index]
+            following = sql[index + 1] if index + 1 < len(sql) else ""
+            if quote:
+                result.append(character)
+                if character == quote:
+                    if following == quote:
+                        result.append(following)
+                        index += 1
+                    else:
+                        quote = None
+                index += 1
+                continue
+            if character in {"'", '"'}:
+                quote = character
+                result.append(character)
+                index += 1
+                continue
+            if character == "-" and following == "-":
+                end = sql.find("\n", index + 2)
+                end = len(sql) if end < 0 else end
+                result.append(sql[index:end])
+                index = end
+                continue
+            if character == "/" and following == "*":
+                end = sql.find("*/", index + 2)
+                if end < 0:
+                    raise ValueError("unterminated connector SQL block comment")
+                result.append(sql[index : end + 2])
+                index = end + 2
+                continue
+            if character != "?":
+                result.append(character)
+                index += 1
+                continue
+            if parameter_index >= len(parameters):
+                raise ValueError("SQL placeholder count does not match parameters")
+            value = parameters[parameter_index]
             if isinstance(value, bool):
                 literal = "1" if value else "0"
             elif isinstance(value, int):
@@ -1796,8 +1865,57 @@ def register_lakeflow_source(spark):
                 literal = "'" + value.replace("'", "''") + "'"
             else:
                 raise TypeError(f"unsupported connector SQL value {type(value).__name__}")
-            result.extend((literal, suffix))
+            result.append(literal)
+            parameter_index += 1
+            index += 1
+        if parameter_index != len(parameters):
+            raise ValueError("SQL placeholder count does not match parameters")
         return "".join(result)
+
+
+    def _statement_keyword(sql: str) -> str:
+        index = 0
+        while True:
+            while index < len(sql) and sql[index].isspace():
+                index += 1
+            if sql.startswith("--", index):
+                newline = sql.find("\n", index + 2)
+                if newline < 0:
+                    return ""
+                index = newline + 1
+                continue
+            if sql.startswith("/*", index):
+                end = sql.find("*/", index + 2)
+                if end < 0:
+                    return ""
+                index = end + 2
+                continue
+            break
+        end = index
+        while end < len(sql) and (sql[end].isalnum() or sql[end] == "_"):
+            end += 1
+        return sql[index:end].upper()
+
+
+    _NON_ROW_STATEMENTS = frozenset(
+        {
+            "ALTER",
+            "BEGIN",
+            "COMMIT",
+            "CREATE",
+            "DELETE",
+            "DROP",
+            "GRANT",
+            "INSERT",
+            "MERGE",
+            "RENAME",
+            "REVOKE",
+            "ROLLBACK",
+            "SET",
+            "TRUNCATE",
+            "UPDATE",
+        }
+    )
 
 
     def _typed_bind(value: object) -> TypedBind:
@@ -1817,7 +1935,7 @@ def register_lakeflow_source(spark):
     def _decode_result_value(
         data: bytes, column: ResultColumn, encoding: str, pad_varchar: bool = False
     ) -> object:
-        kind = column.type_code & 0xFF
+        kind = _effective_result_kind(column)
         if kind == 0:  # CHAR
             return data[: column.encoded_length].decode(encoding).rstrip(" ")
         if kind == 1:
@@ -1852,6 +1970,20 @@ def register_lakeflow_source(spark):
             if size == 1 and data[1] == 0:
                 return None
             return data[1 : size + 1].decode(encoding)
+        if kind == 43:
+            if len(data) < 5:
+                raise SqliProtocolError("truncated variable LVARCHAR")
+            marker = data[0]
+            size = struct.unpack_from(">i", data, 1)[0]
+            if size < 0 or size + 5 != len(data):
+                raise SqliProtocolError("LVARCHAR length does not match tuple column")
+            if marker == 1:
+                if size != 0:
+                    raise SqliProtocolError("null LVARCHAR has a non-empty payload")
+                return None
+            if marker != 0:
+                raise SqliProtocolError(f"invalid LVARCHAR null marker {marker}")
+            return data[5:].decode(encoding)
         if kind in {17, 18}:
             type_name = "INT8" if kind == 17 else "SERIAL8"
             value, consumed = decode_value(
@@ -1879,15 +2011,31 @@ def register_lakeflow_source(spark):
                 ColumnDescriptor("datetime", "DATETIME", length=qualifier),
             )
             return value
-        if kind in {23, 45}:
+        if kind == 45:
+            if len(data) >= 5:
+                envelope_size = struct.unpack_from(">i", data, 1)[0]
+                if envelope_size < 0 or envelope_size + 5 != len(data):
+                    raise SqliProtocolError("BOOLEAN envelope length does not match tuple column")
+                null_marker = data[0]
+                if null_marker == 1:
+                    if envelope_size != 0:
+                        raise SqliProtocolError("null BOOLEAN has a non-empty payload")
+                    return None
+                if null_marker != 0:
+                    raise SqliProtocolError(
+                        f"invalid BOOLEAN envelope null marker {null_marker}"
+                    )
+                data = data[5:]
             if not data:
                 raise SqliProtocolError("truncated BOOLEAN result")
             marker = struct.unpack_from(">b", data, 1 if len(data) >= 2 else 0)[0]
             if marker == -1:
                 return None
-            if marker not in {0, 1}:
-                raise SqliProtocolError(f"invalid BOOLEAN result marker {marker}")
-            return bool(marker)
+            if marker in {1, ord("t"), ord("T")}:
+                return True
+            if marker in {0, ord("f"), ord("F")}:
+                return False
+            raise SqliProtocolError(f"invalid BOOLEAN result marker {marker}")
         raise SqliDescriptorNotImplemented(f"ordinary Informix result type {kind} is unsupported")
 
 
@@ -1915,7 +2063,7 @@ def register_lakeflow_source(spark):
         if kind == 10:
             total, fraction = (column.encoded_length >> 8) & 0xFF, column.encoded_length & 0xFF
             return (total + (fraction & 1) + 3) // 2
-        if kind in {23, 45}:
+        if kind == 45:
             if column.encoded_length not in {1, 2}:
                 raise SqliProtocolError(
                     f"BOOLEAN result width must be 1 or 2, got {column.encoded_length}"
@@ -1951,6 +2099,7 @@ def register_lakeflow_source(spark):
         remove_64k_limit: bool = field(default=False, init=False)
         large_tuple_size: bool = field(default=False, init=False)
         long_row_id: bool = field(default=False, init=False)
+        bigint_supported: bool = field(default=False, init=False)
         _socket: socket.socket | None = field(default=None, init=False, repr=False)
         _input: BinaryIO | None = field(default=None, init=False, repr=False)
         _output: BinaryIO | None = field(default=None, init=False, repr=False)
@@ -2062,6 +2211,7 @@ def register_lakeflow_source(spark):
                 self.remove_64k_limit = bool(self.server_protocols[7] & 0x02)
                 self.large_tuple_size = bool(self.server_protocols[8] & 0x04)
                 self.long_row_id = bool(self.server_protocols[8] & 0x02)
+                self.bigint_supported = _protocol_feature(self.server_protocols, 54)
                 pam_advertised = _protocol_feature(self.server_protocols, 44)
                 if self.authentication_mode == "pam":
                     if not pam_advertised:
@@ -2161,6 +2311,7 @@ def register_lakeflow_source(spark):
         def _reset_connection_state(self) -> None:
             self.close()
             self.remove_64k_limit = self.large_tuple_size = self.long_row_id = False
+            self.bigint_supported = False
             for name in ("asc_accept", "server_protocols"):
                 if hasattr(self, name):
                     delattr(self, name)
@@ -2209,6 +2360,7 @@ def register_lakeflow_source(spark):
                 raise SqliProtocolError("SQLI input is unavailable")
             saw_done = False
             saw_description = False
+            statement_type = None
             while True:
                 code = read_smallint(self._input)
                 if code == SQ_EOT:
@@ -2231,6 +2383,12 @@ def register_lakeflow_source(spark):
                             "non-row command returned a row-producing SQ_DESCRIBE"
                         )
                     saw_description = True
+                    statement_type = description.statement_type
+                    continue
+                if code == SQ_INSERTDONE:
+                    if statement_type != 6:
+                        raise SqliProtocolError("SQ_INSERTDONE arrived outside an INSERT")
+                    self._read_insertdone()
                     continue
                 if code == SQ_DONE:
                     self._read_done()
@@ -2258,6 +2416,15 @@ def register_lakeflow_source(spark):
             serial = read_int32(self._input)
             return warnings, rows, row_id, serial
 
+        def _read_insertdone(self) -> None:
+            if self._input is None:
+                raise SqliProtocolError("SQLI input is unavailable")
+            # JDBC readLongInt uses Informix's 10-byte signed-magnitude
+            # INT8 representation; BIGSERIAL uses an 8-byte bigint.
+            read_exact(self._input, 10)
+            if self.bigint_supported:
+                read_exact(self._input, 8)
+
         def _read_error(self) -> tuple[int, int, int, str]:
             if self._input is None:
                 raise SqliProtocolError("SQLI input is unavailable")
@@ -2271,11 +2438,14 @@ def register_lakeflow_source(spark):
         def execute(
             self, sql: str, parameters: tuple = (), max_result_bytes: int | None = None
         ) -> list[tuple]:
-            _, output_stream = self._require_open()
             # Connector queries are fixed templates. Literalizing their bounded scalar
             # values avoids depending on the separate input-parameter descriptor that
             # JDBC uses to choose VARCHAR bind widths.
             sql = _connector_sql(sql, parameters)
+            if _statement_keyword(sql) in _NON_ROW_STATEMENTS:
+                self.execute_command(sql)
+                return []
+            _, output_stream = self._require_open()
             typed: tuple[TypedBind, ...] = ()
             with self._lock:
                 try:
@@ -2318,7 +2488,9 @@ def register_lakeflow_source(spark):
                         )
                         output_stream.flush()
                         self._read_query_group(description)
-                        output_stream.write(encode_variable_fetch(description))
+                        output_stream.write(
+                            encode_variable_fetch(description, encoding=self._encoding)
+                        )
                         output_stream.flush()
                         _, batch, exhausted = self._read_query_group(description)
                         append_batch(batch)
@@ -2411,6 +2583,10 @@ def register_lakeflow_source(spark):
                     read_exact(self._input, 8)
                 elif code == 99:
                     read_exact(self._input, 6)
+                elif code == SQ_INSERTDONE:
+                    if description is None or description.statement_type != 6:
+                        raise SqliProtocolError("SQ_INSERTDONE arrived outside an INSERT")
+                    self._read_insertdone()
                 elif code == SQ_DONE:
                     _, affected_rows, _, _ = self._read_done()
                     # A forward-only fetch that has no more tuples is reported as
@@ -2445,8 +2621,8 @@ def register_lakeflow_source(spark):
                 position = read_int32(self._input)
                 type_code = read_smallint(self._input)
                 extended_id = read_int32(self._input)
-                decode_char(self._input, self._encoding)
-                decode_char(self._input, self._encoding)
+                extended_owner = decode_char(self._input, self._encoding)
+                extended_name = decode_char(self._input, self._encoding)
                 read_smallint(self._input)
                 read_smallint(self._input)
                 read_int32(self._input)
@@ -2460,7 +2636,16 @@ def register_lakeflow_source(spark):
                     or encoded_length > tuple_limit
                 ):
                     raise SqliProtocolError("invalid result column position/length")
-                raw.append((position, type_code, extended_id, encoded_length))
+                raw.append(
+                    (
+                        position,
+                        type_code,
+                        extended_id,
+                        encoded_length,
+                        extended_owner,
+                        extended_name,
+                    )
+                )
             if name_size < 0 or name_size > 1 << 20:
                 raise SqliProtocolError(f"unsafe descriptor name blob length {name_size}")
             names_raw = read_exact(self._input, name_size)
@@ -2490,18 +2675,25 @@ def register_lakeflow_source(spark):
             if size & 1:
                 read_exact(self._input, 1)
             result = {}
-            variable_layout = not self.pad_varchar and any(
-                (column.type_code & 0xFF) in {13, 16, 40, 41, 43, 46}
+            variable_layout = any(
+                (column.type_code & 0xFF) in {40, 41, 43, 46}
+                or (
+                    not self.pad_varchar
+                    and (column.type_code & 0xFF) in {13, 16}
+                )
                 for column in description.columns
             )
             cursor = 0
             for index, column in enumerate(description.columns):
-                kind = column.type_code & 0xFF
+                kind = _effective_result_kind(column)
                 start = cursor if variable_layout else column.position
                 if variable_layout and kind in {13, 16}:
-                    if start >= len(payload):
-                        raise SqliProtocolError("truncated variable VARCHAR tuple")
-                    limit = start + 1 + payload[start]
+                    if self.pad_varchar:
+                        limit = start + column.encoded_length
+                    else:
+                        if start >= len(payload):
+                            raise SqliProtocolError("truncated variable VARCHAR tuple")
+                        limit = start + 1 + payload[start]
                 elif variable_layout and kind in {40, 41, 43, 45, 46}:
                     if start + 5 > len(payload):
                         raise SqliProtocolError("truncated complex variable tuple")
@@ -2764,24 +2956,30 @@ def register_lakeflow_source(spark):
     OP = "_informix_op"
     _INTERNAL_COLUMNS = (CURSOR, COMMIT_LSN, TX_ID, OP)
     _LSN_DECIMAL_WIDTH = 20
-    _OFFSET_VERSION = 6
+    _OFFSET_VERSION = 7
     _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
     _DATA_OPS = {"INSERT", "BEFORE_UPDATE", "AFTER_UPDATE", "DELETE", "TRUNCATE"}
     _DEFAULT_SNAPSHOT_PAGE_SIZE = 10000
     _DEFAULT_MAX_RECORDS_PER_BATCH = 10000
-    _SHARED_STATE_VERSION = 5
+    _SHARED_STATE_VERSION = 6
     _SHARED_STATE_WAIT_SECONDS = 300
+    _DEFAULT_SCOPE_RETENTION_SECONDS = 30 * 24 * 60 * 60
+    _STATE_SWEEP_INTERVAL_SECONDS = 24 * 60 * 60
     _MAX_SHARED_STATE_BYTES = 1 << 20
+    _MAX_SWEEP_MARKER_BYTES = 4096
     _ARTIFACT_RETENTION_SECONDS = 3600
     _VALIDATED_STATE_LOCATIONS: set[str] = set()
+    _LAST_STATE_SWEEP: dict[str, float] = {}
 
     def _informix_available_now_base(base: type) -> type:
         """Wrap the generated reader base without changing the shared adapter source."""
 
+        original_base = getattr(base, "_informix_original_base", base)
         registration_scope = secrets.token_hex(16)
 
-        class InformixAvailableNowBase(base):
+        class InformixAvailableNowBase(original_base):
             _informix_available_now_wrapper = True
+            _informix_original_base = original_base
 
             def __init_subclass__(cls, **kwargs):
                 super().__init_subclass__(**kwargs)
@@ -2795,6 +2993,15 @@ def register_lakeflow_source(spark):
                     setter = getattr(reader.lakeflow_connect, "set_registration_scope", None)
                     if setter is not None:
                         setter(registration_scope)
+                    options = getattr(reader, "options", {})
+                    table = options.get("tableName", "<unknown>")
+                    role = "delete" if options.get("isDeleteFlow") == "true" else "upsert"
+                    logging.getLogger(__name__).info(
+                        "Informix CDC reader initialized: scope=%s table=%s role=%s",
+                        registration_scope,
+                        table,
+                        role,
+                    )
 
                 def prepare_for_trigger(reader) -> None:
                     prepare = getattr(
@@ -2823,14 +3030,17 @@ def register_lakeflow_source(spark):
         # Avoid assigning this name in register_lakeflow_source(): doing so would
         # make the imported PySpark base an uninitialized local throughout that
         # function. Replace the generated module global instead.
-        if not getattr(_generated_trigger_base, "_informix_available_now_wrapper", False):
-            globals()["SupportsTriggerAvailableNow"] = _informix_available_now_base(
-                _generated_trigger_base
-            )
+        globals()["SupportsTriggerAvailableNow"] = _informix_available_now_base(
+            _generated_trigger_base
+        )
 
 
     class InformixError(RuntimeError):
         """Base error raised by this connector."""
+
+
+    class SharedStateValidationError(InformixError):
+        """A shared-state file is structurally invalid but storage remains usable."""
 
 
     class LogRetentionError(InformixError):
@@ -3011,8 +3221,10 @@ def register_lakeflow_source(spark):
 
         def _describe_table(self, owner: str, name: str) -> dict[str, Any]:
             columns = self.transport.execute(
-                "SELECT c.colname, c.coltype, c.collength, c.colno, t.tabid "
+                "SELECT c.colname, c.coltype, c.collength, c.colno, t.tabid, "
+                "c.extended_id, x.name AS extended_name, x.owner AS extended_owner "
                 "FROM systables t JOIN syscolumns c ON t.tabid = c.tabid "
+                "LEFT JOIN sysxtdtypes x ON x.extended_id = c.extended_id "
                 "WHERE t.owner = ? AND t.tabname = ? ORDER BY c.colno",
                 (owner, name),
                 max_result_bytes=(
@@ -3865,6 +4077,11 @@ def register_lakeflow_source(spark):
                 ("authentication.pam.max.rounds", "16", 1),
                 ("redirect.max", "3", 0),
                 ("cdc.shared.state.wait.seconds", str(_SHARED_STATE_WAIT_SECONDS), 1),
+                (
+                    "cdc.shared.state.scope.retention.seconds",
+                    str(_DEFAULT_SCOPE_RETENTION_SECONDS),
+                    3600,
+                ),
             ):
                 if int(options.get(name, default)) < minimum:
                     raise ValueError(f"Option '{name}' must be >= {minimum}")
@@ -3885,12 +4102,7 @@ def register_lakeflow_source(spark):
             self._trigger_available_now = False
             self._trigger_high_water: int | None = None
             self._trigger_generation: str | None = None
-            configured_scope = str(options.get("pipeline.id", ""))
-            self._registration_scope = (
-                hashlib.sha256(configured_scope.encode()).hexdigest()[:32]
-                if configured_scope
-                else None
-            )
+            self._registration_scope: str | None = None
 
         def set_registration_scope(self, scope: str) -> None:
             """Install the UUID shared by every reader serialized from one registration."""
@@ -4200,8 +4412,12 @@ def register_lakeflow_source(spark):
                     table,
                     int(checkpoint["commit_lsn"]),
                     checkpoint_schema_id,
+                    pipeline_scope,
                     owner=not deletes,
                 )
+            # Spark has committed the start offset before invoking this read.  The
+            # end offset returned below is not durable until a later invocation.
+            self._acknowledge_scope(table, checkpoint, deletes=deletes)
             max_rows = self._table_int_option(
                 options, "max.records.per.batch", _DEFAULT_MAX_RECORDS_PER_BATCH, minimum=1
             )
@@ -4306,6 +4522,7 @@ def register_lakeflow_source(spark):
             table: Table,
             checkpoint_lsn: int,
             checkpoint_schema_id: str,
+            pipeline_scope: str,
             *,
             owner: bool,
         ) -> None:
@@ -4322,6 +4539,12 @@ def register_lakeflow_source(spark):
                 if state is not None and _state_schema(
                     state, _schema_fingerprint(table), schema_id=checkpoint_schema_id
                 ) is not None:
+                    scopes = state.get("scopes", {})
+                    if not isinstance(scopes, dict) or pipeline_scope not in scopes:
+                        raise InformixError(
+                            f"Pipeline scope {pipeline_scope} for '{table.exposed_name}' was "
+                            "removed from shared state; run a full refresh"
+                        )
                     return
                 lock_token = self._acquire_shared_state_lock(directory, lock_path)
                 if lock_token is not None:
@@ -4347,7 +4570,11 @@ def register_lakeflow_source(spark):
                             )
                             self._renew_shared_state_lock(lock_path, lock_token)
                             self._write_shared_table_state(
-                                state_path, table, checkpoint_lsn, node
+                                state_path,
+                                table,
+                                checkpoint_lsn,
+                                node,
+                                pipeline_scope=pipeline_scope,
                             )
                             return
                         if _state_schema(
@@ -4355,6 +4582,13 @@ def register_lakeflow_source(spark):
                             _schema_fingerprint(table),
                             schema_id=checkpoint_schema_id,
                         ) is not None:
+                            scopes = state.get("scopes", {})
+                            if not isinstance(scopes, dict) or pipeline_scope not in scopes:
+                                raise InformixError(
+                                    f"Pipeline scope {pipeline_scope} for "
+                                    f"'{table.exposed_name}' was removed from shared state; "
+                                    "run a full refresh"
+                                )
                             return
                         schemas = list(state.get("schemas", []))
                         schemas.append(
@@ -4386,7 +4620,7 @@ def register_lakeflow_source(spark):
             # after every successfully coordinated trigger. Keying the next boundary
             # by that durable predecessor avoids relying on Lakeflow runtime IDs,
             # which are not exposed to Python data-source workers.
-            predecessor = str(checkpoint.get("trigger_generation", "initial"))
+            predecessor = str(checkpoint.get("trigger_generation") or "initial")
             scope = self._pipeline_scope(checkpoint)
             boundary_key = hashlib.sha256(
                 "\0".join(
@@ -4405,6 +4639,14 @@ def register_lakeflow_source(spark):
             )
             while True:
                 state = self._read_shared_table_state(state_path, table)
+                scopes = state.get("scopes", {}) if state is not None else {}
+                if state is not None and (
+                    not isinstance(scopes, dict) or scope not in scopes
+                ):
+                    raise InformixError(
+                        f"Pipeline scope {scope} for '{table.exposed_name}' was removed from "
+                        "shared state; run a full refresh"
+                    )
                 boundaries = state.get("trigger_boundaries", {}) if state is not None else {}
                 trigger = boundaries.get(boundary_key) if isinstance(boundaries, dict) else None
                 if trigger is None and not owner and isinstance(boundaries, dict):
@@ -4710,6 +4952,7 @@ def register_lakeflow_source(spark):
                     if (
                         schema_known
                         and self._bridge.minimum_lsn() <= value <= self._bridge.current_lsn()
+                        and not owner
                     ):
                         self._bridge.validate_initial_lsn(
                             _capture_descriptor(table, _client_encoding(self.options)), value
@@ -4736,6 +4979,20 @@ def register_lakeflow_source(spark):
                                 <= value
                                 <= self._bridge.current_lsn()
                             ):
+                                scope = self._pipeline_scope()
+                                scopes = state.setdefault("scopes", {})
+                                if not isinstance(scopes, dict):
+                                    raise InformixError(
+                                        f"Invalid shared pipeline scopes for "
+                                        f"'{table.exposed_name}'"
+                                    )
+                                scopes.setdefault(
+                                    scope,
+                                    {"created_at": time.time(), "last_seen": time.time()},
+                                )
+                                state.pop("file_cleanup_candidate_at", None)
+                                self._renew_shared_state_lock(lock_path, lock_token)
+                                self._write_shared_state(state_path, state)
                                 return value, str(active["id"])
                         value = self._bridge.prepare_initial_capture([table.native_identity])
                         self._bridge.validate_initial_lsn(
@@ -4744,7 +5001,13 @@ def register_lakeflow_source(spark):
                         node = _schema_state(table, value)
                         self._renew_shared_state_lock(lock_path, lock_token)
                         if state is None or not state.get("schemas"):
-                            self._write_shared_table_state(state_path, table, value, node)
+                            self._write_shared_table_state(
+                                state_path,
+                                table,
+                                value,
+                                node,
+                                pipeline_scope=self._pipeline_scope(),
+                            )
                         else:
                             schemas = list(state["schemas"])
                             schemas.append(node)
@@ -4752,6 +5015,17 @@ def register_lakeflow_source(spark):
                             state["lsn"] = str(value)
                             state["active_schema_id"] = node["id"]
                             state["created_at"] = time.time()
+                            scopes = state.setdefault("scopes", {})
+                            if not isinstance(scopes, dict):
+                                raise InformixError(
+                                    f"Invalid shared pipeline scopes for '{table.exposed_name}'"
+                                )
+                            scope = self._pipeline_scope()
+                            scopes.setdefault(
+                                scope,
+                                {"created_at": time.time(), "last_seen": time.time()},
+                            )
+                            state.pop("file_cleanup_candidate_at", None)
                             self._write_shared_state(state_path, state)
                         return value, str(node["id"])
                     finally:
@@ -4801,10 +5075,25 @@ def register_lakeflow_source(spark):
                         snapshots[snapshot_key] = {
                             "created_at": time.time(),
                             "initial_lsn": str(initial_lsn),
+                            "scope": pipeline_scope,
                             "schema_id": schema_id,
                             "snapshot_lsn": str(snapshot_lsn),
                         }
                         state["snapshot_boundaries"] = snapshots
+                        scopes = state.setdefault("scopes", {})
+                        if not isinstance(scopes, dict):
+                            raise InformixError(
+                                f"Invalid shared pipeline scopes for '{table.exposed_name}'"
+                            )
+                        scope_state = scopes.setdefault(
+                            pipeline_scope,
+                            {"created_at": time.time(), "last_seen": time.time()},
+                        )
+                        if not isinstance(scope_state, dict):
+                            raise InformixError(
+                                f"Invalid shared pipeline scope for '{table.exposed_name}'"
+                            )
+                        scope_state["last_seen"] = time.time()
                         self._renew_shared_state_lock(lock_path, token)
                         self._write_shared_state(state_path, state)
                         return
@@ -4816,6 +5105,463 @@ def register_lakeflow_source(spark):
                         f"{self._lock_recovery_detail(lock_path)}"
                     )
                 time.sleep(0.1)
+
+        def _acknowledge_scope(
+            self, table: Table, checkpoint: dict[str, Any], *, deletes: bool
+        ) -> None:
+            """Publish one channel checkpoint and prune boundaries no longer referenced."""
+
+            scope = self._pipeline_scope(checkpoint)
+            channel = "delete" if deletes else "upsert"
+            directory, state_path, lock_path = self._shared_table_state_paths(table)
+            retention = int(
+                self.options.get(
+                    "cdc.shared.state.scope.retention.seconds",
+                    str(_DEFAULT_SCOPE_RETENTION_SECONDS),
+                )
+            )
+            heartbeat = max(3600, min(24 * 60 * 60, retention // 4))
+
+            def unchanged(scope_state: dict[str, object], now: float) -> bool:
+                acknowledgement = scope_state.get(channel)
+                return (
+                    isinstance(acknowledgement, dict)
+                    and acknowledgement.get("commit_lsn") == str(checkpoint["commit_lsn"])
+                    and acknowledgement.get("phase") == checkpoint.get("phase")
+                    and acknowledgement.get("schema_id") == checkpoint.get("schema_id")
+                    and acknowledgement.get("trigger_generation")
+                    == checkpoint.get("trigger_generation")
+                    and float(scope_state.get("last_seen", 0)) >= now - heartbeat
+                )
+
+            observed = self._read_shared_table_state(state_path, table)
+            observed_scopes = observed.get("scopes", {}) if observed is not None else {}
+            observed_scope = (
+                observed_scopes.get(scope) if isinstance(observed_scopes, dict) else None
+            )
+            if not isinstance(observed_scope, dict):
+                raise InformixError(
+                    f"Pipeline scope {scope} for '{table.exposed_name}' was removed from "
+                    "shared state; run a full refresh"
+                )
+            self._maybe_sweep_connection_state(
+                directory, protected_path=state_path, protected_scope=scope
+            )
+            if unchanged(observed_scope, time.time()):
+                return
+            deadline = time.monotonic() + int(
+                self.options.get(
+                    "cdc.shared.state.wait.seconds", str(_SHARED_STATE_WAIT_SECONDS)
+                )
+            )
+            while True:
+                token = self._acquire_shared_state_lock(directory, lock_path)
+                if token is not None:
+                    try:
+                        state = self._read_shared_table_state(state_path, table)
+                        if state is None:
+                            raise InformixError(
+                                f"Shared CDC state disappeared for '{table.exposed_name}'"
+                            )
+                        scopes = state.get("scopes", {})
+                        scope_state = scopes.get(scope) if isinstance(scopes, dict) else None
+                        if not isinstance(scope_state, dict):
+                            raise InformixError(
+                                f"Pipeline scope {scope} for '{table.exposed_name}' was removed "
+                                "from shared state; run a full refresh"
+                            )
+                        now = time.time()
+                        if unchanged(scope_state, now):
+                            return
+                        scope_state["last_seen"] = now
+                        scope_state.pop("cleanup_candidate_at", None)
+                        scope_state[channel] = {
+                            "commit_lsn": str(checkpoint["commit_lsn"]),
+                            "phase": str(checkpoint["phase"]),
+                            "schema_id": str(checkpoint["schema_id"]),
+                            "seen_at": now,
+                            "trigger_generation": checkpoint.get("trigger_generation"),
+                        }
+                        self._prune_shared_boundaries(state, scope, now)
+                        self._renew_shared_state_lock(lock_path, token)
+                        self._write_shared_state(state_path, state)
+                        return
+                    finally:
+                        self._release_shared_state_lock(lock_path, token)
+                if time.monotonic() >= deadline:
+                    raise InformixError(
+                        f"Timed out acknowledging pipeline scope for '{table.exposed_name}'. "
+                        f"{self._lock_recovery_detail(lock_path)}"
+                    )
+                time.sleep(0.1)
+
+        def _prune_shared_boundaries(
+            self, state: dict[str, object], current_scope: str, now: float
+        ) -> None:
+            scopes = state.get("scopes", {})
+            snapshots = state.get("snapshot_boundaries", {})
+            triggers = state.get("trigger_boundaries", {})
+            if not all(isinstance(value, dict) for value in (scopes, snapshots, triggers)):
+                raise InformixError("Invalid Informix shared boundary collections")
+
+            scope_state = scopes[current_scope]
+            upsert = scope_state.get("upsert")
+            delete = scope_state.get("delete")
+            if isinstance(upsert, dict) and isinstance(delete, dict):
+                if upsert.get("phase") == delete.get("phase") == "stream":
+                    for key, snapshot in list(snapshots.items()):
+                        if (
+                            isinstance(snapshot, dict)
+                            and snapshot.get("scope") == current_scope
+                            and snapshot.get("schema_id") == upsert.get("schema_id")
+                            and snapshot.get("schema_id") == delete.get("schema_id")
+                        ):
+                            del snapshots[key]
+                acknowledged = {
+                    upsert.get("trigger_generation"),
+                    delete.get("trigger_generation"),
+                }
+                if len(acknowledged) == 1 and None not in acknowledged:
+                    generation = next(iter(acknowledged))
+                    for key, trigger in list(triggers.items()):
+                        if (
+                            isinstance(trigger, dict)
+                            and trigger.get("scope") == current_scope
+                            and trigger.get("generation") == generation
+                        ):
+                            del triggers[key]
+
+            retention = int(
+                self.options.get(
+                    "cdc.shared.state.scope.retention.seconds",
+                    str(_DEFAULT_SCOPE_RETENTION_SECONDS),
+                )
+            )
+            self._expire_inactive_scopes(
+                state, now, retention, protected_scope=current_scope
+            )
+
+        @staticmethod
+        def _expire_inactive_scopes(
+            state: dict[str, object],
+            now: float,
+            retention: int,
+            *,
+            protected_scope: str | None = None,
+        ) -> set[str]:
+            scopes = state.get("scopes", {})
+            snapshots = state.get("snapshot_boundaries", {})
+            triggers = state.get("trigger_boundaries", {})
+            if not all(isinstance(value, dict) for value in (scopes, snapshots, triggers)):
+                raise InformixError("Invalid Informix shared boundary collections")
+            expired: set[str] = set()
+            for scope, value in scopes.items():
+                if scope == protected_scope or not isinstance(value, dict):
+                    continue
+                last_seen = float(value.get("last_seen", 0))
+                candidate = value.get("cleanup_candidate_at")
+                if last_seen >= now - retention:
+                    value.pop("cleanup_candidate_at", None)
+                elif candidate is None:
+                    # Require a second stale observation one full retention period
+                    # later. Constant clock offsets therefore cannot expire a scope
+                    # merely because another worker's clock differs.
+                    value["cleanup_candidate_at"] = now
+                elif last_seen > float(candidate):
+                    # A heartbeat observed after the candidate invalidates the
+                    # first stale observation, including across skewed clocks.
+                    value["cleanup_candidate_at"] = now
+                elif float(candidate) <= now - retention and last_seen <= float(candidate):
+                    expired.add(scope)
+            for scope in expired:
+                del scopes[scope]
+            for collection in (snapshots, triggers):
+                for key, value in list(collection.items()):
+                    if isinstance(value, dict) and value.get("scope") in expired:
+                        del collection[key]
+            return expired
+
+        def _maybe_sweep_connection_state(
+            self,
+            directory: str,
+            *,
+            protected_path: str,
+            protected_scope: str,
+        ) -> None:
+            now_monotonic = time.monotonic()
+            if _LAST_STATE_SWEEP.get(directory, 0) > now_monotonic - _STATE_SWEEP_INTERVAL_SECONDS:
+                return
+            sweep_lock = os.path.join(directory, ".informix-sweep.lock")
+            sweep_marker = os.path.join(directory, ".informix-sweep.json")
+            token = self._acquire_shared_state_lock(directory, sweep_lock)
+            if token is None:
+                return
+            retention = int(
+                self.options.get(
+                    "cdc.shared.state.scope.retention.seconds",
+                    str(_DEFAULT_SCOPE_RETENTION_SECONDS),
+                )
+            )
+            remove_directory = False
+            try:
+                now = time.time()
+                try:
+                    if os.stat(sweep_marker).st_size > _MAX_SWEEP_MARKER_BYTES:
+                        raise InformixError(
+                            f"Informix shared-state sweep marker '{sweep_marker}' exceeds "
+                            f"{_MAX_SWEEP_MARKER_BYTES} bytes"
+                        )
+                    with open(sweep_marker, encoding="utf-8") as handle:
+                        payload = handle.read(_MAX_SWEEP_MARKER_BYTES + 1)
+                    if len(payload.encode("utf-8")) > _MAX_SWEEP_MARKER_BYTES:
+                        raise InformixError(
+                            f"Informix shared-state sweep marker '{sweep_marker}' exceeds "
+                            f"{_MAX_SWEEP_MARKER_BYTES} bytes"
+                        )
+                    marker = json.loads(payload)
+                    completed_at = _strict_timestamp(marker["completed_at"], "completed_at")
+                    if not math.isfinite(completed_at) or not (
+                        0 <= completed_at <= now + _STATE_SWEEP_INTERVAL_SECONDS
+                    ):
+                        raise ValueError("completed_at is outside the accepted clock-skew range")
+                except FileNotFoundError:
+                    completed_at = 0.0
+                except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                    raise InformixError(
+                        f"Cannot read Informix shared-state sweep marker '{sweep_marker}'"
+                    ) from error
+                if completed_at >= now - _STATE_SWEEP_INTERVAL_SECONDS:
+                    _LAST_STATE_SWEEP[directory] = now_monotonic
+                    return
+                try:
+                    entries = list(os.scandir(directory))
+                except FileNotFoundError:
+                    return
+                except OSError as error:
+                    raise InformixError(
+                        f"Cannot inspect Informix shared-state directory '{directory}'"
+                    ) from error
+                for entry in entries:
+                    if (
+                        not re.fullmatch(r"[0-9a-f]{24}\.json", entry.name)
+                        or not entry.is_file(follow_symlinks=False)
+                    ):
+                        continue
+                    try:
+                        self._sweep_table_state_file(
+                            directory,
+                            entry.path,
+                            retention,
+                            protected_scope=(
+                                protected_scope if entry.path == protected_path else None
+                            ),
+                        )
+                    except SharedStateValidationError:
+                        if entry.path == protected_path:
+                            raise
+                        logging.getLogger(__name__).exception(
+                            "Skipping invalid unrelated Informix shared-state file during "
+                            "connection cleanup: path=%s",
+                            entry.path,
+                        )
+                remaining = [
+                    entry
+                    for entry in os.scandir(directory)
+                    if re.fullmatch(r"[0-9a-f]{24}\.json", entry.name)
+                    and entry.is_file(follow_symlinks=False)
+                ]
+                if remaining:
+                    self._renew_shared_state_lock(sweep_lock, token)
+                    self._write_shared_state(sweep_marker, {"completed_at": now})
+                else:
+                    try:
+                        os.unlink(sweep_marker)
+                    except FileNotFoundError:
+                        pass
+                    remove_directory = True
+                _LAST_STATE_SWEEP[directory] = now_monotonic
+            finally:
+                self._release_shared_state_lock(sweep_lock, token)
+            if remove_directory:
+                try:
+                    os.rmdir(directory)
+                except OSError as error:
+                    if error.errno not in {errno.ENOTEMPTY, errno.EEXIST, errno.ENOENT}:
+                        raise InformixError(
+                            f"Cannot remove empty Informix shared-state directory '{directory}'"
+                        ) from error
+
+        def _sweep_table_state_file(
+            self,
+            directory: str,
+            state_path: str,
+            retention: int,
+            *,
+            protected_scope: str | None = None,
+        ) -> None:
+            lock_path = f"{state_path}.lock"
+            token = self._acquire_shared_state_lock(directory, lock_path)
+            if token is None:
+                return
+            try:
+                state = self._read_sweep_state(state_path)
+                if state is None:
+                    return
+                now = time.time()
+                self._validate_sweep_timestamps(state, now, retention)
+                self._expire_inactive_scopes(
+                    state, now, retention, protected_scope=protected_scope
+                )
+                self._prune_schema_history(state)
+                if not state.get("scopes") and not state.get("snapshot_boundaries") and not state.get(
+                    "trigger_boundaries"
+                ):
+                    candidate = state.get("file_cleanup_candidate_at")
+                    if candidate is None:
+                        state["file_cleanup_candidate_at"] = now
+                    elif float(candidate) <= now - retention:
+                        tombstone = f"{state_path}.{token}.deleted"
+                        self._renew_shared_state_lock(lock_path, token)
+                        os.rename(state_path, tombstone)
+                        os.unlink(tombstone)
+                        return
+                else:
+                    state.pop("file_cleanup_candidate_at", None)
+                self._renew_shared_state_lock(lock_path, token)
+                self._write_shared_state(state_path, state)
+            finally:
+                self._release_shared_state_lock(lock_path, token)
+
+        def _read_sweep_state(self, path: str) -> dict[str, object] | None:
+            try:
+                if os.stat(path).st_size > _MAX_SHARED_STATE_BYTES:
+                    raise SharedStateValidationError(
+                        f"Informix shared CDC state '{path}' exceeds "
+                        f"{_MAX_SHARED_STATE_BYTES} bytes"
+                    )
+                with open(path, encoding="utf-8") as handle:
+                    payload = handle.read(_MAX_SHARED_STATE_BYTES + 1)
+                if len(payload.encode("utf-8")) > _MAX_SHARED_STATE_BYTES:
+                    raise SharedStateValidationError(
+                        f"Informix shared CDC state '{path}' exceeds "
+                        f"{_MAX_SHARED_STATE_BYTES} bytes"
+                    )
+                state = json.loads(payload)
+            except FileNotFoundError:
+                return None
+            except OSError as error:
+                raise InformixError(
+                    f"Cannot read Informix shared CDC state '{path}' during cleanup"
+                ) from error
+            except json.JSONDecodeError as error:
+                raise SharedStateValidationError(
+                    f"Cannot decode Informix shared CDC state '{path}' during cleanup"
+                ) from error
+            if not isinstance(state, dict):
+                raise SharedStateValidationError(
+                    f"Invalid Informix shared CDC state object in '{path}'"
+                )
+            try:
+                state = _normalize_shared_state_version(state, path)
+            except InformixError as error:
+                raise SharedStateValidationError(str(error)) from error
+            active = _state_schema(state, schema_id=str(state.get("active_schema_id")))
+            if active is None:
+                raise SharedStateValidationError(
+                    f"Informix shared CDC state '{path}' has no active schema"
+                )
+            try:
+                table = _table_from_schema_state(active, self.options.get("database", ""))
+                return self._read_shared_table_state(path, table)
+            except SharedStateValidationError:
+                raise
+            except InformixError as error:
+                if isinstance(error.__cause__, OSError):
+                    raise
+                raise SharedStateValidationError(
+                    f"Invalid Informix shared CDC state '{path}' during cleanup"
+                ) from error
+
+        @staticmethod
+        def _validate_sweep_timestamps(
+            state: dict[str, object], now: float, retention: int
+        ) -> None:
+            maximum = now + retention
+
+            def timestamp(value: object, name: str) -> float:
+                try:
+                    parsed = _strict_timestamp(value, name)
+                except (TypeError, ValueError) as error:
+                    raise SharedStateValidationError(
+                        f"Invalid Informix shared-state timestamp {name}={value!r}"
+                    ) from error
+                if not 0 <= parsed <= maximum:
+                    raise SharedStateValidationError(
+                        f"Informix shared-state timestamp {name}={value!r} is outside "
+                        f"[0, {maximum}]"
+                    )
+                return parsed
+
+            timestamp(state.get("created_at"), "created_at")
+            file_candidate = state.get("file_cleanup_candidate_at")
+            if file_candidate is not None:
+                timestamp(file_candidate, "file_cleanup_candidate_at")
+            scopes = state.get("scopes", {})
+            if not isinstance(scopes, dict):
+                raise SharedStateValidationError("Invalid Informix shared pipeline scopes")
+            for scope, value in scopes.items():
+                if not isinstance(value, dict):
+                    raise SharedStateValidationError(
+                        f"Invalid Informix shared pipeline scope {scope!r}"
+                    )
+                timestamp(value.get("created_at"), f"{scope}.created_at")
+                timestamp(value.get("last_seen"), f"{scope}.last_seen")
+                candidate = value.get("cleanup_candidate_at")
+                if candidate is not None:
+                    timestamp(candidate, f"{scope}.cleanup_candidate_at")
+
+        @staticmethod
+        def _prune_schema_history(state: dict[str, object]) -> None:
+            schemas = state.get("schemas", [])
+            scopes = state.get("scopes", {})
+            snapshots = state.get("snapshot_boundaries", {})
+            if not isinstance(schemas, list) or not isinstance(scopes, dict) or not isinstance(
+                snapshots, dict
+            ):
+                raise SharedStateValidationError("Invalid Informix schema cleanup state")
+            by_id = {
+                str(schema.get("id")): schema
+                for schema in schemas
+                if isinstance(schema, dict) and isinstance(schema.get("id"), str)
+            }
+            referenced = {str(state.get("active_schema_id"))}
+            for scope_state in scopes.values():
+                if not isinstance(scope_state, dict):
+                    continue
+                for channel in ("upsert", "delete"):
+                    acknowledgement = scope_state.get(channel)
+                    if isinstance(acknowledgement, dict):
+                        referenced.add(str(acknowledgement.get("schema_id")))
+            for boundary in snapshots.values():
+                if isinstance(boundary, dict):
+                    referenced.add(str(boundary.get("schema_id")))
+            retained: set[str] = set()
+            for schema_id in referenced:
+                cursor: str | None = schema_id
+                while cursor in by_id and cursor not in retained:
+                    retained.add(cursor)
+                    predecessor = by_id[cursor].get("predecessor")
+                    cursor = predecessor if isinstance(predecessor, str) else None
+            missing = referenced - set(by_id)
+            if missing:
+                raise SharedStateValidationError(
+                    f"Informix retained scopes reference missing schema nodes: {sorted(missing)}"
+                )
+            state["schemas"] = [
+                schema
+                for schema in schemas
+                if isinstance(schema, dict) and schema.get("id") in retained
+            ]
 
         def _shared_table_state_paths(self, table: Table) -> tuple[str, str, str]:
             hostname = self.options.get("hostname", "").strip().rstrip(".").casefold()
@@ -4854,21 +5600,18 @@ def register_lakeflow_source(spark):
                 raise InformixError(f"Cannot read Informix shared CDC state '{path}'") from error
             if not isinstance(state, dict):
                 raise InformixError(f"Invalid Informix shared CDC state object in '{path}'")
-            if state.get("version") == 1:
-                state = _upgrade_legacy_schema_state(state)
-            elif state.get("version") in (2, 3, 4):
-                state = dict(state)
-                state["version"] = _SHARED_STATE_VERSION
-                state.pop("snapshot_boundary", None)
-                state.pop("trigger", None)
-                state.pop("snapshot_boundaries", None)
-                state.pop("trigger_boundaries", None)
-            elif state.get("version") != _SHARED_STATE_VERSION:
-                raise InformixError(f"Unsupported Informix shared CDC state version in '{path}'")
+            state = _normalize_shared_state_version(state, path)
             if state.get("table") != table.native_identity:
                 raise InformixError(f"Informix shared CDC state table mismatch in '{path}'")
             try:
-                if int(state["lsn"]) < 1:
+                if _strict_timestamp(state["created_at"], "created_at") < 0:
+                    raise ValueError
+            except (KeyError, TypeError, ValueError) as error:
+                raise SharedStateValidationError(
+                    f"Invalid Informix shared CDC state creation time in '{path}'"
+                ) from error
+            try:
+                if _strict_lsn(state["lsn"], "lsn") < 1:
                     raise ValueError
             except (KeyError, TypeError, ValueError) as error:
                 raise InformixError(f"Invalid Informix shared CDC LSN in '{path}'") from error
@@ -4894,9 +5637,13 @@ def register_lakeflow_source(spark):
                         or not re.fullmatch(r"[0-9a-f]{64}", key)
                         or not isinstance(snapshot, dict)
                         or not isinstance(snapshot["schema_id"], str)
-                        or int(snapshot["initial_lsn"]) < 1
-                        or int(snapshot["snapshot_lsn"]) < int(snapshot["initial_lsn"])
-                        or not math.isfinite(float(snapshot["created_at"]))
+                        or not re.fullmatch(r"[0-9a-f]{32}", snapshot["schema_id"])
+                        or not isinstance(snapshot["scope"], str)
+                        or not re.fullmatch(r"[0-9a-f]{32}", snapshot["scope"])
+                        or _strict_lsn(snapshot["initial_lsn"], "initial_lsn") < 1
+                        or _strict_lsn(snapshot["snapshot_lsn"], "snapshot_lsn")
+                        < _strict_lsn(snapshot["initial_lsn"], "initial_lsn")
+                        or _strict_timestamp(snapshot["created_at"], "created_at") < 0
                     ):
                         raise ValueError
                 except (KeyError, TypeError, ValueError) as error:
@@ -4914,9 +5661,13 @@ def register_lakeflow_source(spark):
                         or not isinstance(trigger, dict)
                         or not isinstance(trigger["generation"], str)
                         or not re.fullmatch(r"[0-9a-f]{32}", trigger["generation"])
-                        or int(trigger["high_water"]) < 1
-                        or not math.isfinite(float(trigger["created_at"]))
+                        or _strict_lsn(trigger["high_water"], "high_water") < 1
+                        or _strict_timestamp(trigger["created_at"], "created_at") < 0
                         or not isinstance(trigger["predecessor"], str)
+                        or (
+                            trigger["predecessor"] != "initial"
+                            and not re.fullmatch(r"[0-9a-f]{32}", trigger["predecessor"])
+                        )
                         or not isinstance(trigger["scope"], str)
                         or not re.fullmatch(r"[0-9a-f]{32}", trigger["scope"])
                     ):
@@ -4924,6 +5675,65 @@ def register_lakeflow_source(spark):
                 except (KeyError, TypeError, ValueError) as error:
                     raise InformixError(
                         f"Invalid Informix shared trigger boundary in '{path}'"
+                    ) from error
+            scopes = state.get("scopes", {})
+            if not isinstance(scopes, dict):
+                raise InformixError(f"Invalid Informix shared pipeline scopes in '{path}'")
+            file_cleanup_candidate = state.get("file_cleanup_candidate_at")
+            if file_cleanup_candidate is not None:
+                try:
+                    if _strict_timestamp(
+                        file_cleanup_candidate, "file_cleanup_candidate_at"
+                    ) < 0:
+                        raise ValueError
+                except (TypeError, ValueError) as error:
+                    raise SharedStateValidationError(
+                        f"Invalid Informix shared file cleanup candidate in '{path}'"
+                    ) from error
+            for scope, scope_state in scopes.items():
+                try:
+                    if (
+                        not isinstance(scope, str)
+                        or not re.fullmatch(r"[0-9a-f]{32}", scope)
+                        or not isinstance(scope_state, dict)
+                        or _strict_timestamp(scope_state["created_at"], "created_at") < 0
+                        or _strict_timestamp(scope_state["last_seen"], "last_seen") < 0
+                    ):
+                        raise ValueError
+                    cleanup_candidate = scope_state.get("cleanup_candidate_at")
+                    if cleanup_candidate is not None and _strict_timestamp(
+                        cleanup_candidate, "cleanup_candidate_at"
+                    ) < 0:
+                        raise ValueError
+                    for channel in ("upsert", "delete"):
+                        acknowledgement = scope_state.get(channel)
+                        if acknowledgement is not None and (
+                            not isinstance(acknowledgement, dict)
+                            or _strict_timestamp(acknowledgement["seen_at"], "seen_at") < 0
+                            or not isinstance(acknowledgement["schema_id"], str)
+                            or not re.fullmatch(
+                                r"[0-9a-f]{32}", acknowledgement["schema_id"]
+                            )
+                            or not isinstance(acknowledgement["phase"], str)
+                            or acknowledgement["phase"] not in {"snapshot", "stream"}
+                            or _strict_lsn(acknowledgement["commit_lsn"], "commit_lsn") < 0
+                            or (
+                                acknowledgement.get("trigger_generation") is not None
+                                and (
+                                    not isinstance(
+                                        acknowledgement["trigger_generation"], str
+                                    )
+                                    or not re.fullmatch(
+                                        r"[0-9a-f]{32}",
+                                        acknowledgement["trigger_generation"],
+                                    )
+                                )
+                            )
+                        ):
+                            raise ValueError
+                except (KeyError, TypeError, ValueError) as error:
+                    raise InformixError(
+                        f"Invalid Informix shared pipeline scope in '{path}'"
                     ) from error
             return state
 
@@ -5071,6 +5881,8 @@ def register_lakeflow_source(spark):
             table: Table,
             lsn: int,
             node: dict[str, object] | None = None,
+            *,
+            pipeline_scope: str | None = None,
         ) -> None:
             schema = node or _schema_state(table, lsn)
             state = {
@@ -5080,6 +5892,16 @@ def register_lakeflow_source(spark):
                 "active_schema_id": schema["id"],
                 "created_at": time.time(),
                 "schemas": [schema],
+                "scopes": (
+                    {
+                        pipeline_scope: {
+                            "created_at": time.time(),
+                            "last_seen": time.time(),
+                        }
+                    }
+                    if pipeline_scope is not None
+                    else {}
+                ),
             }
             self._write_shared_state(path, state)
 
@@ -5231,6 +6053,21 @@ def register_lakeflow_source(spark):
         type_name = _CATALOG_TYPES.get(base_type)
         if type_name is None:
             raise InformixError(f"Unsupported Informix catalog coltype {base_type} for {name}")
+        if type_name in {"UDT_VAR", "UDT_FIXED"}:
+            if isinstance(row, dict):
+                lowered = {str(key).lower(): value for key, value in row.items()}
+                extended_name = str(lowered.get("extended_name") or "").strip().upper()
+                extended_owner = str(lowered.get("extended_owner") or "").strip().upper()
+            else:
+                extended_name = str(row[6] or "").strip().upper() if len(row) > 6 else ""
+                extended_owner = str(row[7] or "").strip().upper() if len(row) > 7 else ""
+            builtin_extended_types = {
+                ("UDT_VAR", "INFORMIX", "LVARCHAR"): "LVARCHAR",
+                ("UDT_FIXED", "INFORMIX", "BOOLEAN"): "BOOLEAN",
+            }
+            type_name = builtin_extended_types.get(
+                (type_name, extended_owner, extended_name), type_name
+            )
         if type_name == "DATETIME":
             # syscolumns.collength stores the packed width in its high byte and
             # start/end qualifier nibbles in its low byte.  CDC descriptors use
@@ -5243,15 +6080,11 @@ def register_lakeflow_source(spark):
         if type_name in {"DECIMAL", "MONEY"}:
             precision, scale = (length >> 8) & 0xFF, length & 0xFF
         unsupported = {
-            "INT8",
-            "SERIAL8",
-            "DATETIME",
             "BYTE",
             "TEXT",
             "BLOB",
             "CLOB",
             "INTERVAL",
-            "LVARCHAR",
             "NCHAR",
             "SET",
             "MULTISET",
@@ -5261,6 +6094,9 @@ def register_lakeflow_source(spark):
             "UDT_VAR",
             "UDT_FIXED",
         }
+        cdc_supported = type_name not in unsupported
+        if type_name == "DATETIME":
+            cdc_supported = _datetime_qualifier_supported(length)
         return {
             "name": name,
             "type_name": type_name,
@@ -5268,7 +6104,7 @@ def register_lakeflow_source(spark):
             "length": length,
             "precision": precision,
             "scale": scale,
-            "cdc_supported": type_name not in unsupported,
+            "cdc_supported": cdc_supported,
         }
 
 
@@ -5293,6 +6129,38 @@ def register_lakeflow_source(spark):
 
     def _optional_int(value: Any) -> int | None:
         return None if value is None or value == "" else int(value)
+
+
+    def _strict_int(value: object, name: str) -> int:
+        if isinstance(value, bool) or not (
+            isinstance(value, int)
+            or (isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value))
+        ):
+            raise ValueError(f"{name} must be an integer, not {value!r}")
+        return int(value)
+
+
+    def _strict_timestamp(value: object, name: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            raise ValueError(f"{name} must be a timestamp, not {value!r}")
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must be finite, not {value!r}")
+        return result
+
+
+    def _strict_lsn(value: object, name: str) -> int:
+        result = _strict_int(value, name)
+        if not 0 <= result < 1 << 64:
+            raise ValueError(f"{name} is outside the unsigned 64-bit LSN domain")
+        return result
+
+
+    def _strict_tx_id(value: object, name: str = "tx_id") -> int:
+        result = _strict_int(value, name)
+        if not -(1 << 31) <= result < 1 << 32:
+            raise ValueError(f"{name} is outside the native 32-bit transaction-ID domain")
+        return result + (1 << 32) if result < 0 else result
 
 
     def _patterns(value: str | None) -> tuple[str, ...]:
@@ -5323,7 +6191,6 @@ def register_lakeflow_source(spark):
             "BLOB",
             "CLOB",
             "INTERVAL",
-            "LVARCHAR",
             "NCHAR",
             "SET",
             "MULTISET",
@@ -5333,7 +6200,21 @@ def register_lakeflow_source(spark):
             "UDT_VAR",
             "UDT_FIXED",
         }
-        return tuple(column for column in table.columns if column.type_name in unsupported)
+        return tuple(
+            column
+            for column in table.columns
+            if column.type_name in unsupported
+            or (
+                column.type_name == "DATETIME"
+                and not _datetime_qualifier_supported(column.length or 0)
+            )
+        )
+
+
+    def _datetime_qualifier_supported(qualifier: int) -> bool:
+        start, end = (qualifier >> 8) & 0xF, qualifier & 0xF
+        fields = {0, 2, 4, 6, 8, 10}
+        return start in fields and end in {*fields, 11, 12, 13, 14, 15} and end >= start
 
 
     def _ensure_materializable(table: Table) -> None:
@@ -5397,17 +6278,20 @@ def register_lakeflow_source(spark):
         value = record.get("lsn", record.get("sequence", record.get("sequence_id")))
         if value is None:
             raise InformixError(f"CDC record has no LSN: {record!r}")
-        result = int(value)
-        if result < 0:
-            raise InformixError(f"CDC record has a negative LSN: {record!r}")
-        return result
+        try:
+            return _strict_lsn(value, "CDC record LSN")
+        except ValueError as error:
+            raise InformixError(f"CDC record has an invalid LSN: {record!r}") from error
 
 
     def _tx_id(record: dict[str, Any]) -> int:
         value = record.get("tx_id", record.get("transaction_id"))
         if value is None:
             raise InformixError(f"CDC record has no transaction ID: {record!r}")
-        return int(value)
+        try:
+            return _strict_tx_id(value, "CDC transaction ID")
+        except ValueError as error:
+            raise InformixError(f"CDC record has an invalid transaction ID: {record!r}") from error
 
 
     def _normalise_record(raw: dict[str, Any]) -> dict[str, Any]:
@@ -5434,7 +6318,7 @@ def register_lakeflow_source(spark):
         for record in records:
             if _operation(record) == "TIMEOUT":
                 timed_out = True
-            if _operation(record) not in {"METADATA", "ERROR", "DISCARD"}:
+            if _operation(record) not in {"METADATA", "ERROR", "DISCARD", "TIMEOUT"}:
                 lsn = _lsn(record)
                 if last_lsn is not None and lsn < last_lsn:
                     raise InformixError(f"CDC stream LSN regressed globally: {lsn} < {last_lsn}")
@@ -5715,7 +6599,7 @@ def register_lakeflow_source(spark):
         if not isinstance(raw, dict):
             raise InformixError("Informix shared CDC schema is missing table metadata")
         try:
-            start_lsn = int(state["start_lsn"])
+            start_lsn = _strict_lsn(state["start_lsn"], "start_lsn")
         except (KeyError, TypeError, ValueError) as error:
             raise InformixError("Informix shared CDC schema has an invalid start LSN") from error
         if start_lsn < 1:
@@ -5724,6 +6608,41 @@ def register_lakeflow_source(spark):
         if _schema_fingerprint(table) != state.get("fingerprint"):
             raise InformixError("Informix shared CDC schema fingerprint does not match metadata")
         return table
+
+
+    def _normalize_shared_state_version(
+        state: dict[str, object], path: str
+    ) -> dict[str, object]:
+        version = state.get("version")
+        if version == 1:
+            normalized = _upgrade_legacy_schema_state(state)
+        elif version in (2, 3, 4, 5):
+            normalized = dict(state)
+            normalized["version"] = _SHARED_STATE_VERSION
+            normalized.pop("snapshot_boundary", None)
+            normalized.pop("trigger", None)
+            normalized.pop("snapshot_boundaries", None)
+            normalized.pop("trigger_boundaries", None)
+            normalized.pop("scopes", None)
+        elif version != _SHARED_STATE_VERSION:
+            raise InformixError(
+                f"Unsupported Informix shared CDC state version {version!r} in '{path}'"
+            )
+        else:
+            normalized = state
+        boundaries = normalized.get("trigger_boundaries", {})
+        if isinstance(boundaries, dict) and any(
+            isinstance(value, dict) and value.get("predecessor") == "None"
+            for value in boundaries.values()
+        ):
+            normalized = dict(normalized)
+            migrated = {}
+            for key, value in boundaries.items():
+                if isinstance(value, dict) and value.get("predecessor") == "None":
+                    value = {**value, "predecessor": "initial"}
+                migrated[key] = value
+            normalized["trigger_boundaries"] = migrated
+        return normalized
 
 
     def _upgrade_legacy_schema_state(state: dict[str, object]) -> dict[str, object]:
@@ -5782,7 +6701,7 @@ def register_lakeflow_source(spark):
                 raise InformixError("Informix shared CDC schema has an invalid id")
             if schema_id in validated:
                 raise InformixError(f"Duplicate Informix shared CDC schema id {schema_id}")
-            start_lsn = int(schema["start_lsn"])
+            start_lsn = _strict_lsn(schema["start_lsn"], "start_lsn")
             predecessor = _schema_predecessor(schemas, index)
             if predecessor is not None:
                 if predecessor not in validated:
@@ -5931,11 +6850,7 @@ def register_lakeflow_source(spark):
         for key in ("commit_lsn", "change_lsn", "begin_lsn"):
             if key not in result:
                 raise ValueError(f"Informix stream offset is missing '{key}'")
-            values[key] = int(result[key])
-            if values[key] < 0:
-                raise ValueError(f"Informix offset '{key}' must be non-negative")
-            if values[key] >= 1 << 64:
-                raise ValueError(f"Informix offset '{key}' exceeds the unsigned 64-bit LSN domain")
+            values[key] = _strict_lsn(result[key], key)
         if not values["begin_lsn"] <= values["change_lsn"] <= values["commit_lsn"]:
             raise ValueError("Informix offset must satisfy begin_lsn <= change_lsn <= commit_lsn")
         phase = result.get("phase")
@@ -5968,10 +6883,19 @@ def register_lakeflow_source(spark):
             or not re.fullmatch(r"[0-9a-f]{32}", trigger_generation)
         ):
             raise ValueError("Informix offset has an invalid trigger_generation")
+        tx_id = result.get("tx_id")
+        if tx_id is not None:
+            result["tx_id"] = _strict_tx_id(tx_id)
         if phase == "snapshot":
-            if "snapshot_lsn" not in result or int(result["snapshot_lsn"]) < 0:
+            if (
+                "snapshot_lsn" not in result
+                or _strict_lsn(result["snapshot_lsn"], "snapshot_lsn") < 0
+            ):
                 raise ValueError("Informix snapshot offset has an invalid snapshot_lsn")
-            if any(values[key] != int(result["snapshot_lsn"]) for key in values):
+            if any(
+                values[key] != _strict_lsn(result["snapshot_lsn"], "snapshot_lsn")
+                for key in values
+            ):
                 raise ValueError(
                     "Informix snapshot offset requires snapshot_lsn, begin_lsn, "
                     "change_lsn, and commit_lsn to be equal"

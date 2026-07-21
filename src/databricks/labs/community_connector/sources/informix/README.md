@@ -58,6 +58,7 @@ connector deployment.
 | `max.records.per.batch` | No | `10000` | Target maximum projected CDC rows; minimum `1`. A complete transaction may exceed it. |
 | `cdc.timeout` | No | `5` | CDC idle-read timeout in seconds; minimum `1`. Zero is rejected because it can select an unbounded native wait. |
 | `cdc.shared.state.wait.seconds` | No | `300` | Maximum time a delete reader waits for its table's upsert reader to publish automatic initialization state. |
+| `cdc.shared.state.scope.retention.seconds` | No | `2592000` | Stale-observation interval for an inactive checkpoint scope (30 days by default; minimum one hour). Cleanup is two-phase: a scope is marked after one interval and removed only after remaining stale for a second interval. Restarting after removal requires a full refresh. |
 | `cdc.max.records` | No | `64` | Soft native record target per CDC session; range `1`–`256`. Once reached, records continue until every transaction already observed commits, rolls back, or Informix returns TIMEOUT. |
 | `cdc.max.frame.bytes` | No | `16777216` | Maximum accepted native CDC frame size (16 MiB by default; minimum `16`). |
 | `cdc.max.transaction.records` | No | `100000` | Maximum records buffered in an open transaction. Exceeding it fails without emitting uncommitted data. |
@@ -260,11 +261,62 @@ A table supports CDC only when it has a primary key and every column has a suppo
 
 | CDC status | Informix types |
 |---|---|
-| Supported end to end | `SMALLINT`, `INTEGER`/`INT`, `SERIAL`, `INT8`, `SERIAL8`, `BIGINT`, `BIGSERIAL`, `FLOAT`/`DOUBLE`, `REAL`/`SMALLFLOAT`, `DECIMAL`/`NUMERIC`, `MONEY`, `DATE`, supported `DATETIME` qualifiers, `BOOLEAN`, `CHAR`, `VARCHAR`/`NVARCHAR` |
-| Rejected before ingestion | `BYTE`, `TEXT`, `BLOB`, `CLOB`, `INTERVAL`, `LVARCHAR`, `NCHAR`, complex and opaque types |
+| Live-validated end to end | `SMALLINT`, `INTEGER`/`INT`, `SERIAL`, `INT8`, `SERIAL8`, `BIGINT`, `BIGSERIAL`, `FLOAT`/`DOUBLE`, `REAL`/`SMALLFLOAT`, `DECIMAL`/`NUMERIC`, `MONEY`, `DATE`, supported `DATETIME` qualifiers, `BOOLEAN`, `CHAR`, `VARCHAR`/`NVARCHAR`, `LVARCHAR` |
+| Rejected before ingestion | `BYTE`, `TEXT`, `BLOB`, `CLOB`, `INTERVAL`, `NCHAR`, complex and opaque types |
 | Excluded from speculative decoding | Unknown catalog types, UDT and complex types such as `ROW`, `SET`, `LIST`, and `MULTISET` |
 
-`INT8` and `SERIAL8` use Informix's complete ten-byte signed-magnitude CDC representation. A `DATETIME` qualifier is CDC-capable when its start and end fields are supported by the native decoder. Values containing `YEAR` through at least `DAY` are exposed as timezone-free Spark timestamps; partial/time-only values are deterministic strings and never acquire the worker's current date.
+`INT8` and `SERIAL8` use Informix's complete ten-byte signed-magnitude CDC representation. `LVARCHAR` supports its variable-width ordinary SQLI snapshot envelope and native CDC representation. A `DATETIME` qualifier is CDC-capable when its start and end fields are supported by the native decoder. Values containing `YEAR` through at least `DAY` are exposed as timezone-free Spark timestamps; partial/time-only values are deterministic strings and never acquire the worker's current date.
+
+Set `scalar.types.live.validation=true` and `scalar.types.test.table=owner.table` in an opt-in live test configuration to validate snapshot and CDC decoding against a populated, dedicated mutable table containing `INT8`, `SERIAL8`, `DATETIME`, `LVARCHAR`, and `BOOLEAN` columns. Snapshot validation opens separate `padVarchar=false` and `padVarchar=true` sessions so mixed padded VARCHAR and LVARCHAR/BOOLEAN envelope behavior is exercised in both negotiated tuple modes. Provide `scalar.types.expected.snapshot` and `scalar.types.expected.cdc` as JSON objects containing exact non-null wire boundaries: a signed INT8 extreme, a positive generated SERIAL8 value, an LVARCHAR occupying its catalog maximum in the configured `CLIENT_LOCALE` encoding, a DATETIME preserving its declared fractional precision, and a Boolean value. INT8 exercises the shared signed-magnitude extreme without advancing the SERIAL8 generator to exhaustion. Provide corresponding null-sentinel cases in `scalar.types.expected.null.snapshot` and `scalar.types.expected.null.cdc`; each must include every required column and set every nullable scalar column to JSON `null`. Configure committed mutations with `scalar.types.mutation.sql` and `scalar.types.null.mutation.sql`, plus one idempotent `scalar.types.cleanup.sql` statement that removes both mutations. The test commits every statement explicitly in ANSI and non-ANSI databases and preserves all primary, rollback, cleanup, and close failures.
+
+This regression passed against Informix 15.0.FC0DE in an ANSI-mode database over
+the verified TLS SQLI listener, covering padded and unpadded snapshots, exact
+boundary and null values, committed full-row CDC updates, and cleanup.
+
+A reproducible fixture uses one non-scalar marker so CDC can emit unchanged
+boundary/null scalar values through full-row logging:
+
+```sql
+CREATE TABLE scalar_types_live (
+  id INTEGER NOT NULL PRIMARY KEY,
+  int8_value INT8,
+  serial8_value SERIAL8 NOT NULL,
+  datetime_value DATETIME YEAR TO FRACTION(5),
+  lvarchar_value LVARCHAR(16),
+  boolean_value BOOLEAN,
+  marker INTEGER NOT NULL
+);
+
+INSERT INTO scalar_types_live
+  (id, int8_value, serial8_value, datetime_value, lvarchar_value, boolean_value, marker)
+VALUES
+  (1, 9223372036854775807, 0,
+   DATETIME(2026-07-21 12:34:56.12345) YEAR TO FRACTION(5),
+   'abcdefghijklmnop', 't', 0);
+INSERT INTO scalar_types_live
+  (id, int8_value, serial8_value, datetime_value, lvarchar_value, boolean_value, marker)
+VALUES (2, NULL, 0, NULL, NULL, NULL, 0);
+```
+
+Add these test-only entries to `CONNECTOR_TEST_CONFIG_JSON` or the JSON file
+referenced by `CONNECTOR_TEST_CONFIG_PATH`; expected objects are JSON-encoded
+strings because connection options are strings:
+
+```json
+{
+  "scalar.types.live.validation": "true",
+  "scalar.types.test.table": "informix.scalar_types_live",
+  "scalar.types.expected.snapshot": "{\"int8_value\":9223372036854775807,\"serial8_value\":1,\"datetime_value\":\"2026-07-21T12:34:56.12345\",\"lvarchar_value\":\"abcdefghijklmnop\",\"boolean_value\":true}",
+  "scalar.types.expected.null.snapshot": "{\"int8_value\":null,\"serial8_value\":2,\"datetime_value\":null,\"lvarchar_value\":null,\"boolean_value\":null}",
+  "scalar.types.mutation.sql": "UPDATE scalar_types_live SET marker=1 WHERE id=1",
+  "scalar.types.null.mutation.sql": "UPDATE scalar_types_live SET marker=1 WHERE id=2",
+  "scalar.types.cleanup.sql": "UPDATE scalar_types_live SET marker=0 WHERE id IN (1,2)",
+  "scalar.types.expected.cdc": "{\"int8_value\":9223372036854775807,\"serial8_value\":1,\"datetime_value\":\"2026-07-21T12:34:56.12345\",\"lvarchar_value\":\"abcdefghijklmnop\",\"boolean_value\":true}",
+  "scalar.types.expected.null.cdc": "{\"int8_value\":null,\"serial8_value\":2,\"datetime_value\":null,\"lvarchar_value\":null,\"boolean_value\":null}",
+  "scalar.types.insert.smoke.sql": "INSERT INTO scalar_types_live (id,int8_value,serial8_value,datetime_value,lvarchar_value,boolean_value,marker) VALUES (9,NULL,42,NULL,NULL,NULL,0)",
+  "scalar.types.insert.smoke.cleanup.sql": "DELETE FROM scalar_types_live WHERE id=9"
+}
+```
 
 Informix's native capture-column API and ordinary SQLI snapshot protocol do not yet provide end-to-end materialization for the rejected types. The connector fails during metadata discovery with the exact columns involved instead of advertising a snapshot fallback that later fails or silently returning placeholders. Unknown catalog type codes also fail discovery. Decimal CDC requires valid precision and scale metadata within Spark's 38-digit decimal limit.
 
@@ -329,11 +381,13 @@ Regenerate the deployable file with `bash src/databricks/labs/community_connecto
 
 Delivery is at least once. A failure after rows are returned but before Lakeflow commits its checkpoint can replay them. `TRUNCATE` cannot be represented by keyed Lakeflow deletes and fails explicitly. Snapshot-only tables are fully reread and fail when they exceed `snapshot.max.rows`.
 
-The connector adds `_informix_change_lsn`, `_informix_commit_lsn`, `_informix_tx_id`, and `_informix_op` to rows. The two LSN columns are fixed-width, zero-padded 20-digit decimal strings so Spark string ordering is identical to numeric LSN ordering. `_informix_change_lsn` is the incremental cursor; operations are `r` (snapshot), `c` (insert), `u` (update), and `d` (delete). Targets created with an older connector that emitted unpadded LSN strings require a full refresh before using this version.
+The connector adds `_informix_change_lsn`, `_informix_commit_lsn`, `_informix_tx_id`, and `_informix_op` to rows. Native LSN fields are decoded across their complete unsigned 64-bit wire domain. The two LSN columns are fixed-width, zero-padded 20-digit decimal strings so Spark string ordering is identical to numeric LSN ordering. Native signed int32 transaction-ID bit patterns are normalized to `0..4294967295`, ensuring one stable identifier after the high bit is set. `_informix_change_lsn` is the incremental cursor; operations are `r` (snapshot), `c` (insert), `u` (update), and `d` (delete). Targets created with an older connector that emitted unpadded LSN strings require a full refresh before using this version.
 
 ### Checkpoints and log retention
 
-During snapshot, Lakeflow checkpoints the connector offset version, snapshot LSN, last primary-key values, a source-schema fingerprint, a generation-specific schema node ID, and a pipeline scope. A completed consistent snapshot publishes its fresh resume LSN for both independently instantiated channels, so a full refresh never replays older retained transactions or historical `TRUNCATE` records. Streaming checkpoints the version, `commit_lsn`, `change_lsn`, the oldest required `begin_lsn`, fingerprint, schema node ID, pipeline scope, and triggered-update generation; retaining the begin position is necessary for interleaved transactions. Triggered upsert and delete readers use one atomically published per-table high-water LSN rather than sampling independently. The generated source creates one random registration scope before Spark serializes its readers. Every upsert and delete reader receives that same value, records it in its first offset, and thereafter prefers the durable checkpoint value across driver and worker restarts. Snapshot and trigger records are keyed by this scope, isolating concurrently registered pipelines without requiring Lakeflow to expose pipeline or update IDs to Python workers. The node ID distinguishes separate table generations that happen to have identical layouts. Data and delete channels have separate checkpoints and replay the source independently. A missing or unsupported offset version fails closed and requires a full refresh. A changed fingerprint enters the additive schema transition described below. Offset version 6 introduces the durable registration scope; earlier checkpoints require a full refresh. Shared-state version 5 removes boundaries from earlier unscoped formats while preserving schema history.
+During snapshot, Lakeflow checkpoints the connector offset version, snapshot LSN, last primary-key values, a source-schema fingerprint, a generation-specific schema node ID, and a pipeline scope. A completed consistent snapshot publishes its fresh resume LSN for both independently instantiated channels, so a full refresh never replays older retained transactions or historical `TRUNCATE` records. Streaming checkpoints the version, `commit_lsn`, `change_lsn`, the oldest required `begin_lsn`, fingerprint, schema node ID, pipeline scope, and triggered-update generation; retaining the begin position is necessary for interleaved transactions. Triggered upsert and delete readers use one atomically published per-table high-water LSN rather than sampling independently. The generated source creates one random registration scope before Spark serializes its readers. Every upsert and delete reader receives that same value, records it in its first offset, and thereafter prefers the durable checkpoint value across driver and worker restarts. Snapshot and trigger records are keyed by this scope, isolating concurrently registered pipelines without requiring Lakeflow to expose pipeline or update IDs to Python workers. On each invocation the connector acknowledges only the committed start offset, never the uncommitted end offset being returned. Unchanged acknowledgements avoid Volume locking and writes except for a bounded heartbeat. Once both channels pass a boundary, it is pruned atomically. Inactive scopes use two-phase cleanup: one stale interval marks a candidate and a second full interval must pass before removal, preventing a single clock-skewed observation from deleting state. Restarting a removed checkpoint fails closed and requires a full refresh. The node ID distinguishes separate table generations that happen to have identical layouts. Data and delete channels have separate checkpoints and replay the source independently. A missing or unsupported offset version fails closed and requires a full refresh. A changed fingerprint enters the additive schema transition described below. Offset version 7 introduces scope acknowledgements; earlier checkpoints require a full refresh. Shared-state version 6 adds retained scope state while removing boundaries from older formats.
+
+Once per day, any active pipeline may sweep every table-state file belonging to the same Informix connection and shared-state location. An atomic connection-level `.informix-sweep.lock` elects one worker across all pipelines, and a shared `.informix-sweep.json` marker enforces the interval; other workers skip the scan. The sweep expires abandoned scopes, removes schema branches no retained checkpoint or boundary references, tombstones empty table-state files after a second retention interval, and removes empty connection directories. A connection that is never used again cannot run connector cleanup and requires an external maintenance job or Volume lifecycle policy.
 
 An idle timeout returns no rows and leaves the checkpoint unchanged. Incomplete or open transactions do not advance it. If the restart LSN predates the minimum retained logical log in `sysmaster:syslogs`, continuation fails and the table must be resnapshotted. Every CDC session validates its initial METADATA frame against a fresh catalog layout before decoding later records; another METADATA frame in that session fails immediately and requires a full refresh.
 

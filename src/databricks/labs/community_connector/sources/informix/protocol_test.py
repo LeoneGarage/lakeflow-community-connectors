@@ -24,11 +24,14 @@ from databricks.labs.community_connector.sources.informix.sqli import (
     PasswordAuthenticationProvider,
     ResultColumn,
     ResultDescription,
+    SqliDescriptorNotImplemented,
     SqliProtocolError,
     SqliUnsupportedAuthentication,
     TypedBind,
+    _connector_sql,
     _DeadlineReader,
     _decode_result_value,
+    _statement_keyword,
     decode_asc_accept,
     decode_asc_response,
     decode_lodata_response,
@@ -78,6 +81,11 @@ class FrameTests(unittest.TestCase):
         frames = parser.feed(first[7:] + second)
         self.assertEqual(frames, [first, second])
         self.assertEqual(decode_frame(first, {})["lsn"], 17)
+
+    def test_lsn_uses_full_unsigned_64_bit_wire_domain(self):
+        lsn = (1 << 63) + 17
+        record = decode_frame(_frame(201, struct.pack(">Q", lsn)), {})
+        self.assertEqual(record["lsn"], lsn)
 
     def test_metadata_tolerates_ibm_header_extension(self):
         record = decode_frame(_frame(200, struct.pack(">i", 7) + bytes(16), b"integer id"), {})
@@ -134,6 +142,12 @@ class FrameTests(unittest.TestCase):
             decode_value(memoryview(b"\x01\x00"), ColumnDescriptor("v", "VARCHAR")),
             (None, 2),
         )
+        self.assertEqual(
+            decode_value(memoryview(b"\x01\x00"), ColumnDescriptor("b", "BOOLEAN")),
+            (None, 2),
+        )
+        with self.assertRaisesRegex(CdcProtocolError, "boolean null flag"):
+            decode_value(memoryview(b"\x02\x00"), ColumnDescriptor("b", "BOOLEAN"))
         self.assertEqual(
             decode_value(memoryview(b"\xff" * 8), ColumnDescriptor("f", "FLOAT")),
             (None, 8),
@@ -254,8 +268,27 @@ class FrameTests(unittest.TestCase):
         two_byte = ResultColumn("enabled", 0, 45, 0, 2)
         self.assertIsNone(_decode_result_value(b"\xff", one_byte, "utf-8"))
         self.assertIsNone(_decode_result_value(b"\x00\xff", two_byte, "utf-8"))
+        self.assertIs(_decode_result_value(b"t", one_byte, "utf-8", True), True)
+        self.assertIs(_decode_result_value(b"f", one_byte, "utf-8", True), False)
         with self.assertRaisesRegex(SqliProtocolError, "invalid BOOLEAN"):
             _decode_result_value(b"\x02", one_byte, "utf-8")
+        enveloped = ResultColumn("enabled", 0, 45, 0, 1)
+        self.assertTrue(
+            _decode_result_value(
+                b"\x00" + struct.pack(">i", 1) + b"\x01", enveloped, "utf-8"
+            )
+        )
+        self.assertIsNone(
+            _decode_result_value(
+                b"\x01" + struct.pack(">i", 0), enveloped, "utf-8"
+            )
+        )
+        with self.assertRaises(SqliDescriptorNotImplemented):
+            _decode_result_value(
+                b"\x00" + struct.pack(">i", 1) + b"\x01",
+                ResultColumn("collection", 0, 23, 0, 1),
+                "utf-8",
+            )
 
     def test_ordinary_char_strips_only_space_padding(self):
         column = ResultColumn("value", 0, 0, 0, 4)
@@ -270,6 +303,20 @@ class FrameTests(unittest.TestCase):
             with self.subTest(type_code=type_code):
                 column = ResultColumn("value", 0, type_code, 0, 20)
                 self.assertIsNone(_decode_result_value(b"\x01\x00", column, "utf-8"))
+
+    def test_ordinary_lvarchar_value_null_and_validation(self):
+        column = ResultColumn("value", 0, 43, 0, 100)
+        self.assertEqual(
+            _decode_result_value(b"\x00" + struct.pack(">i", 5) + b"hello", column, "utf-8"),
+            "hello",
+        )
+        self.assertIsNone(
+            _decode_result_value(b"\x01" + struct.pack(">i", 0), column, "utf-8")
+        )
+        with self.assertRaisesRegex(SqliProtocolError, "length"):
+            _decode_result_value(
+                b"\x00" + struct.pack(">i", 4) + b"short", column, "utf-8"
+            )
 
 
 class LoDataTests(unittest.TestCase):
@@ -305,7 +352,34 @@ class SqliPacketTests(unittest.TestCase):
             "databricks.labs.community_connector.sources.informix.sqli._retained_size",
             side_effect=AssertionError("must not account"),
         ):
-            self.assertEqual(client.execute("SET EXPLAIN OFF"), [])
+            self.assertEqual(client.execute("SELECT 1 FROM systables"), [])
+
+    def test_execute_routes_non_row_statements_to_command_path(self):
+        client = InformixSqliClient("host", 9088, "db", "user", "password")
+        with patch.object(client, "execute_command") as execute_command:
+            self.assertEqual(
+                client.execute("UPDATE app.orders SET state = ?", ("done",)), []
+            )
+
+        execute_command.assert_called_once_with(
+            "UPDATE app.orders SET state = 'done'"
+        )
+
+    def test_execute_routes_commented_non_row_statements_to_command_path(self):
+        client = InformixSqliClient("host", 9088, "db", "user", "password")
+        with patch.object(client, "execute_command") as execute_command:
+            client.execute("/* mutation */\n-- owned SQL\nUPDATE t SET value = ?", (1,))
+        execute_command.assert_called_once_with(
+            "/* mutation */\n-- owned SQL\nUPDATE t SET value = 1"
+        )
+
+    def test_connector_sql_ignores_question_marks_in_literals_and_comments(self):
+        sql = "SELECT '?' AS literal /* ? */ FROM t -- ?\nWHERE id = ?"
+        self.assertEqual(
+            _connector_sql(sql, (7,)),
+            "SELECT '?' AS literal /* ? */ FROM t -- ?\nWHERE id = 7",
+        )
+        self.assertEqual(_statement_keyword("/* note */ -- note\n UPDATE t SET x=1"), "UPDATE")
 
     def test_non_row_command_uses_sq_command_execute_release_path(self):
         client = InformixSqliClient("host", 9088, "db", "user", "password")
@@ -620,6 +694,129 @@ class SqliPacketTests(unittest.TestCase):
             struct.pack(">hhhhhhihihh", 4, 7, 100, 1, 1, 13, 20, 9, 4096, 0, 12),
         )
 
+    def test_variable_fetch_resolves_builtin_extended_types(self):
+        description = ResultDescription(
+            2,
+            7,
+            17,
+            (
+                ResultColumn("text", 0, 40, 1, 16, "informix", "lvarchar"),
+                ResultColumn("enabled", 16, 41, 5, 1, "informix", "boolean"),
+            ),
+        )
+        expected = bytearray(struct.pack(">hhhhh", 4, 7, 100, 1, 2))
+        expected.extend(struct.pack(">h", 43))
+        expected.extend(encode_char(""))
+        expected.extend(encode_char(""))
+        expected.extend(struct.pack(">i", 16))
+        expected.extend(struct.pack(">h", 45))
+        expected.extend(encode_char("informix"))
+        expected.extend(encode_char("boolean"))
+        expected.extend(struct.pack(">i", 1))
+        expected.extend(struct.pack(">hihh", 9, 4096, 0, 12))
+
+        self.assertEqual(encode_variable_fetch(description, 4096), bytes(expected))
+
+    def test_variable_fetch_rejects_user_defined_builtin_name(self):
+        description = ResultDescription(
+            2,
+            7,
+            16,
+            (ResultColumn("value", 0, 40, 9, 16, "application", "lvarchar"),),
+        )
+
+        with self.assertRaisesRegex(SqliDescriptorNotImplemented, "result type 40"):
+            encode_variable_fetch(description)
+
+    def test_mixed_lvarchar_and_boolean_tuple_decodes_variable_envelopes(self):
+        payload = (
+            b"\x00"
+            + struct.pack(">i", 5)
+            + b"hello"
+            + b"\x00"
+            + struct.pack(">i", 1)
+            + b"\x01"
+        )
+        transcript = struct.pack(">hi", 0, len(payload)) + payload
+        if len(payload) & 1:
+            transcript += b"\x00"
+        client = InformixSqliClient("host", 9088, "db", "user", "password")
+        client._input = io.BytesIO(transcript)
+        description = ResultDescription(
+            2,
+            7,
+            len(payload),
+            (
+                ResultColumn("text", 0, 43, 0, 100),
+                ResultColumn("enabled", 10, 45, 0, 1),
+            ),
+        )
+
+        self.assertEqual(
+            client._read_tuple(description), {"text": "hello", "enabled": True}
+        )
+
+    def test_padded_varchar_does_not_disable_lvarchar_envelope_walking(self):
+        payload = (
+            b"ab  "
+            + b"\x00"
+            + struct.pack(">i", 5)
+            + b"hello"
+            + b"\x00"
+            + struct.pack(">i", 1)
+            + b"\x01"
+        )
+        transcript = struct.pack(">hi", 0, len(payload)) + payload
+        if len(payload) & 1:
+            transcript += b"\x00"
+        client = InformixSqliClient(
+            "host", 9088, "db", "user", "password", pad_varchar=True
+        )
+        client._input = io.BytesIO(transcript)
+        description = ResultDescription(
+            2,
+            7,
+            len(payload),
+            (
+                ResultColumn("padded", 0, 13, 0, 4),
+                ResultColumn("text", 4, 43, 0, 100),
+                ResultColumn("enabled", 14, 45, 0, 1),
+            ),
+        )
+
+        self.assertEqual(
+            client._read_tuple(description),
+            {"padded": "ab", "text": "hello", "enabled": True},
+        )
+
+    def test_variable_tuple_positions_do_not_bound_runtime_envelopes(self):
+        payload = (
+            b"\x00"
+            + struct.pack(">i", 5)
+            + b"hello"
+            + b"\x00"
+            + struct.pack(">i", 1)
+            + b"\x01"
+        )
+        transcript = struct.pack(">hi", 0, len(payload)) + payload
+        if len(payload) & 1:
+            transcript += b"\x00"
+        client = InformixSqliClient("host", 9088, "db", "user", "password")
+        client._input = io.BytesIO(transcript)
+        description = ResultDescription(
+            2,
+            7,
+            len(payload),
+            (
+                ResultColumn("text", 0, 43, 0, 100),
+                ResultColumn("enabled", 9, 45, 0, 1),
+            ),
+        )
+
+        self.assertEqual(
+            client._read_tuple(description), {"text": "hello", "enabled": True}
+        )
+
     def test_live_feature62_prepare_and_fixed_open_fetch_goldens(self):
         prepare = encode_prepare("x" * 38, parameter_count=0, long_sql_length=True)
         self.assertEqual(len(prepare), 52)
@@ -646,6 +843,63 @@ class SqliPacketTests(unittest.TestCase):
         _, rows, exhausted = client._read_query_group(None)
         self.assertEqual(rows, [])
         self.assertTrue(exhausted)
+
+    def test_insertdone_consumes_serial_metadata(self):
+        description = ResultDescription(6, 7, 0, ())
+        for bigint_supported, body in (
+            (False, b"s" * 10),
+            (True, b"s" * 10 + b"b" * 8),
+        ):
+            client = InformixSqliClient("host", 9088, "db", "user", "password")
+            client.bigint_supported = bigint_supported
+            transcript = struct.pack(">h", 94) + body + struct.pack(">h", 12)
+            client._input = io.BytesIO(transcript)
+
+            client._read_query_group(description)
+
+            self.assertEqual(client._input.tell(), len(transcript))
+
+    def test_insertdone_outside_insert_fails_closed(self):
+        client = InformixSqliClient("host", 9088, "db", "user", "password")
+        client._input = io.BytesIO(struct.pack(">h", 94) + b"s" * 10)
+
+        with self.assertRaisesRegex(SqliProtocolError, "outside an INSERT"):
+            client._read_query_group(ResultDescription(2, 7, 0, ()))
+
+    def test_status_group_consumes_insertdone_serial_metadata(self):
+        for bigint_supported, body in (
+            (False, b"s" * 10),
+            (True, b"s" * 10 + b"b" * 8),
+        ):
+            with self.subTest(bigint_supported=bigint_supported):
+                done = struct.pack(">hhiii", 15, 0, 1, 0, 0)
+                transcript = (
+                    struct.pack(">hh", 8, 94)
+                    + body
+                    + done
+                    + struct.pack(">h", 12)
+                )
+                client = InformixSqliClient("host", 9088, "db", "user", "password")
+                client.bigint_supported = bigint_supported
+                client._input = io.BytesIO(transcript)
+                with patch.object(
+                    client,
+                    "_read_description",
+                    return_value=ResultDescription(6, 7, 0, ()),
+                ):
+                    client._read_status_group(require_done=True)
+
+                self.assertEqual(client._input.tell(), len(transcript))
+
+    def test_status_group_rejects_insertdone_for_non_insert(self):
+        client = InformixSqliClient("host", 9088, "db", "user", "password")
+        client._input = io.BytesIO(struct.pack(">hh", 8, 94) + b"s" * 10)
+        with patch.object(
+            client,
+            "_read_description",
+            return_value=ResultDescription(4, 7, 0, ()),
+        ), self.assertRaisesRegex(SqliProtocolError, "outside an INSERT"):
+            client._read_status_group()
 
     def test_zero_row_done_marks_fetch_exhausted(self):
         done = struct.pack(">hhiii", 15, 0, 0, 0, 0) + struct.pack(">h", 12)

@@ -171,7 +171,7 @@ def decode_frame(frame: bytes, columns_by_label: dict[int, tuple[ColumnDescripto
     record: dict[str, Any] = {"op": op, "reserved": reserved}
     if kind in _OP_TYPES:
         _require_header(header, 16, op)
-        lsn, tx_id, label = struct.unpack_from(">qii", header)
+        lsn, tx_id, label = struct.unpack_from(">Qii", header)
         record.update(lsn=lsn, tx_id=tx_id, label=label)
         columns = columns_by_label.get(label)
         if columns is None:
@@ -179,26 +179,26 @@ def decode_frame(frame: bytes, columns_by_label: dict[int, tuple[ColumnDescripto
         record["row"] = decode_row(payload, columns)
     elif kind == 1:
         _require_header(header, 24, op)
-        lsn, tx_id, timestamp, user_id = struct.unpack_from(">qiqi", header)
+        lsn, tx_id, timestamp, user_id = struct.unpack_from(">Qiqi", header)
         record.update(lsn=lsn, tx_id=tx_id, timestamp=timestamp, user_id=user_id)
     elif kind == 2:
         _require_header(header, 20, op)
-        lsn, tx_id, timestamp = struct.unpack_from(">qiq", header)
+        lsn, tx_id, timestamp = struct.unpack_from(">Qiq", header)
         record.update(lsn=lsn, tx_id=tx_id, timestamp=timestamp)
     elif kind in {3, 62}:
         _require_header(header, 12, op)
-        lsn, tx_id = struct.unpack_from(">qi", header)
+        lsn, tx_id = struct.unpack_from(">Qi", header)
         record.update(lsn=lsn, tx_id=tx_id)
     elif kind == 119:
         _require_header(header, 16, op)
-        lsn, tx_id, label = struct.unpack_from(">qii", header)
+        lsn, tx_id, label = struct.unpack_from(">Qii", header)
         record.update(lsn=lsn, tx_id=tx_id, user_id=label, capture_label=label)
     elif kind == 200:
         _require_header(header, 4, op)
         record.update(label=struct.unpack_from(">i", header)[0], metadata=bytes(payload))
     elif kind == 201:
         _require_header(header, 8, op)
-        record["lsn"] = struct.unpack_from(">q", header)[0]
+        record["lsn"] = struct.unpack_from(">Q", header)[0]
     elif kind == 202:
         _require_header(header, 8, op)
         record["flags"], record["error"] = struct.unpack_from(">ii", header)
@@ -257,9 +257,12 @@ def decode_value(data: memoryview, column: ColumnDescriptor) -> tuple[Any, int]:
         return value, 4
     if kind in {"BOOLEAN", "BOOL"}:
         _need(data, 2)
+        null_flag = data[0]
         marker = struct.unpack_from(">b", data, 1)[0]
-        if marker == -1:
+        if null_flag == 1:
             return None, 2
+        if null_flag != 0:
+            raise CdcProtocolError(f"invalid boolean null flag {null_flag}")
         if marker not in {0, 1}:
             raise CdcProtocolError(f"invalid boolean marker {marker}")
         return bool(marker), 2

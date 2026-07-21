@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import errno
 import hashlib
 import importlib
@@ -230,14 +231,16 @@ class LakeflowContractTests(unittest.TestCase):
         self._shared_state.cleanup()
 
     def connector(self, bridge=None, **options):
+        scope_label = str(options.pop("registration_scope", "test-pipeline"))
         connector = InformixLakeflowConnect(
             {
                 "database": "demo",
                 "cdc.shared.state.location": self._shared_state.name,
-                "pipeline.id": "test-pipeline",
-                "pipeline.update.id": "test-update",
                 **options,
             }
+        )
+        connector.set_registration_scope(
+            hashlib.sha256(scope_label.encode()).hexdigest()[:32]
         )
         connector._bridge_instance = bridge or FakeBridge()
         return connector
@@ -309,6 +312,20 @@ class LakeflowContractTests(unittest.TestCase):
             {"colname": "updated_at", "coltype": 10, "collength": 0x130F, "colno": 2}
         )
         self.assertEqual(column["length"], 0x000F)
+        self.assertTrue(column["cdc_supported"])
+
+        unsupported = _catalog_column(
+            {"colname": "invalid", "coltype": 10, "collength": 0x1314, "colno": 3}
+        )
+        self.assertFalse(unsupported["cdc_supported"])
+
+    def test_catalog_enables_implemented_scalar_cdc_types(self):
+        for type_id in (17, 18, 43):
+            with self.subTest(type_id=type_id):
+                column = _catalog_column(
+                    {"colname": "value", "coltype": type_id, "collength": 100, "colno": 1}
+                )
+                self.assertTrue(column["cdc_supported"])
 
     def test_catalog_native_type_ids_are_not_confused_with_complex_types(self):
         expected = {
@@ -332,6 +349,56 @@ class LakeflowContractTests(unittest.TestCase):
                     {"colname": "value", "coltype": type_id, "collength": 8, "colno": 1}
                 )
                 self.assertEqual(column["type_name"], type_name)
+
+    def test_catalog_resolves_builtin_extended_scalar_types(self):
+        lvarchar = _catalog_column(
+            {
+                "colname": "value",
+                "coltype": 40,
+                "collength": 16,
+                "colno": 1,
+                "tabid": 100,
+                "extended_id": 1,
+                "extended_name": "lvarchar",
+                "extended_owner": "informix",
+            }
+        )
+        boolean = _catalog_column(
+            {
+                "colname": "enabled",
+                "coltype": 41,
+                "collength": 1,
+                "colno": 2,
+                "tabid": 100,
+                "extended_id": 5,
+                "extended_name": "boolean",
+                "extended_owner": "informix",
+            }
+        )
+
+        self.assertEqual(lvarchar["type_name"], "LVARCHAR")
+        self.assertTrue(lvarchar["cdc_supported"])
+        self.assertEqual(boolean["type_name"], "BOOLEAN")
+        self.assertTrue(boolean["cdc_supported"])
+
+    def test_catalog_does_not_promote_user_defined_builtin_names(self):
+        for coltype, extended_name, expected in (
+            (40, "lvarchar", "UDT_VAR"),
+            (41, "boolean", "UDT_FIXED"),
+        ):
+            with self.subTest(extended_name=extended_name):
+                column = _catalog_column(
+                    {
+                        "colname": "value",
+                        "coltype": coltype,
+                        "collength": 16,
+                        "extended_name": extended_name,
+                        "extended_owner": "application",
+                    }
+                )
+
+                self.assertEqual(column["type_name"], expected)
+                self.assertFalse(column["cdc_supported"])
 
     def test_spark_serialization_discards_live_bridge_state(self):
         connector = self.connector()
@@ -797,7 +864,7 @@ class LakeflowContractTests(unittest.TestCase):
             )
 
     def test_native_cdc_rejects_negative_lsn_before_projection(self):
-        with self.assertRaisesRegex(InformixError, "negative LSN"):
+        with self.assertRaisesRegex(InformixError, "invalid LSN"):
             TransactionBuffer().feed({"op": "BEGIN", "tx_id": 1, "lsn": -1})
 
     def test_transaction_buffer_rejects_duplicate_begin(self):
@@ -805,6 +872,28 @@ class LakeflowContractTests(unittest.TestCase):
         buffer.feed({"op": "BEGIN", "tx_id": 1, "lsn": 10})
         with self.assertRaisesRegex(InformixError, "Duplicate CDC BEGIN"):
             buffer.feed({"op": "BEGIN", "tx_id": 1, "lsn": 11})
+
+    def test_native_signed_transaction_id_is_normalized_to_uint32(self):
+        transactions = _committed_transactions(
+            [
+                {"op": "BEGIN", "tx_id": -1, "lsn": 10},
+                {"op": "INSERT", "tx_id": -1, "lsn": 11, "row": {"id": 1}},
+                {"op": "COMMIT", "tx_id": -1, "lsn": 12},
+                {"op": "TIMEOUT", "lsn": 12},
+            ]
+        )
+        self.assertEqual(transactions[0].tx_id, (1 << 32) - 1)
+
+    def test_timeout_unavailable_lsn_does_not_participate_in_ordering(self):
+        transactions = _committed_transactions(
+            [
+                {"op": "TIMEOUT", "lsn": (1 << 64) - 1},
+                {"op": "BEGIN", "tx_id": 1, "lsn": 10},
+                {"op": "INSERT", "tx_id": 1, "lsn": 11, "row": {"id": 1}},
+                {"op": "COMMIT", "tx_id": 1, "lsn": 12},
+            ]
+        )
+        self.assertEqual(transactions[0].commit_lsn, 12)
 
     def test_transaction_buffer_rejects_lsn_regression(self):
         buffer = TransactionBuffer()
@@ -1213,17 +1302,17 @@ class LakeflowContractTests(unittest.TestCase):
                 return snapshot_lsn, list(bridge.rows)
 
             bridge.consistent_snapshot = consistent_snapshot
-            connector = self.connector(bridge, **{"pipeline.id": pipeline_id})
+            connector = self.connector(bridge, registration_scope=pipeline_id)
             _, offset = connector.read_table("app.orders", {}, {})
             return bridge, offset
 
         bridge_a, offset_a = snapshot_connector("pipeline-a", 120)
         bridge_b, offset_b = snapshot_connector("pipeline-b", 150)
         _, delete_a = self.connector(
-            bridge_a, **{"pipeline.id": "pipeline-a"}
+            bridge_a, registration_scope="pipeline-a"
         ).read_table_deletes("app.orders", {}, {})
         _, delete_b = self.connector(
-            bridge_b, **{"pipeline.id": "pipeline-b"}
+            bridge_b, registration_scope="pipeline-b"
         ).read_table_deletes("app.orders", {}, {})
 
         self.assertEqual(offset_a["commit_lsn"], delete_a["commit_lsn"])
@@ -1556,6 +1645,196 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertTrue(informix_module.os.path.exists(state_path))
 
+    def test_sweep_fails_closed_on_invalid_table_state(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        directory, state_path, _ = connector._shared_table_state_paths(table)
+        informix_module.os.makedirs(directory, exist_ok=True)
+        with open(state_path, "w", encoding="utf-8") as handle:
+            handle.write("{not-json")
+
+        with self.assertRaisesRegex(InformixError, "during cleanup"):
+            connector._sweep_table_state_file(directory, state_path, 3600)
+
+    def test_sweep_fails_closed_on_unsupported_state_version(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        directory, state_path, _ = connector._shared_table_state_paths(table)
+        informix_module.os.makedirs(directory, exist_ok=True)
+        with open(state_path, "w", encoding="utf-8") as handle:
+            json.dump({"version": 999}, handle)
+
+        with self.assertRaisesRegex(InformixError, "version 999"):
+            connector._sweep_table_state_file(directory, state_path, 3600)
+
+    def test_connection_sweep_logs_but_skips_invalid_unrelated_table_state(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        directory, state_path, _ = connector._shared_table_state_paths(table)
+        informix_module.os.makedirs(directory, exist_ok=True)
+        connector._write_shared_table_state(
+            state_path,
+            table,
+            90,
+            pipeline_scope=connector._pipeline_scope(),
+        )
+        unrelated = informix_module.os.path.join(directory, f"{'f' * 24}.json")
+        with open(unrelated, "w", encoding="utf-8") as handle:
+            handle.write("{not-json")
+        informix_module._LAST_STATE_SWEEP.pop(directory, None)
+
+        with self.assertLogs(informix_module.__name__, level="ERROR") as captured:
+            connector._maybe_sweep_connection_state(
+                directory,
+                protected_path=state_path,
+                protected_scope=connector._pipeline_scope(),
+            )
+
+        self.assertTrue(any(unrelated in message for message in captured.output))
+        self.assertTrue(informix_module.os.path.exists(unrelated))
+
+    def test_connection_sweep_propagates_unrelated_storage_failure(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        directory, state_path, _ = connector._shared_table_state_paths(table)
+        informix_module.os.makedirs(directory, exist_ok=True)
+        connector._write_shared_table_state(state_path, table, 90)
+        unrelated = informix_module.os.path.join(directory, f"{'e' * 24}.json")
+        connector._write_shared_table_state(unrelated, table, 90)
+        informix_module._LAST_STATE_SWEEP.pop(directory, None)
+        original = connector._sweep_table_state_file
+
+        def fail_storage(directory_arg, path, retention, **kwargs):
+            if path == unrelated:
+                raise InformixError("volume unavailable")
+            return original(directory_arg, path, retention, **kwargs)
+
+        with mock.patch.object(
+            connector, "_sweep_table_state_file", side_effect=fail_storage
+        ), self.assertRaisesRegex(InformixError, "volume unavailable"):
+            connector._maybe_sweep_connection_state(
+                directory,
+                protected_path=state_path,
+                protected_scope=connector._pipeline_scope(),
+            )
+        self.assertFalse(
+            informix_module.os.path.exists(
+                informix_module.os.path.join(directory, ".informix-sweep.json")
+            )
+        )
+
+    def test_sweep_normalizes_legacy_state_before_cleanup(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        directory, state_path, _ = connector._shared_table_state_paths(table)
+        informix_module.os.makedirs(directory, exist_ok=True)
+        connector._write_shared_table_state(state_path, table, 90)
+        with open(state_path, encoding="utf-8") as handle:
+            state = json.load(handle)
+        state["version"] = 5
+        connector._write_shared_state(state_path, state)
+
+        connector._sweep_table_state_file(directory, state_path, 3600)
+
+        with open(state_path, encoding="utf-8") as handle:
+            normalized = json.load(handle)
+        self.assertEqual(normalized["version"], informix_module._SHARED_STATE_VERSION)
+
+    def test_schema_pruning_classifies_missing_reference_as_validation_error(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        directory, state_path, _ = connector._shared_table_state_paths(table)
+        informix_module.os.makedirs(directory, exist_ok=True)
+        connector._write_shared_table_state(state_path, table, 90)
+        with open(state_path, encoding="utf-8") as handle:
+            state = json.load(handle)
+        state["snapshot_boundaries"] = {
+            "f" * 64: {
+                "created_at": informix_module.time.time(),
+                "initial_lsn": "90",
+                "scope": "e" * 32,
+                "schema_id": "d" * 32,
+                "snapshot_lsn": "90",
+            }
+        }
+        connector._write_shared_state(state_path, state)
+
+        with self.assertRaises(informix_module.SharedStateValidationError):
+            connector._sweep_table_state_file(directory, state_path, 3600)
+
+    def test_invalid_file_cleanup_candidate_is_a_validation_error(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        directory, state_path, _ = connector._shared_table_state_paths(table)
+        informix_module.os.makedirs(directory, exist_ok=True)
+        connector._write_shared_table_state(state_path, table, 90)
+        with open(state_path, encoding="utf-8") as handle:
+            state = json.load(handle)
+        for candidate in (True, "not-a-time", -1, informix_module.time.time() + 7200):
+            with self.subTest(candidate=candidate):
+                state["file_cleanup_candidate_at"] = candidate
+                connector._write_shared_state(state_path, state)
+                with self.assertRaises(informix_module.SharedStateValidationError):
+                    connector._sweep_table_state_file(directory, state_path, 3600)
+
+    def test_shared_state_rejects_oversized_lsns_and_invalid_generations(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        directory, state_path, _ = connector._shared_table_state_paths(table)
+        informix_module.os.makedirs(directory, exist_ok=True)
+        scope = connector._pipeline_scope()
+        connector._write_shared_table_state(
+            state_path, table, 90, pipeline_scope=scope
+        )
+        with open(state_path, encoding="utf-8") as handle:
+            baseline = json.load(handle)
+
+        legacy_none = copy.deepcopy(baseline)
+        legacy_none["trigger_boundaries"] = {
+            "e" * 64: {
+                "created_at": informix_module.time.time(),
+                "generation": "a" * 32,
+                "high_water": "90",
+                "predecessor": "None",
+                "scope": scope,
+            }
+        }
+        connector._write_shared_state(state_path, legacy_none)
+        migrated = connector._read_shared_table_state(state_path, table)
+        self.assertEqual(
+            migrated["trigger_boundaries"]["e" * 64]["predecessor"], "initial"
+        )
+
+        corruptions = []
+        oversized = copy.deepcopy(baseline)
+        oversized["lsn"] = str(1 << 64)
+        corruptions.append(oversized)
+        bad_ack = copy.deepcopy(baseline)
+        bad_ack["scopes"][scope]["upsert"] = {
+            "commit_lsn": True,
+            "phase": "stream",
+            "schema_id": baseline["active_schema_id"],
+            "seen_at": informix_module.time.time(),
+            "trigger_generation": "not-a-generation",
+        }
+        corruptions.append(bad_ack)
+        bad_trigger = copy.deepcopy(baseline)
+        bad_trigger["trigger_boundaries"] = {
+            "f" * 64: {
+                "created_at": informix_module.time.time(),
+                "generation": "a" * 32,
+                "high_water": "90",
+                "predecessor": "not-a-generation",
+                "scope": scope,
+            }
+        }
+        corruptions.append(bad_trigger)
+
+        for state in corruptions:
+            connector._write_shared_state(state_path, state)
+            with self.assertRaises(informix_module.SharedStateValidationError):
+                connector._sweep_table_state_file(directory, state_path, 3600)
+
     def test_future_schema_transition_state_fails_closed(self):
         bridge = FakeBridge()
         connector = self.connector(bridge)
@@ -1717,7 +1996,11 @@ class LakeflowContractTests(unittest.TestCase):
         attempts = iter((False, True))
 
         def contend_once(directory, lock_path):
-            return acquire(directory, lock_path) if next(attempts) else None
+            try:
+                should_acquire = next(attempts)
+            except StopIteration:
+                should_acquire = True
+            return acquire(directory, lock_path) if should_acquire else None
 
         with mock.patch.object(
             connector, "_acquire_shared_state_lock", side_effect=contend_once
@@ -1823,7 +2106,7 @@ class LakeflowContractTests(unittest.TestCase):
                 **raw,
                 "columns": [
                     *raw["columns"],
-                    {"name": "payload", "type_name": "LVARCHAR", "nullable": True},
+                    {"name": "payload", "type_name": "TEXT", "nullable": True},
                 ],
             }
 
@@ -1900,6 +2183,15 @@ class LakeflowContractTests(unittest.TestCase):
             }
         )
         invalid_offsets.append(oversized_lsn)
+        boolean_lsn = _stream_offset()
+        boolean_lsn.update(begin_lsn=True, change_lsn=True, commit_lsn=True)
+        invalid_offsets.append(boolean_lsn)
+        boolean_tx = _stream_offset()
+        boolean_tx["tx_id"] = True
+        invalid_offsets.append(boolean_tx)
+        oversized_tx = _stream_offset()
+        oversized_tx["tx_id"] = 1 << 32
+        invalid_offsets.append(oversized_tx)
         inconsistent_snapshot = _stream_offset()
         inconsistent_snapshot.update(
             {"phase": "snapshot", "snapshot_lsn": "91", "snapshot": {"last_pk": [1]}}
@@ -1970,18 +2262,48 @@ class LakeflowContractTests(unittest.TestCase):
         class LakeflowStreamReader(Wrapped):
             def __init__(self):
                 self.lakeflow_connect = mock.Mock()
+                self.options = {"tableName": "members", "isDeleteFlow": "true"}
 
             def prepareForTriggerAvailableNow(self):
                 raise AssertionError("shared no-op was not replaced")
 
-        reader = LakeflowStreamReader()
+        with self.assertLogs(informix_module.__name__, level="INFO") as captured:
+            reader = LakeflowStreamReader()
+            second = LakeflowStreamReader()
         reader.prepareForTriggerAvailableNow()
         reader.lakeflow_connect.prepare_for_trigger_available_now.assert_called_once_with()
         first_scope = reader.lakeflow_connect.set_registration_scope.call_args.args[0]
-        second = LakeflowStreamReader()
         second_scope = second.lakeflow_connect.set_registration_scope.call_args.args[0]
         self.assertRegex(first_scope, r"^[0-9a-f]{32}$")
         self.assertEqual(first_scope, second_scope)
+        self.assertEqual(len(captured.output), 2)
+        for message in captured.output:
+            self.assertIn(f"scope={first_scope}", message)
+            self.assertIn("table=members", message)
+            self.assertIn("role=delete", message)
+
+    def test_each_reader_registration_gets_a_fresh_scope(self):
+        class TriggerBase:
+            pass
+
+        def reader_type(base):
+            class LakeflowStreamReader(base):
+                def __init__(self):
+                    self.lakeflow_connect = mock.Mock()
+                    self.options = {}
+
+            return LakeflowStreamReader
+
+        first_type = reader_type(_informix_available_now_base(TriggerBase))
+        second_type = reader_type(_informix_available_now_base(first_type.__bases__[0]))
+        first = first_type()
+        second = second_type()
+
+        first_scope = first.lakeflow_connect.set_registration_scope.call_args.args[0]
+        second_scope = second.lakeflow_connect.set_registration_scope.call_args.args[0]
+        self.assertRegex(first_scope, r"^[0-9a-f]{32}$")
+        self.assertRegex(second_scope, r"^[0-9a-f]{32}$")
+        self.assertNotEqual(first_scope, second_scope)
 
     def test_canonically_generated_reader_executes_available_now_callback(self):
         generated = importlib.import_module(
@@ -2117,6 +2439,278 @@ class LakeflowContractTests(unittest.TestCase):
         second.prepare_for_trigger_available_now()
         self.assertEqual(second._trigger_high_water, 105)
 
+    def test_acknowledged_snapshot_and_trigger_boundaries_are_pruned(self):
+        bridge = FakeBridge()
+        upsert = self.connector(bridge)
+        _, upsert_checkpoint = upsert.read_table("app.orders", {}, {})
+        delete = self.connector(FakeBridge())
+        _, delete_checkpoint = delete.read_table_deletes("app.orders", {}, {})
+        table = Table.parse(bridge.tables[0], "demo")
+        _, state_path, _ = upsert._shared_table_state_paths(table)
+
+        bridge.changes = [{"op": "TIMEOUT", "lsn": bridge.now}]
+        upsert.read_table("app.orders", upsert_checkpoint, {})
+        with open(state_path, encoding="utf-8") as handle:
+            self.assertTrue(json.load(handle)["snapshot_boundaries"])
+        delete.read_table_deletes("app.orders", delete_checkpoint, {})
+        with open(state_path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["snapshot_boundaries"], {})
+
+        upsert = self.connector(bridge)
+        delete_bridge = FakeBridge()
+        delete_bridge.changes = [{"op": "TIMEOUT", "lsn": delete_bridge.now}]
+        delete = self.connector(delete_bridge)
+        upsert.prepare_for_trigger_available_now()
+        delete.prepare_for_trigger_available_now()
+        _, upsert_end = upsert.read_table("app.orders", upsert_checkpoint, {})
+        _, delete_end = delete.read_table_deletes("app.orders", delete_checkpoint, {})
+        self.assertEqual(upsert_end["trigger_generation"], delete_end["trigger_generation"])
+        upsert.read_table("app.orders", upsert_end, {})
+        delete.read_table_deletes("app.orders", delete_end, {})
+        with open(state_path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["trigger_boundaries"], {})
+
+    def test_expired_scope_is_pruned_and_cannot_restart(self):
+        bridge = FakeBridge()
+        connector = self.connector(bridge)
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        table = Table.parse(bridge.tables[0], "demo")
+        _, state_path, _ = connector._shared_table_state_paths(table)
+        with open(state_path, encoding="utf-8") as handle:
+            state = json.load(handle)
+        expired_scope = "e" * 32
+        state["scopes"][expired_scope] = {
+            "cleanup_candidate_at": 1.0,
+            "created_at": 1.0,
+            "last_seen": 1.0,
+        }
+        state["snapshot_boundaries"]["f" * 64] = {
+            "created_at": 1.0,
+            "initial_lsn": "90",
+            "scope": expired_scope,
+            "schema_id": checkpoint["schema_id"],
+            "snapshot_lsn": "90",
+        }
+        connector._write_shared_state(state_path, state)
+        bridge.changes = [{"op": "TIMEOUT", "lsn": bridge.now}]
+
+        connector.read_table("app.orders", checkpoint, {})
+
+        with open(state_path, encoding="utf-8") as handle:
+            cleaned = json.load(handle)
+        self.assertNotIn(expired_scope, cleaned["scopes"])
+        self.assertNotIn("f" * 64, cleaned["snapshot_boundaries"])
+        cleaned["scopes"].pop(checkpoint["pipeline_scope"])
+        connector._write_shared_state(state_path, cleaned)
+        with self.assertRaisesRegex(InformixError, "removed.*full refresh"):
+            self.connector(bridge).read_table("app.orders", checkpoint, {})
+
+    def test_returned_end_offset_is_not_acknowledged_before_commit(self):
+        bridge = FakeBridge()
+        connector = self.connector(bridge)
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        connector.prepare_for_trigger_available_now()
+        bridge.changes = [{"op": "TIMEOUT", "lsn": bridge.now}]
+
+        _, uncommitted_end = connector.read_table("app.orders", checkpoint, {})
+
+        table = Table.parse(bridge.tables[0], "demo")
+        _, state_path, _ = connector._shared_table_state_paths(table)
+        with open(state_path, encoding="utf-8") as handle:
+            state = json.load(handle)
+        scope_state = state["scopes"][checkpoint["pipeline_scope"]]
+        self.assertIsNone(scope_state["upsert"]["trigger_generation"])
+        self.assertTrue(state["trigger_boundaries"])
+        self.assertIsNotNone(uncommitted_end["trigger_generation"])
+
+    def test_unchanged_acknowledgement_skips_volume_lock(self):
+        bridge = FakeBridge()
+        connector = self.connector(bridge)
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        bridge.changes = [{"op": "TIMEOUT", "lsn": bridge.now}]
+        connector.read_table("app.orders", checkpoint, {})
+
+        with mock.patch.object(
+            connector,
+            "_acquire_shared_state_lock",
+            side_effect=AssertionError("unchanged acknowledgement acquired lock"),
+        ):
+            connector.read_table("app.orders", checkpoint, {})
+
+    def test_advancing_checkpoint_updates_shared_acknowledgement(self):
+        bridge = FakeBridge()
+        connector = self.connector(bridge)
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        table = Table.parse(bridge.tables[0], "demo")
+        connector._acknowledge_scope(table, checkpoint, deletes=False)
+        advanced = dict(checkpoint)
+        advanced.update(commit_lsn="91", change_lsn="91", begin_lsn="91")
+
+        connector._acknowledge_scope(table, advanced, deletes=False)
+
+        _, state_path, _ = connector._shared_table_state_paths(table)
+        with open(state_path, encoding="utf-8") as handle:
+            state = json.load(handle)
+        scope = state["scopes"][checkpoint["pipeline_scope"]]
+        self.assertEqual(scope["upsert"]["commit_lsn"], "91")
+
+    def test_scope_expiration_requires_two_stale_observations(self):
+        connector = self.connector(FakeBridge())
+        current_scope = connector._pipeline_scope()
+        stale_scope = "e" * 32
+        state = {
+            "scopes": {
+                current_scope: {"created_at": 1.0, "last_seen": 1.0},
+                stale_scope: {"created_at": 1.0, "last_seen": 1.0},
+            },
+            "snapshot_boundaries": {},
+            "trigger_boundaries": {},
+        }
+        retention = int(
+            connector.options.get(
+                "cdc.shared.state.scope.retention.seconds", str(30 * 24 * 60 * 60)
+            )
+        )
+
+        connector._prune_shared_boundaries(state, current_scope, retention + 2.0)
+
+        self.assertIn(stale_scope, state["scopes"])
+        self.assertEqual(
+            state["scopes"][stale_scope]["cleanup_candidate_at"], retention + 2.0
+        )
+
+    def test_connection_sweep_deletes_expired_table_state_file(self):
+        connector = self.connector(FakeBridge())
+        raw = _table()
+        raw["name"] = "retired_orders"
+        table = Table.parse(raw, "demo")
+        directory, state_path, _ = connector._shared_table_state_paths(table)
+        informix_module.os.makedirs(directory, exist_ok=True)
+        scope = "e" * 32
+        connector._write_shared_table_state(
+            state_path, table, 90, pipeline_scope=scope
+        )
+        with open(state_path, encoding="utf-8") as handle:
+            state = json.load(handle)
+        state["scopes"][scope].update(
+            {"cleanup_candidate_at": 1.0, "last_seen": 1.0}
+        )
+        state["file_cleanup_candidate_at"] = 1.0
+        connector._write_shared_state(state_path, state)
+
+        connector._sweep_table_state_file(directory, state_path, 3600)
+
+        self.assertFalse(informix_module.os.path.exists(state_path))
+
+    def test_schema_sweep_keeps_referenced_paths_and_prunes_orphans(self):
+        table = Table.parse(_table(), "demo")
+        root = _schema_state(table, 90, schema_id="1" * 32)
+        active = _schema_state(
+            table, 100, predecessor="1" * 32, schema_id="2" * 32
+        )
+        orphan = _schema_state(table, 110, schema_id="3" * 32)
+        scope = "a" * 32
+        state = {
+            "active_schema_id": "2" * 32,
+            "schemas": [root, active, orphan],
+            "scopes": {
+                scope: {
+                    "created_at": 1.0,
+                    "last_seen": 1.0,
+                    "upsert": {
+                        "phase": "stream",
+                        "schema_id": "1" * 32,
+                        "seen_at": 1.0,
+                    },
+                }
+            },
+            "snapshot_boundaries": {},
+            "trigger_boundaries": {},
+        }
+
+        connector = self.connector(FakeBridge())
+        connector._prune_schema_history(state)
+
+        self.assertEqual(
+            [schema["id"] for schema in state["schemas"]],
+            ["1" * 32, "2" * 32],
+        )
+
+    def test_active_table_sweeps_retired_table_in_same_connection(self):
+        connector = self.connector(FakeBridge())
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        current = Table.parse(_table(), "demo")
+        directory, current_path, _ = connector._shared_table_state_paths(current)
+        retired_raw = _table()
+        retired_raw["name"] = "retired_orders"
+        retired = Table.parse(retired_raw, "demo")
+        _, retired_path, _ = connector._shared_table_state_paths(retired)
+        retired_scope = "e" * 32
+        connector._write_shared_table_state(
+            retired_path, retired, 90, pipeline_scope=retired_scope
+        )
+        with open(retired_path, encoding="utf-8") as handle:
+            retired_state = json.load(handle)
+        retired_state["scopes"][retired_scope].update(
+            {"cleanup_candidate_at": 1.0, "last_seen": 1.0}
+        )
+        retired_state["file_cleanup_candidate_at"] = 1.0
+        connector._write_shared_state(retired_path, retired_state)
+        informix_module._LAST_STATE_SWEEP.pop(directory, None)
+
+        connector._maybe_sweep_connection_state(
+            directory,
+            protected_path=current_path,
+            protected_scope=checkpoint["pipeline_scope"],
+        )
+
+        self.assertTrue(informix_module.os.path.exists(current_path))
+        self.assertFalse(informix_module.os.path.exists(retired_path))
+
+        # Simulate another worker whose process-local throttle is empty.  The
+        # shared marker still prevents a duplicate connection scan.
+        informix_module._LAST_STATE_SWEEP.pop(directory, None)
+        other_worker = self.connector(FakeBridge())
+        with mock.patch.object(
+            other_worker,
+            "_sweep_table_state_file",
+            side_effect=AssertionError("shared sweep marker was ignored"),
+        ):
+            other_worker._maybe_sweep_connection_state(
+                directory,
+                protected_path=current_path,
+                protected_scope=checkpoint["pipeline_scope"],
+            )
+
+    def test_connection_sweep_rejects_oversized_and_future_markers(self):
+        connector = self.connector(FakeBridge())
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        table = Table.parse(_table(), "demo")
+        directory, state_path, _ = connector._shared_table_state_paths(table)
+        marker_path = informix_module.os.path.join(directory, ".informix-sweep.json")
+        cases = (
+            "x" * (informix_module._MAX_SWEEP_MARKER_BYTES + 1),
+            json.dumps({"completed_at": True}),
+            json.dumps(
+                {
+                    "completed_at": informix_module.time.time()
+                    + informix_module._STATE_SWEEP_INTERVAL_SECONDS
+                    + 60
+                }
+            ),
+        )
+        for payload in cases:
+            with self.subTest(payload_size=len(payload)):
+                with open(marker_path, "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+                informix_module._LAST_STATE_SWEEP.pop(directory, None)
+                with self.assertRaisesRegex(InformixError, "sweep marker"):
+                    connector._maybe_sweep_connection_state(
+                        directory,
+                        protected_path=state_path,
+                        protected_scope=checkpoint["pipeline_scope"],
+                    )
+
     def test_concurrent_pipelines_keep_trigger_boundaries_isolated(self):
         seed_bridge = FakeBridge()
         _, seed = self.connector(seed_bridge).read_table("app.orders", {}, {})
@@ -2125,20 +2719,20 @@ class LakeflowContractTests(unittest.TestCase):
 
         upsert_a_bridge = FakeBridge()
         upsert_a_bridge.now = 105
-        upsert_a = self.connector(upsert_a_bridge, **{"pipeline.id": "pipeline-a"})
+        upsert_a = self.connector(upsert_a_bridge, registration_scope="pipeline-a")
         upsert_a.prepare_for_trigger_available_now()
         upsert_a.read_table("app.orders", checkpoint_a, {})
 
         upsert_b_bridge = FakeBridge()
         upsert_b_bridge.now = 110
-        upsert_b = self.connector(upsert_b_bridge, **{"pipeline.id": "pipeline-b"})
+        upsert_b = self.connector(upsert_b_bridge, registration_scope="pipeline-b")
         upsert_b.prepare_for_trigger_available_now()
         upsert_b.read_table("app.orders", checkpoint_b, {})
 
-        delete_a = self.connector(FakeBridge(), **{"pipeline.id": "pipeline-a"})
+        delete_a = self.connector(FakeBridge(), registration_scope="pipeline-a")
         delete_a.prepare_for_trigger_available_now()
         delete_a.read_table_deletes("app.orders", checkpoint_a, {})
-        delete_b = self.connector(FakeBridge(), **{"pipeline.id": "pipeline-b"})
+        delete_b = self.connector(FakeBridge(), registration_scope="pipeline-b")
         delete_b.prepare_for_trigger_available_now()
         delete_b.read_table_deletes("app.orders", checkpoint_b, {})
 
@@ -2171,8 +2765,6 @@ class LakeflowContractTests(unittest.TestCase):
             {"op": "COMMIT", "tx_id": 8, "lsn": 110},
         ]
         connector = self.connector(bridge)
-        connector.options.pop("pipeline.id")
-        connector.options.pop("pipeline.update.id")
         connector.prepare_for_trigger_available_now()
 
         _, checkpoint = connector.read_table("app.orders", _stream_offset(), {})

@@ -51,6 +51,7 @@ SQ_PROTOCOLS = 126
 SQ_EXIT = 56
 SQ_LODATA = 97
 SQ_RET_TYPE = 100
+SQ_INSERTDONE = 94
 SQ_ASSOC = 100
 SQ_ASCBINARY = 101
 SQ_ASCENV = 106
@@ -168,6 +169,8 @@ class ResultColumn:
     type_code: int
     extended_id: int
     encoded_length: int
+    extended_owner: str = ""
+    extended_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -612,7 +615,20 @@ def encode_fetch(statement_id: int, buffer_size: int = 32767) -> bytes:
     return struct.pack(">hhhihh", SQ_ID, statement_id, SQ_NFETCH, buffer_size, 0, SQ_EOT)
 
 
-def encode_variable_fetch(description: ResultDescription, buffer_size: int = 32767) -> bytes:
+def _effective_result_kind(column: ResultColumn) -> int:
+    kind = column.type_code & 0xFF
+    extended_owner = column.extended_owner.strip().upper()
+    extended_name = column.extended_name.strip().upper()
+    if kind == 40 and (extended_owner, extended_name) == ("INFORMIX", "LVARCHAR"):
+        return 43
+    if kind == 41 and (extended_owner, extended_name) == ("INFORMIX", "BOOLEAN"):
+        return 45
+    return kind
+
+
+def encode_variable_fetch(
+    description: ResultDescription, buffer_size: int = 32767, encoding: str = "utf-8"
+) -> bytes:
     """Encode JDBC's two-phase variable-row RET_TYPE + NFETCH request."""
 
     if not 1 <= buffer_size <= 32767:
@@ -623,12 +639,24 @@ def encode_variable_fetch(description: ResultDescription, buffer_size: int = 327
         )
     )
     for column in description.columns:
-        kind = column.type_code & 0xFF
-        if kind > 18 and kind not in {23, 45, 52, 53}:
+        native_kind = column.type_code & 0xFF
+        kind = _effective_result_kind(column)
+        if kind > 18 and kind not in {23, 43, 45, 52, 53}:
             raise SqliDescriptorNotImplemented(
                 f"variable result type {kind} requires an extended SQ_RET_TYPE name"
             )
-        result.extend(struct.pack(">hi", kind, column.encoded_length))
+        result.extend(struct.pack(">h", kind))
+        if kind == 43:
+            result.extend(encode_char("", encoding))
+            result.extend(encode_char("", encoding))
+        elif native_kind in {40, 41} and column.extended_id:
+            if not column.extended_owner or not column.extended_name:
+                raise SqliDescriptorNotImplemented(
+                    f"extended result type {native_kind} is missing owner/type metadata"
+                )
+            result.extend(encode_char(column.extended_owner, encoding))
+            result.extend(encode_char(column.extended_name, encoding))
+        result.extend(struct.pack(">i", column.encoded_length))
     result.extend(struct.pack(">hihh", SQ_NFETCH, buffer_size, 0, SQ_EOT))
     return bytes(result)
 
@@ -776,11 +804,48 @@ def _retained_size(value: object, seen: set[int] | None = None) -> int:
 def _connector_sql(sql: str, parameters: tuple) -> str:
     """Bind only connector-owned scalar values using strict SQL literals."""
 
-    if sql.count("?") != len(parameters):
-        raise ValueError("SQL placeholder count does not match parameters")
-    pieces = sql.split("?")
-    result = [pieces[0]]
-    for value, suffix in zip(parameters, pieces[1:]):
+    result: list[str] = []
+    parameter_index = 0
+    index = 0
+    quote = None
+    while index < len(sql):
+        character = sql[index]
+        following = sql[index + 1] if index + 1 < len(sql) else ""
+        if quote:
+            result.append(character)
+            if character == quote:
+                if following == quote:
+                    result.append(following)
+                    index += 1
+                else:
+                    quote = None
+            index += 1
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            result.append(character)
+            index += 1
+            continue
+        if character == "-" and following == "-":
+            end = sql.find("\n", index + 2)
+            end = len(sql) if end < 0 else end
+            result.append(sql[index:end])
+            index = end
+            continue
+        if character == "/" and following == "*":
+            end = sql.find("*/", index + 2)
+            if end < 0:
+                raise ValueError("unterminated connector SQL block comment")
+            result.append(sql[index : end + 2])
+            index = end + 2
+            continue
+        if character != "?":
+            result.append(character)
+            index += 1
+            continue
+        if parameter_index >= len(parameters):
+            raise ValueError("SQL placeholder count does not match parameters")
+        value = parameters[parameter_index]
         if isinstance(value, bool):
             literal = "1" if value else "0"
         elif isinstance(value, int):
@@ -791,8 +856,57 @@ def _connector_sql(sql: str, parameters: tuple) -> str:
             literal = "'" + value.replace("'", "''") + "'"
         else:
             raise TypeError(f"unsupported connector SQL value {type(value).__name__}")
-        result.extend((literal, suffix))
+        result.append(literal)
+        parameter_index += 1
+        index += 1
+    if parameter_index != len(parameters):
+        raise ValueError("SQL placeholder count does not match parameters")
     return "".join(result)
+
+
+def _statement_keyword(sql: str) -> str:
+    index = 0
+    while True:
+        while index < len(sql) and sql[index].isspace():
+            index += 1
+        if sql.startswith("--", index):
+            newline = sql.find("\n", index + 2)
+            if newline < 0:
+                return ""
+            index = newline + 1
+            continue
+        if sql.startswith("/*", index):
+            end = sql.find("*/", index + 2)
+            if end < 0:
+                return ""
+            index = end + 2
+            continue
+        break
+    end = index
+    while end < len(sql) and (sql[end].isalnum() or sql[end] == "_"):
+        end += 1
+    return sql[index:end].upper()
+
+
+_NON_ROW_STATEMENTS = frozenset(
+    {
+        "ALTER",
+        "BEGIN",
+        "COMMIT",
+        "CREATE",
+        "DELETE",
+        "DROP",
+        "GRANT",
+        "INSERT",
+        "MERGE",
+        "RENAME",
+        "REVOKE",
+        "ROLLBACK",
+        "SET",
+        "TRUNCATE",
+        "UPDATE",
+    }
+)
 
 
 def _typed_bind(value: object) -> TypedBind:
@@ -812,7 +926,7 @@ def _typed_bind(value: object) -> TypedBind:
 def _decode_result_value(
     data: bytes, column: ResultColumn, encoding: str, pad_varchar: bool = False
 ) -> object:
-    kind = column.type_code & 0xFF
+    kind = _effective_result_kind(column)
     if kind == 0:  # CHAR
         return data[: column.encoded_length].decode(encoding).rstrip(" ")
     if kind == 1:
@@ -847,6 +961,20 @@ def _decode_result_value(
         if size == 1 and data[1] == 0:
             return None
         return data[1 : size + 1].decode(encoding)
+    if kind == 43:
+        if len(data) < 5:
+            raise SqliProtocolError("truncated variable LVARCHAR")
+        marker = data[0]
+        size = struct.unpack_from(">i", data, 1)[0]
+        if size < 0 or size + 5 != len(data):
+            raise SqliProtocolError("LVARCHAR length does not match tuple column")
+        if marker == 1:
+            if size != 0:
+                raise SqliProtocolError("null LVARCHAR has a non-empty payload")
+            return None
+        if marker != 0:
+            raise SqliProtocolError(f"invalid LVARCHAR null marker {marker}")
+        return data[5:].decode(encoding)
     if kind in {17, 18}:
         type_name = "INT8" if kind == 17 else "SERIAL8"
         value, consumed = decode_value(
@@ -874,15 +1002,31 @@ def _decode_result_value(
             ColumnDescriptor("datetime", "DATETIME", length=qualifier),
         )
         return value
-    if kind in {23, 45}:
+    if kind == 45:
+        if len(data) >= 5:
+            envelope_size = struct.unpack_from(">i", data, 1)[0]
+            if envelope_size < 0 or envelope_size + 5 != len(data):
+                raise SqliProtocolError("BOOLEAN envelope length does not match tuple column")
+            null_marker = data[0]
+            if null_marker == 1:
+                if envelope_size != 0:
+                    raise SqliProtocolError("null BOOLEAN has a non-empty payload")
+                return None
+            if null_marker != 0:
+                raise SqliProtocolError(
+                    f"invalid BOOLEAN envelope null marker {null_marker}"
+                )
+            data = data[5:]
         if not data:
             raise SqliProtocolError("truncated BOOLEAN result")
         marker = struct.unpack_from(">b", data, 1 if len(data) >= 2 else 0)[0]
         if marker == -1:
             return None
-        if marker not in {0, 1}:
-            raise SqliProtocolError(f"invalid BOOLEAN result marker {marker}")
-        return bool(marker)
+        if marker in {1, ord("t"), ord("T")}:
+            return True
+        if marker in {0, ord("f"), ord("F")}:
+            return False
+        raise SqliProtocolError(f"invalid BOOLEAN result marker {marker}")
     raise SqliDescriptorNotImplemented(f"ordinary Informix result type {kind} is unsupported")
 
 
@@ -910,7 +1054,7 @@ def _fixed_result_size(column: ResultColumn, remaining: bytes) -> int:
     if kind == 10:
         total, fraction = (column.encoded_length >> 8) & 0xFF, column.encoded_length & 0xFF
         return (total + (fraction & 1) + 3) // 2
-    if kind in {23, 45}:
+    if kind == 45:
         if column.encoded_length not in {1, 2}:
             raise SqliProtocolError(
                 f"BOOLEAN result width must be 1 or 2, got {column.encoded_length}"
@@ -946,6 +1090,7 @@ class InformixSqliClient:
     remove_64k_limit: bool = field(default=False, init=False)
     large_tuple_size: bool = field(default=False, init=False)
     long_row_id: bool = field(default=False, init=False)
+    bigint_supported: bool = field(default=False, init=False)
     _socket: socket.socket | None = field(default=None, init=False, repr=False)
     _input: BinaryIO | None = field(default=None, init=False, repr=False)
     _output: BinaryIO | None = field(default=None, init=False, repr=False)
@@ -1057,6 +1202,7 @@ class InformixSqliClient:
             self.remove_64k_limit = bool(self.server_protocols[7] & 0x02)
             self.large_tuple_size = bool(self.server_protocols[8] & 0x04)
             self.long_row_id = bool(self.server_protocols[8] & 0x02)
+            self.bigint_supported = _protocol_feature(self.server_protocols, 54)
             pam_advertised = _protocol_feature(self.server_protocols, 44)
             if self.authentication_mode == "pam":
                 if not pam_advertised:
@@ -1156,6 +1302,7 @@ class InformixSqliClient:
     def _reset_connection_state(self) -> None:
         self.close()
         self.remove_64k_limit = self.large_tuple_size = self.long_row_id = False
+        self.bigint_supported = False
         for name in ("asc_accept", "server_protocols"):
             if hasattr(self, name):
                 delattr(self, name)
@@ -1204,6 +1351,7 @@ class InformixSqliClient:
             raise SqliProtocolError("SQLI input is unavailable")
         saw_done = False
         saw_description = False
+        statement_type = None
         while True:
             code = read_smallint(self._input)
             if code == SQ_EOT:
@@ -1226,6 +1374,12 @@ class InformixSqliClient:
                         "non-row command returned a row-producing SQ_DESCRIBE"
                     )
                 saw_description = True
+                statement_type = description.statement_type
+                continue
+            if code == SQ_INSERTDONE:
+                if statement_type != 6:
+                    raise SqliProtocolError("SQ_INSERTDONE arrived outside an INSERT")
+                self._read_insertdone()
                 continue
             if code == SQ_DONE:
                 self._read_done()
@@ -1253,6 +1407,15 @@ class InformixSqliClient:
         serial = read_int32(self._input)
         return warnings, rows, row_id, serial
 
+    def _read_insertdone(self) -> None:
+        if self._input is None:
+            raise SqliProtocolError("SQLI input is unavailable")
+        # JDBC readLongInt uses Informix's 10-byte signed-magnitude
+        # INT8 representation; BIGSERIAL uses an 8-byte bigint.
+        read_exact(self._input, 10)
+        if self.bigint_supported:
+            read_exact(self._input, 8)
+
     def _read_error(self) -> tuple[int, int, int, str]:
         if self._input is None:
             raise SqliProtocolError("SQLI input is unavailable")
@@ -1266,11 +1429,14 @@ class InformixSqliClient:
     def execute(
         self, sql: str, parameters: tuple = (), max_result_bytes: int | None = None
     ) -> list[tuple]:
-        _, output_stream = self._require_open()
         # Connector queries are fixed templates. Literalizing their bounded scalar
         # values avoids depending on the separate input-parameter descriptor that
         # JDBC uses to choose VARCHAR bind widths.
         sql = _connector_sql(sql, parameters)
+        if _statement_keyword(sql) in _NON_ROW_STATEMENTS:
+            self.execute_command(sql)
+            return []
+        _, output_stream = self._require_open()
         typed: tuple[TypedBind, ...] = ()
         with self._lock:
             try:
@@ -1313,7 +1479,9 @@ class InformixSqliClient:
                     )
                     output_stream.flush()
                     self._read_query_group(description)
-                    output_stream.write(encode_variable_fetch(description))
+                    output_stream.write(
+                        encode_variable_fetch(description, encoding=self._encoding)
+                    )
                     output_stream.flush()
                     _, batch, exhausted = self._read_query_group(description)
                     append_batch(batch)
@@ -1406,6 +1574,10 @@ class InformixSqliClient:
                 read_exact(self._input, 8)
             elif code == 99:
                 read_exact(self._input, 6)
+            elif code == SQ_INSERTDONE:
+                if description is None or description.statement_type != 6:
+                    raise SqliProtocolError("SQ_INSERTDONE arrived outside an INSERT")
+                self._read_insertdone()
             elif code == SQ_DONE:
                 _, affected_rows, _, _ = self._read_done()
                 # A forward-only fetch that has no more tuples is reported as
@@ -1440,8 +1612,8 @@ class InformixSqliClient:
             position = read_int32(self._input)
             type_code = read_smallint(self._input)
             extended_id = read_int32(self._input)
-            decode_char(self._input, self._encoding)
-            decode_char(self._input, self._encoding)
+            extended_owner = decode_char(self._input, self._encoding)
+            extended_name = decode_char(self._input, self._encoding)
             read_smallint(self._input)
             read_smallint(self._input)
             read_int32(self._input)
@@ -1455,7 +1627,16 @@ class InformixSqliClient:
                 or encoded_length > tuple_limit
             ):
                 raise SqliProtocolError("invalid result column position/length")
-            raw.append((position, type_code, extended_id, encoded_length))
+            raw.append(
+                (
+                    position,
+                    type_code,
+                    extended_id,
+                    encoded_length,
+                    extended_owner,
+                    extended_name,
+                )
+            )
         if name_size < 0 or name_size > 1 << 20:
             raise SqliProtocolError(f"unsafe descriptor name blob length {name_size}")
         names_raw = read_exact(self._input, name_size)
@@ -1485,18 +1666,25 @@ class InformixSqliClient:
         if size & 1:
             read_exact(self._input, 1)
         result = {}
-        variable_layout = not self.pad_varchar and any(
-            (column.type_code & 0xFF) in {13, 16, 40, 41, 43, 46}
+        variable_layout = any(
+            (column.type_code & 0xFF) in {40, 41, 43, 46}
+            or (
+                not self.pad_varchar
+                and (column.type_code & 0xFF) in {13, 16}
+            )
             for column in description.columns
         )
         cursor = 0
         for index, column in enumerate(description.columns):
-            kind = column.type_code & 0xFF
+            kind = _effective_result_kind(column)
             start = cursor if variable_layout else column.position
             if variable_layout and kind in {13, 16}:
-                if start >= len(payload):
-                    raise SqliProtocolError("truncated variable VARCHAR tuple")
-                limit = start + 1 + payload[start]
+                if self.pad_varchar:
+                    limit = start + column.encoded_length
+                else:
+                    if start >= len(payload):
+                        raise SqliProtocolError("truncated variable VARCHAR tuple")
+                    limit = start + 1 + payload[start]
             elif variable_layout and kind in {40, 41, 43, 45, 46}:
                 if start + 5 > len(payload):
                     raise SqliProtocolError("truncated complex variable tuple")
