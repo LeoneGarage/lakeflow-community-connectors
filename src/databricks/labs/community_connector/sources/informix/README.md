@@ -37,17 +37,17 @@ connector deployment.
 | `DB_LOCALE` | No | `en_US.819` | Database locale. Set it explicitly when the database uses another locale. |
 | `CLIENT_LOCALE` | No | `en_US.utf8` | Client locale. Its codeset controls Python row decoding. |
 | `port` | No | `9088` | Informix SQLI port; range `1`–`65535`. |
-| `encrypt` | No | `true` | Enables TLS. Truthy values are `1`, `true`, and `yes`, case-insensitively. Disabling TLS fails closed. |
+| `encrypt` | No | `true` | Enables TLS. Boolean values must be `1`, `true`, `yes`, `0`, `false`, or `no`, case-insensitively. Disabling TLS fails closed. |
 | `ssl.ca.file` | No | system CA store | Path to a PEM CA bundle available on the pipeline worker. Hostname verification remains enabled. |
 | `authentication.mode` | No | `password` | `password` or non-interactive `pam`. Other modes fail closed. |
 | `authentication.provider.factory` | No | built-in provider | Trusted Python factory in `module:callable` form. It receives all connection options and returns a non-interactive PAM response provider. |
 | `authentication.pam.echo.response` | No | `password` | Secret response used by the built-in provider for PAM echo-on prompts. Echo-off prompts use `password`. |
 | `authentication.pam.max.rounds` | No | `16` | Maximum PAM challenge rounds before login fails. Each encoded response is limited to 512 bytes. |
 | `authentication.login.timeout` | No | `30` | Overall login deadline in seconds, shared by connection, authentication, and all redirect attempts. |
-| `redirect.enabled` | No | `false` | Opts into protocol redirects. A redirect still fails unless its destination is explicitly allowed. |
+| `redirect.enabled` | No | `false` | Opts into protocol redirects. Boolean values are validated strictly; a redirect still fails unless its destination is explicitly allowed. |
 | `redirect.allowlist` | No | empty | Comma-separated exact `host:numeric-port` redirect destinations. See the security rules below. |
 | `redirect.max` | No | `3` | Maximum redirects within one login; revisiting a destination is rejected as a loop. |
-| `padVarchar` | No | `false` | Enables fixed-width padded decoding for ordinary SQL `VARCHAR`/`NVARCHAR` snapshot and metadata results. Use only when required by the negotiated server tuple format. |
+| `padVarchar` | No | `false` | Enables fixed-width padded decoding for ordinary SQL `VARCHAR`/`NVARCHAR` snapshot and metadata results. Boolean values are validated strictly. Use only when required by the negotiated server tuple format. |
 | `table.include.list` | No | all eligible tables | Comma-separated shell-style table patterns. |
 | `tables` | No | | Alias for `table.include.list`; ignored when that option is set. |
 | `table.exclude.list` | No | none | Comma-separated shell-style patterns excluded after inclusion filtering. |
@@ -57,7 +57,7 @@ connector deployment.
 | `metadata.max.bytes` | No | `67108864` | Maximum estimated decoded Python bytes retained by an individual catalog query and by complete discovery. Set `0` to disable the limit and byte accounting. |
 | `max.records.per.batch` | No | `10000` | Target maximum projected CDC rows; minimum `1`. A complete transaction may exceed it. |
 | `cdc.timeout` | No | `5` | CDC idle-read timeout in seconds; minimum `1`. Zero is rejected because it can select an unbounded native wait. |
-| `cdc.shared.state.wait.seconds` | No | `300` | Maximum time a delete reader waits for its table's upsert reader to publish automatic initialization state. |
+| `cdc.shared.state.wait.seconds` | No | `300` | Maximum time a delete reader waits for its table's upsert reader to publish initialization, trigger-boundary, or schema-transition state. |
 | `cdc.max.records` | No | `64` | Soft native record target per CDC session; range `1`–`256`. Once reached, records continue until every transaction already observed commits, rolls back, or Informix returns TIMEOUT. |
 | `cdc.max.frame.bytes` | No | `16777216` | Maximum accepted native CDC frame size (16 MiB by default; minimum `16`). |
 | `cdc.max.transaction.records` | No | `100000` | Maximum records buffered in an open transaction. Exceeding it fails without emitting uncommitted data. |
@@ -345,6 +345,8 @@ validate_volume_concurrency(
 
 The validator fails unless exactly one worker wins the shared `mkdir`, at least
 two worker hosts participate, and the subsequent rename is immediately visible.
+Each connector worker also probes descriptor-relative create, scan, no-follow
+open, rename-without-replacement, and directory fsync before publishing state.
 
 Regenerate the deployable file with `bash src/databricks/labs/community_connector/sources/informix/generate_source.sh`. Informix-owned code wraps the generated reader base and installs the AvailableNow callback at class creation, so this output is identical to the repository's canonical merge command and needs no post-generation patch. The source-local tests use `*_test.py` names so the standard merger excludes them.
 
@@ -354,18 +356,21 @@ The connector adds `_informix_change_lsn`, `_informix_commit_lsn`, `_informix_tx
 
 ### Checkpoints and log retention
 
-During snapshot, Lakeflow checkpoints the connector offset version, snapshot LSN, last primary-key values, a source-schema fingerprint, a generation-specific schema node ID, and a pipeline scope. A completed consistent snapshot publishes its fresh resume LSN for both independently instantiated channels. Streaming checkpoints the `commit_lsn`, `change_lsn`, oldest required `begin_lsn`, fingerprint, schema node ID, pipeline scope, and triggered-update generation. Triggered readers share one immutable per-table high-water LSN and fail closed if their predecessor generations differ. The connector never automatically deletes committed initialization, snapshot, trigger, or schema heads because filesystem retention alone cannot safely fence a paused reader. Running pipelines immutably elect one worker per daily bucket to perform best-effort candidate garbage collection. There is no in-bucket takeover: if the winner fails, cleanup waits until the next daily bucket rather than risking overlapping scans. Losing candidates are eligible once their namespace has a committed head, and headless candidates are eligible after 30 days. Versioned daily election and completion markers are validated before use, and exactly seven daily coordination buckets are retained. A writer resuming after its candidate was collected can fail that attempt and retry, but committed state is never affected. The offline maintenance helper rejects missing or non-directory Volume locations and removes all remaining candidates only after every pipeline using the location is stopped; retired committed state requires a separate Volume lifecycle or administrator cleanup process.
+During snapshot, Lakeflow checkpoints the connector offset version, snapshot LSN, last primary-key values, a source-schema fingerprint, a generation-specific schema node ID, and a pipeline scope. A completed consistent snapshot publishes its fresh resume LSN for both independently instantiated channels. Streaming checkpoints the `commit_lsn`, `change_lsn`, oldest required `begin_lsn`, fingerprint, schema node ID, pipeline scope, and triggered-update generation. Triggered readers share one immutable per-table high-water LSN and fail closed if their predecessor generations differ. The connector never automatically deletes committed initialization, snapshot, trigger, or schema heads because filesystem retention alone cannot safely fence a paused reader. Running pipelines immutably elect one worker per daily bucket to perform best-effort candidate garbage collection. A winner fences itself against unfinished elections in every other bucket before scanning, and the lower bucket deterministically wins a simultaneous cross-bucket race. Losing candidates are eligible once their namespace has a committed head, and headless candidates are eligible after 30 days. Cleanup streams the Volume traversal, quarantines candidates atomically, removes malformed candidate contents without following symlinks, and isolates an inaccessible artifact so it cannot stop later candidates. State reads and mutations are anchored to no-follow directory handles. Versioned daily election and completion markers are validated before use, and exactly seven daily coordination buckets are retained. The stopped-pipeline maintenance helper removes abandoned candidates and cleanup elections, restoring automatic cleanup after a crashed winner. A writer resuming after its candidate was collected can fail that attempt and retry, but committed state is never affected. The helper rejects missing or non-directory Volume locations; retired committed state requires a separate Volume lifecycle or administrator cleanup process.
 
 ```python
 from databricks.labs.community_connector.sources.informix.informix import (
     cleanup_abandoned_immutable_candidates,
 )
 
-cleanup_abandoned_immutable_candidates(
+removed = cleanup_abandoned_immutable_candidates(
     "/Volumes/catalog/schema/volume/informix-state",
     acknowledge_pipelines_stopped=True,
 )
 ```
+
+Offline cleanup is strict: it raises instead of reporting success if any
+candidate or traversal path remains inaccessible.
 
 An idle timeout returns no rows and leaves the checkpoint unchanged. Incomplete or open transactions do not advance it. If the restart LSN predates the minimum retained logical log in `sysmaster:syslogs`, continuation fails and the table must be resnapshotted. Every CDC session validates its initial METADATA frame against a fresh catalog layout before decoding later records; another METADATA frame in that session fails immediately and requires a full refresh.
 

@@ -1543,6 +1543,30 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertFalse(os.path.exists(root))
 
+    def test_many_stale_probe_artifacts_are_cleaned_incrementally(self):
+        roots = []
+        for index in range(100):
+            root = os.path.join(
+                self._shared_state.name, f".informix-probe-stale-{index}"
+            )
+            os.mkdir(root)
+            os.utime(root, (1, 1))
+            roots.append(root)
+
+        informix_module._cleanup_probe_artifacts(self._shared_state.name)
+
+        self.assertFalse(any(os.path.exists(root) for root in roots))
+
+    def test_probe_cleanup_tolerates_entry_disappearing_during_stat(self):
+        entry = mock.Mock()
+        entry.name = ".informix-probe-vanished"
+        entry.is_dir.return_value = True
+        entry.stat.side_effect = FileNotFoundError()
+        scan = mock.MagicMock()
+        scan.__enter__.return_value = iter((entry,))
+        with mock.patch.object(informix_module.os, "scandir", return_value=scan):
+            informix_module._cleanup_probe_artifacts(self._shared_state.name)
+
     def test_unsupported_volume_directory_open_does_not_fail_publication(self):
         connector = self.connector(FakeBridge())
         table = Table.parse(_table(), "demo")
@@ -2483,6 +2507,133 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(removed, 0)
         self.assertTrue(os.path.exists(record))
 
+    def test_candidate_cleanup_removes_malformed_candidate_contents(self):
+        candidate = os.path.join(
+            self._shared_state.name, "candidate-" + "9" * 32
+        )
+        nested = os.path.join(candidate, "unexpected")
+        os.makedirs(nested)
+        with open(os.path.join(candidate, "extra.bin"), "w", encoding="utf-8") as handle:
+            handle.write("extra")
+        target = os.path.join(self._shared_state.name, "outside")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write("keep")
+        os.symlink(target, os.path.join(nested, "record.json"))
+        os.utime(candidate, (1, 1))
+
+        removed = informix_module._cleanup_immutable_candidates(
+            self._shared_state.name, headless_cutoff=float("inf")
+        )
+
+        self.assertEqual(removed, 1)
+        self.assertFalse(os.path.exists(candidate))
+        self.assertTrue(os.path.exists(target))
+
+    def test_candidate_cleanup_handles_deep_malformed_tree_iteratively(self):
+        candidate = os.path.join(
+            self._shared_state.name, "candidate-" + "6" * 32
+        )
+        os.mkdir(candidate)
+        cursor = candidate
+        for _ in range(150):
+            cursor = os.path.join(cursor, "d")
+            os.mkdir(cursor)
+        os.utime(candidate, (1, 1))
+
+        removed = informix_module._cleanup_immutable_candidates(
+            self._shared_state.name, headless_cutoff=float("inf")
+        )
+
+        self.assertEqual(removed, 1)
+        self.assertFalse(os.path.exists(candidate))
+
+    def test_candidate_cleanup_streams_wide_malformed_directory(self):
+        candidate = os.path.join(
+            self._shared_state.name, "candidate-" + "4" * 32
+        )
+        os.mkdir(candidate)
+        for index in range(1000):
+            with open(
+                os.path.join(candidate, f"extra-{index}"), "w", encoding="utf-8"
+            ) as handle:
+                handle.write("x")
+        os.utime(candidate, (1, 1))
+
+        removed = informix_module._cleanup_immutable_candidates(
+            self._shared_state.name, headless_cutoff=float("inf")
+        )
+
+        self.assertEqual(removed, 1)
+
+    def test_one_inaccessible_candidate_does_not_abort_cleanup(self):
+        first = os.path.join(self._shared_state.name, "candidate-" + "8" * 32)
+        second = os.path.join(self._shared_state.name, "candidate-" + "7" * 32)
+        os.mkdir(first)
+        os.mkdir(second)
+
+        with mock.patch.object(
+            informix_module,
+            "_remove_candidate_tree_at",
+            side_effect=(PermissionError(errno.EACCES, "denied"), None),
+        ):
+            removed = informix_module._cleanup_immutable_candidates(
+                self._shared_state.name, headless_cutoff=float("inf")
+            )
+        self.assertEqual(removed, 1)
+
+    def test_offline_cleanup_fails_if_any_candidate_is_inaccessible(self):
+        candidate = os.path.join(
+            self._shared_state.name, "candidate-" + "5" * 32
+        )
+        os.mkdir(candidate)
+        with mock.patch.object(
+            informix_module,
+            "_validated_volume_state_location",
+            return_value=self._shared_state.name,
+        ), mock.patch.object(
+            informix_module,
+            "_remove_candidate_tree_at",
+            side_effect=PermissionError(errno.EACCES, "denied"),
+        ):
+            with self.assertRaisesRegex(InformixError, "inaccessible artifacts"):
+                informix_module.cleanup_abandoned_immutable_candidates(
+                    "/Volumes/catalog/schema/volume/state",
+                    acknowledge_pipelines_stopped=True,
+                )
+
+    def test_offline_cleanup_removes_quarantined_coordination_artifacts(self):
+        cleanup_root = os.path.join(
+            self._shared_state.name, ".informix-candidate-cleanup"
+        )
+        invalid = os.path.join(cleanup_root, ".invalid-bucket-deadbeef")
+        os.makedirs(invalid)
+        with open(os.path.join(invalid, "junk"), "w", encoding="utf-8") as handle:
+            handle.write("junk")
+        with mock.patch.object(
+            informix_module,
+            "_validated_volume_state_location",
+            return_value=self._shared_state.name,
+        ):
+            informix_module.cleanup_abandoned_immutable_candidates(
+                "/Volumes/catalog/schema/volume/state",
+                acknowledge_pipelines_stopped=True,
+            )
+        self.assertFalse(os.path.exists(cleanup_root))
+
+    def test_candidate_discovery_does_not_use_materializing_os_walk(self):
+        candidate = os.path.join(
+            self._shared_state.name, "candidate-" + "3" * 32
+        )
+        os.mkdir(candidate)
+        os.utime(candidate, (1, 1))
+        with mock.patch.object(
+            informix_module.os, "walk", side_effect=AssertionError("must stream")
+        ):
+            removed = informix_module._cleanup_immutable_candidates(
+                self._shared_state.name, headless_cutoff=float("inf")
+            )
+        self.assertEqual(removed, 1)
+
     def test_candidate_cleanup_cannot_publish_an_empty_head_during_rename_race(self):
         namespace = os.path.join(self._shared_state.name, "namespace")
         candidate = os.path.join(namespace, "candidate-" + "e" * 32)
@@ -2492,11 +2643,11 @@ class LakeflowContractTests(unittest.TestCase):
         os.utime(candidate, (1, 1))
         real_rename = informix_module.os.rename
 
-        def publisher_wins(source, target):
-            if source == candidate and ".candidate-gc-" in target:
-                real_rename(candidate, os.path.join(namespace, "head"))
+        def publisher_wins(source, target, **kwargs):
+            if source == os.path.basename(candidate) and ".candidate-gc-" in target:
+                real_rename(source, "head", **kwargs)
                 raise FileNotFoundError(candidate)
-            return real_rename(source, target)
+            return real_rename(source, target, **kwargs)
 
         with mock.patch.object(informix_module.os, "rename", side_effect=publisher_wins):
             removed = informix_module._cleanup_immutable_candidates(
@@ -2547,6 +2698,7 @@ class LakeflowContractTests(unittest.TestCase):
         )
         informix_module._publish_candidate_cleanup_completion(location, bucket)
         marker = informix_module._read_cleanup_marker(
+            location,
             informix_module._candidate_cleanup_completion_path(location, bucket),
             "candidate-cleanup-completion",
             bucket,
@@ -2577,6 +2729,7 @@ class LakeflowContractTests(unittest.TestCase):
         cleanup.assert_called_once()
         self.assertEqual(
             informix_module._read_cleanup_marker(
+                location,
                 marker, "candidate-cleanup-completion", bucket
             )["bucket"],
             bucket,
@@ -2601,6 +2754,7 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertFalse(os.path.islink(marker))
         self.assertEqual(
             informix_module._read_cleanup_marker(
+                location,
                 marker, "candidate-cleanup-completion", bucket
             )["bucket"],
             bucket,
@@ -2630,6 +2784,221 @@ class LakeflowContractTests(unittest.TestCase):
             informix_module._maybe_cleanup_immutable_candidates(location)
         cleanup.assert_not_called()
 
+    def test_cleanup_marker_rejects_symlinked_head_directory(self):
+        location = self._shared_state.name
+        bucket = 7
+        marker = informix_module._candidate_cleanup_completion_path(location, bucket)
+        target = os.path.join(location, "cleanup-head-target")
+        os.makedirs(target)
+        with open(os.path.join(target, "record.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "format_version": 1,
+                    "record_type": "candidate-cleanup-completion",
+                    "bucket": bucket,
+                    "created_at": 1.0,
+                },
+                handle,
+            )
+        os.makedirs(os.path.dirname(os.path.dirname(marker)))
+        os.symlink(target, os.path.dirname(marker))
+        with self.assertRaisesRegex(InformixError, "traverses symlink"):
+            informix_module._read_cleanup_marker(
+                location, marker, "candidate-cleanup-completion", bucket
+            )
+
+    def test_cleanup_marker_rejects_boolean_numeric_fields(self):
+        location = self._shared_state.name
+        bucket = 7
+        marker = informix_module._candidate_cleanup_completion_path(location, bucket)
+        os.makedirs(os.path.dirname(marker))
+        with open(marker, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "format_version": True,
+                    "record_type": "candidate-cleanup-completion",
+                    "bucket": bucket,
+                    "created_at": True,
+                },
+                handle,
+            )
+        with self.assertRaisesRegex(InformixError, "Invalid Informix cleanup marker"):
+            informix_module._read_cleanup_marker(
+                location, marker, "candidate-cleanup-completion", bucket
+            )
+
+    def test_cleanup_marker_rejects_oversized_record_before_json_decode(self):
+        location = self._shared_state.name
+        bucket = 7
+        marker = informix_module._candidate_cleanup_completion_path(location, bucket)
+        os.makedirs(os.path.dirname(marker))
+        with open(marker, "wb") as handle:
+            handle.truncate(informix_module._MAX_SHARED_STATE_BYTES + 1)
+        with self.assertRaisesRegex(InformixError, "too large"):
+            informix_module._read_cleanup_marker(
+                location, marker, "candidate-cleanup-completion", bucket
+            )
+
+    def test_cleanup_marker_normalizes_invalid_utf8_and_excessive_nesting(self):
+        location = self._shared_state.name
+        bucket = 7
+        marker = informix_module._candidate_cleanup_completion_path(location, bucket)
+        os.makedirs(os.path.dirname(marker))
+        for payload in (b"\xff", ("[" * 1100 + "0" + "]" * 1100).encode()):
+            with self.subTest(payload_size=len(payload)):
+                with open(marker, "wb") as handle:
+                    handle.write(payload)
+                with self.assertRaisesRegex(InformixError, "cleanup marker"):
+                    informix_module._read_cleanup_marker(
+                        location, marker, "candidate-cleanup-completion", bucket
+                    )
+
+    def test_cleanup_marker_publication_fsyncs_directories(self):
+        location = self._shared_state.name
+        bucket = 7
+        marker = informix_module._candidate_cleanup_completion_path(location, bucket)
+        with mock.patch.object(informix_module.os, "fsync") as fsync:
+            won = informix_module._publish_cleanup_marker(
+                location,
+                marker,
+                {
+                    "format_version": 1,
+                    "record_type": "candidate-cleanup-completion",
+                    "bucket": bucket,
+                    "created_at": 1.0,
+                },
+            )
+        self.assertTrue(won)
+        self.assertGreaterEqual(fsync.call_count, 3)
+
+    def test_state_root_creation_fsyncs_existing_parent(self):
+        parent = tempfile.TemporaryDirectory()
+        self.addCleanup(parent.cleanup)
+        root = os.path.join(parent.name, "new-state")
+        path = os.path.join(root, "nested")
+        with mock.patch.object(informix_module.os, "fsync") as fsync:
+            informix_module._makedirs_durable(root, path)
+        self.assertGreaterEqual(fsync.call_count, 3)
+
+    def test_state_root_creation_supports_multiple_missing_components(self):
+        parent = tempfile.TemporaryDirectory()
+        self.addCleanup(parent.cleanup)
+        root = os.path.join(parent.name, "team", "informix", "state")
+        path = os.path.join(root, "nested", "namespace")
+
+        informix_module._makedirs_durable(root, path)
+
+        self.assertTrue(os.path.isdir(path))
+
+    def test_cleanup_completion_validates_existing_winner(self):
+        location = self._shared_state.name
+        bucket = 7
+        marker = informix_module._candidate_cleanup_completion_path(location, bucket)
+        os.makedirs(os.path.dirname(marker))
+        with open(marker, "w", encoding="utf-8") as handle:
+            handle.write("not-json")
+        with self.assertRaisesRegex(InformixError, "cleanup marker"):
+            informix_module._publish_candidate_cleanup_completion(location, bucket)
+
+    def test_losing_marker_cleanup_error_does_not_mask_election_result(self):
+        location = self._shared_state.name
+        bucket = 7
+        marker = informix_module._candidate_cleanup_completion_path(location, bucket)
+        informix_module._publish_candidate_cleanup_completion(location, bucket)
+        with mock.patch.object(
+            informix_module.os,
+            "unlink",
+            side_effect=PermissionError(errno.EACCES, "denied"),
+        ):
+            won = informix_module._publish_cleanup_marker(
+                location,
+                marker,
+                {
+                    "format_version": 1,
+                    "record_type": "candidate-cleanup-completion",
+                    "bucket": bucket,
+                    "created_at": 1.0,
+                },
+            )
+        self.assertFalse(won)
+
+    def test_running_cleanup_rejects_symlinked_state_root(self):
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        alias_parent = tempfile.TemporaryDirectory()
+        self.addCleanup(alias_parent.cleanup)
+        alias = os.path.join(alias_parent.name, "state")
+        os.symlink(outside.name, alias)
+        with self.assertRaisesRegex(InformixError, "traverses symlink"):
+            informix_module._maybe_cleanup_immutable_candidates(alias)
+
+    def test_cleanup_pruning_rejects_symlinked_coordination_root(self):
+        location = self._shared_state.name
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        os.symlink(
+            outside.name,
+            os.path.join(location, ".informix-candidate-cleanup"),
+        )
+        with self.assertRaisesRegex(InformixError, "traverses symlink"):
+            informix_module._prune_candidate_cleanup_markers(location, 100)
+
+    def test_unfinished_prior_bucket_fences_new_cleanup_scan(self):
+        location = self._shared_state.name
+        current = int(
+            informix_module.time.time()
+            // informix_module._CANDIDATE_CLEANUP_INTERVAL_SECONDS
+        )
+        informix_module._publish_cleanup_marker(
+            location,
+            informix_module._candidate_cleanup_election_path(location, current - 1),
+            {
+                "format_version": 1,
+                "record_type": "candidate-cleanup-election",
+                "bucket": current - 1,
+                "created_at": 1.0,
+            },
+        )
+        informix_module._LAST_CANDIDATE_CLEANUP.pop(location, None)
+        with mock.patch.object(informix_module, "_cleanup_immutable_candidates") as cleanup:
+            informix_module._maybe_cleanup_immutable_candidates(location)
+        cleanup.assert_not_called()
+
+    def test_new_winner_cancels_if_other_bucket_appears_during_election(self):
+        location = self._shared_state.name
+        bucket = int(
+            informix_module.time.time()
+            // informix_module._CANDIDATE_CLEANUP_INTERVAL_SECONDS
+        )
+        informix_module._LAST_CANDIDATE_CLEANUP.pop(location, None)
+        with mock.patch.object(
+            informix_module,
+            "_unfinished_cleanup_elections",
+            side_effect=((), (bucket - 1,)),
+        ), mock.patch.object(informix_module, "_cleanup_immutable_candidates") as cleanup:
+            informix_module._maybe_cleanup_immutable_candidates(location)
+        cleanup.assert_not_called()
+        self.assertFalse(
+            os.path.exists(
+                informix_module._candidate_cleanup_election_path(location, bucket)
+            )
+        )
+
+    def test_lower_bucket_winner_proceeds_when_higher_bucket_appears(self):
+        location = self._shared_state.name
+        bucket = int(
+            informix_module.time.time()
+            // informix_module._CANDIDATE_CLEANUP_INTERVAL_SECONDS
+        )
+        informix_module._LAST_CANDIDATE_CLEANUP.pop(location, None)
+        with mock.patch.object(
+            informix_module,
+            "_unfinished_cleanup_elections",
+            side_effect=((), (bucket + 1,)),
+        ), mock.patch.object(informix_module, "_cleanup_immutable_candidates") as cleanup:
+            informix_module._maybe_cleanup_immutable_candidates(location)
+        cleanup.assert_called_once()
+
     def test_cleanup_throttle_cache_is_bounded(self):
         informix_module._LAST_CANDIDATE_CLEANUP.clear()
         limit = informix_module._MAX_CANDIDATE_CLEANUP_THROTTLES
@@ -2658,6 +3027,74 @@ class LakeflowContractTests(unittest.TestCase):
         retained = sorted(int(name) for name in os.listdir(root))
         self.assertEqual(retained, list(range(current - 6, current + 1)))
 
+    def test_cleanup_pruning_removes_symlinked_numeric_bucket(self):
+        location = self._shared_state.name
+        root = os.path.join(location, ".informix-candidate-cleanup")
+        os.mkdir(root)
+        target = os.path.join(location, "outside-bucket")
+        os.mkdir(target)
+        link = os.path.join(root, "1")
+        os.symlink(target, link)
+
+        informix_module._prune_candidate_cleanup_markers(location, 100)
+
+        self.assertFalse(os.path.lexists(link))
+        self.assertTrue(os.path.isdir(target))
+
+    def test_running_cleanup_quarantines_malformed_numeric_bucket(self):
+        location = self._shared_state.name
+        root = os.path.join(location, ".informix-candidate-cleanup")
+        malformed = os.path.join(root, "1", "election", "head", "record.json")
+        os.makedirs(os.path.dirname(malformed))
+        with open(malformed, "w", encoding="utf-8") as handle:
+            handle.write("not-json")
+
+        unfinished = informix_module._unfinished_cleanup_elections(location, 2)
+
+        self.assertEqual(unfinished, ())
+        self.assertFalse(os.path.exists(os.path.join(root, "1")))
+        self.assertTrue(
+            any(name.startswith(".invalid-bucket-") for name in os.listdir(root))
+        )
+
+    def test_extremely_long_numeric_cleanup_bucket_is_quarantined(self):
+        location = self._shared_state.name
+        root = os.path.join(location, ".informix-candidate-cleanup")
+        os.makedirs(os.path.join(root, "9" * 200))
+
+        self.assertEqual(informix_module._unfinished_cleanup_elections(location, 2), ())
+        self.assertTrue(
+            any(name.startswith(".invalid-bucket-") for name in os.listdir(root))
+        )
+
+    def test_unfinished_cleanup_discovery_retains_only_earliest_bucket(self):
+        location = self._shared_state.name
+        for bucket in range(10, 110):
+            informix_module._publish_cleanup_marker(
+                location,
+                informix_module._candidate_cleanup_election_path(location, bucket),
+                {
+                    "format_version": 1,
+                    "record_type": "candidate-cleanup-election",
+                    "bucket": bucket,
+                    "created_at": 1.0,
+                },
+            )
+
+        self.assertEqual(
+            informix_module._unfinished_cleanup_elections(location, 200), (10,)
+        )
+
+    def test_pruning_removes_quarantined_malformed_bucket(self):
+        location = self._shared_state.name
+        root = os.path.join(location, ".informix-candidate-cleanup")
+        invalid = os.path.join(root, ".invalid-bucket-deadbeef")
+        os.makedirs(invalid)
+
+        informix_module._prune_candidate_cleanup_markers(location, 100)
+
+        self.assertFalse(os.path.exists(invalid))
+
     def test_immutable_head_rejects_symlinked_record(self):
         namespace = os.path.join(self._shared_state.name, "symlink-record")
         head = os.path.join(namespace, "head")
@@ -2666,8 +3103,9 @@ class LakeflowContractTests(unittest.TestCase):
         with open(target, "w", encoding="utf-8") as handle:
             handle.write('{}')
         os.symlink(target, os.path.join(head, "record.json"))
-        with self.assertRaisesRegex(InformixError, "Invalid Informix immutable record"):
-            informix_module.InformixLakeflowConnect._read_immutable_head(namespace)
+        connector = self.connector(FakeBridge())
+        with self.assertRaisesRegex(InformixError, "traverses symlink"):
+            connector._read_immutable_head(namespace)
 
     def test_immutable_head_rejects_symlinked_head_directory(self):
         namespace = os.path.join(self._shared_state.name, "symlink-head")
@@ -2677,8 +3115,36 @@ class LakeflowContractTests(unittest.TestCase):
             handle.write('{}')
         os.makedirs(namespace)
         os.symlink(target, os.path.join(namespace, "head"))
-        with self.assertRaisesRegex(InformixError, "Invalid Informix immutable head"):
-            informix_module.InformixLakeflowConnect._read_immutable_head(namespace)
+        connector = self.connector(FakeBridge())
+        with self.assertRaisesRegex(InformixError, "traverses symlink"):
+            connector._read_immutable_head(namespace)
+
+    def test_immutable_head_rejects_symlinked_namespace_ancestor(self):
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        with open(os.path.join(outside.name, "record.json"), "w", encoding="utf-8") as handle:
+            handle.write('{}')
+        alias = os.path.join(self._shared_state.name, "alias")
+        os.symlink(outside.name, alias)
+        namespace = os.path.join(alias, "namespace")
+        os.makedirs(os.path.join(outside.name, "namespace", "head"))
+        with open(
+            os.path.join(outside.name, "namespace", "head", "record.json"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write('{}')
+        connector = self.connector(FakeBridge())
+        with self.assertRaisesRegex(InformixError, "traverses symlink"):
+            connector._read_immutable_head(namespace)
+
+    def test_immutable_header_rejects_float_version(self):
+        with self.assertRaisesRegex(InformixError, "Unsupported or mismatched"):
+            informix_module.InformixLakeflowConnect._validate_immutable_record_header(
+                {"format_version": 1.0, "record_type": "trigger"},
+                "trigger",
+                "test",
+            )
 
     def test_oversized_immutable_record_does_not_leak_candidate(self):
         connector = self.connector(FakeBridge())
@@ -2718,8 +3184,8 @@ class LakeflowContractTests(unittest.TestCase):
         namespace = connector._immutable_namespace(table, "probe", "mkdir-error")
         _validate_shared_state_filesystem(self._shared_state.name)
         with mock.patch.object(
-            informix_module.os,
-            "makedirs",
+            informix_module,
+            "_makedirs_durable",
             side_effect=OSError(errno.EIO, "failed"),
         ):
             with self.assertRaisesRegex(InformixError, "Cannot create"):
@@ -2745,8 +3211,72 @@ class LakeflowContractTests(unittest.TestCase):
                 record_type="trigger",
             )
 
-        with self.assertRaisesRegex(InformixError, "Ambiguous immutable trigger"):
+        with mock.patch.object(
+            informix_module.os, "listdir", side_effect=AssertionError("must stream")
+        ), self.assertRaisesRegex(InformixError, "Ambiguous immutable trigger"):
             connector._shared_trigger_boundary(table, checkpoint, owner=False)
+
+    def test_trigger_fallback_ignores_malformed_record_from_other_scope(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        checkpoint = _stream_offset()
+        scope = checkpoint["pipeline_scope"]
+        connector._publish_immutable_head(
+            connector._immutable_namespace(table, "triggers", "unrelated"),
+            {
+                "scope": "f" * 32,
+                "schema_id": checkpoint["schema_id"],
+                "value": "not-a-trigger",
+            },
+            record_type="generic",
+        )
+        connector._publish_immutable_head(
+            connector._immutable_namespace(table, "triggers", "matching"),
+            {
+                "generation": "a" * 32,
+                "high_water": "120",
+                "predecessor": "initial",
+                "schema_id": checkpoint["schema_id"],
+                "scope": scope,
+            },
+            record_type="trigger",
+        )
+
+        self.assertEqual(
+            connector._shared_trigger_boundary(table, checkpoint, owner=False),
+            (120, "a" * 32),
+        )
+
+    def test_boolean_options_reject_unknown_values(self):
+        required = {
+            "hostname": "localhost",
+            "database": "demo",
+            "user": "user",
+            "password": "password",
+            "server": "server",
+        }
+        for name in ("encrypt", "padVarchar", "redirect.enabled"):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, name):
+                if name == "redirect.enabled":
+                    informix_module._option_bool(
+                        {name: "treu"}, name, False
+                    )
+                else:
+                    informix_module._bridge_config({**required, name: "treu"})
+
+    def test_schema_history_discovery_uses_descriptor_streaming(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        transitions = connector._immutable_namespace(table, "schemas")
+        os.makedirs(transitions)
+        with mock.patch.object(
+            informix_module.os, "listdir", side_effect=AssertionError("must stream")
+        ):
+            self.assertIsNone(
+                connector._find_immutable_schema_record(
+                    table, "a" * 32, "b" * 32
+                )
+            )
 
     def test_malformed_trigger_winner_fails_before_caching(self):
         connector = self.connector(FakeBridge())

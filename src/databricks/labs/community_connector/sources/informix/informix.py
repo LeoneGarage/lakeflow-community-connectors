@@ -789,9 +789,9 @@ def _bridge_config(options: dict[str, str]) -> dict[str, Any]:
         "client_locale": (
             options.get("CLIENT_LOCALE") or options.get("client.locale") or "en_US.utf8"
         ),
-        "tls": options.get("encrypt", "true").lower() in {"1", "true", "yes"},
+        "tls": _option_bool(options, "encrypt", True),
         "ca_file": options.get("ssl.ca.file"),
-        "pad_varchar": options.get("padVarchar", "false").lower() in {"1", "true", "yes"},
+        "pad_varchar": _option_bool(options, "padVarchar", False),
         "cdc_timeout": int(options.get("cdc.timeout", "5")),
         "cdc_max_records": int(options.get("cdc.max.records", "64")),
         "stop_logging_on_close": False,
@@ -800,7 +800,16 @@ def _bridge_config(options: dict[str, str]) -> dict[str, Any]:
 
 def _option_bool(options: dict[str, str], name: str, default: bool) -> bool:
     value = options.get(name)
-    return default if value is None else value.lower() in {"1", "true", "yes"}
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes"}:
+        return True
+    if normalized in {"0", "false", "no"}:
+        return False
+    raise ValueError(
+        f"Option '{name}' must be one of: 1, true, yes, 0, false, no"
+    )
 
 
 def _shared_state_location(options: dict[str, str]) -> str:
@@ -829,13 +838,24 @@ def _validate_shared_state_filesystem(location: str) -> None:
 
     if location in _VALIDATED_STATE_LOCATIONS:
         return
+    _makedirs_durable(location, location)
+    _validate_state_path(location, location)
     _cleanup_probe_artifacts(location)
-    probe_root = os.path.join(location, f".informix-probe-{secrets.token_hex(8)}")
-    contender = os.path.join(probe_root, "exclusive")
-    renamed = os.path.join(probe_root, "renamed")
-    occupied = os.path.join(probe_root, "occupied")
+    probe_name = f".informix-probe-{secrets.token_hex(8)}"
+    root_descriptor: int | None = None
+    probe_descriptor: int | None = None
+    renamed_descriptor: int | None = None
+    occupied_descriptor: int | None = None
     try:
-        os.makedirs(probe_root, mode=0o700)
+        root_descriptor = _open_state_directory(location, location)
+        os.mkdir(probe_name, mode=0o700, dir_fd=root_descriptor)
+        probe_descriptor = os.open(
+            probe_name,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=root_descriptor,
+        )
         barrier = threading.Barrier(8, timeout=5)
         winners: list[int] = []
         failures: list[BaseException] = []
@@ -843,7 +863,7 @@ def _validate_shared_state_filesystem(location: str) -> None:
         def compete(index: int) -> None:
             try:
                 barrier.wait()
-                os.mkdir(contender, mode=0o700)
+                os.mkdir("exclusive", mode=0o700, dir_fd=probe_descriptor)
                 winners.append(index)
             except FileExistsError:
                 return
@@ -871,22 +891,54 @@ def _validate_shared_state_filesystem(location: str) -> None:
             raise InformixError(
                 "cdc.shared.state.location does not provide exclusive directory creation"
             ) from (failures[0] if failures else None)
-        os.rename(contender, renamed)
-        if os.path.exists(contender) or not os.path.isdir(renamed):
+        os.rename(
+            "exclusive", "renamed",
+            src_dir_fd=probe_descriptor, dst_dir_fd=probe_descriptor,
+        )
+        names = os.listdir(probe_descriptor)
+        if "exclusive" in names or "renamed" not in names:
             raise InformixError(
                 "cdc.shared.state.location does not provide atomic directory rename"
             )
-        with open(os.path.join(renamed, "record.json"), "x", encoding="utf-8") as handle:
+        renamed_descriptor = os.open(
+            "renamed",
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=probe_descriptor,
+        )
+        record_descriptor = os.open(
+            "record.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            mode=0o600, dir_fd=renamed_descriptor,
+        )
+        with os.fdopen(record_descriptor, "w", encoding="utf-8") as handle:
             handle.write("winner")
             handle.flush()
             os.fsync(handle.fileno())
-        os.mkdir(occupied, mode=0o700)
-        with open(os.path.join(occupied, "record.json"), "x", encoding="utf-8") as handle:
+        with os.scandir(renamed_descriptor) as entries:
+            if [entry.name for entry in entries] != ["record.json"]:
+                raise InformixError("Descriptor-based directory scan is unavailable")
+        os.close(renamed_descriptor)
+        renamed_descriptor = None
+        os.mkdir("occupied", mode=0o700, dir_fd=probe_descriptor)
+        occupied_descriptor = os.open(
+            "occupied",
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=probe_descriptor,
+        )
+        loser_descriptor = os.open(
+            "record.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            mode=0o600, dir_fd=occupied_descriptor,
+        )
+        with os.fdopen(loser_descriptor, "w", encoding="utf-8") as handle:
             handle.write("loser")
             handle.flush()
             os.fsync(handle.fileno())
+        os.close(occupied_descriptor)
+        occupied_descriptor = None
         try:
-            os.rename(occupied, renamed)
+            os.rename(
+                "occupied", "renamed",
+                src_dir_fd=probe_descriptor, dst_dir_fd=probe_descriptor,
+            )
         except OSError as error:
             if error.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
                 raise
@@ -894,9 +946,18 @@ def _validate_shared_state_filesystem(location: str) -> None:
             raise InformixError(
                 "cdc.shared.state.location permits replacing a populated immutable head"
             )
-        with open(os.path.join(renamed, "record.json"), encoding="utf-8") as handle:
+        renamed_descriptor = os.open(
+            "renamed",
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=probe_descriptor,
+        )
+        winner_descriptor = os.open("record.json", os.O_RDONLY, dir_fd=renamed_descriptor)
+        with os.fdopen(winner_descriptor, encoding="utf-8") as handle:
             if handle.read() != "winner":
                 raise InformixError("Immutable-head filesystem probe replaced its winner")
+        os.close(renamed_descriptor)
+        renamed_descriptor = None
+        os.fsync(probe_descriptor)
         # A duplicate concurrent probe is harmless because every probe uses a
         # unique directory. Avoid retaining a process lock in the generated
         # source closure: Spark must pickle the DataSource class for workers.
@@ -906,66 +967,61 @@ def _validate_shared_state_filesystem(location: str) -> None:
             f"Cannot validate Informix shared-state filesystem at '{location}'"
         ) from error
     finally:
-        for path in (renamed, occupied):
+        if renamed_descriptor is not None:
+            os.close(renamed_descriptor)
+        if occupied_descriptor is not None:
+            os.close(occupied_descriptor)
+        if probe_descriptor is not None:
+            for name in ("renamed", "occupied", "exclusive"):
+                try:
+                    _remove_candidate_tree_at(probe_descriptor, name)
+                    os.rmdir(name, dir_fd=probe_descriptor)
+                except OSError:
+                    pass
+            os.close(probe_descriptor)
+        if root_descriptor is not None:
             try:
-                os.unlink(os.path.join(path, "record.json"))
+                os.rmdir(probe_name, dir_fd=root_descriptor)
             except OSError:
                 pass
-        for path in (renamed, occupied, contender, probe_root):
-            try:
-                os.rmdir(path)
-            except OSError:
-                pass
+            os.close(root_descriptor)
 
 
 def _cleanup_probe_artifacts(location: str) -> None:
     cutoff = time.time() - _ARTIFACT_RETENTION_SECONDS
     try:
-        entries = list(os.scandir(location))
+        descriptor = _open_state_directory(location, location)
     except FileNotFoundError:
         return
     except OSError as error:
         raise InformixError(
             f"Cannot inspect Informix shared-state location '{location}'"
         ) from error
-    for entry in entries:
-        try:
-            if (
-                not entry.name.startswith(".informix-probe-")
-                or not entry.is_dir(follow_symlinks=False)
-                or entry.stat(follow_symlinks=False).st_mtime > cutoff
-            ):
-                continue
-            for child_name in ("exclusive", "renamed", "occupied"):
-                child = os.path.join(entry.path, child_name)
+    try:
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
                 try:
-                    metadata = os.lstat(child)
+                    eligible = (
+                        entry.name.startswith(".informix-probe-")
+                        and entry.is_dir(follow_symlinks=False)
+                        and entry.stat(follow_symlinks=False).st_mtime <= cutoff
+                    )
                 except FileNotFoundError:
                     continue
-                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-                    raise InformixError(
-                        f"Invalid abandoned Informix probe artifact '{child}'"
-                    )
-                record = os.path.join(child, "record.json")
+                if not eligible:
+                    continue
                 try:
-                    record_metadata = os.lstat(record)
-                    if stat.S_ISLNK(record_metadata.st_mode) or not stat.S_ISREG(
-                        record_metadata.st_mode
-                    ):
-                        raise InformixError(
-                            f"Invalid abandoned Informix probe record '{record}'"
-                        )
-                    os.unlink(record)
+                    _remove_candidate_tree_at(descriptor, entry.name)
+                    os.rmdir(entry.name, dir_fd=descriptor)
                 except FileNotFoundError:
-                    pass
-                os.rmdir(child)
-            os.rmdir(entry.path)
-        except FileNotFoundError:
-            continue
-        except OSError as error:
-            raise InformixError(
-                f"Cannot clean abandoned Informix probe '{entry.path}'"
-            ) from error
+                    continue
+                except OSError as error:
+                    raise InformixError(
+                        f"Cannot clean abandoned Informix probe '{entry.name}'"
+                    ) from error
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _validated_volume_state_location(state_location: str) -> str:
@@ -1002,71 +1058,183 @@ def _validated_volume_state_location(state_location: str) -> str:
     return location
 
 
-def _cleanup_immutable_candidates(location: str, *, headless_cutoff: float) -> int:
-    removed = 0
-    traversal_errors: list[OSError] = []
+def _remove_candidate_tree_at(parent_descriptor: int, name: str) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    root = os.open(name, flags, dir_fd=parent_descriptor)
+    stack: list[tuple[int, os.ScandirIterator, str | None]] = [
+        (root, os.scandir(root), None)
+    ]
     try:
-        entries = list(
-            os.walk(
-                location,
-                topdown=False,
-                followlinks=False,
-                onerror=traversal_errors.append,
-            )
-        )
-    except OSError as error:
-        raise InformixError(
-            f"Cannot inspect Informix shared-state location '{location}'"
-        ) from error
-    if traversal_errors:
-        error = traversal_errors[0]
-        raise InformixError(
-            f"Cannot inspect Informix shared-state path '{error.filename or location}'"
-        ) from error
-    for directory, names, _ in entries:
-        for name in names:
-            quarantined = bool(re.fullmatch(r"\.candidate-gc-[0-9a-f]{32}", name))
-            if not quarantined and not re.fullmatch(
-                r"candidate-[0-9a-f]{16,64}", name
-            ):
-                continue
-            path = os.path.join(directory, name)
+        while stack:
+            descriptor, entries, child_name = stack[-1]
             try:
-                metadata = os.lstat(path)
-                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-                    continue
-                cleanup_path = path
-                if not quarantined:
-                    committed = os.path.isfile(
-                        os.path.join(directory, "head", "record.json")
-                    )
-                    if not committed and metadata.st_mtime > headless_cutoff:
-                        continue
-                    cleanup_path = os.path.join(
-                        directory, f".candidate-gc-{secrets.token_hex(16)}"
-                    )
-                    try:
-                        os.rename(path, cleanup_path)
-                    except FileNotFoundError:
-                        continue
-                record_path = os.path.join(cleanup_path, "record.json")
-                try:
-                    record_metadata = os.lstat(record_path)
-                    if stat.S_ISLNK(record_metadata.st_mode):
-                        continue
-                    if not stat.S_ISREG(record_metadata.st_mode):
-                        continue
-                    os.unlink(record_path)
-                except FileNotFoundError:
-                    pass
-                os.rmdir(cleanup_path)
-                removed += 1
+                entry = next(entries)
+            except StopIteration:
+                entries.close()
+                os.close(descriptor)
+                stack.pop()
+                if stack and child_name is not None:
+                    os.rmdir(child_name, dir_fd=stack[-1][0])
+                continue
+            metadata = entry.stat(follow_symlinks=False)
+            if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+                child = os.open(entry.name, flags, dir_fd=descriptor)
+                stack.append((child, os.scandir(child), entry.name))
+            else:
+                os.unlink(entry.name, dir_fd=descriptor)
+    finally:
+        while stack:
+            descriptor, entries, _ = stack.pop()
+            entries.close()
+            os.close(descriptor)
+
+
+def _committed_head_exists_at(namespace_descriptor: int) -> bool:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        head = os.open("head", flags, dir_fd=namespace_descriptor)
+    except OSError as error:
+        if error.errno not in {
+            errno.ENOENT,
+            errno.ENOTDIR,
+            errno.ELOOP,
+        }:
+            raise
+        return False
+    try:
+        try:
+            record = os.open(
+                "record.json",
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=head,
+            )
+        except OSError as error:
+            if error.errno in {errno.ENOENT, errno.ELOOP}:
+                return False
+            raise
+        try:
+            return stat.S_ISREG(os.fstat(record).st_mode)
+        finally:
+            os.close(record)
+    finally:
+        os.close(head)
+
+
+def _cleanup_immutable_candidates(
+    location: str, *, headless_cutoff: float, strict: bool = False
+) -> int:
+    _validate_state_path(location, location)
+    removed = 0
+    first_traversal_error: OSError | None = None
+    first_removal_error: BaseException | None = None
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    root = _open_state_directory(location, location)
+    try:
+        root_entries = os.scandir(root)
+    except BaseException:
+        os.close(root)
+        raise
+    stack: list[tuple[int, os.ScandirIterator, str]] = [(root, root_entries, location)]
+    try:
+        while stack:
+            directory_descriptor, entries, directory = stack[-1]
+            try:
+                entry = next(entries)
+            except StopIteration:
+                entries.close()
+                os.close(directory_descriptor)
+                stack.pop()
+                continue
+            except OSError as error:
+                if first_traversal_error is None:
+                    first_traversal_error = error
+                logging.getLogger(__name__).warning(
+                    "Cannot inspect Informix shared-state path: path=%s", directory
+                )
+                entries.close()
+                os.close(directory_descriptor)
+                stack.pop()
+                continue
+            name = entry.name
+            quarantined = bool(re.fullmatch(r"\.candidate-gc-[0-9a-f]{32}", name))
+            candidate = quarantined or bool(
+                re.fullmatch(r"candidate-[0-9a-f]{16,64}", name)
+            )
+            try:
+                metadata = entry.stat(follow_symlinks=False)
             except FileNotFoundError:
                 continue
             except OSError as error:
-                raise InformixError(
-                    f"Cannot remove abandoned Informix candidate '{path}'"
-                ) from error
+                if first_traversal_error is None:
+                    first_traversal_error = error
+                logging.getLogger(__name__).warning(
+                    "Cannot inspect Informix shared-state path: path=%s",
+                    os.path.join(directory, name),
+                )
+                continue
+            if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                continue
+            if not candidate:
+                try:
+                    child = os.open(name, flags, dir_fd=directory_descriptor)
+                    try:
+                        child_entries = os.scandir(child)
+                    except BaseException:
+                        os.close(child)
+                        raise
+                    stack.append(
+                        (child, child_entries, os.path.join(directory, name))
+                    )
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    if first_traversal_error is None:
+                        first_traversal_error = error
+                    logging.getLogger(__name__).warning(
+                        "Cannot inspect Informix shared-state path: path=%s",
+                        os.path.join(directory, name),
+                    )
+                continue
+            path = os.path.join(directory, name)
+            try:
+                cleanup_name = name
+                if not quarantined:
+                    committed = _committed_head_exists_at(directory_descriptor)
+                    if not committed and metadata.st_mtime > headless_cutoff:
+                        continue
+                    cleanup_name = f".candidate-gc-{secrets.token_hex(16)}"
+                    try:
+                        os.rename(
+                            name,
+                            cleanup_name,
+                            src_dir_fd=directory_descriptor,
+                            dst_dir_fd=directory_descriptor,
+                        )
+                    except FileNotFoundError:
+                        continue
+                _remove_candidate_tree_at(directory_descriptor, cleanup_name)
+                os.rmdir(cleanup_name, dir_fd=directory_descriptor)
+                removed += 1
+            except FileNotFoundError:
+                continue
+            except Exception as error:
+                if first_removal_error is None:
+                    first_removal_error = error
+                logging.getLogger(__name__).warning(
+                    "Cannot remove abandoned Informix candidate: path=%s",
+                    path,
+                    exc_info=True,
+                )
+    finally:
+        while stack:
+            descriptor, entries, _ = stack.pop()
+            entries.close()
+            os.close(descriptor)
+    if strict and (first_traversal_error is not None or first_removal_error is not None):
+        error = first_traversal_error or first_removal_error
+        raise InformixError(
+            f"Informix candidate cleanup left inaccessible artifacts under '{location}'"
+        ) from error
     return removed
 
 
@@ -1080,7 +1248,20 @@ def cleanup_abandoned_immutable_candidates(
             "Candidate cleanup requires acknowledgement that all pipelines are stopped"
         )
     location = _validated_volume_state_location(state_location)
-    return _cleanup_immutable_candidates(location, headless_cutoff=float("inf"))
+    removed = _cleanup_immutable_candidates(
+        location, headless_cutoff=float("inf"), strict=True
+    )
+    root_descriptor = _open_state_directory(location, location)
+    try:
+        try:
+            _remove_candidate_tree_at(root_descriptor, ".informix-candidate-cleanup")
+            os.rmdir(".informix-candidate-cleanup", dir_fd=root_descriptor)
+            os.fsync(root_descriptor)
+        except FileNotFoundError:
+            pass
+    finally:
+        os.close(root_descriptor)
+    return removed
 
 
 def _candidate_cleanup_completion_path(state_location: str, bucket: int) -> str:
@@ -1104,104 +1285,319 @@ def _candidate_cleanup_election_path(state_location: str, bucket: int) -> str:
     )
 
 
-def _read_cleanup_marker(path: str, record_type: str, bucket: int) -> dict[str, object] | None:
+def _validate_state_path(root: str, path: str) -> None:
+    if os.path.commonpath((root, path)) != root:
+        raise InformixError(f"Informix shared-state path escapes '{root}': '{path}'")
+    cursor = root
+    relative = os.path.relpath(path, root)
+    parts = () if relative == "." else tuple(relative.split(os.sep))
+    for index, part in enumerate(("", *parts)):
+        if index:
+            cursor = os.path.join(cursor, part)
+        try:
+            metadata = os.lstat(cursor)
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(metadata.st_mode):
+            raise InformixError(f"Informix shared-state path traverses symlink '{cursor}'")
+        if index < len(parts) and not stat.S_ISDIR(metadata.st_mode):
+            raise InformixError(f"Informix shared-state ancestor is not a directory: '{cursor}'")
+
+
+def _fsync_directory_path(path: str) -> None:
     try:
-        metadata = os.lstat(path)
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError as error:
+        if error.errno in {errno.EINVAL, errno.ENOTSUP, errno.EACCES}:
+            return
+        raise
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as error:
+            if error.errno not in {errno.EINVAL, errno.ENOTSUP}:
+                raise
+    finally:
+        os.close(descriptor)
+
+
+def _open_state_directory(root: str, path: str) -> int:
+    """Open a directory beneath root without following a replaceable symlink."""
+
+    if os.path.commonpath((root, path)) != root:
+        raise InformixError(f"Informix shared-state path escapes '{root}': '{path}'")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(root, flags)
+    try:
+        relative = os.path.relpath(path, root)
+        for part in (() if relative == "." else relative.split(os.sep)):
+            try:
+                child = os.open(part, flags, dir_fd=descriptor)
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise InformixError(
+                        f"Informix shared-state path traverses symlink or non-directory: '{path}'"
+                    ) from error
+                raise
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_state_file(root: str, path: str) -> int:
+    parent = os.path.dirname(path)
+    directory = _open_state_directory(root, parent)
+    try:
+        try:
+            return os.open(
+                os.path.basename(path),
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory,
+            )
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise InformixError(
+                    f"Informix shared-state path traverses symlink '{path}'"
+                ) from error
+            raise
+    finally:
+        os.close(directory)
+
+
+def _makedirs_durable(root: str, path: str) -> None:
+    if os.path.commonpath((root, path)) != root:
+        raise InformixError(f"Informix shared-state path escapes '{root}': '{path}'")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(root, flags)
+    except FileNotFoundError:
+        parts = root.split(os.sep)
+        if len(parts) >= 5 and parts[1] == "Volumes":
+            anchor = os.path.join(os.sep, *parts[1:5])
+        else:
+            anchor = os.path.dirname(root)
+            while not os.path.isdir(anchor):
+                parent = os.path.dirname(anchor)
+                if parent == anchor:
+                    raise InformixError(
+                        f"Cannot find an existing parent for shared-state root '{root}'"
+                    )
+                anchor = parent
+        descriptor = os.open(anchor, flags)
+        root_parts = tuple(
+            part for part in os.path.relpath(root, anchor).split(os.sep) if part != "."
+        )
+    else:
+        root_parts = ()
+    path_parts = tuple(
+        part for part in os.path.relpath(path, root).split(os.sep) if part != "."
+    )
+    try:
+        for part in (*root_parts, *path_parts):
+            try:
+                child = os.open(part, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                os.fsync(descriptor)
+                child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _read_cleanup_marker(
+    state_location: str, path: str, record_type: str, bucket: int
+) -> dict[str, object] | None:
+    try:
+        descriptor = _open_state_file(state_location, path)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            os.close(descriptor)
             raise InformixError(f"Invalid Informix cleanup marker '{path}'")
-        with open(path, encoding="utf-8") as handle:
+        if metadata.st_size > _MAX_SHARED_STATE_BYTES:
+            os.close(descriptor)
+            raise InformixError(f"Informix cleanup marker '{path}' is too large")
+        with os.fdopen(descriptor, encoding="utf-8") as handle:
             record = json.load(handle)
     except FileNotFoundError:
         return None
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as error:
         raise InformixError(f"Cannot read Informix cleanup marker '{path}'") from error
     if (
         not isinstance(record, dict)
+        or not isinstance(record.get("format_version"), int)
+        or isinstance(record.get("format_version"), bool)
         or record.get("format_version") != _IMMUTABLE_STATE_VERSION
         or record.get("record_type") != record_type
+        or not isinstance(record.get("bucket"), int)
+        or isinstance(record.get("bucket"), bool)
         or record.get("bucket") != bucket
+        or isinstance(record.get("created_at"), bool)
         or not isinstance(record.get("created_at"), (int, float))
+        or not math.isfinite(float(record["created_at"]))
     ):
         raise InformixError(f"Invalid Informix cleanup marker '{path}'")
     return record
 
 
-def _publish_cleanup_marker(path: str, payload: dict[str, object]) -> bool:
+def _publish_cleanup_marker(
+    state_location: str, path: str, payload: dict[str, object]
+) -> bool:
     namespace = os.path.dirname(os.path.dirname(path))
-    os.makedirs(namespace, mode=0o700, exist_ok=True)
-    candidate = os.path.join(namespace, f"candidate-{secrets.token_hex(16)}")
-    os.mkdir(candidate, mode=0o700)
-    record = os.path.join(candidate, "record.json")
+    _makedirs_durable(state_location, namespace)
+    candidate_name = f"candidate-{secrets.token_hex(16)}"
+    candidate = os.path.join(namespace, candidate_name)
+    namespace_descriptor = _open_state_directory(state_location, namespace)
+    candidate_descriptor: int | None = None
     won = False
     try:
-        with open(record, "x", encoding="utf-8") as handle:
+        os.mkdir(candidate_name, mode=0o700, dir_fd=namespace_descriptor)
+        candidate_descriptor = os.open(
+            candidate_name,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=namespace_descriptor,
+        )
+        record_descriptor = os.open(
+            "record.json",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            mode=0o600,
+            dir_fd=candidate_descriptor,
+        )
+        with os.fdopen(record_descriptor, "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
             handle.flush()
             os.fsync(handle.fileno())
+        os.fsync(candidate_descriptor)
+        os.close(candidate_descriptor)
+        candidate_descriptor = None
         try:
-            os.rename(candidate, os.path.join(namespace, "head"))
+            os.rename(
+                candidate_name,
+                "head",
+                src_dir_fd=namespace_descriptor,
+                dst_dir_fd=namespace_descriptor,
+            )
+            os.fsync(namespace_descriptor)
             won = True
         except OSError as error:
             if error.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
                 raise
     finally:
+        if candidate_descriptor is not None:
+            os.close(candidate_descriptor)
         if not won:
             try:
-                os.unlink(record)
+                os.unlink(os.path.join(candidate_name, "record.json"), dir_fd=namespace_descriptor)
             except FileNotFoundError:
                 pass
+            except OSError:
+                logging.getLogger(__name__).warning(
+                    "Retained abandoned Informix cleanup candidate: path=%s", candidate
+                )
             try:
-                os.rmdir(candidate)
+                os.rmdir(candidate_name, dir_fd=namespace_descriptor)
             except FileNotFoundError:
                 pass
+            except OSError:
+                logging.getLogger(__name__).warning(
+                    "Retained abandoned Informix cleanup candidate: path=%s", candidate
+                )
+        os.close(namespace_descriptor)
     return won
 
 
 def _publish_candidate_cleanup_completion(state_location: str, bucket: int) -> None:
+    path = _candidate_cleanup_completion_path(state_location, bucket)
     _publish_cleanup_marker(
-        _candidate_cleanup_completion_path(state_location, bucket),
+        state_location,
+        path,
         {"format_version": _IMMUTABLE_STATE_VERSION,
          "record_type": "candidate-cleanup-completion", "bucket": bucket,
          "created_at": time.time()},
     )
+    if _read_cleanup_marker(
+        state_location, path, "candidate-cleanup-completion", bucket
+    ) is None:
+        raise InformixError(
+            f"Informix cleanup completion election has no readable winner: '{path}'"
+        )
 
 
-def _quarantine_invalid_cleanup_marker(path: str) -> None:
+def _quarantine_invalid_cleanup_marker(state_location: str, path: str) -> None:
     head = os.path.dirname(path)
     namespace = os.path.dirname(head)
+    descriptor = _open_state_directory(state_location, namespace)
     try:
-        os.rename(head, os.path.join(namespace, f".invalid-{secrets.token_hex(16)}"))
+        os.rename(
+            "head",
+            f".invalid-{secrets.token_hex(16)}",
+            src_dir_fd=descriptor,
+            dst_dir_fd=descriptor,
+        )
+        os.fsync(descriptor)
     except FileNotFoundError:
         pass
+    finally:
+        os.close(descriptor)
+
+
+def _cancel_cleanup_election(state_location: str, path: str) -> None:
+    head = os.path.dirname(path)
+    namespace = os.path.dirname(head)
+    descriptor = _open_state_directory(state_location, namespace)
+    try:
+        os.rename(
+            "head",
+            f".cancelled-{secrets.token_hex(16)}",
+            src_dir_fd=descriptor,
+            dst_dir_fd=descriptor,
+        )
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _prune_candidate_cleanup_markers(state_location: str, bucket: int) -> None:
     root = os.path.join(state_location, ".informix-candidate-cleanup")
+    _validate_state_path(state_location, root)
     try:
-        names = os.listdir(root)
+        descriptor = _open_state_directory(state_location, root)
     except FileNotFoundError:
         return
-    for name in names:
-        if (
-            not name.isdigit()
-            or int(name) > bucket - _CANDIDATE_CLEANUP_MARKER_RETENTION_BUCKETS
-        ):
-            continue
-        bucket_path = os.path.join(root, name)
-        for directory, _, files in os.walk(bucket_path, topdown=False, followlinks=False):
-            if stat.S_ISLNK(os.lstat(directory).st_mode):
-                continue
-            for filename in files:
-                path = os.path.join(directory, filename)
-                if filename == "record.json":
-                    metadata = os.lstat(path)
-                    if stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-                        os.unlink(path)
-            try:
-                os.rmdir(directory)
-            except OSError as error:
-                if error.errno not in {errno.ENOTEMPTY, errno.ENOENT}:
-                    raise
+    try:
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
+                name = entry.name
+                other = _cleanup_bucket_number(name)
+                invalid = name.startswith(".invalid-bucket-")
+                if not invalid and (
+                    other is None
+                    or other > bucket - _CANDIDATE_CLEANUP_MARKER_RETENTION_BUCKETS
+                ):
+                    continue
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                        os.unlink(name, dir_fd=descriptor)
+                        continue
+                    _remove_candidate_tree_at(descriptor, name)
+                    os.rmdir(name, dir_fd=descriptor)
+                except OSError as error:
+                    if error.errno != errno.ENOENT:
+                        raise
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _remember_candidate_cleanup(state_location: str, when: float) -> None:
@@ -1212,7 +1608,85 @@ def _remember_candidate_cleanup(state_location: str, when: float) -> None:
         del _LAST_CANDIDATE_CLEANUP[oldest]
 
 
+def _cleanup_bucket_number(name: str) -> int | None:
+    if re.fullmatch(r"[0-9]{1,20}", name) is None:
+        return None
+    return int(name)
+
+
+def _unfinished_cleanup_elections(state_location: str, bucket: int) -> tuple[int, ...]:
+    root = os.path.join(state_location, ".informix-candidate-cleanup")
+    _validate_state_path(state_location, root)
+    try:
+        descriptor = _open_state_directory(state_location, root)
+    except FileNotFoundError:
+        return ()
+    earliest_unfinished: int | None = None
+    try:
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
+                name = entry.name
+                other = _cleanup_bucket_number(name)
+                if other is None:
+                    if name.isdigit():
+                        try:
+                            os.rename(
+                                name,
+                                f".invalid-bucket-{secrets.token_hex(16)}",
+                                src_dir_fd=descriptor,
+                                dst_dir_fd=descriptor,
+                            )
+                        except FileNotFoundError:
+                            pass
+                    continue
+                if other == bucket:
+                    continue
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                    os.unlink(name, dir_fd=descriptor)
+                    continue
+                try:
+                    election = _read_cleanup_marker(
+                        state_location,
+                        _candidate_cleanup_election_path(state_location, other),
+                        "candidate-cleanup-election",
+                        other,
+                    )
+                    if election is None:
+                        continue
+                    completion = _read_cleanup_marker(
+                        state_location,
+                        _candidate_cleanup_completion_path(state_location, other),
+                        "candidate-cleanup-completion",
+                        other,
+                    )
+                    if completion is None:
+                        earliest_unfinished = (
+                            other
+                            if earliest_unfinished is None
+                            else min(earliest_unfinished, other)
+                        )
+                except InformixError:
+                    try:
+                        os.rename(
+                            name,
+                            f".invalid-bucket-{secrets.token_hex(16)}",
+                            src_dir_fd=descriptor,
+                            dst_dir_fd=descriptor,
+                        )
+                    except FileNotFoundError:
+                        continue
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return () if earliest_unfinished is None else (earliest_unfinished,)
+
+
 def _maybe_cleanup_immutable_candidates(state_location: str) -> None:
+    _validate_state_path(state_location, state_location)
     now = time.monotonic()
     if (
         _LAST_CANDIDATE_CLEANUP.get(state_location, 0)
@@ -1222,13 +1696,15 @@ def _maybe_cleanup_immutable_candidates(state_location: str) -> None:
     bucket = int(time.time() // _CANDIDATE_CLEANUP_INTERVAL_SECONDS)
     completion = _candidate_cleanup_completion_path(state_location, bucket)
     try:
-        completed = _read_cleanup_marker(completion, "candidate-cleanup-completion", bucket)
+        completed = _read_cleanup_marker(
+            state_location, completion, "candidate-cleanup-completion", bucket
+        )
     except InformixError:
         logging.getLogger(__name__).exception(
             "Invalid Informix candidate-cleanup completion marker: location=%s", state_location
         )
         try:
-            _quarantine_invalid_cleanup_marker(completion)
+            _quarantine_invalid_cleanup_marker(state_location, completion)
         except OSError:
             logging.getLogger(__name__).exception(
                 "Cannot quarantine invalid Informix cleanup marker: location=%s",
@@ -1241,17 +1717,32 @@ def _maybe_cleanup_immutable_candidates(state_location: str) -> None:
         _remember_candidate_cleanup(state_location, now)
         return
     try:
+        if _unfinished_cleanup_elections(state_location, bucket):
+            _remember_candidate_cleanup(state_location, now)
+            return
         election_path = _candidate_cleanup_election_path(state_location, bucket)
         won = _publish_cleanup_marker(
+            state_location,
             election_path,
             {"format_version": _IMMUTABLE_STATE_VERSION,
              "record_type": "candidate-cleanup-election", "bucket": bucket,
              "created_at": time.time()},
         )
         if not won:
-            _read_cleanup_marker(
-                election_path, "candidate-cleanup-election", bucket
-            )
+            try:
+                _read_cleanup_marker(
+                    state_location,
+                    election_path,
+                    "candidate-cleanup-election",
+                    bucket,
+                )
+            except InformixError:
+                _quarantine_invalid_cleanup_marker(state_location, election_path)
+            _remember_candidate_cleanup(state_location, now)
+            return
+        unfinished = _unfinished_cleanup_elections(state_location, bucket)
+        if unfinished and min(unfinished) < bucket:
+            _cancel_cleanup_election(state_location, election_path)
             _remember_candidate_cleanup(state_location, now)
             return
         _cleanup_immutable_candidates(
@@ -1261,7 +1752,7 @@ def _maybe_cleanup_immutable_candidates(state_location: str) -> None:
         _publish_candidate_cleanup_completion(state_location, bucket)
         _prune_candidate_cleanup_markers(state_location, bucket)
         _remember_candidate_cleanup(state_location, now)
-    except (OSError, InformixError):
+    except Exception:
         _remember_candidate_cleanup(state_location, now)
         logging.getLogger(__name__).exception(
             "Skipping failed Informix candidate cleanup: location=%s", state_location
@@ -2062,34 +2553,60 @@ class InformixLakeflowConnect(LakeflowConnect):
             trigger = self._read_immutable_head(namespace)
             if trigger is None and not owner:
                 trigger_root = self._immutable_namespace(table, "triggers")
-                direct: list[dict[str, object]] = []
-                fallback: list[dict[str, object]] = []
+                direct: dict[str, object] | None = None
+                direct_count = 0
+                fallback_found = False
                 try:
-                    keys = os.listdir(trigger_root)
+                    trigger_descriptor = _open_state_directory(
+                        self._shared_state_location, trigger_root
+                    )
                 except FileNotFoundError:
-                    keys = []
+                    trigger_descriptor = None
                 except OSError as error:
                     raise InformixError(
                         f"Cannot inspect Informix trigger boundaries '{trigger_root}'"
                     ) from error
-                for key in keys:
-                    candidate = self._read_immutable_head(os.path.join(trigger_root, key))
-                    if (
-                        candidate is not None
-                        and candidate.get("scope") == scope
-                        and candidate.get("schema_id") == checkpoint.get("schema_id")
-                        and candidate.get("generation") != predecessor
-                        and self._immutable_lsn(
-                            candidate, "high_water", table.exposed_name
-                        )
-                        >= int(checkpoint.get("commit_lsn", 0))
-                    ):
-                        fallback.append(candidate)
-                        if candidate.get("predecessor") == predecessor:
-                            direct.append(candidate)
-                if len(direct) == 1:
-                    trigger = direct[0]
-                elif len(direct) > 1 or fallback:
+                if trigger_descriptor is not None:
+                    try:
+                        with os.scandir(trigger_descriptor) as entries:
+                            for entry in entries:
+                                try:
+                                    is_directory = entry.is_dir(follow_symlinks=False)
+                                except FileNotFoundError:
+                                    continue
+                                if not is_directory:
+                                    continue
+                                candidate = self._read_immutable_head(
+                                    os.path.join(trigger_root, entry.name)
+                                )
+                                if candidate is None:
+                                    continue
+                                if (
+                                    candidate.get("scope") != scope
+                                    or candidate.get("schema_id")
+                                    != checkpoint.get("schema_id")
+                                ):
+                                    continue
+                                self._validate_immutable_record_header(
+                                    candidate, "trigger", table.exposed_name
+                                )
+                                if (
+                                    candidate.get("generation") != predecessor
+                                    and self._immutable_lsn(
+                                        candidate, "high_water", table.exposed_name
+                                    )
+                                    >= int(checkpoint.get("commit_lsn", 0))
+                                ):
+                                    fallback_found = True
+                                    if candidate.get("predecessor") == predecessor:
+                                        direct_count += 1
+                                        if direct_count == 1:
+                                            direct = candidate
+                    finally:
+                        os.close(trigger_descriptor)
+                if direct_count == 1:
+                    trigger = direct
+                elif direct_count > 1 or fallback_found:
                     raise InformixError(
                         f"Ambiguous immutable trigger boundary for '{table.exposed_name}'; "
                         "run a full refresh rather than choosing between overlapping updates"
@@ -2494,45 +3011,57 @@ class InformixLakeflowConnect(LakeflowConnect):
                 }
         transitions = self._immutable_namespace(table, "schemas")
         try:
-            predecessors = os.listdir(transitions)
+            transitions_descriptor = _open_state_directory(
+                self._shared_state_location, transitions
+            )
         except FileNotFoundError:
-            predecessors = []
+            return None
         except OSError as error:
             raise InformixError(
                 f"Cannot inspect immutable schema transitions '{transitions}'"
             ) from error
-        matches: list[dict[str, object]] = []
-        for predecessor in predecessors:
-            record = self._read_immutable_head(os.path.join(transitions, predecessor))
-            if record is not None:
-                self._validate_immutable_record_header(
-                    record, "schema-transition", table.exposed_name
-                )
-            schema = record.get("schema") if record is not None else None
-            if isinstance(schema, dict) and schema.get("id") == schema_id:
-                matches.append(record)
-        if len(matches) > 1:
-            raise InformixError(
-                f"Duplicate immutable schema node {schema_id} for '{table.exposed_name}'"
-            )
-        return matches[0] if matches else None
+        match: dict[str, object] | None = None
+        try:
+            with os.scandir(transitions_descriptor) as entries:
+                for entry in entries:
+                    try:
+                        is_directory = entry.is_dir(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    if not is_directory:
+                        continue
+                    record = self._read_immutable_head(
+                        os.path.join(transitions, entry.name)
+                    )
+                    if record is not None:
+                        self._validate_immutable_record_header(
+                            record, "schema-transition", table.exposed_name
+                        )
+                    schema = record.get("schema") if record is not None else None
+                    if isinstance(schema, dict) and schema.get("id") == schema_id:
+                        if match is not None:
+                            raise InformixError(
+                                f"Duplicate immutable schema node {schema_id} for "
+                                f"'{table.exposed_name}'"
+                            )
+                        match = record
+        finally:
+            os.close(transitions_descriptor)
+        return match
 
-    @staticmethod
-    def _read_immutable_head(namespace: str) -> dict[str, object] | None:
+    def _read_immutable_head(self, namespace: str) -> dict[str, object] | None:
         head = os.path.join(namespace, "head")
         path = os.path.join(head, "record.json")
         try:
-            head_metadata = os.lstat(head)
-            if stat.S_ISLNK(head_metadata.st_mode) or not stat.S_ISDIR(
-                head_metadata.st_mode
-            ):
-                raise InformixError(f"Invalid Informix immutable head '{head}'")
-            metadata = os.lstat(path)
-            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            descriptor = _open_state_file(self._shared_state_location, path)
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                os.close(descriptor)
                 raise InformixError(f"Invalid Informix immutable record '{path}'")
             if metadata.st_size > _MAX_SHARED_STATE_BYTES:
+                os.close(descriptor)
                 raise InformixError(f"Informix immutable record '{path}' is too large")
-            with open(path, encoding="utf-8") as handle:
+            with os.fdopen(descriptor, encoding="utf-8") as handle:
                 value = json.load(handle)
         except FileNotFoundError:
             return None
@@ -2559,11 +3088,28 @@ class InformixLakeflowConnect(LakeflowConnect):
             "record_type": record_type,
         }
         token = secrets.token_hex(16)
-        candidate = os.path.join(namespace, f"candidate-{token}")
+        candidate_name = f"candidate-{token}"
+        candidate = os.path.join(namespace, candidate_name)
+        namespace_descriptor: int | None = None
+        candidate_descriptor: int | None = None
         try:
-            os.makedirs(namespace, mode=0o700, exist_ok=True)
-            os.mkdir(candidate, mode=0o700)
+            _makedirs_durable(self._shared_state_location, namespace)
+            namespace_descriptor = _open_state_directory(
+                self._shared_state_location, namespace
+            )
+            os.mkdir(candidate_name, mode=0o700, dir_fd=namespace_descriptor)
+            candidate_descriptor = os.open(
+                candidate_name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=namespace_descriptor,
+            )
         except OSError as error:
+            if candidate_descriptor is not None:
+                os.close(candidate_descriptor)
+            if namespace_descriptor is not None:
+                os.close(namespace_descriptor)
             raise InformixError(
                 f"Cannot create Informix immutable candidate '{candidate}'"
             ) from error
@@ -2574,14 +3120,27 @@ class InformixLakeflowConnect(LakeflowConnect):
                 raise InformixError(
                     f"Informix immutable record '{record_path}' is too large"
                 )
-            with open(record_path, "x", encoding="utf-8") as handle:
+            record_descriptor = os.open(
+                "record.json",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                mode=0o600,
+                dir_fd=candidate_descriptor,
+            )
+            with os.fdopen(record_descriptor, "w", encoding="utf-8") as handle:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
-            self._fsync_directory(candidate)
+            os.fsync(candidate_descriptor)
+            os.close(candidate_descriptor)
+            candidate_descriptor = None
             try:
-                os.rename(candidate, os.path.join(namespace, "head"))
-                self._fsync_directory(namespace)
+                os.rename(
+                    candidate_name,
+                    "head",
+                    src_dir_fd=namespace_descriptor,
+                    dst_dir_fd=namespace_descriptor,
+                )
+                os.fsync(namespace_descriptor)
                 return record
             except OSError as error:
                 if error.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
@@ -2597,8 +3156,14 @@ class InformixLakeflowConnect(LakeflowConnect):
                 f"Cannot publish Informix immutable record at '{namespace}'"
             ) from error
         finally:
+            if candidate_descriptor is not None:
+                os.close(candidate_descriptor)
             try:
-                os.unlink(record_path)
+                if namespace_descriptor is not None:
+                    os.unlink(
+                        os.path.join(candidate_name, "record.json"),
+                        dir_fd=namespace_descriptor,
+                    )
             except FileNotFoundError:
                 pass
             except OSError:
@@ -2606,20 +3171,25 @@ class InformixLakeflowConnect(LakeflowConnect):
                     "Retained abandoned Informix immutable candidate: path=%s", candidate
                 )
             try:
-                os.rmdir(candidate)
+                if namespace_descriptor is not None:
+                    os.rmdir(candidate_name, dir_fd=namespace_descriptor)
             except FileNotFoundError:
                 pass
             except OSError:
                 logging.getLogger(__name__).warning(
                     "Retained abandoned Informix immutable candidate: path=%s", candidate
                 )
+            if namespace_descriptor is not None:
+                os.close(namespace_descriptor)
 
     @staticmethod
     def _validate_immutable_record_header(
         record: dict[str, object], expected_type: str, context: str
     ) -> None:
         if (
-            record.get("format_version") != _IMMUTABLE_STATE_VERSION
+            not isinstance(record.get("format_version"), int)
+            or isinstance(record.get("format_version"), bool)
+            or record.get("format_version") != _IMMUTABLE_STATE_VERSION
             or record.get("record_type") != expected_type
         ):
             raise InformixError(
@@ -2662,20 +3232,7 @@ class InformixLakeflowConnect(LakeflowConnect):
 
     @staticmethod
     def _fsync_directory(path: str) -> None:
-        try:
-            descriptor = os.open(path, os.O_RDONLY)
-        except OSError as error:
-            if error.errno in {errno.EINVAL, errno.ENOTSUP, errno.EACCES}:
-                return
-            raise
-        try:
-            try:
-                os.fsync(descriptor)
-            except OSError as error:
-                if error.errno not in {errno.EINVAL, errno.ENOTSUP}:
-                    raise
-        finally:
-            os.close(descriptor)
+        _fsync_directory_path(path)
 
     def _table_map(self, refresh: bool = False) -> dict[str, Table]:
         if self._tables is None or refresh:
