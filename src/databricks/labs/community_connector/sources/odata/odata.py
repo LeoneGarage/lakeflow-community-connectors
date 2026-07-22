@@ -25,6 +25,8 @@ Per-table options (allowlisted via externalOptionsAllowList):
     cursor_field          column to drive incremental reads; absent → snapshot
     select                comma-separated $select projection
     filter                additional $filter expression
+    filters_at            JSON object mapping contained segment names (or
+                          zero-based indices) to per-segment $filter expressions
     page_size             $top per request; unset → 1000 under the default
                           client-driven pagination (auto/skip/keyset need a
                           $top to size pages). Only pagination=nextlink leaves
@@ -91,14 +93,13 @@ from databricks.labs.community_connector.interface import LakeflowConnect
 from databricks.labs.community_connector.interface.supports_namespaces import (
     SupportsNamespaces,
 )
-
 # Contained navigation-property support lives in ``_contained.py`` to keep
 # this module under its line-count budget. Re-exported under the original
 # private names so the rest of this file can keep using them as before.
 from databricks.labs.community_connector.sources.odata._helpers import (
     DELETED_COL as _DELETED_COL,
     SEQUENCE_COL as _SEQUENCE_COL,
-    cursor_le as _cursor_le,
+    cursor_at_or_before_for_refilter as _cursor_at_or_before_for_refilter,
     cursor_max as _cursor_max,
     jsonify_complex_values as _jsonify_complex_values,
     max_or as _max_or,
@@ -138,6 +139,7 @@ from databricks.labs.community_connector.sources.odata._contained import (
     looks_like_iso8601 as _looks_like_iso8601,
     odata_literal as _odata_literal,
     odata_literal_typed as _odata_literal_typed,
+    parse_batch_size_cap as _parse_batch_size_cap,
     parse_contained_path as _parse_contained_path,
     resolve_segment_filters as _resolve_segment_filters,
     validate_page_size as _validate_page_size,
@@ -146,7 +148,6 @@ from databricks.labs.community_connector.sources.odata._contained import (
 from databricks.labs.community_connector.sources.odata._partition import (
     PartitionMixin,
 )
-
 
 # ---------------------------------------------------------------------------
 # EDM (CSDL) → Spark type mapping
@@ -1971,7 +1972,9 @@ class ODataLakeflowConnect(
         if "batch_ok" in off:
             self.__dict__["_batch_supported"] = bool(off["batch_ok"])
         if "batch_size_ok" in off:
-            self.__dict__["_batch_size_cap"] = int(off["batch_size_ok"])
+            self.__dict__["_batch_size_cap"] = _parse_batch_size_cap(
+                off["batch_size_ok"], "resume checkpoint"
+            )
         if off.get("expand_ok"):
             # PASS verdicts only — by design the offset never carries a fail
             # (see _merge_capability_caches), and a checkpoint poisoned with
@@ -2248,11 +2251,15 @@ class ODataLakeflowConnect(
             if skip_null and row.get(cursor_field) is None:
                 continue
             rec_cursor = effective(row)
-            # Chronological, not lexical (``_cursor_le``): a server that
+            # Chronological, not lexical: a server that
             # renders fractional seconds value-dependently puts ``…00.5Z``
             # lexically BEFORE ``…00Z`` — a raw ``<=`` would drop the newer
             # row the server correctly returned, permanently.
-            if since is not None and rec_cursor is not None and _cursor_le(rec_cursor, since):
+            if (
+                since is not None
+                and rec_cursor is not None
+                and _cursor_at_or_before_for_refilter(rec_cursor, since)
+            ):
                 continue
             records.append(row)
             if len(records) >= max_records:
@@ -3364,9 +3371,9 @@ class ODataLakeflowConnect(
         supported — the real seek then surfaces any genuine error) and records
         **nothing**, so the next seek re-probes instead of durably pinning the
         slower ``$skip`` walk on a momentary blip. Going through
-        :meth:`_http_get_once` (not a raw ``session.get``) means an expired
-        OAuth token is refreshed rather than misread as a ``401`` = "OR
-        unsupported"."""
+        :meth:`_http_get_once` (not a raw ``session.get``) means a 401/403 is
+        raised as an auth failure and caught by this probe rather than misread
+        as "OR unsupported"."""
         if len(order_keys) < 2:
             return True
         cached = self.__dict__.get("_or_filter_ok")
@@ -3687,16 +3694,17 @@ class ODataLakeflowConnect(
     def _http_get(
         self, session: requests.Session, url: str, method: str = "GET", **kwargs: Any
     ) -> requests.Response:
-        """GET (or other ``method``) with auth-aware 401/403 handling + transient-failure retry.
+        """GET (or other ``method``) with terminal auth handling and transient retries.
 
         ``method`` defaults to ``GET``; a ``POST`` (with ``json=``) routes the
-        ``$batch`` endpoint through the same throttle/transient/token-refresh
-        retry path as every read.
+        ``$batch`` endpoint through the same throttle/transient retry path as
+        every read.
 
         Outer loop retries on two classes of transient failure, both
         capped by ``retry_max_delay_seconds`` per attempt:
 
-        * **HTTP 429 / 503** — throttling or service unavailable.
+        * **HTTP 408 / 429 / 500 / 502 / 503 / 504** — timeout, throttling,
+          or transient server/proxy failure.
           Honours the ``Retry-After`` header when present (integer
           seconds or HTTP-date), otherwise exponential backoff
           (1, 2, 4, 8, 16 s …). After ``max_retries`` attempts, raises
@@ -3713,28 +3721,12 @@ class ODataLakeflowConnect(
           type with the attempt count appended; ``__cause__`` preserves
           the original traceback for triage.
 
-        Inner per-attempt logic (see ``_http_get_once``):
-
-        1. **Pre-emptive token refresh** — when the OAuth ``expires_in``
-           clock is past the recorded deadline (60 s safety buffer),
-           swap the bearer header *before* sending. Avoids a wasted
-           round-trip on long paginated reads straddling an expiry
-           boundary.
-        2. **Reactive token refresh** — 401 from the source + OAuth
-           refresh path is available → mint a fresh token and retry
-           once. A second 401 means the access token reached the server
-           but the principal lacks access (raise
-           :class:`PermissionError` immediately, no further retry).
-        3. **Actionable no-refresh-path failure** — 401 or 403 with no
-           automatic refresh configured (bearer, basic, api_key, or
-           OAuth without a refresh-issuing token endpoint). Raise
-           :class:`PermissionError` whose message names the specific
-           connection options the operator should check.
-
-        Retries happen between attempts of the inner logic, so a token
-        refresh and a throttle backoff compose cleanly: refresh →
-        request → 429 → sleep → next attempt's pre-emptive refresh
-        check picks up where we left off.
+        ``_http_get_once`` enforces same-origin redirects and raises an
+        actionable :class:`PermissionError` immediately on 401/403. The
+        connector never mints or refreshes tokens: Unity Catalog refreshes
+        OAuth tokens server-side and injects one at query start. Consequently,
+        a token that expires mid-read terminates that read; the next query
+        receives a fresh token. Auth failures are not retried here.
         """
         attempts = self.max_retries + 1
         for attempt in range(attempts):

@@ -14,8 +14,7 @@ exercise the connector's CDC, pagination, and discovery paths:
     terms; subsequent terms are tie-breakers.
   * ``$top`` — page-size cap on the response.
   * ``$skip`` — offset into the filtered+sorted list.
-  * ``$select`` — projects the named columns (passed through unchanged
-    in the response).
+  * ``$select`` — projects the named columns; ``*`` keeps all columns.
   * ``@odata.nextLink`` — set on the response whenever the current
     slice does not exhaust the filtered result set. The link encodes
     ``$skip=<next_offset>`` so the connector's ``urljoin``-based
@@ -40,10 +39,8 @@ import copy
 import json
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
-
-from requests.models import PreparedRequest, Response
 
 from databricks.labs.community_connector.source_simulator.cassette import (
     ResponseRecord,
@@ -51,7 +48,7 @@ from databricks.labs.community_connector.source_simulator.cassette import (
 from databricks.labs.community_connector.source_simulator.interceptor import (
     response_from_record,
 )
-
+from requests.models import PreparedRequest, Response
 
 # Mirror Northwind's server-side response cap. Real OData servers (per
 # the v4 spec) are free to ignore the client's ``$top`` and impose
@@ -97,6 +94,9 @@ def serve_entity_set(prep: PreparedRequest, spec: Any, corpus: Any) -> Response:
 
     total = len(records)
     page = records[skip : skip + top]
+    select = query.get("$select")
+    if select:
+        page = [_apply_select(record, select) for record in page]
     # Inject ``@odata.etag`` per record so the per-field diff in the
     # validator matches live (Northwind emits one on every entity).
     # The connector strips all ``@odata.*`` keys before yielding, so
@@ -124,6 +124,24 @@ def serve_entity_set(prep: PreparedRequest, spec: Any, corpus: Any) -> Response:
         url=prep.url,
     )
     return response_from_record(rec, prep)
+
+
+# ---------------------------------------------------------------------------
+# $select
+# ---------------------------------------------------------------------------
+
+
+def _apply_select(record: Dict[str, Any], select: str) -> Dict[str, Any]:
+    """Return the structural properties requested by an OData ``$select``.
+
+    Unknown properties are omitted, matching normal OData projection
+    behavior. ``*`` selects every structural property. Protocol annotations
+    are added separately by :func:`serve_entity_set`.
+    """
+    fields = [field.strip() for field in select.split(",") if field.strip()]
+    if "*" in fields:
+        return dict(record)
+    return {field: record[field] for field in fields if field in record}
 
 
 # ---------------------------------------------------------------------------

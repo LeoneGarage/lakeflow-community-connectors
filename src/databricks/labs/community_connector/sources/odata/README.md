@@ -125,7 +125,7 @@ w.api_client.do(
             "token": "<bearer-token>",
             "externalOptionsAllowList": (
                 "namespace,cursor_field,select,filter,"
-                "filter_at_*,page_size,max_records_per_batch,cursor_nulls,"
+                "filters_at,page_size,max_records_per_batch,cursor_nulls,"
                 "delta_tracking,expand_contained,num_partitions,pagination,"
                 "exclude_ancestor_columns,cursor_lookback_seconds,"
                 "cursor_lookback_factor,cursor_lookback_max_seconds,"
@@ -300,8 +300,8 @@ links to its detail subsection.
 | `namespace` | — | Selects the OData schema (e.g. `Sales`, `HR`) when two schemas declare an entity set with the same name. The schema's `Alias` is accepted interchangeably. |
 | `cursor_field` | — | Drives incremental reads (`cursor gt <last>` per batch). Omit for snapshot. On contained paths the column may live on the leaf or an ancestor — see [Cursor-based incremental on contained tables](#cursor-based-incremental-on-contained-tables). |
 | [`select`](#select) | all | `$select` projection, leaf-scoped on contained paths. |
-| [`filter`](#filter-and-filter_at_segment) | — | Extra `$filter` expression, applied to the leaf segment. |
-| [`filter_at_<segment>` / `filter_at_<idx>`](#filter-and-filter_at_segment) | — | Per-segment `$filter` for contained paths. |
+| [`filter`](#filter-and-filters_at) | — | Extra `$filter` expression, applied to the leaf segment. |
+| [`filters_at`](#filter-and-filters_at) | — | JSON object mapping segment names or zero-based indices to per-segment `$filter` expressions. |
 | [`page_size`](#page_size) | `1000` | Per-response row budget (`$top`), distributed across `$expand` levels. |
 | [`max_records_per_batch`](#max_records_per_batch) | `10000` | Per-batch cap on emitted rows, with resumable park state. |
 | [`cursor_nulls`](#cursor_nulls) | `coalesce` | How cursor reads handle rows whose `cursor_field` is null. |
@@ -330,24 +330,28 @@ the derived Spark schema is filtered to the same leaf columns
 Must keep the leaf's primary-key columns and any leaf-level
 `cursor_field` (curated error otherwise).
 
-### filter and filter_at_&lt;segment&gt;
+### filter and filters_at
 
 `filter` is an extra OData `$filter` expression applied to the **leaf
 segment** in both modes — the leaf URL in N+1 mode
 (`expand_contained=false`), the innermost `$expand(...)` clause in
-expand mode. It is equivalent to `filter_at_<leaf-segment>` and
-AND-composes with it if both are set.
+expand mode. It AND-composes with a leaf entry in `filters_at` if both
+are set.
 
-`filter_at_<segment>` / `filter_at_<idx>` places a `$filter` on a
-specific level of a contained path:
+`filters_at` is a JSON object that places `$filter` expressions on
+specific levels of a contained path. For example:
+
+```json
+{"Instances": "Id eq 5", "Projects": "Status eq 'active'"}
+```
 
 - **N+1 mode**: the ancestor walk at that level is pruned to matching
   rows, cascading the savings down to every child.
 - **Expand mode**: the filter is injected inside the corresponding
   `$expand(...)` clause per OData v4 §5.1.1.6.
-- Two equivalent forms: by segment name (`filter_at_Instances=Id eq 5`
-  — must match a segment in the contained path) or by zero-based index
-  (`filter_at_0=Id eq 5`). Index wins on conflict.
+- Keys may be segment names (matched case-insensitively) or zero-based
+  indices (`{"0": "Id eq 5"}`). Index wins when both forms target the
+  same segment.
 - Composes with cursor filters (AND-ed at the cursor's segment) and
   with the `filter` option (AND-ed at the leaf in N+1 mode, AND-ed at
   the top in expand mode).
@@ -954,7 +958,7 @@ non-partitionable tables (they fall back to single-task reads).
   `eq null` probe so a null-cursor parent *inserted mid-stream* is
   caught too (best-effort: a server rejecting the `eq null` filter
   keeps the first-batch-only check). Exclude them with
-  `filter_at_<top>` (`<cursor> ne null`), fix the data, or read
+  a top-segment `filters_at` entry (`<cursor> ne null`), fix the data, or read
   serially.
 - **The fence probe self-checks `$orderby` honoring**: the per-trigger
   watermark comes from one `$top=1&$orderby=<cursor> desc` request,
@@ -1382,7 +1386,7 @@ detects this and falls back to whatever cursor/snapshot config is set.
   PK-only upserts. Changing `delta_tracking` on an existing table
   needs a full refresh of that flow. The same rule applies generally:
   **changing any option that re-shapes the read** (`cursor_field` or
-  its level, `filter_at_<segment>`, `namespace`,
+  its level, `filters_at`, `namespace`,
   `expand_contained`) **over an existing streaming checkpoint needs a
   full refresh** — the parked resume state (cursor watermarks,
   mid-walk checkpoints, continuation links) was written under the old
@@ -1659,7 +1663,7 @@ under later parents during resume, the connector:
 
 When a contained path's intermediate segments carry filterable
 properties (status flags, region codes, soft-delete columns), use
-`filter_at_<segment>` to prune the walk before the leaf fetch — this
+`filters_at` to prune the walk before the leaf fetch — this
 cascades the savings down to every child.
 
 ```python
@@ -1668,9 +1672,11 @@ cascades the savings down to every child.
     "table": {
         "source_table": "Parents__Children__Notes",
         "table_configuration": {
-            "filter_at_Parents": "Region eq 'EMEA'",
-            "filter_at_Children": "Archived eq false",
-            "filter": "Pinned eq true",  # equivalent to filter_at_Notes
+            "filters_at": (
+                '{"Parents": "Region eq \'EMEA\'", '
+                '"Children": "Archived eq false"}'
+            ),
+            "filter": "Pinned eq true",
         },
     }
 }
@@ -1679,7 +1685,7 @@ cascades the savings down to every child.
 In N+1 mode this turns three coarse walks into three filtered walks
 (the connector only enumerates Parents matching `Region eq 'EMEA'`,
 only fetches Children where `Archived eq false`, etc.). In
-`expand_contained=true` mode each `filter_at_<segment>` becomes a
+`expand_contained=true` mode each `filters_at` entry becomes a
 filter inside the corresponding `$expand(...)` clause per OData v4
 §5.1.1.6.
 

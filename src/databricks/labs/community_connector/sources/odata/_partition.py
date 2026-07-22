@@ -65,13 +65,25 @@ from databricks.labs.community_connector.sources.odata._contained import (
 )
 from databricks.labs.community_connector.sources.odata._helpers import (
     DELETED_COL as _DELETED_COL,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
     SEQUENCE_COL as _SEQUENCE_COL,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
+    cursor_at_or_before_for_refilter as _cursor_at_or_before_for_refilter,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
     cursor_le as _cursor_le,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
     jsonify_complex_values as _jsonify_complex_values,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
     max_or as _max_or,
+)
+from databricks.labs.community_connector.sources.odata._helpers import (
     pad_row_to_fields,
 )
-
 
 _DEFAULT_NUM_PARTITIONS = 4
 _OPT_NUM_PARTITIONS = "num_partitions"
@@ -714,7 +726,7 @@ class PartitionMixin(SupportsPartitionedStream):
                 self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
                 if cursor_level == len(segments) - 1:
                     # Leaf-cursor mode: filter per row by ``cursor gt
-                    # cursor_lower`` — chronological via ``_cursor_le``,
+                    # cursor_lower`` — chronological comparison,
                     # never lexical (``.5Z`` vs ``Z`` renderings invert
                     # under string order).
                     rec = row.get(cursor_field)
@@ -723,7 +735,7 @@ class PartitionMixin(SupportsPartitionedStream):
                     if (
                         cursor_lower is not None
                         and rec is not None
-                        and _cursor_le(rec, cursor_lower)
+                        and _cursor_at_or_before_for_refilter(rec, cursor_lower)
                     ):
                         continue
                 else:

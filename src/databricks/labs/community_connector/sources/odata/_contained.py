@@ -42,7 +42,7 @@ from databricks.labs.community_connector.sources.odata._helpers import (
     parse_iso8601,
 )
 from databricks.labs.community_connector.sources.odata._helpers import (
-    cursor_le as _cursor_le,
+    cursor_at_or_before_for_refilter as _cursor_at_or_before_for_refilter,
 )
 from databricks.labs.community_connector.sources.odata._helpers import (
     cursor_max as _cursor_max,
@@ -221,6 +221,33 @@ class _CursorProbePreflightUnavailable(Exception):
 # triggers an adaptive shrink (see ``_post_batch_adaptive``), and the discovered
 # working size is recorded in the offset as ``batch_size_ok``.
 _BATCH_MAX_OPS = 1000
+
+
+def parse_batch_size_cap(raw: Any, origin: str) -> int:
+    """Validate a persisted adaptive ``$batch`` chunk cap.
+
+    Connector-written values are positive integers. Checkpoints and the
+    process/file capability cache are external persistence boundaries, so a
+    corrupt or hand-edited value gets an actionable error instead of a bare
+    ``int()`` failure or a lossy coercion.
+    """
+    if isinstance(raw, bool):
+        raise ValueError(
+            f"Invalid batch_size_ok in {origin}: {raw!r}. Expected a positive integer (>= 1)."
+        )
+    try:
+        size = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Invalid batch_size_ok in {origin}: {raw!r}. Expected a positive integer (>= 1)."
+        ) from None
+    if size < 1 or isinstance(raw, float) and not raw.is_integer():
+        raise ValueError(
+            f"Invalid batch_size_ok in {origin}: {raw!r}. Expected a positive integer (>= 1)."
+        )
+    return size
+
+
 # On a "too many parts" rejection, shrink the working chunk size by this factor
 # and retry, up to ``_BATCH_OVERFLOW_RETRIES`` times before falling back to a
 # plain per-leaf-parent GET. The budget is sized so the geometric shrink from
@@ -446,7 +473,15 @@ _LITERAL_ESCAPES = (
 
 def _escape_literal_text(s: str) -> str:
     """Percent-encode URL-reserved characters in generated literal text
-    (see :data:`_LITERAL_ESCAPES`)."""
+    (see :data:`_LITERAL_ESCAPES`).
+
+    This is deliberately not a general OData-syntax sanitizer. Spaces are
+    encoded by the HTTP client's URL preparation; apostrophes in string
+    values are doubled before this helper is called; and parentheses or
+    apostrophes cannot occur in a conforming bare Guid/numeric/Boolean/date/
+    time literal. The typed bare path is selected from CSDL, not from arbitrary
+    user-authored filter text.
+    """
     for raw, enc in _LITERAL_ESCAPES:
         s = s.replace(raw, enc)
     return s
@@ -969,8 +1004,7 @@ def resolve_segment_filters(
     table_options: dict[str, str] | None,
     segments: list[str],
 ) -> dict[int, str]:
-    """Parse ``filter_at_<segment>`` and ``filter_at_<idx>`` table-option
-    keys into a ``{level: filter_string}`` mapping.
+    """Parse ``filters_at`` into a ``{level: filter_string}`` mapping.
 
     Per-segment filters let the user push a ``$filter`` to the exact
     walk level (or ``$expand`` clause) that owns the property. Without
@@ -978,58 +1012,80 @@ def resolve_segment_filters(
     (leaf for N+1 mode, top for expand mode), leaving intermediate
     levels unfiltered and forcing a full fan-out.
 
-    Two equivalent key forms are accepted:
+    ``filters_at`` is a JSON object whose keys use either form:
 
-    * **By segment name** — ``filter_at_Instances=Id eq 5`` matches the
+    * **By segment name** — ``{"Instances": "Id eq 5"}`` matches the
       segment literally as it appears in the contained path / URL.
-    * **By zero-based index** — ``filter_at_0=Id eq 5`` matches the
-      level positionally. Useful when nav-property names repeat at
-      different depths.
+    * **By zero-based index** — ``{"0": "Id eq 5"}`` matches the level
+      positionally. Useful when nav-property names repeat at different depths.
 
     Both forms may be set; the **index form wins on conflict**, since
     it's the more explicit of the two. Unknown segment names and
     out-of-range indices raise ``ValueError`` immediately so typos
     don't silently produce a full-fan-out walk.
+
+    Legacy ``filter_at_<segment>`` / ``filter_at_<idx>`` keys remain accepted
+    for direct callers, but the UC allowlist exposes only ``filters_at``.
     """
     if not table_options:
         return {}
+    raw_filters = table_options.get("filters_at")
+    filters: dict[str, str] = {}
+    if raw_filters is not None:
+        try:
+            decoded = json.loads(raw_filters)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "Invalid table option filters_at: expected a JSON object "
+                'such as {"Instances": "Id eq 5"}.'
+            ) from exc
+        if not isinstance(decoded, dict):
+            raise ValueError("Invalid table option filters_at: expected a JSON object.")
+        for key, value in decoded.items():
+            if not isinstance(key, str) or not key:
+                raise ValueError(
+                    "Invalid table option filters_at: every key must be a non-empty string."
+                )
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"Invalid table option filters_at[{key!r}]: filter must be a "
+                    "non-empty string."
+                )
+            filters[key] = value
+
+    # Backward compatibility for direct callers. These dynamic keys cannot be
+    # represented by UC's exact-match external-options allowlist.
+    for key, value in table_options.items():
+        if key.startswith("filter_at_"):
+            filters.setdefault(key[len("filter_at_") :], value)
+
     out: dict[int, str] = {}
-    # Lakeflow Connect lowercases option keys before forwarding them
-    # to ``read_table``, so a pipeline-config ``filter_at_Instances``
-    # arrives here as ``filter_at_instances``. Match the segment-name
-    # suffix case-insensitively against the discovered path so the
-    # pipeline config doesn't have to special-case the framework's
-    # normalisation rules. Values aren't normalised — only keys — so
-    # the filter expression itself is preserved verbatim.
+    # Match segment names case-insensitively against the discovered path.
+    # This also preserves compatibility with legacy dynamic option keys,
+    # which Lakeflow lowercases before forwarding them to ``read_table``.
     seg_to_idx = {s.lower(): i for i, s in enumerate(segments)}
     # Pass 1: name-keyed. Index-keyed entries override these on
     # conflict, so process them after.
-    for key, value in table_options.items():
-        if not key.startswith("filter_at_"):
-            continue
-        suffix = key[len("filter_at_") :]
+    for suffix, value in filters.items():
         if suffix.isdigit():
             continue
         idx = seg_to_idx.get(suffix.lower())
         if idx is None:
             raise ValueError(
-                f"Invalid table option {key}={value!r}: segment "
+                f"Invalid table option filters_at[{suffix!r}]={value!r}: segment "
                 f"{suffix!r} not in path {segments!r}. Valid "
                 f"segments (case-insensitive): {segments}."
             )
         out[idx] = value
     # Pass 2: index-keyed (overrides name form when both target the
     # same level).
-    for key, value in table_options.items():
-        if not key.startswith("filter_at_"):
-            continue
-        suffix = key[len("filter_at_") :]
+    for suffix, value in filters.items():
         if not suffix.isdigit():
             continue
         idx = int(suffix)
         if not 0 <= idx < len(segments):
             raise ValueError(
-                f"Invalid table option {key}={value!r}: index {idx} "
+                f"Invalid table option filters_at[{suffix!r}]={value!r}: index {idx} "
                 f"out of range for path with {len(segments)} segments "
                 f"(valid: 0..{len(segments) - 1})."
             )
@@ -1892,7 +1948,7 @@ class ContainedNavMixin:
         """Yield every ancestor key chain (len = len(segments) - 1) reaching
         the leaf. Each level fetched with ``$select=<pks>``; user ``filter``
         not forwarded — that string lands at the leaf URL only. To filter
-        an ancestor walk use ``filter_at_<segment>`` / ``filter_at_<idx>``.
+        an ancestor walk use the corresponding ``filters_at`` entry.
 
         ``top_parent_rows`` lets a partitioned caller supply a pre-
         discovered subset of level-0 rows; when provided, the level-0
@@ -1994,7 +2050,7 @@ class ContainedNavMixin:
         could return a non-newest row and under-report — that residual
         server-dependence is why ``cursor_probe`` is opt-in (default off):
         enable it only where the source is known to honour inner-``$expand``
-        options. A ``filter_at_<leaf>`` segment filter is deliberately NOT
+        options. A leaf-segment ``filters_at`` entry is deliberately NOT
         applied in the probe (it has no inner ``$filter``); at worst that
         over-fetches a parent whose recent changes the filter excludes — the
         hydrate then emits nothing, never a miss.
@@ -2784,8 +2840,8 @@ class ContainedNavMixin:
         auth-aware attempt (``_http_get_once``, not the retrying ``_http_get``):
         a capability probe must fail FAST, not stall every ``auto`` read behind
         the transient-retry backoff loop — and routing through the auth-aware
-        path means an expired OAuth token is refreshed rather than misread as
-        "no ``$batch``"."""
+        path means a 401/403 is surfaced as an auth failure rather than misread
+        as "no ``$batch``"."""
         if (start_offset or {}).get("batch_ok"):
             return True
         cached = self.__dict__.get("_batch_supported")
@@ -2801,7 +2857,9 @@ class ContainedNavMixin:
             self.__dict__["_batch_supported"] = cached
             cap = self._cached_capability("batch_size_ok")
             if cap is not None and "_batch_size_cap" not in self.__dict__:
-                self.__dict__["_batch_size_cap"] = int(cap)
+                self.__dict__["_batch_size_cap"] = parse_batch_size_cap(
+                    cap, "shared capability cache"
+                )
             return cached
         # Probe with the SAME shape the real hydrate sends: no ``$top`` (the
         # sub-requests deliberately strip it and let the server drive paging
@@ -3138,7 +3196,7 @@ class ContainedNavMixin:
         """Direct-navigation URL for the cross-check: the child collection at
         ``lvl + 1`` under ``chain``, ``$top=1``, carrying the SAME ``$filter``
         the expand's inner clause applied at that level (cursor filter /
-        ``filter_at_<segment>`` / the leaf ``filter``) so a legitimately
+        ``filters_at`` / the leaf ``filter``) so a legitimately
         filtered-empty level isn't misread as the server ignoring ``$expand``."""
         segment_filters = resolve_segment_filters(table_options, segments)
         is_leaf = (lvl + 1) == len(segments) - 1
@@ -4929,12 +4987,12 @@ class ContainedNavMixin:
                     if skip_null and row.get(cursor_field) is None:
                         continue
                     rec_cursor = effective(row)
-                    # Chronological, not lexical (``_cursor_le``) — see the
+                    # Chronological, not lexical — see the
                     # flat re-filter in ``_read_incremental``.
                     if (
                         chain_since is not None
                         and rec_cursor is not None
-                        and _cursor_le(rec_cursor, chain_since)
+                        and _cursor_at_or_before_for_refilter(rec_cursor, chain_since)
                     ):
                         continue
                     self._tag_with_ancestor_fks(row, segments, chain, fk_columns)
@@ -5126,12 +5184,12 @@ class ContainedNavMixin:
                         if skip_null and row.get(cursor_field) is None:
                             continue
                         rec_cursor = effective(row)
-                        # Chronological, not lexical (``_cursor_le``) — see
+                        # Chronological, not lexical — see
                         # the flat re-filter in ``_read_incremental``.
                         if (
                             since is not None
                             and rec_cursor is not None
-                            and _cursor_le(rec_cursor, since)
+                            and _cursor_at_or_before_for_refilter(rec_cursor, since)
                         ):
                             continue
                         clean = {k: v for k, v in row.items() if not k.startswith("@odata.")}
@@ -5221,7 +5279,7 @@ class ContainedNavMixin:
             f"whose {cursor_field} equals the prior offset (server did not "
             f"honor `{cursor_field} gt <since>`). Fix the cursor at the "
             f"source (non-nullable, strictly monotonic), exclude offending "
-            f"rows with `filter`/`filter_at_<segment>` (or drop null-cursor "
+            f"rows with `filter`/`filters_at` (or drop null-cursor "
             f"rows entirely with cursor_nulls=ignore), or pick a different "
             f"cursor."
         )

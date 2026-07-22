@@ -75,6 +75,12 @@ connection:
             URL, SAP XSUAA, a Databricks App's ``/oidc/v1/token``, ...).
             For the ``u2m`` browser flow also supply
             ``authorization_endpoint``.
+        - name: authorization_endpoint
+          type: string
+          required: false
+          description: >
+            OAuth authorization endpoint URL required for the ``u2m``
+            browser flow. Not needed for ``m2m`` client credentials.
         - name: oauth_scope
           type: string
           required: false
@@ -109,6 +115,15 @@ connection:
       description: >
         OData v4 service root URL, e.g.
         ``https://services.odata.org/V4/Northwind/Northwind.svc/``.
+
+    - name: auth_type
+      type: string
+      required: false
+      description: >
+        Authentication method used by the connector. Set to ``bearer``,
+        ``basic``, or ``api_key`` to match the selected authentication
+        method. Omit for Unity Catalog OAuth, which injects an
+        ``access_token`` at query time.
 
     - name: timeout_seconds
       type: string
@@ -184,4 +199,4 @@ connection:
         high-throughput pipelines.
 
 # Per-table options the pipeline may pass through.
-external_options_allowlist: "namespace,cursor_field,select,filter,filter_at_*,page_size,max_records_per_batch,cursor_nulls,delta_tracking,expand_contained,num_partitions,pagination,exclude_ancestor_columns,cursor_lookback_seconds,cursor_lookback_factor,cursor_lookback_max_seconds,cursor_lookback_dedup,cursor_probe,contained_fetch"
+external_options_allowlist: "namespace,cursor_field,select,filter,filters_at,page_size,max_records_per_batch,cursor_nulls,delta_tracking,expand_contained,num_partitions,pagination,exclude_ancestor_columns,cursor_lookback_seconds,cursor_lookback_factor,cursor_lookback_max_seconds,cursor_lookback_dedup,cursor_probe,contained_fetch"

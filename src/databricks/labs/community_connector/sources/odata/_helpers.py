@@ -300,6 +300,29 @@ def cursor_le(a: Any, b: Any) -> bool:
     return not cursor_newer(a, b)
 
 
+def cursor_at_or_before_for_refilter(a: Any, b: Any) -> bool:
+    """Whether a returned row is provably at or before its watermark.
+
+    Client-side re-filters must fail open when a cursor column changes
+    semantic shape mid-stream. For example, an ISO timestamp and a numeric
+    watermark are not meaningfully orderable even if both arrived as strings;
+    applying the raw-text fallback used by :func:`cursor_newer` could silently
+    drop the row. Values are comparable here only when both are timestamps,
+    both are numeric (including number/string bridges), or both are raw values.
+    """
+
+    def family(value: Any) -> str:
+        if isinstance(cursor_sort_key(value), datetime):
+            return "datetime"
+        if _as_exact_number(value) is not None:
+            return "numeric"
+        return "raw"
+
+    if family(a) != family(b):
+        return False
+    return cursor_le(a, b)
+
+
 def cursor_max(values: Any) -> Any:
     """Max of an iterable of non-``None`` cursor values in cursor order.
     Pairwise via :func:`cursor_newer` (not ``max(key=…)``) so a shape-mixed
