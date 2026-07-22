@@ -346,7 +346,7 @@ def decode_packed_decimal(data: bytes, precision: int, scale: int) -> Decimal | 
     with localcontext() as context:
         context.prec = max(precision + 8, 46)
         value = sum(
-            Decimal(digit) * (Decimal(100) ** (exponent - index))
+            Decimal(digit) * (Decimal(100) ** (exponent - index - 1))
             for index, digit in enumerate(digits)
         )
         if not positive:

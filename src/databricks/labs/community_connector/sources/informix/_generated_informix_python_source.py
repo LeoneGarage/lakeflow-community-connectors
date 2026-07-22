@@ -953,7 +953,7 @@ def register_lakeflow_source(spark):
         with localcontext() as context:
             context.prec = max(precision + 8, 46)
             value = sum(
-                Decimal(digit) * (Decimal(100) ** (exponent - index))
+                Decimal(digit) * (Decimal(100) ** (exponent - index - 1))
                 for index, digit in enumerate(digits)
             )
             if not positive:

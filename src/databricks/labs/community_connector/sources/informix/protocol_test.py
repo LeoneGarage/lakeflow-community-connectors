@@ -163,8 +163,15 @@ class FrameTests(unittest.TestCase):
 
     def test_packed_decimal_positive_negative_and_null(self):
         column = ColumnDescriptor("d", "DECIMAL", precision=4, scale=2)
-        self.assertEqual(decode_value(memoryview(b"\xc0\x0c\x22"), column), (Decimal("12.34"), 3))
-        self.assertEqual(decode_value(memoryview(b"\x3f\x57\x42"), column), (Decimal("-12.34"), 3))
+        self.assertEqual(decode_value(memoryview(b"\xc1\x0c\x22"), column), (Decimal("12.34"), 3))
+        self.assertEqual(decode_value(memoryview(b"\x3e\x57\x42"), column), (Decimal("-12.34"), 3))
+        self.assertEqual(
+            decode_value(
+                memoryview(b"\xc2\x02\x32\x00\x00\x00"),
+                ColumnDescriptor("amount", "DECIMAL", precision=10, scale=2),
+            ),
+            (Decimal("250.00"), 6),
+        )
         self.assertEqual(decode_value(memoryview(b"\0\0\0"), column), (None, 3))
 
     def test_open_record_bound_excludes_committed_and_handles_interleaving(self):
