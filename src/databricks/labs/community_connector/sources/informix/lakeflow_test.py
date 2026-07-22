@@ -254,6 +254,187 @@ class LakeflowContractTests(unittest.TestCase):
         sleep.assert_called_once_with(0.25)
         self.assertEqual(next_delay, 2.0)
 
+    def test_production_bridge_defers_connection_until_first_operation(self):
+        transport = mock.Mock()
+        transport.execute.return_value = []
+        options = {
+            "hostname": "host",
+            "port": "9088",
+            "database": "demo",
+            "user": "user",
+            "password": "password",
+            "server": "server",
+            "encrypt": "true",
+        }
+        with mock.patch.object(
+            informix_module, "InformixSqliClient", return_value=transport
+        ):
+            bridge = PurePythonInformixBridge(options)
+            transport.connect.assert_not_called()
+            self.assertEqual(bridge.list_tables(), [])
+
+        transport.connect.assert_called_once_with()
+
+    def test_production_bridge_connect_is_single_flight(self):
+        transport = mock.Mock()
+        transport.execute.return_value = []
+        entered = threading.Event()
+        release = threading.Event()
+
+        def connect():
+            entered.set()
+            release.wait(timeout=2)
+
+        transport.connect.side_effect = connect
+        with mock.patch.object(
+            informix_module, "InformixSqliClient", return_value=transport
+        ):
+            bridge = PurePythonInformixBridge(
+                {
+                    "hostname": "host",
+                    "port": "9088",
+                    "database": "demo",
+                    "user": "user",
+                    "password": "password",
+                    "server": "server",
+                    "encrypt": "true",
+                }
+            )
+
+        first = threading.Thread(target=bridge.list_tables)
+        second = threading.Thread(target=bridge.list_tables)
+        first.start()
+        self.assertTrue(entered.wait(timeout=1))
+        second.start()
+        release.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        transport.connect.assert_called_once_with()
+
+    def test_shared_state_validation_is_single_flight_per_process(self):
+        location = self._shared_state.name
+        coordinator = informix_module._STATE_VALIDATION_COORDINATOR
+        coordinator.validated.discard(location)
+        coordinator.claims.clear()
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def probe(_location):
+            calls.append(_location)
+            entered.set()
+            release.wait(timeout=2)
+
+        failures = []
+
+        def validate():
+            try:
+                _validate_shared_state_filesystem(location)
+            except BaseException as error:
+                failures.append(error)
+
+        with mock.patch.object(
+            informix_module, "_probe_shared_state_filesystem", side_effect=probe
+        ):
+            first = threading.Thread(target=validate)
+            second = threading.Thread(target=validate)
+            first.start()
+            self.assertTrue(entered.wait(timeout=1))
+            second.start()
+            release.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+
+        self.assertEqual(calls, [location])
+        self.assertEqual(failures, [])
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+
+    def test_shared_state_validation_retries_transient_failure(self):
+        location = self._shared_state.name
+        coordinator = informix_module._STATE_VALIDATION_COORDINATOR
+        coordinator.validated.discard(location)
+        coordinator.claims.clear()
+
+        with mock.patch.object(
+            informix_module,
+            "_probe_shared_state_filesystem",
+            side_effect=[OSError("transient"), None],
+        ) as probe:
+            with self.assertRaisesRegex(OSError, "transient"):
+                _validate_shared_state_filesystem(location)
+            _validate_shared_state_filesystem(location)
+
+        self.assertEqual(probe.call_count, 2)
+
+    def test_shared_state_validation_retires_expired_owner(self):
+        location = self._shared_state.name
+        coordinator = informix_module._STATE_VALIDATION_COORDINATOR
+        coordinator.validated.discard(location)
+        coordinator.claims.clear()
+        timeout = 0.1
+        coordinator.claims[location] = (
+            object(),
+            informix_module.time.monotonic() - 1,
+        )
+
+        with mock.patch.object(
+            informix_module, "_probe_shared_state_filesystem"
+        ) as probe:
+            _validate_shared_state_filesystem(location, timeout_seconds=timeout)
+
+        probe.assert_called_once_with(location)
+        self.assertNotIn(location, coordinator.claims)
+
+    def test_shared_state_validation_waits_for_full_owner_lease(self):
+        location = self._shared_state.name
+        coordinator = informix_module._STATE_VALIDATION_COORDINATOR
+        coordinator.validated.discard(location)
+        coordinator.claims.clear()
+        coordinator.claims[location] = (object(), 0.19)
+
+        with mock.patch.object(
+            informix_module.time, "monotonic", side_effect=[0.11, 0.20]
+        ), mock.patch.object(coordinator.condition, "wait") as wait, mock.patch.object(
+            informix_module, "_probe_shared_state_filesystem"
+        ) as probe:
+            _validate_shared_state_filesystem(location, timeout_seconds=0.1)
+
+        wait.assert_called_once()
+        self.assertGreater(wait.call_args.kwargs["timeout"], 0.07)
+        probe.assert_called_once_with(location)
+        self.assertFalse(coordinator.claims)
+
+    def test_shared_state_validation_module_state_is_pickle_safe(self):
+        coordinator = informix_module._STATE_VALIDATION_COORDINATOR
+        restored = pickle.loads(pickle.dumps(coordinator))
+
+        self.assertFalse(restored.validated)
+        self.assertFalse(restored.claims)
+
+    def test_generated_source_class_survives_cloudpickle_when_available(self):
+        try:
+            from pyspark import cloudpickle
+        except ImportError:
+            try:
+                import cloudpickle
+            except ImportError:
+                self.skipTest("cloudpickle is not installed in the unit environment")
+        generated = importlib.import_module(
+            "databricks.labs.community_connector.sources.informix."
+            "_generated_informix_python_source"
+        )
+
+        registry = mock.Mock()
+        spark = types.SimpleNamespace(dataSource=registry)
+        generated.register_lakeflow_source(spark)
+        source_class = registry.register.call_args.args[0]
+
+        cloudpickle.loads(cloudpickle.dumps(source_class))
+
     def test_shared_state_location_is_mandatory_and_absolute(self):
         with self.assertRaisesRegex(ValueError, "cdc.shared.state.location"):
             InformixLakeflowConnect({"database": "demo"})
@@ -1017,7 +1198,7 @@ class LakeflowContractTests(unittest.TestCase):
         connector.read_table_metadata("app.orders", {})
         connector.read_table_metadata("app.audit", {})
 
-        self.assertEqual(counts, {"list": 1, "get": 2})
+        self.assertEqual(counts, {"list": 0, "get": 2})
 
     def test_snapshot_bridge_passes_incremental_result_byte_bound(self):
         class SnapshotTransport:
@@ -1235,6 +1416,8 @@ class LakeflowContractTests(unittest.TestCase):
         bridge._describe_table("app", "orders")
 
         self.assertIn("x.tabid=i.tabid", bridge.transport.sql[1])
+        self.assertIn("t.tabtype = 'T'", bridge.transport.sql[0])
+        self.assertIn("t.tabtype='T'", bridge.transport.sql[1])
 
     def test_live_catalog_requires_positive_table_incarnation(self):
         class CatalogTransport:
@@ -1278,6 +1461,14 @@ class LakeflowContractTests(unittest.TestCase):
         for type_name in ("SMALLINT", "INT2"):
             spark_type = _spark_type(Column(name="flag", type_name=type_name))
             self.assertEqual(type(spark_type).__name__, "IntegerType")
+
+    def test_money_schema_preserves_explicit_zero_scale(self):
+        spark_type = _spark_type(
+            Column(name="amount", type_name="MONEY", precision=12, scale=0)
+        )
+
+        self.assertEqual(spark_type.precision, 12)
+        self.assertEqual(spark_type.scale, 0)
 
     def test_discovery_filter_schema_and_metadata(self):
         connector = self.connector(table_include_list="ignored")
@@ -1607,7 +1798,7 @@ class LakeflowContractTests(unittest.TestCase):
 
     def test_shared_state_probe_thread_start_failure_is_bounded(self):
         location = self._shared_state.name
-        informix_module._VALIDATED_STATE_LOCATIONS.discard(location)
+        informix_module._STATE_VALIDATION_COORDINATOR.validated.discard(location)
         with mock.patch.object(
             informix_module.threading.Thread,
             "start",
@@ -1968,8 +2159,9 @@ class LakeflowContractTests(unittest.TestCase):
         bridge.get_table = refreshed_without_primary_key
         connector = self.connector(bridge)
 
-        with self.assertRaisesRegex(InformixError, "no longer CDC-capable"):
-            connector.read_table("app.orders", {}, {})
+        rows, offset = connector.read_table("app.orders", {}, {})
+        self.assertGreater(len(list(rows)), 0)
+        self.assertIsNone(offset)
 
     def test_stream_rechecks_schema_after_native_poll(self):
         bridge = FakeBridge()

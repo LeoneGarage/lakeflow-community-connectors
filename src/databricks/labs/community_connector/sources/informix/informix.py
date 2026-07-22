@@ -75,8 +75,27 @@ _HEADLESS_CANDIDATE_RETENTION_SECONDS = 30 * 24 * 60 * 60
 _CANDIDATE_CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60
 _CANDIDATE_CLEANUP_MARKER_RETENTION_BUCKETS = 7
 _MAX_CANDIDATE_CLEANUP_THROTTLES = 128
-_VALIDATED_STATE_LOCATIONS: set[str] = set()
 _LAST_CANDIDATE_CLEANUP: dict[str, float] = {}
+
+
+class _StateValidationCoordinator:
+    """Process-local exact leases whose synchronization state is never serialized."""
+
+    def __init__(self) -> None:
+        self.condition = threading.Condition()
+        self.validated: set[str] = set()
+        self.claims: dict[str, tuple[object, float]] = {}
+
+    def __getstate__(self) -> dict[str, object]:
+        # Spark workers must establish their own process-local validation state.
+        return {}
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        del state
+        self.__init__()
+
+
+_STATE_VALIDATION_COORDINATOR = _StateValidationCoordinator()
 
 
 def _sleep_with_backoff(deadline: float, delay: float) -> float:
@@ -255,11 +274,24 @@ class PurePythonInformixBridge:
                 redirect_allowlist=_redirect_allowlist(options.get("redirect.allowlist", "")),
                 redirect_max=int(options.get("redirect.max", "3")),
             )
-        connect = getattr(self.transport, "connect", None)
-        if connect:
-            connect()
+        self._connected = False
+        self._connect_lock = threading.Lock()
+
+    def _ensure_connected(self) -> None:
+        # Tests and injected bridges built with ``object.__new__`` already
+        # supply a ready transport and intentionally bypass ``__init__``.
+        if getattr(self, "_connected", True):
+            return
+        with self._connect_lock:
+            if self._connected:
+                return
+            connect = getattr(self.transport, "connect", None)
+            if connect:
+                connect()
+            self._connected = True
 
     def list_tables(self) -> list[dict[str, Any]]:
+        self._ensure_connected()
         maximum = int(self.options.get("metadata.max.bytes", str(64 << 20)))
         rows = self.transport.execute(
             "SELECT owner, tabname FROM systables "
@@ -285,6 +317,7 @@ class PurePythonInformixBridge:
         return result
 
     def get_table(self, identity: str) -> dict[str, Any]:
+        self._ensure_connected()
         parts = identity.split(".")
         if len(parts) != 3:
             raise InformixError(f"Invalid logical table identity {identity!r}")
@@ -338,7 +371,7 @@ class PurePythonInformixBridge:
             "c.extended_id, x.name AS extended_name, x.owner AS extended_owner "
             "FROM systables t JOIN syscolumns c ON t.tabid = c.tabid "
             "LEFT JOIN sysxtdtypes x ON x.extended_id = c.extended_id "
-            "WHERE t.owner = ? AND t.tabname = ? ORDER BY c.colno",
+            "WHERE t.tabtype = 'T' AND t.owner = ? AND t.tabname = ? ORDER BY c.colno",
             (owner, name),
             max_result_bytes=(
                 int(self.options.get("metadata.max.bytes", str(64 << 20))) or None
@@ -349,7 +382,7 @@ class PurePythonInformixBridge:
             "i.part9,i.part10,i.part11,i.part12,i.part13,i.part14,i.part15,i.part16 "
             "FROM systables t JOIN sysconstraints x ON t.tabid=x.tabid "
             "JOIN sysindexes i ON x.idxname=i.idxname AND x.tabid=i.tabid "
-            "WHERE x.constrtype='P' AND t.owner=? AND t.tabname=?",
+            "WHERE t.tabtype='T' AND x.constrtype='P' AND t.owner=? AND t.tabname=?",
             (owner, name),
             max_result_bytes=(
                 int(self.options.get("metadata.max.bytes", str(64 << 20))) or None
@@ -395,17 +428,21 @@ class PurePythonInformixBridge:
         }
 
     def current_lsn(self) -> int:
+        self._ensure_connected()
         row = self.transport.execute(
             "SELECT uniqid, used FROM sysmaster:syslogs WHERE is_current = 1"
         )[0]
         return (int(_field(row, "uniqid", 0)) << 32) + (int(_field(row, "used", 1)) << 12)
 
     def minimum_lsn(self) -> int:
+        self._ensure_connected()
         row = self.transport.execute("SELECT MIN(uniqid) AS uniqid FROM sysmaster:syslogs")[0]
         return int(_field(row, "uniqid", 0)) << 32
 
     def prepare_initial_capture(self, identities: Sequence[str]) -> int:
         """Enable full-row logging for every table, then capture one shared LSN."""
+
+        self._ensure_connected()
 
         if not identities:
             raise InformixError("Initial CDC preparation requires at least one table")
@@ -429,6 +466,8 @@ class PurePythonInformixBridge:
 
     def validate_initial_lsn(self, capture: dict[str, Any], start_lsn: int) -> None:
         """Validate CDC registration/activation without reading LODATA records."""
+
+        self._ensure_connected()
 
         server_row = self.transport.execute(
             "SELECT env_value FROM sysmaster:sysenv WHERE env_name='INFORMIXSERVER'"
@@ -496,6 +535,7 @@ class PurePythonInformixBridge:
     def snapshot_page(
         self, identity, columns, primary_keys, after, limit, max_bytes=None
     ):
+        self._ensure_connected()
         database, owner, name = identity.split(".")
         for identifier in (database, owner, name, *columns, *primary_keys):
             if not _IDENTIFIER.fullmatch(identifier):
@@ -530,6 +570,8 @@ class PurePythonInformixBridge:
         self, identity, columns, primary_keys, page_size, max_rows, max_bytes
     ):
         """Read one bounded point-in-time snapshot in a repeatable-read transaction."""
+
+        self._ensure_connected()
 
         execute_command = getattr(self.transport, "execute_command", self.transport.execute)
         ansi_rows = self.transport.execute(
@@ -598,6 +640,7 @@ class PurePythonInformixBridge:
             raise
 
     def read_changes(self, tables, start_lsn, timeout_seconds, max_records):
+        self._ensure_connected()
         set_socket_timeout = getattr(self.transport, "set_socket_timeout", None)
         previous_socket_timeout = getattr(self.transport, "socket_timeout", None)
         server_row = self.transport.execute(
@@ -844,11 +887,45 @@ def _shared_state_location(options: dict[str, str]) -> str:
     return normalized
 
 
-def _validate_shared_state_filesystem(location: str) -> None:
-    """Probe the filesystem primitives required for cross-reader coordination once."""
+def _validate_shared_state_filesystem(
+    location: str, timeout_seconds: float = _SHARED_STATE_WAIT_SECONDS
+) -> None:
+    """Run one shared filesystem probe per location and worker process."""
 
-    if location in _VALIDATED_STATE_LOCATIONS:
-        return
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("Shared-state filesystem validation timeout must be positive")
+    claim = object()
+    coordinator = _STATE_VALIDATION_COORDINATOR
+    with coordinator.condition:
+        while True:
+            if location in coordinator.validated:
+                return
+            now = time.monotonic()
+            owner = coordinator.claims.get(location)
+            if owner is None or owner[1] <= now:
+                coordinator.claims[location] = (claim, now + timeout_seconds)
+                break
+            coordinator.condition.wait(timeout=owner[1] - now)
+    try:
+        _probe_shared_state_filesystem(location)
+    except BaseException:
+        with coordinator.condition:
+            owner = coordinator.claims.get(location)
+            if owner is not None and owner[0] is claim:
+                coordinator.claims.pop(location, None)
+            coordinator.condition.notify_all()
+        raise
+    with coordinator.condition:
+        coordinator.validated.add(location)
+        owner = coordinator.claims.get(location)
+        if owner is not None and owner[0] is claim:
+            coordinator.claims.pop(location, None)
+        coordinator.condition.notify_all()
+
+
+def _probe_shared_state_filesystem(location: str) -> None:
+    """Probe primitives required for cross-reader coordination."""
+
     _makedirs_durable(location, location)
     _validate_state_path(location, location)
     _cleanup_probe_artifacts(location)
@@ -972,7 +1049,6 @@ def _validate_shared_state_filesystem(location: str) -> None:
         # A duplicate concurrent probe is harmless because every probe uses a
         # unique directory. Avoid retaining a process lock in the generated
         # source closure: Spark must pickle the DataSource class for workers.
-        _VALIDATED_STATE_LOCATIONS.add(location)
     except OSError as error:
         raise InformixError(
             f"Cannot validate Informix shared-state filesystem at '{location}'"
@@ -2008,6 +2084,7 @@ class InformixLakeflowConnect(LakeflowConnect):
             raise ValueError("Option 'authentication.login.timeout' must be > 0")
         self._bridge_instance: InformixBridge | None = None
         self._tables: dict[str, Table] | None = None
+        self._tables_complete = False
         self._snapshot_high_water: dict[str, int] = {}
         self._snapshot_schema_ids: dict[str, str] = {}
         self._trigger_available_now = False
@@ -3013,7 +3090,14 @@ class InformixLakeflowConnect(LakeflowConnect):
     ) -> dict[str, object]:
         """Elect exactly one complete immutable record for a logical key."""
 
-        _validate_shared_state_filesystem(self._shared_state_location)
+        _validate_shared_state_filesystem(
+            self._shared_state_location,
+            float(
+                self.options.get(
+                    "cdc.shared.state.wait.seconds", str(_SHARED_STATE_WAIT_SECONDS)
+                )
+            ),
+        )
         _maybe_cleanup_immutable_candidates(self._shared_state_location)
         record = {
             **record,
@@ -3168,7 +3252,7 @@ class InformixLakeflowConnect(LakeflowConnect):
         _fsync_directory_path(path)
 
     def _table_map(self, refresh: bool = False) -> dict[str, Table]:
-        if self._tables is None or refresh:
+        if self._tables is None or not self._tables_complete or refresh:
             result: dict[str, Table] = {}
             database = self.options.get("database", "")
             for raw in self._bridge.list_tables():
@@ -3178,6 +3262,7 @@ class InformixLakeflowConnect(LakeflowConnect):
                         raise InformixError(f"Duplicate exposed table name {table.exposed_name}")
                     result[table.exposed_name] = table
             self._tables = result
+            self._tables_complete = True
         return self._tables
 
     def _selected(self, table: Table) -> bool:
@@ -3190,17 +3275,25 @@ class InformixLakeflowConnect(LakeflowConnect):
 
     def _table(self, name: str, options: dict[str, str], refresh: bool = False) -> Table:
         exposed = options.get("qualified_source_table", name)
-        tables = self._table_map()
-        if exposed not in tables and refresh:
-            tables = self._table_map(refresh=True)
+        if self._tables is not None and exposed in self._tables and not refresh:
+            return self._tables[exposed]
+        parts = exposed.split(".")
+        if len(parts) == 2 and all(_IDENTIFIER.fullmatch(part) for part in parts):
+            database = self.options.get("database", "")
+            table = Table.parse(
+                self._bridge.get_table(f"{database}.{parts[0]}.{parts[1]}"),
+                database,
+            )
+            if not _eligible(table) or not self._selected(table):
+                raise ValueError(f"Unknown or excluded Informix table '{exposed}'")
+            if self._tables is None:
+                self._tables = {}
+            self._tables[exposed] = table
+            return table
+        tables = self._table_map(refresh=refresh)
         if exposed not in tables:
             raise ValueError(f"Unknown or excluded Informix table '{exposed}'")
-        table = tables[exposed]
-        if refresh:
-            raw = self._bridge.get_table(table.identity)
-            table = Table.parse(raw, table.database)
-            self._tables[exposed] = table
-        return table
+        return tables[exposed]
 
 
 # Conventional alias used by some connector loaders.
@@ -3476,8 +3569,10 @@ def _spark_type(column: Column):
     if name in {"FLOAT", "DOUBLE", "DOUBLE PRECISION"}:
         return DoubleType()
     if name in {"DECIMAL", "NUMERIC", "MONEY"}:
-        precision = column.precision or (19 if name == "MONEY" else 38)
-        scale = column.scale or (2 if name == "MONEY" else 0)
+        precision = (
+            column.precision if column.precision is not None else (19 if name == "MONEY" else 38)
+        )
+        scale = column.scale if column.scale is not None else (2 if name == "MONEY" else 0)
         if 1 <= precision <= 38 and 0 <= scale <= precision:
             return DecimalType(precision, scale)
         return StringType()
