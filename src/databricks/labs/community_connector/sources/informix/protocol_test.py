@@ -26,6 +26,8 @@ from databricks.labs.community_connector.sources.informix.sqli import (
     ResultDescription,
     SqliDescriptorNotImplemented,
     SqliProtocolError,
+    SqliRedirect,
+    SqliTransportError,
     SqliUnsupportedAuthentication,
     TypedBind,
     _connector_sql,
@@ -569,6 +571,157 @@ class SqliPacketTests(unittest.TestCase):
             (2, 1, 6, "", ("127.0.0.1", 9088)),
         ]):
             client._validate_redirect_destination("target", 9088, True)
+
+    def test_redirect_uses_one_validated_dns_result_for_connection(self):
+        client = InformixSqliClient(
+            "origin", 9088, "db", "user", "secret", server_name="origin",
+            redirect_enabled=True,
+            redirect_allowlist=frozenset({("target", 9089)}),
+        )
+        with patch.object(
+            client,
+            "_connect_once",
+            side_effect=(SqliRedirect("redirect:x:srv:target:9089"), None),
+        ) as connect_once, patch(
+            "socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("8.8.8.8", 9089))],
+        ) as resolve:
+            client.connect()
+
+        self.assertEqual(resolve.call_count, 1)
+        self.assertEqual(connect_once.call_args_list[-1].args[-1], "8.8.8.8")
+
+    def test_redirect_retries_each_validated_dns_address(self):
+        client = InformixSqliClient(
+            "origin", 9088, "db", "user", "secret", server_name="origin",
+            redirect_enabled=True,
+            redirect_allowlist=frozenset({("target", 9089)}),
+        )
+        with patch.object(
+            client,
+            "_connect_once",
+            side_effect=(
+                SqliRedirect("redirect:x:srv:target:9089"),
+                SqliTransportError("first address closed during SQLI negotiation"),
+                None,
+            ),
+        ) as connect_once, patch(
+            "socket.getaddrinfo",
+            return_value=[
+                (2, 1, 6, "", ("8.8.8.8", 9089)),
+                (2, 1, 6, "", ("8.8.4.4", 9089)),
+            ],
+        ):
+            client.connect()
+
+        self.assertEqual(
+            [call.args[-1] for call in connect_once.call_args_list],
+            [None, "8.8.4.4", "8.8.8.8"],
+        )
+
+    def test_redirect_preserves_protocol_failure_when_all_addresses_fail(self):
+        client = InformixSqliClient(
+            "origin", 9088, "db", "user", "secret", server_name="origin",
+            redirect_enabled=True,
+            redirect_allowlist=frozenset({("target", 9089)}),
+        )
+        protocol_error = SqliTransportError("truncated SQLI response")
+        with patch.object(
+            client,
+            "_connect_once",
+            side_effect=(
+                SqliRedirect("redirect:x:srv:target:9089"),
+                protocol_error,
+                OSError("second address unavailable"),
+            ),
+        ), patch(
+            "socket.getaddrinfo",
+            return_value=[
+                (2, 1, 6, "", ("8.8.8.8", 9089)),
+                (2, 1, 6, "", ("8.8.4.4", 9089)),
+            ],
+        ):
+            with self.assertRaisesRegex(SqliTransportError, "truncated SQLI response") as raised:
+                client.connect()
+
+        self.assertTrue(
+            any(
+                "second address unavailable" in note
+                for note in getattr(raised.exception, "__notes__", ())
+            )
+        )
+
+    def test_redirect_does_not_retry_permanent_protocol_failure(self):
+        client = InformixSqliClient(
+            "origin", 9088, "db", "user", "secret", server_name="origin",
+            redirect_enabled=True,
+            redirect_allowlist=frozenset({("target", 9089)}),
+        )
+        with patch.object(
+            client,
+            "_connect_once",
+            side_effect=(
+                SqliRedirect("redirect:x:srv:target:9089"),
+                SqliProtocolError("Informix SQL error -951"),
+            ),
+        ) as connect_once, patch(
+            "socket.getaddrinfo",
+            return_value=[
+                (2, 1, 6, "", ("8.8.8.8", 9089)),
+                (2, 1, 6, "", ("8.8.4.4", 9089)),
+            ],
+        ):
+            with self.assertRaisesRegex(SqliProtocolError, "-951"):
+                client.connect()
+
+        self.assertEqual(connect_once.call_count, 2)
+
+    def test_redirect_shared_address_space_requires_exact_ip_allowlist(self):
+        client = InformixSqliClient(
+            "origin", 9088, "db", "user", "secret",
+            redirect_allowlist=frozenset({("target", 9088)}),
+        )
+        with self.assertRaises(SqliUnsupportedAuthentication):
+            client._validate_redirect_destination(
+                "target", 9088, True, ("100.64.0.1",)
+            )
+        client.redirect_allowlist = frozenset(
+            {("target", 9088), ("100.64.0.1", 9088)}
+        )
+        client._validate_redirect_destination(
+            "target", 9088, True, ("100.64.0.1",)
+        )
+
+    def test_tls_handshake_failure_closes_raw_socket(self):
+        raw = Mock()
+        context = Mock()
+        context.wrap_socket.side_effect = OSError("TLS failed")
+        client = InformixSqliClient(
+            "host", 9088, "db", "user", "secret", server_name="server",
+            ssl_context=context,
+        )
+        with patch("socket.create_connection", return_value=raw):
+            with self.assertRaisesRegex(OSError, "TLS failed"):
+                client._connect_once(
+                    "host", 9088, "server", float("inf")
+                )
+        raw.close.assert_called_once_with()
+
+    def test_tls_socket_cleanup_does_not_mask_handshake_failure(self):
+        raw = Mock()
+        raw.close.side_effect = OSError("close failed")
+        context = Mock()
+        context.wrap_socket.side_effect = ValueError("handshake failed")
+        client = InformixSqliClient(
+            "host", 9088, "db", "user", "secret", server_name="server",
+            ssl_context=context,
+        )
+        with patch("socket.create_connection", return_value=raw):
+            with self.assertRaisesRegex(ValueError, "handshake failed") as raised:
+                client._connect_once("host", 9088, "server", float("inf"))
+        self.assertTrue(
+            any("close failed" in note for note in getattr(raised.exception, "__notes__", ()))
+        )
 
     def test_session_header_round_trip(self):
         packet = encode_session_packet(1, b"request")

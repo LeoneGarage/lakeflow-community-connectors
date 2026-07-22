@@ -77,6 +77,10 @@ class SqliProtocolError(RuntimeError):
     pass
 
 
+class SqliTransportError(SqliProtocolError):
+    """A connection-specific SQLI failure that is safe to retry on another address."""
+
+
 def informix_locale_encoding(locale: str | None) -> str:
     """Return the verified Python codec for an Informix locale codeset."""
 
@@ -768,7 +772,9 @@ def read_exact(stream: BinaryIO, size: int) -> bytes:
     while len(chunks) < size:
         chunk = stream.read(size - len(chunks))
         if not chunk:
-            raise SqliProtocolError(f"truncated SQLI stream: needed {size}, got {len(chunks)}")
+            raise SqliTransportError(
+                f"truncated SQLI stream: needed {size}, got {len(chunks)}"
+            )
         chunks.extend(chunk)
     return bytes(chunks)
 
@@ -1115,16 +1121,48 @@ class InformixSqliClient:
         while True:
             self._reset_connection_state()
             redirected = redirects > 0
-            self._validate_redirect_destination(host, port, redirected=redirected)
             addresses = self._resolved_addresses(host, port) if redirected else (host,)
+            self._validate_redirect_destination(
+                host, port, redirected=redirected, addresses=addresses
+            )
             identity = (server, ",".join(addresses), port)
             if identity in visited:
                 raise SqliUnsupportedAuthentication("Informix redirect loop detected")
             visited.add(identity)
             try:
-                self._connect_once(
-                    host, port, server, deadline, addresses[0] if redirected else None
-                )
+                if redirected:
+                    failures: list[OSError | SqliTransportError] = []
+                    for address in addresses:
+                        try:
+                            self._connect_once(host, port, server, deadline, address)
+                            break
+                        except SqliRedirect:
+                            raise
+                        except SqliUnsupportedAuthentication:
+                            raise
+                        except (OSError, SqliTransportError) as error:
+                            failures.append(error)
+                            self._reset_connection_state()
+                    else:
+                        protocol_failure = next(
+                            (
+                                error
+                                for error in failures
+                                if isinstance(error, SqliTransportError)
+                            ),
+                            None,
+                        )
+                        selected = protocol_failure or failures[-1]
+                        if hasattr(selected, "add_note"):
+                            for failure in failures:
+                                if failure is not selected:
+                                    selected.add_note(
+                                        f"Another validated redirect address failed: "
+                                        f"{type(failure).__name__}: {failure}"
+                                    )
+                        raise selected
+                else:
+                    self._connect_once(host, port, server, deadline, None)
                 self.hostname, self.port, self.server_name = host, port, server
                 return self
             except SqliRedirect as redirect:
@@ -1159,10 +1197,21 @@ class InformixSqliClient:
         raw = socket.create_connection(
             (validated_address or host, port), min(self.connect_timeout, remaining)
         )
-        raw.settimeout(min(self.socket_timeout, max(0.001, deadline - time.monotonic())))
-        raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        context = self.ssl_context or ssl.create_default_context(cafile=self.ca_file)
-        self._socket = context.wrap_socket(raw, server_hostname=host)
+        try:
+            raw.settimeout(min(self.socket_timeout, max(0.001, deadline - time.monotonic())))
+            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            context = self.ssl_context or ssl.create_default_context(cafile=self.ca_file)
+            wrapped = context.wrap_socket(raw, server_hostname=host)
+        except BaseException as primary_error:
+            try:
+                raw.close()
+            except OSError as close_error:
+                if hasattr(primary_error, "add_note"):
+                    primary_error.add_note(
+                        f"Closing the failed Informix TLS socket also failed: {close_error}"
+                    )
+            raise
+        self._socket = wrapped
         self._input = _DeadlineReader(
             self._socket.makefile("rb", buffering=4096),
             self._socket,
@@ -1281,22 +1330,23 @@ class InformixSqliClient:
             raise SqliUnsupportedAuthentication("redirect destination cannot be resolved") from exc
         if not values:
             raise SqliUnsupportedAuthentication("redirect destination has no addresses")
-        if len(values) != 1:
-            raise SqliUnsupportedAuthentication(
-                "redirect destination must resolve to exactly one stable address"
-            )
         return tuple(sorted(values))
 
-    def _validate_redirect_destination(self, host: str, port: int, redirected: bool) -> None:
+    def _validate_redirect_destination(
+        self,
+        host: str,
+        port: int,
+        redirected: bool,
+        addresses: tuple[str, ...] | None = None,
+    ) -> None:
         if not redirected:
             return
         if (host, port) not in self.redirect_allowlist:
             raise SqliUnsupportedAuthentication("redirect target is not explicitly allow-listed")
-        for value in self._resolved_addresses(host, port):
+        resolved = addresses if addresses is not None else self._resolved_addresses(host, port)
+        for value in resolved:
             address = ipaddress.ip_address(value)
-            unsafe = (address.is_loopback or address.is_link_local or address.is_multicast
-                      or address.is_unspecified or address.is_private)
-            if redirected and unsafe and (str(address), port) not in self.redirect_allowlist:
+            if not address.is_global and (str(address), port) not in self.redirect_allowlist:
                 raise SqliUnsupportedAuthentication("redirect resolved to a non-public address")
 
     def _reset_connection_state(self) -> None:
@@ -1788,6 +1838,7 @@ __all__ = [
     "PasswordAuthenticationProvider",
     "SqliDescriptorNotImplemented",
     "SqliProtocolError",
+    "SqliTransportError",
     "SqliRedirect",
     "SqliUnsupportedAuthentication",
     "TypedBind",

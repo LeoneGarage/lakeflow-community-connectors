@@ -218,7 +218,7 @@ Keep `password` and `authentication.pam.echo.response` in secret-backed connecti
 }
 ```
 
-Redirects are an explicit opt-in because the destination is supplied by the server. With `redirect.enabled=true`, every target must exactly match a `host:numeric-port` entry in `redirect.allowlist`; wildcards, service names, and omitted ports are rejected. A hostname must resolve to exactly one stable address. If it resolves to a private, loopback, link-local, multicast, or otherwise non-public address, the exact resolved `IP:numeric-port` must also be allow-listed. These checks prevent a permitted hostname from becoming an unrestricted network pivot.
+Redirects are an explicit opt-in because the destination is supplied by the server. With `redirect.enabled=true`, every target must exactly match a `host:numeric-port` entry in `redirect.allowlist`; wildcards, service names, and omitted ports are rejected. Every address returned for an allowed hostname is validated once and pinned for that connection attempt. The connector tries the validated addresses sequentially only after transport-level failures. If any address is private, loopback, link-local, multicast, or otherwise non-public, its exact `IP:numeric-port` must also be allow-listed. These checks prevent a permitted hostname from becoming an unrestricted network pivot.
 
 Each redirect discards the old socket, parser, authentication, and statement state and starts login again. It remains inside `authentication.login.timeout`, cannot exceed `redirect.max`, and cannot revisit the same server/address/port identity. DNS is resolved and checked before connection. TLS is recreated with the original trust policy and hostname verification is performed against the redirected hostname; redirects cannot downgrade encryption or bypass certificate verification.
 
@@ -238,9 +238,9 @@ A secret-free redirect configuration shape is:
 }
 ```
 
-GSS/Kerberos, private-server authentication, and automatic server-name or locale discovery remain unsupported. PAM and the full redirect/reconnect security path have live integration coverage. The redirect test uses a deterministic ASF type-13 responder rather than a redirect emitted by IDS/HDR itself. Serverless Lakeflow Connect execution over an Informix TLS listener has been validated separately.
+GSS/Kerberos, private-server authentication, and automatic server-name or locale discovery remain unsupported. PAM has live integration coverage. Redirect parsing, multi-address validation and transport failover, reconnect state, limits, and loop detection have deterministic protocol-test coverage, but the current redirect fixture does not provide a TLS listener and therefore is not live redirect coverage. Serverless Lakeflow Connect execution over an Informix TLS listener has been validated separately.
 
-The fixture at `/Users/leon.eller/work/dev/informix-cdc` live-tests PAM against an Informix listener at `localhost:9090`. Its deterministic redirect responder listens at `localhost:9191`, emits ASF session type 13, and redirects to `127.0.0.1:9088`; the test then proves a fresh, allow-listed, TLS-revalidated login and query on the target. This validates the connector's complete redirect parsing, policy, reset, and reconnect path, but is not evidence that IDS/HDR emits redirects itself. Client-side `sqlhosts` failover is likewise not redirect coverage. Fixture credentials are disposable test data and are intentionally not repeated here.
+The fixture at `/Users/leon.eller/work/dev/informix-cdc` live-tests PAM against an Informix listener at `localhost:9090`. Its deterministic redirect responder on `localhost:9191` is plaintext, while this connector requires TLS before reading ASC packets, so it cannot currently be used for an end-to-end connector redirect test. Live redirect validation requires a TLS-capable responder or an IDS/HDR listener that emits redirects, with every destination explicitly allow-listed. Client-side `sqlhosts` failover is not redirect coverage. Fixture credentials are disposable test data and are intentionally not repeated here.
 
 ## Supported objects and naming
 
@@ -356,6 +356,9 @@ The connector adds `_informix_change_lsn`, `_informix_commit_lsn`, `_informix_tx
 
 ### Checkpoints and log retention
 
+Trigger records use pipeline-scope-specific subtrees, so recovery never reads
+another pipeline's trigger records.
+
 During snapshot, Lakeflow checkpoints the connector offset version, snapshot LSN, last primary-key values, a source-schema fingerprint, a generation-specific schema node ID, and a pipeline scope. A completed consistent snapshot publishes its fresh resume LSN for both independently instantiated channels. Streaming checkpoints the `commit_lsn`, `change_lsn`, oldest required `begin_lsn`, fingerprint, schema node ID, pipeline scope, and triggered-update generation. Triggered readers share one immutable per-table high-water LSN and fail closed if their predecessor generations differ. The connector never automatically deletes committed initialization, snapshot, trigger, or schema heads because filesystem retention alone cannot safely fence a paused reader. Running pipelines immutably elect one worker per daily bucket to perform best-effort candidate garbage collection. A winner fences itself against unfinished elections in every other bucket before scanning, and the lower bucket deterministically wins a simultaneous cross-bucket race. Losing candidates are eligible once their namespace has a committed head, and headless candidates are eligible after 30 days. Cleanup streams the Volume traversal, quarantines candidates atomically, removes malformed candidate contents without following symlinks, and isolates an inaccessible artifact so it cannot stop later candidates. State reads and mutations are anchored to no-follow directory handles. Versioned daily election and completion markers are validated before use, and exactly seven daily coordination buckets are retained. The stopped-pipeline maintenance helper removes abandoned candidates and cleanup elections, restoring automatic cleanup after a crashed winner. A writer resuming after its candidate was collected can fail that attempt and retry, but committed state is never affected. The helper rejects missing or non-directory Volume locations; retired committed state requires a separate Volume lifecycle or administrator cleanup process.
 
 ```python
@@ -415,9 +418,11 @@ that spans the transition fails closed. Run the connector once after upgrading f
 schema history and before applying DDL so the current checkpoint descriptor is
 seeded in shared state.
 
-History is bounded by the one-MiB serialized state limit rather than a fixed
-number of schema nodes. If that limit is reached, stop all pipelines using the
-connection, configure a new shared-state location, and perform full refreshes.
+The one-MiB limit applies to each immutable state record, not to aggregate
+history. Committed schema generations are retained because automatically
+deleting one could break a paused pipeline. Plan Volume lifecycle management
+for long-lived connections. If a required historical schema node is removed,
+the affected pipeline fails closed and requires a full refresh.
 
 ## Table configuration
 
@@ -471,7 +476,7 @@ This changes Lakeflow Auto CDC ordering and deduplication to `updated_at`; it do
 ## Operational guidance
 
 - Start with one small table and verify snapshot, insert, update, delete, restart, rollback, idle timeout, and retention-expiry behavior against the target Informix version before broader use.
-- Disposable Informix 15 testing has validated normal-password and PAM authentication, queries, discovery, snapshots, and committed INSERT/UPDATE/DELETE transactions through `syscdcv1`. A deterministic ASF type-13 responder has validated the complete redirect/reconnect security path through a successful target query. A serverless Lakeflow Connect pipeline has validated TLS, multi-table snapshots, checkpointed CDC flows, deletes, and SCD Type 2 materialization. Validate TLS trust, locale behavior, permissions, schemas, data-type boundaries, restart behavior, retention, and IDS/HDR-emitted redirects against the target environment.
+- Disposable Informix 15 testing has validated normal-password and PAM authentication, queries, discovery, snapshots, and committed INSERT/UPDATE/DELETE transactions through `syscdcv1`. Redirect security behavior has deterministic protocol coverage but still requires a TLS-capable live redirect fixture. A serverless Lakeflow Connect pipeline has validated TLS, multi-table snapshots, checkpointed CDC flows, deletes, and SCD Type 2 materialization. Validate TLS trust, locale behavior, permissions, schemas, data-type boundaries, restart behavior, retention, and IDS/HDR-emitted redirects against the target environment.
 - Authentication errors commonly indicate a wrong `server`/locale, unsupported authentication mode or redirect, an untrusted/mismatched TLS certificate, or insufficient `syscdcv1` privileges.
 - Schema changes that alter captured column layout are not guaranteed to be safe during active capture. Restart and validate at a clean LSN boundary.
 - Ensure source log retention covers downtime and the oldest checkpoint. Otherwise resnapshotting is required.

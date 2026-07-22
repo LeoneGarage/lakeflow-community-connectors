@@ -8,6 +8,7 @@ import importlib
 import json
 import os
 import pickle
+import shutil
 import sys
 import tempfile
 import threading
@@ -242,6 +243,17 @@ class LakeflowContractTests(unittest.TestCase):
         connector._bridge_instance = bridge or FakeBridge()
         return connector
 
+    def test_shared_state_backoff_never_sleeps_past_deadline(self):
+        with mock.patch.object(
+            informix_module.time, "monotonic", return_value=9.75
+        ), mock.patch.object(
+            informix_module.random, "uniform", return_value=1.2
+        ), mock.patch.object(informix_module.time, "sleep") as sleep:
+            next_delay = informix_module._sleep_with_backoff(10.0, 2.0)
+
+        sleep.assert_called_once_with(0.25)
+        self.assertEqual(next_delay, 2.0)
+
     def test_shared_state_location_is_mandatory_and_absolute(self):
         with self.assertRaisesRegex(ValueError, "cdc.shared.state.location"):
             InformixLakeflowConnect({"database": "demo"})
@@ -303,6 +315,41 @@ class LakeflowContractTests(unittest.TestCase):
                     "cdc.shared.state.location": "/Volumes/catalog-only",
                 }
             )
+
+    def test_changing_registration_scope_clears_scope_bound_caches(self):
+        connector = self.connector(FakeBridge())
+        connector._snapshot_high_water["demo.app.orders"] = 90
+        connector._snapshot_schema_ids["demo.app.orders"] = "a" * 32
+        connector._trigger_boundaries["demo.app.orders"] = (
+            100, "b" * 32, connector._registration_scope, "initial"
+        )
+        connector.prepare_for_trigger_available_now()
+        self.assertTrue(connector._trigger_available_now)
+
+        connector.set_registration_scope("f" * 32)
+
+        self.assertEqual(connector._snapshot_high_water, {})
+        self.assertEqual(connector._snapshot_schema_ids, {})
+        self.assertEqual(connector._trigger_boundaries, {})
+        self.assertFalse(connector._trigger_available_now)
+
+    def test_new_registration_scope_does_not_retain_available_now_mode(self):
+        bridge = FakeBridge()
+        connector = self.connector(bridge)
+        connector.prepare_for_trigger_available_now()
+        connector.set_registration_scope("e" * 32)
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 8, "lsn": 101},
+            {"op": "INSERT", "tx_id": 8, "lsn": 102, "row": {"id": 4, "value": "d"}},
+            {"op": "COMMIT", "tx_id": 8, "lsn": 105},
+        ]
+
+        rows, end = connector.read_table("app.orders", checkpoint, {})
+
+        self.assertEqual(len(list(rows)), 1)
+        self.assertEqual(end["commit_lsn"], "105")
+        self.assertIsNone(end["trigger_generation"])
 
     def test_live_catalog_datetime_qualifier_is_normalized_for_cdc(self):
         column = _catalog_column(
@@ -1508,11 +1555,54 @@ class LakeflowContractTests(unittest.TestCase):
         bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
         connector = self.connector(bridge)
         connector._trigger_available_now = True
-        connector._trigger_boundaries["demo.app.orders"] = (110, "a" * 32)
+        connector._trigger_boundaries["demo.app.orders"] = (
+            110,
+            "a" * 32,
+            checkpoint["pipeline_scope"],
+            "initial",
+        )
 
         _, end = connector.read_table("app.orders", checkpoint, {})
 
         self.assertEqual(end["commit_lsn"], checkpoint["commit_lsn"])
+
+    def test_available_now_keeps_boundary_across_full_schema_transition(self):
+        bridge = FakeBridge()
+        _, old_checkpoint = self.connector(bridge).read_table("app.orders", {}, {})
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+        self.connector(bridge).read_table("app.orders", old_checkpoint, {})
+
+        bridge.now = 150
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 8, "lsn": 125},
+            {
+                "op": "INSERT",
+                "tx_id": 8,
+                "lsn": 126,
+                "row": {"id": 4, "value": "d", "added": 9},
+            },
+            {"op": "COMMIT", "tx_id": 8, "lsn": 130},
+            {"op": "TIMEOUT", "lsn": 150},
+        ]
+        connector = self.connector(bridge)
+        connector.prepare_for_trigger_available_now()
+
+        _, transitioned = connector.read_table("app.orders", old_checkpoint, {})
+        frozen = connector._trigger_boundaries["demo.app.orders"]
+        self.assertEqual(frozen[0], 150)
+        self.assertNotEqual(transitioned["schema_id"], old_checkpoint["schema_id"])
+        self.assertIsNone(transitioned["trigger_generation"])
+
+        bridge.now = 170
+        rows, completed = connector.read_table("app.orders", transitioned, {})
+
+        self.assertEqual(list(rows)[0]["added"], 9)
+        self.assertEqual(connector._trigger_boundaries["demo.app.orders"], frozen)
+        self.assertEqual(completed["trigger_generation"], frozen[1])
 
 
     def test_shared_state_probe_thread_start_failure_is_bounded(self):
@@ -2219,6 +2309,62 @@ class LakeflowContractTests(unittest.TestCase):
             connector._trigger_boundaries["demo.app.orders"][1], first_generation
         )
 
+    def test_trigger_cache_revalidates_checkpoint_identity(self):
+        bridge = FakeBridge()
+        connector = self.connector(bridge)
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        table = Table.parse(_table(), "demo")
+        first = connector._shared_trigger_boundary(table, checkpoint, owner=True)
+
+        bridge.now = first[0] + 10
+        next_checkpoint = {
+            **checkpoint,
+            "commit_lsn": str(first[0]),
+            "change_lsn": str(first[0]),
+            "begin_lsn": str(first[0]),
+            "trigger_generation": first[1],
+        }
+        second = connector._shared_trigger_boundary(table, next_checkpoint, owner=True)
+
+        self.assertEqual(second[0], first[0] + 10)
+        self.assertNotEqual(second[1], first[1])
+
+    def test_trigger_cache_rejects_checkpoint_past_frozen_boundary(self):
+        connector = self.connector(FakeBridge())
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        table = Table.parse(_table(), "demo")
+        connector._trigger_boundaries[table.identity] = (
+            100,
+            "a" * 32,
+            checkpoint["pipeline_scope"],
+            "initial",
+        )
+        checkpoint = {
+            **checkpoint,
+            "begin_lsn": "101",
+            "change_lsn": "101",
+            "commit_lsn": "101",
+        }
+
+        with self.assertRaisesRegex(InformixError, "Cached trigger boundary"):
+            connector._shared_trigger_boundary(table, checkpoint, owner=True)
+
+    def test_trigger_boundary_survives_schema_transition_within_update(self):
+        bridge = FakeBridge()
+        bridge.now = 105
+        owner = self.connector(bridge)
+        _, checkpoint = owner.read_table("app.orders", {}, {})
+        table = Table.parse(_table(), "demo")
+        boundary = owner._shared_trigger_boundary(table, checkpoint, owner=True)
+
+        transitioned = {**checkpoint, "schema_id": "f" * 32}
+        delete_reader = self.connector(FakeBridge())
+        recovered = delete_reader._shared_trigger_boundary(
+            table, transitioned, owner=False
+        )
+
+        self.assertEqual(recovered, boundary)
+
     def test_concurrent_pipelines_keep_trigger_boundaries_isolated(self):
         seed_bridge = FakeBridge()
         _, seed = self.connector(seed_bridge).read_table("app.orders", {}, {})
@@ -2251,7 +2397,7 @@ class LakeflowContractTests(unittest.TestCase):
             delete_b._trigger_boundaries["demo.app.orders"][1],
         )
 
-    def test_divergent_trigger_predecessors_fail_closed(self):
+    def test_divergent_trigger_predecessors_fail_without_guessing_from_history(self):
         bridge = FakeBridge()
         _, seed = self.connector(bridge).read_table("app.orders", {}, {})
         upsert_checkpoint = {**seed, "trigger_generation": "a" * 32}
@@ -2261,9 +2407,14 @@ class LakeflowContractTests(unittest.TestCase):
         upsert.prepare_for_trigger_available_now()
         upsert.read_table("app.orders", upsert_checkpoint, {})
         delete = self.connector(FakeBridge())
-        delete.prepare_for_trigger_available_now()
-        with self.assertRaisesRegex(InformixError, "Ambiguous immutable trigger"):
-            delete.read_table_deletes("app.orders", delete_checkpoint, {})
+        delete.options["cdc.shared.state.wait.seconds"] = "1"
+        table = Table.parse(_table(), "demo")
+        with mock.patch.object(
+            informix_module.time, "monotonic", side_effect=(0.0, 2.0)
+        ), self.assertRaisesRegex(
+            InformixError, "may not have run or the upsert/delete checkpoints may differ"
+        ):
+            delete._shared_trigger_boundary(table, delete_checkpoint, owner=False)
 
     def test_trigger_boundary_allows_divergent_channel_lsns(self):
         bridge = FakeBridge()
@@ -3191,61 +3342,33 @@ class LakeflowContractTests(unittest.TestCase):
             with self.assertRaisesRegex(InformixError, "Cannot create"):
                 connector._publish_immutable_head(namespace, {"value": 1})
 
-    def test_ambiguous_trigger_fallback_fails_closed(self):
+    def test_delete_trigger_wait_reads_only_exact_deterministic_boundary(self):
         connector = self.connector(FakeBridge())
         table = Table.parse(_table(), "demo")
         checkpoint = _stream_offset()
-        scope = checkpoint["pipeline_scope"]
-        for index in (1, 2):
-            connector._publish_immutable_head(
-                connector._immutable_namespace(table, "triggers", f"candidate-{index}"),
-                {
-                    "created_at": float(index),
-                    "checkpoint_lsn": checkpoint["commit_lsn"],
-                    "generation": f"{index:032x}",
-                    "high_water": "120",
-                    "predecessor": "f" * 32,
-                    "schema_id": checkpoint["schema_id"],
-                    "scope": scope,
-                },
-                record_type="trigger",
-            )
-
+        connector.options["cdc.shared.state.wait.seconds"] = "1"
         with mock.patch.object(
-            informix_module.os, "listdir", side_effect=AssertionError("must stream")
-        ), self.assertRaisesRegex(InformixError, "Ambiguous immutable trigger"):
+            informix_module.time, "monotonic", side_effect=(0.0, 2.0)
+        ), mock.patch.object(
+            informix_module.os,
+            "scandir",
+            side_effect=AssertionError("trigger history must not be scanned"),
+        ), self.assertRaisesRegex(InformixError, "Timed out waiting"):
             connector._shared_trigger_boundary(table, checkpoint, owner=False)
 
-    def test_trigger_fallback_ignores_malformed_record_from_other_scope(self):
+    def test_immutable_record_normalizes_invalid_utf8_and_excessive_nesting(self):
         connector = self.connector(FakeBridge())
         table = Table.parse(_table(), "demo")
-        checkpoint = _stream_offset()
-        scope = checkpoint["pipeline_scope"]
-        connector._publish_immutable_head(
-            connector._immutable_namespace(table, "triggers", "unrelated"),
-            {
-                "scope": "f" * 32,
-                "schema_id": checkpoint["schema_id"],
-                "value": "not-a-trigger",
-            },
-            record_type="generic",
-        )
-        connector._publish_immutable_head(
-            connector._immutable_namespace(table, "triggers", "matching"),
-            {
-                "generation": "a" * 32,
-                "high_water": "120",
-                "predecessor": "initial",
-                "schema_id": checkpoint["schema_id"],
-                "scope": scope,
-            },
-            record_type="trigger",
-        )
-
-        self.assertEqual(
-            connector._shared_trigger_boundary(table, checkpoint, owner=False),
-            (120, "a" * 32),
-        )
+        namespace = connector._immutable_namespace(table, "invalid-json")
+        head = os.path.join(namespace, "head")
+        os.makedirs(head)
+        record = os.path.join(head, "record.json")
+        for payload in (b"\xff", ("[" * 1100 + "0" + "]" * 1100).encode()):
+            with self.subTest(payload_size=len(payload)):
+                with open(record, "wb") as handle:
+                    handle.write(payload)
+                with self.assertRaisesRegex(InformixError, "immutable record"):
+                    connector._read_immutable_head(namespace)
 
     def test_boolean_options_reject_unknown_values(self):
         required = {
@@ -3264,19 +3387,46 @@ class LakeflowContractTests(unittest.TestCase):
                 else:
                     informix_module._bridge_config({**required, name: "treu"})
 
-    def test_schema_history_discovery_uses_descriptor_streaming(self):
+    def test_schema_history_recovery_never_scans_unrelated_transitions(self):
         connector = self.connector(FakeBridge())
         table = Table.parse(_table(), "demo")
         transitions = connector._immutable_namespace(table, "schemas")
-        os.makedirs(transitions)
+        unrelated = os.path.join(transitions, "unrelated", "head")
+        os.makedirs(unrelated)
+        with open(os.path.join(unrelated, "record.json"), "wb") as handle:
+            handle.write(b"not json")
         with mock.patch.object(
-            informix_module.os, "listdir", side_effect=AssertionError("must stream")
+            informix_module.os, "scandir", side_effect=AssertionError("must not scan")
         ):
             self.assertIsNone(
                 connector._find_immutable_schema_record(
                     table, "a" * 32, "b" * 32
                 )
             )
+
+    def test_initial_schema_node_recovery_accepts_progressed_checkpoint(self):
+        bridge = FakeBridge()
+        connector = self.connector(bridge)
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        table = Table.parse(_table(), "demo")
+        node_path = connector._immutable_namespace(
+            table, "schema-nodes", checkpoint["schema_id"]
+        )
+        shutil.rmtree(node_path)
+        checkpoint_lsn = min(100, bridge.now)
+
+        replacement = self.connector(bridge)
+        replacement._record_current_schema(
+            table,
+            checkpoint_lsn,
+            checkpoint["schema_id"],
+            checkpoint["schema_fingerprint"],
+            checkpoint["pipeline_scope"],
+            owner=True,
+        )
+
+        restored = replacement._read_immutable_head(node_path)
+        self.assertLessEqual(int(restored["schema"]["start_lsn"]), checkpoint_lsn)
 
     def test_malformed_trigger_winner_fails_before_caching(self):
         connector = self.connector(FakeBridge())
@@ -3285,16 +3435,12 @@ class LakeflowContractTests(unittest.TestCase):
         scope = checkpoint["pipeline_scope"]
         predecessor = "initial"
         key = hashlib.sha256(
-            "\0".join(
-                (
-                    scope,
-                    checkpoint["schema_id"],
-                    predecessor,
-                )
-            ).encode()
+            "\0".join((scope, predecessor)).encode()
         ).hexdigest()
         connector._publish_immutable_head(
-            connector._immutable_namespace(table, "triggers", key),
+            connector._immutable_namespace(
+                table, "triggers", "scopes", scope, key
+            ),
             {
                 "checkpoint_lsn": checkpoint["commit_lsn"],
                 "generation": "invalid",
@@ -3324,12 +3470,12 @@ class LakeflowContractTests(unittest.TestCase):
                 ).hexdigest()[:32]
                 scope = checkpoint["pipeline_scope"]
                 key = hashlib.sha256(
-                    "\0".join(
-                        (scope, checkpoint["schema_id"], "initial")
-                    ).encode()
+                    "\0".join((scope, "initial")).encode()
                 ).hexdigest()
                 connector._publish_immutable_head(
-                    connector._immutable_namespace(table, "triggers", key),
+                    connector._immutable_namespace(
+                        table, "triggers", "scopes", scope, key
+                    ),
                     {
                         "checkpoint_lsn": checkpoint["commit_lsn"],
                         "generation": "a" * 32,

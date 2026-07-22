@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import secrets
 import stat
@@ -76,6 +77,16 @@ _CANDIDATE_CLEANUP_MARKER_RETENTION_BUCKETS = 7
 _MAX_CANDIDATE_CLEANUP_THROTTLES = 128
 _VALIDATED_STATE_LOCATIONS: set[str] = set()
 _LAST_CANDIDATE_CLEANUP: dict[str, float] = {}
+
+
+def _sleep_with_backoff(deadline: float, delay: float) -> float:
+    """Sleep with jitter without crossing the caller's absolute deadline."""
+
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        time.sleep(min(delay * random.uniform(0.8, 1.2), remaining))
+    return min(delay * 1.5, 2.0)
+
 
 def _informix_available_now_base(base: type) -> type:
     """Wrap the generated reader base without changing the shared adapter source."""
@@ -2000,7 +2011,7 @@ class InformixLakeflowConnect(LakeflowConnect):
         self._snapshot_high_water: dict[str, int] = {}
         self._snapshot_schema_ids: dict[str, str] = {}
         self._trigger_available_now = False
-        self._trigger_boundaries: dict[str, tuple[int, str]] = {}
+        self._trigger_boundaries: dict[str, tuple[int, str, str, str]] = {}
         self._registration_scope: str | None = None
 
     def set_registration_scope(self, scope: str) -> None:
@@ -2008,6 +2019,11 @@ class InformixLakeflowConnect(LakeflowConnect):
 
         if not re.fullmatch(r"[0-9a-f]{32}", scope):
             raise ValueError("Informix registration scope must be a 32-character UUID")
+        if self._registration_scope != scope:
+            self._snapshot_high_water.clear()
+            self._snapshot_schema_ids.clear()
+            self._trigger_boundaries.clear()
+            self._trigger_available_now = False
         self._registration_scope = scope
 
     def _pipeline_scope(self, checkpoint: dict[str, Any] | None = None) -> str:
@@ -2512,7 +2528,7 @@ class InformixLakeflowConnect(LakeflowConnect):
             not isinstance(schema, dict)
             or schema.get("id") != checkpoint_schema_id
             or self._immutable_lsn(schema, "start_lsn", table.exposed_name)
-            != checkpoint_lsn
+            > checkpoint_lsn
             or _table_from_schema_state(schema, table.database).native_identity
             != table.native_identity
             or schema.get("fingerprint") != _schema_fingerprint(table)
@@ -2525,92 +2541,38 @@ class InformixLakeflowConnect(LakeflowConnect):
     def _shared_trigger_boundary(
         self, table: Table, checkpoint: dict[str, Any], *, owner: bool
     ) -> tuple[int, str]:
-        cached = self._trigger_boundaries.get(table.identity)
-        if cached is not None:
-            return cached
         # Both independently checkpointed readers present the same predecessor
         # after every successfully coordinated trigger. Keying the next boundary
         # by that durable predecessor avoids relying on Lakeflow runtime IDs,
         # which are not exposed to Python data-source workers.
         predecessor = str(checkpoint.get("trigger_generation") or "initial")
         scope = self._pipeline_scope(checkpoint)
+        cached = self._trigger_boundaries.get(table.identity)
+        if cached is not None:
+            high_water, generation, cached_scope, cached_predecessor = cached
+            if (cached_scope, cached_predecessor) == (scope, predecessor):
+                if high_water < int(checkpoint.get("commit_lsn", 0)):
+                    raise InformixError(
+                        f"Cached trigger boundary {high_water} precedes checkpoint LSN "
+                        f"{checkpoint.get('commit_lsn')} for '{table.exposed_name}'"
+                    )
+                return high_water, generation
+            self._trigger_boundaries.pop(table.identity, None)
         boundary_key = hashlib.sha256(
-            "\0".join(
-                (
-                    scope,
-                    str(checkpoint.get("schema_id", "")),
-                    predecessor,
-                )
-            ).encode()
+            "\0".join((scope, predecessor)).encode()
         ).hexdigest()
-        namespace = self._immutable_namespace(table, "triggers", boundary_key)
+        trigger_root = self._immutable_namespace(
+            table, "triggers", "scopes", scope
+        )
+        namespace = os.path.join(trigger_root, boundary_key)
         deadline = time.monotonic() + int(
             self.options.get(
                 "cdc.shared.state.wait.seconds", str(_SHARED_STATE_WAIT_SECONDS)
             )
         )
+        delay = 0.1
         while True:
             trigger = self._read_immutable_head(namespace)
-            if trigger is None and not owner:
-                trigger_root = self._immutable_namespace(table, "triggers")
-                direct: dict[str, object] | None = None
-                direct_count = 0
-                fallback_found = False
-                try:
-                    trigger_descriptor = _open_state_directory(
-                        self._shared_state_location, trigger_root
-                    )
-                except FileNotFoundError:
-                    trigger_descriptor = None
-                except OSError as error:
-                    raise InformixError(
-                        f"Cannot inspect Informix trigger boundaries '{trigger_root}'"
-                    ) from error
-                if trigger_descriptor is not None:
-                    try:
-                        with os.scandir(trigger_descriptor) as entries:
-                            for entry in entries:
-                                try:
-                                    is_directory = entry.is_dir(follow_symlinks=False)
-                                except FileNotFoundError:
-                                    continue
-                                if not is_directory:
-                                    continue
-                                candidate = self._read_immutable_head(
-                                    os.path.join(trigger_root, entry.name)
-                                )
-                                if candidate is None:
-                                    continue
-                                if (
-                                    candidate.get("scope") != scope
-                                    or candidate.get("schema_id")
-                                    != checkpoint.get("schema_id")
-                                ):
-                                    continue
-                                self._validate_immutable_record_header(
-                                    candidate, "trigger", table.exposed_name
-                                )
-                                if (
-                                    candidate.get("generation") != predecessor
-                                    and self._immutable_lsn(
-                                        candidate, "high_water", table.exposed_name
-                                    )
-                                    >= int(checkpoint.get("commit_lsn", 0))
-                                ):
-                                    fallback_found = True
-                                    if candidate.get("predecessor") == predecessor:
-                                        direct_count += 1
-                                        if direct_count == 1:
-                                            direct = candidate
-                    finally:
-                        os.close(trigger_descriptor)
-                if direct_count == 1:
-                    trigger = direct
-                elif direct_count > 1 or fallback_found:
-                    raise InformixError(
-                        f"Ambiguous immutable trigger boundary for '{table.exposed_name}'; "
-                        "run a full refresh rather than choosing between overlapping updates"
-                    )
             if isinstance(trigger, dict):
                 self._validate_immutable_record_header(
                     trigger, "trigger", table.exposed_name
@@ -2632,14 +2594,18 @@ class InformixLakeflowConnect(LakeflowConnect):
                     )
                 if (
                     trigger.get("scope") != scope
-                    or trigger.get("schema_id") != checkpoint.get("schema_id")
                     or high_water < int(checkpoint.get("commit_lsn", 0))
                     or trigger.get("predecessor") != predecessor
                 ):
                     raise InformixError(
                         f"Invalid immutable trigger identity for '{table.exposed_name}'"
                     )
-                self._trigger_boundaries[table.identity] = (high_water, generation)
+                self._trigger_boundaries[table.identity] = (
+                    high_water,
+                    generation,
+                    scope,
+                    predecessor,
+                )
                 return high_water, generation
             if owner:
                 candidate_high_water = self._bridge.current_lsn()
@@ -2655,7 +2621,6 @@ class InformixLakeflowConnect(LakeflowConnect):
                         "generation": secrets.token_hex(16),
                         "high_water": str(candidate_high_water),
                         "predecessor": predecessor,
-                        "schema_id": str(checkpoint.get("schema_id", "")),
                         "scope": scope,
                     },
                     record_type="trigger",
@@ -2665,9 +2630,10 @@ class InformixLakeflowConnect(LakeflowConnect):
                 role = "upsert reader" if owner else "the table's upsert reader"
                 raise InformixError(
                     f"Timed out waiting for {role} to publish a triggered boundary for "
-                    f"'{table.exposed_name}'"
+                    f"'{table.exposed_name}' with predecessor {predecessor}; the upsert "
+                    "reader may not have run or the upsert/delete checkpoints may differ"
                 )
-            time.sleep(0.1)
+            delay = _sleep_with_backoff(deadline, delay)
 
     def _schema_transition(
         self,
@@ -2683,6 +2649,7 @@ class InformixLakeflowConnect(LakeflowConnect):
                 "cdc.shared.state.wait.seconds", str(_SHARED_STATE_WAIT_SECONDS)
             )
         )
+        delay = 0.1
         while True:
             previous_record = self._read_immutable_head(
                 self._immutable_namespace(table, "schema-nodes", checkpoint_schema_id)
@@ -2777,7 +2744,7 @@ class InformixLakeflowConnect(LakeflowConnect):
                     f"Timed out waiting for the upsert reader to publish schema transition "
                     f"state for '{table.exposed_name}'"
                 )
-            time.sleep(0.1)
+            delay = _sleep_with_backoff(deadline, delay)
 
     def _refresh_table_schema(
         self, table: Table, expected_fingerprint: str | None
@@ -2839,6 +2806,7 @@ class InformixLakeflowConnect(LakeflowConnect):
                 "cdc.shared.state.wait.seconds", str(_SHARED_STATE_WAIT_SECONDS)
             )
         )
+        delay = 0.1
         while True:
             record = self._read_immutable_head(namespace)
             if record is not None:
@@ -2933,7 +2901,7 @@ class InformixLakeflowConnect(LakeflowConnect):
                     f"Timed out waiting for {role} to publish shared CDC state for "
                     f"'{table.exposed_name}' at '{namespace}'"
                 )
-            time.sleep(0.1)
+            delay = _sleep_with_backoff(deadline, delay)
 
     def _publish_snapshot_boundary(
         self,
@@ -3009,45 +2977,10 @@ class InformixLakeflowConnect(LakeflowConnect):
                     "created_at": initialization.get("created_at", time.time()),
                     "schema": schema,
                 }
-        transitions = self._immutable_namespace(table, "schemas")
-        try:
-            transitions_descriptor = _open_state_directory(
-                self._shared_state_location, transitions
-            )
-        except FileNotFoundError:
-            return None
-        except OSError as error:
-            raise InformixError(
-                f"Cannot inspect immutable schema transitions '{transitions}'"
-            ) from error
-        match: dict[str, object] | None = None
-        try:
-            with os.scandir(transitions_descriptor) as entries:
-                for entry in entries:
-                    try:
-                        is_directory = entry.is_dir(follow_symlinks=False)
-                    except FileNotFoundError:
-                        continue
-                    if not is_directory:
-                        continue
-                    record = self._read_immutable_head(
-                        os.path.join(transitions, entry.name)
-                    )
-                    if record is not None:
-                        self._validate_immutable_record_header(
-                            record, "schema-transition", table.exposed_name
-                        )
-                    schema = record.get("schema") if record is not None else None
-                    if isinstance(schema, dict) and schema.get("id") == schema_id:
-                        if match is not None:
-                            raise InformixError(
-                                f"Duplicate immutable schema node {schema_id} for "
-                                f"'{table.exposed_name}'"
-                            )
-                        match = record
-        finally:
-            os.close(transitions_descriptor)
-        return match
+        # A checkpoint is emitted only after its exact schema-node head is
+        # committed. Do not scan unbounded, unrelated transition history to
+        # compensate for an externally removed historical node.
+        return None
 
     def _read_immutable_head(self, namespace: str) -> dict[str, object] | None:
         head = os.path.join(namespace, "head")
@@ -3065,7 +2998,7 @@ class InformixLakeflowConnect(LakeflowConnect):
                 value = json.load(handle)
         except FileNotFoundError:
             return None
-        except (OSError, json.JSONDecodeError) as error:
+        except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as error:
             raise InformixError(f"Cannot read Informix immutable record '{path}'") from error
         if not isinstance(value, dict):
             raise InformixError(f"Invalid Informix immutable record '{path}'")
