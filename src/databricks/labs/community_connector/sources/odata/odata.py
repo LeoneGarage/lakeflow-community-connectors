@@ -93,6 +93,7 @@ from databricks.labs.community_connector.interface import LakeflowConnect
 from databricks.labs.community_connector.interface.supports_namespaces import (
     SupportsNamespaces,
 )
+
 # Contained navigation-property support lives in ``_contained.py`` to keep
 # this module under its line-count budget. Re-exported under the original
 # private names so the rest of this file can keep using them as before.
@@ -1559,34 +1560,7 @@ class ODataLakeflowConnect(
                 f"rows under ignore). Add {cf!r} to select."
             )
 
-    def _read_table_dispatch(
-        self, table_name: str, start_offset: dict, table_options: dict[str, str]
-    ) -> tuple[Iterator[dict], dict]:
-        # The Spark Python Data Source batch reader
-        # (``LakeflowBatchReader``) passes ``start_offset=None`` and
-        # discards the returned end-offset — so any continuation state
-        # the connector would normally park in the offset (e.g.
-        # ``pending_fetches`` on the ``expand_contained=true`` path,
-        # ``chain_next_link`` on the leaf-cursor N+1 path) is dropped.
-        # Honouring ``max_records_per_batch`` here would therefore
-        # truncate the read at the cap and silently lose the remainder:
-        # a cap can only do something *correct* when the offset survives
-        # to resume from, which it never does under the batch reader.
-        # So treat ``start_offset is None`` as the batch-mode signal and
-        # force the cap effectively-infinite regardless of whether the
-        # user set one — warning when we override a user value so the
-        # ignored option isn't silent. Streaming readers always pass a
-        # dict (``{}`` or the parked offset) and keep their cap intact.
-        # The cursor read paths additionally stream lazily in this mode
-        # (see ``_read_incremental`` / ``_read_contained_incremental`` /
-        # ``_read_contained_expand``) so an uncapped batch doesn't
-        # materialise the whole result set in memory.
-        opts = dict(table_options or {})
-        # The user's OWN page_size, captured before any default is injected
-        # below — the delta branch must distinguish "user asked for response
-        # sizing" (honored via Prefer: odata.maxpagesize) from "client-paging
-        # default" (dropped outright: $top is fatal to a delta bootstrap).
-        user_page_size = opts.get("page_size")
+    def _init_read_scoped_state(self, table_name: str, opts: dict[str, str]) -> None:
         # Pagination strategy for this read. keyset/skip/auto drive
         # pagination client-side (for servers that omit @odata.nextLink)
         # and need a $top to size pages, so force a default page_size when
@@ -1680,6 +1654,41 @@ class ODataLakeflowConnect(
         # value was silent exactly where every other enum option is loud.
         self._expand_contained_mode(opts)
         self._contained_fetch_batch_size(opts)
+
+    def _read_table_dispatch(
+        self, table_name: str, start_offset: dict, table_options: dict[str, str]
+    ) -> tuple[Iterator[dict], dict]:
+        # The Spark Python Data Source batch reader
+        # (``LakeflowBatchReader``) passes ``start_offset=None`` and
+        # discards the returned end-offset — so any continuation state
+        # the connector would normally park in the offset (e.g.
+        # ``pending_fetches`` on the ``expand_contained=true`` path,
+        # ``chain_next_link`` on the leaf-cursor N+1 path) is dropped.
+        # Honouring ``max_records_per_batch`` here would therefore
+        # truncate the read at the cap and silently lose the remainder:
+        # a cap can only do something *correct* when the offset survives
+        # to resume from, which it never does under the batch reader.
+        # So treat ``start_offset is None`` as the batch-mode signal and
+        # force the cap effectively-infinite regardless of whether the
+        # user set one — warning when we override a user value so the
+        # ignored option isn't silent. Streaming readers always pass a
+        # dict (``{}`` or the parked offset) and keep their cap intact.
+        # The cursor read paths additionally stream lazily in this mode
+        # (see ``_read_incremental`` / ``_read_contained_incremental`` /
+        # ``_read_contained_expand``) so an uncapped batch doesn't
+        # materialise the whole result set in memory.
+        opts = dict(table_options or {})
+        # The user's OWN page_size, captured before any default is injected
+        # below — the delta branch must distinguish "user asked for response
+        # sizing" (honored via Prefer: odata.maxpagesize) from "client-paging
+        # default" (dropped outright: $top is fatal to a delta bootstrap).
+        user_page_size = opts.get("page_size")
+        # Parse + validate the read-scoped options and pin them on ``self``
+        # for the duration of this read (pagination, lookback window,
+        # dedup, select/page-size/contained-shape validation). Split out to
+        # keep this dispatcher below pylint's statement cap; see the helper
+        # for why each field is read-scoped state.
+        self._init_read_scoped_state(table_name, opts)
         if self._pagination != "nextlink":
             opts.setdefault("page_size", _DEFAULT_PAGE_SIZE)
         if start_offset is None:
