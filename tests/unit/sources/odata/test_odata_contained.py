@@ -11,7 +11,24 @@ import re
 import pytest
 import responses
 
-from tests.unit.sources.odata._odata_test_helpers import *  # noqa: F401,F403
+from tests.unit.sources.odata._odata_test_helpers import (
+    _GUID,
+    _GUID2,
+    GUID_CURSOR_METADATA_XML,
+    PROBE_TABLE,
+    R45_DIGIT_PK_METADATA,
+    SERVICE_URL,
+    _batch_responder,
+    _drop_lb,
+    _expand_auto_roots_callback,
+    _expand_urls,
+    _make,
+    _mock_metadata,
+    _mock_nested_metadata,
+    _mock_probe_metadata,
+    _switch_opts,
+    _switch_tree,
+)
 
 
 @responses.activate

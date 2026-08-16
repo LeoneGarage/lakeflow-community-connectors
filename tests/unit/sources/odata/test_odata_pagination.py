@@ -11,8 +11,21 @@ import re
 import pytest
 import responses
 
-from tests.unit.sources.odata._odata_test_helpers import *  # noqa: F401,F403
-
+from tests.unit.sources.odata._odata_test_helpers import (
+    _GUID,
+    NONNULL_STREAM_METADATA_XML,
+    PROBE_TABLE,
+    SERVICE_URL,
+    _drop_lb,
+    _expand_auto_roots_callback,
+    _make,
+    _mock_guid_metadata,
+    _mock_metadata,
+    _mock_nested_metadata,
+    _mock_probe_metadata,
+    _pagination_dataset,
+    _patch_sleep,
+)
 
 # ---------------------------------------------------------------------------
 # Snapshot read
@@ -1079,8 +1092,9 @@ def test_retry_honours_retry_after_http_date_header(monkeypatch):
     _mock_metadata()
     sleeps = _patch_sleep(monkeypatch)
     # 30 seconds in the future, formatted as an HTTP-date.
+    from datetime import datetime, timedelta
+    from datetime import timezone as tz
     from email.utils import format_datetime
-    from datetime import datetime, timedelta, timezone as tz
 
     target = datetime.now(tz.utc) + timedelta(seconds=30)
     http_date = format_datetime(target, usegmt=True)

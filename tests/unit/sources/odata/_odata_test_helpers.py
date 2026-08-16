@@ -4,25 +4,15 @@ connector unit tests.
 Extracted from the former monolithic ``test_odata_lakeflow_connect.py`` so the
 per-feature test modules (``test_odata_contained.py`` etc.) can share one copy
 of the ~40 ``*_METADATA_XML`` CSDL documents and the ``responses`` callback
-builders. ``import *`` re-exports every constant and helper via ``__all__``.
+builders. Each test module imports the specific names it needs from here; the
+``__all__`` list documents the shared surface.
 """
 
-
 import json
-import logging
-import os
 import re
-import time
 
-import pytest
-import requests
 import responses
-
 from databricks.labs.community_connector.sources.odata import ODataLakeflowConnect
-from databricks.labs.community_connector.sources.odata.odata import _odata_literal
-from pyspark.sql.types import DecimalType, IntegerType, StringType, TimestampType
-from tests.unit.sources.test_suite import LakeflowConnectTests
-from tests.unit.sources.test_partition_suite import SupportsPartitionedStreamTests
 
 __all__ = [
     "SERVICE_URL",
@@ -98,7 +88,6 @@ __all__ = [
     "_mock_guid_metadata",
     "_run_flip_preflight",
 ]
-
 
 
 SERVICE_URL = "https://example.com/odata/"

@@ -11,7 +11,22 @@ import pytest
 import requests
 import responses
 
-from tests.unit.sources.odata._odata_test_helpers import *  # noqa: F401,F403
+from tests.unit.sources.odata._odata_test_helpers import (
+    _COLLISION_MD,
+    _GUID,
+    DELTA_LINK_V1,
+    DELTA_LINK_V2,
+    METADATA_XML,
+    NONNULL_METADATA_XML,
+    PROBE_TABLE,
+    SERVICE_URL,
+    STREAM_METADATA_XML,
+    _delta_bootstrap_body,
+    _drop_lb,
+    _make,
+    _mock_metadata,
+    _mock_probe_metadata,
+)
 
 
 @responses.activate
@@ -1620,7 +1635,7 @@ def test_capability_cache_caps_entries_and_sweeps_disk():
         assert len(_CAPABILITY_DISK_MTIME) <= _CAPABILITY_CACHE_MAX_SERVICES
         # The most-recent cap services survive; the oldest are evicted.
         assert f"https://cap-r47-{n - 1}.example.com/odata/" in _CAPABILITY_CACHE
-        assert f"https://cap-r47-0.example.com/odata/" not in _CAPABILITY_CACHE
+        assert "https://cap-r47-0.example.com/odata/" not in _CAPABILITY_CACHE
         # Evicted services' disk mirrors are deleted, not left as dead inodes.
         assert not os.path.exists(paths[0])
         assert os.path.exists(paths[-1])

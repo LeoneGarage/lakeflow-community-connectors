@@ -10,9 +10,25 @@ import time
 
 import pytest
 import responses
-
 from databricks.labs.community_connector.sources.odata import ODataLakeflowConnect
-from tests.unit.sources.odata._odata_test_helpers import *  # noqa: F401,F403
+
+from tests.unit.sources.odata._odata_test_helpers import (
+    _FK_NULL_MD,
+    GUID_CURSOR_METADATA_XML,
+    PROBE_TABLE,
+    SERVICE_URL,
+    _batch_responder,
+    _churn_children_cb,
+    _drop_lb,
+    _make,
+    _mids_reject_expand_callback,
+    _mock_metadata,
+    _mock_nested_metadata,
+    _mock_probe_metadata,
+    _probe_filter_floor,
+    _probe_mids_callback,
+    _skip_probe_preflight,
+)
 
 
 def test_cursor_comparisons_are_chronological_not_lexical():

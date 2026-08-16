@@ -10,11 +10,38 @@ import re
 
 import pytest
 import responses
-
 from databricks.labs.community_connector.sources.odata import ODataLakeflowConnect
 from databricks.labs.community_connector.sources.odata.odata import _odata_literal
 from pyspark.sql.types import DecimalType, IntegerType
-from tests.unit.sources.odata._odata_test_helpers import *  # noqa: F401,F403
+
+from tests.unit.sources.odata._odata_test_helpers import (
+    _BINARY_MD,
+    _FENCE_MD,
+    _GUID,
+    _KEYLESS_MD,
+    CYCLE_METADATA_XML,
+    DECIMAL_METADATA_XML,
+    DUNDER_KIDS_METADATA_XML,
+    DUPSET_METADATA_XML,
+    METADATA_XML,
+    METADATA_XML_V2,
+    NONNULL_FLAT_METADATA_XML,
+    R40_DUNDER_NAV_METADATA,
+    R40_PATHKEY_METADATA,
+    R40_TYPEDEF_METADATA,
+    R43_ALIAS_METADATA,
+    R45_KEYLESS_METADATA,
+    REDECLARE_METADATA_XML,
+    SERVICE_URL,
+    TYPEDEF_METADATA_XML,
+    _make,
+    _mock_guid_metadata,
+    _mock_inherited_metadata,
+    _mock_metadata,
+    _mock_multi_metadata,
+    _mock_nested_metadata,
+    _mock_recursive_metadata,
+)
 
 
 def test_parse_iso8601_normalizes_fraction_digit_count():

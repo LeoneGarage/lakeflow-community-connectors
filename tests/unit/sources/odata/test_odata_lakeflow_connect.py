@@ -15,23 +15,12 @@ Two layers:
 """
 
 
-import json
-import logging
-import os
-import re
-import time
 
-import pytest
-import requests
-import responses
 
 from databricks.labs.community_connector.sources.odata import ODataLakeflowConnect
-from databricks.labs.community_connector.sources.odata.odata import _odata_literal
-from pyspark.sql.types import DecimalType, IntegerType, StringType, TimestampType
-from tests.unit.sources.test_suite import LakeflowConnectTests
+
 from tests.unit.sources.test_partition_suite import SupportsPartitionedStreamTests
-
-
+from tests.unit.sources.test_suite import LakeflowConnectTests
 
 
 class TestODataConnector(LakeflowConnectTests, SupportsPartitionedStreamTests):

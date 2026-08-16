@@ -9,7 +9,18 @@ import json
 import pytest
 import responses
 
-from tests.unit.sources.odata._odata_test_helpers import *  # noqa: F401,F403
+from tests.unit.sources.odata._odata_test_helpers import (
+    _GUID,
+    _GUID2,
+    GUID_CURSOR_METADATA_XML,
+    PROBE_TABLE,
+    SERVICE_URL,
+    _drop_lb,
+    _make,
+    _mock_metadata,
+    _mock_nested_metadata,
+    _mock_probe_metadata,
+)
 
 
 def test_pg_is_continuation_recognizes_any_casing():

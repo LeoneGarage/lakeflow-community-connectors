@@ -11,11 +11,30 @@ import re
 
 import pytest
 import responses
-
 from databricks.labs.community_connector.sources.odata import ODataLakeflowConnect
 from databricks.labs.community_connector.sources.odata.odata import _odata_literal
-from tests.unit.sources.odata._odata_test_helpers import *  # noqa: F401,F403
 
+from tests.unit.sources.odata._odata_test_helpers import (
+    _COLLISION_MD,
+    _FK_NULL_MD,
+    COLLIDE_METADATA_XML,
+    DUNDER_SET_METADATA_XML,
+    NONNULL_FLAT_METADATA_XML,
+    NONNULL_METADATA_XML,
+    PROBE_TABLE,
+    R41_INT64_METADATA,
+    SERVICE_URL,
+    _drop_lb,
+    _expand_auto_roots_callback,
+    _leaves_or_probe_callback,
+    _make,
+    _mock_guid_metadata,
+    _mock_metadata,
+    _mock_multi_metadata,
+    _mock_nested_metadata,
+    _mock_probe_metadata,
+    _patch_sleep,
+)
 
 # ---------------------------------------------------------------------------
 # Static helpers
@@ -368,8 +387,8 @@ def test_read_table_disables_cap_when_start_offset_none_and_cap_unset(caplog):
     c = _make()
     # start_offset=None, cap unset → override applies.
     from databricks.labs.community_connector.sources.odata.odata import (
-        ODataLakeflowConnect,
         _BATCH_UNCAPPED,
+        ODataLakeflowConnect,
     )
 
     original = ODataLakeflowConnect._read_contained_expand
@@ -647,9 +666,8 @@ def test_generated_bundle_registers_and_connector_survives_cloudpickle():
     import os
     import types
 
-    from pyspark import cloudpickle
-
     import databricks.labs.community_connector.sources.odata as odata_pkg
+    from pyspark import cloudpickle
 
     bundle_path = os.path.join(
         os.path.dirname(odata_pkg.__file__), "_generated_odata_python_source.py"

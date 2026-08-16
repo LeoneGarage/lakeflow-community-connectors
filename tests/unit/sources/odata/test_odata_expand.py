@@ -10,9 +10,28 @@ import re
 import pytest
 import requests
 import responses
-
 from databricks.labs.community_connector.sources.odata import ODataLakeflowConnect
-from tests.unit.sources.odata._odata_test_helpers import *  # noqa: F401,F403
+
+from tests.unit.sources.odata._odata_test_helpers import (
+    _EXPAND_AUTO_OPTS,
+    PROBE_TABLE,
+    R39_FLIP_METADATA,
+    R42_KEYLESS_MID_METADATA,
+    R43_CI_COLLATION_METADATA,
+    SERVICE_URL,
+    _drop_lb,
+    _expand_auto_roots_callback,
+    _expand_inner_park_batch1,
+    _expand_l0_page1,
+    _expand_l0_park_batch1,
+    _expand_urls,
+    _make,
+    _mock_nested_metadata,
+    _mock_probe_metadata,
+    _run_flip_preflight,
+    _switch_opts,
+    _switch_tree,
+)
 
 
 @responses.activate
