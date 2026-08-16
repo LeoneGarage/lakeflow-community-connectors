@@ -1,0 +1,721 @@
+# Informix Community Connector Spec
+#
+# Pure-Python, serverless-capable SQLI connector. No JVM, database driver jars,
+# or native client installation is required. A disposable
+# Informix 15 instance has validated SQLI discovery/snapshot and the native CDC
+# lifecycle for INSERT, UPDATE, and DELETE. Triggered and continuous serverless
+# Lakeflow Connect pipelines have also been validated.
+#
+# The Informix CDC API (`syscdcv1.sql`) must be installed, transaction logging
+# enabled, and retained logical logs must cover the checkpoint. The user needs
+# source metadata/snapshot access and permission to use the syscdcv1 routines
+# and enable full-row logging.
+#
+# Authentication and TLS limitations:
+#   - Informix ASC username/password and non-interactive PAM authentication are
+#     implemented. PAM is validated against a live PAM-enabled Informix fixture.
+#     Redirect reconnect/security behavior is validated with a deterministic
+#     ASF type-13 redirect responder; a genuine IDS/HDR-issued redirect remains
+#     unvalidated.
+#   - GSS, locale discovery, and private-server authentication remain rejected.
+#   - TLS is mandatory because normal authentication sends the password in the
+#     ASC payload. `encrypt=false` explicitly opts into plaintext transport.
+#   - TLS uses Python hostname verification and either system CA trust or a PEM
+#     CA file supplied with `ssl.ca.file`. There is no insecure-skip-verify mode.
+#
+# CDC-capable tables require a primary key and only supported CDC columns.
+# Supported CDC column types are SMALLINT, INTEGER/INT, SERIAL, FLOAT/DOUBLE,
+# REAL/SMALLFLOAT, DECIMAL, MONEY, DATE, BOOLEAN, CHAR,
+# VARCHAR/NVARCHAR, BIGINT/BIGSERIAL, INT8/SERIAL8, LVARCHAR, and supported
+# DATETIME qualifiers. INT8, SERIAL8, DATETIME, LVARCHAR, and BOOLEAN have
+# dedicated snapshot/CDC live coverage against Informix 15 over TLS.
+# INT8/SERIAL8 use the complete ten-byte CDC signed-magnitude representation;
+# there is no trailer-discard compatibility option. DATETIME values containing
+# YEAR/MONTH/DAY are emitted as naive source calendar values and interpreted by
+# Spark as timestamps; partial qualifiers are deterministic labeled strings and
+# never acquire a current date. BYTE, TEXT, BLOB, CLOB, INTERVAL, NCHAR, and
+# complex or opaque types lack end-to-end snapshot/CDC materialization and cause
+# an explicit metadata error. Unknown catalog types fail discovery rather than being decoded
+# speculatively. Ordinary TEXT/BYTE fetch framing has a bounded internal helper,
+# but content materialization and limits are not exposed by this connector.
+# Generated metadata, snapshot, and CDC lifecycle statements use a deliberately
+# narrow typed-bind implementation (INTEGER/BIGINT/VARCHAR and explicit internal
+# typed nulls). It is not a user-query or arbitrary prepared-statement API.
+#
+# CDC-capable tables receive a deterministic primary-key snapshot followed by
+# CDC from the pre-snapshot high-water LSN. Delivery is at-least-once and a
+# transaction is never split. INSERT/UPDATE rows and DELETE before-images use
+# independently checkpointed channels. Types without ordinary SQLI snapshot
+# materialization fail metadata discovery rather than using snapshot-only mode.
+# TRUNCATE is unsupported by Lakeflow's
+# row-delete contract and fails explicitly. Expired log retention requires a
+# resnapshot. Capture-capable PK-less tables use incremental append-only CDC by
+# default; set append.only.ingestion=false to opt into a bounded snapshot instead.
+
+display_name: Informix
+connection:
+  parameters:
+    - name: hostname
+      type: string
+      required: true
+      description: Informix SQLI hostname or IP address used for TLS hostname verification.
+
+    - name: port
+      type: string
+      required: false
+      description: Informix SQLI port. Default `9088`; range `1`–`65535`.
+
+    - name: database
+      type: string
+      required: true
+      description: Informix database to discover, snapshot, and capture.
+
+    - name: user
+      type: string
+      required: true
+      description: Informix normal-auth user with metadata, snapshot, and CDC privileges.
+
+    - name: password
+      type: string
+      required: true
+      secret: true
+      description: Password used by Informix ASC normal username/password authentication.
+
+    - name: server
+      type: string
+      required: true
+      description: >
+        INFORMIXSERVER name sent during SQLI authentication. The pure-Python
+        client requires this value and does not perform server-name discovery.
+        An enabled, allow-listed redirect may replace it during a fresh login.
+
+    - name: DB_LOCALE
+      type: string
+      required: false
+      description: >
+        Informix database locale sent during SQLI authentication. Default
+        `en_US.819`. Set it explicitly when the database uses another locale;
+        locale discovery is not implemented.
+
+    - name: CLIENT_LOCALE
+      type: string
+      required: false
+      description: >
+        Informix client locale sent during SQLI authentication. Default
+        `en_US.utf8`. Its codeset selects Python row decoding; set it explicitly
+        when another client encoding is required.
+
+    - name: encrypt
+      type: string
+      required: false
+      description: >
+        Enables TLS for SQLI. Default `true`; truthy values are `1`, `true`,
+        and `yes` (case-insensitive). `0`, `false`, and `no` disable TLS and send
+        credentials, authentication exchanges, queries, and row data over a
+        plaintext TCP connection; use that only on a trusted private network.
+        With TLS enabled, system CA trust and hostname verification are always
+        used. Set `ssl.ca.file` to replace system trust with PEM trust anchors;
+        insecure certificate verification is unavailable.
+
+    - name: ssl.ca.file
+      type: string
+      required: false
+      description: >
+        Path to a PEM CA bundle available on the serverless worker. Python loads
+        it into a verified TLS context and still enforces hostname verification.
+        If absent, the platform system CA store is used.
+
+    - name: authentication.mode
+      type: string
+      required: false
+      description: >
+        Authentication mode: `password` or `pam`. Default `password`. PAM is
+        non-interactive and requires either a provider factory or the configured
+        secret response/password fallback. TLS is strongly recommended because
+        PAM exchanges are plaintext when `encrypt=false`. Other modes fail closed.
+
+    - name: authentication.provider.factory
+      type: string
+      required: false
+      description: >
+        Optional trusted Python factory in `module:callable` form. The callable
+        receives all connection options and returns the non-interactive PAM
+        response provider. This imports and executes code in the pipeline;
+        configure only an administrator-reviewed, installed module. When
+        absent, the built-in password provider is used.
+
+    - name: authentication.pam.echo.response
+      type: string
+      required: false
+      secret: true
+      description: >
+        Optional secret response for PAM echo-on prompts. The built-in provider
+        uses `password` for echo-off prompts and this value for echo-on prompts;
+        when absent, `password` is the fallback for both prompt styles. Ignored
+        by a custom authentication provider factory.
+
+    - name: authentication.pam.max.rounds
+      type: string
+      required: false
+      description: >
+        Maximum PAM challenge rounds before authentication fails closed.
+        Default `16`. PAM responses are additionally bounded to 512 encoded
+        bytes by the protocol implementation.
+
+    - name: authentication.login.timeout
+      type: string
+      required: false
+      description: >
+        Overall login deadline in seconds, shared by initial connection,
+        authentication, and every redirect/reconnect attempt. Default `30`.
+
+    - name: max.concurrent.connections
+      type: string
+      required: false
+      description: >
+        Maximum concurrent SQLI connections to one hostname, port, and
+        INFORMIXSERVER, coordinated through the Lakebase `conn_slots` table
+        keyed by that endpoint identity. Range 1 through 9999; default 16.
+        Capacity is the number of seeded rows, so it can be changed in place
+        without stopping pipelines: acquisition bounds `slot_id` by the
+        configured limit, so lowering it takes effect immediately while
+        surplus rows are left in place rather than deleted (removing a row a
+        live reader holds would silently revoke its lease), and raising it
+        seeds additional rows idempotently.
+
+    - name: upsert.connection.reservation
+      type: string
+      required: false
+      description: >
+        Connection slots reserved for the upsert channel, which the delete
+        channel may not claim. Range 0 through max.concurrent.connections - 1;
+        default 0, which is exactly the unreserved behaviour. A floor rather than
+        a partition: beyond the reserved slots both channels compete for all
+        remaining capacity, and total capacity is unchanged. Raise it with care,
+        because a delete reader throttled until its checkpoint predates log
+        retention forces a re-snapshot. Recorded in the endpoint's
+        connection-limit configuration (the Lakebase `conn_limits` row) and
+        validated like
+        max.concurrent.connections, so every pipeline sharing one Informix
+        endpoint must configure the same value: the reservation partitions a
+        single shared slot namespace, so a mismatch would let one pipeline's
+        delete readers claim slots another reserves for upserts. A mismatch fails
+        at startup rather than silently voiding the reservation.
+
+    - name: connection.backlog.hint.enabled
+      type: string
+      required: false
+      description: >
+        Whether readers publish and consume connection-backlog hints; default
+        true. A reader waiting for a connection slot cannot measure how far behind
+        it is, because querying the log position needs the very slot it is waiting
+        for. A reader that holds a slot therefore publishes the server log position
+        into the Lakebase `backlog_hints` table, and waiters subtract their own
+        checkpoint from it to estimate their backlog and press proportionally
+        harder for the next slot. Publication is one `INSERT ... ON CONFLICT DO
+        UPDATE` that keeps `GREATEST(existing, new)`, so a hint can never regress
+        no matter which reader writes last. A waiter reads only rows updated within
+        the last 45 seconds, so a stale hint is invisible rather than misleading.
+        Purely advisory and fail-open: an absent, stale, or unreadable hint leaves
+        acquisition exactly as it behaves with hints disabled, so this never
+        affects correctness. Because the published value is the whole server's log
+        position, it over-states a quiet table's backlog and is compared on a log
+        scale. Set to false to disable both halves of the protocol.
+
+    - name: redirect.enabled
+      type: string
+      required: false
+      description: >
+        Enables Informix protocol redirects. Default `false`; truthy values are
+        `1`, `true`, and `yes` (case-insensitive). Redirects remain fail-closed
+        unless every destination is present in `redirect.allowlist`.
+
+    - name: redirect.allowlist
+      type: string
+      required: false
+      description: >
+        Comma-separated exact `host:numeric-port` destinations permitted for
+        redirects; service names, wildcards, and omitted ports are rejected.
+        A hostname must resolve to exactly one stable address. If that address
+        is private, loopback, link-local, multicast, or otherwise non-public,
+        its exact `IP:numeric-port` must also be listed. Each redirected socket
+        starts a fresh login and revalidates TLS against the redirected hostname.
+
+    - name: redirect.max
+      type: string
+      required: false
+      description: >
+        Maximum redirects permitted within the overall login deadline. Default
+        `3`. Revisited server/address/port destinations are rejected as loops.
+
+    - name: padVarchar
+      type: string
+      required: false
+      description: >
+        Selects fixed-width padded decoding for ordinary SQL VARCHAR/NVARCHAR
+        snapshot and metadata results. Default `false`; truthy values are `1`,
+        `true`, and `yes` (case-insensitive). It does not change native CDC
+        VARCHAR framing. Use only when the server negotiates padded tuples.
+
+    - name: table.include.list
+      type: string
+      required: false
+      description: >
+        Optional comma-separated shell-style patterns selecting discovered
+        tables. Patterns match `database.owner.table`, `owner.table`, or
+        Informix `database:owner.table`. Alias `tables` is also supported.
+
+    - name: tables
+      type: string
+      required: false
+      description: >
+        Alias for `table.include.list`; ignored when `table.include.list` is
+        set. If neither is set, all eligible discovered user tables are used.
+
+    - name: table.exclude.list
+      type: string
+      required: false
+      description: >
+        Optional comma-separated shell-style patterns excluding discovered
+        tables after inclusion filtering.
+
+    - name: snapshot.page.size
+      type: string
+      required: false
+      description: Snapshot rows per page for CDC-capable tables. Default `20000`; minimum `1`.
+
+    - name: snapshot.read.timeout.seconds
+      type: string
+      required: false
+      description: >
+        SQLI socket read timeout while fetching transactional snapshot pages.
+        Default `300` seconds; minimum `1`.
+
+    - name: snapshot.mode
+      type: string
+      required: false
+      description: >
+        Per-table snapshot policy, also accepted at connection scope as the
+        default for every table. Supported values are `incremental` (default),
+        `initial`, `initial_only`, `no_data`, `when_needed`, `recovery`, and
+        `always`. `incremental` copies existing rows in primary-key chunks
+        interleaved with the change stream; `initial` takes a single blocking
+        repeatable-read snapshot. `when_needed` uses the incremental strategy and
+        starts a new chunked copy when a checkpoint LSN is no longer retained.
+        `always` requires a Lakeflow full refresh when a checkpoint exists.
+        Keyless append-only tables default to `no_data` when this option is unset
+        and accept only `no_data` or `initial`; `initial` streams one unordered
+        forward-only cursor into durable bounded pages before CDC.
+        The extension modes `configuration_based` and `custom` are not supported.
+
+    - name: snapshot.incremental.datetime.as.string
+      type: string
+      required: false
+      description: >
+        Per-table boolean option, also accepted at connection scope; default
+        true. When true, an incremental snapshot of a table whose primary key
+        includes one or more DATETIME columns chunks by a fixed-width string
+        cast of each DATETIME key column (in its own qualifier) instead of
+        falling back to the blocking snapshot. Any contiguous DATETIME
+        qualifier is supported, including HOUR-anchored time-of-day ranges, and
+        DATETIME key columns combined with non-DATETIME columns in a composite
+        key. Set false to force the blocking snapshot for DATETIME-keyed tables.
+
+    - name: decimal.variable.type
+      type: string
+      required: false
+      description: >
+        Per-table option controlling how Informix variable-scale
+        `DECIMAL(p)`/`NUMERIC(p)` columns (decimal floating point, where `p` is a
+        significant-digit count and the exponent floats) map to a Spark type.
+        Valid values: `string` (lossless canonical strings), `double`
+        (`DoubleType`), `integer` (`LongType`, truncated toward zero), or
+        `decimal(p,s)` (`DecimalType(p,s)`). Default `decimal(38,18)`. Values
+        whose integer part exceeds the chosen `decimal(p,s)` or the 64-bit range
+        of `integer` fail with a clear error. Explicit fixed-scale `DECIMAL(p,s)`
+        columns are unaffected and remain `DecimalType(p,s)`.
+
+    - name: decimal.variable.column.type
+      type: string
+      required: false
+      description: >
+        Per-table option with comma-separated `column:type` pairs that override
+        `decimal.variable.type` for individual variable-scale decimal columns.
+        `type` accepts the same values as `decimal.variable.type`, including
+        `decimal(p,s)`. Example:
+        `agt_no:decimal(9,0),bnk_acct_no:string`.
+
+    - name: snapshot.max.rows
+      type: string
+      required: false
+      description: >
+        Optional total row bound for a staged transactional CDC snapshot.
+        Default `0` disables the bound because CDC snapshots retain only one
+        page in worker memory. Snapshot-only tables remain bounded to `100000`
+        rows when this option is `0`.
+
+    - name: snapshot.filter
+      type: string
+      required: false
+      description: >
+        Per-table Informix SQL predicate appended to snapshot SELECT statements,
+        without the WHERE keyword. Applies to blocking, incremental, append-only
+        initial, and snapshot-only copies; subsequent CDC events are not filtered.
+        Semicolons, SQL comments, control characters, and predicates longer than
+        8192 characters are rejected.
+
+    - name: append.only.ingestion
+      type: string
+      required: false
+      description: >
+        Controls append-only ingestion. A capture-capable table without a primary
+        key defaults to true, reports `ingestion_type=append` with a cursor, and
+        streams changes incrementally. Set false explicitly to opt a keyless table
+        into bounded snapshot-only ingestion. A keyed table defaults to false but
+        may set true explicitly.
+        Only correct for a genuinely insert-only table: an UPDATE at the source
+        appends a second row, and a DELETE appends nothing and leaves the deleted
+        row present. Nothing in the schema distinguishes an append-only log from a
+        mutable table that merely lacks a key, so use the snapshot opt-out for
+        mutable keyless tables.
+        Set `scd_type: APPEND_ONLY` on the same table so the destination appends
+        rather than attempting a keyed merge; the connector cannot read scd_type
+        itself because the spec parser strips it before options reach the connector.
+        A table whose columns Informix cannot capture ignores this and stays
+        snapshot-only. There is no delete channel: requesting one for an
+        append-only table fails rather than returning empty forever.
+
+    - name: snapshot.max.bytes
+      type: string
+      required: false
+      description: >
+        Maximum estimated decoded Python bytes retained for the complete
+        snapshot, including all internal page queries and shaped output.
+        Default `0`, which disables the limit and byte accounting. Set a
+        positive value to make the SQLI fetch loop fail incrementally when the
+        estimated retained bytes exceed that limit.
+
+    - name: metadata.max.bytes
+      type: string
+      required: false
+      description: >
+        Maximum estimated decoded Python bytes retained by an individual catalog
+        query and by the complete accumulated discovery result. Default `67108864`
+        (64 MiB). Set `0` to disable the limit and byte accounting.
+
+    - name: max.records.per.batch
+      type: string
+      required: false
+      description: >
+        Target maximum projected rows per CDC batch. Default `10000`; minimum
+        `1`. A single complete transaction may exceed this value.
+
+    - name: cdc.timeout
+      type: string
+      required: false
+      description: Informix CDC idle-read timeout in seconds. Default `5`; minimum `1`.
+
+    - name: lakebase.project.id
+      type: string
+      required: false
+      description: >
+        Override the derived Lakebase project id. Defaults to
+        `informix-state-<16 hex>` computed from hostname, port, and
+        INFORMIXSERVER. Set this to share one project across connections that
+        should pool capacity together, or to adopt a pre-created project.
+
+    - name: lakebase.database
+      type: string
+      required: false
+      description: >
+        Name of the Postgres database within the Lakebase project that holds the
+        connector's shared state (connection slots, backlog hints, capacity limit,
+        and immutable per-table records). Default `databricks_postgres`, the
+        database Lakebase provisions by default. Override only to adopt a
+        pre-created database.
+
+    - name: lakebase.workspace.host
+      type: string
+      required: false
+      description: >
+        Override the Databricks workspace host used for Lakebase control-plane
+        calls (project and endpoint provisioning). Normally resolved
+        automatically from the pipeline's captured driver credential, the
+        `DATABRICKS_HOST` environment variable, or the Databricks SDK, so this is
+        only needed when none of those is available or must be overridden.
+
+    - name: lakebase.workspace.token
+      type: string
+      required: false
+      description: >
+        Override the bearer token used for Lakebase control-plane calls. Normally
+        resolved automatically alongside `lakebase.workspace.host`; set explicitly
+        only when the ambient credential cannot be resolved.
+
+    - name: lakebase.autoscale.min.cu
+      type: string
+      required: false
+      description: >
+        Minimum Lakebase compute units. Default `0.5`, which is also the smallest
+        value the API accepts. Applied only when the connector creates the
+        project; an existing project keeps its configured capacity, because
+        resizing a live endpoint is an operator decision.
+
+    - name: lakebase.autoscale.max.cu
+      type: string
+      required: false
+      description: >
+        Maximum Lakebase compute units. Default `2`. Bounds cost when many flows
+        contend; the measured steady-state query cost is ~11 ms, so the default
+        leaves ample headroom for a pipeline's flows. Applied only at project
+        creation.
+
+    - name: lakebase.suspend.timeout.seconds
+      type: string
+      required: false
+      description: >
+        Idle seconds before the Lakebase endpoint scales to zero compute. Default
+        `60`. Resuming from suspended costs about 3.3 s on the next connect, so a
+        continuously streaming pipeline never reaches the timeout while an idle
+        one stops being billed for compute. Applied only at project creation,
+        because the API accepts this value solely through a project's
+        `default_endpoint_settings` and does not apply it retroactively to an
+        endpoint that already exists.
+
+    - name: lakebase.provision.timeout.seconds
+      type: string
+      required: false
+      description: >
+        Absolute maximum time for creating or discovering the Lakebase project
+        and endpoint. Default `180`. Threads waiting for another reader to finish
+        provisioning use the same bound, so source initialization fails with a
+        stage-specific error instead of remaining RUNNING indefinitely.
+
+    - name: lakebase.password
+      type: string
+      required: true
+      description: >
+        Password for `informix_state_user`, the long-lived Postgres role that all
+        state access authenticates as. Required, because it is the credential the
+        running pipeline uses for every read and write of connector state; nothing
+        in that path then depends on a token that can expire mid-stream. The role
+        name is fixed and not configurable — every pipeline sharing a Lakebase
+        endpoint must agree on the role owning the state tables.
+
+        Supply the same value on every update: it is the source of truth, and a
+        role whose password does not match is repaired to match it, which
+        invalidates the previous password. At startup the connector tries this
+        login and, only if it fails, uses the admin identity to create the role or
+        reset its password, then re-validates. Connection option values are
+        redacted by Unity Catalog when read back.
+
+    - name: lakebase.admin_user
+      type: string
+      required: false
+      description: >
+        Postgres role used **only** to provision `informix_state_user` — creating
+        it or resetting its password — which requires CREATEROLE. Distinct from the
+        state role on purpose, so the credential every reader process holds is not
+        one that can create roles. Defaults to the pipeline's own Databricks
+        identity (`DATABRICKS_CLIENT_ID` for a service principal, otherwise the
+        workspace user), which needs no configuration. Set this only when
+        provisioning should use a different role.
+
+    - name: lakebase.admin_password
+      type: string
+      required: false
+      description: >
+        Password for `lakebase.admin_user`. Optional: when unset, the admin role
+        authenticates with a short-lived OAuth credential minted for the
+        pipeline's workspace identity, which is the usual case. Set it only where
+        no such credential can be minted, or where provisioning must use a
+        password-authenticated role. This is **not** `lakebase.password`, which
+        belongs to `informix_state_user` and is what the running pipeline uses.
+
+    - name: snapshot.staging.location
+      type: string
+      required: true
+      description: >
+        Absolute writable `/Volumes/<catalog>/<schema>/<volume>/...` directory
+        used for gzip-compressed immutable initial-snapshot pages. This is the
+        only Volume the connector uses: connection slots, backlog hints, the
+        capacity limit, and all per-table state records live in a Lakebase
+        Postgres endpoint that is provisioned automatically. Required, with no
+        default, because there is no shared-state location left to fall back on.
+        Restrict READ VOLUME because staged files contain source row values and
+        are removed after the snapshot checkpoint reaches CDC.
+
+    - name: snapshot.staging.retention.days
+      type: string
+      required: false
+      description: >
+        Days to retain abandoned immutable snapshot page scopes before
+        best-effort cleanup. Default `4`; minimum `1`. Active and
+        checkpoint-referenced snapshot scopes are never removed.
+
+    - name: cdc.shared.state.wait.seconds
+      type: string
+      required: false
+      description: >
+        Maximum seconds a reader waits for per-table initialization state.
+        Default `300`; minimum `1`.
+
+    - name: state.gc.retention.days
+      type: string
+      required: false
+      description: >
+        Age in days after which unreferenced per-table Lakebase state records
+        (activity markers for pipelines that no longer read the table) become
+        eligible for best-effort garbage collection. Default `30`; minimum `1`.
+
+    - name: state.gc.interval.hours
+      type: string
+      required: false
+      description: >
+        Minimum hours between garbage-collection sweeps for a given table, and
+        the window a reader touches its activity marker within. Default `24`;
+        must be greater than `0`.
+
+    - name: state.gc.drop.unused.projects
+      type: string
+      required: false
+      description: >
+        Whether to also drop Lakebase projects that no pipeline has used within
+        `state.gc.project.retention.days`. Accepts `true` or `false`; default
+        `false`.
+
+    - name: state.gc.project.retention.days
+      type: string
+      required: false
+      description: >
+        Age in days after which an unused Lakebase project becomes eligible for
+        removal when `state.gc.drop.unused.projects` is `true`. Default `90`;
+        must be greater than or equal to `state.gc.retention.days`.
+
+    - name: connection.wait.timeout.seconds
+      type: string
+      required: false
+      description: >
+        Maximum seconds a microbatch waits to acquire an Informix connection
+        capacity slot. Default `600`; minimum `1`. A triggered read that exhausts
+        it fails with ConnectionCapacityUnavailable; a continuous read instead
+        uses the bounded budget described by capacity.retry.max.delay.seconds.
+
+    - name: capacity.retry.max.delay.seconds
+      type: string
+      required: false
+      description: >
+        Enables capacity backpressure for continuous pipelines, where every flow
+        is a permanent consumer of a fixed slot count so contention is the steady
+        state rather than a fault. A continuous reader spends a short bounded
+        budget trying to claim a slot, then waits up to this many jittered seconds
+        and returns an empty batch. The budget grows with the reader's consecutive
+        miss count so a reader starved longest presses hardest, and acquiring a
+        slot resets it. Default `5`, which spaces starved readers apart with
+        jittered backoff, floored at 0.1s so a low draw cannot re-sweep almost
+        immediately. It was briefly `8` with a 0.5s floor to reduce how often
+        starved readers touched the shared Volume, whose FUSE mount disconnects
+        with ENOTCONN under sustained write frequency; slots are Postgres rows now,
+        which absorb that sweep rate without noticing, so the narrower range is
+        restored for responsiveness. This applies only to the steady-state stream (CDC)
+        phase: the blocking snapshot always uses an effective delay of 0
+        regardless of this setting, blocking the full connection.wait.timeout.seconds
+        per attempt to patiently wait for a slot, and the incremental snapshot
+        reader phase does the same by default (governed by
+        snapshot.incremental.blocking). Setting `0` extends that full-block
+        behavior to the stream phase too for
+        a continuous flow (maximum chance to claim a slot, no inter-read delay,
+        so higher shared-Volume metadata load under heavy contention). Must be
+        >= 0. A continuous flow always yields on exhaustion regardless of this
+        value, bounded by capacity.retry.max.retries; the value is irrelevant to
+        a triggered flow, which always blocks the full wait and raises on
+        exhaustion.
+
+    - name: capacity.retry.max.retries
+      type: string
+      required: false
+      description: >
+        Consecutive capacity misses a continuous flow tolerates before it stops
+        yielding empty batches and fails with ConnectionCapacityUnavailable.
+        A reader that never claims a slot yields empties indistinguishable from
+        an idle source; this bound makes a permanently undersized endpoint fail
+        loudly instead of replicating nothing forever. Acquiring a slot resets
+        the count. Default `500`; minimum `1`. Irrelevant to a triggered flow,
+        which raises on the first exhausted wait.
+
+    - name: dropped.mount.max.retries
+      type: string
+      required: false
+      description: >
+        Consecutive reads that find the shared-state Volume's FUSE mount
+        disconnected (ENOTCONN) before the flow stops yielding empty batches and
+        fails. A dropped mount is normally transient and yielding lets the next
+        read proceed once it returns, but a mount that never comes back leaves the
+        pipeline RUNNING and committing zero-row versions on schedule -- state
+        indistinguishable from an idle source. This bound surfaces the outage
+        instead. Counts reads rather than seconds, so the wall-clock tolerance is
+        this many microbatch intervals; raise it for a long trigger interval.
+        Reaching the Volume resets the count. Default `10`; minimum `1`.
+
+    - name: snapshot.incremental.blocking
+      type: string
+      required: false
+      description: >
+        Whether the in-progress incremental snapshot reader phase blocks for a
+        connection-capacity slot. Default `true`: an incremental snapshot read
+        (primary-key chunks interleaved with CDC, before the copy completes)
+        blocks the full connection.wait.timeout.seconds per attempt to patiently
+        claim a slot, like the consistent snapshot, since bulk copying is
+        latency-tolerant and benefits from pressing for a slot rather than
+        yielding empty. Set `false` to treat the incremental reader phase as the
+        steady-state stream instead: it then uses the continuous miss-scaled yield
+        budget and capacity.retry.max.delay.seconds inter-read backoff, freeing
+        the worker between attempts at the cost of a slower copy under contention.
+        Only affects continuous pipelines; a triggered flow always blocks fully.
+        Once the incremental snapshot completes and the reader becomes pure CDC,
+        this option no longer applies. One of: 1, true, yes, 0, false, no.
+
+    - name: cdc.max.records
+      type: string
+      required: false
+      description: Maximum native records requested from a CDC session. Default `256`; range `1`–`256`.
+
+    - name: cdc.max.frame.bytes
+      type: string
+      required: false
+      description: >
+        Maximum accepted native CDC frame size in bytes. Default `16777216`
+        (16 MiB); values below `16` fail when the frame parser is created.
+
+    - name: cdc.max.transaction.records
+      type: string
+      required: false
+      description: >
+        Maximum buffered records while a CDC transaction remains open. Default
+        `100000`. `cdc.max.records` is a soft target while a transaction is open;
+        exceeding this safety bound fails rather than emitting uncommitted data.
+
+    - name: cdc.max.poll.records
+      type: string
+      required: false
+      description: >
+        Hard bound on all decoded records retained by one native CDC poll,
+        including committed transactions interleaved with an open transaction.
+        Default `200000`; minimum `1`.
+
+    - name: cdc.max.poll.bytes
+      type: string
+      required: false
+      description: >
+        Optional estimated retained-byte bound per poll, counting native frames
+        and recursively sized decoded Python values. Default `0`, which disables
+        the bound and byte accounting.
+
+    - name: cdc.read.bytes
+      type: string
+      required: false
+      description: Bytes requested from each Informix SmartLOB CDC read. Default `32000`.
+
+# Exact per-table overrides consumed by the connector. `qualified_source_table` maps a
+# pipeline table to a dynamically discovered exposed name (`owner.table`).
+external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records"

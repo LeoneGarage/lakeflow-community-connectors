@@ -6,6 +6,10 @@
   ],
   "source_exclude": {
     "example": [],
+    "informix": [
+      "volume_semantics_probe.py",
+      "capacity_probe_local.py"
+    ],
     "osipi": [
         "ingest.py"
     ],
