@@ -132,7 +132,7 @@ Before resuming, validate retention with:
 SELECT MIN(uniqid) AS uniqid, 0 AS logpage FROM sysmaster:syslogs
 ```
 
-The minimum available sequence is `(uniqid << 32)`. If the restart LSN is older, incremental continuation is impossible; fail explicitly or perform the configured `when_needed` resnapshot. The approximate current/high-water LSN used before a snapshot is:
+The minimum available sequence is `(uniqid << 32)`. If the restart LSN is older, incremental continuation is impossible; fail explicitly or perform the configured `auto_snapshot` resnapshot. The approximate current/high-water LSN used before a snapshot is:
 
 ```sql
 SELECT uniqid, used AS logpage
@@ -184,19 +184,18 @@ The current maximum LSN is discovered before reading data. Eligible tables are d
 For Lakeflow, snapshot pagination is deterministic by the complete primary key (`ORDER BY pk`, seek after `last_pk`). The production bridge reads all source pages inside one repeatable-read transaction and captures a transactional snapshot LSN for row ordering, but retains only one page in worker memory. Each shaped page is encoded as typed JSON, gzip-compressed, hash-protected, and atomically published under `snapshot.staging.location`, the connector's only Volume. A manifest becomes visible only after every page is durable. Lakeflow checkpoints a page index and `readBetweenOffsets()` replays the exact immutable page, so planning, cancellation, worker replacement, and retry cannot change its rows. Staging contains source values and therefore requires restricted Volume permissions. It is removed after a committed stream-phase checkpoint is observed; abandoned scopes are eligible for best-effort cleanup after `snapshot.staging.retention.days` (default `4`). Active and checkpoint-referenced scopes are retained. After the staged snapshot commits, both channels advance directly to its snapshot LSN because its rows represent the committed state visible at that boundary. The earlier prepared LSN establishes full-row logging and a valid capture window while the transaction starts; it is not replayed after the completed snapshot. The bridge probes `sysmaster:sysdatabases.is_ansi`; non-ANSI databases receive explicit `BEGIN WORK`, while ANSI databases commit the probe's implicit transaction and let the first snapshot statement begin the repeatable-read transaction implicitly. Both branches and their rollback paths have source-local protocol/ordering coverage. `ansi_live_test.py` provides an opt-in regression through the standard connector test configuration and refuses to run unless the target reports `is_ansi=1`; executing it still requires an ANSI-enabled live database. Capture-capable tables without a primary key default to append-only CDC; set `append.only.ingestion=false` to opt into bounded snapshot-only ingestion instead.
 
 The per-table `snapshot.mode` option supports `incremental` (default), `initial`,
-`initial_only`, `no_data`, `when_needed`, `recovery`, and `always`. `initial`
+`initial_only`, `cdc_only`, `auto_snapshot`, and `recovery`. `initial`
 snapshots only without a checkpoint. `initial_only` completes snapshot pages but
-does not subsequently poll CDC. `no_data` publishes the current schema and LSN
+does not subsequently poll CDC. `cdc_only` publishes the current schema and LSN
 as a completed zero-row snapshot so both channels begin at the same future-only
-boundary. `when_needed` uses the incremental PK-chunked strategy, derives a
+boundary. `auto_snapshot` uses the incremental PK-chunked strategy, derives a
 deterministic replacement pipeline scope from the expired checkpoint identity,
 lets the upsert reader publish a new CDC/copy boundary, and makes the delete
 reader adopt that boundary while the upsert channel copies existing rows. `recovery` requires a
 retained stream checkpoint and an exactly matching schema fingerprint; it may
 rebuild a missing schema node but never snapshots data or treats changed schema
-as recoverable. `always` snapshots only when Lakeflow supplies no checkpoint and
-otherwise resumes that checkpoint; reproduce snapshot-on-every-start behavior
-by requesting a Lakeflow full refresh for each update. `configuration_based` and `custom` are
+as recoverable. To force a fresh snapshot of a table that already has a
+checkpoint, request a Lakeflow full refresh for that update. `configuration_based` and `custom` are
 rejected because they depend on external framework extensions that cannot preserve the Python
 connector's two-reader checkpoint protocol.
 

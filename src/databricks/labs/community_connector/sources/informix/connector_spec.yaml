@@ -297,14 +297,13 @@ connection:
       description: >
         Per-table snapshot policy, also accepted at connection scope as the
         default for every table. Supported values are `incremental` (default),
-        `initial`, `initial_only`, `no_data`, `when_needed`, `recovery`, and
-        `always`. `incremental` copies existing rows in primary-key chunks
+        `initial`, `initial_only`, `cdc_only`, `auto_snapshot`, and
+        `recovery`. `incremental` copies existing rows in primary-key chunks
         interleaved with the change stream; `initial` takes a single blocking
-        repeatable-read snapshot. `when_needed` uses the incremental strategy and
+        repeatable-read snapshot. `auto_snapshot` uses the incremental strategy and
         starts a new chunked copy when a checkpoint LSN is no longer retained.
-        `always` requires a Lakeflow full refresh when a checkpoint exists.
-        Keyless append-only tables default to `no_data` when this option is unset
-        and accept only `no_data` or `initial`; `initial` streams one unordered
+        Keyless append-only tables default to `cdc_only` when this option is unset
+        and accept only `cdc_only` or `initial`; `initial` streams one unordered
         forward-only cursor into durable bounded pages before CDC.
         The extension modes `configuration_based` and `custom` are not supported.
 

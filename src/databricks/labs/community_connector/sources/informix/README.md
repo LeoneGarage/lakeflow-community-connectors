@@ -88,7 +88,7 @@ replicated — run a full refresh if the destination must match the source exact
 | `table.exclude.list` | No | none | Comma-separated shell-style patterns excluded after inclusion filtering. |
 | `decimal.variable.type` | No | `decimal(38,18)` | Per-table option. Target Spark type for variable-scale `DECIMAL(p)`/`NUMERIC(p)` columns: `string`, `double`, `integer` (truncated), or `decimal(p,s)`. Explicit `DECIMAL(p,s)` remains fixed-scale. See [Variable-scale decimals](#variable-scale-decimals). |
 | `decimal.variable.column.type` | No | none | Per-table option. Comma-separated `column:type` overrides of `decimal.variable.type` for specific columns, e.g. `agt_no:decimal(9,0),bnk_acct_no:string`. |
-| `snapshot.mode` | No | `incremental` | Per-table snapshot policy: `incremental`, `initial`, `initial_only`, `no_data`, `when_needed`, `recovery`, or `always`. See [Snapshot modes](#snapshot-modes). |
+| `snapshot.mode` | No | `incremental` | Per-table snapshot policy: `incremental`, `initial`, `initial_only`, `cdc_only`, `auto_snapshot`, or `recovery`. See [Snapshot modes](#snapshot-modes). |
 | `snapshot.page.size` | No | `20000` | Rows per immutable staged page for CDC-capable tables; minimum `1`. Pages are read under one repeatable-read transaction and delivered through checkpointed Lakeflow microbatches. |
 | `snapshot.filter` | No | none | Per-table Informix SQL predicate appended to snapshot `SELECT` statements, without the `WHERE` keyword. It filters blocking, incremental, append-only initial, and snapshot-only copies. CDC events after the snapshot are not filtered. Semicolons, SQL comments, control characters, and predicates longer than 8,192 characters are rejected. |
 | `snapshot.read.timeout.seconds` | No | `300` | SQLI socket read timeout while fetching transactional snapshot pages; minimum `1`. |
@@ -524,7 +524,7 @@ default is `incremental`. It may also be set once at connection scope as the
 default for every table, and overridden per table.
 
 For an append-only table without a primary key, an unset mode defaults to
-`no_data`. Such a table supports `no_data` or `initial`: `initial` streams one
+`cdc_only`. Such a table supports `cdc_only` or `initial`: `initial` streams one
 unordered forward-only cursor under repeatable read into durable bounded pages,
 then continues CDC from the snapshot LSN. Other modes require key-based snapshot
 progress and are rejected.
@@ -534,10 +534,9 @@ progress and are rejected.
 | `incremental` | Default. Begin CDC immediately at the captured boundary and copy existing rows in primary-key chunks interleaved with the change stream, one chunk per microbatch. No long-lived repeatable-read transaction is held over the whole table; each chunk is read in its own short repeatable-read transaction and its `r` rows are stamped with the LSN captured just before that chunk. Correctness for keyed (`apply_changes`) targets follows from LSN sequencing — any concurrent or later change to a chunked key commits at a higher `_informix_change_lsn` and supersedes the snapshot row in Auto CDC's sequence-merge, so no in-memory deduplication window is required. Rows inserted beyond the key range captured at snapshot start are left to the change stream. Tables whose primary key includes one or more `DATETIME` columns (alone or combined with non-`DATETIME` key columns in a composite key) are chunked by a fixed-width string cast of each `DATETIME` key column when `snapshot.incremental.datetime.as.string` is true (the default). Any contiguous `DATETIME` qualifier is supported, including `HOUR`-anchored time-of-day ranges. Set the option false to force the blocking `initial` snapshot for such tables. See [Incremental snapshot and append-only targets](#incremental-snapshot-and-append-only-targets). |
 | `initial` | If the table has no checkpoint, take a single transactionally consistent (blocking) snapshot under one repeatable-read transaction and continue from its captured Informix LSN. If a checkpoint exists, resume CDC without another snapshot. Use this when you require a single point-in-time snapshot LSN for the whole table rather than per-chunk boundaries. |
 | `initial_only` | Take the initial snapshot, checkpoint its boundary, and emit no later CDC records. Both upsert and delete readers then remain exhausted. Snapshot continuation pages still finish normally after a restart. |
-| `no_data` | Do not copy existing rows. Enable full-row logging, record the current schema and LSN, and stream only transactions after that boundary. It requires CDC-supported column types; keyless tables use append-only ingestion. |
-| `when_needed` | Behave like `incremental`, but automatically begin a new PK-chunked snapshot if the checkpoint's restart LSN has fallen out of the retained Informix logical logs. CDC begins immediately at the new deterministic boundary while existing rows are copied in chunks; the independently checkpointed delete reader adopts the same boundary. Other checkpoint or schema errors still fail closed. |
+| `cdc_only` | Do not copy existing rows. Enable full-row logging, record the current schema and LSN, and stream only transactions after that boundary. It requires CDC-supported column types; keyless tables use append-only ingestion. |
+| `auto_snapshot` | Behave like `incremental`, but automatically begin a new PK-chunked snapshot if the checkpoint's restart LSN has fallen out of the retained Informix logical logs. CDC begins immediately at the new deterministic boundary while existing rows are copied in chunks; the independently checkpointed delete reader adopts the same boundary. Other checkpoint or schema errors still fail closed. |
 | `recovery` | Rebuild missing immutable schema-history state from an existing stream checkpoint, then resume CDC without copying table data. It is accepted only when the current source schema fingerprint exactly matches the checkpoint and the checkpoint LSN is still retained. If either condition is false, run a full refresh. Do not use this mode to accommodate a real schema change. |
-| `always` | Take a snapshot whenever Lakeflow supplies no checkpoint. To reproduce a snapshot-on-every-start behavior, start the pipeline with a full refresh each time. If Lakeflow supplies an existing checkpoint, the connector must resume it: the data-source API does not expose a reliable update boundary and a connector cannot safely erase framework-owned checkpoints. Selecting this value alone therefore does not resnapshot an ordinary restart. |
 
 For example, to start CDC at the current source position without ingesting
 existing rows:
@@ -547,14 +546,14 @@ existing rows:
   "source_table": "members",
   "table_configuration": {
     "qualified_source_table": "informix.members",
-    "snapshot.mode": "no_data"
+    "snapshot.mode": "cdc_only"
   }
 }
 ```
 
 Changing `snapshot.mode` does not erase a checkpoint. Use a pipeline full
 refresh when deliberately replacing existing destination contents or when
-running `always` with a new snapshot.
+forcing a fresh snapshot of a table that already has a checkpoint.
 
 #### Incremental snapshot and append-only targets
 
