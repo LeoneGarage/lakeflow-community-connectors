@@ -4735,11 +4735,10 @@ def register_lakeflow_source(spark):
     _SNAPSHOT_MODES = frozenset(
         {
             "incremental",
-            "always",
             "initial",
             "initial_only",
-            "no_data",
-            "when_needed",
+            "cdc_only",
+            "auto_snapshot",
             "recovery",
         }
     )
@@ -8028,7 +8027,7 @@ def register_lakeflow_source(spark):
                         else:
                             result = self._read_append_only(table, effective_start, table_options)
                     elif not _cdc_capable(table):
-                        if snapshot_mode in {"no_data", "recovery"}:
+                        if snapshot_mode in {"cdc_only", "recovery"}:
                             raise ValueError(
                                 f"snapshot.mode={snapshot_mode} requires a CDC-capable table; "
                                 f"'{table.exposed_name}' is snapshot-only"
@@ -8067,10 +8066,10 @@ def register_lakeflow_source(spark):
                     elif snapshot_mode == "initial_only" and effective_start.get("phase") == "stream":
                         self._cleanup_completed_snapshot_stage(table, effective_start)
                         result = (iter(()), dict(effective_start))
-                    elif snapshot_mode == "no_data" and not effective_start:
-                        result = self._read_no_data(table, table_options)
+                    elif snapshot_mode == "cdc_only" and not effective_start:
+                        result = self._read_cdc_only(table, table_options)
                     elif (
-                        snapshot_mode == "when_needed"
+                        snapshot_mode == "auto_snapshot"
                         and effective_start.get("phase") == "stream"
                         and self._checkpoint_requires_snapshot(effective_start)
                     ):
@@ -8080,10 +8079,10 @@ def register_lakeflow_source(spark):
                             table_options,
                             pipeline_scope_override=self._resnapshot_scope(table, effective_start),
                         )
-                    elif snapshot_mode in {"incremental", "when_needed"} and not effective_start:
+                    elif snapshot_mode in {"incremental", "auto_snapshot"} and not effective_start:
                         result = self._read_incremental(table, None, table_options)
                     elif (
-                        snapshot_mode in {"incremental", "when_needed"}
+                        snapshot_mode in {"incremental", "auto_snapshot"}
                         and "incremental" in effective_start
                     ):
                         result = self._read_incremental(table, effective_start, table_options)
@@ -9010,7 +9009,7 @@ def register_lakeflow_source(spark):
                     "by Informix CDC and is snapshot-only"
                 )
             if (
-                snapshot_mode == "when_needed"
+                snapshot_mode == "auto_snapshot"
                 and start_offset.get("phase") == "stream"
                 and self._checkpoint_requires_snapshot(start_offset)
             ):
@@ -9126,14 +9125,14 @@ def register_lakeflow_source(spark):
                     f"Releasing the Informix worker connection also failed: {cleanup_error}",
                 )
 
-        def _read_no_data(self, table: Table, options: dict[str, str]) -> tuple[Iterator[dict], dict]:
+        def _read_cdc_only(self, table: Table, options: dict[str, str]) -> tuple[Iterator[dict], dict]:
             """Establish a schema-safe CDC boundary without reading existing rows."""
 
             pipeline_scope = self._pipeline_scope()
             table = self._refresh_table_schema(table, None)
             if not _cdc_capable(table):
                 raise ValueError(
-                    f"snapshot.mode=no_data requires a CDC-capable table; "
+                    f"snapshot.mode=cdc_only requires a CDC-capable table; "
                     f"'{table.exposed_name}' is snapshot-only"
                 )
             high_water = self._initial_lsn(table, scope=pipeline_scope)
@@ -10204,7 +10203,7 @@ def register_lakeflow_source(spark):
 
             Two startup behaviours, selected by ``snapshot.mode``:
 
-            ``no_data`` (also the append-only default when snapshot.mode is unset)
+            ``cdc_only`` (also the append-only default when snapshot.mode is unset)
                 Start at the server's current log position and emit nothing now. Rows
                 that predate the flow are not captured. No size ceiling, no memory
                 spike, and no failure mode -- which is why it is the default. An
@@ -10226,12 +10225,12 @@ def register_lakeflow_source(spark):
             pipeline_scope = self._pipeline_scope()
             configured_mode = options.get("snapshot.mode", self.options.get("snapshot.mode"))
             snapshot_mode = (
-                "no_data" if configured_mode is None else str(configured_mode).strip().lower()
+                "cdc_only" if configured_mode is None else str(configured_mode).strip().lower()
             )
-            if snapshot_mode not in {"initial", "no_data"}:
+            if snapshot_mode not in {"initial", "cdc_only"}:
                 raise ValueError(
                     f"Append-only table '{table.exposed_name}' supports only "
-                    "snapshot.mode=initial or snapshot.mode=no_data"
+                    "snapshot.mode=initial or snapshot.mode=cdc_only"
                 )
 
             if snapshot_mode == "initial":

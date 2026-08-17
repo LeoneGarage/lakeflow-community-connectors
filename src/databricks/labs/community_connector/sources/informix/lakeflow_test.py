@@ -3931,14 +3931,14 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(list(delete_rows), [])
         self.assertEqual(delete_offset, {})
 
-    def test_snapshot_mode_no_data_starts_at_current_lsn(self):
+    def test_snapshot_mode_cdc_only_starts_at_current_lsn(self):
         bridge = FakeBridge()
         bridge.now = 125
         connector = self.connector(bridge)
 
-        rows, checkpoint = connector.read_table("app.orders", {}, {"snapshot.mode": "no_data"})
+        rows, checkpoint = connector.read_table("app.orders", {}, {"snapshot.mode": "cdc_only"})
         delete_rows, delete_checkpoint = self.connector(bridge).read_table_deletes(
-            "app.orders", {}, {"snapshot.mode": "no_data"}
+            "app.orders", {}, {"snapshot.mode": "cdc_only"}
         )
 
         self.assertEqual(list(rows), [])
@@ -3948,7 +3948,7 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(list(delete_rows), [])
         self.assertEqual(delete_checkpoint["commit_lsn"], "125")
 
-    def test_snapshot_mode_when_needed_resnapshots_expired_checkpoint(self):
+    def test_snapshot_mode_auto_snapshot_resnapshots_expired_checkpoint(self):
         bridge = FakeBridge()
         bridge.minimum = 91
         bridge.now = 150
@@ -3958,10 +3958,10 @@ class LakeflowContractTests(unittest.TestCase):
         rows, recovered = self.connector(bridge).read_table(
             "app.orders",
             checkpoint,
-            {"snapshot.mode": "when_needed", "snapshot.page.size": "1"},
+            {"snapshot.mode": "auto_snapshot", "snapshot.page.size": "1"},
         )
         delete_rows, delete_recovered = self.connector(bridge).read_table_deletes(
-            "app.orders", checkpoint, {"snapshot.mode": "when_needed"}
+            "app.orders", checkpoint, {"snapshot.mode": "auto_snapshot"}
         )
 
         self.assertEqual([row["id"] for row in rows], [1])
@@ -3973,13 +3973,13 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(delete_recovered["commit_lsn"], "150")
         self.assertEqual(delete_recovered["pipeline_scope"], recovered["pipeline_scope"])
 
-    def test_snapshot_mode_when_needed_starts_incrementally_without_checkpoint(self):
+    def test_snapshot_mode_auto_snapshot_starts_incrementally_without_checkpoint(self):
         bridge = FakeBridge()
 
         rows, checkpoint = self.connector(bridge).read_table(
             "app.orders",
             {},
-            {"snapshot.mode": "when_needed", "snapshot.page.size": "1"},
+            {"snapshot.mode": "auto_snapshot", "snapshot.page.size": "1"},
         )
 
         self.assertEqual([row["id"] for row in rows], [1])
@@ -4183,13 +4183,6 @@ class LakeflowContractTests(unittest.TestCase):
                 "app.orders", _stream_offset(), {"snapshot.mode": "recovery"}
             )
 
-    def test_snapshot_mode_always_honors_existing_checkpoint(self):
-        connector = self.connector(FakeBridge())
-        checkpoint = _stream_offset()
-        rows, resumed = connector.read_table("app.orders", checkpoint, {"snapshot.mode": "always"})
-        self.assertEqual(list(rows), [])
-        self.assertEqual(resumed, checkpoint)
-
     def test_unchanged_schema_microbatch_trusts_checkpoint_without_state_read(self):
         connector = self.connector(FakeBridge())
         checkpoint = _stream_offset()
@@ -4217,7 +4210,7 @@ class LakeflowContractTests(unittest.TestCase):
 
         bridge = FakeBridge()
         bridge.tables = [_table(cdc=False)]
-        for mode in ("no_data", "recovery"):
+        for mode in ("cdc_only", "recovery"):
             with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "CDC-capable"):
                 self.connector(bridge).read_table("app.orders", {}, {"snapshot.mode": mode})
 
@@ -4865,7 +4858,7 @@ class LakeflowContractTests(unittest.TestCase):
             return {**original(identity), "primary_keys": []}
 
         bridge.get_table = refreshed_without_primary_key
-        connector = self.connector(bridge, **{"snapshot.mode": "no_data"})
+        connector = self.connector(bridge, **{"snapshot.mode": "cdc_only"})
 
         rows, offset = connector.read_table("app.orders", {}, {})
         self.assertEqual(list(rows), [])
@@ -4970,7 +4963,7 @@ class LakeflowContractTests(unittest.TestCase):
     def _keyless_connector(self, **options):
         bridge = FakeBridge()
         bridge.tables = [_table(primary_keys=())]
-        options.setdefault("snapshot.mode", "no_data")
+        options.setdefault("snapshot.mode", "cdc_only")
         return self.connector(bridge, **options), bridge
 
     def test_a_keyless_table_defaults_to_append_with_a_cursor(self):
