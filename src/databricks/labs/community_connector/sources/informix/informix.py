@@ -96,6 +96,12 @@ _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 _DATA_OPS = {"INSERT", "BEFORE_UPDATE", "AFTER_UPDATE", "DELETE", "TRUNCATE"}
 _DEFAULT_SNAPSHOT_PAGE_SIZE = 20000
 _DEFAULT_SNAPSHOT_READ_TIMEOUT_SECONDS = 300
+# CDC session setup/teardown (cdc_opensess/startcapture/activatesess/endcapture/
+# closesess) runs on the transport's default socket timeout unless raised here.
+# syscdcv1 teardown can stall under many concurrent CDC sessions, so give these
+# control-plane calls more room than the 30s default without adopting the much
+# larger snapshot read budget.
+_DEFAULT_CDC_READ_TIMEOUT_SECONDS = 60
 _DEFAULT_MAX_RECORDS_PER_BATCH = 10000
 # Informix's own per-session ceiling, passed straight to cdc_opensess. Each poll
 # pays a connection slot plus a full CDC session open/activate/close, so a small
@@ -1749,6 +1755,18 @@ class PurePythonInformixBridge:
 
         self._ensure_connected()
 
+        # The CDC control-plane calls below (open/start/activate/end/close) run on
+        # the transport's default socket timeout unless raised here. syscdcv1
+        # teardown can stall under many concurrent CDC sessions, so give them the
+        # configured cdc.read.timeout.seconds budget instead of the ~30s default.
+        set_socket_timeout = getattr(self.transport, "set_socket_timeout", None)
+        previous_socket_timeout = getattr(self.transport, "socket_timeout", None)
+        cdc_timeout = float(
+            self.options.get("cdc.read.timeout.seconds", str(_DEFAULT_CDC_READ_TIMEOUT_SECONDS))
+        )
+        if set_socket_timeout is not None:
+            set_socket_timeout(max(float(previous_socket_timeout or 30), cdc_timeout))
+
         server_row = self.transport.execute(
             "SELECT env_value FROM sysmaster:sysenv WHERE env_name='INFORMIXSERVER'"
         )[0]
@@ -1804,6 +1822,11 @@ class PurePythonInformixBridge:
                 )
             except Exception as error:
                 cleanup_errors.append(error)
+            if set_socket_timeout is not None and previous_socket_timeout is not None:
+                try:
+                    set_socket_timeout(float(previous_socket_timeout))
+                except Exception as error:
+                    cleanup_errors.append(error)
             if cleanup_errors and primary_error is None:
                 raise InformixError("Initial CDC validation cleanup failed") from cleanup_errors[0]
             if cleanup_errors and primary_error is not None:

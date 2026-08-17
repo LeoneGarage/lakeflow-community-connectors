@@ -1360,31 +1360,33 @@ class InformixSqliClient:
         raw = socket.create_connection(
             (validated_address or host, port), min(self.connect_timeout, remaining)
         )
+        # Tracks whatever socket must be closed on failure: the raw socket until a
+        # TLS wrap replaces it, so a makefile failure after a successful handshake
+        # closes the wrapped socket rather than leaking it.
+        connection = raw
         try:
             raw.settimeout(min(self.socket_timeout, max(0.001, deadline - time.monotonic())))
             raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             if self.tls:
                 context = self.ssl_context or ssl.create_default_context(cafile=self.ca_file)
                 connection = context.wrap_socket(raw, server_hostname=host)
-            else:
-                connection = raw
+            self._socket = connection
+            self._input = _DeadlineReader(
+                self._socket.makefile("rb", buffering=4096),
+                self._socket,
+                deadline,
+                self.socket_timeout,
+            )
+            self._output = self._socket.makefile("wb", buffering=4096)
         except BaseException as primary_error:
             try:
-                raw.close()
+                connection.close()
             except OSError as close_error:
                 add_informix_exception_note(
                     primary_error,
                     f"Closing the failed Informix socket also failed: {close_error}",
                 )
             raise
-        self._socket = connection
-        self._input = _DeadlineReader(
-            self._socket.makefile("rb", buffering=4096),
-            self._socket,
-            deadline,
-            self.socket_timeout,
-        )
-        self._output = self._socket.makefile("wb", buffering=4096)
         self.state = ConnectionState.SOCKET_OPEN
         properties = {
             "CLIENT_LOCALE": self.client_locale,

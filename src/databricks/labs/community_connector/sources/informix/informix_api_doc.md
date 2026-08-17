@@ -172,7 +172,10 @@ Each finite call opens/replays a CDC session, reads until at least one complete 
 
 Informix snapshot SQLI reads use `snapshot.read.timeout.seconds` (default
 `300`) so large staged pages are not constrained by the normal 30-second
-transport timeout.
+transport timeout. CDC session setup and teardown while validating the initial
+CDC boundary use `cdc.read.timeout.seconds` (default `60`) for the same reason:
+`syscdcv1` open/start/activate/end/close calls can stall under many concurrent
+CDC sessions and should not fail against the 30-second default.
 
 When the shared reader supplies snapshot page N as its new start offset,
 pages below N are acknowledged and removed best-effort. Page N, later pages,

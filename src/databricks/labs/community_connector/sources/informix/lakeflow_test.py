@@ -1908,9 +1908,63 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertIn("validation cleanup also failed", " ".join(caught.exception.__notes__))
 
+    def test_initial_lsn_validation_extends_and_restores_socket_timeout(self):
+        class TimedTransport:
+            def __init__(self):
+                self.socket_timeout = 30.0
+                self.timeouts = []
+
+            def set_socket_timeout(self, timeout):
+                self.socket_timeout = timeout
+                self.timeouts.append(timeout)
+
+            def execute(self, sql, parameters=()):
+                if "sysenv" in sql:
+                    return [{"env_value": "demo_server"}]
+                if "cdc_opensess" in sql:
+                    return [{"session_id": 7}]
+                return [{"status": 0}]
+
+        transport = TimedTransport()
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.transport = transport
+        bridge.options = {}
+
+        bridge.validate_initial_lsn({"identity": "demo:app.orders", "columns": ["id"]}, 80)
+
+        # Raised to the 60s CDC default for the control-plane calls, then restored.
+        self.assertEqual(transport.timeouts, [60.0, 30.0])
+
+    def test_initial_lsn_validation_honors_cdc_read_timeout_option(self):
+        class TimedTransport:
+            def __init__(self):
+                self.socket_timeout = 30.0
+                self.timeouts = []
+
+            def set_socket_timeout(self, timeout):
+                self.socket_timeout = timeout
+                self.timeouts.append(timeout)
+
+            def execute(self, sql, parameters=()):
+                if "sysenv" in sql:
+                    return [{"env_value": "demo_server"}]
+                if "cdc_opensess" in sql:
+                    return [{"session_id": 7}]
+                return [{"status": 0}]
+
+        transport = TimedTransport()
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.transport = transport
+        bridge.options = {"cdc.read.timeout.seconds": "180"}
+
+        bridge.validate_initial_lsn({"identity": "demo:app.orders", "columns": ["id"]}, 80)
+
+        self.assertEqual(transport.timeouts, [180.0, 30.0])
+
     def test_batch_size_defaults(self):
         self.assertEqual(_DEFAULT_SNAPSHOT_PAGE_SIZE, 20000)
         self.assertEqual(informix_module._DEFAULT_SNAPSHOT_READ_TIMEOUT_SECONDS, 300)
+        self.assertEqual(informix_module._DEFAULT_CDC_READ_TIMEOUT_SECONDS, 60)
         self.assertEqual(_DEFAULT_MAX_RECORDS_PER_BATCH, 10000)
         self.assertEqual(informix_module._DEFAULT_CONNECTION_WAIT_TIMEOUT_SECONDS, 600)
 

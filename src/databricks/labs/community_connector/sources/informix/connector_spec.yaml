@@ -291,6 +291,15 @@ connection:
         SQLI socket read timeout while fetching transactional snapshot pages.
         Default `300` seconds; minimum `1`.
 
+    - name: cdc.read.timeout.seconds
+      type: string
+      required: false
+      description: >
+        SQLI socket read timeout for CDC session setup and teardown
+        (cdc_opensess/startcapture/activatesess/endcapture/closesess), used when
+        validating the initial CDC boundary. Raise it if syscdcv1 teardown stalls
+        under many concurrent CDC sessions. Default `60` seconds.
+
     - name: snapshot.mode
       type: string
       required: false

@@ -881,6 +881,29 @@ class SqliPacketTests(unittest.TestCase):
             any("close failed" in note for note in getattr(raised.exception, "__notes__", ()))
         )
 
+    def test_makefile_failure_after_tls_wrap_closes_wrapped_socket(self):
+        raw = Mock()
+        wrapped = Mock()
+        wrapped.makefile.side_effect = OSError("makefile failed")
+        context = Mock()
+        context.wrap_socket.return_value = wrapped
+        client = InformixSqliClient(
+            "host",
+            9088,
+            "db",
+            "user",
+            "secret",
+            server_name="server",
+            ssl_context=context,
+        )
+        with patch("socket.create_connection", return_value=raw):
+            with self.assertRaisesRegex(OSError, "makefile failed"):
+                client._connect_once("host", 9088, "server", float("inf"))
+        # The wrapped socket owns the raw fd after a successful handshake, so it is
+        # the one that must be closed; closing raw would leak the TLS session.
+        wrapped.close.assert_called_once_with()
+        raw.close.assert_not_called()
+
     def test_plaintext_connection_does_not_create_or_wrap_tls_context(self):
         raw = Mock()
         raw.makefile.side_effect = RuntimeError("stop after socket selection")
