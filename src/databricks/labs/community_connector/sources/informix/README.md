@@ -217,6 +217,9 @@ connection = w.connections.create(
         "server": "informix_prod",
         "encrypt": "true",
         "snapshot.staging.location": "/Volumes/main/informix_cdc/staging",
+        # Password for informix_state_user, the Lakebase role holding connector
+        # state. Required; supply the same value on every update.
+        "lakebase.password": os.environ["LAKEBASE_PASSWORD"],
         "externalOptionsAllowList": (
             "qualified_source_table,decimal.variable.type,decimal.variable.column.type,"
             "snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,"
@@ -244,7 +247,7 @@ Do not hard-code production credentials in scripts, notebooks, pipeline JSON, or
 }
 ```
 
-Supply `user` and `password` separately through secret-backed connection properties.
+Supply `user`, `password`, and the required `lakebase.password` separately through secret-backed connection properties.
 
 ### Authentication, redirects, and TLS
 

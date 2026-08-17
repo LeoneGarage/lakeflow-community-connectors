@@ -148,7 +148,7 @@ The Lakeflow implementation should keep an offset per table and per channel beca
 
 ```json
 {
-  "version": 8,
+  "version": 10,
   "commit_lsn": "90",
   "change_lsn": "90",
   "begin_lsn": "90",
@@ -159,12 +159,11 @@ The Lakeflow implementation should keep an offset per table and per channel beca
   "pipeline_scope": "94368468-bc2d-4797-868d-0cb9e19a5610_@_5fc90c10-d5d1-489b-afce-1bd9d36544c1",
   "trigger_generation": null,
   "trigger_high_water": null,
-  "snapshot_lsn": "90",
-  "snapshot": {"last_pk": ["..."]}
+  "incremental": {"chunk_lsn": "90", "last_pk": ["..."], "max_pk": ["..."]}
 }
 ```
 
-Offset versions are intentionally strict. Version 8 identifies the current fixed-width LSN row encoding, schema identity, update scope, self-contained trigger generation/high-water boundary, and optional AvailableNow capacity retry state; an absent or different version fails with a full-refresh instruction rather than mixing incompatible downstream ordering values.
+The `incremental` block is present only during a default `incremental`/`auto_snapshot` copy; a blocking `initial` snapshot instead carries a staged-page index, and a table already in pure CDC omits both. Offset versions are intentionally strict. Version 10 identifies the current fixed-width LSN row encoding, schema identity, update scope, self-contained trigger generation/high-water boundary, and optional AvailableNow capacity retry state; an absent or different version fails with a full-refresh instruction rather than mixing incompatible downstream ordering values.
 
 Each finite call opens/replays a CDC session, reads until at least one complete transaction is available (or timeout), closes it, and returns the exact last committed position. When caught up, return an empty iterator and the unchanged `start_offset`, as required by `LakeflowConnect`.
 
