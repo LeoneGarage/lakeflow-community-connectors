@@ -14,9 +14,6 @@ Two layers:
   HTTP with ``responses`` and run independently of the simulator.
 """
 
-
-
-
 from databricks.labs.community_connector.sources.odata import ODataLakeflowConnect
 
 from tests.unit.sources.test_partition_suite import SupportsPartitionedStreamTests
