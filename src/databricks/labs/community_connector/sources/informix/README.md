@@ -197,15 +197,21 @@ Install or upgrade the Databricks SDK, configure its normal authentication envir
 
 ```python
 import os
+from types import SimpleNamespace
 
 from databricks.sdk import WorkspaceClient
 
 
 w = WorkspaceClient()  # Uses the standard Databricks SDK authentication chain.
 
+# `connection_type` must be the string "COMMUNITY". The SDK's ConnectionType
+# enum does not include it, so pass a small object whose `.value` is the string:
+# `w.connections.create` serializes the argument as `connection_type.value`, and
+# a bare string (no `.value`) or `ConnectionType("COMMUNITY")` (not an enum
+# member) both fail.
 connection = w.connections.create(
     name="informix_sales",
-    connection_type="COMMUNITY",
+    connection_type=SimpleNamespace(value="COMMUNITY"),
     comment="Informix CDC connection",
     options={
         "sourceName": "informix",
@@ -273,7 +279,11 @@ connection = w.connections.update(
 print(connection.full_name or connection.name)
 ```
 
-Some older `databricks-sdk` releases do not include `COMMUNITY` in their generated `ConnectionType` enum. Passing the API value as the string shown above works with current SDK releases; upgrade the SDK if the installed release rejects it.
+The `databricks-sdk` `ConnectionType` enum does not include `COMMUNITY`, so the
+typed enum cannot express it. The `SimpleNamespace(value="COMMUNITY")` shim above
+supplies the `.value` the SDK serializes without depending on the enum. The
+Databricks CLI (`databricks connections create`) takes the string directly and
+needs no such workaround.
 
 Do not hard-code production credentials in scripts, notebooks, pipeline JSON, or source control. Load them from your deployment system's secret store and pass them only while creating the connection. A minimal non-secret configuration shape is:
 
