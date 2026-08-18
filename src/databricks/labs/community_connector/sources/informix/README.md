@@ -232,6 +232,47 @@ connection = w.connections.create(
 print(connection.full_name or connection.name)
 ```
 
+To update an existing connection, call `w.connections.update` with the complete
+desired `options` map. As with the CLI, an update replaces the options wholesale;
+do not assume omitted options are preserved, so include every option the
+connection needs — including the required `lakebase.password`:
+
+```python
+import os
+
+from databricks.sdk import WorkspaceClient
+
+
+w = WorkspaceClient()  # Uses the standard Databricks SDK authentication chain.
+
+connection = w.connections.update(
+    name="informix_sales",
+    options={
+        "sourceName": "informix",
+        "hostname": "informix.example.internal",
+        "port": "9089",
+        "database": "sales",
+        "user": "cdc_service",
+        "password": os.environ["INFORMIX_PASSWORD"],
+        "server": "informix_prod",
+        "encrypt": "true",
+        "ssl.ca.file": "/Volumes/catalog/schema/artifacts/informix-ca.pem",
+        "snapshot.staging.location": "/Volumes/main/informix_cdc/staging",
+        # Password for informix_state_user, the Lakebase role holding connector
+        # state. Required; supply the same value on every update.
+        "lakebase.password": os.environ["LAKEBASE_PASSWORD"],
+        "externalOptionsAllowList": (
+            "qualified_source_table,decimal.variable.type,decimal.variable.column.type,"
+            "snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,"
+            "append.only.ingestion,"
+            "max.records.per.batch,cdc.timeout,cdc.max.records"
+        ),
+    },
+)
+
+print(connection.full_name or connection.name)
+```
+
 Some older `databricks-sdk` releases do not include `COMMUNITY` in their generated `ConnectionType` enum. Passing the API value as the string shown above works with current SDK releases; upgrade the SDK if the installed release rejects it.
 
 Do not hard-code production credentials in scripts, notebooks, pipeline JSON, or source control. Load them from your deployment system's secret store and pass them only while creating the connection. A minimal non-secret configuration shape is:
