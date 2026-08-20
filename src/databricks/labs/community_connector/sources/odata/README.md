@@ -208,6 +208,76 @@ runtime. For the browser-based `u2m` flow the CLI is required (it
 runs the loopback authorization-code flow at creation time); the raw
 REST path only works for `m2m`.
 
+For **connector-side OAuth** (`auth_type=oauth2`), the connection
+carries the client identity directly and the connector mints and
+refreshes the token itself — set `auth_type` to `oauth2` and pass the
+`oauth2_*` options (note the `oauth2_` prefix, distinct from the
+UC-managed `oauth`/`community_oauth_flow` keys above). Client
+credentials needs `oauth2_token_url`, `oauth2_client_id`, and
+`oauth2_client_secret`:
+
+```python
+from databricks.sdk import WorkspaceClient
+
+w = WorkspaceClient()
+
+service_url = "https://services.odata.org/V4/Northwind/Northwind.svc/"
+
+# Load the client id/secret from a secret store — never inline literals.
+client_id = "<client-id>"
+client_secret = "<client-secret>"
+
+allow_list = (
+    "namespace,cursor_field,select,filter,"
+    "filters_at,page_size,max_records_per_batch,cursor_nulls,"
+    "delta_tracking,expand_contained,num_partitions,pagination,"
+    "exclude_ancestor_columns,cursor_lookback_seconds,"
+    "cursor_lookback_factor,cursor_lookback_max_seconds,"
+    "cursor_lookback_dedup,cursor_probe,contained_fetch"
+)
+
+oauth2_options = {
+    "sourceName": "odata",
+    "service_url": service_url,
+    "auth_type": "oauth2",
+    "oauth2_token_url": "https://login.example.com/oauth/token",
+    "oauth2_client_id": client_id,
+    "oauth2_client_secret": client_secret,
+    "oauth2_scope": "read:everything",  # optional; omit if the endpoint
+                                        # doesn't require a scope
+    "externalOptionsAllowList": allow_list,
+}
+
+# Create
+w.api_client.do(
+    "POST",
+    "/api/2.1/unity-catalog/connections",
+    body={
+        "name": "odata_oauth2_connection",
+        "connection_type": "COMMUNITY",
+        "comment": f"service_url={service_url}",
+        "options": oauth2_options,
+    },
+)
+
+# Update (e.g. rotating the client secret). PATCH replaces the whole
+# `options` map, so resend every option you want to keep — including
+# `externalOptionsAllowList`, or table-level options get stripped.
+w.api_client.do(
+    "PATCH",
+    "/api/2.1/unity-catalog/connections/odata_oauth2_connection",
+    body={
+        "name": "odata_oauth2_connection",
+        "options": {**oauth2_options, "oauth2_client_secret": "<new-secret>"},
+    },
+)
+```
+
+For the **authorization-code (user) flow**, add `oauth2_refresh_token`
+(and optionally a pre-issued `oauth2_access_token`) to the options; the
+connector uses the access token until the source returns 401, then
+refreshes via the refresh token.
+
 The `externalOptionsAllowList` must match the connector spec's
 `external_options_allowlist`. The CLI in Option A reads the spec and
 sets this automatically; with the SDK you set it explicitly — keep
