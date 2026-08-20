@@ -58,6 +58,7 @@ For other auth methods, swap `token` for the relevant fields:
 | `bearer` | `token` | |
 | `basic` | `username`, `password` | |
 | `api_key` | `api_key` (optionally `api_key_header`) | |
+| `oauth2` (connector-side) | `oauth2_token_url`, `oauth2_client_id`, `oauth2_client_secret` (optionally `oauth2_scope`; add `oauth2_refresh_token` + optional `oauth2_access_token` for the user flow) | Set `auth_type=oauth2`. The connector mints the token itself (client-credentials) and refreshes it on expiry — pre-emptively when the token endpoint returns `expires_in`, and on a source 401 for the refresh-token (user) flow. Use when the connection carries the client identity directly; prefer UC-managed OAuth below when the deployment can create such a connection. |
 | OAuth (UC-managed) | `client_id`, `client_secret`, `token_endpoint` (optionally `oauth_scope`; `authorization_endpoint` for the browser flow) — plus the connection's `community_oauth_flow` set to `m2m` or `u2m` | The connection layer runs the flow, refreshes tokens **server-side**, and injects a fresh `access_token` into the connector at query time. No `auth_type` is set; the connector treats the injected token as an opaque bearer credential. |
 
 #### OAuth — UC-managed (`community_oauth_flow`)
@@ -95,10 +96,45 @@ For a **user-delegated** source, create the connection with
 the CLI runs the browser consent flow at connection creation and UC
 handles refresh (including rotated refresh tokens) from then on.
 
-Do **not** set `auth_type` for OAuth connections, and never supply
-`access_token`/`refresh_token` yourself — they are minted by the flow
-and injected at runtime. (The old connector-side `auth_type=oauth2`
-mode is retired; using it raises an error with these migration steps.)
+Do **not** set `auth_type` for UC-managed OAuth connections, and never
+supply `access_token`/`refresh_token` yourself — they are minted by the
+flow and injected at runtime. (If instead you want the connector to mint
+and refresh tokens itself — e.g. a non-UC caller, or a connection that
+carries the client identity directly — use `auth_type=oauth2` with the
+`oauth2_*` options; see the connector-side OAuth section below.)
+
+#### OAuth — connector-side (`auth_type=oauth2`)
+
+When a UC-managed OAuth connection isn't available, set `auth_type=oauth2`
+and let the connector run the grant itself. Two flows share one parameter
+set:
+
+- **Client credentials** (server-to-server): supply `oauth2_token_url`,
+  `oauth2_client_id`, `oauth2_client_secret` (and `oauth2_scope` if the
+  endpoint requires one). The connector mints a fresh access token at
+  session start and re-mints on expiry.
+- **Authorization code with refresh** (user-delegated): additionally
+  supply `oauth2_refresh_token` (and optionally a pre-issued
+  `oauth2_access_token`). The connector uses the access token until the
+  source returns 401, then POSTs `grant_type=refresh_token` to mint a
+  fresh one. Providers that rotate refresh tokens have the new value
+  tracked in-process for the run.
+
+```bash
+community-connector create_connection odata odata_connection \
+  -o '{
+        "service_url": "https://your-host/odata/v4/",
+        "auth_type": "oauth2",
+        "oauth2_token_url": "https://login.example.com/oauth/token",
+        "oauth2_client_id": "<client-id>",
+        "oauth2_client_secret": "<client-secret>",
+        "oauth2_scope": "read:everything"
+      }' \
+  --spec ./src/databricks/labs/community_connector/sources/odata/connector_spec.yaml
+```
+
+The connector never follows a redirect from the token endpoint (that
+would re-send the client secret) and never logs a token response body.
 
 ### Option B — Python SDK
 
@@ -210,7 +246,8 @@ lands in pipeline logs. Five classes:
 |---|---|---|
 | Source 401 under a UC-injected `access_token` | `PermissionError` | The connection layer refreshes the token at query start, so a mid-read 401 usually means the token expired during a long read (retry — the next query gets a fresh token), the OAuth principal lacks access, or the connection's `oauth_scope` is too narrow. |
 | Source 403 (any auth mode) | `PermissionError` | Authenticated but not authorized — permissions/scope at the source, not a token problem. |
-| `auth_type=oauth2` configured | `ValueError` at session build | Retired mode; the message carries the migration steps to the UC OAuth connection. |
+| `auth_type=oauth2` token-endpoint failure | `ValueError` at token mint | Names the failing grant (client-credentials vs refresh) and which `oauth2_*` credential to check; refresh-token failures also flag single-use rotation under parallel reads. Token response bodies are never echoed. |
+| Source 401 with connector-side OAuth, no usable grant | `PermissionError` | `auth_type=oauth2` with only a pre-supplied `oauth2_access_token` (no client id/secret or refresh token) — the connector can't mint a replacement; supply a grant or a fresh access token. |
 | Source 401 with static credentials | `PermissionError` | Per auth mode (see below). |
 
 The static-credential 401 remediation depends on the configured mode:
@@ -223,6 +260,11 @@ The static-credential 401 remediation depends on the configured mode:
   permissions at the source.
 - **`api_key`** — names `api_key` (may have been rotated) and
   `api_key_header` (some services expect a non-default header).
+- **`oauth2`** — when the connector *has* a grant, a 401 is answered by
+  minting a fresh token and retrying once; a second 401 means the token
+  reached the server but the principal/scope is the problem, not the
+  token. With no usable grant (pre-supplied `oauth2_access_token` only),
+  the error names the missing credential pair.
 - **No `auth_type` set** — names the static `auth_type` values and the
   UC-managed OAuth alternative.
 
