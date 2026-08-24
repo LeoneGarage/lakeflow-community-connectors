@@ -134,6 +134,27 @@ def informix_locale_encoding(locale: str | None) -> str:
         ) from exc
 
 
+def _decode_text(raw: bytes, encoding: str) -> str:
+    """Decode a result string, turning a codeset mismatch into an actionable error.
+
+    Informix converts result data from the database codeset to the client codeset
+    on the wire, so ``encoding`` is the CLIENT_LOCALE codec. A strict decode failure
+    almost always means CLIENT_LOCALE does not match what the server actually sent
+    (for example CLIENT_LOCALE left at en_US.utf8 while the server transmits Latin-1
+    for an en_US.819 database). Surface that as a clear diagnostic instead of a bare
+    UnicodeDecodeError so the fix -- align CLIENT_LOCALE with the source -- is obvious.
+    """
+
+    try:
+        return raw.decode(encoding)
+    except UnicodeDecodeError as exc:
+        raise SqliProtocolError(
+            f"Could not decode an Informix result string as {encoding!r}; this usually "
+            "means CLIENT_LOCALE does not match the codeset the server is sending "
+            "(align CLIENT_LOCALE with the source database's DB_LOCALE)"
+        ) from exc
+
+
 class SqliUnsupportedAuthentication(SqliProtocolError):
     pass
 
@@ -380,7 +401,7 @@ def decode_char(stream: BinaryIO, encoding: str = "utf-8", maximum: int = 1 << 2
     raw = read_exact(stream, length)
     if length & 1:
         read_exact(stream, 1)
-    return raw.decode(encoding)
+    return _decode_text(raw, encoding)
 
 
 def encode_session_packet(sl_type: int, payload: bytes, protocol: int = SQLI_PROTOCOL) -> bytes:
@@ -1110,7 +1131,7 @@ def _decode_result_value(
 ) -> object:
     kind = _effective_result_kind(column)
     if kind == 0:  # CHAR
-        return data[: column.encoded_length].decode(encoding).rstrip(" ")
+        return _decode_text(data[: column.encoded_length], encoding).rstrip(" ")
     if kind == 1:
         value = struct.unpack(">h", data[:2])[0]
         return None if value == -(1 << 15) else value
@@ -1134,7 +1155,7 @@ def _decode_result_value(
         return None if value == -(1 << 31) else date(1899, 12, 31) + timedelta(days=value)
     if kind in {13, 16}:
         if pad_varchar:
-            return data[: column.encoded_length].decode(encoding).rstrip(" \0")
+            return _decode_text(data[: column.encoded_length], encoding).rstrip(" \0")
         if not data:
             raise SqliProtocolError("truncated variable VARCHAR")
         size = data[0]
@@ -1142,7 +1163,7 @@ def _decode_result_value(
             raise SqliProtocolError("VARCHAR length exceeds tuple column")
         if size == 1 and data[1] == 0:
             return None
-        return data[1 : size + 1].decode(encoding)
+        return _decode_text(data[1 : size + 1], encoding)
     if kind == 43:
         if len(data) < 5:
             raise SqliProtocolError("truncated variable LVARCHAR")
@@ -1156,7 +1177,7 @@ def _decode_result_value(
             return None
         if marker != 0:
             raise SqliProtocolError(f"invalid LVARCHAR null marker {marker}")
-        return data[5:].decode(encoding)
+        return _decode_text(data[5:], encoding)
     if kind in {17, 18}:
         type_name = "INT8" if kind == 17 else "SERIAL8"
         value, consumed = decode_value(memoryview(data), ColumnDescriptor(column.name, type_name))
