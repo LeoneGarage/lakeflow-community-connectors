@@ -92,7 +92,14 @@ OP = "_informix_op"
 _INTERNAL_COLUMNS = (CURSOR, COMMIT_LSN, TX_ID, OP)
 _LSN_DECIMAL_WIDTH = 20
 _OFFSET_VERSION = 10
-_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+# Informix undelimited identifiers: the first character is a "letter" or
+# underscore and later characters add digits and "$", where the "letter" class
+# is defined by the database locale -- under the default en_US.819 (Latin-1) that
+# includes accented letters such as e-acute or n-tilde. Match Unicode letters so a
+# legitimately accented owner/table/column name is not rejected, while ``\w``/``$``
+# still exclude every SQL-unsafe character (quotes, spaces, ``.``, ``;``, ``+`` ...)
+# so interpolating a validated identifier into SQL stays safe.
+_IDENTIFIER = re.compile(r"^[^\W\d][\w$]*$", re.UNICODE)
 _DATA_OPS = {"INSERT", "BEFORE_UPDATE", "AFTER_UPDATE", "DELETE", "TRUNCATE"}
 _DEFAULT_SNAPSHOT_PAGE_SIZE = 20000
 _DEFAULT_SNAPSHOT_READ_TIMEOUT_SECONDS = 300
@@ -1802,6 +1809,7 @@ class PurePythonInformixBridge:
             raise
         finally:
             cleanup_errors = []
+            cleanup_timed_out = False
             if started:
                 try:
                     _expect_zero(
@@ -1813,6 +1821,7 @@ class PurePythonInformixBridge:
                     )
                 except Exception as error:
                     cleanup_errors.append(error)
+                    cleanup_timed_out = cleanup_timed_out or _is_timeout_error(error)
             try:
                 _expect_zero(
                     self.transport.execute(
@@ -1822,12 +1831,38 @@ class PurePythonInformixBridge:
                 )
             except Exception as error:
                 cleanup_errors.append(error)
+                cleanup_timed_out = cleanup_timed_out or _is_timeout_error(error)
             if set_socket_timeout is not None and previous_socket_timeout is not None:
                 try:
                     set_socket_timeout(float(previous_socket_timeout))
                 except Exception as error:
                     cleanup_errors.append(error)
+            # The purpose of this method -- proving the CDC boundary registers and
+            # activates -- is already met once activation succeeds (primary_error is
+            # None). cdc_endcapture/cdc_closesess are best-effort teardown: the server
+            # reclaims an abandoned CDC session on its own, and this method returns no
+            # value derived from them. A teardown that merely *times out* under heavy
+            # syscdcv1 load (many tables opening CDC sessions at once) must not fail an
+            # otherwise-successful validation -- doing so was observed wedging a flow
+            # (e.g. tw101) purely on a slow teardown. Poison the transport so the next
+            # use reconnects rather than resuming a half-torn-down session, and treat it
+            # as non-fatal. A non-timeout cleanup failure, or any failure alongside a
+            # real primary error, is still surfaced.
             if cleanup_errors and primary_error is None:
+                if cleanup_timed_out and all(_is_timeout_error(e) for e in cleanup_errors):
+                    # The socket is mid-read on a half-torn-down CDC session; drop the
+                    # transport so the next operation reconnects instead of resuming it,
+                    # keeping the connection slot (this is not a capacity problem).
+                    reset_transport = getattr(self, "reset_transport", None)
+                    if callable(reset_transport):
+                        reset_transport()
+                    logging.getLogger(__name__).warning(
+                        "Informix CDC validation succeeded but session teardown timed out; "
+                        "treating as non-fatal and reconnecting. Raise cdc.read.timeout.seconds "
+                        "or reduce concurrent CDC sessions if this recurs.",
+                        exc_info=cleanup_errors[0],
+                    )
+                    return
                 raise InformixError("Initial CDC validation cleanup failed") from cleanup_errors[0]
             if cleanup_errors and primary_error is not None:
                 for error in cleanup_errors:
@@ -7274,6 +7309,24 @@ def _expect_zero(rows: list[Any], operation: str) -> None:
     status = int(_field(rows[0], "status", 0))
     if status != 0:
         raise InformixError(f"{operation} failed with status {status}")
+
+
+def _is_timeout_error(error: BaseException | None) -> bool:
+    """Report whether ``error`` (or anything it wraps) is a socket read timeout.
+
+    A SQLI socket read timeout surfaces as a bare ``TimeoutError`` (``socket.timeout``
+    is an alias of it on Python 3.10+); it may also travel as the ``__cause__`` of a
+    wrapping connector error, so walk the cause chain rather than checking the top
+    exception alone.
+    """
+
+    seen: set[int] = set()
+    while error is not None and id(error) not in seen:
+        if isinstance(error, TimeoutError):
+            return True
+        seen.add(id(error))
+        error = error.__cause__ or error.__context__
+    return False
 
 
 def _optional_int(value: Any) -> int | None:

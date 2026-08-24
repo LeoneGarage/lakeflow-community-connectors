@@ -2721,6 +2721,27 @@ def register_lakeflow_source(spark):
             ) from exc
 
 
+    def _decode_text(raw: bytes, encoding: str) -> str:
+        """Decode a result string, turning a codeset mismatch into an actionable error.
+
+        Informix converts result data from the database codeset to the client codeset
+        on the wire, so ``encoding`` is the CLIENT_LOCALE codec. A strict decode failure
+        almost always means CLIENT_LOCALE does not match what the server actually sent
+        (for example CLIENT_LOCALE left at en_US.utf8 while the server transmits Latin-1
+        for an en_US.819 database). Surface that as a clear diagnostic instead of a bare
+        UnicodeDecodeError so the fix -- align CLIENT_LOCALE with the source -- is obvious.
+        """
+
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError as exc:
+            raise SqliProtocolError(
+                f"Could not decode an Informix result string as {encoding!r}; this usually "
+                "means CLIENT_LOCALE does not match the codeset the server is sending "
+                "(align CLIENT_LOCALE with the source database's DB_LOCALE)"
+            ) from exc
+
+
     class SqliUnsupportedAuthentication(SqliProtocolError):
         pass
 
@@ -2967,7 +2988,7 @@ def register_lakeflow_source(spark):
         raw = read_exact(stream, length)
         if length & 1:
             read_exact(stream, 1)
-        return raw.decode(encoding)
+        return _decode_text(raw, encoding)
 
 
     def encode_session_packet(sl_type: int, payload: bytes, protocol: int = SQLI_PROTOCOL) -> bytes:
@@ -3697,7 +3718,7 @@ def register_lakeflow_source(spark):
     ) -> object:
         kind = _effective_result_kind(column)
         if kind == 0:  # CHAR
-            return data[: column.encoded_length].decode(encoding).rstrip(" ")
+            return _decode_text(data[: column.encoded_length], encoding).rstrip(" ")
         if kind == 1:
             value = struct.unpack(">h", data[:2])[0]
             return None if value == -(1 << 15) else value
@@ -3721,7 +3742,7 @@ def register_lakeflow_source(spark):
             return None if value == -(1 << 31) else date(1899, 12, 31) + timedelta(days=value)
         if kind in {13, 16}:
             if pad_varchar:
-                return data[: column.encoded_length].decode(encoding).rstrip(" \0")
+                return _decode_text(data[: column.encoded_length], encoding).rstrip(" \0")
             if not data:
                 raise SqliProtocolError("truncated variable VARCHAR")
             size = data[0]
@@ -3729,7 +3750,7 @@ def register_lakeflow_source(spark):
                 raise SqliProtocolError("VARCHAR length exceeds tuple column")
             if size == 1 and data[1] == 0:
                 return None
-            return data[1 : size + 1].decode(encoding)
+            return _decode_text(data[1 : size + 1], encoding)
         if kind == 43:
             if len(data) < 5:
                 raise SqliProtocolError("truncated variable LVARCHAR")
@@ -3743,7 +3764,7 @@ def register_lakeflow_source(spark):
                 return None
             if marker != 0:
                 raise SqliProtocolError(f"invalid LVARCHAR null marker {marker}")
-            return data[5:].decode(encoding)
+            return _decode_text(data[5:], encoding)
         if kind in {17, 18}:
             type_name = "INT8" if kind == 17 else "SERIAL8"
             value, consumed = decode_value(memoryview(data), ColumnDescriptor(column.name, type_name))
@@ -4723,7 +4744,14 @@ def register_lakeflow_source(spark):
     _INTERNAL_COLUMNS = (CURSOR, COMMIT_LSN, TX_ID, OP)
     _LSN_DECIMAL_WIDTH = 20
     _OFFSET_VERSION = 10
-    _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+    # Informix undelimited identifiers: the first character is a "letter" or
+    # underscore and later characters add digits and "$", where the "letter" class
+    # is defined by the database locale -- under the default en_US.819 (Latin-1) that
+    # includes accented letters such as e-acute or n-tilde. Match Unicode letters so a
+    # legitimately accented owner/table/column name is not rejected, while ``\w``/``$``
+    # still exclude every SQL-unsafe character (quotes, spaces, ``.``, ``;``, ``+`` ...)
+    # so interpolating a validated identifier into SQL stays safe.
+    _IDENTIFIER = re.compile(r"^[^\W\d][\w$]*$", re.UNICODE)
     _DATA_OPS = {"INSERT", "BEFORE_UPDATE", "AFTER_UPDATE", "DELETE", "TRUNCATE"}
     _DEFAULT_SNAPSHOT_PAGE_SIZE = 20000
     _DEFAULT_SNAPSHOT_READ_TIMEOUT_SECONDS = 300
@@ -6433,6 +6461,7 @@ def register_lakeflow_source(spark):
                 raise
             finally:
                 cleanup_errors = []
+                cleanup_timed_out = False
                 if started:
                     try:
                         _expect_zero(
@@ -6444,6 +6473,7 @@ def register_lakeflow_source(spark):
                         )
                     except Exception as error:
                         cleanup_errors.append(error)
+                        cleanup_timed_out = cleanup_timed_out or _is_timeout_error(error)
                 try:
                     _expect_zero(
                         self.transport.execute(
@@ -6453,12 +6483,38 @@ def register_lakeflow_source(spark):
                     )
                 except Exception as error:
                     cleanup_errors.append(error)
+                    cleanup_timed_out = cleanup_timed_out or _is_timeout_error(error)
                 if set_socket_timeout is not None and previous_socket_timeout is not None:
                     try:
                         set_socket_timeout(float(previous_socket_timeout))
                     except Exception as error:
                         cleanup_errors.append(error)
+                # The purpose of this method -- proving the CDC boundary registers and
+                # activates -- is already met once activation succeeds (primary_error is
+                # None). cdc_endcapture/cdc_closesess are best-effort teardown: the server
+                # reclaims an abandoned CDC session on its own, and this method returns no
+                # value derived from them. A teardown that merely *times out* under heavy
+                # syscdcv1 load (many tables opening CDC sessions at once) must not fail an
+                # otherwise-successful validation -- doing so was observed wedging a flow
+                # (e.g. tw101) purely on a slow teardown. Poison the transport so the next
+                # use reconnects rather than resuming a half-torn-down session, and treat it
+                # as non-fatal. A non-timeout cleanup failure, or any failure alongside a
+                # real primary error, is still surfaced.
                 if cleanup_errors and primary_error is None:
+                    if cleanup_timed_out and all(_is_timeout_error(e) for e in cleanup_errors):
+                        # The socket is mid-read on a half-torn-down CDC session; drop the
+                        # transport so the next operation reconnects instead of resuming it,
+                        # keeping the connection slot (this is not a capacity problem).
+                        reset_transport = getattr(self, "reset_transport", None)
+                        if callable(reset_transport):
+                            reset_transport()
+                        logging.getLogger(__name__).warning(
+                            "Informix CDC validation succeeded but session teardown timed out; "
+                            "treating as non-fatal and reconnecting. Raise cdc.read.timeout.seconds "
+                            "or reduce concurrent CDC sessions if this recurs.",
+                            exc_info=cleanup_errors[0],
+                        )
+                        return
                     raise InformixError("Initial CDC validation cleanup failed") from cleanup_errors[0]
                 if cleanup_errors and primary_error is not None:
                     for error in cleanup_errors:
@@ -11905,6 +11961,24 @@ def register_lakeflow_source(spark):
         status = int(_field(rows[0], "status", 0))
         if status != 0:
             raise InformixError(f"{operation} failed with status {status}")
+
+
+    def _is_timeout_error(error: BaseException | None) -> bool:
+        """Report whether ``error`` (or anything it wraps) is a socket read timeout.
+
+        A SQLI socket read timeout surfaces as a bare ``TimeoutError`` (``socket.timeout``
+        is an alias of it on Python 3.10+); it may also travel as the ``__cause__`` of a
+        wrapping connector error, so walk the cause chain rather than checking the top
+        exception alone.
+        """
+
+        seen: set[int] = set()
+        while error is not None and id(error) not in seen:
+            if isinstance(error, TimeoutError):
+                return True
+            seen.add(id(error))
+            error = error.__cause__ or error.__context__
+        return False
 
 
     def _optional_int(value: Any) -> int | None:

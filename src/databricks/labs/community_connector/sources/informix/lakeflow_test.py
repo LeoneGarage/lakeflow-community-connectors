@@ -1908,6 +1908,61 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertIn("validation cleanup also failed", " ".join(caught.exception.__notes__))
 
+    def test_initial_lsn_validation_survives_teardown_timeout(self):
+        # Primary (start+activate) succeeds; only cdc_endcapture teardown times out.
+        # That is best-effort cleanup, so validation must not fail -- it drops the
+        # transport (reset) and returns, rather than wedging the flow (tw101).
+        class TeardownTimeoutTransport:
+            def __init__(self):
+                self.socket_timeout = 30.0
+
+            def set_socket_timeout(self, timeout):
+                self.socket_timeout = timeout
+
+            def execute(self, sql, parameters=()):
+                if "sysenv" in sql:
+                    return [{"env_value": "demo_server"}]
+                if "cdc_opensess" in sql:
+                    return [{"session_id": 7}]
+                if "cdc_startcapture" in sql or "cdc_activatesess" in sql:
+                    return [{"status": 0}]
+                if "cdc_endcapture" in sql:
+                    raise TimeoutError("The read operation timed out")
+                return [{"status": 0}]
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.transport = TeardownTimeoutTransport()
+        bridge.options = {}
+        reset_calls = []
+        bridge.reset_transport = lambda: reset_calls.append(True)
+
+        # Returns normally (no raise) despite the teardown timeout.
+        bridge.validate_initial_lsn({"identity": "demo:app.orders", "columns": ["id"]}, 80)
+        self.assertEqual(reset_calls, [True])
+
+    def test_initial_lsn_validation_still_fails_on_non_timeout_cleanup_error(self):
+        # A non-timeout cleanup failure with a successful primary is still fatal:
+        # only a *timeout* teardown is treated as benign.
+        class BadCleanupTransport:
+            def execute(self, sql, parameters=()):
+                if "sysenv" in sql:
+                    return [{"env_value": "demo_server"}]
+                if "cdc_opensess" in sql:
+                    return [{"session_id": 7}]
+                if "cdc_startcapture" in sql or "cdc_activatesess" in sql:
+                    return [{"status": 0}]
+                if "cdc_endcapture" in sql:
+                    return [{"status": -1}]  # non-timeout failure
+                return [{"status": 0}]
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.transport = BadCleanupTransport()
+        bridge.options = {}
+        bridge.reset_transport = lambda: None
+
+        with self.assertRaisesRegex(InformixError, "cleanup failed"):
+            bridge.validate_initial_lsn({"identity": "demo:app.orders", "columns": ["id"]}, 80)
+
     def test_initial_lsn_validation_extends_and_restores_socket_timeout(self):
         class TimedTransport:
             def __init__(self):
@@ -2060,6 +2115,34 @@ class LakeflowContractTests(unittest.TestCase):
         ):
             with self.subTest(message=message), self.assertRaisesRegex(InformixError, message):
                 Table.parse({**raw, "columns": columns}, "demo")
+
+    def test_table_metadata_accepts_locale_letter_identifiers(self):
+        # Under the default en_US.819 (Latin-1) DB_LOCALE the identifier "letter"
+        # class includes accented letters, so an accented owner/table/column name
+        # is a valid undelimited identifier and must not be rejected.
+        table = Table.parse(
+            {
+                "database": "demo",
+                "owner": "café",
+                "name": "señor",
+                "columns": [
+                    {"name": "größe", "type_name": "INTEGER", "nullable": False},
+                    {"name": "value", "type_name": "VARCHAR", "length": 20},
+                ],
+                "primary_keys": ["größe"],
+            },
+            "demo",
+        )
+        self.assertEqual(table.owner, "café")
+        self.assertEqual(table.name, "señor")
+        self.assertEqual(table.columns[0].name, "größe")
+
+    def test_table_metadata_still_rejects_sql_unsafe_identifiers(self):
+        # Widening to Unicode letters must not admit SQL-unsafe characters: the
+        # 'HCF+gbc'-style garbage from a corrupted catalog read stays rejected.
+        for bad in ("HCF+gbc", "a b", 'a"b', "a.b", "a;b", "a-b"):
+            with self.subTest(bad=bad), self.assertRaisesRegex(InformixError, "Unsafe"):
+                Table.parse({**_table(), "name": bad}, "demo")
 
     def test_table_metadata_rejects_casefold_and_reserved_column_collisions(self):
         raw = _table()
