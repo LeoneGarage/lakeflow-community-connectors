@@ -315,6 +315,21 @@ class FrameTests(unittest.TestCase):
         self.assertEqual(_decode_result_value(struct.pack(">q", 1 << 40), bigint, "utf-8"), 1 << 40)
         self.assertEqual(_decode_result_value(struct.pack(">q", 123), bigserial, "utf-8"), 123)
 
+    def test_char_result_decodes_with_client_locale_codeset(self):
+        # A CHAR value the server transmitted in the client's Latin-1 codeset must
+        # decode with that codeset, not be forced through UTF-8.
+        latin1 = "café".encode("iso8859-1")
+        column = ResultColumn("owner", 0, 0, 0, len(latin1))
+        self.assertEqual(_decode_result_value(latin1, column, "iso8859-1"), "café")
+
+    def test_char_result_codeset_mismatch_raises_actionable_error(self):
+        # A lone 0xE9 ('é' in Latin-1) is not valid UTF-8. Decoding it as UTF-8
+        # must raise a diagnostic that points at CLIENT_LOCALE rather than a bare
+        # UnicodeDecodeError, so a locale misconfiguration is recognizable.
+        column = ResultColumn("owner", 0, 0, 0, 4)
+        with self.assertRaisesRegex(SqliProtocolError, "CLIENT_LOCALE"):
+            _decode_result_value(b"caf\xe9", column, "utf-8")
+
     def test_ordinary_boolean_null_and_marker_validation(self):
         one_byte = ResultColumn("enabled", 0, 45, 0, 1)
         two_byte = ResultColumn("enabled", 0, 45, 0, 2)
