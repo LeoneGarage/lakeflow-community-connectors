@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import (
     Decimal,
@@ -7229,6 +7229,28 @@ def register_lakeflow_source(spark):
         )
 
 
+    _PRIMARY_KEYS_OPTION = "primary.keys"
+
+
+    def _parse_key_columns(raw: str) -> list[str]:
+        """Parse the primary.keys option -- a comma-separated list or a JSON array."""
+
+        text = (raw or "").strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            try:
+                values = json.loads(text)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"Option '{_PRIMARY_KEYS_OPTION}' is not a valid JSON array: {text!r}"
+                ) from error
+            items = [str(value).strip() for value in values]
+        else:
+            items = [item.strip() for item in text.split(",")]
+        return [item for item in items if item]
+
+
     def _snapshot_filter(options: dict[str, str]) -> str | None:
         """Return a validated connector-owned snapshot WHERE predicate."""
 
@@ -7605,6 +7627,11 @@ def register_lakeflow_source(spark):
         columns: tuple[Column, ...]
         primary_keys: tuple[str, ...]
         incarnation: str | None = None
+        # True when primary_keys came from the primary.keys option rather than the
+        # catalog, so a schema refresh preserves them instead of reverting to the
+        # catalog's (empty, for a physically keyless table). Not part of the schema
+        # fingerprint -- only the resulting primary_keys are.
+        key_override: bool = False
 
         @property
         def exposed_name(self) -> str:
@@ -8139,7 +8166,7 @@ def register_lakeflow_source(spark):
                 if self._tables is None:
                     self._tables = {}
                 self._tables[exposed] = table
-                return table
+                return self._apply_primary_key_override(table, table_options)
 
         def _resolve_registration_table(self, exposed: str) -> Table:
             """Resolve a single configured table by exposed ``owner.name`` via a
@@ -9129,6 +9156,36 @@ def register_lakeflow_source(spark):
             if mode == "auto":
                 return not table.primary_keys
             return mode == "true"
+
+        def _apply_primary_key_override(self, table: Table, table_options: dict[str, str]) -> Table:
+            """Override a table's primary key with the connector ``primary.keys`` option.
+
+            When set (per table), treat the table as keyed on those columns -- even a
+            physically keyless one -- so it is read as cdc_with_deletes with
+            keyset-paginated snapshots and reported with those keys (which the pipeline
+            also uses as the destination merge key). The caller MUST guarantee the
+            columns are unique for the row: a non-unique override corrupts upserts,
+            delete identification, and snapshot pagination.
+            """
+
+            raw = table_options.get(_PRIMARY_KEYS_OPTION)
+            if raw is None:
+                return table
+            keys = _parse_key_columns(raw)
+            if not keys:
+                raise ValueError(f"Option '{_PRIMARY_KEYS_OPTION}' is set but lists no columns")
+            if len(keys) != len(set(keys)):
+                raise ValueError(f"Option '{_PRIMARY_KEYS_OPTION}' lists a duplicate column")
+            column_names = {column.name for column in table.columns}
+            missing = [key for key in keys if key not in column_names]
+            if missing:
+                raise InformixError(
+                    f"Option '{_PRIMARY_KEYS_OPTION}' names column(s) not present in "
+                    f"'{table.exposed_name}': {', '.join(missing)}"
+                )
+            if table.key_override and tuple(keys) == table.primary_keys:
+                return table
+            return replace(table, primary_keys=tuple(keys), key_override=True)
 
         def _snapshot_mode(self, table_options: dict[str, str]) -> str:
             mode = (
@@ -11101,6 +11158,12 @@ def register_lakeflow_source(spark):
 
         def _refresh_table_schema(self, table: Table, expected_fingerprint: str | None) -> Table:
             refreshed = Table.parse(self._bridge.get_table(table.identity), table.database)
+            if table.key_override:
+                # Keep the primary.keys override (and therefore the fingerprint) across a
+                # schema refresh instead of reverting to the catalog's keys. Only applies
+                # when the caller was already overridden, so a genuine catalog key change
+                # on a normal table is still detected as drift.
+                refreshed = replace(refreshed, primary_keys=table.primary_keys, key_override=True)
             _ensure_materializable(refreshed)
             fingerprint = _schema_fingerprint(refreshed)
             if expected_fingerprint is not None and expected_fingerprint != fingerprint:
@@ -11947,7 +12010,7 @@ def register_lakeflow_source(spark):
         def _table(self, name: str, options: dict[str, str], refresh: bool = False) -> Table:
             exposed = options.get("qualified_source_table", name)
             if self._tables is not None and exposed in self._tables and not refresh:
-                return self._tables[exposed]
+                return self._apply_primary_key_override(self._tables[exposed], options)
             parts = _split_identity(exposed)
             if len(parts) == 2 and all(_IDENTIFIER.fullmatch(part) for part in parts):
                 database = self.options.get("database", "")
@@ -11960,11 +12023,11 @@ def register_lakeflow_source(spark):
                 if self._tables is None:
                     self._tables = {}
                 self._tables[exposed] = table
-                return table
+                return self._apply_primary_key_override(table, options)
             tables = self._table_map(refresh=refresh)
             if exposed not in tables:
                 raise ValueError(f"Unknown or excluded Informix table '{exposed}'")
-            return tables[exposed]
+            return self._apply_primary_key_override(tables[exposed], options)
 
 
     # Conventional alias used by some connector loaders.

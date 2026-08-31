@@ -95,6 +95,7 @@ replicated — run a full refresh if the destination must match the source exact
 | `cdc.read.timeout.seconds` | No | `60` | SQLI socket read timeout for CDC session setup and teardown (open/start/activate/end/close) when validating the initial CDC boundary. Raise it if `syscdcv1` teardown stalls under many concurrent CDC sessions. |
 | `snapshot.max.rows` | No | `0` | Optional total row bound for a staged CDC snapshot. `0` disables the bound. Snapshot-only tables remain limited to 100,000 rows when this option is `0`. |
 | `append.only.ingestion` | No | `auto` | Tri-state: `auto` (default), `true`, or `false`. `auto` appends only CDC-streamable tables **without** a primary key — the connector reports `ingestion_type=append` with a cursor and streams changes instead of repeatedly reading a bounded snapshot — and leaves keyed tables on their normal CDC path (so keyed tables follow the pipeline `scd_type`, default `SCD_TYPE_1`). For a keyless table `auto` is equivalent to `true`. `true` forces append for every capturable table, including keyed ones; `false` forces the normal CDC/snapshot path, opting a keyless table into bounded snapshot-only ingestion. Append semantics are correct only for genuinely insert-only data: updates append another row and deletes leave old rows present, so use `false` for mutable keyless tables. To append a **keyed** table also set `scd_type: APPEND_ONLY`; the connector cannot read that pipeline setting. Uncapturable types remain snapshot-only, and append-only tables have no delete channel. |
+| `primary.keys` | No | *(catalog key)* | Per-table override of the table's primary key — a comma-separated list (or JSON array) of column names. When set, the connector treats the table as **keyed** on those columns even if it is physically keyless: it reports `ingestion_type=cdc_with_deletes`, reads incrementally with keyset-paginated snapshots and delete identification, and reports the keys so the pipeline uses them as the destination merge key too (no separate `primary_keys` needed). The columns must exist in the table. **You must guarantee they are unique per row** — a non-unique override corrupts upserts, delete identification, and snapshot pagination. Leave unset to use the catalog's primary key (or none). |
 | `snapshot.max.bytes` | No | `0` | Optional estimated decoded Python byte bound for the complete staged snapshot. The default `0` disables the limit and byte accounting. Each encoded staged page also has a fixed 256 MiB safety bound. |
 | `metadata.max.bytes` | No | `67108864` | Maximum estimated decoded Python bytes retained by an individual catalog query and by complete discovery. Set `0` to disable the limit and byte accounting. |
 | `max.records.per.batch` | No | `10000` | Target maximum projected CDC rows; minimum `1`. A complete transaction may exceed it. |
@@ -143,7 +144,7 @@ databricks connections create --json "$(jq -n \
       encrypt: "true",
       "snapshot.staging.location": "/Volumes/main/informix_cdc/staging",
       "lakebase.password": $lakebase_password,
-      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records"
+      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys"
     }
   }')"
 
@@ -181,7 +182,7 @@ databricks connections update informix_sales --json "$(jq -n \
       "ssl.ca.file": "/Volumes/catalog/schema/artifacts/informix-ca.pem",
       "snapshot.staging.location": "/Volumes/main/informix_cdc/staging",
       "lakebase.password": $lakebase_password,
-      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records"
+      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys"
     }
   }')" \
   --profile "$DATABRICKS_PROFILE"
@@ -230,7 +231,7 @@ connection = w.connections.create(
             "qualified_source_table,decimal.variable.type,decimal.variable.column.type,"
             "snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,"
             "append.only.ingestion,"
-            "max.records.per.batch,cdc.timeout,cdc.max.records"
+            "max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys"
         ),
     },
 )
@@ -271,7 +272,7 @@ connection = w.connections.update(
             "qualified_source_table,decimal.variable.type,decimal.variable.column.type,"
             "snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,"
             "append.only.ingestion,"
-            "max.records.per.batch,cdc.timeout,cdc.max.records"
+            "max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys"
         ),
     },
 )
