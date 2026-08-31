@@ -120,6 +120,8 @@ from databricks.labs.community_connector.sources.informix.informix import (  # n
     TransactionBuffer,
     TriggerBoundaryUnavailable,
     UnsupportedChangeError,
+    _SharedCdcShard,
+    _SharedCdcSnapshot,
     _bridge_config,
     _capture_descriptor,
     _catalog_column,
@@ -506,6 +508,12 @@ class LakeflowContractTests(unittest.TestCase):
                 # strategy. Incremental is the production default; tests that
                 # exercise it override snapshot.mode explicitly.
                 "snapshot.mode": "initial",
+                # Sharded CDC is the production default, but these per-table contract
+                # tests inject a bridge directly, so pin it off: they exercise the direct
+                # read path and must not spawn a background daemon reader (which builds
+                # its own bridge and would attempt a real connection). Shared-mode tests
+                # opt in explicitly.
+                "cdc.shared.session": "false",
                 **options,
             }
         )
@@ -7301,6 +7309,9 @@ class IncrementalSnapshotTests(unittest.TestCase):
                 "database": "demo",
                 "snapshot.staging.location": self._shared_state.name,
                 "lakebase.password": "test-state-password",
+                # Pin the per-table path (see LakeflowContractTests.connector): these
+                # tests inject a bridge directly and must not start a daemon reader.
+                "cdc.shared.session": "false",
                 **options,
             }
         )
@@ -8358,6 +8369,316 @@ class ConnectionSlotLeaseLossTests(unittest.TestCase):
                 bridge._heartbeat_connection_slot(object(), stop, lambda: reported.append(True))
 
         self.assertEqual(reported, [])
+
+
+class SharedCdcShardTests(unittest.TestCase):
+    """Fan-out unit tests for the sharded daemon-reader buffer (_SharedCdcShard)."""
+
+    def setUp(self):
+        self.table_a = Table.parse(_table(name="orders"), "demo")
+        self.table_b = Table.parse(_table(name="audit"), "demo")
+        self.id_a = self.table_a.native_identity
+        self.id_b = self.table_b.native_identity
+
+    def _shard_with_two_tables(self):
+        shard = _SharedCdcShard()
+        shard.subscribe(self.id_a, self.table_a, _capture_descriptor(self.table_a), 0, 0)
+        shard.subscribe(self.id_b, self.table_b, _capture_descriptor(self.table_b), 0, 0)
+        return shard
+
+    def _two_table_stream(self):
+        return [
+            {"op": "BEGIN", "tx_id": 1, "lsn": 100},
+            {
+                "op": "INSERT",
+                "tx_id": 1,
+                "lsn": 101,
+                "table": self.table_a.identity,
+                "row": {"id": 1, "value": "a"},
+            },
+            {"op": "COMMIT", "tx_id": 1, "lsn": 102},
+            {"op": "BEGIN", "tx_id": 2, "lsn": 103},
+            {
+                "op": "INSERT",
+                "tx_id": 2,
+                "lsn": 104,
+                "table": self.table_b.identity,
+                "row": {"id": 9, "value": "z"},
+            },
+            {"op": "COMMIT", "tx_id": 2, "lsn": 105},
+            {"op": "TIMEOUT", "lsn": 106},
+        ]
+
+    def _schema_map(self):
+        return {self.id_a: self.table_a, self.id_b: self.table_b}
+
+    def test_multiplexes_two_tables_to_their_own_buffers(self):
+        shard = self._shard_with_two_tables()
+        caught_up = shard.ingest(self._two_table_stream(), self._schema_map(), 1, 106)
+        self.assertTrue(caught_up)
+        view_a = shard.snapshot(self.id_a, 0)
+        view_b = shard.snapshot(self.id_b, 0)
+        self.assertEqual([tx.tx_id for tx in view_a.committed], [1])
+        self.assertEqual([tx.tx_id for tx in view_b.committed], [2])
+        self.assertTrue(view_a.caught_up)
+        self.assertEqual((view_a.min_lsn, view_a.current_lsn), (1, 106))
+
+    def test_per_table_cursor_blocks_reread_duplicates(self):
+        shard = self._shard_with_two_tables()
+        stream = self._two_table_stream()
+        shard.ingest(stream, self._schema_map(), 1, 106)
+        shard.ingest(stream, self._schema_map(), 1, 106)  # daemon re-reads from the floor
+        self.assertEqual(len(shard.buffers[self.id_a]), 1)
+        self.assertEqual(len(shard.buffers[self.id_b]), 1)
+
+    def test_snapshot_peeks_without_removing_until_checkpoint_advances(self):
+        shard = self._shard_with_two_tables()
+        shard.ingest(self._two_table_stream(), self._schema_map(), 1, 106)
+        self.assertEqual([tx.tx_id for tx in shard.snapshot(self.id_a, 0).committed], [1])
+        # A second poll at the same checkpoint still sees the un-consumed transaction.
+        self.assertEqual([tx.tx_id for tx in shard.snapshot(self.id_a, 0).committed], [1])
+        # Once the checkpoint passes its commit LSN it is trimmed.
+        self.assertEqual(shard.snapshot(self.id_a, 102).committed, [])
+
+    def test_late_subscriber_receives_history_without_duplicating_others(self):
+        shard = _SharedCdcShard()
+        shard.subscribe(self.id_a, self.table_a, _capture_descriptor(self.table_a), 0, 0)
+        stream = self._two_table_stream()
+        shard.ingest(stream, {self.id_a: self.table_a}, 1, 106)
+        # B subscribes late; the daemon re-reads the log and B must get its history
+        # while A is not re-delivered.
+        shard.subscribe(self.id_b, self.table_b, _capture_descriptor(self.table_b), 0, 0)
+        shard.ingest(stream, self._schema_map(), 1, 106)
+        self.assertEqual([tx.tx_id for tx in shard.buffers[self.id_b]], [2])
+        self.assertEqual(len(shard.buffers[self.id_a]), 1)
+
+    def test_per_table_open_begin_isolates_tables(self):
+        shard = self._shard_with_two_tables()
+        stream = [
+            {"op": "BEGIN", "tx_id": 3, "lsn": 200},
+            {
+                "op": "INSERT",
+                "tx_id": 3,
+                "lsn": 201,
+                "table": self.table_a.identity,
+                "row": {"id": 2, "value": "b"},
+            },
+        ]  # opened, not committed
+        caught_up = shard.ingest(stream, self._schema_map(), 1, 201)
+        self.assertFalse(caught_up)
+        self.assertEqual(shard.snapshot(self.id_a, 0).open_begin, 200)
+        self.assertIsNone(shard.snapshot(self.id_b, 0).open_begin)
+        self.assertEqual(shard.shared_restart, 200)  # resume from the open BEGIN
+
+    def test_subscribe_lowers_shared_restart_to_admit_history(self):
+        shard = _SharedCdcShard()
+        shard.subscribe(self.id_a, self.table_a, _capture_descriptor(self.table_a), 0, 50)
+        self.assertEqual(shard.shared_restart, 50)
+        shard.subscribe(self.id_b, self.table_b, _capture_descriptor(self.table_b), 0, 30)
+        self.assertEqual(shard.shared_restart, 30)
+
+    def test_snapshot_is_none_until_daemon_publishes(self):
+        shard = self._shard_with_two_tables()
+        self.assertIsNone(shard.snapshot(self.id_a, 0))
+
+
+class SharedCdcOptionTests(unittest.TestCase):
+    def setUp(self):
+        self._shared_state = tempfile.TemporaryDirectory()
+        self._lakebase = _OfflineLakebase().install(self)
+
+    def tearDown(self):
+        self._shared_state.cleanup()
+
+    def _connector(self, **options):
+        connector = InformixLakeflowConnect(
+            {
+                "database": "demo",
+                "snapshot.staging.location": self._shared_state.name,
+                "lakebase.password": "test-state-password",
+                **options,
+            }
+        )
+        connector._bridge_instance = FakeBridge()
+        return connector
+
+    def test_shared_session_defaults_on(self):
+        self.assertTrue(self._connector()._shared_cdc_enabled())
+
+    def test_shared_session_can_be_disabled(self):
+        self.assertFalse(self._connector(**{"cdc.shared.session": "false"})._shared_cdc_enabled())
+
+    def test_shared_session_enables(self):
+        self.assertTrue(self._connector(**{"cdc.shared.session": "true"})._shared_cdc_enabled())
+
+    def test_thread_count_defaults_to_connection_budget(self):
+        self.assertEqual(self._connector()._shared_cdc_thread_count(), 16)
+
+    def test_thread_count_override(self):
+        self.assertEqual(
+            self._connector(**{"cdc.shared.reader.threads": "4"})._shared_cdc_thread_count(), 4
+        )
+
+    def test_invalid_shared_session_value_rejected(self):
+        with self.assertRaises(ValueError):
+            self._connector(**{"cdc.shared.session": "maybe"})
+
+    def test_zero_reader_threads_rejected(self):
+        with self.assertRaises(ValueError):
+            self._connector(**{"cdc.shared.reader.threads": "0"})
+
+    def test_zero_buffer_rejected(self):
+        with self.assertRaises(ValueError):
+            self._connector(**{"cdc.shared.buffer.max.records": "0"})
+
+
+class SharedCdcConsumerSeamTests(unittest.TestCase):
+    """The streaming consumer reads from the shard and touches Informix for nothing."""
+
+    def setUp(self):
+        self._shared_state = tempfile.TemporaryDirectory()
+        self._lakebase = _OfflineLakebase().install(self)
+
+    def tearDown(self):
+        self._shared_state.cleanup()
+
+    def _connector(self, bridge):
+        connector = InformixLakeflowConnect(
+            {
+                "database": "demo",
+                "snapshot.staging.location": self._shared_state.name,
+                "lakebase.password": "test-state-password",
+                "cdc.shared.session": "true",
+            }
+        )
+        connector.set_registration_scope(hashlib.sha256(b"shared").hexdigest()[:32])
+        connector._bridge_instance = bridge
+        return connector
+
+    def test_shared_stream_read_uses_shard_and_skips_bridge(self):
+        class _RecordingBridge(FakeBridge):
+            def __init__(self):
+                super().__init__()
+                self.calls = []
+
+            def get_table(self, identity):
+                self.calls.append("get_table")
+                return super().get_table(identity)
+
+            def minimum_lsn(self):
+                self.calls.append("minimum_lsn")
+                return super().minimum_lsn()
+
+            def current_lsn(self):
+                self.calls.append("current_lsn")
+                return super().current_lsn()
+
+            def read_changes(self, *args, **kwargs):
+                self.calls.append("read_changes")
+                return super().read_changes(*args, **kwargs)
+
+        bridge = _RecordingBridge()
+        connector = self._connector(bridge)
+        table = Table.parse(_table(), "demo")
+        identity = table.native_identity
+
+        shard = _SharedCdcShard()
+        shard.subscribe(identity, table, _capture_descriptor(table), 0, 0)
+        shard.ingest(
+            [
+                {"op": "BEGIN", "tx_id": 5, "lsn": 100},
+                {
+                    "op": "INSERT",
+                    "tx_id": 5,
+                    "lsn": 101,
+                    "table": table.identity,
+                    "row": {"id": 7, "value": "g"},
+                },
+                {"op": "COMMIT", "tx_id": 5, "lsn": 102},
+                {"op": "TIMEOUT", "lsn": 103},
+            ],
+            {identity: table},
+            1,
+            103,
+        )
+
+        with mock.patch.object(informix_module, "_shared_cdc_shard", lambda *a, **k: shard):
+            rows, _offset = connector._read_stream(table, _stream_offset(), {}, deletes=False)
+        rows = list(rows)
+
+        self.assertEqual([row["id"] for row in rows], [7])
+        # Steady-state shared read: the consumer sourced schema, LSN bounds, and change
+        # records from the shard, so it never touched the Informix bridge.
+        self.assertEqual(bridge.calls, [])
+
+    def test_fingerprint_mismatch_falls_back_to_direct_read(self):
+        bridge = FakeBridge()
+        connector = self._connector(bridge)
+        table = Table.parse(_table(), "demo")
+        identity = table.native_identity
+
+        shard = _SharedCdcShard()
+        shard.subscribe(identity, table, _capture_descriptor(table), 0, 0)
+        shard.ingest([{"op": "TIMEOUT", "lsn": 103}], {identity: table}, 1, 103)
+
+        checkpoint = _stream_offset()
+        checkpoint["schema_fingerprint"] = "0" * 64  # simulate an in-flight transition
+
+        with mock.patch.object(informix_module, "_shared_cdc_shard", lambda *a, **k: shard):
+            view = connector._shared_cdc_snapshot(
+                table, checkpoint, {}, False, connector._pipeline_scope()
+            )
+        self.assertIsNone(view)  # daemon view rejected -> direct-read fallback
+
+    def test_primary_keys_override_table_shards_and_detects_pk_change(self):
+        # A primary.keys override makes `value` the key. The daemon preserves that
+        # override on its shard schema, so the table's fingerprint matches (no
+        # fallback) and a change to `value` is detected as a key change.
+        bridge = FakeBridge()
+        connector = self._connector(bridge)
+        base = Table.parse(_table(), "demo")
+        override = informix_module.replace(base, primary_keys=("value",), key_override=True)
+        identity = override.native_identity
+
+        shard = _SharedCdcShard()
+        shard.subscribe(identity, override, _capture_descriptor(override), 0, 0)
+        shard.ingest(
+            [
+                {"op": "BEGIN", "tx_id": 6, "lsn": 100},
+                {
+                    "op": "BEFORE_UPDATE",
+                    "tx_id": 6,
+                    "lsn": 101,
+                    "table": override.identity,
+                    "before": {"id": 1, "value": "a"},
+                },
+                {
+                    "op": "AFTER_UPDATE",
+                    "tx_id": 6,
+                    "lsn": 102,
+                    "table": override.identity,
+                    "after": {"id": 1, "value": "b"},
+                },
+                {"op": "COMMIT", "tx_id": 6, "lsn": 103},
+                {"op": "TIMEOUT", "lsn": 104},
+            ],
+            {identity: override},  # daemon publishes schema WITH the override applied
+            1,
+            104,
+        )
+
+        checkpoint = _stream_offset()
+        checkpoint["schema_fingerprint"] = _schema_fingerprint(override)
+
+        with mock.patch.object(informix_module, "_shared_cdc_shard", lambda *a, **k: shard):
+            snapshot = connector._shared_cdc_snapshot(
+                override, checkpoint, {}, True, connector._pipeline_scope()
+            )
+            self.assertIsNotNone(snapshot)  # override fingerprint matches -> no fallback
+            rows, _offset = connector._read_stream(override, checkpoint, {}, deletes=True)
+        rows = list(rows)
+        # `value` (the override key) changed a->b, so the delete channel emits the old key.
+        self.assertEqual(len(rows), 1)
 
 
 if __name__ == "__main__":

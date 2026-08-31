@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import (
@@ -4885,6 +4886,38 @@ def register_lakeflow_source(spark):
     # append destination. ``true`` forces append for every capturable table; ``false``
     # forces the normal CDC/snapshot path even for a keyless table.
     _APPEND_INGESTION_OPTION = "append.only.ingestion"
+    # Sharded daemon-reader CDC, on by default. Set ``cdc.shared.session=false`` to opt out,
+    # in which case every CDC-capable table runs its own Informix CDC session per poll -- one
+    # connection slot and a full opensess/startcapture/activatesess/endcapture cycle each
+    # microbatch, per table.
+    #
+    # On (the default), the tables are partitioned into K shards
+    # (``cdc.shared.reader.threads``, default = ``max.concurrent.connections``). A bounded
+    # pool of K driver-resident daemon threads -- one per shard -- each holds a single
+    # shared CDC session multiplexing just its shard's subset of tables, reads the log
+    # once, and fans the assembled transactions out to per-table in-memory buffers. The
+    # daemon also supplies the schema and log position each streaming poll needs, so in
+    # steady state a consumer's poll reads entirely from memory and touches Informix for
+    # nothing. Sharding is by stable hash of the native identity, so a table maps to the
+    # same shard on every driver and across restarts without coordination.
+    #
+    # Concurrent CDC sessions drop from ~N to K (bounding the syscdcv1 teardown that stalls
+    # under many concurrent sessions), reads are guaranteed parallel across the K daemon
+    # threads, and the driver thread count is bounded by K. Both the upsert and delete
+    # channels are sharded independently (the shard is keyed by channel).
+    _SHARED_CDC_SESSION_OPTION = "cdc.shared.session"
+    _SHARED_CDC_THREADS_OPTION = "cdc.shared.reader.threads"
+    _SHARED_CDC_BUFFER_OPTION = "cdc.shared.buffer.max.records"
+    # Safety ceiling on buffered-but-unconsumed transactions per table in a shard. When a
+    # shard's slowest buffer reaches it, that shard's daemon defers new reads (throttle to
+    # the slowest reader) until the backlog drains, bounding driver memory.
+    _DEFAULT_SHARED_CDC_BUFFER = 200000
+    # How long a shard retains a subscriber after its last poll before dropping it from the
+    # capture set and floor computation, so a stopped flow cannot pin the shard forever.
+    _SHARED_CDC_SUBSCRIBER_TTL_SECONDS = 300.0
+    # Idle back-off between reads once a shard has drained its log, so a caught-up daemon
+    # does not busy-spin (and releases its connection slot for consumer bootstrap).
+    _SHARED_CDC_IDLE_POLL_SECONDS = 1.0
     # What an append-only table does about rows that predate the flow.
     #
     # ``stream`` (default): begin at the server's current log position and capture only
@@ -7787,6 +7820,302 @@ def register_lakeflow_source(spark):
             return CommittedTransaction(tx_id, tx.begin_lsn, end, restart, tuple(tx.records))
 
 
+    @dataclass(frozen=True)
+    class _SharedCdcSnapshot:
+        """A coherent (schema, log position, transactions) view a consumer poll reads
+        from a shard in place of touching Informix itself."""
+
+        table: "Table"
+        fingerprint: str
+        min_lsn: int
+        current_lsn: int
+        committed: list
+        caught_up: bool
+        open_begin: int | None
+
+
+    class _SharedCdcShard:
+        """One shard of the sharded daemon-reader CDC pool.
+
+        A single daemon thread owns the Informix I/O for this shard's tables -- it reads
+        the shared CDC session, fetches schema, and samples the log bounds -- and publishes
+        the result here. Consumer streaming polls read the fanned-out transactions and the
+        schema/log position from memory rather than connecting themselves. All mutable
+        state is guarded by ``condition``.
+        """
+
+        def __init__(self) -> None:
+            self.condition = threading.Condition()
+            # identity -> {table, capture, checkpoint, floor, last_seen}
+            self.subscribers: dict[str, dict[str, Any]] = {}
+            self.buffers: dict[str, deque] = {}
+            # highest commit_lsn appended per table: dedups re-delivery and lets a lagging
+            # or late subscriber replay its own history exactly once.
+            self.cursors: dict[str, int] = {}
+            self.shared_restart: int | None = None
+            # coherent snapshot, published atomically at the end of each read cycle
+            self.schema: dict[str, "Table"] = {}
+            self.min_lsn: int | None = None
+            self.current_lsn: int | None = None
+            self.caught_up = False
+            self.open_begins: dict[str, int | None] = {}
+            self.ready = False
+            # daemon configuration, set by the first subscriber
+            self.reader_factory: Callable[[], Any] | None = None
+            self.timeout_seconds = 5
+            self.max_records = _DEFAULT_CDC_MAX_RECORDS
+            self.buffer_cap = _DEFAULT_SHARED_CDC_BUFFER
+            self.subscriber_ttl = _SHARED_CDC_SUBSCRIBER_TTL_SECONDS
+
+        def configure(
+            self, *, reader_factory, timeout_seconds, max_records, buffer_cap, subscriber_ttl
+        ):
+            with self.condition:
+                if self.reader_factory is None:
+                    self.reader_factory = reader_factory
+                self.timeout_seconds = timeout_seconds
+                self.max_records = max_records
+                self.buffer_cap = buffer_cap
+                self.subscriber_ttl = subscriber_ttl
+
+        # ---- consumer side ------------------------------------------------------
+
+        def subscribe(self, identity, table, capture, checkpoint_commit_lsn, floor_lsn):
+            with self.condition:
+                existing = self.subscribers.get(identity)
+                self.subscribers[identity] = {
+                    "table": table,
+                    "capture": capture,
+                    "checkpoint": checkpoint_commit_lsn,
+                    "floor": floor_lsn,
+                    "last_seen": time.monotonic(),
+                }
+                self.buffers.setdefault(identity, deque())
+                # Lower the shared read cursor to admit a newly subscribed or lagging
+                # table's history. It only moves backward here; the daemon advances it
+                # forward as it reads. Activating too low is merely wasteful (re-read then
+                # discarded per cursor / _recover); too high would skip a laggard's changes.
+                if self.shared_restart is None:
+                    self.shared_restart = floor_lsn
+                elif existing is None:
+                    self.shared_restart = min(self.shared_restart, floor_lsn)
+                self.condition.notify_all()
+
+        def snapshot(self, identity, checkpoint_commit_lsn):
+            """Return a coherent view for one table, or None to fall back to a direct
+            read (daemon not ready yet, or this table is unknown to the daemon)."""
+
+            with self.condition:
+                if not self.ready or identity not in self.schema:
+                    return None
+                table = self.schema.get(identity)
+                if table is None or self.min_lsn is None or self.current_lsn is None:
+                    return None
+                buf = self.buffers.get(identity)
+                if buf is None:
+                    return None
+                # Drop durably-consumed transactions; keep the rest (peek, don't pop) so a
+                # poll that consumes only part of its budget re-serves the remainder.
+                while buf and buf[0].commit_lsn <= checkpoint_commit_lsn:
+                    buf.popleft()
+                committed = list(buf)
+                # ``committed`` is the entire retained buffer, so nothing is withheld:
+                # the consumer is caught up exactly when the daemon reached end-of-log.
+                caught_up = self.caught_up
+                return _SharedCdcSnapshot(
+                    table=table,
+                    fingerprint=_schema_fingerprint(table),
+                    min_lsn=self.min_lsn,
+                    current_lsn=self.current_lsn,
+                    committed=committed,
+                    caught_up=caught_up,
+                    open_begin=self.open_begins.get(identity),
+                )
+
+        # ---- daemon side --------------------------------------------------------
+
+        def live_subscribers(self):
+            """Drop subscribers past the TTL (a stopped flow must not pin the shard) and
+            return the current set. Caller holds the lock."""
+
+            now = time.monotonic()
+            for identity in list(self.subscribers):
+                if now - self.subscribers[identity]["last_seen"] > self.subscriber_ttl:
+                    del self.subscribers[identity]
+                    for store in (self.buffers, self.cursors, self.schema, self.open_begins):
+                        store.pop(identity, None)
+            return dict(self.subscribers)
+
+        def ingest(self, raw, schema_map, min_lsn, current_lsn):
+            """Assemble one read's records into transactions, fan them out per table, and
+            publish the coherent snapshot. Returns whether the shard is caught up."""
+
+            buffer = TransactionBuffer()
+            committed = []
+            timed_out = False
+            for record in raw:
+                if _operation(record) == "TIMEOUT":
+                    timed_out = True
+                done = buffer.feed(record)
+                if done is not None:
+                    committed.append(done)
+            committed.sort(key=lambda tx: (tx.commit_lsn, tx.tx_id))
+            with self.condition:
+                for tx in committed:
+                    for identity, sub in self.subscribers.items():
+                        if tx.commit_lsn <= self.cursors.get(identity, 0):
+                            continue
+                        if any(_record_matches(record, sub["table"]) for record in tx.records):
+                            self.buffers.setdefault(identity, deque()).append(tx)
+                            self.cursors[identity] = tx.commit_lsn
+                # Resume the next read from the oldest open BEGIN so open transactions are
+                # recaptured; per-table cursors above dedup the resulting re-delivery.
+                global_open = min((item.begin_lsn for item in buffer.open.values()), default=None)
+                if global_open is not None:
+                    self.shared_restart = global_open
+                elif committed:
+                    self.shared_restart = committed[-1].commit_lsn
+                open_begins: dict[str, int | None] = {}
+                for identity, sub in self.subscribers.items():
+                    begins = [
+                        item.begin_lsn
+                        for item in buffer.open.values()
+                        if any(_record_matches(record, sub["table"]) for record in item.records)
+                    ]
+                    open_begins[identity] = min(begins) if begins else None
+                self.open_begins = open_begins
+                self.schema = dict(schema_map)
+                self.min_lsn = min_lsn
+                self.current_lsn = current_lsn
+                self.caught_up = timed_out and not buffer.open
+                self.ready = True
+                self.condition.notify_all()
+            return self.caught_up
+
+        def mark_unready(self):
+            with self.condition:
+                self.ready = False
+
+
+    # Serialization-safe registry (a bare module global becomes a function local in the
+    # merged deployment; a mutated dict survives, as with _lakebase_waiter_lock).
+    _SHARED_CDC_SHARDS: dict[tuple, _SharedCdcShard] = {}
+    _SHARED_CDC_THREADS: dict[tuple, threading.Thread] = {}
+    _SHARED_CDC_REGISTRY_LOCK: dict[str, threading.Lock] = {}
+
+
+    def _shared_cdc_registry_lock() -> threading.Lock:
+        lock = _SHARED_CDC_REGISTRY_LOCK.get("lock")
+        if lock is None:
+            lock = _SHARED_CDC_REGISTRY_LOCK.setdefault("lock", threading.Lock())
+        return lock
+
+
+    def _shared_cdc_shard(
+        key, *, reader_factory, timeout_seconds, max_records, buffer_cap, subscriber_ttl
+    ) -> _SharedCdcShard:
+        with _shared_cdc_registry_lock():
+            shard = _SHARED_CDC_SHARDS.get(key)
+            if shard is None:
+                shard = _SHARED_CDC_SHARDS.setdefault(key, _SharedCdcShard())
+            shard.configure(
+                reader_factory=reader_factory,
+                timeout_seconds=timeout_seconds,
+                max_records=max_records,
+                buffer_cap=buffer_cap,
+                subscriber_ttl=subscriber_ttl,
+            )
+            thread = _SHARED_CDC_THREADS.get(key)
+            if thread is None or not thread.is_alive():
+                thread = threading.Thread(
+                    target=_run_shared_cdc_shard,
+                    args=(shard,),
+                    daemon=True,
+                    name=f"informix-shared-cdc-{key[-2]}-{key[-1]}",
+                )
+                _SHARED_CDC_THREADS[key] = thread
+                thread.start()
+            return shard
+
+
+    def _close_shared_cdc_reader(reader) -> None:
+        if reader is None:
+            return
+        try:
+            reader.close()
+        except Exception:  # noqa: BLE001 - best-effort slot release
+            logging.getLogger(__name__).debug("shared CDC reader close failed", exc_info=True)
+
+
+    def _run_shared_cdc_shard(shard: _SharedCdcShard) -> None:
+        """Daemon loop for one shard: read the shared CDC session, fetch schema + log
+        bounds, and publish. Holds one connection slot only across consecutive productive
+        reads; releases it before any idle wait so consumer bootstrap can use the slot."""
+
+        logger = logging.getLogger(__name__)
+        reader = None
+        try:
+            while True:
+                with shard.condition:
+                    subscribers = shard.live_subscribers()
+                    have_subscribers = bool(subscribers)
+                    throttled = have_subscribers and any(
+                        len(buf) >= shard.buffer_cap for buf in shard.buffers.values()
+                    )
+                    restart = shard.shared_restart
+                    captures = [sub["capture"] for sub in subscribers.values()]
+                    identities = [(identity, sub["table"]) for identity, sub in subscribers.items()]
+                if not have_subscribers or throttled or restart is None or shard.reader_factory is None:
+                    _close_shared_cdc_reader(reader)
+                    reader = None
+                    with shard.condition:
+                        shard.condition.wait(timeout=_SHARED_CDC_IDLE_POLL_SECONDS)
+                    continue
+                if reader is None:
+                    reader = shard.reader_factory()
+                try:
+                    schema_map = {}
+                    for identity, table in identities:
+                        fresh = Table.parse(reader._bridge.get_table(table.identity), table.database)
+                        if table.key_override:
+                            # Preserve the subscriber's primary.keys override (and its
+                            # fingerprint) on the daemon's schema, exactly as
+                            # _refresh_table_schema does. Without this an overridden table's
+                            # fingerprint never matches its checkpoint, so it would always
+                            # fall back to a direct read and never benefit from sharding --
+                            # and its PK-change detection would use the wrong keys.
+                            fresh = replace(fresh, primary_keys=table.primary_keys, key_override=True)
+                        schema_map[identity] = fresh
+                    min_lsn = reader._bridge.minimum_lsn()
+                    current_lsn = reader._bridge.current_lsn()
+                    raw = reader._read_changes_with_reconnect(
+                        captures,
+                        restart,
+                        shard.timeout_seconds,
+                        shard.max_records,
+                        table=identities[0][1],
+                    )
+                    caught_up = shard.ingest(raw, schema_map, min_lsn, current_lsn)
+                except Exception:  # noqa: BLE001 - surfaced by degrading to direct reads
+                    logger.warning(
+                        "Shared CDC shard read failed; consumers fall back to direct reads "
+                        "until it recovers",
+                        exc_info=True,
+                    )
+                    shard.mark_unready()
+                    _close_shared_cdc_reader(reader)
+                    reader = None
+                    time.sleep(_SHARED_CDC_IDLE_POLL_SECONDS)
+                    continue
+                if caught_up:
+                    _close_shared_cdc_reader(reader)
+                    reader = None
+                    with shard.condition:
+                        shard.condition.wait(timeout=_SHARED_CDC_IDLE_POLL_SECONDS)
+        finally:
+            _close_shared_cdc_reader(reader)
+
+
     class InformixLakeflowConnect(LakeflowConnect):
         """Pure-Python connector live-validated on disposable Informix 15.
 
@@ -7858,12 +8187,18 @@ def register_lakeflow_source(spark):
                 ),
                 ("redirect.max", "3", 0),
                 ("cdc.shared.state.wait.seconds", str(_SHARED_STATE_WAIT_SECONDS), 1),
+                (_SHARED_CDC_BUFFER_OPTION, str(_DEFAULT_SHARED_CDC_BUFFER), 1),
             ):
                 if int(options.get(name, default)) < minimum:
                     raise ValueError(f"Option '{name}' must be >= {minimum}")
+            # Shared-reader thread count defaults to the connection budget, so it is
+            # validated here rather than in the static-default loop above.
+            if _SHARED_CDC_THREADS_OPTION in options and int(options[_SHARED_CDC_THREADS_OPTION]) < 1:
+                raise ValueError(f"Option '{_SHARED_CDC_THREADS_OPTION}' must be >= 1")
             # Validate boolean capacity options eagerly (they are otherwise only
             # checked on first read, deep inside a running flow).
             _option_bool(options, "snapshot.incremental.blocking", True)
+            _option_bool(options, _SHARED_CDC_SESSION_OPTION, True)
             if _APPEND_INGESTION_OPTION in options:
                 _append_only_value(options[_APPEND_INGESTION_OPTION])
             if int(options.get("cdc.max.records", str(_DEFAULT_CDC_MAX_RECORDS))) > 256:
@@ -10634,10 +10969,83 @@ def register_lakeflow_source(spark):
                     time.sleep(delay)
                     attempt += 1
 
+        def _shared_cdc_enabled(self) -> bool:
+            return _option_bool(self.options, _SHARED_CDC_SESSION_OPTION, True)
+
+        def _shared_cdc_thread_count(self) -> int:
+            return max(
+                1,
+                int(
+                    self.options.get(
+                        _SHARED_CDC_THREADS_OPTION,
+                        self.options.get(
+                            "max.concurrent.connections", str(_DEFAULT_MAX_CONCURRENT_CONNECTIONS)
+                        ),
+                    )
+                ),
+            )
+
+        def _shared_cdc_reader_factory(self, channel: str) -> Callable[[], "InformixLakeflowConnect"]:
+            # The daemon reader gets its OWN options copy: the connector mutates options
+            # mid-read (channel, capacity hints), so a shared dict would race. Shared mode
+            # is cleared on the copy so the reader never recurses into this path.
+            reader_options = dict(self.options)
+            reader_options[_CONNECTION_CHANNEL_OPTION] = channel
+            reader_options[_SHARED_CDC_SESSION_OPTION] = "false"
+            cls = type(self)
+            return lambda: cls(reader_options)
+
+        def _shared_cdc_snapshot(self, table, checkpoint, options, deletes, pipeline_scope):
+            """Subscribe this table to its shard and return the daemon's coherent view, or
+            None to fall back to a direct read (daemon not ready, or a schema transition)."""
+
+            channel = "delete" if deletes else "upsert"
+            threads = self._shared_cdc_thread_count()
+            shard_id = int(hashlib.sha256(table.native_identity.encode()).hexdigest(), 16) % threads
+            key = (self._lakebase_state_namespace(), pipeline_scope, channel, shard_id)
+            capture = _capture_descriptor(table, _client_encoding(self.options))
+            checkpoint_commit = int(checkpoint["commit_lsn"])
+            floor = int(checkpoint.get("begin_lsn") or checkpoint["commit_lsn"])
+            shard = _shared_cdc_shard(
+                key,
+                reader_factory=self._shared_cdc_reader_factory(channel),
+                timeout_seconds=self._table_int_option(options, "cdc.timeout", 5, minimum=1),
+                max_records=self._table_int_option(
+                    options, "cdc.max.records", _DEFAULT_CDC_MAX_RECORDS, minimum=1, maximum=256
+                ),
+                buffer_cap=int(
+                    self.options.get(_SHARED_CDC_BUFFER_OPTION, str(_DEFAULT_SHARED_CDC_BUFFER))
+                ),
+                subscriber_ttl=float(
+                    self.options.get("cdc.shared.state.wait.seconds", str(_SHARED_STATE_WAIT_SECONDS))
+                ),
+            )
+            shard.subscribe(table.native_identity, table, capture, checkpoint_commit, floor)
+            view = shard.snapshot(table.native_identity, checkpoint_commit)
+            if view is None:
+                return None
+            # A fingerprint mismatch means a schema transition is in flight; defer to the
+            # direct-read path, which owns the transition/replay logic.
+            if str(checkpoint.get("schema_fingerprint")) != view.fingerprint:
+                return None
+            return view
+
         def _read_stream(self, table: Table, start: dict, options: dict[str, str], deletes: bool):
             checkpoint = _validated_offset(start)
             pipeline_scope = self._pipeline_scope()
-            table = self._refresh_table_schema(table, None)
+            # In shared-session mode a daemon reader owns this shard's Informix I/O: it
+            # supplies the schema, log bounds, and change records, so a steady-state poll
+            # touches Informix for nothing. A None view (daemon not ready yet, or a schema
+            # transition in flight) transparently falls back to the direct-read path below.
+            shared_view = None
+            if self._shared_cdc_enabled():
+                shared_view = self._shared_cdc_snapshot(
+                    table, checkpoint, options, deletes, pipeline_scope
+                )
+            if shared_view is not None:
+                table = shared_view.table
+            else:
+                table = self._refresh_table_schema(table, None)
             fingerprint = _schema_fingerprint(table)
             checkpoint_fingerprint = checkpoint.get("schema_fingerprint")
             checkpoint_schema_id = str(checkpoint["schema_id"])
@@ -10647,7 +11055,7 @@ def register_lakeflow_source(spark):
                     "run a full refresh before resuming CDC"
                 )
             restart = int(checkpoint.get("begin_lsn") or checkpoint["commit_lsn"])
-            minimum = self._bridge.minimum_lsn()
+            minimum = shared_view.min_lsn if shared_view is not None else self._bridge.minimum_lsn()
             if restart < minimum:
                 raise LogRetentionError(
                     f"Restart LSN {restart} is older than minimum retained LSN "
@@ -10673,7 +11081,7 @@ def register_lakeflow_source(spark):
             # Fail loudly rather than advancing: the checkpoint's position is unrelated
             # to the current log, so no safe resume point can be inferred from it and
             # only a full refresh can re-establish one.
-            current = self._bridge.current_lsn()
+            current = shared_view.current_lsn if shared_view is not None else self._bridge.current_lsn()
             if (restart >> 32) > (current >> 32):
                 raise LogRetentionError(
                     f"Restart LSN {restart} for '{table.exposed_name}' names logical log "
@@ -10729,7 +11137,10 @@ def register_lakeflow_source(spark):
             trigger_generation: str | None = None
             if self._trigger_available_now:
                 stop_lsn, trigger_generation = self._shared_trigger_boundary(
-                    table, checkpoint, owner=not deletes
+                    table,
+                    checkpoint,
+                    owner=not deletes,
+                    current_lsn=shared_view.current_lsn if shared_view is not None else None,
                 )
                 trigger_high_water = stop_lsn
             if transition_lsn is not None:
@@ -10755,17 +11166,26 @@ def register_lakeflow_source(spark):
                 # truncating it is the very divergence being removed. The LSN bound caps
                 # the read instead, so the budget must not also cut it short.
                 max_rows = _REPLAY_UNBOUNDED_ROWS
-            raw_records = self._read_changes_with_reconnect(
-                [_capture_descriptor(capture_table, _client_encoding(self.options))],
-                restart,
-                self._table_int_option(options, "cdc.timeout", 5, minimum=1),
-                self._table_int_option(
-                    options, "cdc.max.records", _DEFAULT_CDC_MAX_RECORDS, minimum=1, maximum=256
-                ),
-                table=table,
-            )
-            table = self._refresh_table_schema(table, fingerprint)
-            committed, caught_up, open_begin = _transaction_batch(raw_records)
+            if shared_view is not None:
+                # The daemon already assembled and fanned out this shard's transactions and
+                # re-validated the schema; take them as-is (no Informix I/O, no re-fetch).
+                committed, caught_up, open_begin = (
+                    shared_view.committed,
+                    shared_view.caught_up,
+                    shared_view.open_begin,
+                )
+            else:
+                raw_records = self._read_changes_with_reconnect(
+                    [_capture_descriptor(capture_table, _client_encoding(self.options))],
+                    restart,
+                    self._table_int_option(options, "cdc.timeout", 5, minimum=1),
+                    self._table_int_option(
+                        options, "cdc.max.records", _DEFAULT_CDC_MAX_RECORDS, minimum=1, maximum=256
+                    ),
+                    table=table,
+                )
+                table = self._refresh_table_schema(table, fingerprint)
+                committed, caught_up, open_begin = _transaction_batch(raw_records)
             recovered = _recover(committed, checkpoint)
             output: list[dict[str, Any]] = []
             end = dict(start)
@@ -10955,7 +11375,12 @@ def register_lakeflow_source(spark):
                 )
 
         def _shared_trigger_boundary(
-            self, table: Table, checkpoint: dict[str, Any], *, owner: bool
+            self,
+            table: Table,
+            checkpoint: dict[str, Any],
+            *,
+            owner: bool,
+            current_lsn: int | None = None,
         ) -> tuple[int, str]:
             # One pipeline update owns exactly one immutable per-table boundary.
             # Upsert and delete checkpoints may legitimately have different prior
@@ -11011,7 +11436,9 @@ def register_lakeflow_source(spark):
                     )
                     return high_water, generation
                 if owner:
-                    candidate_high_water = self._bridge.current_lsn()
+                    candidate_high_water = (
+                        current_lsn if current_lsn is not None else self._bridge.current_lsn()
+                    )
                     if candidate_high_water < int(checkpoint["commit_lsn"]):
                         raise InformixError(
                             f"Current LSN {candidate_high_water} precedes checkpoint LSN "
