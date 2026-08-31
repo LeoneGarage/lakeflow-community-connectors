@@ -2139,15 +2139,20 @@ class LakeflowContractTests(unittest.TestCase):
 
     def test_table_metadata_still_rejects_sql_unsafe_identifiers(self):
         # Widening the identifier class must not admit injection-unsafe characters.
-        for bad in ("a b", 'a"b', "a.b", "a;b", "a-b"):
+        for bad in ("a b", 'a"b', "a;b", "a-b"):
             with self.subTest(bad=bad), self.assertRaisesRegex(InformixError, "Unsafe"):
                 Table.parse({**_table(), "name": bad}, "demo")
 
-    def test_table_metadata_accepts_plus_in_identifiers(self):
-        # '+' is permitted in identifiers (e.g. an owner/table name like HCF+gbc).
-        table = Table.parse({**_table(), "owner": "HCF+gbc", "name": "a+b"}, "demo")
-        self.assertEqual(table.owner, "HCF+gbc")
-        self.assertEqual(table.name, "a+b")
+    def test_table_metadata_accepts_special_character_identifiers(self):
+        # "." appears in "first.last" login owners and "+" in some names; both are
+        # permitted and rendered as delimited identifiers in identity strings.
+        table = Table.parse({**_table(), "owner": "jacqueline.clarke", "name": "orders"}, "demo")
+        self.assertEqual(table.owner, "jacqueline.clarke")
+        self.assertEqual(table.exposed_name, '"jacqueline.clarke".orders')
+        self.assertEqual(table.identity, 'demo."jacqueline.clarke".orders')
+        self.assertEqual(table.native_identity, 'demo:"jacqueline.clarke".orders')
+        plus = Table.parse({**_table(), "owner": "HCF+gbc", "name": "orders"}, "demo")
+        self.assertEqual(plus.exposed_name, '"HCF+gbc".orders')
 
     def test_table_metadata_rejects_casefold_and_reserved_column_collisions(self):
         raw = _table()
@@ -2277,6 +2282,40 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(informix_module._sql_identifier("café"), "café")
         self.assertEqual(informix_module._sql_identifier("HCF+gbc"), '"HCF+gbc"')
         self.assertEqual(informix_module._sql_identifier('a"b'), '"a""b"')
+
+    def test_identity_join_split_round_trips_special_characters(self):
+        # A dotted "first.last" owner must survive the join/split round trip so
+        # its "." is not mistaken for a component separator.
+        for components in (
+            ["demo", "app", "orders"],
+            ["demo", "jacqueline.clarke", "orders"],
+            ["demo", "a+b", "c.d"],
+            ['weird"owner', "t"],
+        ):
+            joined = informix_module._join_identity(*components)
+            self.assertEqual(informix_module._split_identity(joined), components)
+        # Normal identifiers are unchanged (no gratuitous quoting).
+        self.assertEqual(informix_module._join_identity("demo", "app", "orders"), "demo.app.orders")
+
+    def test_snapshot_bridge_reads_dotted_owner_via_quoted_identity(self):
+        class SnapshotTransport:
+            def __init__(self):
+                self.sql = None
+
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                self.sql = sql
+                return []
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.transport = SnapshotTransport()
+
+        bridge.snapshot_page('demo."jacqueline.clarke".orders', ["id"], ["id"], None, 5)
+
+        self.assertEqual(
+            bridge.transport.sql,
+            'SELECT FIRST 5 id FROM demo:"jacqueline.clarke".orders ORDER BY id',
+        )
 
     def test_snapshot_bridge_delimits_special_character_identifiers(self):
         class SnapshotTransport:
