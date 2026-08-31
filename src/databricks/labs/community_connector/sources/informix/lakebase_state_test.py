@@ -881,6 +881,24 @@ class LakebaseStateRecordTests(unittest.TestCase):
         self.assertIsNone(params["retained_scope"])
         connection.commit.assert_called_once()
 
+    def test_touch_activity_casts_jsonb_value_parameters(self):
+        # Regression: params used as jsonb_build_object values sit in "any"-typed
+        # positions, so without an explicit cast the server cannot determine their
+        # type when the statement is prepared (IndeterminateDatatype: parameter $3).
+        connection = mock.MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = ({"record": 1},)
+
+        touched = lakebase_state.touch_table_activity(
+            connection, "ns", "state-gc/table-activity", "prefix", "pipe", 30
+        )
+
+        self.assertTrue(touched)
+        normalized = " ".join(cursor.execute.call_args.args[0].split())
+        self.assertIn("%(pipeline_id)s::text", normalized)
+        self.assertIn("%(table_prefix)s::text", normalized)
+        connection.commit.assert_called_once()
+
 
 class LakebaseProjectNamingTests(unittest.TestCase):
     def test_project_id_is_stable_and_dns_compliant(self):
