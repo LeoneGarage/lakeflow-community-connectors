@@ -5239,6 +5239,23 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(metadata["ingestion_type"], "append")
 
+    def test_auto_appends_a_keyless_table(self):
+        connector, _ = self._keyless_connector(**{"append.only.ingestion": "auto"})
+
+        metadata = connector.read_table_metadata("app.orders", {})
+
+        self.assertEqual(metadata["ingestion_type"], "append")
+        self.assertEqual(metadata["cursor_field"], informix_module.CURSOR)
+
+    def test_auto_leaves_a_keyed_table_on_cdc(self):
+        bridge = FakeBridge()  # default app.orders has a primary key
+        connector = self.connector(bridge)
+
+        metadata = connector.read_table_metadata("app.orders", {"append.only.ingestion": "auto"})
+
+        self.assertEqual(metadata["ingestion_type"], "cdc_with_deletes")
+        self.assertTrue(metadata["primary_keys"])
+
     def test_a_table_with_uncapturable_columns_is_never_append(self):
         bridge = FakeBridge()
         bridge.tables = [_table(cdc=False, primary_keys=())]
