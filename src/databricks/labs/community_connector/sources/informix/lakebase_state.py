@@ -1252,7 +1252,10 @@ WHERE namespace = %(namespace)s
   AND record_key LIKE %(record_key_pattern)s
   AND record->>'scope' LIKE %(pipeline_scope_pattern)s
   AND record->>'scope' <> %(current_scope)s
-  AND (%(retained_scope)s IS NULL OR record->>'scope' <> %(retained_scope)s)
+  -- Cast the nullable parameter to text so Postgres can determine its type:
+  -- a NULL retained_scope is sent with an unknown type OID, and `$n IS NULL`
+  -- alone gives the planner nothing to infer from (AmbiguousParameter otherwise).
+  AND (%(retained_scope)s::text IS NULL OR record->>'scope' <> %(retained_scope)s::text)
 RETURNING record_key
 """
 

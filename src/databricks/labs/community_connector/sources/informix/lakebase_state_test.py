@@ -860,6 +860,27 @@ class LakebaseStateRecordTests(unittest.TestCase):
         cleanup_args = cursor.execute.call_args_list[2].args[1]
         self.assertEqual(cleanup_args["cutoff_epoch"], 3_000_000 - 30 * 86400)
 
+    def test_obsolete_scope_delete_casts_nullable_retained_scope(self):
+        # Regression: retained_scope defaults to None, which psycopg sends with an
+        # unknown type OID. Without an explicit cast, `%(retained_scope)s IS NULL`
+        # left Postgres unable to infer the parameter type and raised
+        # AmbiguousParameter ("could not determine data type of parameter $5").
+        connection = mock.MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchall.return_value = [("channels/old",)]
+
+        deleted = lakebase_state.delete_obsolete_scoped_state_records(
+            connection, "ns", "channels", "pipe_@_", "pipe_@_new", retained_scope=None
+        )
+
+        self.assertEqual(deleted, 1)
+        sql, params = cursor.execute.call_args.args
+        normalized = " ".join(sql.split())
+        self.assertIn("%(retained_scope)s::text IS NULL", normalized)
+        self.assertNotIn("%(retained_scope)s IS NULL", normalized)
+        self.assertIsNone(params["retained_scope"])
+        connection.commit.assert_called_once()
+
 
 class LakebaseProjectNamingTests(unittest.TestCase):
     def test_project_id_is_stable_and_dns_compliant(self):
