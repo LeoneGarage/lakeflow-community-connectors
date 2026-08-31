@@ -74,6 +74,7 @@ if "pyspark.sql.types" not in sys.modules:
         "ShortType",
         "StringType",
         "TimestampType",
+        "TimestampNTZType",
         "ArrayType",
         "DataType",
         "MapType",
@@ -2786,6 +2787,40 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(spark_type.precision, 12)
         self.assertEqual(spark_type.scale, 0)
+
+    def test_datetime_maps_to_timestamp_ntz(self):
+        # Informix DATETIME has no timezone, so it must map to TIMESTAMP_NTZ rather
+        # than the timezone-aware timestamp type (which would shift the wall clock).
+        # 0x000A = YEAR(0) TO FRACTION(3), a full date-time qualifier.
+        spark_type = _spark_type(Column(name="created", type_name="DATETIME", length=0x000A))
+        self.assertEqual(type(spark_type).__name__, "TimestampNTZType")
+
+    def test_partial_datetime_qualifier_stays_string(self):
+        # A HOUR-anchored (time-of-day) qualifier is not a full date-time and remains
+        # a qualifier-aware string, unchanged by the NTZ mapping.
+        spark_type = _spark_type(Column(name="t", type_name="DATETIME", length=0x060F))
+        self.assertEqual(type(spark_type).__name__, "StringType")
+
+    def test_datetime_spark_type_option_selects_timezone_aware(self):
+        spark_type = _spark_type(
+            Column(name="created", type_name="DATETIME", length=0x000A),
+            {"datetime.spark.type": "timestamp"},
+        )
+        self.assertEqual(type(spark_type).__name__, "TimestampType")
+
+    def test_datetime_spark_type_option_ntz_is_explicit_default(self):
+        spark_type = _spark_type(
+            Column(name="created", type_name="DATETIME", length=0x000A),
+            {"datetime.spark.type": "timestamp_ntz"},
+        )
+        self.assertEqual(type(spark_type).__name__, "TimestampNTZType")
+
+    def test_datetime_spark_type_option_rejects_unknown_value(self):
+        with self.assertRaises(ValueError):
+            _spark_type(
+                Column(name="created", type_name="DATETIME", length=0x000A),
+                {"datetime.spark.type": "instant"},
+            )
 
     def test_discovery_filter_schema_and_metadata(self):
         connector = self.connector(table_include_list="ignored")
