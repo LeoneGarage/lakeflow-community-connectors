@@ -550,11 +550,32 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertNotIn("_informix.bypass.connection.capacity", connector.options)
 
-    def test_registration_catalog_is_shared_across_schema_instances(self):
+    def test_registration_reads_only_the_requested_table(self):
+        # Registration must resolve the one configured table with a targeted
+        # lookup and never scan the whole catalog -- an unrelated unsupported
+        # table elsewhere cannot then break a configured table's registration.
+        bridge = FakeBridge()
+        bridge.list_tables = mock.Mock(wraps=bridge.list_tables)
+        bridge.get_table = mock.Mock(wraps=bridge.get_table)
+        connector = self.connector(
+            bridge,
+            hostname="informix.example",
+            server="ol_informix",
+            registration_scope="targeted-read",
+            **{"snapshot.staging.location": "/Volumes/test/default/informix_state"},
+        )
+
+        connector.read_table_metadata("app.orders", {})
+
+        bridge.get_table.assert_called_once()
+        bridge.list_tables.assert_not_called()
+
+    def test_registration_table_is_shared_across_schema_instances(self):
         first_bridge = FakeBridge()
         second_bridge = FakeBridge()
+        first_bridge.get_table = mock.Mock(wraps=first_bridge.get_table)
+        second_bridge.get_table = mock.Mock(wraps=second_bridge.get_table)
         first_bridge.list_tables = mock.Mock(wraps=first_bridge.list_tables)
-        second_bridge.list_tables = mock.Mock(wraps=second_bridge.list_tables)
         options = {
             "hostname": "informix.example",
             "server": "ol_informix",
@@ -571,14 +592,17 @@ class LakeflowContractTests(unittest.TestCase):
             [field.name for field in first_schema.fields],
             [field.name for field in second_schema.fields],
         )
-        first_bridge.list_tables.assert_called_once_with()
-        second_bridge.list_tables.assert_not_called()
+        # One targeted lookup, shared across instances via the coordinator cache;
+        # the catalog is never scanned wholesale.
+        first_bridge.get_table.assert_called_once()
+        second_bridge.get_table.assert_not_called()
+        first_bridge.list_tables.assert_not_called()
 
-    def test_new_registration_refreshes_shared_schema_catalog(self):
+    def test_new_registration_scope_refetches_table(self):
         first_bridge = FakeBridge()
         second_bridge = FakeBridge()
-        first_bridge.list_tables = mock.Mock(wraps=first_bridge.list_tables)
-        second_bridge.list_tables = mock.Mock(wraps=second_bridge.list_tables)
+        first_bridge.get_table = mock.Mock(wraps=first_bridge.get_table)
+        second_bridge.get_table = mock.Mock(wraps=second_bridge.get_table)
         options = {
             "hostname": "informix.example",
             "server": "ol_informix",
@@ -592,8 +616,8 @@ class LakeflowContractTests(unittest.TestCase):
         first.get_table_schema("app.orders", {})
         second.get_table_schema("app.orders", {})
 
-        first_bridge.list_tables.assert_called_once_with()
-        second_bridge.list_tables.assert_called_once_with()
+        first_bridge.get_table.assert_called_once()
+        second_bridge.get_table.assert_called_once()
 
     def test_worker_release_failure_does_not_mask_primary_error(self):
         bridge = FakeBridge()

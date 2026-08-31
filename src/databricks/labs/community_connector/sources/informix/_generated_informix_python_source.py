@@ -5213,7 +5213,11 @@ def register_lakeflow_source(spark):
     # that a genuine outage still surfaces as a failed flow rather than a silent hang.
     _SHARED_STATE_MOUNT_RETRY_MAX_SECONDS = 8.0
     _METADATA_SESSION_IDLE_SECONDS = 1.0
-    _MAX_REGISTRATION_TABLE_CACHES = 16
+    # Bound on cached per-table registration lookups shared across reader instances
+    # in one process. Entries are single resolved tables (keyed by source identity +
+    # exposed name), so this can be generous -- a pipeline registers one entry per
+    # configured table.
+    _MAX_REGISTRATION_TABLE_CACHES = 512
     _LAST_CANDIDATE_CLEANUP: dict[str, float] = {}
     _LAST_RETIRED_CONNECTION_CLEANUP: dict[str, float] = {}
     _RETIRED_CONNECTION_CLEANUP_CURSOR: dict[str, str] = {}
@@ -5234,7 +5238,7 @@ def register_lakeflow_source(spark):
             self.condition = threading.Condition()
             self.validated: set[str] = set()
             self.claims: dict[str, tuple[object, float]] = {}
-            self.table_caches: dict[tuple[str, ...], dict[str, "Table"]] = {}
+            self.table_caches: dict[tuple[str, ...], "Table"] = {}
             self.connection_limits: set[tuple[str, int]] = set()
 
         def __getstate__(self) -> dict[str, object]:
@@ -8082,25 +8086,52 @@ def register_lakeflow_source(spark):
                 return result
 
         def _registration_table(self, table_name: str, table_options: dict[str, str]) -> Table:
-            """Resolve one table from a catalog snapshot shared by this registration."""
+            """Resolve one configured table with a targeted catalog lookup.
 
+            The framework asks for one specific table at a time (the pipeline spec's
+            exact ``owner.name``), so query just that table rather than scanning and
+            parsing the whole catalog. This keeps an unrelated unsupported table from
+            breaking registration for tables that are configured, and avoids reading
+            a large catalog wholesale. Resolved tables are cached per table in the
+            cross-instance coordinator so repeated registrations reuse them.
+            """
+
+            exposed = table_options.get("qualified_source_table", table_name)
             key = self._registration_table_cache_key()
             if key is None:
                 return self._table(table_name, table_options, refresh=True)
-            exposed = table_options.get("qualified_source_table", table_name)
             coordinator = _STATE_VALIDATION_COORDINATOR
+            cache_key = (*key, exposed)
             with coordinator.condition:
-                tables = coordinator.table_caches.get(key)
-                if tables is None:
-                    tables = dict(self._table_map(refresh=True))
-                    coordinator.table_caches[key] = tables
+                table = coordinator.table_caches.get(cache_key)
+                if table is None:
+                    table = self._resolve_registration_table(exposed)
+                    coordinator.table_caches[cache_key] = table
                     while len(coordinator.table_caches) > _MAX_REGISTRATION_TABLE_CACHES:
                         del coordinator.table_caches[next(iter(coordinator.table_caches))]
-                if exposed not in tables:
-                    raise ValueError(f"Unknown or excluded Informix table '{exposed}'")
-                self._tables = tables
-                self._tables_complete = True
-                return tables[exposed]
+                if self._tables is None:
+                    self._tables = {}
+                self._tables[exposed] = table
+                return table
+
+        def _resolve_registration_table(self, exposed: str) -> Table:
+            """Resolve a single configured table by exposed ``owner.name`` via a
+            targeted catalog query, applying the same eligibility and selection
+            filters ``_table_map`` would. Only this one table is read and parsed, so
+            an unrelated unsupported table elsewhere in the catalog cannot fail it.
+            """
+
+            parts = _split_identity(exposed)
+            if len(parts) != 2 or not all(_IDENTIFIER.fullmatch(part) for part in parts):
+                raise ValueError(f"Unknown or excluded Informix table '{exposed}'")
+            database = self.options.get("database", "")
+            table = Table.parse(
+                self._bridge.get_table(_join_identity(database, parts[0], parts[1])),
+                database,
+            )
+            if not _eligible(table) or not self._selected(table):
+                raise ValueError(f"Unknown or excluded Informix table '{exposed}'")
+            return table
 
         def _registration_table_cache_key(self) -> tuple[str, ...] | None:
             scope = self._registration_scope
