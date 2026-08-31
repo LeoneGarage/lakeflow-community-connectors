@@ -58,7 +58,6 @@ from pyspark.sql.types import (
     StringType,
     StructField,
     StructType,
-    TimestampNTZType,
     TimestampType,
     VariantType,
     VariantVal,
@@ -13220,27 +13219,6 @@ def register_lakeflow_source(spark):
                 )
 
 
-    _DATETIME_TYPE_OPTION = "datetime.spark.type"
-
-
-    def _datetime_spark_type(options: dict[str, str] | None):
-        """Select the Spark type for a full-qualifier Informix DATETIME / TIMESTAMP.
-
-        Per-table ``datetime.spark.type``. Default ``timestamp_ntz`` maps to TIMESTAMP_NTZ,
-        preserving the source wall clock (Informix DATETIME carries no timezone).
-        ``timestamp`` opts into the timezone-aware TimestampType, which Spark shifts by the
-        session timezone on read -- correct only when the stored values are known to be UTC
-        and that shift is wanted.
-        """
-
-        value = (options or {}).get(_DATETIME_TYPE_OPTION, "timestamp_ntz").strip().lower()
-        if value == "timestamp_ntz":
-            return TimestampNTZType()
-        if value == "timestamp":
-            return TimestampType()
-        raise ValueError(f"Option '{_DATETIME_TYPE_OPTION}' must be 'timestamp_ntz' or 'timestamp'")
-
-
     def _spark_type(column: Column, options: dict[str, str] | None = None):
         name = column.type_name.split("(", 1)[0].strip()
         if name in {"SMALLINT", "INT2"}:
@@ -13274,9 +13252,7 @@ def register_lakeflow_source(spark):
             return DateType()
         if name.startswith("DATETIME") or name == "TIMESTAMP":
             start, end = ((column.length or 0) >> 8) & 0xF, (column.length or 0) & 0xF
-            # Full date-time qualifiers map to a timestamp type chosen by
-            # datetime.spark.type (default timestamp_ntz); partial qualifiers stay strings.
-            return _datetime_spark_type(options) if start == 0 and end >= 4 else StringType()
+            return TimestampType() if start == 0 and end >= 4 else StringType()
         if name in {"BOOLEAN", "BOOL"}:
             return BooleanType()
         if name in {"BYTE", "BLOB", "BINARY", "VARBINARY"}:
@@ -13596,12 +13572,10 @@ def register_lakeflow_source(spark):
                             valid = True
                         except ValueError:
                             pass
-                elif isinstance(spark_type, (TimestampType, TimestampNTZType)):
+                elif isinstance(spark_type, TimestampType):
                     if isinstance(value, str):
                         try:
                             parsed = datetime.fromisoformat(value)
-                            # Both a timezone-naive TimestampType and TIMESTAMP_NTZ require
-                            # an offset-free wall-clock value.
                             valid = parsed.tzinfo is None
                         except ValueError:
                             pass
@@ -13628,11 +13602,10 @@ def register_lakeflow_source(spark):
 
 
     def _framework_value(value: Any) -> Any:
-        # The shared Spark Python Data Source parser accepts ISO strings for DateType and
-        # timestamp types (TimestampType / TIMESTAMP_NTZ), but rejects a native
-        # datetime.date.  Normalize both temporal Python objects at the connector boundary
-        # for consistent snapshot and CDC behavior. A naive datetime's isoformat carries no
-        # offset, which is exactly what TIMESTAMP_NTZ expects.
+        # The shared Spark Python Data Source parser accepts ISO strings for DateType
+        # and TimestampType, but rejects a native datetime.date.  Normalize both
+        # temporal Python objects at the connector boundary for consistent snapshot
+        # and CDC behavior.
         return value.isoformat() if isinstance(value, (date, datetime)) else value
 
 

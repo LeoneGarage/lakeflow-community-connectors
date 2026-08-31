@@ -88,7 +88,6 @@ replicated — run a full refresh if the destination must match the source exact
 | `table.exclude.list` | No | none | Comma-separated shell-style patterns excluded after inclusion filtering. |
 | `decimal.variable.type` | No | `decimal(38,18)` | Per-table option. Target Spark type for variable-scale `DECIMAL(p)`/`NUMERIC(p)` columns: `string`, `double`, `integer` (truncated), or `decimal(p,s)`. Explicit `DECIMAL(p,s)` remains fixed-scale. See [Variable-scale decimals](#variable-scale-decimals). |
 | `decimal.variable.column.type` | No | none | Per-table option. Comma-separated `column:type` overrides of `decimal.variable.type` for specific columns, e.g. `agt_no:decimal(9,0),bnk_acct_no:string`. |
-| `datetime.spark.type` | No | `timestamp_ntz` | Per-table Spark type for full date-time `DATETIME`/`TIMESTAMP` columns: `timestamp_ntz` (preserves the source wall clock; Informix DATETIME has no timezone) or `timestamp` (timezone-aware; Spark shifts by the session timezone on read — use only for known-UTC values). Partial qualifiers stay strings. Changing it on an ingested table changes the Delta column type and needs a full refresh of that table. |
 | `snapshot.mode` | No | `incremental` | Per-table snapshot policy: `incremental`, `initial`, `initial_only`, `cdc_only`, `auto_snapshot`, or `recovery`. See [Snapshot modes](#snapshot-modes). |
 | `snapshot.page.size` | No | `20000` | Rows per immutable staged page for CDC-capable tables; minimum `1`. Pages are read under one repeatable-read transaction and delivered through checkpointed Lakeflow microbatches. |
 | `snapshot.filter` | No | none | Per-table Informix SQL predicate appended to snapshot `SELECT` statements, without the `WHERE` keyword. It filters blocking, incremental, append-only initial, and snapshot-only copies. CDC events after the snapshot are not filtered. Semicolons, SQL comments, control characters, and predicates longer than 8,192 characters are rejected. |
@@ -118,7 +117,7 @@ replicated — run a full refresh if the destination must match the source exact
 Because per-table options are supported, configure the Unity Catalog connection with this exact `externalOptionsAllowList`:
 
 ```text
-qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,datetime.spark.type
+qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records
 ```
 
 Create the connection from the Lakeflow Community Connector flow on the **Add Data** page, with the Databricks CLI, or with the Databricks SDK for Python. The Unity Catalog connection type must be `COMMUNITY`, and `sourceName` must be `informix`.
@@ -151,7 +150,7 @@ databricks connections create --json "$(jq -n \
       encrypt: "true",
       "snapshot.staging.location": "/Volumes/main/informix_cdc/staging",
       "lakebase.password": $lakebase_password,
-      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,datetime.spark.type"
+      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys"
     }
   }')"
 
@@ -189,7 +188,7 @@ databricks connections update informix_sales --json "$(jq -n \
       "ssl.ca.file": "/Volumes/catalog/schema/artifacts/informix-ca.pem",
       "snapshot.staging.location": "/Volumes/main/informix_cdc/staging",
       "lakebase.password": $lakebase_password,
-      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,datetime.spark.type"
+      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys"
     }
   }')" \
   --profile "$DATABRICKS_PROFILE"
@@ -238,7 +237,7 @@ connection = w.connections.create(
             "qualified_source_table,decimal.variable.type,decimal.variable.column.type,"
             "snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,"
             "append.only.ingestion,"
-            "max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,datetime.spark.type"
+            "max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys"
         ),
     },
 )
@@ -279,7 +278,7 @@ connection = w.connections.update(
             "qualified_source_table,decimal.variable.type,decimal.variable.column.type,"
             "snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,"
             "append.only.ingestion,"
-            "max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,datetime.spark.type"
+            "max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys"
         ),
     },
 )
@@ -378,7 +377,7 @@ A table supports CDC only when it has a primary key and every column has a suppo
 | Rejected before ingestion | `BYTE`, `TEXT`, `BLOB`, `CLOB`, `INTERVAL`, `NCHAR`, complex and opaque types |
 | Excluded from speculative decoding | Unknown catalog types, UDT and complex types such as `ROW`, `SET`, `LIST`, and `MULTISET` |
 
-`INT8` and `SERIAL8` use Informix's complete ten-byte signed-magnitude CDC representation. `LVARCHAR` supports its variable-width ordinary SQLI snapshot envelope and native CDC representation. A `DATETIME` qualifier is CDC-capable when its start and end fields are supported by the native decoder. Values containing `YEAR` through at least `DAY` are exposed as `TIMESTAMP_NTZ` (timezone-free) Spark timestamps by default, so the source wall-clock value is preserved without any session-timezone shift; set the per-table `datetime.spark.type=timestamp` to use the timezone-aware type instead. `HOUR`-based values are SQL TIME strings such as `13:03:36.93100`; other partial values remain qualifier-aware strings and never acquire the worker's current date.
+`INT8` and `SERIAL8` use Informix's complete ten-byte signed-magnitude CDC representation. `LVARCHAR` supports its variable-width ordinary SQLI snapshot envelope and native CDC representation. A `DATETIME` qualifier is CDC-capable when its start and end fields are supported by the native decoder. Values containing `YEAR` through at least `DAY` are exposed as timezone-free Spark timestamps. `HOUR`-based values are SQL TIME strings such as `13:03:36.93100`; other partial values remain qualifier-aware strings and never acquire the worker's current date.
 
 ### Variable-scale decimals
 
@@ -577,7 +576,7 @@ node is removed, the affected pipeline fails closed and requires a full refresh.
 }
 ```
 
-Supported source-specific table options are `qualified_source_table`, `decimal.variable.type`, `decimal.variable.column.type`, `snapshot.mode`, `snapshot.page.size`, `snapshot.filter`, `snapshot.max.rows`, `snapshot.max.bytes`, `max.records.per.batch`, `cdc.timeout`, `cdc.max.records`, `primary.keys`, and `datetime.spark.type`. `qualified_source_table` maps the pipeline's logical table name to an Informix `owner.table` name. Standard destination, SCD, key, sequence, and clustering options remain available.
+Supported source-specific table options are `qualified_source_table`, `decimal.variable.type`, `decimal.variable.column.type`, `snapshot.mode`, `snapshot.page.size`, `snapshot.filter`, `snapshot.max.rows`, `snapshot.max.bytes`, `max.records.per.batch`, `cdc.timeout`, and `cdc.max.records`. `qualified_source_table` maps the pipeline's logical table name to an Informix `owner.table` name. Standard destination, SCD, key, sequence, and clustering options remain available.
 
 ### Snapshot modes
 
