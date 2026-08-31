@@ -96,16 +96,18 @@ _OFFSET_VERSION = 10
 # underscore and later characters add digits and "$", where the "letter" class
 # is defined by the database locale -- under the default en_US.819 (Latin-1) that
 # includes accented letters such as e-acute or n-tilde. Match Unicode letters so a
-# legitimately accented owner/table/column name is not rejected. ``+`` is also
-# permitted in later positions; the class still excludes the injection-unsafe
-# characters (quotes, spaces, ``.``, ``;`` ...) so a validated identifier cannot
-# break out of its SQL context.
-_IDENTIFIER = re.compile(r"^[^\W\d][\w$+]*$", re.UNICODE)
+# legitimately accented owner/table/column name is not rejected. ``+`` and ``.``
+# are also permitted in later positions -- both occur in real Informix owner names
+# (e.g. a "firstname.lastname" login owner) -- while the class still excludes the
+# injection-unsafe characters (quotes, spaces, ``;`` ...) so a validated identifier
+# cannot break out of its SQL context. Characters beyond the bare-safe set are sent
+# as delimited identifiers (see _sql_identifier / _join_identity).
+_IDENTIFIER = re.compile(r"^[^\W\d][\w$+.]*$", re.UNICODE)
 # Identifiers safe to interpolate *bare* (undelimited): a locale letter or
 # underscore followed by letters/digits/underscore/"$". Anything the validator
-# admits beyond this (e.g. "+") is not a valid undelimited identifier and must be
-# sent delimited -- wrapped in double quotes, which the server honors because the
-# connection sets DELIMIDENT.
+# admits beyond this (e.g. "+" or ".") is not a valid undelimited identifier and
+# must be sent delimited -- wrapped in double quotes, which the server honors
+# because the connection sets DELIMIDENT.
 _BARE_IDENTIFIER = re.compile(r"^[^\W\d][\w$]*$", re.UNICODE)
 
 
@@ -115,12 +117,59 @@ def _sql_identifier(identifier: str) -> str:
     Bare when it is a valid undelimited identifier; otherwise delimited with
     double quotes, doubling any embedded quote. The identifier must already have
     passed ``_IDENTIFIER`` validation, so the delimited branch only ever escapes
-    admitted characters such as "+".
+    admitted characters such as "+" and ".".
     """
 
     if _BARE_IDENTIFIER.fullmatch(identifier):
         return identifier
     return '"' + identifier.replace('"', '""') + '"'
+
+
+def _join_identity(*components: str) -> str:
+    """Join identity components with ``.``, delimiting any component that is not a
+    valid undelimited identifier so the result round-trips through
+    ``_split_identity`` even when a component itself contains ``.``.
+    """
+
+    return ".".join(_sql_identifier(component) for component in components)
+
+
+def _split_identity(identity: str) -> list[str]:
+    """Split a ``.``-joined identity into its components -- the inverse of
+    ``_join_identity``.
+
+    A double-quoted component is taken whole (so it may contain ``.``) with its
+    doubled quotes unescaped; bare components split on ``.`` as before.
+    """
+
+    parts: list[str] = []
+    index, length = 0, len(identity)
+    while True:
+        if index < length and identity[index] == '"':
+            cursor, buffer = index + 1, []
+            while cursor < length:
+                if identity[cursor] == '"':
+                    if cursor + 1 < length and identity[cursor + 1] == '"':
+                        buffer.append('"')
+                        cursor += 2
+                        continue
+                    break
+                buffer.append(identity[cursor])
+                cursor += 1
+            else:
+                raise InformixError(f"Unterminated quoted identifier in {identity!r}")
+            parts.append("".join(buffer))
+            index = cursor + 1
+        else:
+            dot = identity.find(".", index)
+            end = length if dot == -1 else dot
+            parts.append(identity[index:end])
+            index = end
+        if index >= length:
+            return parts
+        if identity[index] != ".":
+            raise InformixError(f"Malformed identity {identity!r}")
+        index += 1
 
 
 _DATA_OPS = {"INSERT", "BEFORE_UPDATE", "AFTER_UPDATE", "DELETE", "TRUNCATE"}
@@ -1633,7 +1682,7 @@ class PurePythonInformixBridge:
     @_serialized_sqli_operation
     def get_table(self, identity: str) -> dict[str, Any]:
         self._ensure_connected()
-        parts = identity.split(".")
+        parts = _split_identity(identity)
         if len(parts) != 3:
             raise InformixError(f"Invalid logical table identity {identity!r}")
         return self._describe_table(parts[1], parts[2])
@@ -1644,7 +1693,7 @@ class PurePythonInformixBridge:
         native = str(capture["identity"])
         try:
             database, qualified = native.split(":", 1)
-            owner, name = qualified.split(".", 1)
+            owner, name = _split_identity(qualified)
         except ValueError as error:
             raise InformixError(f"Invalid native table identity {native!r}") from error
         refreshed = _capture_descriptor(
@@ -1908,7 +1957,7 @@ class PurePythonInformixBridge:
         snapshot_filter=None,
     ):
         self._ensure_connected()
-        database, owner, name = identity.split(".")
+        database, owner, name = _split_identity(identity)
         for identifier in (database, owner, name, *columns, *primary_keys):
             if not _IDENTIFIER.fullmatch(identifier):
                 raise InformixError(f"Unsafe snapshot identifier {identifier!r}")
@@ -2093,7 +2142,7 @@ class PurePythonInformixBridge:
         """
 
         self._ensure_connected()
-        database, owner, name = identity.split(".")
+        database, owner, name = _split_identity(identity)
         for identifier in (database, owner, name, *primary_keys):
             if not _IDENTIFIER.fullmatch(identifier):
                 raise InformixError(f"Unsafe max-key identifier {identifier!r}")
@@ -2152,7 +2201,7 @@ class PurePythonInformixBridge:
             page_index = 0
 
             if not primary_keys:
-                database, owner, name = identity.split(".")
+                database, owner, name = _split_identity(identity)
                 for identifier in (database, owner, name, *columns):
                     if not _IDENTIFIER.fullmatch(identifier):
                         raise InformixError(f"Unsafe snapshot identifier {identifier!r}")
@@ -2866,15 +2915,15 @@ class Table:
 
     @property
     def exposed_name(self) -> str:
-        return f"{self.owner}.{self.name}"
+        return _join_identity(self.owner, self.name)
 
     @property
     def identity(self) -> str:
-        return f"{self.database}.{self.owner}.{self.name}"
+        return _join_identity(self.database, self.owner, self.name)
 
     @property
     def native_identity(self) -> str:
-        return f"{self.database}:{self.owner}.{self.name}"
+        return f"{self.database}:{_sql_identifier(self.owner)}.{_sql_identifier(self.name)}"
 
     @classmethod
     def parse(cls, raw: dict[str, Any], default_database: str) -> "Table":
@@ -6521,7 +6570,7 @@ class InformixLakeflowConnect(LakeflowConnect):
     def _native_table_state_identity(self, exposed: str) -> tuple[str, str, str] | None:
         """Derive native and Lakebase table identities without opening Informix."""
 
-        parts = exposed.split(".")
+        parts = _split_identity(exposed)
         if len(parts) == 2:
             database = self.options.get("database", "")
             owner, name = parts
@@ -6533,7 +6582,7 @@ class InformixLakeflowConnect(LakeflowConnect):
             return None
         if not database or not all(_IDENTIFIER.fullmatch(part) for part in (database, owner, name)):
             return None
-        native_identity = f"{database}:{owner}.{name}"
+        native_identity = f"{database}:{_sql_identifier(owner)}.{_sql_identifier(name)}"
         connection_key = self._lakebase_state_namespace()
         table_key = hashlib.sha256(native_identity.encode()).hexdigest()[:24]
         return native_identity, connection_key, table_key
@@ -7172,11 +7221,11 @@ class InformixLakeflowConnect(LakeflowConnect):
         exposed = options.get("qualified_source_table", name)
         if self._tables is not None and exposed in self._tables and not refresh:
             return self._tables[exposed]
-        parts = exposed.split(".")
+        parts = _split_identity(exposed)
         if len(parts) == 2 and all(_IDENTIFIER.fullmatch(part) for part in parts):
             database = self.options.get("database", "")
             table = Table.parse(
-                self._bridge.get_table(f"{database}.{parts[0]}.{parts[1]}"),
+                self._bridge.get_table(_join_identity(database, parts[0], parts[1])),
                 database,
             )
             if not _eligible(table) or not self._selected(table):
