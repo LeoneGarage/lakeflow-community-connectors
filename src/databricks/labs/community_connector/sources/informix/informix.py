@@ -5408,6 +5408,27 @@ class InformixLakeflowConnect(LakeflowConnect):
                 f"Releasing the Informix worker connection also failed: {cleanup_error}",
             )
 
+    def _reset_lakebase_connection(self) -> None:
+        """Drop the cached Lakebase state connection so the next use reopens fresh.
+
+        A psycopg connection left open across a long, idle wait -- worse, left
+        idle inside the implicit read transaction that a bare SELECT starts --
+        is reaped by Lakebase's ``idle_in_transaction_session_timeout``, and
+        ``.closed`` stays False until the next query fails, so
+        ``_lakebase_connection`` cannot tell it is dead and hands it back. The
+        snapshot-drain consumer blocks for the whole drain without touching
+        state, so it closes the connection here and lets the post-wait manifest
+        read reopen a guaranteed-live one.
+        """
+
+        connection = getattr(self, "_lakebase_conn", None)
+        self._lakebase_conn = None
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:  # pragma: no cover - best-effort teardown
+                pass
+
     def _read_cdc_only(self, table: Table, options: dict[str, str]) -> tuple[Iterator[dict], dict]:
         """Establish a schema-safe CDC boundary without reading existing rows."""
 
@@ -6693,8 +6714,9 @@ class InformixLakeflowConnect(LakeflowConnect):
         schema_id: str,
         allow_keyless: bool,
     ) -> dict[str, Any]:
-        """Enqueue this table's drain on the bounded pool and wait -- holding no slot --
-        for the daemon to stage it and publish the manifest, then return that manifest."""
+        """Enqueue this table's drain on the bounded pool and wait -- holding no slot
+        or state connection -- for the daemon to stage it and publish the manifest,
+        then return that manifest."""
 
         namespace = self._lakebase_state_namespace()
         pool = _snapshot_drain_pool(
@@ -6713,6 +6735,11 @@ class InformixLakeflowConnect(LakeflowConnect):
         wait_seconds = float(
             self.options.get("snapshot.drain.wait.seconds", str(_SNAPSHOT_DRAIN_WAIT_SECONDS))
         )
+        # Hold no Lakebase connection across the drain wait: the caller's manifest
+        # probe left this connection idle inside a read transaction, which Lakebase
+        # reaps as an idle-in-transaction timeout over a multi-minute drain. The
+        # daemon stages on its own connection; the post-wait read reopens fresh.
+        self._reset_lakebase_connection()
         if not pool.wait(job_key, wait_seconds):
             raise InformixError(
                 f"Timed out after {wait_seconds:g}s waiting for the shared snapshot drain "

@@ -9235,6 +9235,52 @@ class SnapshotDaemonSeamTests(unittest.TestCase):
         rows, _ = consumer.read_table("app.orders", {}, {})
         self.assertTrue(list(rows))
 
+    def test_shared_read_drops_state_connection_before_waiting(self):
+        # Regression: the drain consumer must not hold its Lakebase connection across the
+        # wait. The manifest probe just before the wait leaves psycopg idle inside a read
+        # transaction, which Lakebase reaps as an idle-in-transaction timeout over a
+        # multi-minute drain; the post-wait manifest read then died with
+        # IdleInTransactionSessionTimeout. The consumer now drops the cached connection
+        # first, so the post-wait read reopens a fresh one.
+        scope_hex = hashlib.sha256(os.urandom(16)).hexdigest()[:32]
+
+        def fake_factory():
+            reader = InformixLakeflowConnect(self._options(**{"snapshot.shared.session": "false"}))
+            reader.set_registration_scope(scope_hex)
+            reader._bridge_instance = FakeBridge()
+            return reader
+
+        consumer = InformixLakeflowConnect(
+            self._options(**{"snapshot.shared.session": "true", "snapshot.reader.threads": "1"})
+        )
+        consumer.set_registration_scope(scope_hex)
+        consumer._bridge_instance = FakeBridge()
+        consumer._snapshot_drain_reader_factory = lambda: fake_factory
+
+        seen = []
+        original_reset = consumer._reset_lakebase_connection
+
+        def spy_reset():
+            # Capture the connection cached at reset time (the manifest probe opened one)
+            # and confirm the reset actually closes and clears it.
+            seen.append(getattr(consumer, "_lakebase_conn", None))
+            return original_reset()
+
+        consumer._reset_lakebase_connection = spy_reset
+
+        rows, _ = consumer.read_table("app.orders", {}, {})
+
+        self.assertTrue(list(rows), "the consumer served the daemon-staged snapshot")
+        self.assertTrue(seen, "the consumer reset its Lakebase connection before the drain wait")
+        pre_wait_conn = seen[0]
+        self.assertIsNotNone(pre_wait_conn, "the manifest probe opened a state connection")
+        self.assertTrue(pre_wait_conn.closed, "the pre-wait state connection was closed")
+        self.assertIsNot(
+            consumer._lakebase_conn,
+            pre_wait_conn,
+            "the post-wait manifest read reopened a fresh connection",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
