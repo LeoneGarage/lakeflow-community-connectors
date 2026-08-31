@@ -1414,6 +1414,11 @@ class InformixSqliClient:
             "CLNT_PAM_CAPABLE": "1",
             "DBPATH": ".",
             "DB_LOCALE": self.db_locale,
+            # Honor double-quoted delimited identifiers so table/owner names with
+            # characters that are not valid undelimited (e.g. "+") can be escaped.
+            # Safe here because the connector's SQL uses single-quoted string
+            # literals exclusively, so no literal is reinterpreted as an identifier.
+            "DELIMIDENT": "1",
             "IFX_UPDDESC": "1",
             "NODEFDAC": "no",
         }

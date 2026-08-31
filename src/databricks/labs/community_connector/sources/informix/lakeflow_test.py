@@ -2138,11 +2138,16 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(table.columns[0].name, "größe")
 
     def test_table_metadata_still_rejects_sql_unsafe_identifiers(self):
-        # Widening to Unicode letters must not admit SQL-unsafe characters: the
-        # 'HCF+gbc'-style garbage from a corrupted catalog read stays rejected.
-        for bad in ("HCF+gbc", "a b", 'a"b', "a.b", "a;b", "a-b"):
+        # Widening the identifier class must not admit injection-unsafe characters.
+        for bad in ("a b", 'a"b', "a.b", "a;b", "a-b"):
             with self.subTest(bad=bad), self.assertRaisesRegex(InformixError, "Unsafe"):
                 Table.parse({**_table(), "name": bad}, "demo")
+
+    def test_table_metadata_accepts_plus_in_identifiers(self):
+        # '+' is permitted in identifiers (e.g. an owner/table name like HCF+gbc).
+        table = Table.parse({**_table(), "owner": "HCF+gbc", "name": "a+b"}, "demo")
+        self.assertEqual(table.owner, "HCF+gbc")
+        self.assertEqual(table.name, "a+b")
 
     def test_table_metadata_rejects_casefold_and_reserved_column_collisions(self):
         raw = _table()
@@ -2262,6 +2267,35 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(
             bridge.transport.sql,
             "SELECT SKIP 10000 FIRST 2 event_time FROM demo:app.events " "ORDER BY event_time",
+        )
+
+    def test_sql_identifier_delimits_only_when_needed(self):
+        # Valid undelimited names (incl. accented under en_US.819) stay bare;
+        # names with admitted-but-not-undelimited characters (e.g. "+") are
+        # wrapped in double quotes, doubling any embedded quote.
+        self.assertEqual(informix_module._sql_identifier("orders"), "orders")
+        self.assertEqual(informix_module._sql_identifier("café"), "café")
+        self.assertEqual(informix_module._sql_identifier("HCF+gbc"), '"HCF+gbc"')
+        self.assertEqual(informix_module._sql_identifier('a"b'), '"a""b"')
+
+    def test_snapshot_bridge_delimits_special_character_identifiers(self):
+        class SnapshotTransport:
+            def __init__(self):
+                self.sql = None
+
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                self.sql = sql
+                return []
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.transport = SnapshotTransport()
+
+        bridge.snapshot_page("demo.HCF+gbc.a+b", ["event_time"], ["event_time"], None, 2)
+
+        self.assertEqual(
+            bridge.transport.sql,
+            'SELECT FIRST 2 event_time FROM demo:"HCF+gbc"."a+b" ORDER BY event_time',
         )
 
     def test_production_bridge_reads_consistent_snapshot_in_one_transaction(self):
