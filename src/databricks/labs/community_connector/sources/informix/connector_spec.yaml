@@ -202,6 +202,53 @@ connection:
         delete readers claim slots another reserves for upserts. A mismatch fails
         at startup rather than silently voiding the reservation.
 
+    - name: snapshot.shared.session
+      type: string
+      required: false
+      description: >
+        Selects how an `initial`-mode snapshot avoids starving streaming readers
+        while it holds a connection slot for the whole table drain. Default true
+        (Model C): the drain moves off the microbatch thread onto a bounded pool of
+        `snapshot.reader.threads` daemon workers; the consumer waits, holding no
+        slot, for the daemon to stage the table and publish its manifest, then serves
+        the staged pages. At most `snapshot.reader.threads` drains hold a slot at
+        once, so keep that count below max.concurrent.connections to leave a floor for
+        streaming readers. Set false (Model A): the drain runs inline on the
+        microbatch thread but acquires its slot above `snapshot.connection.reservation`,
+        so those low slots stay reachable by the streaming/CDC readers.
+
+    - name: snapshot.reader.threads
+      type: string
+      required: false
+      description: >
+        Model C only (`snapshot.shared.session=true`): the number of daemon workers
+        that drain `initial` snapshots concurrently, which is also the ceiling on
+        connection slots snapshots can hold at once. Minimum 1; default 1. Keep it
+        below max.concurrent.connections so streaming/CDC readers always retain
+        slots (a good starting point is max.concurrent.connections minus
+        cdc.shared.reader.threads minus a small margin).
+
+    - name: snapshot.connection.reservation
+      type: string
+      required: false
+      description: >
+        Model A only (`snapshot.shared.session=false`): connection slots that the
+        monolithic full-table drain (`snapshot.mode` `initial` or `initial_only`, which
+        holds one connection for the whole scan) may not claim, guaranteeing them to the
+        streaming/CDC readers so a long drain cannot starve them. Only that drain is held
+        off these slots -- keyed tables' default `incremental`/`auto_snapshot` snapshots
+        and stream/CDC reads release their slot after each microbatch, so they never
+        starve anyone and borrow the reserved slots freely. Range 0 through
+        max.concurrent.connections - 1. Default 0, which in Model A is interpreted as
+        one third of the pool -- floor(max.concurrent.connections / 3), rounded up to at
+        least 1 whenever the pool has 2 or more slots (0 only for a single-slot pool,
+        which cannot spare one) -- so a long inline drain leaves streaming readers about
+        two-thirds of capacity without any tuning. Set a positive value to override that
+        default. A floor rather than a partition -- beyond the reserved
+        slots the drain competes for all remaining capacity -- so it bounds the
+        starvation without slowing the drain. Independent of `snapshot.reader.threads`,
+        which governs Model C.
+
     - name: connection.backlog.hint.enabled
       type: string
       required: false

@@ -206,6 +206,36 @@ The current maximum LSN is discovered before reading data. Eligible tables are d
 
 For Lakeflow, snapshot pagination is deterministic by the complete primary key (`ORDER BY pk`, seek after `last_pk`). The production bridge reads all source pages inside one repeatable-read transaction and captures a transactional snapshot LSN for row ordering, but retains only one page in worker memory. Each shaped page is encoded as typed JSON, gzip-compressed, hash-protected, and atomically published under `snapshot.staging.location`, the connector's only Volume. A manifest becomes visible only after every page is durable. Lakeflow checkpoints a page index and `readBetweenOffsets()` replays the exact immutable page, so planning, cancellation, worker replacement, and retry cannot change its rows. Staging contains source values and therefore requires restricted Volume permissions. It is removed after a committed stream-phase checkpoint is observed; abandoned scopes are eligible for best-effort cleanup after `snapshot.staging.retention.days` (default `4`). Active and checkpoint-referenced scopes are retained. After the staged snapshot commits, both channels advance directly to its snapshot LSN because its rows represent the committed state visible at that boundary. The earlier prepared LSN establishes full-row logging and a valid capture window while the transaction starts; it is not replayed after the completed snapshot. The bridge probes `sysmaster:sysdatabases.is_ansi`; non-ANSI databases receive explicit `BEGIN WORK`, while ANSI databases commit the probe's implicit transaction and let the first snapshot statement begin the repeatable-read transaction implicitly. Both branches and their rollback paths have source-local protocol/ordering coverage. `ansi_live_test.py` provides an opt-in regression through the standard connector test configuration and refuses to run unless the target reports `is_ansi=1`; executing it still requires an ANSI-enabled live database. Capture-capable tables without a primary key default to append-only CDC under the `auto` mode (`append.only.ingestion=auto`, the default); set `append.only.ingestion=false` to opt into bounded snapshot-only ingestion instead, or `true` to force append for a keyed table as well. Alternatively, the per-table `primary.keys` option (a comma-separated list or JSON array of column names) overrides the table's key: the connector then treats even a physically keyless table as keyed on those columns — reading it as `cdc_with_deletes` with keyset-paginated snapshots and delete identification, and reporting those keys so the pipeline adopts them as the destination merge key. The declared columns must exist and the operator must guarantee they are unique per row; a non-unique override corrupts upserts, delete identification, and snapshot pagination.
 
+An `initial`-mode snapshot drains the whole table through one repeatable-read
+transaction, holding a connection slot for the entire scan; with many tables this
+can consume every slot and starve the streaming/CDC readers waiting for one.
+`snapshot.shared.session` selects the mitigation. Default `true` (Model C): the
+drain runs on a bounded pool of `snapshot.reader.threads` (default `1`)
+driver-resident daemon workers. `false` (Model A): the drain runs inline but
+acquires its slot above `snapshot.connection.reservation`, so that many low slots
+are always reachable by non-snapshot readers and can never all be held by drains at
+once — the same slot-floor mechanism the delete-channel reservation uses. Only the
+monolithic full-table drain (`snapshot.mode` `initial` or `initial_only`, which
+holds one connection for the whole scan) takes the floor; every other read releases
+its slot after each microbatch — a keyed table's default `incremental` /
+`auto_snapshot` snapshot reads one bounded chunk per microbatch, and stream/CDC reads
+are one bounded poll each — so they never hold long enough to starve anyone and may
+freely borrow the reserved slots. A `0` (unset) reservation is interpreted in Model A
+as `floor(max.concurrent.connections / 3)`, rounded up to at least 1 whenever the
+pool has 2 or more slots (0 only for a single-slot pool, which cannot spare one), so
+a long drain leaves streaming readers about two-thirds of the pool without any
+tuning; a positive value overrides it. Under Model C, the consumer
+establishes the durable boundary
+(`_initial_lsn`), releases its connection slot, and waits — holding no slot — for a
+worker to stage the table and publish its manifest, then serves the staged pages
+through the ordinary resumed-snapshot path. Each worker builds a private reader
+that drains inline (shared mode cleared on its options), stages and publishes the
+manifest durably, then closes to release its slot, so at most `snapshot.reader.threads`
+slots are held by snapshots at once and the drain is crash-recoverable exactly as
+the inline path is (a restart with no manifest re-drains). Keep `snapshot.reader.threads`
+below `max.concurrent.connections` so a floor of slots always remains for streaming
+readers.
+
 The per-table `snapshot.mode` option supports `incremental` (default), `initial`,
 `initial_only`, `cdc_only`, `auto_snapshot`, and `recovery`. `initial`
 snapshots only without a checkpoint. `initial_only` completes snapshot pages but

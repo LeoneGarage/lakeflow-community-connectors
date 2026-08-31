@@ -4919,6 +4919,36 @@ def register_lakeflow_source(spark):
     # Idle back-off between reads once a shard has drained its log, so a caught-up daemon
     # does not busy-spin (and releases its connection slot for consumer bootstrap).
     _SHARED_CDC_IDLE_POLL_SECONDS = 1.0
+    # Snapshot-drain fairness. An ``initial``-mode snapshot drains the whole table through
+    # one REPEATABLE READ transaction, holding one connection slot for the entire scan; with
+    # many tables this can consume every slot and starve the streaming/CDC readers waiting
+    # for one. Two strategies, selected by ``snapshot.shared.session``:
+    #
+    #   true (default) -- Model C, a bounded daemon pool. The drain moves off the microbatch
+    #   thread onto ``snapshot.reader.threads`` (K) driver-resident daemon workers; the
+    #   consumer waits (holding no slot) for the daemon to stage the table and publish its
+    #   manifest, then serves the staged pages exactly as a resumed snapshot does. At most K
+    #   drains run at once, so at most K slots are held by snapshots -- keep
+    #   K < max.concurrent.connections and a floor always remains for streaming readers.
+    #
+    #   false -- Model A, a reservation floor. A snapshot-phase read acquires its slot above
+    #   ``snapshot.connection.reservation``, so that many low slots are guaranteed reachable
+    #   by non-snapshot readers and can never all be held by drains at once. Off by default
+    #   (reservation 0), so this mode bounds the starvation only once the reservation is set;
+    #   cheap, and it leaves the drain on the microbatch thread.
+    _SNAPSHOT_SHARED_SESSION_OPTION = "snapshot.shared.session"
+    _SNAPSHOT_READER_THREADS_OPTION = "snapshot.reader.threads"
+    _DEFAULT_SNAPSHOT_READER_THREADS = 1
+    _SNAPSHOT_RESERVATION_OPTION = "snapshot.connection.reservation"
+    # Private per-read marker: set on a reader's options while it performs a snapshot-phase
+    # read, so the lazy slot acquisition can apply the reservation floor. Mirrors how the
+    # channel and attempt-budget options are threaded to the bridge.
+    _SNAPSHOT_DRAIN_MARKER_OPTION = "_informix.snapshot.drain"
+    # Idle back-off for a snapshot-drain worker with no queued jobs, so it does not busy-spin.
+    _SNAPSHOT_DRAIN_IDLE_SECONDS = 1.0
+    # Safety cap on how long a consumer waits for the daemon to publish a snapshot manifest
+    # before failing loudly, so a silently-wedged worker cannot block a flow forever.
+    _SNAPSHOT_DRAIN_WAIT_SECONDS = 3600.0
     # What an append-only table does about rows that predate the flow.
     #
     # ``stream`` (default): begin at the server's current log position and capture only
@@ -4962,6 +4992,14 @@ def register_lakeflow_source(spark):
     # reader held back until its checkpoint predates log retention forces a
     # re-snapshot, so this defaults to 0 (no reservation) and is opt-in.
     _DEFAULT_UPSERT_CONNECTION_RESERVATION = 0
+    # Slots a snapshot-phase (Model A) read may not claim, guaranteeing them to the
+    # streaming/CDC readers so a long initial drain cannot starve them. Same floor mechanism
+    # as the upsert reservation. The configured default is 0, but in Model A a 0 (unset) is
+    # interpreted as floor(max.concurrent.connections / 3), rounded up to at least 1 whenever
+    # the pool has 2+ slots (0 only for a single-slot pool, which cannot spare one) -- so a
+    # long inline drain leaves streaming readers about two-thirds of the pool without any
+    # tuning; set a positive value to override, and Model C (the default) ignores it entirely.
+    _DEFAULT_SNAPSHOT_CONNECTION_RESERVATION = 0
     # The framework strips ``isDeleteFlow`` before it reaches the connector, so the
     # reader publishes the channel to its own bridge through this private option --
     # the same mechanism ``_informix.bypass.connection.capacity`` already uses.
@@ -6000,6 +6038,32 @@ def register_lakeflow_source(spark):
                 )
             return reservation
 
+        def _snapshot_connection_reservation(self, slot_count: int) -> int:
+            reservation = int(
+                self.options.get(
+                    _SNAPSHOT_RESERVATION_OPTION,
+                    str(_DEFAULT_SNAPSHOT_CONNECTION_RESERVATION),
+                )
+            )
+            if not 0 <= reservation < slot_count:
+                # At slot_count a snapshot drain could never claim a slot at all, which
+                # deadlocks the drain rather than merely deferring it behind streams.
+                raise ValueError(
+                    f"Option '{_SNAPSHOT_RESERVATION_OPTION}' must be >= 0 and < "
+                    f"max.concurrent.connections ({slot_count})"
+                )
+            # Model A with an unset/zero reservation reserves a third of the pool by default,
+            # so a long inline drain always leaves the streaming/CDC readers roughly
+            # two-thirds of capacity rather than potentially every slot. Reserve at least one
+            # slot whenever the pool can spare one (>= 2 slots), rounding floor(slot_count/3)
+            # up to 1; clamp to slot_count - 1 so a single-slot pool reserves 0 -- reserving
+            # its only slot would floor the drain out of every slot and deadlock it.
+            if reservation == 0 and not _option_bool(
+                self.options, _SNAPSHOT_SHARED_SESSION_OPTION, True
+            ):
+                return min(max(1, slot_count // 3), slot_count - 1)
+            return reservation
+
         def _connection_sweep_rank_scale(self) -> float:
             """Shrink the gap between acquisition sweeps for a further-behind reader.
 
@@ -6044,6 +6108,12 @@ def register_lakeflow_source(spark):
             )
             reservation = self._upsert_connection_reservation(slot_count)
             floor = reservation if self._connection_channel_is_delete() else 0
+            # Model A: a snapshot-phase read holds its slot for the whole drain, so push it
+            # above the snapshot reservation, leaving those low slots reachable by the
+            # streaming/CDC readers. Only when the daemon pool (Model C) is off -- in shared
+            # mode the daemon bounds concurrency instead and this marker is never set.
+            if self.options.get(_SNAPSHOT_DRAIN_MARKER_OPTION) == "true":
+                floor = max(floor, self._snapshot_connection_reservation(slot_count))
             connection_wait_timeout = float(
                 self.options.get(
                     "connection.wait.timeout.seconds",
@@ -8117,6 +8187,157 @@ def register_lakeflow_source(spark):
             _close_shared_cdc_reader(reader)
 
 
+    class _SnapshotDrainPool:
+        """Bounded pool that drains ``initial``-mode snapshots off the microbatch thread.
+
+        A fixed number of driver-resident daemon workers (``snapshot.reader.threads``) pull
+        drain jobs off a shared queue; each builds a private reader, runs the ordinary inline
+        snapshot drain (which stages the pages and publishes the manifest durably), then
+        closes the reader to release its connection slot. Because at most K workers drain at
+        once, at most K slots are ever held by snapshots -- the fairness guarantee that keeps
+        streaming readers from being starved. A consumer subscribes a job and waits, holding
+        no slot, for its result. All state is guarded by ``condition``.
+        """
+
+        def __init__(self) -> None:
+            self.condition = threading.Condition()
+            self.queue: deque = deque()
+            # Job keys queued or running: dedups concurrent subscribers so one table drains
+            # exactly once even when several flows (or retries) ask for it at the same time.
+            self.pending: set = set()
+            self.jobs: dict[tuple, dict[str, Any]] = {}
+            # job key -> None on success, or the Exception to re-raise to the waiter.
+            self.results: dict[tuple, Any] = {}
+            self.reader_factory: Callable[[], Any] | None = None
+            self.thread_count = _DEFAULT_SNAPSHOT_READER_THREADS
+
+        def configure(self, *, reader_factory, thread_count):
+            with self.condition:
+                if self.reader_factory is None:
+                    self.reader_factory = reader_factory
+                self.thread_count = thread_count
+
+        def submit(self, job_key, *, table, options, pipeline_scope, allow_keyless):
+            with self.condition:
+                # Drop a prior terminal result so a re-subscribe after a failed drain (or a
+                # process restart that left no manifest) enqueues a fresh attempt.
+                self.results.pop(job_key, None)
+                if job_key not in self.pending:
+                    self.jobs[job_key] = {
+                        "table": table,
+                        "options": options,
+                        "pipeline_scope": pipeline_scope,
+                        "allow_keyless": allow_keyless,
+                    }
+                    self.queue.append(job_key)
+                    self.pending.add(job_key)
+                    self.condition.notify_all()
+
+        def wait(self, job_key, timeout):
+            deadline = time.monotonic() + timeout
+            with self.condition:
+                while job_key in self.pending:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self.condition.wait(timeout=min(remaining, _SNAPSHOT_DRAIN_IDLE_SECONDS))
+                result = self.results.get(job_key)
+            if isinstance(result, BaseException):
+                raise result
+            return True
+
+
+    # Serialization-safe registry (a bare module global becomes a function local in the
+    # merged deployment; a mutated dict survives, as with the shared-CDC registry).
+    _SNAPSHOT_DRAIN_POOLS: dict[tuple, _SnapshotDrainPool] = {}
+    _SNAPSHOT_DRAIN_THREADS: dict[tuple, list] = {}
+    _SNAPSHOT_DRAIN_REGISTRY_LOCK: dict[str, threading.Lock] = {}
+
+
+    def _snapshot_drain_registry_lock() -> threading.Lock:
+        lock = _SNAPSHOT_DRAIN_REGISTRY_LOCK.get("lock")
+        if lock is None:
+            lock = _SNAPSHOT_DRAIN_REGISTRY_LOCK.setdefault("lock", threading.Lock())
+        return lock
+
+
+    def _snapshot_drain_pool(key, *, reader_factory, thread_count) -> _SnapshotDrainPool:
+        with _snapshot_drain_registry_lock():
+            pool = _SNAPSHOT_DRAIN_POOLS.get(key)
+            if pool is None:
+                pool = _SNAPSHOT_DRAIN_POOLS.setdefault(key, _SnapshotDrainPool())
+            pool.configure(reader_factory=reader_factory, thread_count=thread_count)
+            threads = _SNAPSHOT_DRAIN_THREADS.setdefault(key, [])
+            threads[:] = [thread for thread in threads if thread.is_alive()]
+            index = len(threads)
+            while len(threads) < thread_count:
+                thread = threading.Thread(
+                    target=_run_snapshot_drain_worker,
+                    args=(pool,),
+                    daemon=True,
+                    name=f"informix-snapshot-drain-{key[-1]}-{index}",
+                )
+                threads.append(thread)
+                index += 1
+                thread.start()
+            return pool
+
+
+    def _close_snapshot_drain_reader(reader) -> None:
+        if reader is None:
+            return
+        try:
+            reader.close()
+        except Exception:  # noqa: BLE001 - best-effort slot release
+            logging.getLogger(__name__).debug("snapshot drain reader close failed", exc_info=True)
+
+
+    def _run_snapshot_drain_worker(pool: _SnapshotDrainPool) -> None:
+        """Daemon loop: pull one drain job, run the inline snapshot drain under a private
+        reader (staging pages and publishing the manifest durably), then close the reader to
+        release its slot. A failure is recorded on the job so the waiting consumer re-raises
+        and its next microbatch re-subscribes -- the same recover-by-restart the inline drain
+        already relies on."""
+
+        logger = logging.getLogger(__name__)
+        while True:
+            with pool.condition:
+                while not pool.queue:
+                    pool.condition.wait(timeout=_SNAPSHOT_DRAIN_IDLE_SECONDS)
+                job_key = pool.queue.popleft()
+                job = pool.jobs.get(job_key)
+                factory = pool.reader_factory
+            result: Any = None
+            reader = None
+            if job is not None and factory is not None:
+                try:
+                    reader = factory()
+                    # shared mode is off on the copy, so this drains inline and returns the
+                    # staged page-0 result; the daemon ignores the rows -- it only needs the
+                    # durable manifest the drain publishes as a side effect.
+                    reader._read_snapshot(
+                        job["table"],
+                        None,
+                        job["options"],
+                        pipeline_scope_override=job["pipeline_scope"],
+                        allow_keyless=job["allow_keyless"],
+                    )
+                except Exception as error:  # noqa: BLE001 - surfaced to the waiting consumer
+                    logger.warning(
+                        "Informix snapshot drain job failed; the consumer will re-raise and "
+                        "retry on its next microbatch",
+                        exc_info=True,
+                    )
+                    result = error
+                finally:
+                    _close_snapshot_drain_reader(reader)
+            with pool.condition:
+                pool.jobs.pop(job_key, None)
+                pool.pending.discard(job_key)
+                pool.results[job_key] = result
+                pool.condition.notify_all()
+
+
     class InformixLakeflowConnect(LakeflowConnect):
         """Pure-Python connector live-validated on disposable Informix 15.
 
@@ -8196,10 +8417,16 @@ def register_lakeflow_source(spark):
             # validated here rather than in the static-default loop above.
             if _SHARED_CDC_THREADS_OPTION in options and int(options[_SHARED_CDC_THREADS_OPTION]) < 1:
                 raise ValueError(f"Option '{_SHARED_CDC_THREADS_OPTION}' must be >= 1")
+            if (
+                _SNAPSHOT_READER_THREADS_OPTION in options
+                and int(options[_SNAPSHOT_READER_THREADS_OPTION]) < 1
+            ):
+                raise ValueError(f"Option '{_SNAPSHOT_READER_THREADS_OPTION}' must be >= 1")
             # Validate boolean capacity options eagerly (they are otherwise only
             # checked on first read, deep inside a running flow).
             _option_bool(options, "snapshot.incremental.blocking", True)
             _option_bool(options, _SHARED_CDC_SESSION_OPTION, True)
+            _option_bool(options, _SNAPSHOT_SHARED_SESSION_OPTION, True)
             if _APPEND_INGESTION_OPTION in options:
                 _append_only_value(options[_APPEND_INGESTION_OPTION])
             if int(options.get("cdc.max.records", str(_DEFAULT_CDC_MAX_RECORDS))) > 256:
@@ -8233,6 +8460,19 @@ def register_lakeflow_source(spark):
             if not 0 <= reservation < slot_count:
                 raise ValueError(
                     "Option 'upsert.connection.reservation' must be >= 0 and < "
+                    f"max.concurrent.connections ({slot_count})"
+                )
+            snapshot_reservation = int(
+                options.get(
+                    _SNAPSHOT_RESERVATION_OPTION,
+                    str(_DEFAULT_SNAPSHOT_CONNECTION_RESERVATION),
+                )
+            )
+            # Reject rather than clamp: at slot_count a snapshot drain could never claim a
+            # slot, deadlocking the drain instead of merely deferring it behind streams.
+            if not 0 <= snapshot_reservation < slot_count:
+                raise ValueError(
+                    f"Option '{_SNAPSHOT_RESERVATION_OPTION}' must be >= 0 and < "
                     f"max.concurrent.connections ({slot_count})"
                 )
             port = int(options.get("port", "9088"))
@@ -8551,12 +8791,27 @@ def register_lakeflow_source(spark):
             )
             replaying = self._replay_stop_lsn(table_options) is not None
             replay_wait_budget = self._replay_connection_wait_budget(table_options)
+            # Model A only, and only for the monolithic full-table drain -- the `initial` /
+            # `initial_only` read that holds one connection for the whole scan. That is the
+            # sole reader that can starve streaming readers, so only it takes the reservation
+            # floor. Everything else releases its slot after each microbatch: a keyed table's
+            # default `incremental` / `auto_snapshot` snapshot reads a bounded chunk per
+            # microbatch and frees the slot between them, and stream/CDC reads are one bounded
+            # poll each -- none of them hold long enough to starve anyone, so they may freely
+            # borrow the reserved slots (floor 0). In shared mode (Model C) the daemon bounds
+            # drain concurrency instead, so no read takes this floor.
+            reserve_snapshot_slot = (
+                not self._snapshot_shared_enabled()
+                and snapshot_mode in ("initial", "initial_only")
+                and effective_start.get("phase") != "stream"
+            )
             with contextlib.ExitStack() as stack:
                 stack.enter_context(
                     self._capacity_attempt(
                         start_offset,
                         replaying=replaying,
                         replay_wait_budget=replay_wait_budget,
+                        reserve_snapshot_slot=reserve_snapshot_slot,
                     )
                 )
                 return self._read_table_attempt(
@@ -9215,6 +9470,7 @@ def register_lakeflow_source(spark):
             *,
             replaying: bool = False,
             replay_wait_budget: float | None = None,
+            reserve_snapshot_slot: bool = False,
         ):
             """Publish this read's acquisition budget and rank, then restore both.
 
@@ -9241,10 +9497,15 @@ def register_lakeflow_source(spark):
             )
             previous = self.options.get(_CONNECTION_ATTEMPT_BUDGET_OPTION)
             previous_rank = self.options.get(_CONNECTION_ATTEMPT_RANK_OPTION)
+            previous_drain = self.options.get(_SNAPSHOT_DRAIN_MARKER_OPTION)
             if budget is not None:
                 self.options[_CONNECTION_ATTEMPT_BUDGET_OPTION] = repr(budget)
             if rank > 0:
                 self.options[_CONNECTION_ATTEMPT_RANK_OPTION] = str(rank)
+            # Marks the lazy slot acquisition as a snapshot-phase read so it applies the
+            # Model A reservation floor. Set only when the daemon pool is off (see caller).
+            if reserve_snapshot_slot:
+                self.options[_SNAPSHOT_DRAIN_MARKER_OPTION] = "true"
             try:
                 yield
             finally:
@@ -9256,6 +9517,10 @@ def register_lakeflow_source(spark):
                     self.options.pop(_CONNECTION_ATTEMPT_RANK_OPTION, None)
                 else:
                     self.options[_CONNECTION_ATTEMPT_RANK_OPTION] = previous_rank
+                if previous_drain is None:
+                    self.options.pop(_SNAPSHOT_DRAIN_MARKER_OPTION, None)
+                else:
+                    self.options[_SNAPSHOT_DRAIN_MARKER_OPTION] = previous_drain
 
         def _capacity_retry_offset(self, start_offset: dict) -> dict:
             """Yield an empty continuous batch when no connection slot is free.
@@ -10692,6 +10957,33 @@ def register_lakeflow_source(spark):
                             pipeline_scope,
                         )
                     return self._staged_snapshot_result(table, pipeline_scope, schema_id, manifest, 0)
+                if self._snapshot_shared_enabled():
+                    # Model C: hand the long drain to the bounded daemon pool. Free this
+                    # reader's connection slot first so the wait holds none, then serve the
+                    # pages the daemon stages -- exactly as a resumed snapshot does. At most
+                    # ``snapshot.reader.threads`` drains run at once, so streaming readers
+                    # keep the remaining slots. ``_initial_lsn`` above already established
+                    # the durable boundary; the daemon reads it rather than redoing it.
+                    self._release_worker_connection()
+                    manifest = self._drain_via_snapshot_daemon(
+                        table, options, pipeline_scope, schema_id, allow_keyless
+                    )
+                    page_count = int(manifest["page_count"])
+                    if page_count == 0:
+                        snapshot_lsn = int(manifest["snapshot_lsn"])
+                        return iter(()), _offset(
+                            snapshot_lsn,
+                            snapshot_lsn,
+                            snapshot_lsn,
+                            None,
+                            "stream",
+                            table,
+                            schema_id,
+                            pipeline_scope,
+                        )
+                    return self._staged_snapshot_result(table, pipeline_scope, schema_id, manifest, 0)
+                # Model A: drain inline below. The reservation floor applied at slot
+                # acquisition keeps low slots reachable by streaming readers throughout.
                 max_rows = self._table_int_option(options, "snapshot.max.rows", 0, minimum=0)
                 expected_columns = {column.name for column in table.columns}
                 page_count = 0
@@ -10972,6 +11264,72 @@ def register_lakeflow_source(spark):
 
         def _shared_cdc_enabled(self) -> bool:
             return _option_bool(self.options, _SHARED_CDC_SESSION_OPTION, True)
+
+        def _snapshot_shared_enabled(self) -> bool:
+            return _option_bool(self.options, _SNAPSHOT_SHARED_SESSION_OPTION, True)
+
+        def _snapshot_reader_thread_count(self) -> int:
+            return max(
+                1,
+                int(
+                    self.options.get(
+                        _SNAPSHOT_READER_THREADS_OPTION,
+                        str(_DEFAULT_SNAPSHOT_READER_THREADS),
+                    )
+                ),
+            )
+
+        def _snapshot_drain_reader_factory(self) -> Callable[[], "InformixLakeflowConnect"]:
+            # The daemon worker gets its OWN options copy with shared mode cleared, so its
+            # ``_read_snapshot`` drains inline (Model A path) rather than recursing back into
+            # the pool. Capacity accounting is left intact -- the drain must count against the
+            # same connection budget so ``snapshot.reader.threads`` bounds the slots it holds.
+            reader_options = dict(self.options)
+            reader_options[_SNAPSHOT_SHARED_SESSION_OPTION] = "false"
+            cls = type(self)
+            return lambda: cls(reader_options)
+
+        def _drain_via_snapshot_daemon(
+            self,
+            table: Table,
+            options: dict[str, str],
+            pipeline_scope: str,
+            schema_id: str,
+            allow_keyless: bool,
+        ) -> dict[str, Any]:
+            """Enqueue this table's drain on the bounded pool and wait -- holding no slot --
+            for the daemon to stage it and publish the manifest, then return that manifest."""
+
+            namespace = self._lakebase_state_namespace()
+            pool = _snapshot_drain_pool(
+                (namespace, pipeline_scope),
+                reader_factory=self._snapshot_drain_reader_factory(),
+                thread_count=self._snapshot_reader_thread_count(),
+            )
+            job_key = (namespace, pipeline_scope, table.native_identity, schema_id)
+            pool.submit(
+                job_key,
+                table=table,
+                options=dict(options),
+                pipeline_scope=pipeline_scope,
+                allow_keyless=allow_keyless,
+            )
+            wait_seconds = float(
+                self.options.get("snapshot.drain.wait.seconds", str(_SNAPSHOT_DRAIN_WAIT_SECONDS))
+            )
+            if not pool.wait(job_key, wait_seconds):
+                raise InformixError(
+                    f"Timed out after {wait_seconds:g}s waiting for the shared snapshot drain "
+                    f"of '{table.exposed_name}'; raise snapshot.drain.wait.seconds or "
+                    "snapshot.reader.threads"
+                )
+            manifest = self._read_snapshot_stage_manifest(table, pipeline_scope, schema_id)
+            if manifest is None:
+                raise InformixError(
+                    f"Shared snapshot drain of '{table.exposed_name}' completed without "
+                    "publishing a manifest"
+                )
+            return manifest
 
         def _shared_cdc_thread_count(self) -> int:
             return max(

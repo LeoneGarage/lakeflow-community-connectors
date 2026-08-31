@@ -123,6 +123,7 @@ from databricks.labs.community_connector.sources.informix.informix import (  # n
     UnsupportedChangeError,
     _SharedCdcShard,
     _SharedCdcSnapshot,
+    _SnapshotDrainPool,
     _bridge_config,
     _capture_descriptor,
     _catalog_column,
@@ -509,12 +510,13 @@ class LakeflowContractTests(unittest.TestCase):
                 # strategy. Incremental is the production default; tests that
                 # exercise it override snapshot.mode explicitly.
                 "snapshot.mode": "initial",
-                # Sharded CDC is the production default, but these per-table contract
-                # tests inject a bridge directly, so pin it off: they exercise the direct
-                # read path and must not spawn a background daemon reader (which builds
-                # its own bridge and would attempt a real connection). Shared-mode tests
-                # opt in explicitly.
+                # Sharded CDC and the shared snapshot-drain pool are the production
+                # defaults, but these per-table contract tests inject a bridge directly,
+                # so pin both off: they exercise the direct/inline read path and must not
+                # spawn a background daemon (which builds its own bridge and would attempt
+                # a real connection). Shared-mode tests opt in explicitly.
                 "cdc.shared.session": "false",
+                "snapshot.shared.session": "false",
                 **options,
             }
         )
@@ -7344,9 +7346,10 @@ class IncrementalSnapshotTests(unittest.TestCase):
                 "database": "demo",
                 "snapshot.staging.location": self._shared_state.name,
                 "lakebase.password": "test-state-password",
-                # Pin the per-table path (see LakeflowContractTests.connector): these
+                # Pin the direct/inline path (see LakeflowContractTests.connector): these
                 # tests inject a bridge directly and must not start a daemon reader.
                 "cdc.shared.session": "false",
+                "snapshot.shared.session": "false",
                 **options,
             }
         )
@@ -8714,6 +8717,448 @@ class SharedCdcConsumerSeamTests(unittest.TestCase):
         rows = list(rows)
         # `value` (the override key) changed a->b, so the delete channel emits the old key.
         self.assertEqual(len(rows), 1)
+
+
+class SnapshotFairnessOptionTests(unittest.TestCase):
+    """Options that select and tune the snapshot-drain fairness strategies."""
+
+    def setUp(self):
+        self._shared_state = tempfile.TemporaryDirectory()
+        self._lakebase = _OfflineLakebase().install(self)
+
+    def tearDown(self):
+        self._shared_state.cleanup()
+
+    def _connector(self, **options):
+        connector = InformixLakeflowConnect(
+            {
+                "database": "demo",
+                "snapshot.staging.location": self._shared_state.name,
+                "lakebase.password": "test-state-password",
+                **options,
+            }
+        )
+        connector._bridge_instance = FakeBridge()
+        return connector
+
+    def test_shared_session_defaults_on(self):
+        self.assertTrue(self._connector()._snapshot_shared_enabled())
+
+    def test_shared_session_can_disable(self):
+        self.assertFalse(
+            self._connector(**{"snapshot.shared.session": "false"})._snapshot_shared_enabled()
+        )
+
+    def test_shared_session_can_enable(self):
+        self.assertTrue(
+            self._connector(**{"snapshot.shared.session": "true"})._snapshot_shared_enabled()
+        )
+
+    def test_reader_threads_default_one(self):
+        self.assertEqual(self._connector()._snapshot_reader_thread_count(), 1)
+
+    def test_reader_threads_override(self):
+        self.assertEqual(
+            self._connector(**{"snapshot.reader.threads": "4"})._snapshot_reader_thread_count(),
+            4,
+        )
+
+    def test_zero_reader_threads_rejected(self):
+        with self.assertRaises(ValueError):
+            self._connector(**{"snapshot.reader.threads": "0"})
+
+    def test_invalid_shared_session_rejected(self):
+        with self.assertRaises(ValueError):
+            self._connector(**{"snapshot.shared.session": "maybe"})
+
+    def test_reservation_at_slot_count_rejected(self):
+        with self.assertRaises(ValueError):
+            self._connector(
+                **{"snapshot.connection.reservation": "8", "max.concurrent.connections": "8"}
+            )
+
+    def test_reservation_below_slot_count_accepted(self):
+        # Construction validates 0 <= reservation < slot_count; a valid value does not
+        # raise. The floor it produces is asserted in SnapshotReservationFloorTests.
+        self._connector(
+            **{"snapshot.connection.reservation": "3", "max.concurrent.connections": "8"}
+        )
+
+
+class SnapshotReservationFloorTests(unittest.TestCase):
+    """Model A: a snapshot-phase read claims its slot above the reservation, so the low
+    slots stay reachable by the streaming/CDC readers.
+
+    The slot floor is computed in the bridge's ``_acquire_connection_slot`` (the bridge
+    shares the connector's ``options`` dict, so the drain marker the connector sets is
+    visible there), so these exercise a real bridge with ``acquire_slot`` stubbed to
+    capture the floor before any lease is taken.
+    """
+
+    def setUp(self):
+        self._shared_state = tempfile.TemporaryDirectory()
+        self._lakebase = _OfflineLakebase().install(self)
+
+    def tearDown(self):
+        self._shared_state.cleanup()
+
+    def _bridge(self, **options):
+        return informix_module.PurePythonInformixBridge(
+            {
+                "hostname": "localhost",
+                "database": "demo",
+                "user": "informix",
+                "password": "secret",
+                "server": "demo_on",
+                "lakebase.password": "test-state-password",
+                "max.concurrent.connections": "8",
+                **options,
+            }
+        )
+
+    def _captured_floor(self, bridge):
+        seen = {}
+
+        class _StopProbe(Exception):
+            pass
+
+        def probe(*args, floor, **kwargs):
+            seen["floor"] = floor
+            raise _StopProbe
+
+        with mock.patch.object(informix_module, "acquire_slot", side_effect=probe):
+            with self.assertRaises(_StopProbe):
+                bridge._acquire_connection_slot()
+        return seen["floor"]
+
+    def test_marker_applies_reservation_floor(self):
+        bridge = self._bridge(**{"snapshot.connection.reservation": "3"})
+        bridge.options[informix_module._SNAPSHOT_DRAIN_MARKER_OPTION] = "true"
+        self.assertEqual(self._captured_floor(bridge), 3)
+
+    def test_no_marker_keeps_zero_floor(self):
+        bridge = self._bridge(**{"snapshot.connection.reservation": "3"})
+        self.assertEqual(self._captured_floor(bridge), 0)
+
+    def test_marker_takes_max_of_delete_and_snapshot_floors(self):
+        bridge = self._bridge(
+            **{
+                "snapshot.connection.reservation": "2",
+                "upsert.connection.reservation": "5",
+            }
+        )
+        bridge.options[informix_module._CONNECTION_CHANNEL_OPTION] = "delete"
+        bridge.options[informix_module._SNAPSHOT_DRAIN_MARKER_OPTION] = "true"
+        # Delete channel floors at the upsert reservation (5); the snapshot floor (2) is
+        # lower, so the higher of the two wins.
+        self.assertEqual(self._captured_floor(bridge), 5)
+
+    def test_zero_reservation_defaults_to_a_third_in_model_a(self):
+        # Model A (shared session off) with an unset reservation reserves a third of the
+        # pool: floor(9 / 3) = 3.
+        bridge = self._bridge(
+            **{"snapshot.shared.session": "false", "max.concurrent.connections": "9"}
+        )
+        bridge.options[informix_module._SNAPSHOT_DRAIN_MARKER_OPTION] = "true"
+        self.assertEqual(self._captured_floor(bridge), 3)
+
+    def test_zero_reservation_not_derived_when_shared_session_on(self):
+        # The third-of-the-pool default is Model A only; with shared session on, a zero
+        # reservation stays zero (Model C bounds drains by its thread count instead).
+        bridge = self._bridge(
+            **{"snapshot.shared.session": "true", "max.concurrent.connections": "9"}
+        )
+        bridge.options[informix_module._SNAPSHOT_DRAIN_MARKER_OPTION] = "true"
+        self.assertEqual(self._captured_floor(bridge), 0)
+
+    def test_zero_reservation_rounds_up_to_one_on_small_pools(self):
+        # floor(n / 3) is 0 for a 2-, 3-, or 4-slot pool, but at least one slot is
+        # reserved whenever the pool can spare one.
+        for slot_count in (2, 3, 4):
+            bridge = self._bridge(
+                **{
+                    "snapshot.shared.session": "false",
+                    "max.concurrent.connections": str(slot_count),
+                }
+            )
+            bridge.options[informix_module._SNAPSHOT_DRAIN_MARKER_OPTION] = "true"
+            self.assertEqual(self._captured_floor(bridge), 1, f"slot_count={slot_count}")
+
+    def test_zero_reservation_stays_zero_on_single_slot_pool(self):
+        # A single-slot pool cannot spare one: reserving its only slot would floor the
+        # drain out of every slot and deadlock it, so the derived reservation is 0.
+        bridge = self._bridge(
+            **{"snapshot.shared.session": "false", "max.concurrent.connections": "1"}
+        )
+        bridge.options[informix_module._SNAPSHOT_DRAIN_MARKER_OPTION] = "true"
+        self.assertEqual(self._captured_floor(bridge), 0)
+
+    def test_explicit_reservation_overrides_the_third_default(self):
+        # A positive value is honoured verbatim even in Model A.
+        bridge = self._bridge(
+            **{
+                "snapshot.shared.session": "false",
+                "snapshot.connection.reservation": "2",
+                "max.concurrent.connections": "9",
+            }
+        )
+        bridge.options[informix_module._SNAPSHOT_DRAIN_MARKER_OPTION] = "true"
+        self.assertEqual(self._captured_floor(bridge), 2)
+
+
+class SnapshotDrainMarkerTests(unittest.TestCase):
+    """The connector sets the drain marker (Model A) around a snapshot-phase read and
+    restores it afterward, so the bridge applies the reservation floor only then."""
+
+    def setUp(self):
+        self._shared_state = tempfile.TemporaryDirectory()
+        self._lakebase = _OfflineLakebase().install(self)
+
+    def tearDown(self):
+        self._shared_state.cleanup()
+
+    def _connector(self, **options):
+        connector = InformixLakeflowConnect(
+            {
+                "database": "demo",
+                "snapshot.staging.location": self._shared_state.name,
+                "lakebase.password": "test-state-password",
+                "snapshot.mode": "initial",
+                "cdc.shared.session": "false",
+                # Model A by default here; the shared-mode marker test overrides this.
+                "snapshot.shared.session": "false",
+                **options,
+            }
+        )
+        connector.set_registration_scope(hashlib.sha256(b"marker").hexdigest()[:32])
+        connector._bridge_instance = FakeBridge()
+        return connector
+
+    def test_snapshot_phase_read_sets_marker_during_read(self):
+        connector = self._connector()
+        seen = {}
+        original = connector._refresh_table_schema
+
+        def spy(table, fingerprint):
+            seen.setdefault(
+                "marker",
+                connector.options.get(informix_module._SNAPSHOT_DRAIN_MARKER_OPTION),
+            )
+            return original(table, fingerprint)
+
+        connector._refresh_table_schema = spy
+        connector.read_table("app.orders", {}, {})
+        self.assertEqual(seen["marker"], "true")
+
+    def test_marker_restored_after_read(self):
+        connector = self._connector()
+        connector.read_table("app.orders", {}, {})
+        self.assertNotIn(informix_module._SNAPSHOT_DRAIN_MARKER_OPTION, connector.options)
+
+    def test_shared_mode_read_does_not_set_marker(self):
+        # In shared mode the daemon bounds concurrency, so the consumer takes no floor.
+        connector = self._connector(**{"snapshot.shared.session": "true"})
+        connector._drain_via_snapshot_daemon = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("should not reach the daemon in this marker check")
+        )
+        seen = {}
+        original = connector._refresh_table_schema
+
+        def spy(table, fingerprint):
+            seen.setdefault(
+                "marker",
+                connector.options.get(informix_module._SNAPSHOT_DRAIN_MARKER_OPTION),
+            )
+            return original(table, fingerprint)
+
+        connector._refresh_table_schema = spy
+        try:
+            connector.read_table("app.orders", {}, {})
+        except AssertionError:
+            pass  # the daemon stub fired after the schema refresh; the marker check ran
+        self.assertIsNone(seen.get("marker"))
+
+    def test_incremental_keyed_read_does_not_set_marker(self):
+        # A keyed table's default incremental snapshot reads a bounded chunk per
+        # microbatch and frees the slot between them, so it is never floored -- it
+        # borrows the reserved slots freely. Only the monolithic initial drain is floored.
+        connector = self._connector(**{"snapshot.mode": "incremental"})
+        seen = {}
+        original = connector._table
+
+        def spy(name, opts):
+            seen.setdefault(
+                "marker",
+                connector.options.get(informix_module._SNAPSHOT_DRAIN_MARKER_OPTION),
+            )
+            return original(name, opts)
+
+        connector._table = spy
+        connector.read_table("app.orders", {}, {})
+        self.assertIsNone(seen.get("marker"))
+
+
+class SnapshotDrainPoolTests(unittest.TestCase):
+    """The bounded pool that runs Model C drains off the microbatch thread."""
+
+    def test_submit_dedups_and_queues_once(self):
+        pool = _SnapshotDrainPool()
+        pool.submit(("k",), table=None, options={}, pipeline_scope="s", allow_keyless=False)
+        pool.submit(("k",), table=None, options={}, pipeline_scope="s", allow_keyless=False)
+        self.assertEqual(list(pool.queue), [("k",)])
+        self.assertIn(("k",), pool.pending)
+
+    def test_wait_returns_true_on_success(self):
+        pool = _SnapshotDrainPool()
+        pool.submit(("k",), table=None, options={}, pipeline_scope="s", allow_keyless=False)
+        with pool.condition:
+            pool.queue.clear()
+            pool.pending.discard(("k",))
+            pool.results[("k",)] = None
+            pool.condition.notify_all()
+        self.assertTrue(pool.wait(("k",), 1.0))
+
+    def test_wait_reraises_failure(self):
+        pool = _SnapshotDrainPool()
+        pool.submit(("k",), table=None, options={}, pipeline_scope="s", allow_keyless=False)
+        with pool.condition:
+            pool.pending.discard(("k",))
+            pool.results[("k",)] = InformixError("boom")
+            pool.condition.notify_all()
+        with self.assertRaisesRegex(InformixError, "boom"):
+            pool.wait(("k",), 1.0)
+
+    def test_wait_times_out_when_never_completed(self):
+        pool = _SnapshotDrainPool()
+        pool.submit(("k",), table=None, options={}, pipeline_scope="s", allow_keyless=False)
+        self.assertFalse(pool.wait(("k",), 0.05))
+
+    def test_worker_runs_job_and_closes_reader(self):
+        pool = _SnapshotDrainPool()
+        calls = {}
+
+        class _FakeReader:
+            def _read_snapshot(
+                self, table, start, options, *, pipeline_scope_override, allow_keyless
+            ):
+                calls["read"] = (table, start, pipeline_scope_override, allow_keyless)
+
+            def close(self):
+                calls["closed"] = True
+
+        pool.configure(reader_factory=_FakeReader, thread_count=1)
+        worker = threading.Thread(
+            target=informix_module._run_snapshot_drain_worker, args=(pool,), daemon=True
+        )
+        worker.start()
+        pool.submit(
+            ("k",), table="T", options={"a": "b"}, pipeline_scope="scope", allow_keyless=True
+        )
+        self.assertTrue(pool.wait(("k",), 2.0))
+        self.assertEqual(calls["read"], ("T", None, "scope", True))
+        self.assertTrue(calls["closed"])
+
+    def test_worker_surfaces_failure_to_waiter(self):
+        pool = _SnapshotDrainPool()
+
+        class _BoomReader:
+            def _read_snapshot(self, *args, **kwargs):
+                raise InformixError("drain failed")
+
+            def close(self):
+                pass
+
+        pool.configure(reader_factory=_BoomReader, thread_count=1)
+        worker = threading.Thread(
+            target=informix_module._run_snapshot_drain_worker, args=(pool,), daemon=True
+        )
+        worker.start()
+        pool.submit(("k",), table="T", options={}, pipeline_scope="scope", allow_keyless=False)
+        with self.assertRaisesRegex(InformixError, "drain failed"):
+            pool.wait(("k",), 2.0)
+
+
+class SnapshotDaemonSeamTests(unittest.TestCase):
+    """Model C end to end: the consumer frees its slot, a daemon worker drains and stages
+    the table, and the consumer serves the staged pages."""
+
+    def setUp(self):
+        self._shared_state = tempfile.TemporaryDirectory()
+        self._lakebase = _OfflineLakebase().install(self)
+
+    def tearDown(self):
+        self._shared_state.cleanup()
+
+    def _options(self, **extra):
+        return {
+            "database": "demo",
+            "snapshot.staging.location": self._shared_state.name,
+            "lakebase.password": "test-state-password",
+            "snapshot.mode": "initial",
+            "cdc.shared.session": "false",
+            **extra,
+        }
+
+    def test_shared_read_drains_via_daemon_and_serves_pages(self):
+        # A unique scope per invocation: the drain pool is a module-global keyed by scope,
+        # and these classes are re-run under two file paths in one process, so a fixed
+        # scope would make the second run reuse the first's pool + torn-down state.
+        scope_hex = hashlib.sha256(os.urandom(16)).hexdigest()[:32]
+
+        def fake_factory():
+            reader = InformixLakeflowConnect(self._options(**{"snapshot.shared.session": "false"}))
+            reader.set_registration_scope(scope_hex)
+            reader._bridge_instance = FakeBridge()
+            return reader
+
+        consumer = InformixLakeflowConnect(
+            self._options(**{"snapshot.shared.session": "true", "snapshot.reader.threads": "1"})
+        )
+        consumer.set_registration_scope(scope_hex)
+        consumer._bridge_instance = FakeBridge()
+        # Give the daemon a fake-bridge reader factory sharing this test's offline state
+        # and stage, so no real connection is attempted.
+        consumer._snapshot_drain_reader_factory = lambda: fake_factory
+
+        released = []
+        original_release = consumer._release_worker_connection
+
+        def spy_release():
+            released.append(True)
+            return original_release()
+
+        consumer._release_worker_connection = spy_release
+
+        rows, offset = consumer.read_table("app.orders", {}, {})
+        rows = list(rows)
+
+        self.assertTrue(rows, "the consumer served the daemon-staged snapshot")
+        self.assertTrue(released, "the consumer freed its slot before waiting on the daemon")
+        # A single-page snapshot serves its only (final) page and hands straight to the
+        # stream; a multi-page one stays in the snapshot phase. Either way it advanced.
+        self.assertIn(offset.get("phase"), ("snapshot", "stream"))
+
+    def test_shared_read_serves_existing_manifest_without_daemon(self):
+        # When a prior drain already published the manifest, the shared-mode consumer
+        # serves it directly and never enqueues a daemon job.
+        scope_hex = hashlib.sha256(os.urandom(16)).hexdigest()[:32]
+        # The primer drains inline (Model A) to pre-publish the manifest without a daemon.
+        primer = InformixLakeflowConnect(self._options(**{"snapshot.shared.session": "false"}))
+        primer.set_registration_scope(scope_hex)
+        primer._bridge_instance = FakeBridge()
+        primer.read_table("app.orders", {}, {})
+
+        consumer = InformixLakeflowConnect(self._options(**{"snapshot.shared.session": "true"}))
+        consumer.set_registration_scope(scope_hex)
+        consumer._bridge_instance = FakeBridge()
+
+        def _boom():
+            raise AssertionError("daemon path must not run when a manifest already exists")
+
+        consumer._drain_via_snapshot_daemon = lambda *a, **k: _boom()
+
+        rows, _ = consumer.read_table("app.orders", {}, {})
+        self.assertTrue(list(rows))
 
 
 if __name__ == "__main__":
