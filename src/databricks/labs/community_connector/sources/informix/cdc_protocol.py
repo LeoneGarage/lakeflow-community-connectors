@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, localcontext
 from typing import Any, Iterable, Sequence
 
@@ -446,7 +446,7 @@ def _decode_datetime(
             raise CdcProtocolError(f"invalid DATETIME calendar fields {digits}")
     if {0, 2, 4}.issubset(values):
         try:
-            return datetime(
+            decoded = datetime(
                 values[0],
                 values[2],
                 values[4],
@@ -454,9 +454,19 @@ def _decode_datetime(
                 values.get(8, 0),
                 values.get(10, 0),
                 int((fraction + "000000")[:6] or 0),
-            ), size
+            )
         except ValueError as exc:
             raise CdcProtocolError(f"invalid DATETIME calendar fields {digits}") from exc
+        # Year 1 (e.g. the 0001-01-01 00:00:00 sentinel) sits adjacent to
+        # ``datetime.min``. PySpark converts a TimestampType value with
+        # ``datetime.astimezone()``, which subtracts the session UTC offset and
+        # overflows below ``datetime.min`` for a naive year-1 value, failing the read.
+        # Attaching UTC makes ``astimezone(UTC)`` a true no-op, so 0001-01-01T00:00:00Z
+        # passes through into the DataFrame intact. Safe because Informix DATETIME
+        # carries no timezone, so treating the wall clock as UTC preserves its value.
+        if values[0] <= 1:
+            decoded = decoded.replace(tzinfo=timezone.utc)
+        return decoded, size
     if start == 6:
         rendered = ":".join(f"{values[code]:0{widths[code]}d}" for code in selected)
         if fraction:

@@ -249,6 +249,21 @@ class FrameTests(unittest.TestCase):
             ("00:33:11.31773", 7),
         )
 
+    def test_year_one_datetime_is_utc_aware(self):
+        # 0001-01-01 00:00:00.00000 sits adjacent to datetime.min; a naive value
+        # overflows PySpark's internal astimezone() on TimestampType conversion, so the
+        # decoder attaches UTC (a no-op for astimezone(UTC)) to let it pass through.
+        temporal = ColumnDescriptor("t", "DATETIME", length=0x000F)
+        raw = bytes([0xC7, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0])
+        self.assertEqual(
+            decode_value(memoryview(raw), temporal),
+            (datetime(1, 1, 1, tzinfo=timezone.utc), 11),
+        )
+        # A normal year stays a naive wall-clock value (no session-timezone shift).
+        normal = bytes([0xC7, 20, 24, 1, 2, 3, 4, 5, 12, 34, 50])
+        decoded, _ = decode_value(memoryview(normal), temporal)
+        self.assertIsNone(decoded.tzinfo)
+
     def test_datetime_partial_qualifiers(self):
         cases = (
             (0x060A, bytes([0xC3, 12, 34, 56]), "12:34:56"),
