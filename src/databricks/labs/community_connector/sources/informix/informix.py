@@ -29,7 +29,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from typing import Any, Callable, Iterable, Iterator, Protocol, Sequence
 
@@ -8913,7 +8913,13 @@ def _validate_shaped_rows(
                 if isinstance(value, str):
                     try:
                         parsed = datetime.fromisoformat(value)
-                        valid = parsed.tzinfo is None
+                        # A naive wall-clock value or an explicit UTC offset both
+                        # materialize cleanly. The connector attaches UTC to a year-1
+                        # DATETIME so PySpark's internal astimezone() does not overflow
+                        # on a value adjacent to datetime.min; a non-UTC offset never
+                        # originates here.
+                        offset = parsed.utcoffset()
+                        valid = offset is None or offset == timedelta(0)
                     except ValueError:
                         pass
             elif isinstance(spark_type, BooleanType):
