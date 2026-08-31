@@ -8871,6 +8871,116 @@ class SnapshotReservationFloorTests(unittest.TestCase):
         self.assertEqual(self._captured_floor(bridge), 2)
 
 
+class DaemonReservationFloorTests(unittest.TestCase):
+    """A background daemon (sharded CDC, snapshot drain pool) claims its slot above the
+    daemon reservation, so the low slots stay reachable by consumer bootstrap reads that
+    would otherwise be starved by a daemon pinning every slot."""
+
+    def setUp(self):
+        self._shared_state = tempfile.TemporaryDirectory()
+        self._lakebase = _OfflineLakebase().install(self)
+
+    def tearDown(self):
+        self._shared_state.cleanup()
+
+    def _bridge(self, **options):
+        return informix_module.PurePythonInformixBridge(
+            {
+                "hostname": "localhost",
+                "database": "demo",
+                "user": "informix",
+                "password": "secret",
+                "server": "demo_on",
+                "lakebase.password": "test-state-password",
+                "max.concurrent.connections": "6",
+                **options,
+            }
+        )
+
+    def _captured_floor(self, bridge):
+        seen = {}
+
+        class _StopProbe(Exception):
+            pass
+
+        def probe(*args, floor, **kwargs):
+            seen["floor"] = floor
+            raise _StopProbe
+
+        with mock.patch.object(informix_module, "acquire_slot", side_effect=probe):
+            with self.assertRaises(_StopProbe):
+                bridge._acquire_connection_slot()
+        return seen["floor"]
+
+    def test_daemon_marker_reserves_a_third_by_default(self):
+        # Pool 6, unset reservation -> floor(6 / 3) = 2 reserved for consumer reads.
+        bridge = self._bridge()
+        bridge.options[informix_module._DAEMON_SLOT_MARKER_OPTION] = "true"
+        self.assertEqual(self._captured_floor(bridge), 2)
+
+    def test_no_daemon_marker_keeps_zero_floor(self):
+        # A consumer bootstrap read (no daemon marker) may claim any slot.
+        self.assertEqual(self._captured_floor(self._bridge()), 0)
+
+    def test_daemon_reservation_explicit_override(self):
+        bridge = self._bridge(**{"daemon.connection.reservation": "1"})
+        bridge.options[informix_module._DAEMON_SLOT_MARKER_OPTION] = "true"
+        self.assertEqual(self._captured_floor(bridge), 1)
+
+    def test_daemon_floor_takes_max_with_delete_channel(self):
+        bridge = self._bridge(
+            **{"daemon.connection.reservation": "1", "upsert.connection.reservation": "3"}
+        )
+        bridge.options[informix_module._CONNECTION_CHANNEL_OPTION] = "delete"
+        bridge.options[informix_module._DAEMON_SLOT_MARKER_OPTION] = "true"
+        # Delete daemon floors at max(upsert reservation 3, daemon reservation 1) = 3.
+        self.assertEqual(self._captured_floor(bridge), 3)
+
+    def test_reservation_at_slot_count_rejected(self):
+        # Eagerly validated in the connector constructor (0 <= reservation < slot_count).
+        with self.assertRaises(ValueError):
+            InformixLakeflowConnect(
+                {
+                    "database": "demo",
+                    "snapshot.staging.location": self._shared_state.name,
+                    "lakebase.password": "test-state-password",
+                    "daemon.connection.reservation": "6",
+                    "max.concurrent.connections": "6",
+                }
+            )
+
+
+class DaemonReaderFactoryMarkerTests(unittest.TestCase):
+    """Both daemon reader factories tag their reader so its slot acquisition is floored."""
+
+    def setUp(self):
+        self._shared_state = tempfile.TemporaryDirectory()
+        self._lakebase = _OfflineLakebase().install(self)
+
+    def tearDown(self):
+        self._shared_state.cleanup()
+
+    def _connector(self, **options):
+        connector = InformixLakeflowConnect(
+            {
+                "database": "demo",
+                "snapshot.staging.location": self._shared_state.name,
+                "lakebase.password": "test-state-password",
+                **options,
+            }
+        )
+        connector._bridge_instance = FakeBridge()
+        return connector
+
+    def test_cdc_reader_factory_sets_daemon_marker(self):
+        reader = self._connector()._shared_cdc_reader_factory("upsert")()
+        self.assertEqual(reader.options.get(informix_module._DAEMON_SLOT_MARKER_OPTION), "true")
+
+    def test_snapshot_drain_reader_factory_sets_daemon_marker(self):
+        reader = self._connector()._snapshot_drain_reader_factory()()
+        self.assertEqual(reader.options.get(informix_module._DAEMON_SLOT_MARKER_OPTION), "true")
+
+
 class SnapshotDrainMarkerTests(unittest.TestCase):
     """The connector sets the drain marker (Model A) around a snapshot-phase read and
     restores it afterward, so the bridge applies the reservation floor only then."""
