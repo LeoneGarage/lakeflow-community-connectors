@@ -972,11 +972,12 @@ class SqliPacketTests(unittest.TestCase):
             "CLNT_PAM_CAPABLE": "1",
             "DBPATH": ".",
             "DB_LOCALE": "en_US.819",
+            "DELIMIDENT": "1",
             "IFX_UPDDESC": "1",
             "NODEFDAC": "no",
         }
         encoded = encode_asc_environment(values, "iso8859-1")
-        self.assertTrue(encoded.startswith(struct.pack(">hh", 106, 6)))
+        self.assertTrue(encoded.startswith(struct.pack(">hh", 106, 7)))
         offsets = [encoded.index(key.encode() + b"\0") for key in sorted(values)]
         self.assertEqual(offsets, sorted(offsets))
 

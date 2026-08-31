@@ -96,10 +96,33 @@ _OFFSET_VERSION = 10
 # underscore and later characters add digits and "$", where the "letter" class
 # is defined by the database locale -- under the default en_US.819 (Latin-1) that
 # includes accented letters such as e-acute or n-tilde. Match Unicode letters so a
-# legitimately accented owner/table/column name is not rejected, while ``\w``/``$``
-# still exclude every SQL-unsafe character (quotes, spaces, ``.``, ``;``, ``+`` ...)
-# so interpolating a validated identifier into SQL stays safe.
-_IDENTIFIER = re.compile(r"^[^\W\d][\w$]*$", re.UNICODE)
+# legitimately accented owner/table/column name is not rejected. ``+`` is also
+# permitted in later positions; the class still excludes the injection-unsafe
+# characters (quotes, spaces, ``.``, ``;`` ...) so a validated identifier cannot
+# break out of its SQL context.
+_IDENTIFIER = re.compile(r"^[^\W\d][\w$+]*$", re.UNICODE)
+# Identifiers safe to interpolate *bare* (undelimited): a locale letter or
+# underscore followed by letters/digits/underscore/"$". Anything the validator
+# admits beyond this (e.g. "+") is not a valid undelimited identifier and must be
+# sent delimited -- wrapped in double quotes, which the server honors because the
+# connection sets DELIMIDENT.
+_BARE_IDENTIFIER = re.compile(r"^[^\W\d][\w$]*$", re.UNICODE)
+
+
+def _sql_identifier(identifier: str) -> str:
+    """Render a (already validated) identifier for interpolation into SQL.
+
+    Bare when it is a valid undelimited identifier; otherwise delimited with
+    double quotes, doubling any embedded quote. The identifier must already have
+    passed ``_IDENTIFIER`` validation, so the delimited branch only ever escapes
+    admitted characters such as "+".
+    """
+
+    if _BARE_IDENTIFIER.fullmatch(identifier):
+        return identifier
+    return '"' + identifier.replace('"', '""') + '"'
+
+
 _DATA_OPS = {"INSERT", "BEFORE_UPDATE", "AFTER_UPDATE", "DELETE", "TRUNCATE"}
 _DEFAULT_SNAPSHOT_PAGE_SIZE = 20000
 _DEFAULT_SNAPSHOT_READ_TIMEOUT_SECONDS = 300
@@ -1910,7 +1933,7 @@ class PurePythonInformixBridge:
         window = f"SKIP {int(skip)} " if skip else ""
         sql = (
             f"SELECT {window}FIRST {int(limit)} {','.join(projection)} "
-            f"FROM {database}:{owner}.{name}"
+            f"FROM {database}:{_sql_identifier(owner)}.{_sql_identifier(name)}"
         )
         parameters: list[Any] = []
         predicates = [f"({snapshot_filter})"] if snapshot_filter else []
@@ -2081,7 +2104,10 @@ class PurePythonInformixBridge:
         ]
         result_names = [f"__chunk_{key}" if key in chunk_exprs else key for key in primary_keys]
         order = ",".join(f"{chunk_exprs.get(key, key)} DESC" for key in primary_keys)
-        sql = f"SELECT FIRST 1 {','.join(select_terms)} " f"FROM {database}:{owner}.{name}"
+        sql = (
+            f"SELECT FIRST 1 {','.join(select_terms)} "
+            f"FROM {database}:{_sql_identifier(owner)}.{_sql_identifier(name)}"
+        )
         if snapshot_filter:
             sql += f" WHERE ({snapshot_filter})"
         sql += f" ORDER BY {order}"
@@ -2156,7 +2182,8 @@ class PurePythonInformixBridge:
                     page_index += 1
 
                 execute_pages(
-                    f"SELECT {','.join(columns)} FROM {database}:{owner}.{name}"
+                    f"SELECT {','.join(columns)} "
+                    f"FROM {database}:{_sql_identifier(owner)}.{_sql_identifier(name)}"
                     + (f" WHERE ({snapshot_filter})" if snapshot_filter else ""),
                     (),
                     page_size,
