@@ -397,6 +397,20 @@ connection:
         snapshot-only. There is no delete channel: requesting one for an
         append-only table fails rather than returning empty forever.
 
+    - name: primary.keys
+      type: string
+      required: false
+      description: >
+        Per-table override for the table's primary key, as a comma-separated list
+        (or JSON array) of column names. When set, the connector treats the table
+        as keyed on those columns -- even a physically keyless table -- so it is
+        read as cdc_with_deletes with keyset-paginated snapshots and delete
+        identification, and reports those keys so the pipeline uses them as the
+        destination merge key too (no separate `primary_keys` needed). The columns
+        must exist in the table. You MUST guarantee they are unique per row: a
+        non-unique override corrupts upserts, delete identification, and snapshot
+        pagination. Leave unset to use the catalog's primary key (or none).
+
     - name: snapshot.max.bytes
       type: string
       required: false
@@ -730,4 +744,4 @@ connection:
 
 # Exact per-table overrides consumed by the connector. `qualified_source_table` maps a
 # pipeline table to a dynamically discovered exposed name (`owner.table`).
-external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records"
+external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys"

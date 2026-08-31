@@ -5256,6 +5256,44 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(metadata["ingestion_type"], "cdc_with_deletes")
         self.assertTrue(metadata["primary_keys"])
 
+    def test_primary_keys_override_promotes_keyless_to_cdc(self):
+        # A declared key turns a physically keyless table into a keyed CDC table,
+        # and is reported so the pipeline uses it as the destination merge key too.
+        connector, _ = self._keyless_connector()
+
+        metadata = connector.read_table_metadata("app.orders", {"primary.keys": "id"})
+
+        self.assertEqual(metadata["ingestion_type"], "cdc_with_deletes")
+        self.assertEqual(metadata["primary_keys"], ["id"])
+        self.assertEqual(metadata["cursor_field"], informix_module.CURSOR)
+
+    def test_primary_keys_override_accepts_multiple_columns(self):
+        connector, _ = self._keyless_connector()
+
+        metadata = connector.read_table_metadata("app.orders", {"primary.keys": "id,value"})
+
+        self.assertEqual(metadata["ingestion_type"], "cdc_with_deletes")
+        self.assertEqual(metadata["primary_keys"], ["id", "value"])
+
+    def test_primary_keys_override_rejects_unknown_column(self):
+        connector, _ = self._keyless_connector()
+
+        with self.assertRaisesRegex(InformixError, "not present"):
+            connector.read_table_metadata("app.orders", {"primary.keys": "nope"})
+
+    def test_primary_keys_override_survives_schema_refresh(self):
+        # A refresh re-reads the catalog (which reports no key); the override and
+        # its fingerprint must persist rather than reverting to keyless.
+        connector, _ = self._keyless_connector()
+        table = connector._table("app.orders", {"primary.keys": "id"})
+        self.assertEqual(table.primary_keys, ("id",))
+        self.assertTrue(table.key_override)
+
+        refreshed = connector._refresh_table_schema(table, None)
+
+        self.assertEqual(refreshed.primary_keys, ("id",))
+        self.assertTrue(refreshed.key_override)
+
     def test_a_table_with_uncapturable_columns_is_never_append(self):
         bridge = FakeBridge()
         bridge.tables = [_table(cdc=False, primary_keys=())]
