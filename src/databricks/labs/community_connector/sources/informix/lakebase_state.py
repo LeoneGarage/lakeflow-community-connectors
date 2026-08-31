@@ -1264,8 +1264,11 @@ INSERT INTO state_records (namespace, record_key, record, record_type)
 VALUES (
   %(namespace)s, %(record_key)s,
   jsonb_build_object(
-    'format_version', 1, 'pipeline_id', %(pipeline_id)s,
-    'table_prefix', %(table_prefix)s,
+    -- Cast the string parameters: jsonb_build_object value arguments are typed
+    -- "any", so an uncast parameter has no determinable type when the statement
+    -- is prepared (IndeterminateDatatype: could not determine data type of $n).
+    'format_version', 1, 'pipeline_id', %(pipeline_id)s::text,
+    'table_prefix', %(table_prefix)s::text,
     'last_used_at', extract(epoch FROM clock_timestamp())
   ),
   'table-activity'
