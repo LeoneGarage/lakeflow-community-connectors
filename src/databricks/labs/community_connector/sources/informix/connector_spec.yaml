@@ -458,19 +458,6 @@ connection:
         non-unique override corrupts upserts, delete identification, and snapshot
         pagination. Leave unset to use the catalog's primary key (or none).
 
-    - name: datetime.spark.type
-      type: string
-      required: false
-      description: >
-        Per-table Spark type for full date-time Informix DATETIME/TIMESTAMP columns:
-        `timestamp_ntz` (default) or `timestamp`. Informix DATETIME carries no timezone,
-        so the default `timestamp_ntz` (TIMESTAMP_NTZ) preserves the stored wall-clock
-        value. `timestamp` maps to the timezone-aware type, which Spark shifts by the
-        session timezone on read -- correct only when the values are known to be UTC and
-        that shift is wanted. Partial qualifiers (e.g. HOUR-anchored time-of-day) remain
-        strings regardless. Changing this on an already-ingested table changes the Delta
-        column type and requires a full refresh of that table.
-
     - name: snapshot.max.bytes
       type: string
       required: false
@@ -837,4 +824,4 @@ connection:
 
 # Exact per-table overrides consumed by the connector. `qualified_source_table` maps a
 # pipeline table to a dynamically discovered exposed name (`owner.table`).
-external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,datetime.spark.type"
+external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys"
