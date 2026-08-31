@@ -584,7 +584,40 @@ connection:
       required: false
       description: >
         Maximum seconds a reader waits for per-table initialization state.
-        Default `300`; minimum `1`.
+        Default `300`; minimum `1`. In shared-session mode this also bounds how long
+        a shard retains a subscriber after its last poll before dropping it.
+
+    - name: cdc.shared.session
+      type: string
+      required: false
+      description: >
+        Sharded daemon-reader CDC. Default `true`. Set `false` to opt out (each
+        CDC-capable table then runs its own Informix CDC session per poll). When on,
+        tables are partitioned
+        into K shards; a bounded pool of K driver-resident daemon threads each hold a
+        single shared CDC session multiplexing their shard's tables and fan the changes
+        out in memory, so concurrent CDC sessions drop from ~N to K and reads run in
+        parallel across the K threads. Accepts `true`/`false` (or `1`/`yes`, `0`/`no`).
+        Note: each shard's log-retention floor tracks that shard's slowest table.
+
+    - name: cdc.shared.reader.threads
+      type: string
+      required: false
+      description: >
+        Number of shards / daemon reader threads (K) when `cdc.shared.session=true`.
+        Default = `max.concurrent.connections`; minimum `1`. K=1 collapses the whole
+        channel onto one session; larger K spreads tables across more parallel readers.
+        Bounds the driver thread count. Also caps concurrent daemon connection slots,
+        which draw from the same pool as consumer bootstrap.
+
+    - name: cdc.shared.buffer.max.records
+      type: string
+      required: false
+      description: >
+        Per-table cap on buffered-but-unconsumed transactions in a shard
+        (`cdc.shared.session=true`). When a shard's slowest buffer reaches it, that
+        shard's daemon defers new reads (throttle to the slowest reader) until the
+        backlog drains, bounding driver memory. Default `200000`; minimum `1`.
 
     - name: state.gc.retention.days
       type: string

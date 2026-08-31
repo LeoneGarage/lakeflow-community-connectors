@@ -167,6 +167,27 @@ The `incremental` block is present only during a default `incremental`/`auto_sna
 
 Each finite call opens/replays a CDC session, reads until at least one complete transaction is available (or timeout), closes it, and returns the exact last committed position. When caught up, return an empty iterator and the unchanged `start_offset`, as required by `LakeflowConnect`.
 
+### Optional sharded daemon-reader CDC
+
+`cdc_opensess` / `cdc_startcapture` accept multiple tables in one session and tag each
+record with its source table, so the streaming read can be shared. This is on by default
+(`cdc.shared.session`, set `false` to opt out, in which case each CDC-capable table runs
+its own session per poll). When on, it partitions tables into K shards (by stable hash of the native
+identity; K = `cdc.shared.reader.threads`, default = `max.concurrent.connections`) and
+runs one driver-resident daemon thread per shard. Each daemon holds a single shared CDC
+session over its shard's tables, assembles complete transactions once, and fans them out
+to per-table in-memory buffers; it also refreshes each table's schema and samples
+`minimum_lsn`/`current_lsn` each cycle. A streaming poll then reads the change records,
+schema, and log bounds from its shard and — in steady state — issues no Informix calls of
+its own. The daemon activates its shared session at the minimum committed offset across
+its shard's tables and relies on the same transaction-atomic `commit_lsn > checkpoint`
+recovery as the per-table path, so a lagging or newly added table replays its own history
+without duplicating others. This bounds concurrent CDC sessions to K (rather than N) — the
+same teardown pressure `cdc.read.timeout.seconds` guards against — at the cost of a
+per-shard log-retention floor that tracks that shard's slowest table. A daemon that is not
+yet ready, or a table in a schema transition, transparently falls back to a direct
+per-table read for that poll.
+
 ## Snapshot semantics
 
 Informix snapshot SQLI reads use `snapshot.read.timeout.seconds` (default
