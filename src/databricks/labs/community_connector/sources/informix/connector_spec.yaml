@@ -376,16 +376,20 @@ connection:
       type: string
       required: false
       description: >
-        Controls append-only ingestion. A capture-capable table without a primary
-        key defaults to true, reports `ingestion_type=append` with a cursor, and
-        streams changes incrementally. Set false explicitly to opt a keyless table
-        into bounded snapshot-only ingestion. A keyed table defaults to false but
-        may set true explicitly.
+        Controls append-only ingestion. Accepts `true`, `false`, or `auto`
+        (the default when unset). `auto` appends only capture-capable tables
+        without a primary key -- reporting `ingestion_type=append` with a cursor
+        and streaming changes incrementally -- and leaves keyed tables on their
+        normal CDC path (so keyed tables follow the pipeline `scd_type`, default
+        SCD_TYPE_1). For a keyless table `auto` is equivalent to `true`. `true`
+        forces append for every capture-capable table, including keyed ones;
+        `false` forces the normal CDC/snapshot path, opting a keyless table into
+        bounded snapshot-only ingestion.
         Only correct for a genuinely insert-only table: an UPDATE at the source
         appends a second row, and a DELETE appends nothing and leaves the deleted
         row present. Nothing in the schema distinguishes an append-only log from a
-        mutable table that merely lacks a key, so use the snapshot opt-out for
-        mutable keyless tables.
+        mutable table that merely lacks a key, so use `false` for mutable keyless
+        tables.
         Set `scd_type: APPEND_ONLY` on the same table so the destination appends
         rather than attempting a keyed merge; the connector cannot read scd_type
         itself because the spec parser strips it before options reach the connector.

@@ -212,9 +212,15 @@ _UNSUPPORTED_SNAPSHOT_MODES = frozenset({"configuration_based", "custom"})
 # It cannot be read from ``scd_type`` either, even though the pipeline layer already
 # maps ``scd_type=APPEND_ONLY`` onto an append flow: ``get_table_configuration``
 # strips scd_type/primary_keys/sequence_by before the connector sees any options, so
-# the value is structurally unavailable here. Set both -- this option so the connector
-# streams incrementally, and ``scd_type: APPEND_ONLY`` so the destination appends
-# instead of attempting a keyed merge.
+# the value is structurally unavailable here. To append a *keyed* table, set both --
+# this option (``true``) so the connector streams incrementally, and
+# ``scd_type: APPEND_ONLY`` so the destination appends instead of a keyed merge.
+#
+# Accepts ``true`` / ``false`` / ``auto``. ``auto`` (also the default when the option
+# is unset) appends only keyless tables and leaves keyed tables on their normal
+# CDC/snapshot path -- equivalent, for a keyless table, to ``true`` + a keyless
+# append destination. ``true`` forces append for every capturable table; ``false``
+# forces the normal CDC/snapshot path even for a keyless table.
 _APPEND_INGESTION_OPTION = "append.only.ingestion"
 # What an append-only table does about rows that predate the flow.
 #
@@ -2540,6 +2546,26 @@ def _option_bool(options: dict[str, str], name: str, default: bool) -> bool:
     raise ValueError(f"Option '{name}' must be one of: 1, true, yes, 0, false, no")
 
 
+def _append_only_value(raw: str) -> str:
+    """Normalize the tri-state ``append.only.ingestion`` option.
+
+    ``true``/``false`` force append (or not) for every capturable table; ``auto``
+    (also the default when the option is unset) applies append only to keyless
+    tables and leaves keyed tables on their normal CDC/snapshot path.
+    """
+
+    normalized = (raw or "").strip().lower()
+    if normalized in {"1", "true", "yes"}:
+        return "true"
+    if normalized in {"0", "false", "no"}:
+        return "false"
+    if normalized == "auto":
+        return "auto"
+    raise ValueError(
+        f"Option '{_APPEND_INGESTION_OPTION}' must be one of: true, false, auto (or 1/yes, 0/no)"
+    )
+
+
 def _snapshot_filter(options: dict[str, str]) -> str | None:
     """Return a validated connector-owned snapshot WHERE predicate."""
 
@@ -3148,7 +3174,8 @@ class InformixLakeflowConnect(LakeflowConnect):
         # Validate boolean capacity options eagerly (they are otherwise only
         # checked on first read, deep inside a running flow).
         _option_bool(options, "snapshot.incremental.blocking", True)
-        _option_bool(options, _APPEND_INGESTION_OPTION, False)
+        if _APPEND_INGESTION_OPTION in options:
+            _append_only_value(options[_APPEND_INGESTION_OPTION])
         if int(options.get("cdc.max.records", str(_DEFAULT_CDC_MAX_RECORDS))) > 256:
             raise ValueError("Option 'cdc.max.records' must be <= 256")
         if int(options.get("cdc.read.bytes", "32000")) > 32767:
@@ -4411,28 +4438,34 @@ class InformixLakeflowConnect(LakeflowConnect):
             # happened to get a slot.
         return rows, end_offset
 
-    def _append_only(self, table_options: dict[str, str]) -> bool:
-        """Report whether this table was opted into append-only ingestion."""
+    def _append_only_mode(self, table_options: dict[str, str]) -> str:
+        """Resolve ``append.only.ingestion`` to ``'true'``, ``'false'``, or ``'auto'``.
 
-        if _APPEND_INGESTION_OPTION in table_options:
-            return _option_bool(table_options, _APPEND_INGESTION_OPTION, False)
-        return _option_bool(self.options, _APPEND_INGESTION_OPTION, False)
+        ``table_options`` override the connection options; when the option is set
+        nowhere the mode defaults to ``'auto'``.
+        """
+
+        for source in (table_options, self.options):
+            if _APPEND_INGESTION_OPTION in source:
+                return _append_only_value(source[_APPEND_INGESTION_OPTION])
+        return "auto"
 
     def _append_only_table(self, table: Table, table_options: dict[str, str]) -> bool:
         """Report whether this read should use the append-only path.
 
-        Requires both the opt-in *and* a table Informix can capture. A table with a
-        primary key is deliberately still allowed: a caller may want append
-        semantics for an insert-only keyed table, and refusing would be surprising.
-        Only a table whose columns cannot be captured falls back to snapshot, since
-        append has no way to represent rows it cannot read.
+        ``true`` forces append for any capturable table (a caller may want append
+        semantics even for an insert-only keyed table); ``false`` forces the normal
+        CDC/snapshot path; ``auto`` (the default) appends only keyless tables and
+        leaves keyed tables on CDC. A table whose columns cannot be captured always
+        falls back to snapshot, since append cannot represent rows it cannot read.
         """
 
         if not _cdc_streamable(table):
             return False
-        if _APPEND_INGESTION_OPTION in table_options or _APPEND_INGESTION_OPTION in self.options:
-            return self._append_only(table_options)
-        return not table.primary_keys
+        mode = self._append_only_mode(table_options)
+        if mode == "auto":
+            return not table.primary_keys
+        return mode == "true"
 
     def _snapshot_mode(self, table_options: dict[str, str]) -> str:
         mode = (
