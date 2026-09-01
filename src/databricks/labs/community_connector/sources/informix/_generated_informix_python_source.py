@@ -5028,8 +5028,13 @@ def register_lakeflow_source(spark):
     _DAEMON_RESERVATION_OPTION = "daemon.connection.reservation"
     _DEFAULT_DAEMON_CONNECTION_RESERVATION = 0
     # Private marker set on a daemon reader's options so its lazy slot acquisition applies the
-    # daemon reservation floor. Set by the CDC and snapshot-drain reader factories.
+    # daemon reservation floor. Set by the CDC reader factory only.
     _DAEMON_SLOT_MARKER_OPTION = "_informix.daemon.slot"
+    # Private marker for the snapshot-drain daemon reader. Unlike the CDC daemon (deferrable,
+    # floored highest), a drain is bootstrap work that must make progress to unblock its
+    # append-only consumer, so it is floored *below* the CDC daemon -- into a band the CDC
+    # daemon cannot claim -- rather than sharing the CDC floor and being starved by it.
+    _SNAPSHOT_DAEMON_SLOT_MARKER_OPTION = "_informix.snapshot.daemon.slot"
     # Private, published per read by a yielding continuous reader: how long this
     # attempt may spend acquiring a slot before the reader gives up and returns empty.
     _CONNECTION_ATTEMPT_BUDGET_OPTION = "_informix.connection.attempt.budget.seconds"
@@ -6113,6 +6118,30 @@ def register_lakeflow_source(spark):
                 return min(max(1, slot_count // 3), slot_count - 1)
             return reservation
 
+        def _snapshot_daemon_connection_reservation(self, slot_count: int) -> int:
+            """Floor for the snapshot-drain daemon: one band below the CDC daemon.
+
+            The CDC daemon is deferrable and floored at ``daemon.connection.reservation``;
+            a drain is bootstrap work that must make progress, so it sits ``snapshot.reader
+            .threads`` slots lower, giving it that many slots the CDC daemon cannot claim.
+            The band below it (``daemon.connection.reservation - snapshot.reader.threads``
+            slots) stays reachable only by consumer bootstrap reads at floor 0. When the
+            pool cannot spare a private drain band the floor collapses to 0, where the drain
+            still reaches the CDC-free low slots (consumer reads release per microbatch, so
+            those slots churn) -- it simply loses its dedicated headroom.
+            """
+
+            daemon_reservation = self._daemon_connection_reservation(slot_count)
+            threads = max(
+                1,
+                int(
+                    self.options.get(
+                        _SNAPSHOT_READER_THREADS_OPTION, str(_DEFAULT_SNAPSHOT_READER_THREADS)
+                    )
+                ),
+            )
+            return max(0, daemon_reservation - threads)
+
         def _connection_sweep_rank_scale(self) -> float:
             """Shrink the gap between acquisition sweeps for a further-behind reader.
 
@@ -6163,15 +6192,20 @@ def register_lakeflow_source(spark):
             # mode the daemon bounds concurrency instead and this marker is never set.
             if self.options.get(_SNAPSHOT_DRAIN_MARKER_OPTION) == "true":
                 floor = max(floor, self._snapshot_connection_reservation(slot_count))
-            # A background daemon (sharded CDC, or the snapshot drain pool) draws from the
-            # same pool but, unlike a consumer read, never releases per microbatch: a busy
-            # CDC shard re-reads in a tight loop and a drain holds its slot for the whole
-            # scan. With the CDC daemon's default thread count equal to the pool size and two
-            # channels, the daemons can pin every slot and starve a fresh consumer bootstrap
-            # read (which then times out and fails the query). Floor every daemon above the
-            # daemon reservation so those low slots stay reachable by consumer reads.
+            # The sharded CDC daemon draws from the same pool but, unlike a consumer read,
+            # never releases per microbatch: a busy CDC shard re-reads in a tight loop. With
+            # its default thread count equal to the pool size and two channels, it can pin
+            # every slot and starve a fresh consumer bootstrap read (which then times out and
+            # fails the query). Floor it above the daemon reservation so those low slots stay
+            # reachable by consumer reads.
             if self.options.get(_DAEMON_SLOT_MARKER_OPTION) == "true":
                 floor = max(floor, self._daemon_connection_reservation(slot_count))
+            # The snapshot-drain daemon also holds its slot for the whole scan, but it is
+            # bootstrap work that must finish to unblock its consumer -- so it floors *below*
+            # the CDC daemon into a band the CDC daemon cannot claim, rather than sharing the
+            # CDC floor and being starved by a saturated CDC daemon.
+            if self.options.get(_SNAPSHOT_DAEMON_SLOT_MARKER_OPTION) == "true":
+                floor = max(floor, self._snapshot_daemon_connection_reservation(slot_count))
             connection_wait_timeout = float(
                 self.options.get(
                     "connection.wait.timeout.seconds",
@@ -11378,9 +11412,11 @@ def register_lakeflow_source(spark):
             # same connection budget so ``snapshot.reader.threads`` bounds the slots it holds.
             reader_options = dict(self.options)
             reader_options[_SNAPSHOT_SHARED_SESSION_OPTION] = "false"
-            # The drain runs on a daemon thread, so floor its slot above the daemon
-            # reservation to leave headroom for consumer bootstrap reads.
-            reader_options[_DAEMON_SLOT_MARKER_OPTION] = "true"
+            # The drain runs on a daemon thread and holds its slot for the whole scan, but it
+            # is bootstrap work that must finish to unblock its consumer. Floor it one band
+            # below the CDC daemon (not at the CDC floor), so a saturated CDC daemon cannot
+            # starve it -- it always has slots the CDC daemon is locked out of.
+            reader_options[_SNAPSHOT_DAEMON_SLOT_MARKER_OPTION] = "true"
             cls = type(self)
             return lambda: cls(reader_options)
 
