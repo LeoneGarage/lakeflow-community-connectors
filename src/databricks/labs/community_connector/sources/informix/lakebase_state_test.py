@@ -547,6 +547,39 @@ class LakebaseSlotTests(unittest.TestCase):
         self.assertIn("(record->>'last_used_at')::double precision", schema)
         self.assertIn("WHERE record_type = 'table-activity'", schema)
 
+    def test_ensure_schema_locks_before_creating_tables(self):
+        # CREATE TABLE IF NOT EXISTS races on the catalog insert when several workers
+        # create a brand-new table at once, so schema creation must sit behind an
+        # advisory lock. Assert the lock is taken before the first CREATE.
+        executed: list[str] = []
+
+        class _RecordingCursor:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __enter__(self):
+                self._inner.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return self._inner.__exit__(*exc)
+
+            def execute(self, statement, parameters=None):
+                executed.append(" ".join(statement.split()))
+                return self._inner.execute(statement, parameters)
+
+            def fetchone(self):
+                return self._inner.fetchone()
+
+        connection = _FakeConnection(_FakeDatabase())
+        connection.cursor = lambda inner=connection.cursor: _RecordingCursor(inner())
+
+        lakebase_state.ensure_schema(connection)
+
+        lock_at = next(i for i, s in enumerate(executed) if "pg_advisory_xact_lock" in s)
+        create_at = next(i for i, s in enumerate(executed) if s.startswith("CREATE TABLE"))
+        self.assertLess(lock_at, create_at)
+
     def test_capacity_is_never_exceeded(self):
         held = [self.acquire(f"o{index}") for index in range(20)]
         issued = [slot for slot in held if slot is not None]
