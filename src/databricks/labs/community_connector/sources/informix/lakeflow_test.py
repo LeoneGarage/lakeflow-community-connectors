@@ -8763,12 +8763,32 @@ class SnapshotFairnessOptionTests(unittest.TestCase):
             self._connector(**{"snapshot.shared.session": "true"})._snapshot_shared_enabled()
         )
 
-    def test_reader_threads_default_one(self):
-        self.assertEqual(self._connector()._snapshot_reader_thread_count(), 1)
+    def test_reader_threads_default_is_a_third_of_pool(self):
+        # Keyless drains serialize through this pool, so the default worker count
+        # tracks a third of max.concurrent.connections (matching the CDC-daemon
+        # reservation band) rather than a flat 1.
+        self.assertEqual(
+            self._connector(**{"max.concurrent.connections": "6"})._snapshot_reader_thread_count(),
+            2,
+        )
+        self.assertEqual(
+            self._connector(**{"max.concurrent.connections": "16"})._snapshot_reader_thread_count(),
+            5,
+        )
+
+    def test_reader_threads_default_floors_at_one(self):
+        # A tiny pool still gets a worker.
+        self.assertEqual(
+            self._connector(**{"max.concurrent.connections": "2"})._snapshot_reader_thread_count(),
+            1,
+        )
 
     def test_reader_threads_override(self):
+        # An explicit value wins regardless of pool size.
         self.assertEqual(
-            self._connector(**{"snapshot.reader.threads": "4"})._snapshot_reader_thread_count(),
+            self._connector(
+                **{"snapshot.reader.threads": "4", "max.concurrent.connections": "6"}
+            )._snapshot_reader_thread_count(),
             4,
         )
 
@@ -8994,13 +9014,22 @@ class DaemonReservationFloorTests(unittest.TestCase):
             )
 
     def test_snapshot_daemon_floors_one_band_below_cdc_daemon(self):
-        # Pool 6, daemon reservation 2, snapshot.reader.threads 1 -> the snapshot drain
-        # floors at 2 - 1 = 1, one slot below the CDC daemon (which floors at 2). That
+        # Pool 6, daemon reservation 2, snapshot.reader.threads pinned to 1 -> the snapshot
+        # drain floors at 2 - 1 = 1, one slot below the CDC daemon (which floors at 2). That
         # leaves slot [1, 2) reachable by the drain but NOT the CDC daemon, so a saturated
-        # CDC daemon cannot starve the drain. Slot 0 stays for consumer bootstrap.
-        bridge = self._bridge()
+        # CDC daemon cannot starve the drain. Slot 0 stays for consumer bootstrap. (Pinned
+        # to 1 because the default now scales to a third of the pool.)
+        bridge = self._bridge(**{"snapshot.reader.threads": "1"})
         bridge.options[informix_module._SNAPSHOT_DAEMON_SLOT_MARKER_OPTION] = "true"
         self.assertEqual(self._captured_floor(bridge), 1)
+
+    def test_snapshot_daemon_floor_tracks_default_reader_thread_count(self):
+        # With the pool-relative default (6 // 3 = 2 workers) and daemon reservation 2, the
+        # reserved band is exactly the worker count, so the floor collapses to 0 -- the
+        # drains fill the whole below-CDC band rather than under-reserving it.
+        bridge = self._bridge()
+        bridge.options[informix_module._SNAPSHOT_DAEMON_SLOT_MARKER_OPTION] = "true"
+        self.assertEqual(self._captured_floor(bridge), 0)
 
     def test_snapshot_daemon_floor_tracks_reader_threads(self):
         # More drain threads reserve a wider private band, pulling the floor further down.

@@ -211,8 +211,12 @@ An `initial`-mode snapshot drains the whole table through one repeatable-read
 transaction, holding a connection slot for the entire scan; with many tables this
 can consume every slot and starve the streaming/CDC readers waiting for one.
 `snapshot.shared.session` selects the mitigation. Default `true` (Model C): the
-drain runs on a bounded pool of `snapshot.reader.threads` (default `1`)
-driver-resident daemon workers. `false` (Model A): the drain runs inline but
+drain runs on a bounded pool of `snapshot.reader.threads` (default
+`max(1, max.concurrent.connections // 3)`, matching the CDC-daemon reservation)
+driver-resident daemon workers. Keyless (append-only, no primary key) tables drain
+one-at-a-time through this pool, so a single worker serialized every keyless table's
+initial scan and the later tables timed out at `snapshot.drain.wait.seconds`; the
+pool-relative default parallelizes them on a 6+-slot pool. `false` (Model A): the drain runs inline but
 acquires its slot above `snapshot.connection.reservation`, so that many low slots
 are always reachable by non-snapshot readers and can never all be held by drains at
 once — the same slot-floor mechanism the delete-channel reservation uses. Only the
