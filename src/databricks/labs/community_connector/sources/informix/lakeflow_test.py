@@ -1879,6 +1879,30 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(config["db_locale"], "en_US.819")
         self.assertEqual(config["client_locale"], "en_US.utf8")
 
+    def test_locale_honors_spark_lowercased_keys(self):
+        # Spark hands option keys to the Python Data Source lowercased, so a
+        # user's ``CLIENT_LOCALE`` / ``DB_LOCALE`` arrive as ``client_locale`` /
+        # ``db_locale``. The bridge config must pick those up, not fall back to
+        # the utf8 default (which produced 0xa0 decode failures against a
+        # Latin-1 source).
+        config = _bridge_config(
+            {
+                "hostname": "host",
+                "database": "db",
+                "user": "user",
+                "password": "secret",
+                "server": "srv",
+                "client_locale": "en_US.819",
+                "db_locale": "en_US.819",
+            }
+        )
+        self.assertEqual(config["client_locale"], "en_US.819")
+        self.assertEqual(config["db_locale"], "en_US.819")
+        self.assertEqual(
+            informix_module._client_encoding({"client_locale": "en_US.819"}),
+            "iso8859-1",
+        )
+
     def test_partial_preparation_reports_tables_left_enabled(self):
         class PartialTransport:
             def execute(self, sql, parameters=()):
