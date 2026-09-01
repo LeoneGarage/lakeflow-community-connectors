@@ -2214,6 +2214,8 @@ def register_lakeflow_source(spark):
         with connection.cursor() as cursor:
             cursor.execute(_READ_HINTS, {"namespace": namespace, "max_age": float(max_age_seconds)})
             rows = cursor.fetchall()
+        # End the read-only transaction so the connection is never left idle-in-transaction.
+        connection.rollback()
         return {str(name): int(lsn) for name, lsn in rows}
 
 
@@ -2264,6 +2266,8 @@ def register_lakeflow_source(spark):
                 {"namespace": namespace},
             )
             row = cursor.fetchone()
+        # End the read-only transaction so the connection is never left idle-in-transaction.
+        connection.rollback()
         if row is None:
             return None
         return {
@@ -2486,6 +2490,11 @@ def register_lakeflow_source(spark):
         with connection.cursor() as cursor:
             cursor.execute(_SELECT_RECORD, {"namespace": namespace, "record_key": record_key})
             row = cursor.fetchone()
+        # End the implicit transaction a bare SELECT opens. Without this the connection
+        # is left "idle in transaction" and Lakebase reaps it after
+        # idle_in_transaction_session_timeout -- fatal when a caller interleaves a slow
+        # non-Lakebase step (a full-table snapshot scan) before its next state write.
+        connection.rollback()
         if row is None:
             return None
         return _as_dict(row[0])
