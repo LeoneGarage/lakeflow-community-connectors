@@ -212,11 +212,14 @@ transaction, holding a connection slot for the entire scan; with many tables thi
 can consume every slot and starve the streaming/CDC readers waiting for one.
 `snapshot.shared.session` selects the mitigation. Default `true` (Model C): the
 drain runs on a bounded pool of `snapshot.reader.threads` (default
-`max(1, max.concurrent.connections // 3)`, matching the CDC-daemon reservation)
+`max(1, daemon.connection.reservation − 1)`, i.e. one below the CDC-daemon reservation)
 driver-resident daemon workers. Keyless (append-only, no primary key) tables drain
 one-at-a-time through this pool, so a single worker serialized every keyless table's
-initial scan and the later tables sat queued behind it; the
-pool-relative default parallelizes them on a 6+-slot pool. `false` (Model A): the drain runs inline but
+initial scan and the later tables sat queued behind it. Keeping the default one below
+the reservation guarantees the snapshot-drain floor never collapses to 0, so a low slot
+stays reachable by consumer reads even while the drains hold their slots for whole scans;
+it parallelizes drains once the pool is large enough to spare a drain band and still keep
+that consumer floor. `false` (Model A): the drain runs inline but
 acquires its slot above `snapshot.connection.reservation`, so that many low slots
 are always reachable by non-snapshot readers and can never all be held by drains at
 once — the same slot-floor mechanism the delete-channel reservation uses. Only the
