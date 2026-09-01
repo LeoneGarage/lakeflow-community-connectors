@@ -223,16 +223,20 @@ connection:
       description: >
         Model C only (`snapshot.shared.session=true`): the number of daemon workers
         that drain `initial` snapshots concurrently, which is also the ceiling on
-        connection slots snapshots can hold at once. Minimum 1. Default a third of the
-        pool -- max(1, max.concurrent.connections // 3) -- which matches the CDC-daemon
-        reservation, so the drains fill precisely the reserved band below the CDC daemon.
-        Keyless (append-only, no primary key) tables drain one-at-a-time through this
-        pool, so a single worker serializes every keyless table's initial scan and the
-        later tables sit queued behind it; the pool-relative default parallelizes them on
-        a 6+-slot pool. The consumer waits on the drain as a liveness window (it may run
-        as long as it keeps staging pages; see connection.wait.timeout.seconds), so a
-        large keyless table is not capped by a fixed timeout. Keep it below
-        max.concurrent.connections so streaming/CDC readers always retain slots.
+        connection slots snapshots can hold at once. Minimum 1. Default one below the
+        CDC-daemon reservation -- max(1, daemon.connection.reservation - 1), where the
+        reservation is itself about a third of the pool. Keeping it strictly below the
+        reservation guarantees the snapshot-drain floor (daemon.connection.reservation -
+        snapshot.reader.threads) never collapses to 0, so a low slot always stays
+        reachable by consumer reads even while the drains hold their slots for whole
+        scans. Keyless (append-only, no primary key) tables drain one-at-a-time through
+        this pool, so a single worker serializes every keyless table's initial scan and
+        the later tables sit queued behind it; the default parallelizes them once the pool
+        is large enough to spare a drain band and still keep a consumer floor (6-slot pool
+        -> reservation 2 -> 1 worker; 16-slot pool -> reservation 5 -> 4 workers). The
+        consumer waits on the drain as a liveness window (it may run as long as it keeps
+        staging pages; see connection.wait.timeout.seconds), so a large keyless table is
+        not capped by a fixed timeout.
 
     - name: snapshot.connection.reservation
       type: string

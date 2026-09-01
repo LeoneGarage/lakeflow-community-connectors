@@ -5846,16 +5846,36 @@ def register_lakeflow_source(spark):
         return serialized
 
 
+    def _resolve_daemon_reservation(options: dict[str, str], slot_count: int) -> int:
+        """Effective CDC-daemon slot reservation (the ``0`` = auto case resolved).
+
+        Resolution only -- range validation stays in ``_daemon_connection_reservation`` and
+        the constructor. Extracted so ``_resolve_snapshot_reader_threads`` can key its default
+        off the same value without duplicating the auto formula.
+        """
+
+        reservation = int(
+            options.get(_DAEMON_RESERVATION_OPTION, str(_DEFAULT_DAEMON_CONNECTION_RESERVATION))
+        )
+        if reservation == 0:
+            return min(max(1, slot_count // 3), slot_count - 1)
+        return reservation
+
+
     def _resolve_snapshot_reader_threads(options: dict[str, str]) -> int:
         """Number of snapshot-drain workers the pool spawns for these options.
 
-        Shared by the connector (worker count) and the bridge (reservation band) so the
-        two never drift. An explicit ``snapshot.reader.threads`` wins; otherwise the count
-        tracks a third of ``max.concurrent.connections`` -- matching the CDC-daemon
-        reservation, so keyless drains fill precisely the reserved band below the CDC daemon.
-        Keyless drains serialize through this pool, so a flat single worker made every
-        keyless table's initial scan queue behind the last, stalling the later tables on
-        multi-table pipelines.
+        Shared by the connector (worker count) and the bridge (reservation band) so the two
+        never drift. An explicit ``snapshot.reader.threads`` wins; otherwise the count is one
+        below the CDC-daemon reservation. Keeping it strictly below the reservation guarantees
+        the snapshot-drain floor (``daemon.connection.reservation - threads``) never collapses
+        to 0, so a low slot always stays reachable by consumer bootstrap reads even while the
+        drains hold their slots for whole scans -- otherwise the drains grab the lowest slots
+        and, holding them for the entire (uncapped) backfill, starve consumer/CDC reads on a
+        small pool. Keyless drains serialize through this pool, so a flat single worker made
+        every keyless table's initial scan queue behind the last, stalling the later tables on
+        multi-table pipelines; one-below-reservation parallelizes them once the pool is large
+        enough to spare a drain band and still keep a consumer floor.
         """
 
         explicit = options.get(_SNAPSHOT_READER_THREADS_OPTION)
@@ -5864,7 +5884,7 @@ def register_lakeflow_source(spark):
         slot_count = int(
             options.get("max.concurrent.connections", str(_DEFAULT_MAX_CONCURRENT_CONNECTIONS))
         )
-        return max(1, slot_count // 3)
+        return max(1, _resolve_daemon_reservation(options, slot_count) - 1)
 
 
     class PurePythonInformixBridge:
@@ -6155,10 +6175,9 @@ def register_lakeflow_source(spark):
             # at least 1 whenever the pool has 2+ slots, 0 only for a single-slot pool), so a
             # fresh consumer bootstrap read always has slots the daemons cannot pin. Set a
             # positive value to give the daemons more of the pool (down to reserving a single
-            # slot); a single-slot pool reserves nothing because it cannot spare one.
-            if reservation == 0:
-                return min(max(1, slot_count // 3), slot_count - 1)
-            return reservation
+            # slot); a single-slot pool reserves nothing because it cannot spare one. Resolved
+            # through the shared helper so the snapshot-reader-thread default tracks the same value.
+            return _resolve_daemon_reservation(self.options, slot_count)
 
         def _snapshot_daemon_connection_reservation(self, slot_count: int) -> int:
             """Floor for the snapshot-drain daemon: one band below the CDC daemon.
