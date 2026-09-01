@@ -228,9 +228,11 @@ connection:
         reservation, so the drains fill precisely the reserved band below the CDC daemon.
         Keyless (append-only, no primary key) tables drain one-at-a-time through this
         pool, so a single worker serializes every keyless table's initial scan and the
-        later tables time out at `snapshot.drain.wait.seconds` before a worker reaches
-        them; the pool-relative default parallelizes them on a 6+-slot pool. Keep it
-        below max.concurrent.connections so streaming/CDC readers always retain slots.
+        later tables sit queued behind it; the pool-relative default parallelizes them on
+        a 6+-slot pool. The consumer waits on the drain as a liveness window (it may run
+        as long as it keeps staging pages; see connection.wait.timeout.seconds), so a
+        large keyless table is not capped by a fixed timeout. Keep it below
+        max.concurrent.connections so streaming/CDC readers always retain slots.
 
     - name: snapshot.connection.reservation
       type: string
