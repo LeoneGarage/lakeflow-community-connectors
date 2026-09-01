@@ -7419,9 +7419,21 @@ def register_lakeflow_source(spark):
             "user": options["user"],
             "password": options["password"],
             "server": options.get("server"),
-            "db_locale": options.get("DB_LOCALE") or options.get("db.locale") or "en_US.819",
+            "db_locale": (
+                # Spark hands option keys to the Python Data Source lowercased (its
+                # JVM CaseInsensitiveStringMap stores them that way), so a user's
+                # ``DB_LOCALE`` arrives as ``db_locale``. Check the lowercased form
+                # first; keep the original-case and dotted spellings as fallbacks.
+                options.get("db_locale")
+                or options.get("DB_LOCALE")
+                or options.get("db.locale")
+                or "en_US.819"
+            ),
             "client_locale": (
-                options.get("CLIENT_LOCALE") or options.get("client.locale") or "en_US.utf8"
+                options.get("client_locale")
+                or options.get("CLIENT_LOCALE")
+                or options.get("client.locale")
+                or "en_US.utf8"
             ),
             "tls": _option_bool(options, "encrypt", True),
             "ca_file": options.get("ssl.ca.file"),
@@ -13561,7 +13573,14 @@ def register_lakeflow_source(spark):
 
 
     def _client_encoding(options: dict[str, str]) -> str:
-        locale = options.get("CLIENT_LOCALE") or options.get("client.locale") or "en_US.utf8"
+        # Spark lowercases option keys, so ``CLIENT_LOCALE`` arrives as
+        # ``client_locale``; check that first, then the original-case / dotted forms.
+        locale = (
+            options.get("client_locale")
+            or options.get("CLIENT_LOCALE")
+            or options.get("client.locale")
+            or "en_US.utf8"
+        )
         return informix_locale_encoding(locale)
 
 
