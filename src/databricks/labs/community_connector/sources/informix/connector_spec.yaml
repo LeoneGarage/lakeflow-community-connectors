@@ -223,10 +223,14 @@ connection:
       description: >
         Model C only (`snapshot.shared.session=true`): the number of daemon workers
         that drain `initial` snapshots concurrently, which is also the ceiling on
-        connection slots snapshots can hold at once. Minimum 1; default 1. Keep it
-        below max.concurrent.connections so streaming/CDC readers always retain
-        slots (a good starting point is max.concurrent.connections minus
-        cdc.shared.reader.threads minus a small margin).
+        connection slots snapshots can hold at once. Minimum 1. Default a third of the
+        pool -- max(1, max.concurrent.connections // 3) -- which matches the CDC-daemon
+        reservation, so the drains fill precisely the reserved band below the CDC daemon.
+        Keyless (append-only, no primary key) tables drain one-at-a-time through this
+        pool, so a single worker serializes every keyless table's initial scan and the
+        later tables time out at `snapshot.drain.wait.seconds` before a worker reaches
+        them; the pool-relative default parallelizes them on a 6+-slot pool. Keep it
+        below max.concurrent.connections so streaming/CDC readers always retain slots.
 
     - name: snapshot.connection.reservation
       type: string

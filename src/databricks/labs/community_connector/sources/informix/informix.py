@@ -1161,6 +1161,27 @@ def _serialized_sqli_operation(method: Callable[..., Any]) -> Callable[..., Any]
     return serialized
 
 
+def _resolve_snapshot_reader_threads(options: dict[str, str]) -> int:
+    """Number of snapshot-drain workers the pool spawns for these options.
+
+    Shared by the connector (worker count) and the bridge (reservation band) so the
+    two never drift. An explicit ``snapshot.reader.threads`` wins; otherwise the count
+    tracks a third of ``max.concurrent.connections`` -- matching the CDC-daemon
+    reservation, so keyless drains fill precisely the reserved band below the CDC daemon.
+    Keyless drains serialize through this pool, so a flat single worker made every
+    keyless table's initial scan queue behind the last, timing out at
+    ``snapshot.drain.wait.seconds`` on multi-table pipelines.
+    """
+
+    explicit = options.get(_SNAPSHOT_READER_THREADS_OPTION)
+    if explicit is not None:
+        return max(1, int(explicit))
+    slot_count = int(
+        options.get("max.concurrent.connections", str(_DEFAULT_MAX_CONCURRENT_CONNECTIONS))
+    )
+    return max(1, slot_count // 3)
+
+
 class PurePythonInformixBridge:
     """Pure-Python SQLI/CDC bridge validated against disposable Informix 15.
 
@@ -1468,14 +1489,13 @@ class PurePythonInformixBridge:
         """
 
         daemon_reservation = self._daemon_connection_reservation(slot_count)
-        threads = max(
-            1,
-            int(
-                self.options.get(
-                    _SNAPSHOT_READER_THREADS_OPTION, str(_DEFAULT_SNAPSHOT_READER_THREADS)
-                )
-            ),
-        )
+        # Reserve a band exactly as wide as the number of drain workers the pool will
+        # actually spawn -- resolved through the same module helper the connector's
+        # _snapshot_reader_thread_count uses, so a pool-relative default
+        # (max.concurrent.connections // 3) and an explicit override both stay in lockstep
+        # with the reservation. A flat constant here would under-reserve once the default
+        # scales with the pool.
+        threads = _resolve_snapshot_reader_threads(self.options)
         return max(0, daemon_reservation - threads)
 
     def _connection_sweep_rank_scale(self) -> float:
@@ -6783,15 +6803,7 @@ class InformixLakeflowConnect(LakeflowConnect):
         return _option_bool(self.options, _SNAPSHOT_SHARED_SESSION_OPTION, True)
 
     def _snapshot_reader_thread_count(self) -> int:
-        return max(
-            1,
-            int(
-                self.options.get(
-                    _SNAPSHOT_READER_THREADS_OPTION,
-                    str(_DEFAULT_SNAPSHOT_READER_THREADS),
-                )
-            ),
-        )
+        return _resolve_snapshot_reader_threads(self.options)
 
     def _snapshot_drain_reader_factory(self) -> Callable[[], "InformixLakeflowConnect"]:
         # The daemon worker gets its OWN options copy with shared mode cleared, so its
