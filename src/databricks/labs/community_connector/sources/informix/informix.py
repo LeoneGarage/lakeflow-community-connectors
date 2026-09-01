@@ -3736,10 +3736,19 @@ class _SnapshotDrainPool:
 
     The consumer's ``wait`` is a *liveness watchdog*, not a total-duration deadline: the
     drain reports progress (via ``report_progress``) each time it stages a page, and the
-    wait trips only after the drain has gone quiet for a whole idle window. A large table
-    that is steadily staging pages runs as long as it needs; a wedged drain (a hung fetch,
-    or a dead worker thread) stages nothing and trips after one window. Because progress is
-    tied to *actual staged pages*, a hung fetch cannot masquerade as liveness.
+    wait trips only after progress has gone quiet for a whole idle window. Liveness is
+    scoped by state so a job is neither failed early nor kept alive on someone else's work:
+
+    - A **running** job (a worker has picked it up) is measured from *its own* staged
+      pages, so a hung fetch on its worker trips even while other workers advance.
+    - A **queued** job (waiting for a free worker) is measured from *pool-wide* progress,
+      so it waits its turn behind a large, healthy drain instead of failing while queued,
+      and only trips when the whole pool goes quiet.
+
+    Because progress is tied to *actual staged pages* (plus a pickup), a hung fetch cannot
+    masquerade as liveness. At most K workers drain at once, so at most K slots are ever
+    held by snapshots -- the fairness guarantee that keeps streaming readers from being
+    starved. A consumer subscribes a job and waits, holding no slot, for its result.
     """
 
     def __init__(self) -> None:
@@ -3752,8 +3761,16 @@ class _SnapshotDrainPool:
         # job key -> None on success, or the Exception to re-raise to the waiter.
         self.results: dict[tuple, Any] = {}
         # job key -> monotonic timestamp of the last forward progress (enqueue, worker
-        # pickup, or a staged page). The waiter's idle window is measured from this.
+        # pickup, or a staged page). A *running* job's waiter is measured from this, so a
+        # hung fetch on its own worker is caught even while other workers progress.
         self.progress: dict[tuple, float] = {}
+        # Job keys a worker has picked up and is actively draining (vs. still queued).
+        self.running: set = set()
+        # Pool-wide last-progress clock, bumped by any worker's pickup or staged page. A
+        # *queued* job's waiter is measured from max(its own, this), so it waits its turn
+        # as long as the pool as a whole is draining something -- and only times out when
+        # the whole pool goes quiet, not merely because a big drain is ahead of it.
+        self.last_progress_any: float = 0.0
         self.reader_factory: Callable[[], Any] | None = None
         self.thread_count = _DEFAULT_SNAPSHOT_READER_THREADS
 
@@ -3783,25 +3800,52 @@ class _SnapshotDrainPool:
                 self.progress[job_key] = time.monotonic()
                 self.condition.notify_all()
 
-    def report_progress(self, job_key) -> None:
-        """Record forward progress on a job so the waiter's idle window resets."""
+    def mark_running(self, job_key) -> None:
+        """Record that a worker has picked this job up (it is no longer merely queued)."""
 
         with self.condition:
+            self.running.add(job_key)
+            now = time.monotonic()
             if job_key in self.pending:
-                self.progress[job_key] = time.monotonic()
-                self.condition.notify_all()
+                self.progress[job_key] = now
+            # Picking a job up is pool progress: it proves a worker just freed and took
+            # the next job, so every queued waiter's idle window resets.
+            self.last_progress_any = now
+            self.condition.notify_all()
+
+    def report_progress(self, job_key) -> None:
+        """Record forward progress on a job so waiters' idle windows reset.
+
+        A staged page advances both this job's own clock (for its running waiter) and the
+        pool-wide clock (for every queued waiter), so a queued job stays alive as long as
+        any worker is draining.
+        """
+
+        with self.condition:
+            now = time.monotonic()
+            if job_key in self.pending:
+                self.progress[job_key] = now
+            self.last_progress_any = now
+            self.condition.notify_all()
 
     def wait(self, job_key, idle_timeout):
         """Block until the job finishes, fails, or goes quiet for ``idle_timeout``.
 
         Returns True on success, re-raises the worker's exception on failure, and returns
-        False only when the drain has reported no progress for a full ``idle_timeout`` --
-        i.e. it is stalled, not merely slow.
+        False only when the drain is *stalled*. "Stalled" means different things by state:
+        a **running** job must make its own progress (a hung fetch on its worker times
+        out even while other workers advance); a **queued** job only needs the pool to be
+        making progress (it waits its turn behind a big, healthy drain rather than failing
+        while it is still queued). Either way it fails once the whole pool goes quiet.
         """
 
         with self.condition:
             while job_key in self.pending:
-                last = self.progress.get(job_key, time.monotonic())
+                own = self.progress.get(job_key, time.monotonic())
+                if job_key in self.running:
+                    last = own
+                else:
+                    last = max(own, self.last_progress_any)
                 remaining = (last + idle_timeout) - time.monotonic()
                 if remaining <= 0:
                     return False
@@ -3872,10 +3916,10 @@ def _run_snapshot_drain_worker(pool: _SnapshotDrainPool) -> None:
             job_key = pool.queue.popleft()
             job = pool.jobs.get(job_key)
             factory = pool.reader_factory
-        # Picking the job up is itself progress: reset the consumer's idle clock so the
-        # startup phase (slot acquisition + first page) gets a fresh window rather than
-        # being charged for time the job spent queued behind other drains.
-        pool.report_progress(job_key)
+        # Mark the job running (so its waiter switches from pool-wide to own-progress
+        # liveness) and reset the idle clock: startup (slot acquisition + first page) gets
+        # a fresh window, and every still-queued job sees this pickup as pool progress.
+        pool.mark_running(job_key)
         result: Any = None
         reader = None
         if job is not None and factory is not None:
@@ -3906,6 +3950,7 @@ def _run_snapshot_drain_worker(pool: _SnapshotDrainPool) -> None:
         with pool.condition:
             pool.jobs.pop(job_key, None)
             pool.pending.discard(job_key)
+            pool.running.discard(job_key)
             pool.progress.pop(job_key, None)
             pool.results[job_key] = result
             pool.condition.notify_all()

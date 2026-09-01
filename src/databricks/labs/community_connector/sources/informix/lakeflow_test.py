@@ -9344,6 +9344,57 @@ class SnapshotDrainPoolTests(unittest.TestCase):
         with self.assertRaisesRegex(InformixError, "drain failed"):
             pool.wait(("k",), 2.0)
 
+    def test_queued_job_waits_while_the_pool_makes_progress(self):
+        # A queued job (no worker yet) must not time out while another drain is healthily
+        # progressing ahead of it -- it waits its turn rather than failing behind a big drain.
+        pool = _SnapshotDrainPool()
+        pool.submit(("A",), table=None, options={}, pipeline_scope="s", allow_keyless=False)
+        pool.mark_running(("A",))  # A is draining
+        pool.submit(("B",), table=None, options={}, pipeline_scope="s", allow_keyless=False)
+
+        def drive():
+            for _ in range(6):  # 0.3s of pool progress, well past B's 0.1s idle window
+                time.sleep(0.05)
+                pool.report_progress(("A",))
+            with pool.condition:  # A finishes, B is served
+                pool.pending.discard(("B",))
+                pool.running.discard(("B",))
+                pool.progress.pop(("B",), None)
+                pool.results[("B",)] = None
+                pool.condition.notify_all()
+
+        driver = threading.Thread(target=drive, daemon=True)
+        driver.start()
+        self.assertTrue(pool.wait(("B",), 0.1))  # B rode out A's drain, never tripped
+        driver.join(timeout=2)
+
+    def test_running_job_trips_on_its_own_stall_even_while_pool_progresses(self):
+        # A running job is measured from its OWN progress: a hung fetch on its worker
+        # trips even though another worker keeps the pool clock fresh.
+        pool = _SnapshotDrainPool()
+        pool.submit(("A",), table=None, options={}, pipeline_scope="s", allow_keyless=False)
+        pool.mark_running(("A",))  # picked up, then stalls -- never reports again
+        stop = threading.Event()
+
+        def other_worker():
+            while not stop.is_set():
+                pool.report_progress(("B",))  # another worker advancing the pool clock
+                time.sleep(0.02)
+
+        noise = threading.Thread(target=other_worker, daemon=True)
+        noise.start()
+        try:
+            self.assertFalse(pool.wait(("A",), 0.1))  # own stall trips despite pool activity
+        finally:
+            stop.set()
+            noise.join(timeout=2)
+
+    def test_queued_job_trips_when_the_whole_pool_is_quiet(self):
+        # With nothing running and no progress anywhere, a queued job still times out.
+        pool = _SnapshotDrainPool()
+        pool.submit(("B",), table=None, options={}, pipeline_scope="s", allow_keyless=False)
+        self.assertFalse(pool.wait(("B",), 0.05))
+
 
 class SnapshotDaemonSeamTests(unittest.TestCase):
     """Model C end to end: the consumer frees its slot, a daemon worker drains and stages
