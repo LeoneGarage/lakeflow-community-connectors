@@ -4954,6 +4954,20 @@ def register_lakeflow_source(spark):
     _SNAPSHOT_READER_THREADS_OPTION = "snapshot.reader.threads"
     _DEFAULT_SNAPSHOT_READER_THREADS = 1
     _SNAPSHOT_RESERVATION_OPTION = "snapshot.connection.reservation"
+    # Isolation level for the monolithic ``snapshot.mode=initial`` full-table snapshot. A
+    # table option: the isolation trade-off is per table, not per connection. Maps a small
+    # validated token to a fixed SQL clause (so the value can never be SQL-injected). The
+    # default is COMMITTED READ LAST COMMITTED -- it reads the last-committed image of a
+    # locked row instead of taking held shared locks, so the scan does not lock the table
+    # against writers; the cost is that rows inserted DURING the scan can be captured by both
+    # the snapshot and the CDC stream, which a key-less table cannot de-duplicate (see the
+    # README warning). REPEATABLE READ restores the exactly-once, table-locking behaviour.
+    _SNAPSHOT_ISOLATION_OPTION = "snapshot.isolation"
+    _DEFAULT_SNAPSHOT_ISOLATION = "committed_read_last_committed"
+    _SNAPSHOT_ISOLATION_SQL = {
+        "committed_read_last_committed": "COMMITTED READ LAST COMMITTED",
+        "repeatable_read": "REPEATABLE READ",
+    }
     # Private per-read marker: set on a reader's options while it performs a snapshot-phase
     # read, so the lazy slot acquisition can apply the reservation floor. Mirrors how the
     # channel and attempt-budget options are threaded to the bridge.
@@ -6902,15 +6916,22 @@ def register_lakeflow_source(spark):
             ]
 
         @contextlib.contextmanager
-        def _repeatable_read_transaction(self):
-            """Run a REPEATABLE READ transaction with the snapshot socket timeout.
+        def _repeatable_read_transaction(self, isolation: str = "REPEATABLE READ"):
+            """Run a snapshot transaction at ``isolation`` with the snapshot socket timeout.
 
             Yields ``execute_command``. Commits on success and rolls back on any
             error, preserving the primary error if rollback also fails. Isolates
             the ANSI/non-ANSI transaction handling shared by the blocking
             consistent snapshot and per-chunk incremental snapshot reads.
+
+            ``isolation`` is the SQL clause after ``SET ISOLATION TO`` and must be one
+            of the fixed clauses in ``_SNAPSHOT_ISOLATION_SQL`` -- it is interpolated
+            into a statement, so it is guarded here against anything else even though
+            the connector already maps it from a validated token.
             """
 
+            if isolation not in _SNAPSHOT_ISOLATION_SQL.values():
+                raise InformixError(f"Unsupported snapshot isolation {isolation!r}")
             execute_command = getattr(self.transport, "execute_command", self.transport.execute)
             ansi_rows = self.transport.execute(
                 "SELECT is_ansi FROM sysmaster:sysdatabases WHERE name = ?",
@@ -6925,7 +6946,7 @@ def register_lakeflow_source(spark):
                 # The catalog SELECT starts an implicit transaction in an ANSI
                 # database. End it before establishing the snapshot isolation.
                 execute_command("COMMIT WORK")
-            execute_command("SET ISOLATION TO REPEATABLE READ")
+            execute_command(f"SET ISOLATION TO {isolation}")
             if not is_ansi:
                 execute_command("BEGIN WORK")
             set_socket_timeout = getattr(self.transport, "set_socket_timeout", None)
@@ -7049,20 +7070,29 @@ def register_lakeflow_source(spark):
             datetime_primary_key=False,
             page_consumer=None,
             snapshot_filter=None,
+            isolation="REPEATABLE READ",
         ):
-            """Read one bounded point-in-time snapshot in a repeatable-read transaction."""
+            """Read one bounded point-in-time snapshot at ``isolation``.
+
+            ``isolation`` defaults to REPEATABLE READ, which freezes the scanned rows
+            so the snapshot is exactly the committed state as-of ``snapshot_lsn``. A
+            non-locking level (e.g. COMMITTED READ LAST COMMITTED) avoids locking the
+            table but no longer freezes it, so rows committed during the scan may be
+            captured here and replayed by CDC -- harmless for a keyed table (the sink
+            de-duplicates), a duplicate-row risk for a key-less one.
+            """
 
             self._ensure_connected()
 
             # Informix SQLI does not expose parameter binding, so keyset pagination
             # must render continuation values as SQL literals. Some valid partial
             # DATETIME values are rejected when parsed back by Informix (-1263).
-            # Within this repeatable-read transaction, positional pagination is
-            # stable and avoids converting DATETIME keys back into SQL.
+            # Within this snapshot transaction, positional pagination is stable and
+            # avoids converting DATETIME keys back into SQL.
             positional_pagination = bool(datetime_primary_key)
 
             self._ensure_connected()
-            with self._repeatable_read_transaction():
+            with self._repeatable_read_transaction(isolation):
                 snapshot_lsn = self.current_lsn()
                 rows: list[dict[str, Any]] = []
                 retained_bytes = _deep_size(rows) if max_bytes else 0
@@ -11175,6 +11205,7 @@ def register_lakeflow_source(spark):
                     ),
                     page_consumer=stage_page,
                     snapshot_filter=_snapshot_filter(options),
+                    isolation=self._snapshot_isolation(options),
                 )
                 try:
                     snapshot_lsn = _strict_lsn(snapshot_lsn, "snapshot_lsn")
@@ -11390,6 +11421,29 @@ def register_lakeflow_source(spark):
 
         def _shared_cdc_enabled(self) -> bool:
             return _option_bool(self.options, _SHARED_CDC_SESSION_OPTION, True)
+
+        def _snapshot_isolation(self, options: dict[str, str]) -> str:
+            """Resolve the ``snapshot.isolation`` table option to its SQL clause.
+
+            Defaults to COMMITTED READ LAST COMMITTED (non-locking; see the README
+            duplicate warning). Tokens are whitespace/hyphen-insensitive; an unknown
+            value fails loudly rather than silently falling back.
+            """
+
+            token = (
+                str(options.get(_SNAPSHOT_ISOLATION_OPTION, _DEFAULT_SNAPSHOT_ISOLATION))
+                .strip()
+                .lower()
+                .replace("-", "_")
+                .replace(" ", "_")
+            )
+            try:
+                return _SNAPSHOT_ISOLATION_SQL[token]
+            except KeyError:
+                raise ValueError(
+                    f"Option '{_SNAPSHOT_ISOLATION_OPTION}' must be one of "
+                    f"{sorted(_SNAPSHOT_ISOLATION_SQL)}; got {token!r}"
+                ) from None
 
         def _snapshot_shared_enabled(self) -> bool:
             return _option_bool(self.options, _SNAPSHOT_SHARED_SESSION_OPTION, True)

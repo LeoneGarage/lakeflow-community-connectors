@@ -438,6 +438,20 @@ connection:
         Semicolons, SQL comments, control characters, and predicates longer than
         8192 characters are rejected.
 
+    - name: snapshot.isolation
+      type: string
+      required: false
+      description: >
+        Per-table isolation level for the monolithic `snapshot.mode=initial`
+        full-table snapshot. `committed_read_last_committed` (default) reads the
+        last-committed image of a locked row instead of holding shared locks, so
+        the snapshot does NOT lock the table against writers; but because it no
+        longer freezes the table, rows inserted during the scan can be captured by
+        both the snapshot and the change stream. A keyed table de-duplicates these
+        by primary key; a KEYLESS table cannot, so it may emit DUPLICATE rows. Set
+        `repeatable_read` to restore the exactly-once, table-locking behavior.
+        Tokens are case- and whitespace-insensitive; unknown values are rejected.
+
     - name: append.only.ingestion
       type: string
       required: false
@@ -843,4 +857,4 @@ connection:
 
 # Exact per-table overrides consumed by the connector. `qualified_source_table` maps a
 # pipeline table to a dynamically discovered exposed name (`owner.table`).
-external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys"
+external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys"
