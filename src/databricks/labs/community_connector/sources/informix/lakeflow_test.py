@@ -8517,12 +8517,29 @@ class SharedCdcOptionTests(unittest.TestCase):
     def test_shared_session_enables(self):
         self.assertTrue(self._connector(**{"cdc.shared.session": "true"})._shared_cdc_enabled())
 
-    def test_thread_count_defaults_to_connection_budget(self):
-        self.assertEqual(self._connector()._shared_cdc_thread_count(), 16)
+    def test_thread_count_defaults_to_quarter_of_pool(self):
+        # Per-channel threads default to a quarter of the pool: with both channels sharded
+        # independently that keeps total daemon slot demand (2K) near half the pool,
+        # leaving room for consumer bootstrap reads and the snapshot drain.
+        self.assertEqual(self._connector()._shared_cdc_thread_count(), 4)  # 16 // 4
+
+    def test_thread_count_default_tracks_max_connections(self):
+        self.assertEqual(
+            self._connector(**{"max.concurrent.connections": "6"})._shared_cdc_thread_count(),
+            1,  # 6 // 4 -> floored, then max(1, ...)
+        )
 
     def test_thread_count_override(self):
         self.assertEqual(
             self._connector(**{"cdc.shared.reader.threads": "4"})._shared_cdc_thread_count(), 4
+        )
+
+    def test_thread_count_override_ignores_pool_size(self):
+        self.assertEqual(
+            self._connector(
+                **{"cdc.shared.reader.threads": "8", "max.concurrent.connections": "6"}
+            )._shared_cdc_thread_count(),
+            8,
         )
 
     def test_invalid_shared_session_value_rejected(self):
@@ -9015,6 +9032,30 @@ class DaemonReaderFactoryMarkerTests(unittest.TestCase):
             reader.options.get(informix_module._SNAPSHOT_DAEMON_SLOT_MARKER_OPTION), "true"
         )
         self.assertNotEqual(reader.options.get(informix_module._DAEMON_SLOT_MARKER_OPTION), "true")
+
+    def test_snapshot_drain_reader_waits_for_the_full_drain_window(self):
+        # The worker must be as patient acquiring a slot as the consumer is waiting for the
+        # drain: it inherits connection.wait.timeout.seconds = snapshot.drain.wait.seconds,
+        # so under a contended pool it rides out the churn instead of dying at the 600s
+        # connection default while the consumer would still have waited.
+        connector = self._connector(**{"snapshot.drain.wait.seconds": "1800"})
+        reader = connector._snapshot_drain_reader_factory()()
+        self.assertEqual(reader.options.get("connection.wait.timeout.seconds"), "1800")
+
+    def test_snapshot_drain_reader_default_wait_matches_drain_default(self):
+        reader = self._connector()._snapshot_drain_reader_factory()()
+        self.assertEqual(
+            reader.options.get("connection.wait.timeout.seconds"),
+            str(int(informix_module._SNAPSHOT_DRAIN_WAIT_SECONDS)),
+        )
+
+    def test_snapshot_drain_reader_drops_inherited_attempt_budget(self):
+        # A per-read attempt budget from the consumer would cap the slot wait below the
+        # drain window, so the factory clears it on the worker's copy.
+        connector = self._connector()
+        connector.options[informix_module._CONNECTION_ATTEMPT_BUDGET_OPTION] = "5"
+        reader = connector._snapshot_drain_reader_factory()()
+        self.assertIsNone(reader.options.get(informix_module._CONNECTION_ATTEMPT_BUDGET_OPTION))
 
 
 class SnapshotDrainMarkerTests(unittest.TestCase):
