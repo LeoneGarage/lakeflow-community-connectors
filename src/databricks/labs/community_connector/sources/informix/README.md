@@ -91,6 +91,7 @@ replicated — run a full refresh if the destination must match the source exact
 | `snapshot.mode` | No | `incremental` | Per-table snapshot policy: `incremental`, `initial`, `initial_only`, `cdc_only`, `auto_snapshot`, or `recovery`. See [Snapshot modes](#snapshot-modes). |
 | `snapshot.page.size` | No | `20000` | Rows per immutable staged page for CDC-capable tables; minimum `1`. Pages are read under one repeatable-read transaction and delivered through checkpointed Lakeflow microbatches. |
 | `snapshot.filter` | No | none | Per-table Informix SQL predicate appended to snapshot `SELECT` statements, without the `WHERE` keyword. It filters blocking, incremental, append-only initial, and snapshot-only copies. CDC events after the snapshot are not filtered. Semicolons, SQL comments, control characters, and predicates longer than 8,192 characters are rejected. |
+| `snapshot.isolation` | No | `committed_read_last_committed` | Per-table isolation level for the monolithic `snapshot.mode=initial` full-table snapshot. `committed_read_last_committed` (default) reads the last-committed image of a locked row instead of holding shared locks, so the snapshot does **not** lock the table against writers. `repeatable_read` restores the exactly-once, table-locking behavior. Tokens are case- and whitespace-insensitive; unknown values are rejected. **⚠️ Duplicate-row warning:** under `committed_read_last_committed` the table is no longer frozen at the snapshot LSN, so a row inserted **during** the scan can be captured by both the snapshot and the change stream. A keyed table de-duplicates these by primary key, but a **keyless (append-only) table has no key to de-duplicate on and may therefore emit duplicate rows**. Use `repeatable_read` for keyless tables that require exactly-once, or run the `initial` backfill during a quiet window. See [Snapshot isolation](#snapshot-isolation). |
 | `snapshot.read.timeout.seconds` | No | `300` | SQLI socket read timeout while fetching transactional snapshot pages; minimum `1`. |
 | `cdc.read.timeout.seconds` | No | `60` | SQLI socket read timeout for CDC session setup and teardown (open/start/activate/end/close) when validating the initial CDC boundary. Raise it if `syscdcv1` teardown stalls under many concurrent CDC sessions. |
 | `snapshot.max.rows` | No | `0` | Optional total row bound for a staged CDC snapshot. `0` disables the bound. Snapshot-only tables remain limited to 100,000 rows when this option is `0`. |
@@ -118,7 +119,7 @@ replicated — run a full refresh if the destination must match the source exact
 Because per-table options are supported, configure the Unity Catalog connection with this exact `externalOptionsAllowList`:
 
 ```text
-qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records
+qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records
 ```
 
 Create the connection from the Lakeflow Community Connector flow on the **Add Data** page, with the Databricks CLI, or with the Databricks SDK for Python. The Unity Catalog connection type must be `COMMUNITY`, and `sourceName` must be `informix`.
@@ -151,7 +152,7 @@ databricks connections create --json "$(jq -n \
       encrypt: "true",
       "snapshot.staging.location": "/Volumes/main/informix_cdc/staging",
       "lakebase.password": $lakebase_password,
-      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys"
+      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys"
     }
   }')"
 
@@ -189,7 +190,7 @@ databricks connections update informix_sales --json "$(jq -n \
       "ssl.ca.file": "/Volumes/catalog/schema/artifacts/informix-ca.pem",
       "snapshot.staging.location": "/Volumes/main/informix_cdc/staging",
       "lakebase.password": $lakebase_password,
-      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys"
+      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys"
     }
   }')" \
   --profile "$DATABRICKS_PROFILE"
@@ -236,7 +237,7 @@ connection = w.connections.create(
         "lakebase.password": os.environ["LAKEBASE_PASSWORD"],
         "externalOptionsAllowList": (
             "qualified_source_table,decimal.variable.type,decimal.variable.column.type,"
-            "snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,"
+            "snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,"
             "append.only.ingestion,"
             "max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys"
         ),
@@ -277,7 +278,7 @@ connection = w.connections.update(
         "lakebase.password": os.environ["LAKEBASE_PASSWORD"],
         "externalOptionsAllowList": (
             "qualified_source_table,decimal.variable.type,decimal.variable.column.type,"
-            "snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.max.rows,snapshot.max.bytes,"
+            "snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,"
             "append.only.ingestion,"
             "max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys"
         ),
@@ -455,6 +456,17 @@ For a CDC-capable table, the connector defaults to an `incremental` snapshot: it
 
 Selecting `snapshot.mode=initial` uses the earlier blocking strategy instead: the SQLI bridge establishes one repeatable-read transaction, captures a single snapshot LSN, and reads the bounded initial snapshot in complete primary-key order before commit. Non-ANSI databases use explicit `BEGIN WORK`; ANSI databases use their implicit transaction after committing the catalog-mode probe. Snapshot rows use the transactional snapshot LSN, and both channels advance directly to that same boundary because the snapshot already represents all committed state visible there. The earlier prepared LSN ensures full-row logging and a valid capture window while the snapshot is established; it is not replayed after the completed snapshot.
 
+### Snapshot isolation
+
+The `snapshot.mode=initial` full-table snapshot runs in a single transaction, so its isolation level governs the whole scan. The per-table `snapshot.isolation` option selects it:
+
+- **`committed_read_last_committed`** (default) — Informix reads the last-committed image of any row locked by a concurrent writer instead of taking and holding shared locks. The scan therefore **does not lock the table against writes** for its whole duration.
+- **`repeatable_read`** — the scan holds shared locks on every row it reads until commit, freezing the table (a sequential scan effectively locks the whole table). This blocks concurrent `INSERT`/`UPDATE`/`DELETE` for the entire drain, which for a large keyless table can be minutes.
+
+> **⚠️ Duplicate rows under `committed_read_last_committed`.** The gapless handoff to CDC works by capturing `snapshot_lsn` at the start of the scan and having the stream replay everything committed after it. `repeatable_read` freezes the table at that LSN, so each row is emitted exactly once. `committed_read_last_committed` does **not** freeze it: a row inserted *during* the multi-minute scan can be read into the snapshot **and** replayed by CDC (its commit LSN is greater than `snapshot_lsn`). A **keyed** table de-duplicates these by primary key at the sink, so this is harmless. A **keyless (append-only) table has no key to de-duplicate on and will emit duplicate rows** for anything inserted during the scan. For keyless tables that require exactly-once, set `snapshot.isolation=repeatable_read`, run the `initial` backfill during a quiet window, or use the default `cdc_only` mode (which takes no snapshot at all).
+
+This option applies only to the monolithic `initial` snapshot. The default `incremental`/`auto_snapshot` strategy reads each chunk in its own short repeatable-read transaction regardless, so it never holds a whole-table lock.
+
 To validate the ANSI transaction sequence against a live ANSI-mode database, supply the standard `CONNECTOR_TEST_CONFIG_JSON` or `CONNECTOR_TEST_CONFIG_PATH` configuration with `ansi.live.validation=true` and `ansi.test.table=owner.table`, then run `ansi_live_test.py`. The selected table must have a primary key and no more than 10,000 rows.
 
 Only complete committed transactions are emitted. Inserts and update after-images go to the data channel; deletes go to an independently checkpointed delete channel. Delete output contains the primary-key fields and connector metadata. A primary-key update emits the new row and deletes the old key. Rollbacks are suppressed. Transactions are never split: `cdc.max.records` and `max.records.per.batch` are soft targets, and a transaction already observed is read through commit/rollback unless Informix returns TIMEOUT. CDC metadata and timeout control frames do not consume the `cdc.max.records` budget. Record and estimated retained-memory bounds limit each poll. Replay is transaction-atomic: another transaction's checkpoint never removes earlier records from a newly committed interleaved transaction. Continuous runs follow new commits without a mode-specific option.
@@ -577,7 +589,7 @@ node is removed, the affected pipeline fails closed and requires a full refresh.
 }
 ```
 
-Supported source-specific table options are `qualified_source_table`, `decimal.variable.type`, `decimal.variable.column.type`, `snapshot.mode`, `snapshot.page.size`, `snapshot.filter`, `snapshot.max.rows`, `snapshot.max.bytes`, `max.records.per.batch`, `cdc.timeout`, and `cdc.max.records`. `qualified_source_table` maps the pipeline's logical table name to an Informix `owner.table` name. Standard destination, SCD, key, sequence, and clustering options remain available.
+Supported source-specific table options are `qualified_source_table`, `decimal.variable.type`, `decimal.variable.column.type`, `snapshot.mode`, `snapshot.page.size`, `snapshot.filter`, `snapshot.isolation`, `snapshot.max.rows`, `snapshot.max.bytes`, `max.records.per.batch`, `cdc.timeout`, and `cdc.max.records`. `qualified_source_table` maps the pipeline's logical table name to an Informix `owner.table` name. Standard destination, SCD, key, sequence, and clustering options remain available.
 
 ### Snapshot modes
 

@@ -199,6 +199,7 @@ class FakeBridge:
         self.snapshot_max_bytes = []
         self.snapshot_max_rows = []
         self.snapshot_filters = []
+        self.snapshot_isolations = []
         self.prepared_identities = []
         self.validated_initial = []
         self.change_reads = []
@@ -284,11 +285,13 @@ class FakeBridge:
         datetime_primary_key=False,
         page_consumer=None,
         snapshot_filter=None,
+        isolation="REPEATABLE READ",
     ):
         del identity, columns, primary_keys, datetime_primary_key
         self.snapshot_max_bytes.append(max_bytes)
         self.snapshot_max_rows.append(max_rows)
         self.snapshot_filters.append(snapshot_filter)
+        self.snapshot_isolations.append(isolation)
         if max_rows and len(self.rows) > max_rows:
             raise InformixError(f"Initial snapshot exceeds snapshot.max.rows={max_rows}")
         if page_consumer is not None:
@@ -9313,6 +9316,106 @@ class SnapshotDaemonSeamTests(unittest.TestCase):
             pre_wait_conn,
             "the post-wait manifest read reopened a fresh connection",
         )
+
+
+class SnapshotIsolationOptionTests(unittest.TestCase):
+    """The snapshot.isolation table option selects the SET ISOLATION level used by the
+    monolithic initial snapshot, defaulting to the non-locking COMMITTED READ LAST
+    COMMITTED."""
+
+    def setUp(self):
+        self._shared_state = tempfile.TemporaryDirectory()
+        self._lakebase = _OfflineLakebase().install(self)
+
+    def tearDown(self):
+        self._shared_state.cleanup()
+
+    def _connector(self, **options):
+        connector = InformixLakeflowConnect(
+            {
+                "database": "demo",
+                "snapshot.staging.location": self._shared_state.name,
+                "lakebase.password": "test-state-password",
+                "snapshot.mode": "initial",
+                "snapshot.shared.session": "false",
+                "cdc.shared.session": "false",
+                **options,
+            }
+        )
+        # Unique scope per connector: staged snapshot state is keyed by scope and these
+        # classes run under two file paths in one process, so a fixed scope would collide.
+        connector.set_registration_scope(hashlib.sha256(os.urandom(16)).hexdigest()[:32])
+        connector._bridge_instance = FakeBridge()
+        return connector
+
+    def test_defaults_to_last_committed(self):
+        self.assertEqual(self._connector()._snapshot_isolation({}), "COMMITTED READ LAST COMMITTED")
+
+    def test_repeatable_read_selectable(self):
+        self.assertEqual(
+            self._connector()._snapshot_isolation({"snapshot.isolation": "repeatable_read"}),
+            "REPEATABLE READ",
+        )
+
+    def test_token_is_whitespace_and_case_insensitive(self):
+        self.assertEqual(
+            self._connector()._snapshot_isolation(
+                {"snapshot.isolation": "Committed Read Last Committed"}
+            ),
+            "COMMITTED READ LAST COMMITTED",
+        )
+
+    def test_invalid_value_raises(self):
+        with self.assertRaises(ValueError):
+            self._connector()._snapshot_isolation({"snapshot.isolation": "dirty_read"})
+
+    def test_initial_snapshot_uses_last_committed_by_default(self):
+        connector = self._connector()
+        connector.read_table("app.orders", {}, {})
+        self.assertEqual(
+            connector._bridge_instance.snapshot_isolations, ["COMMITTED READ LAST COMMITTED"]
+        )
+
+    def test_initial_snapshot_honors_repeatable_read_table_option(self):
+        connector = self._connector()
+        connector.read_table("app.orders", {}, {"snapshot.isolation": "repeatable_read"})
+        self.assertEqual(connector._bridge_instance.snapshot_isolations, ["REPEATABLE READ"])
+
+    def test_bridge_emits_last_committed_set_isolation(self):
+        # The transaction helper interpolates the isolation into the SET statement;
+        # confirm the last-committed clause reaches Informix verbatim.
+        class RecordingTransport:
+            def __init__(self):
+                self.sql = []
+
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                del parameters, max_result_bytes
+                self.sql.append(sql)
+                if "sysmaster:sysdatabases" in sql:
+                    return [{"is_ansi": 0}]
+                return []
+
+            def execute_command(self, sql):
+                self.sql.append(f"COMMAND:{sql}")
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {"database": "demo"}
+        bridge.config = {"database": "demo"}
+        bridge.transport = RecordingTransport()
+
+        with bridge._repeatable_read_transaction("COMMITTED READ LAST COMMITTED"):
+            pass
+        self.assertIn(
+            "COMMAND:SET ISOLATION TO COMMITTED READ LAST COMMITTED", bridge.transport.sql
+        )
+
+    def test_bridge_rejects_unknown_isolation(self):
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {"database": "demo"}
+        bridge.config = {"database": "demo"}
+        with self.assertRaises(informix_module.InformixError):
+            with bridge._repeatable_read_transaction("DROP TABLE users"):
+                pass
 
 
 if __name__ == "__main__":
