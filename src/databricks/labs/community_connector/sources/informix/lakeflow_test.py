@@ -9574,5 +9574,89 @@ class SnapshotIsolationOptionTests(unittest.TestCase):
                 pass
 
 
+class FairSlotQueueWiringTests(unittest.TestCase):
+    """_acquire_connection_slot enqueues a fair-queue ticket, waits its turn, and
+    always drops the ticket -- unless the kill-switch reverts to the raw race."""
+
+    def setUp(self):
+        self._lakebase = _OfflineLakebase().install(self)
+
+    def _bridge(self, **options):
+        return informix_module.PurePythonInformixBridge(
+            {
+                "hostname": "localhost",
+                "database": "demo",
+                "user": "informix",
+                "password": "secret",
+                "server": "demo_on",
+                "lakebase.password": "test-state-password",
+                "max.concurrent.connections": "1",
+                **options,
+            }
+        )
+
+    def _waiters(self, namespace):
+        return sorted(ticket for (ns, ticket) in self._lakebase.database.waiters if ns == namespace)
+
+    def _stop_heartbeat(self, bridge):
+        stop = getattr(bridge, "_connection_slot_heartbeat_stop", None)
+        if stop is not None:
+            stop.set()
+
+    def test_fair_queue_passes_a_ticket_to_acquire(self):
+        bridge = self._bridge()
+        captured = {}
+        real = informix_module.acquire_slot
+
+        def spy(*args, **kwargs):
+            captured["ticket_id"] = kwargs.get("ticket_id")
+            return real(*args, **kwargs)
+
+        with mock.patch.object(informix_module, "acquire_slot", side_effect=spy):
+            bridge._acquire_connection_slot()
+        self.addCleanup(self._stop_heartbeat, bridge)
+        self.assertIsNotNone(captured["ticket_id"])
+
+    def test_kill_switch_passes_no_ticket(self):
+        bridge = self._bridge(**{"connection.fair.queue.enabled": "false"})
+        captured = {"ticket_id": "unset"}
+        real = informix_module.acquire_slot
+
+        def spy(*args, **kwargs):
+            captured["ticket_id"] = kwargs.get("ticket_id")
+            return real(*args, **kwargs)
+
+        with mock.patch.object(informix_module, "acquire_slot", side_effect=spy):
+            bridge._acquire_connection_slot()
+        self.addCleanup(self._stop_heartbeat, bridge)
+        self.assertIsNone(captured["ticket_id"])
+
+    def test_successful_acquire_dequeues_its_ticket(self):
+        bridge = self._bridge()
+        bridge._acquire_connection_slot()
+        self.addCleanup(self._stop_heartbeat, bridge)
+        namespace = bridge._lakebase_namespace()
+        self.assertIsNotNone(bridge._lakebase_slot)
+        self.assertEqual(self._waiters(namespace), [])  # ticket dropped on success
+
+    def test_acquire_waits_behind_an_older_ticket(self):
+        from databricks.labs.community_connector.sources.informix import lakebase_state
+
+        bridge = self._bridge()
+        namespace = bridge._lakebase_namespace()
+        connection = bridge._lakebase_connection()
+        lakebase_state.seed_slots(connection, namespace, 1)
+        # Another reader is already queued for the only slot; even though slot 0 is
+        # free, this acquire must yield to the older ticket rather than jump ahead.
+        older = lakebase_state.enqueue_waiter(connection, namespace, "other", floor=0, ceiling=1)
+
+        with self.assertRaises(informix_module.ConnectionCapacityUnavailable):
+            bridge._acquire_connection_slot(budget_seconds=0.01)
+
+        # It cleaned up only its own ticket; the older waiter's is untouched.
+        self.assertEqual(self._waiters(namespace), [older])
+        self.assertIsNone(getattr(bridge, "_lakebase_slot", None))
+
+
 if __name__ == "__main__":
     unittest.main()

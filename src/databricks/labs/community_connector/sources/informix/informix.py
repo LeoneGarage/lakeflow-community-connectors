@@ -51,7 +51,10 @@ from databricks.labs.community_connector.sources.informix.lakebase_state import 
     capture_workspace_credentials,
     collect_stale_table_state,
     delete_obsolete_scoped_state_records,
+    dequeue_waiter,
+    enqueue_waiter,
     heartbeat_slot,
+    heartbeat_waiter,
     publish_backlog_hint,
     publish_connection_limit,
     publish_minimum_lsn_state_record,
@@ -400,6 +403,16 @@ _CONNECTION_SLOT_JOIN_SECONDS = 3.0
 # inside the 1-5s a production slot is typically held.
 _LAKEBASE_SWEEP_MIN_SECONDS = 0.5
 _LAKEBASE_SWEEP_MAX_SECONDS = 2.0
+# Fair slot queue: a waiter enqueues a ticket so acquisition is first-come per slot
+# rather than a raw race, which prevents an unlucky reader being lapped indefinitely
+# under contention. On by default; the kill-switch reverts to the raw race without a
+# redeploy if the queue ever misbehaves on a live pipeline.
+_CONNECTION_FAIR_QUEUE_OPTION = "connection.fair.queue.enabled"
+# A ticket stays authoritative for this long without a heartbeat. A waiter heartbeats
+# every sweep (<= _LAKEBASE_SWEEP_MAX_SECONDS), so this is many sweeps of slack for a
+# briefly-stalled live waiter, yet far below the slot lease so a crashed waiter's ticket
+# stops blocking the queue quickly.
+_LAKEBASE_WAITER_TTL_SECONDS = 15.0
 # The backlog hint describes the *endpoint's* log position, not one table's, so
 # all publishers share a single row. The hints table is keyed per table because
 # state records reuse it; this constant is the endpoint-wide key.
@@ -1600,37 +1613,67 @@ class PurePythonInformixBridge:
         owner = f"{secrets.token_hex(16)}"
         scope = self.options.get("_informix.pipeline.scope") or None
         deadline = time.monotonic() + connection_wait_timeout
-        while True:
-            slot = acquire_slot(
-                connection,
-                namespace,
-                owner,
-                slot_count=slot_count,
-                floor=floor,
-                scope=scope,
-                lease_seconds=_CONNECTION_SLOT_LEASE_SECONDS,
-            )
-            if slot is not None:
-                self._connection_slot = f"slot-{slot.slot_id:04d}"
-                self._connection_slot_token = owner
-                self._lakebase_slot = slot
-                stop = threading.Event()
-                heartbeat = threading.Thread(
-                    target=self._heartbeat_connection_slot,
-                    args=(slot, stop, self._poison_connection_slot_lease),
-                    daemon=True,
-                    name="informix-lakebase-slot-heartbeat",
+        # Fair queue (default on): enqueue a ticket so acquisition is first-come per slot
+        # instead of a raw race, then heartbeat it each sweep and drop it the moment we win
+        # or give up. The kill-switch falls back to the unticketed race.
+        fair = _option_bool(self.options, _CONNECTION_FAIR_QUEUE_OPTION, True)
+        ticket_id = (
+            enqueue_waiter(connection, namespace, owner, floor=floor, ceiling=slot_count)
+            if fair
+            else None
+        )
+        try:
+            while True:
+                if ticket_id is not None:
+                    # Renew our place and reap any crashed/timed-out waiters so a dead
+                    # ticket cannot block us; a lost state connection here is transient,
+                    # so let it surface and be retried by the normal reconnect path.
+                    heartbeat_waiter(
+                        connection, namespace, ticket_id, waiter_ttl=_LAKEBASE_WAITER_TTL_SECONDS
+                    )
+                slot = acquire_slot(
+                    connection,
+                    namespace,
+                    owner,
+                    slot_count=slot_count,
+                    floor=floor,
+                    scope=scope,
+                    lease_seconds=_CONNECTION_SLOT_LEASE_SECONDS,
+                    ticket_id=ticket_id,
+                    waiter_ttl=_LAKEBASE_WAITER_TTL_SECONDS,
                 )
-                self._connection_slot_heartbeat_stop = stop
-                self._connection_slot_heartbeat = heartbeat
-                heartbeat.start()
-                return
-            if time.monotonic() >= deadline:
-                raise ConnectionCapacityUnavailable(
-                    "Timed out waiting for an Informix connection-capacity slot after "
-                    f"{connection_wait_timeout:g} seconds"
-                )
-            time.sleep(random.uniform(sweep_min, sweep_max))
+                if slot is not None:
+                    self._connection_slot = f"slot-{slot.slot_id:04d}"
+                    self._connection_slot_token = owner
+                    self._lakebase_slot = slot
+                    stop = threading.Event()
+                    heartbeat = threading.Thread(
+                        target=self._heartbeat_connection_slot,
+                        args=(slot, stop, self._poison_connection_slot_lease),
+                        daemon=True,
+                        name="informix-lakebase-slot-heartbeat",
+                    )
+                    self._connection_slot_heartbeat_stop = stop
+                    self._connection_slot_heartbeat = heartbeat
+                    heartbeat.start()
+                    return
+                if time.monotonic() >= deadline:
+                    raise ConnectionCapacityUnavailable(
+                        "Timed out waiting for an Informix connection-capacity slot after "
+                        f"{connection_wait_timeout:g} seconds"
+                    )
+                time.sleep(random.uniform(sweep_min, sweep_max))
+        finally:
+            # Drop our ticket whether we won, timed out, or errored -- a lingering ticket
+            # would wrongly hold back younger waiters until it aged out. Best-effort: a
+            # dequeue failure must never mask a successful acquire or the real timeout.
+            if ticket_id is not None:
+                try:
+                    dequeue_waiter(connection, namespace, ticket_id)
+                except Exception:  # noqa: BLE001 - ticket ages out via the reaper anyway
+                    logging.getLogger(__name__).debug(
+                        "snapshot slot waiter dequeue failed", exc_info=True
+                    )
 
     def _heartbeat_connection_slot(
         self,
@@ -3957,6 +4000,7 @@ class InformixLakeflowConnect(LakeflowConnect):
         _option_bool(options, "snapshot.incremental.blocking", True)
         _option_bool(options, _SHARED_CDC_SESSION_OPTION, True)
         _option_bool(options, _SNAPSHOT_SHARED_SESSION_OPTION, True)
+        _option_bool(options, _CONNECTION_FAIR_QUEUE_OPTION, True)
         if _APPEND_INGESTION_OPTION in options:
             _append_only_value(options[_APPEND_INGESTION_OPTION])
         if int(options.get("cdc.max.records", str(_DEFAULT_CDC_MAX_RECORDS))) > 256:

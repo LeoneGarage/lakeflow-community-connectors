@@ -79,6 +79,15 @@ class _FakeCursor:
         if "UPDATE conn_slots SET owner = NULL" in text:
             self._release(args, text)
             return
+        if "INSERT INTO slot_waiters" in text:
+            self._enqueue_waiter(args)
+            return
+        if "UPDATE slot_waiters SET heartbeat_at = now()" in text:
+            self._heartbeat_waiter(args)
+            return
+        if "DELETE FROM slot_waiters" in text:
+            self._delete_waiter(args, text)
+            return
         if "INSERT INTO backlog_hints" in text:
             self._write_hint(args, text)
             return
@@ -184,6 +193,11 @@ class _FakeCursor:
         bounded_below = "slot_id >= %(floor)s" in text
         bounded_above = "slot_id < %(ceiling)s" in text
         expires = "renewed_at < now() - make_interval(secs => %(lease)s)" in text
+        # The fair variant carries the NOT EXISTS over slot_waiters: a slot is
+        # eligible only when no older, still-heartbeating waiter is also eligible for
+        # it. Model that ordering so a dropped clause changes behaviour here as it
+        # would in Postgres.
+        fair = "slot_waiters" in text
         now = self._database.now()
         with self._database.lock:
             eligible = sorted(
@@ -200,6 +214,19 @@ class _FakeCursor:
                     )
                 )
             )
+            if fair:
+                ttl = float(args["waiter_ttl"])
+                eligible = [
+                    slot_id
+                    for slot_id in eligible
+                    if not any(
+                        ns == args["namespace"]
+                        and ticket < args["ticket_id"]
+                        and waiter["floor"] <= slot_id < waiter["ceiling"]
+                        and now - waiter["heartbeat_at"] <= ttl
+                        for (ns, ticket), waiter in self._database.waiters.items()
+                    )
+                ]
             if not eligible:
                 return
             # SKIP LOCKED semantics: the lock is held for the whole claim, so a
@@ -244,6 +271,48 @@ class _FakeCursor:
             row["scope"] = None
             row["renewed_at"] = None
             self._result = [(args["slot_id"],)]
+
+    # -- slot_waiters -------------------------------------------------------
+
+    def _enqueue_waiter(self, args: dict) -> None:
+        with self._database.lock:
+            # bigserial: a single monotonic sequence, so a later enqueue always
+            # gets a strictly larger ticket than an earlier one.
+            self._database.waiter_seq += 1
+            ticket_id = self._database.waiter_seq
+            self._database.waiters[(args["namespace"], ticket_id)] = {
+                "owner": args["owner"],
+                "floor": int(args["floor"]),
+                "ceiling": int(args["ceiling"]),
+                "heartbeat_at": self._database.now(),
+            }
+            self._result = [(ticket_id,)]
+
+    def _heartbeat_waiter(self, args: dict) -> None:
+        with self._database.lock:
+            waiter = self._database.waiters.get((args["namespace"], args["ticket_id"]))
+            if waiter is None:
+                return
+            waiter["heartbeat_at"] = self._database.now()
+            self._result = [(args["ticket_id"],)]
+
+    def _delete_waiter(self, args: dict, text: str) -> None:
+        now = self._database.now()
+        with self._database.lock:
+            if "heartbeat_at <" in text:
+                # Reap: drop every ticket in the namespace whose owner stopped
+                # heartbeating past the TTL.
+                ttl = float(args["waiter_ttl"])
+                stale = [
+                    key
+                    for key, waiter in self._database.waiters.items()
+                    if key[0] == args["namespace"] and now - waiter["heartbeat_at"] > ttl
+                ]
+                for key in stale:
+                    del self._database.waiters[key]
+            else:
+                # Dequeue one ticket by id.
+                self._database.waiters.pop((args["namespace"], args["ticket_id"]), None)
 
     # -- backlog_hints ------------------------------------------------------
 
@@ -398,6 +467,10 @@ class _FakeDatabase:
 
     def __init__(self) -> None:
         self.slots: dict[tuple[str, int], dict] = {}
+        # Fair-queue tickets, keyed (namespace, ticket_id); waiter_seq is the
+        # bigserial sequence behind ticket_id.
+        self.waiters: dict[tuple[str, int], dict] = {}
+        self.waiter_seq: int = 0
         self.hints: dict[tuple[str, str], dict] = {}
         self.limits: dict[str, dict] = {}
         self.records: dict[tuple[str, str], str] = {}
@@ -1580,6 +1653,121 @@ class LakebaseCredentialCaptureTests(unittest.TestCase):
 
         self.assertEqual(host, "https://explicit.example")
         self.assertEqual(token, "explicit-token")
+
+
+class LakebaseWaiterQueueTests(unittest.TestCase):
+    """The fair slot queue: per-slot FIFO layered over the raw acquire race."""
+
+    def setUp(self) -> None:
+        self.database = _FakeDatabase()
+        self.connection = _FakeConnection(self.database)
+        lakebase_state.ensure_schema(self.connection)
+
+    def _seed(self, namespace: str, count: int) -> None:
+        lakebase_state.seed_slots(self.connection, namespace, count)
+
+    def _occupy(self, namespace: str, count: int, *, floor: int = 0, slot_count: int) -> None:
+        for index in range(count):
+            slot = lakebase_state.acquire_slot(
+                self.connection, namespace, f"filler{index}", slot_count=slot_count, floor=floor
+            )
+            self.assertIsNotNone(slot)
+
+    def _enqueue(self, namespace: str, owner: str, *, floor: int, ceiling: int) -> int:
+        return lakebase_state.enqueue_waiter(
+            self.connection, namespace, owner, floor=floor, ceiling=ceiling
+        )
+
+    def _fair_acquire(self, namespace: str, owner: str, ticket_id: int, *, slot_count, floor=0):
+        return lakebase_state.acquire_slot(
+            self.connection,
+            namespace,
+            owner,
+            slot_count=slot_count,
+            floor=floor,
+            ticket_id=ticket_id,
+        )
+
+    def test_enqueue_returns_monotonic_tickets(self):
+        first = self._enqueue("ns", "a", floor=0, ceiling=4)
+        second = self._enqueue("ns", "b", floor=0, ceiling=4)
+
+        self.assertLess(first, second)
+
+    def test_older_waiter_wins_the_free_slot_in_its_band(self):
+        # One free slot, two same-band waiters: the younger must not jump ahead of
+        # the older while the older is still queued and live.
+        self._seed("ns", 1)
+        older = self._enqueue("ns", "older", floor=0, ceiling=1)
+        younger = self._enqueue("ns", "younger", floor=0, ceiling=1)
+
+        self.assertIsNone(self._fair_acquire("ns", "younger", younger, slot_count=1))
+        self.assertIsNotNone(self._fair_acquire("ns", "older", older, slot_count=1))
+
+    def test_younger_waiter_takes_a_low_slot_the_older_cannot_use(self):
+        # Cross-band: an older delete-channel waiter reserved to slot >= 2 must not
+        # block a younger consumer from the only free low slot (0) it could use.
+        self._seed("ns", 3)
+        self._occupy("ns", 2, floor=1, slot_count=3)  # take slots 1 and 2, leave 0 free
+        older_high = self._enqueue("ns", "delete", floor=2, ceiling=3)
+        younger_low = self._enqueue("ns", "consumer", floor=0, ceiling=3)
+
+        self.assertIsNone(self._fair_acquire("ns", "delete", older_high, slot_count=3, floor=2))
+        slot = self._fair_acquire("ns", "consumer", younger_low, slot_count=3)
+        self.assertIsNotNone(slot)
+        self.assertEqual(slot.slot_id, 0)
+
+    def test_stale_waiter_ticket_stops_blocking(self):
+        # An older waiter that stopped heartbeating past the TTL is ignored, so a
+        # live younger waiter is not starved by a crashed predecessor.
+        self._seed("ns", 1)
+        self._enqueue("ns", "dead", floor=0, ceiling=1)
+        younger = self._enqueue("ns", "live", floor=0, ceiling=1)
+        self.database.advance(lakebase_state._DEFAULT_WAITER_TTL_SECONDS + 1.0)
+
+        self.assertIsNotNone(self._fair_acquire("ns", "live", younger, slot_count=1))
+
+    def test_heartbeat_reaps_stale_tickets(self):
+        self._seed("ns", 1)
+        stale = self._enqueue("ns", "dead", floor=0, ceiling=1)
+        live = self._enqueue("ns", "live", floor=0, ceiling=1)
+        self.database.advance(lakebase_state._DEFAULT_WAITER_TTL_SECONDS + 1.0)
+
+        lakebase_state.heartbeat_waiter(
+            self.connection, "ns", live, waiter_ttl=lakebase_state._DEFAULT_WAITER_TTL_SECONDS
+        )
+
+        self.assertNotIn(("ns", stale), self.database.waiters)
+        self.assertIn(("ns", live), self.database.waiters)
+
+    def test_dequeue_unblocks_a_younger_waiter(self):
+        # Once the older waiter gives up (dequeues), the younger may claim the slot.
+        self._seed("ns", 1)
+        older = self._enqueue("ns", "older", floor=0, ceiling=1)
+        younger = self._enqueue("ns", "younger", floor=0, ceiling=1)
+        self.assertIsNone(self._fair_acquire("ns", "younger", younger, slot_count=1))
+
+        lakebase_state.dequeue_waiter(self.connection, "ns", older)
+
+        self.assertIsNotNone(self._fair_acquire("ns", "younger", younger, slot_count=1))
+
+    def test_capacity_is_never_exceeded_with_tickets(self):
+        # Fairness must not weaken the capacity guarantee: N ticketed acquirers on an
+        # N-slot pool get N distinct slots and no more.
+        self._seed("ns", 4)
+        held = []
+        for index in range(6):
+            ticket = self._enqueue("ns", f"o{index}", floor=0, ceiling=4)
+            slot = self._fair_acquire("ns", f"o{index}", ticket, slot_count=4)
+            held.append(slot)
+            if slot is not None:
+                # A winner dequeues its ticket, exactly as the connector does, so it
+                # does not linger and block the next acquirer.
+                lakebase_state.dequeue_waiter(self.connection, "ns", ticket)
+        issued = [slot for slot in held if slot is not None]
+
+        self.assertEqual(len(issued), 4)
+        self.assertEqual(len({slot.slot_id for slot in issued}), 4)
 
 
 if __name__ == "__main__":
