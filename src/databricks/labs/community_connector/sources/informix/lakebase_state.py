@@ -693,9 +693,23 @@ _SCHEMA_STATEMENTS = (
 
 
 def ensure_schema(connection: Any) -> None:
-    """Create the state tables if they do not already exist."""
+    """Create the state tables if they do not already exist.
+
+    Serialized on a transaction-scoped advisory lock: ``CREATE TABLE IF NOT EXISTS``
+    is *not* concurrency-safe on first creation -- when a Lakeflow pipeline starts one
+    Python worker per flow and they all create a brand-new table at once (the first run
+    after a table is added), the existence check passes for all of them and every worker
+    but one then fails inserting the catalog row with ``duplicate key ... pg_type_typname
+    _nsp_index``. The lock makes the losers wait, so they find the objects already present.
+    It needs no connector schema and is released by the commit below, so it is safe during
+    first provisioning; the key is distinct from the role-provisioning lock's.
+    """
 
     with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            ("lakeflow-informix-ensure-schema",),
+        )
         for statement in _SCHEMA_STATEMENTS:
             cursor.execute(statement)
     connection.commit()
