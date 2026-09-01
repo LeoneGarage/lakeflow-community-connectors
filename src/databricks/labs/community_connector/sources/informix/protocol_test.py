@@ -249,6 +249,39 @@ class FrameTests(unittest.TestCase):
             ("00:33:11.31773", 7),
         )
 
+    def test_datetime_sub_unit_fraction_has_negative_exponent(self):
+        # A time whose whole fields AND first fraction group are all zero -- e.g.
+        # 00:00:00.00042 in a HOUR TO FRACTION(5) column -- normalizes to a *negative*
+        # base-100 exponent (the leading zero groups are stripped, like any DECIMAL).
+        # The mantissa [04, 20, 0, 0, 0, 0] with exponent -1 (header 0x80 | (63)) must
+        # reconstruct rather than being rejected as "exceeds its qualifier width".
+        time_fraction = ColumnDescriptor("t", "DATETIME", length=0x060F)
+        self.assertEqual(
+            decode_value(memoryview(bytes([0xBF, 4, 20, 0, 0, 0, 0])), time_fraction),
+            ("00:00:00.00042", 7),
+        )
+        # And 00:00:00.00001 -> exponent -2: the fraction "00001" pads to groups
+        # [00, 00, 10], whose only significant group (10) sits in the last slot, so the
+        # normalized mantissa is [10, ...] at exponent -2 (header 0x80 | 62).
+        self.assertEqual(
+            decode_value(memoryview(bytes([0xBE, 10, 0, 0, 0, 0, 0])), time_fraction),
+            ("00:00:00.00001", 7),
+        )
+
+    def test_datetime_precision_beyond_qualifier_is_rejected(self):
+        # A sub-unit value against a fraction-less qualifier (HOUR TO SECOND) would need
+        # precision the qualifier cannot hold -- reject it clearly rather than silently
+        # dropping the significant group.
+        hour_to_second = ColumnDescriptor("t", "DATETIME", length=0x060A)
+        with self.assertRaisesRegex(CdcProtocolError, "more precision than"):
+            decode_value(memoryview(bytes([0xBF, 5, 0, 0])), hour_to_second)
+
+    def test_datetime_exponent_above_qualifier_still_rejected(self):
+        # More integer groups than the qualifier admits remains a true overflow.
+        hour_to_second = ColumnDescriptor("t", "DATETIME", length=0x060A)
+        with self.assertRaisesRegex(CdcProtocolError, "exceeds its qualifier width"):
+            decode_value(memoryview(bytes([0xC4, 1, 2, 3])), hour_to_second)
+
     def test_year_one_datetime_is_utc_aware(self):
         # 0001-01-01 00:00:00.00000 sits adjacent to datetime.min; a naive value
         # overflows PySpark's internal astimezone() on TimestampType conversion, so the
