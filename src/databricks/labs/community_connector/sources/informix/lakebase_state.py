@@ -1284,6 +1284,31 @@ def release_slot(connection: Any, slot: ConnectionSlot) -> bool:
     return released
 
 
+# A monotonic "the pool is recycling slots" token. ``epoch`` increments on every claim
+# (see ``_ACQUIRE_SLOT``: ``epoch = epoch + 1``), so the sum over a namespace strictly
+# increases each time any slot is acquired -- and a freed slot is only re-acquired when
+# a waiter wins it, so a rising sum means work is completing and capacity is turning
+# over. A caller that cannot win a slot can poll this between sweeps to tell "the pool
+# is busy (turning over) -- keep waiting" from "the pool is wedged (frozen) -- give up",
+# without needing to see which slot moved. A slot merely held (a long read that neither
+# releases nor re-claims) does not advance it: that is deliberate, the token measures
+# forward progress of the pool, not liveness of an individual holder.
+_POOL_PROGRESS_TOKEN = """
+SELECT COALESCE(SUM(epoch), 0) FROM conn_slots WHERE namespace = %(namespace)s
+"""
+
+
+def pool_progress_token(connection: Any, namespace: str) -> int:
+    """Return the pool's turnover token (see ``_POOL_PROGRESS_TOKEN``)."""
+
+    with connection.cursor() as cursor:
+        cursor.execute(_POOL_PROGRESS_TOKEN, {"namespace": namespace})
+        row = cursor.fetchone()
+    # Commit so the next poll sees a fresh snapshot rather than this transaction's.
+    connection.commit()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
 # --- backlog hints ---------------------------------------------------------
 #
 # One row per table, and ``GREATEST`` makes the write monotonic. The Volume
