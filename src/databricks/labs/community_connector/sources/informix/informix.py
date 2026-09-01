@@ -59,6 +59,7 @@ from databricks.labs.community_connector.sources.informix.lakebase_state import 
     publish_connection_limit,
     publish_minimum_lsn_state_record,
     publish_state_record,
+    pool_progress_token,
     read_backlog_hints,
     read_state_record,
     release_slot,
@@ -300,6 +301,16 @@ _SNAPSHOT_DRAIN_MARKER_OPTION = "_informix.snapshot.drain"
 # Idle back-off for a snapshot-drain worker with no queued jobs, so it does not busy-spin.
 # Also the granularity at which the consumer's liveness watchdog re-checks for progress.
 _SNAPSHOT_DRAIN_IDLE_SECONDS = 1.0
+# Master switch for the drain worker's slot-wait liveness watchdog (default on). When on,
+# a drain worker blocked acquiring its connection slot resets its deadline as long as the
+# pool keeps recycling slots (turnover), and only gives up once the pool is genuinely
+# wedged; when off it falls back to the plain ``connection.wait.timeout.seconds`` deadline.
+_SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION = "snapshot.drain.slot.liveness.enabled"
+# Extra grace the consumer's drain watchdog waits beyond the worker's slot-wait window, so
+# a wedged pool surfaces the worker's precise ConnectionCapacityUnavailable (recorded when
+# the worker gives up) rather than the consumer's generic "appears stalled" racing it out.
+# Comfortably larger than one acquisition sweep so the worker always records first.
+_SNAPSHOT_DRAIN_STALL_GRACE_SECONDS = 30.0
 # What an append-only table does about rows that predate the flow.
 #
 # ``stream`` (default): begin at the server's current log position and capture only
@@ -1268,6 +1279,10 @@ class PurePythonInformixBridge:
         self._connection_slot_token: str | None = None
         self._connection_slot_heartbeat_stop: threading.Event | None = None
         self._connection_slot_heartbeat: threading.Thread | None = None
+        # Optional callback the snapshot-drain reader installs so a worker blocked in
+        # ``_acquire_connection_slot`` can report "still alive, pool is turning over" up to
+        # the waiting consumer's liveness watchdog. None (the default) for every other read.
+        self._slot_wait_liveness: Callable[[], None] | None = None
 
     def _ensure_connected(self) -> None:
         # Tests and injected bridges built with ``object.__new__`` already
@@ -1590,7 +1605,8 @@ class PurePythonInformixBridge:
         # bootstrap work that must finish to unblock its consumer -- so it floors *below*
         # the CDC daemon into a band the CDC daemon cannot claim, rather than sharing the
         # CDC floor and being starved by a saturated CDC daemon.
-        if self.options.get(_SNAPSHOT_DAEMON_SLOT_MARKER_OPTION) == "true":
+        is_snapshot_daemon = self.options.get(_SNAPSHOT_DAEMON_SLOT_MARKER_OPTION) == "true"
+        if is_snapshot_daemon:
             floor = max(floor, self._snapshot_daemon_connection_reservation(slot_count))
         connection_wait_timeout = float(
             self.options.get(
@@ -1613,6 +1629,18 @@ class PurePythonInformixBridge:
         owner = f"{secrets.token_hex(16)}"
         scope = self.options.get("_informix.pipeline.scope") or None
         deadline = time.monotonic() + connection_wait_timeout
+        # Slot-wait liveness (snapshot-drain daemon only, default on). The drain is bootstrap
+        # work that must finish, so unlike a consumer read it must not fail merely because the
+        # pool is *full* -- only when the pool is *wedged*. So its deadline is a liveness
+        # watchdog keyed on pool turnover: as long as slots keep being claimed (the token
+        # advances -- other work is completing and recycling capacity), reset the deadline and
+        # ping the waiting consumer that the drain is still live; give up only after a whole
+        # window with zero turnover. Other callers keep the plain deadline (a consumer that
+        # cannot get a slot should fail its microbatch and retry, not wait out a backfill).
+        liveness = is_snapshot_daemon and _option_bool(
+            self.options, _SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION, True
+        )
+        progress_token = pool_progress_token(connection, namespace) if liveness else None
         # Fair queue (default on): enqueue a ticket so acquisition is first-come per slot
         # instead of a raw race, then heartbeat it each sweep and drop it the moment we win
         # or give up. The kill-switch falls back to the unticketed race.
@@ -1657,7 +1685,26 @@ class PurePythonInformixBridge:
                     self._connection_slot_heartbeat = heartbeat
                     heartbeat.start()
                     return
+                if liveness:
+                    # Poll the turnover token: if any slot was claimed since the last sweep
+                    # the pool is doing work and will free capacity, so extend the window and
+                    # tell the consumer's watchdog the drain is still live. If it is frozen,
+                    # fall through to the deadline check -- the pool is genuinely wedged.
+                    token = pool_progress_token(connection, namespace)
+                    if token != progress_token:
+                        progress_token = token
+                        deadline = time.monotonic() + connection_wait_timeout
+                        if self._slot_wait_liveness is not None:
+                            self._slot_wait_liveness()
                 if time.monotonic() >= deadline:
+                    if liveness:
+                        raise ConnectionCapacityUnavailable(
+                            f"Timed out waiting for an Informix connection-capacity slot: the "
+                            f"pool made no progress (no slot was claimed or released) for "
+                            f"{connection_wait_timeout:g}s, so capacity is wedged rather than "
+                            f"merely busy. Raise max.concurrent.connections, or reduce "
+                            f"concurrent daemon/consumer load."
+                        )
                     raise ConnectionCapacityUnavailable(
                         "Timed out waiting for an Informix connection-capacity slot after "
                         f"{connection_wait_timeout:g} seconds"
@@ -3739,8 +3786,10 @@ class _SnapshotDrainPool:
     wait trips only after progress has gone quiet for a whole idle window. Liveness is
     scoped by state so a job is neither failed early nor kept alive on someone else's work:
 
-    - A **running** job (a worker has picked it up) is measured from *its own* staged
-      pages, so a hung fetch on its worker trips even while other workers advance.
+    - A **running** job (a worker has picked it up) is measured from *its own* progress --
+      a staged page, or, while its worker is still acquiring a connection slot, a turnover
+      ping from the slot wait -- so a hung fetch on its worker trips even while other
+      workers advance, but a worker legitimately queued behind a busy pool does not.
     - A **queued** job (waiting for a free worker) is measured from *pool-wide* progress,
       so it waits its turn behind a large, healthy drain instead of failing while queued,
       and only trips when the whole pool goes quiet.
@@ -4046,6 +4095,7 @@ class InformixLakeflowConnect(LakeflowConnect):
         _option_bool(options, _SHARED_CDC_SESSION_OPTION, True)
         _option_bool(options, _SNAPSHOT_SHARED_SESSION_OPTION, True)
         _option_bool(options, _CONNECTION_FAIR_QUEUE_OPTION, True)
+        _option_bool(options, _SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION, True)
         if _APPEND_INGESTION_OPTION in options:
             _append_only_value(options[_APPEND_INGESTION_OPTION])
         if int(options.get("cdc.max.records", str(_DEFAULT_CDC_MAX_RECORDS))) > 256:
@@ -6551,6 +6601,11 @@ class InformixLakeflowConnect(LakeflowConnect):
     ):
         checkpoint = _validated_offset(start) if start else None
         pipeline_scope = pipeline_scope_override or self._pipeline_scope()
+        # Hand the bridge the same progress callback the drain worker installed, so a worker
+        # blocked acquiring its slot (before any page is staged) can keep the consumer's
+        # liveness watchdog alive while the pool is turning over. None for non-drain reads,
+        # where slot-wait liveness is off anyway. Constructs the bridge without connecting.
+        self._bridge._slot_wait_liveness = self._drain_progress
         if checkpoint and checkpoint.get("schema_fingerprint") is None:
             raise InformixError(
                 f"Informix snapshot checkpoint for '{table.exposed_name}' predates "
@@ -6968,11 +7023,12 @@ class InformixLakeflowConnect(LakeflowConnect):
         # below the CDC daemon (not at the CDC floor), so a saturated CDC daemon cannot
         # starve it -- it always has slots the CDC daemon is locked out of.
         reader_options[_SNAPSHOT_DAEMON_SLOT_MARKER_OPTION] = "true"
-        # The worker waits for its slot using its own ``connection.wait.timeout.seconds`` --
-        # the same value the consumer uses as the drain's per-progress idle window, so the
-        # single knob governs both "how long to wait for a slot" and "how long a stalled
-        # drain may go quiet". Drop any inherited per-read attempt budget so it cannot cap
-        # the slot wait below that window.
+        # The worker waits for its slot using its own ``connection.wait.timeout.seconds`` as
+        # a *per-turnover* window, not a hard cap: it resets every time the pool claims a slot
+        # (see the slot-wait liveness in ``_acquire_connection_slot``), so it waits out a busy
+        # backfill and only gives up when the pool is wedged. It is also the consumer's
+        # per-progress idle window, so the single knob governs both. Drop any inherited
+        # per-read attempt budget so it cannot cap the slot wait below that window.
         reader_options.pop(_CONNECTION_ATTEMPT_BUDGET_OPTION, None)
         reader_options.pop(_REPLAY_CONNECTION_WAIT_BUDGET_OPTION, None)
         cls = type(self)
@@ -7005,10 +7061,15 @@ class InformixLakeflowConnect(LakeflowConnect):
             allow_keyless=allow_keyless,
         )
         # The wait is a liveness watchdog, not a total-duration cap: it trips only after
-        # the drain reports no staged-page progress for a whole ``connection.wait.timeout
-        # .seconds`` window. A large table drains as long as it keeps making progress; a
-        # stalled or wedged drain trips after one idle window. The same value bounds how
-        # long the worker waits for its connection slot (see the reader factory).
+        # the worker reports no progress for a whole ``connection.wait.timeout.seconds``
+        # window. "Progress" is a staged page *or* -- while the worker is still acquiring
+        # its slot -- a turnover ping from ``_acquire_connection_slot``, so a drain that is
+        # legitimately queued behind a busy-but-live pool never trips here; the worker's own
+        # slot-wait watchdog owns the wedged-capacity case and raises a precise
+        # ConnectionCapacityUnavailable. The consumer waits one extra grace beyond the
+        # worker's window so, on a genuine wedge, that precise error (recorded by the worker
+        # when it gives up) surfaces instead of this generic message racing it out -- which
+        # then means only one thing: the worker went dark without recording an error.
         idle_timeout = float(
             self.options.get(
                 "connection.wait.timeout.seconds",
@@ -7020,11 +7081,12 @@ class InformixLakeflowConnect(LakeflowConnect):
         # reaps as an idle-in-transaction timeout over a multi-minute drain. The
         # daemon stages on its own connection; the post-wait read reopens fresh.
         self._reset_lakebase_connection()
-        if not pool.wait(job_key, idle_timeout):
+        if not pool.wait(job_key, idle_timeout + _SNAPSHOT_DRAIN_STALL_GRACE_SECONDS):
             raise InformixError(
                 f"Shared snapshot drain of '{table.exposed_name}' made no progress for "
-                f"{idle_timeout:g}s and appears stalled; raise connection.wait.timeout"
-                ".seconds or snapshot.reader.threads"
+                f"{idle_timeout:g}s and appears stalled: the drain worker stopped reporting "
+                f"progress without failing. Check the source for a hung query, or raise "
+                f"connection.wait.timeout.seconds."
             )
         manifest = self._read_snapshot_stage_manifest(table, pipeline_scope, schema_id)
         if manifest is None:

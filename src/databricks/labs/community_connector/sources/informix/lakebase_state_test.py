@@ -79,6 +79,15 @@ class _FakeCursor:
         if "UPDATE conn_slots SET owner = NULL" in text:
             self._release(args, text)
             return
+        if "SELECT COALESCE(SUM(epoch), 0) FROM conn_slots" in text:
+            with self._database.lock:
+                total = sum(
+                    row["epoch"]
+                    for (namespace, _slot_id), row in self._database.slots.items()
+                    if namespace == args["namespace"]
+                )
+            self._result = [(total,)]
+            return
         if "INSERT INTO slot_waiters" in text:
             self._enqueue_waiter(args)
             return
@@ -591,6 +600,29 @@ class LakebaseSlotTests(unittest.TestCase):
         lakebase_state.seed_slots(self.connection, "ns", 16)
 
         self.assertEqual(len([key for key in self.database.slots if key[0] == "ns"]), 16)
+
+    def test_pool_progress_token_advances_on_every_claim(self):
+        # The drain's slot-wait liveness leans on this: a claim must move the token so a
+        # waiter can tell the pool is turning over, and a mere pause (no claim) must not.
+        start = lakebase_state.pool_progress_token(self.connection, "ns")
+
+        self.acquire("first")
+        after_one = lakebase_state.pool_progress_token(self.connection, "ns")
+        self.assertGreater(after_one, start)
+
+        self.acquire("second")
+        after_two = lakebase_state.pool_progress_token(self.connection, "ns")
+        self.assertGreater(after_two, after_one)
+
+        # No acquisition between reads -> frozen token (the "wedged pool" signal).
+        self.assertEqual(lakebase_state.pool_progress_token(self.connection, "ns"), after_two)
+
+    def test_pool_progress_token_is_namespace_scoped(self):
+        lakebase_state.seed_slots(self.connection, "other", 4)
+        self.acquire("first")
+
+        self.assertGreater(lakebase_state.pool_progress_token(self.connection, "ns"), 0)
+        self.assertEqual(lakebase_state.pool_progress_token(self.connection, "other"), 0)
 
     def test_expired_lease_is_reclaimed_by_a_new_owner(self):
         original = self.acquire("first")

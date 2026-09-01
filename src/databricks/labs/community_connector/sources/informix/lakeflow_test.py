@@ -9709,5 +9709,117 @@ class FairSlotQueueWiringTests(unittest.TestCase):
         self.assertIsNone(getattr(bridge, "_lakebase_slot", None))
 
 
+class SnapshotDrainSlotLivenessTests(unittest.TestCase):
+    """The snapshot-drain worker's slot wait is a liveness watchdog: it resets while the
+    pool is turning over (busy doing work) and only gives up when the pool is wedged.
+    Every other caller keeps the plain ``connection.wait.timeout.seconds`` deadline."""
+
+    def setUp(self):
+        self._lakebase = _OfflineLakebase().install(self)
+
+    def _bridge(self, *, drain=True, **options):
+        bridge = informix_module.PurePythonInformixBridge(
+            {
+                "hostname": "localhost",
+                "database": "demo",
+                "user": "informix",
+                "password": "secret",
+                "server": "demo_on",
+                "lakebase.password": "test-state-password",
+                "max.concurrent.connections": "6",
+                **options,
+            }
+        )
+        if drain:
+            bridge.options[informix_module._SNAPSHOT_DAEMON_SLOT_MARKER_OPTION] = "true"
+        return bridge
+
+    def _stop_heartbeat(self, bridge):
+        stop = getattr(bridge, "_connection_slot_heartbeat_stop", None)
+        if stop is not None:
+            stop.set()
+
+    def test_turnover_resets_the_deadline_and_pings_then_acquires(self):
+        # Pool keeps claiming slots (token climbs) for three sweeps while our slot is
+        # busy, then a slot frees and we win. The wait must not give up, and each turnover
+        # must ping the consumer's liveness callback.
+        bridge = self._bridge()
+        pinged = mock.Mock()
+        bridge._slot_wait_liveness = pinged
+        real_acquire = informix_module.acquire_slot
+        calls = {"n": 0}
+
+        def acquire(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] <= 3:
+                return None  # slot still busy
+            return real_acquire(*args, **kwargs)  # now free -- really claim it
+
+        token = {"v": 0}
+
+        def climbing_token(*_args, **_kwargs):
+            token["v"] += 1
+            return token["v"]
+
+        with (
+            mock.patch.object(informix_module, "acquire_slot", side_effect=acquire),
+            mock.patch.object(informix_module, "pool_progress_token", side_effect=climbing_token),
+            mock.patch.object(informix_module.random, "uniform", return_value=0),
+        ):
+            bridge._acquire_connection_slot()
+        self.addCleanup(self._stop_heartbeat, bridge)
+
+        self.assertIsNotNone(bridge._lakebase_slot)  # eventually won a slot
+        self.assertEqual(pinged.call_count, 3)  # one ping per turnover before the win
+
+    def test_wedged_pool_raises_the_specific_capacity_error(self):
+        # Token frozen (no slot ever claimed) -> the pool is wedged, not merely busy, so
+        # the worker gives up with the precise message instead of waiting forever.
+        bridge = self._bridge()
+        pinged = mock.Mock()
+        bridge._slot_wait_liveness = pinged
+
+        with (
+            mock.patch.object(informix_module, "acquire_slot", return_value=None),
+            mock.patch.object(informix_module, "pool_progress_token", return_value=7),
+            mock.patch.object(informix_module.random, "uniform", return_value=0),
+        ):
+            with self.assertRaises(informix_module.ConnectionCapacityUnavailable) as caught:
+                bridge._acquire_connection_slot(budget_seconds=0.0)
+
+        self.assertIn("wedged", str(caught.exception))
+        pinged.assert_not_called()  # no turnover -> no liveness ping
+
+    def test_kill_switch_reverts_to_the_plain_deadline(self):
+        bridge = self._bridge(**{"snapshot.drain.slot.liveness.enabled": "false"})
+
+        with (
+            mock.patch.object(informix_module, "acquire_slot", return_value=None),
+            mock.patch.object(informix_module, "pool_progress_token") as token,
+            mock.patch.object(informix_module.random, "uniform", return_value=0),
+        ):
+            with self.assertRaises(informix_module.ConnectionCapacityUnavailable) as caught:
+                bridge._acquire_connection_slot(budget_seconds=0.0)
+
+        token.assert_not_called()  # liveness off -> the token is never polled
+        self.assertNotIn("wedged", str(caught.exception))
+
+    def test_non_drain_reader_never_polls_the_token(self):
+        # A consumer read (no drain marker) keeps the plain hard deadline: it must fail its
+        # microbatch and retry rather than wait out a backfill.
+        bridge = self._bridge(drain=False)
+
+        with (
+            mock.patch.object(informix_module, "acquire_slot", return_value=None),
+            mock.patch.object(informix_module, "pool_progress_token") as token,
+            mock.patch.object(informix_module.random, "uniform", return_value=0),
+        ):
+            with self.assertRaises(informix_module.ConnectionCapacityUnavailable) as caught:
+                bridge._acquire_connection_slot(budget_seconds=0.0)
+
+        token.assert_not_called()
+        self.assertNotIn("wedged", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

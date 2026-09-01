@@ -751,7 +751,26 @@ connection:
         Maximum seconds a microbatch waits to acquire an Informix connection
         capacity slot. Default `600`; minimum `1`. A triggered read that exhausts
         it fails with ConnectionCapacityUnavailable; a continuous read instead
-        uses the bounded budget described by capacity.retry.max.delay.seconds.
+        uses the bounded budget described by capacity.retry.max.delay.seconds. For
+        the shared snapshot drain it is a per-progress liveness window, not a hard
+        cap: the drain worker resets it on each staged page and, while still waiting
+        for its slot, on each pool slot claim (turnover), so a drain queued behind a
+        busy backfill waits it out and fails only when the pool is wedged (no
+        turnover for a whole window). See snapshot.drain.slot.liveness.enabled.
+
+    - name: snapshot.drain.slot.liveness.enabled
+      type: string
+      required: false
+      description: >
+        Whether the shared snapshot drain worker treats its connection-slot wait as
+        a turnover-based liveness watchdog. Default true: a drain worker blocked
+        acquiring its slot resets its connection.wait.timeout.seconds window every
+        time the pool claims a slot (other work completing and recycling capacity),
+        so it waits out a busy multi-table backfill on a small pool instead of timing
+        out against a pool that is full but healthy, and gives up only when the pool
+        is genuinely wedged. Set false to revert to a plain fixed deadline. Only
+        affects the snapshot-drain daemon; consumer and CDC-daemon reads always keep
+        the plain deadline. Accepts true/false (1/yes, 0/no).
 
     - name: connection.fair.queue.enabled
       type: string
