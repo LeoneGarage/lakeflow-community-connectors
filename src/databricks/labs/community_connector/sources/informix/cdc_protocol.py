@@ -404,11 +404,27 @@ def _decode_datetime(
         raise CdcProtocolError("DATETIME contains a base-100 group above 99")
     exponent = (raw[0] & 0x7F) - 64
     whole_groups = sum(widths[code] for code in selected) // 2
-    if not 0 <= exponent <= whole_groups:
+    grid = whole_groups + (fraction_digits + 1) // 2
+    # ``groups`` is a fixed-width, left-aligned mantissa -- most significant *non-zero*
+    # base-100 group first, ``exponent`` giving that group's base-100 place -- exactly as
+    # decode_packed_decimal reads a DECIMAL. Reconstruct the fixed [whole | fraction] grid
+    # by shifting the mantissa back right over the leading zero groups normalization
+    # stripped. ``exponent`` can be <= 0 for a sub-unit value (e.g. 00:00:00.00042 in a
+    # HOUR TO FRACTION column, whose whole groups and first fraction group are all zero);
+    # only ``exponent > whole_groups`` -- more integer groups than the qualifier admits --
+    # is a true overflow.
+    if exponent > whole_groups:
         raise CdcProtocolError(f"DATETIME exponent {exponent} exceeds its qualifier width")
-    whole = bytes(whole_groups - exponent) + groups[:exponent]
-    fractional = "".join(f"{group:02d}" for group in groups[exponent:])
-    digits = "".join(f"{group:02d}" for group in whole) + fractional[:fraction_digits]
+    combined = [0] * (whole_groups - exponent) + list(groups)
+    # A non-zero group shifted past the fraction's resolution would be a value finer than
+    # the qualifier -- silent data loss rather than a decode we can trust.
+    if any(combined[grid:]):
+        raise CdcProtocolError(
+            f"DATETIME value carries more precision than its {start} TO {end} qualifier"
+        )
+    digits = "".join(f"{group:02d}" for group in combined[:grid])[
+        : whole_groups * 2 + fraction_digits
+    ]
     values, position = {}, 0
     for code in selected:
         width = widths[code]
