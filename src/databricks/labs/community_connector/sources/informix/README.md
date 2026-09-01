@@ -744,8 +744,16 @@ that already exists. Resizing a live endpoint is therefore an operator action
 
 Requirements and caveats:
 
-- `psycopg2` (preinstalled on Databricks runtimes) or `psycopg`, and permission
-  to create Lakebase projects.
+- A Postgres driver — `psycopg2` **or** `psycopg` (v3) — must be importable on the
+  compute that runs the connector, plus permission to create Lakebase projects.
+  `psycopg2` is preinstalled on classic Databricks runtimes, but **serverless
+  pipeline compute may have neither**. When it does not, add a **prebuilt binary
+  wheel** to the pipeline's environment dependencies: `psycopg2-binary` (matches the
+  connector's first-choice import) or `psycopg[binary]`. Do **not** use plain
+  `psycopg` — it is a source distribution that compiles against `libpq` and needs
+  `pg_config` at install time, which pipeline clusters lack, so the install fails
+  with `ENVIRONMENT_PIP_INSTALL_ERROR` and the connector then raises
+  `LakebaseStateError: needs psycopg2 or psycopg installed on the runtime`.
 - `snapshot.staging.location` is now required and has no default, because the
   shared-state location it used to fall back on no longer exists.
 - `lakebase.password` is required. Choose a value once and supply the same one on
