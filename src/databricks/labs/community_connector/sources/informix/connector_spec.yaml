@@ -753,6 +753,18 @@ connection:
         it fails with ConnectionCapacityUnavailable; a continuous read instead
         uses the bounded budget described by capacity.retry.max.delay.seconds.
 
+    - name: connection.fair.queue.enabled
+      type: string
+      required: false
+      description: >
+        Whether slot acquisition uses the fair waiter queue. Default true. When on,
+        a reader blocked on a slot enqueues a ticket so acquisition is first-come per
+        slot rather than a raw race, which prevents an unlucky reader being lapped
+        indefinitely while others churn the pool; ordering is per slot, so an older
+        reader reserved to high slots never blocks a younger one from a low slot it
+        could not use. Set false to revert to the unordered race (a kill-switch if the
+        queue ever misbehaves). Accepts true/false (1/yes, 0/no).
+
     - name: capacity.retry.max.delay.seconds
       type: string
       required: false

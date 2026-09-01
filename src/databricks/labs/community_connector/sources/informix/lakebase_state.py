@@ -104,6 +104,11 @@ _AUTO_PROJECT_PREFIX = "informix-state-"
 # A suspended endpoint must be allowed to wake. This bounds the *connect*, not a
 # steady-state query, and is generous relative to the ~3.3s measured resume.
 _CONNECT_TIMEOUT_SECONDS = 120
+# How long a slot-queue ticket stays authoritative without a heartbeat. A waiter
+# heartbeats every sweep (<= 2s), so this is many sweeps of slack -- enough that a
+# briefly-stalled live waiter is never mistaken for a crashed one -- yet far below the
+# 120s slot lease, so a truly dead waiter's ticket stops blocking the queue quickly.
+_DEFAULT_WAITER_TTL_SECONDS = 15.0
 # OAuth credentials last an hour; recycle pooled connections well before that so
 # no connection is ever handed out holding a nearly-expired token.
 _CREDENTIAL_REFRESH_SECONDS = 2700
@@ -612,6 +617,27 @@ _SCHEMA_STATEMENTS = (
     CREATE INDEX IF NOT EXISTS conn_slots_free_idx
         ON conn_slots (namespace, slot_id) WHERE owner IS NULL
     """,
+    # Fair waiter queue: one row per reader currently blocked on a slot, carrying
+    # its eligible band [floor, ceiling). ``ticket_id`` is a global monotonic
+    # sequence, so a smaller ticket enqueued earlier -- acquisition consults it to
+    # give the oldest still-heartbeating waiter first claim on each slot (see
+    # _ACQUIRE_SLOT_FAIR), turning the raw race into per-slot FIFO.
+    """
+    CREATE TABLE IF NOT EXISTS slot_waiters (
+        namespace    text        NOT NULL,
+        ticket_id    bigserial   NOT NULL,
+        owner        text        NOT NULL,
+        floor        integer     NOT NULL,
+        ceiling      integer     NOT NULL,
+        heartbeat_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (namespace, ticket_id)
+    )
+    """,
+    # Ordering scans walk a namespace's tickets oldest-first; the reaper filters by age.
+    """
+    CREATE INDEX IF NOT EXISTS slot_waiters_order_idx
+        ON slot_waiters (namespace, ticket_id)
+    """,
     """
     CREATE TABLE IF NOT EXISTS conn_limits (
         namespace        text        PRIMARY KEY,
@@ -1030,6 +1056,61 @@ WHERE namespace = %(namespace)s AND slot_id = %(slot_id)s
 RETURNING slot_id
 """
 
+# Fair acquisition: the same claim as _ACQUIRE_SLOT, but a slot is eligible only when
+# no *older, still-heartbeating* waiter is also eligible for it. That makes acquisition
+# first-come-first-served per slot -- the oldest waiter in a band always has priority --
+# so no waiter is lapped indefinitely under contention. Ordering is per slot rather than
+# global: the band predicate (w.floor <= slot < w.ceiling) means an older delete-channel
+# waiter reserved to high slots does not block a younger consumer from a low slot it could
+# never use, so there is no cross-band head-of-line blocking. The CAS (SKIP LOCKED + epoch)
+# is unchanged, so capacity is still exact: a rare ordering inversion under a read race
+# costs at most one extra sweep, never an over-issued slot.
+_ACQUIRE_SLOT_FAIR = """
+UPDATE conn_slots SET owner = %(owner)s, epoch = epoch + 1,
+                      scope = %(scope)s, renewed_at = now()
+WHERE (namespace, slot_id) = (
+    SELECT s.namespace, s.slot_id FROM conn_slots s
+    WHERE s.namespace = %(namespace)s
+      AND s.slot_id >= %(floor)s
+      AND s.slot_id < %(ceiling)s
+      AND (s.owner IS NULL OR s.renewed_at < now() - make_interval(secs => %(lease)s))
+      AND NOT EXISTS (
+          SELECT 1 FROM slot_waiters w
+          WHERE w.namespace = %(namespace)s
+            AND w.ticket_id < %(ticket_id)s
+            AND w.floor <= s.slot_id AND s.slot_id < w.ceiling
+            AND w.heartbeat_at >= now() - make_interval(secs => %(waiter_ttl)s)
+      )
+    ORDER BY s.slot_id
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+)
+RETURNING slot_id, epoch
+"""
+
+# A waiter enqueues one ticket for the whole time it blocks, heartbeats it each sweep,
+# and deletes it the instant it wins a slot (or gives up). The heartbeat doubles as the
+# reaper -- it drops any ticket whose owner stopped heartbeating -- so a crashed or
+# timed-out waiter cannot wedge the queue and the table needs no separate GC.
+_ENQUEUE_WAITER = """
+INSERT INTO slot_waiters (namespace, owner, floor, ceiling)
+VALUES (%(namespace)s, %(owner)s, %(floor)s, %(ceiling)s)
+RETURNING ticket_id
+"""
+_HEARTBEAT_WAITER = """
+UPDATE slot_waiters SET heartbeat_at = now()
+WHERE namespace = %(namespace)s AND ticket_id = %(ticket_id)s
+RETURNING ticket_id
+"""
+_REAP_WAITERS = """
+DELETE FROM slot_waiters
+WHERE namespace = %(namespace)s
+  AND heartbeat_at < now() - make_interval(secs => %(waiter_ttl)s)
+"""
+_DEQUEUE_WAITER = """
+DELETE FROM slot_waiters WHERE namespace = %(namespace)s AND ticket_id = %(ticket_id)s
+"""
+
 
 class ConnectionSlot:
     """A held connection-capacity lease.
@@ -1059,6 +1140,8 @@ def acquire_slot(
     floor: int = 0,
     scope: str | None = None,
     lease_seconds: float = 120.0,
+    ticket_id: int | None = None,
+    waiter_ttl: float = _DEFAULT_WAITER_TTL_SECONDS,
 ) -> ConnectionSlot | None:
     """Claim one slot, or return ``None`` when every eligible slot is busy.
 
@@ -1067,25 +1150,88 @@ def acquire_slot(
     reservation a guarantee rather than a preference. ``slot_count`` bounds the
     ceiling, so lowering the configured limit takes effect immediately even
     though surplus rows are deliberately left in place.
+
+    ``ticket_id`` opts into the fair queue: pass the id returned by
+    ``enqueue_waiter`` (with the same ``waiter_ttl`` used to heartbeat it) and the
+    claim yields any slot an older, still-heartbeating waiter is also eligible for,
+    so this caller waits its turn. Omit it (the default) for the raw first-come race.
     """
 
+    parameters = {
+        "owner": owner,
+        "scope": scope,
+        "namespace": namespace,
+        "floor": max(0, floor),
+        "ceiling": slot_count,
+        "lease": float(lease_seconds),
+    }
+    if ticket_id is None:
+        statement = _ACQUIRE_SLOT
+    else:
+        statement = _ACQUIRE_SLOT_FAIR
+        parameters["ticket_id"] = int(ticket_id)
+        parameters["waiter_ttl"] = float(waiter_ttl)
     with connection.cursor() as cursor:
-        cursor.execute(
-            _ACQUIRE_SLOT,
-            {
-                "owner": owner,
-                "scope": scope,
-                "namespace": namespace,
-                "floor": max(0, floor),
-                "ceiling": slot_count,
-                "lease": float(lease_seconds),
-            },
-        )
+        cursor.execute(statement, parameters)
         row = cursor.fetchone()
     connection.commit()
     if row is None:
         return None
     return ConnectionSlot(namespace, int(row[0]), int(row[1]), owner)
+
+
+def enqueue_waiter(connection: Any, namespace: str, owner: str, *, floor: int, ceiling: int) -> int:
+    """Register this caller as a slot waiter and return its queue ticket.
+
+    The ticket records the eligible band [floor, ceiling); acquisition consults it
+    so an older waiter in the same band is served first. Commit it before waiting so
+    other waiters' connections can see it.
+    """
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            _ENQUEUE_WAITER,
+            {
+                "namespace": namespace,
+                "owner": owner,
+                "floor": max(0, floor),
+                "ceiling": int(ceiling),
+            },
+        )
+        row = cursor.fetchone()
+    connection.commit()
+    return int(row[0])
+
+
+def heartbeat_waiter(connection: Any, namespace: str, ticket_id: int, *, waiter_ttl: float) -> None:
+    """Renew this waiter's ticket and reap any whose owner stopped heartbeating.
+
+    Folding the reap into the heartbeat keeps the queue self-cleaning: a crashed or
+    timed-out waiter's ticket ages out and is dropped by the next live heartbeat, so
+    it never blocks the queue and no separate GC pass is needed.
+    """
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            _HEARTBEAT_WAITER,
+            {"namespace": namespace, "ticket_id": int(ticket_id)},
+        )
+        cursor.execute(
+            _REAP_WAITERS,
+            {"namespace": namespace, "waiter_ttl": float(waiter_ttl)},
+        )
+    connection.commit()
+
+
+def dequeue_waiter(connection: Any, namespace: str, ticket_id: int) -> None:
+    """Remove this waiter's ticket -- on winning a slot or on giving up."""
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            _DEQUEUE_WAITER,
+            {"namespace": namespace, "ticket_id": int(ticket_id)},
+        )
+    connection.commit()
 
 
 def heartbeat_slot(connection: Any, slot: ConnectionSlot) -> bool:
