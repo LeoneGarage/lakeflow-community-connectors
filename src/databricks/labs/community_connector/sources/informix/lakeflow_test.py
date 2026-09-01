@@ -9086,25 +9086,23 @@ class DaemonReaderFactoryMarkerTests(unittest.TestCase):
         )
         self.assertNotEqual(reader.options.get(informix_module._DAEMON_SLOT_MARKER_OPTION), "true")
 
-    def test_snapshot_drain_reader_waits_for_the_full_drain_window(self):
-        # The worker must be as patient acquiring a slot as the consumer is waiting for the
-        # drain: it inherits connection.wait.timeout.seconds = snapshot.drain.wait.seconds,
-        # so under a contended pool it rides out the churn instead of dying at the 600s
-        # connection default while the consumer would still have waited.
-        connector = self._connector(**{"snapshot.drain.wait.seconds": "1800"})
+    def test_snapshot_drain_reader_inherits_connection_wait_timeout(self):
+        # The worker waits for its slot using the same connection.wait.timeout.seconds the
+        # consumer uses as the drain's idle window -- one knob governs both. The factory no
+        # longer overrides it (the removed snapshot.drain.wait.seconds), so it passes through.
+        connector = self._connector(**{"connection.wait.timeout.seconds": "1800"})
         reader = connector._snapshot_drain_reader_factory()()
         self.assertEqual(reader.options.get("connection.wait.timeout.seconds"), "1800")
 
-    def test_snapshot_drain_reader_default_wait_matches_drain_default(self):
+    def test_snapshot_drain_reader_does_not_inject_connection_wait_timeout(self):
+        # With nothing set, the factory injects no connection.wait.timeout.seconds of its
+        # own -- the worker falls back to the same default as any other reader.
         reader = self._connector()._snapshot_drain_reader_factory()()
-        self.assertEqual(
-            reader.options.get("connection.wait.timeout.seconds"),
-            str(int(informix_module._SNAPSHOT_DRAIN_WAIT_SECONDS)),
-        )
+        self.assertIsNone(reader.options.get("connection.wait.timeout.seconds"))
 
     def test_snapshot_drain_reader_drops_inherited_attempt_budget(self):
         # A per-read attempt budget from the consumer would cap the slot wait below the
-        # drain window, so the factory clears it on the worker's copy.
+        # idle window, so the factory clears it on the worker's copy.
         connector = self._connector()
         connector.options[informix_module._CONNECTION_ATTEMPT_BUDGET_OPTION] = "5"
         reader = connector._snapshot_drain_reader_factory()()
@@ -9237,6 +9235,59 @@ class SnapshotDrainPoolTests(unittest.TestCase):
         pool = _SnapshotDrainPool()
         pool.submit(("k",), table=None, options={}, pipeline_scope="s", allow_keyless=False)
         self.assertFalse(pool.wait(("k",), 0.05))
+
+    def test_progress_resets_the_idle_window(self):
+        # The wait is a liveness watchdog: reported progress resets the idle window, so a
+        # job that keeps making progress does not trip even past several idle windows.
+        pool = _SnapshotDrainPool()
+        pool.submit(("k",), table=None, options={}, pipeline_scope="s", allow_keyless=False)
+
+        def drive():
+            for _ in range(6):  # 6 * 0.05s = 0.3s, well past the 0.1s idle window
+                time.sleep(0.05)
+                pool.report_progress(("k",))
+            with pool.condition:
+                pool.pending.discard(("k",))
+                pool.progress.pop(("k",), None)
+                pool.results[("k",)] = None
+                pool.condition.notify_all()
+
+        driver = threading.Thread(target=drive, daemon=True)
+        driver.start()
+        self.assertTrue(pool.wait(("k",), 0.1))
+        driver.join(timeout=2)
+
+    def test_wait_trips_after_progress_then_stalls(self):
+        # Progress advances the window once, but once it stops the watchdog still trips.
+        pool = _SnapshotDrainPool()
+        pool.submit(("k",), table=None, options={}, pipeline_scope="s", allow_keyless=False)
+        pool.report_progress(("k",))
+        self.assertFalse(pool.wait(("k",), 0.05))
+
+    def test_worker_progress_keeps_a_slow_drain_alive(self):
+        # End to end: a drain that stages pages slower than the idle window still completes,
+        # because the worker wires each staged page through report_progress.
+        pool = _SnapshotDrainPool()
+
+        class _SlowReader:
+            _drain_progress = None
+
+            def _read_snapshot(self, *args, **kwargs):
+                for _ in range(6):  # 0.3s total, longer than the 0.1s idle window
+                    time.sleep(0.05)
+                    if self._drain_progress is not None:
+                        self._drain_progress()
+
+            def close(self):
+                pass
+
+        pool.configure(reader_factory=_SlowReader, thread_count=1)
+        worker = threading.Thread(
+            target=informix_module._run_snapshot_drain_worker, args=(pool,), daemon=True
+        )
+        worker.start()
+        pool.submit(("k",), table="T", options={}, pipeline_scope="scope", allow_keyless=False)
+        self.assertTrue(pool.wait(("k",), 0.1))
 
     def test_worker_runs_job_and_closes_reader(self):
         pool = _SnapshotDrainPool()

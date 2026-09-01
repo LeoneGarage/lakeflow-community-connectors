@@ -4982,10 +4982,8 @@ def register_lakeflow_source(spark):
     # channel and attempt-budget options are threaded to the bridge.
     _SNAPSHOT_DRAIN_MARKER_OPTION = "_informix.snapshot.drain"
     # Idle back-off for a snapshot-drain worker with no queued jobs, so it does not busy-spin.
+    # Also the granularity at which the consumer's liveness watchdog re-checks for progress.
     _SNAPSHOT_DRAIN_IDLE_SECONDS = 1.0
-    # Safety cap on how long a consumer waits for the daemon to publish a snapshot manifest
-    # before failing loudly, so a silently-wedged worker cannot block a flow forever.
-    _SNAPSHOT_DRAIN_WAIT_SECONDS = 3600.0
     # What an append-only table does about rows that predate the flow.
     #
     # ``stream`` (default): begin at the server's current log position and capture only
@@ -5856,8 +5854,8 @@ def register_lakeflow_source(spark):
         tracks a third of ``max.concurrent.connections`` -- matching the CDC-daemon
         reservation, so keyless drains fill precisely the reserved band below the CDC daemon.
         Keyless drains serialize through this pool, so a flat single worker made every
-        keyless table's initial scan queue behind the last, timing out at
-        ``snapshot.drain.wait.seconds`` on multi-table pipelines.
+        keyless table's initial scan queue behind the last, stalling the later tables on
+        multi-table pipelines.
         """
 
         explicit = options.get(_SNAPSHOT_READER_THREADS_OPTION)
@@ -8360,6 +8358,13 @@ def register_lakeflow_source(spark):
         once, at most K slots are ever held by snapshots -- the fairness guarantee that keeps
         streaming readers from being starved. A consumer subscribes a job and waits, holding
         no slot, for its result. All state is guarded by ``condition``.
+
+        The consumer's ``wait`` is a *liveness watchdog*, not a total-duration deadline: the
+        drain reports progress (via ``report_progress``) each time it stages a page, and the
+        wait trips only after the drain has gone quiet for a whole idle window. A large table
+        that is steadily staging pages runs as long as it needs; a wedged drain (a hung fetch,
+        or a dead worker thread) stages nothing and trips after one window. Because progress is
+        tied to *actual staged pages*, a hung fetch cannot masquerade as liveness.
         """
 
         def __init__(self) -> None:
@@ -8371,6 +8376,9 @@ def register_lakeflow_source(spark):
             self.jobs: dict[tuple, dict[str, Any]] = {}
             # job key -> None on success, or the Exception to re-raise to the waiter.
             self.results: dict[tuple, Any] = {}
+            # job key -> monotonic timestamp of the last forward progress (enqueue, worker
+            # pickup, or a staged page). The waiter's idle window is measured from this.
+            self.progress: dict[tuple, float] = {}
             self.reader_factory: Callable[[], Any] | None = None
             self.thread_count = _DEFAULT_SNAPSHOT_READER_THREADS
 
@@ -8394,13 +8402,32 @@ def register_lakeflow_source(spark):
                     }
                     self.queue.append(job_key)
                     self.pending.add(job_key)
+                    # Start the liveness clock at enqueue; a worker pickup and each staged
+                    # page reset it, so a queued-but-not-yet-started job is not charged for
+                    # time it spent waiting behind other drains.
+                    self.progress[job_key] = time.monotonic()
                     self.condition.notify_all()
 
-        def wait(self, job_key, timeout):
-            deadline = time.monotonic() + timeout
+        def report_progress(self, job_key) -> None:
+            """Record forward progress on a job so the waiter's idle window resets."""
+
+            with self.condition:
+                if job_key in self.pending:
+                    self.progress[job_key] = time.monotonic()
+                    self.condition.notify_all()
+
+        def wait(self, job_key, idle_timeout):
+            """Block until the job finishes, fails, or goes quiet for ``idle_timeout``.
+
+            Returns True on success, re-raises the worker's exception on failure, and returns
+            False only when the drain has reported no progress for a full ``idle_timeout`` --
+            i.e. it is stalled, not merely slow.
+            """
+
             with self.condition:
                 while job_key in self.pending:
-                    remaining = deadline - time.monotonic()
+                    last = self.progress.get(job_key, time.monotonic())
+                    remaining = (last + idle_timeout) - time.monotonic()
                     if remaining <= 0:
                         return False
                     self.condition.wait(timeout=min(remaining, _SNAPSHOT_DRAIN_IDLE_SECONDS))
@@ -8470,11 +8497,18 @@ def register_lakeflow_source(spark):
                 job_key = pool.queue.popleft()
                 job = pool.jobs.get(job_key)
                 factory = pool.reader_factory
+            # Picking the job up is itself progress: reset the consumer's idle clock so the
+            # startup phase (slot acquisition + first page) gets a fresh window rather than
+            # being charged for time the job spent queued behind other drains.
+            pool.report_progress(job_key)
             result: Any = None
             reader = None
             if job is not None and factory is not None:
                 try:
                     reader = factory()
+                    # Each staged page resets the consumer's liveness watchdog, so a big table
+                    # that keeps making progress never trips it while a wedged drain does.
+                    reader._drain_progress = lambda: pool.report_progress(job_key)
                     # shared mode is off on the copy, so this drains inline and returns the
                     # staged page-0 result; the daemon ignores the rows -- it only needs the
                     # durable manifest the drain publishes as a side effect.
@@ -8497,6 +8531,7 @@ def register_lakeflow_source(spark):
             with pool.condition:
                 pool.jobs.pop(job_key, None)
                 pool.pending.discard(job_key)
+                pool.progress.pop(job_key, None)
                 pool.results[job_key] = result
                 pool.condition.notify_all()
 
@@ -8679,6 +8714,9 @@ def register_lakeflow_source(spark):
             self._metadata_session_lock = threading.RLock()
             self._metadata_release_timer: threading.Timer | None = None
             self._metadata_session_generation = 0
+            # Set by a snapshot-drain worker to a callback that reports a staged page to the
+            # pool, resetting the consumer's liveness watchdog. None on a normal reader.
+            self._drain_progress: Callable[[], None] | None = None
 
         def set_registration_scope(self, scope: str) -> None:
             """Install the scope shared by every reader serialized from one registration."""
@@ -11232,6 +11270,11 @@ def register_lakeflow_source(spark):
                     previous_upper_pk = [page_rows[-1][key] for key in table.primary_keys]
                     page_count = max(page_count, page_index + 1)
                     row_count += len(page_rows)
+                    # A staged page is forward progress: reset the drain pool's liveness
+                    # watchdog so a large-but-progressing drain is never mistaken for a stall.
+                    # No-op on a non-daemon (inline Model A) drain, which sets no callback.
+                    if self._drain_progress is not None:
+                        self._drain_progress()
 
                 snapshot_lsn, rows = consistent_snapshot(
                     table.identity,
@@ -11504,25 +11547,11 @@ def register_lakeflow_source(spark):
             # below the CDC daemon (not at the CDC floor), so a saturated CDC daemon cannot
             # starve it -- it always has slots the CDC daemon is locked out of.
             reader_options[_SNAPSHOT_DAEMON_SLOT_MARKER_OPTION] = "true"
-            # Wait for a slot as patiently as the consumer waits for the drain. The worker runs
-            # inside the consumer's ``pool.wait(snapshot.drain.wait.seconds)`` window, so giving
-            # up at the shorter ``connection.wait.timeout.seconds`` (default 600s) fails the
-            # query while the consumer would still have waited. Under a contended pool the drain
-            # is the most vulnerable reader -- it must acquire *and hold* a slot for the whole
-            # scan -- but consumer reads release their slot each microbatch, so a patient drain
-            # wins a slot as capacity churns instead of dying prematurely. Drop any inherited
-            # per-read attempt budget so it cannot cap the wait below the drain window.
-            # connection.wait.timeout.seconds is int-validated, while snapshot.drain.wait.seconds
-            # is a float; coerce to a whole-second integer string.
-            reader_options["connection.wait.timeout.seconds"] = str(
-                int(
-                    float(
-                        self.options.get(
-                            "snapshot.drain.wait.seconds", str(_SNAPSHOT_DRAIN_WAIT_SECONDS)
-                        )
-                    )
-                )
-            )
+            # The worker waits for its slot using its own ``connection.wait.timeout.seconds`` --
+            # the same value the consumer uses as the drain's per-progress idle window, so the
+            # single knob governs both "how long to wait for a slot" and "how long a stalled
+            # drain may go quiet". Drop any inherited per-read attempt budget so it cannot cap
+            # the slot wait below that window.
             reader_options.pop(_CONNECTION_ATTEMPT_BUDGET_OPTION, None)
             reader_options.pop(_REPLAY_CONNECTION_WAIT_BUDGET_OPTION, None)
             cls = type(self)
@@ -11554,19 +11583,27 @@ def register_lakeflow_source(spark):
                 pipeline_scope=pipeline_scope,
                 allow_keyless=allow_keyless,
             )
-            wait_seconds = float(
-                self.options.get("snapshot.drain.wait.seconds", str(_SNAPSHOT_DRAIN_WAIT_SECONDS))
+            # The wait is a liveness watchdog, not a total-duration cap: it trips only after
+            # the drain reports no staged-page progress for a whole ``connection.wait.timeout
+            # .seconds`` window. A large table drains as long as it keeps making progress; a
+            # stalled or wedged drain trips after one idle window. The same value bounds how
+            # long the worker waits for its connection slot (see the reader factory).
+            idle_timeout = float(
+                self.options.get(
+                    "connection.wait.timeout.seconds",
+                    str(_DEFAULT_CONNECTION_WAIT_TIMEOUT_SECONDS),
+                )
             )
             # Hold no Lakebase connection across the drain wait: the caller's manifest
             # probe left this connection idle inside a read transaction, which Lakebase
             # reaps as an idle-in-transaction timeout over a multi-minute drain. The
             # daemon stages on its own connection; the post-wait read reopens fresh.
             self._reset_lakebase_connection()
-            if not pool.wait(job_key, wait_seconds):
+            if not pool.wait(job_key, idle_timeout):
                 raise InformixError(
-                    f"Timed out after {wait_seconds:g}s waiting for the shared snapshot drain "
-                    f"of '{table.exposed_name}'; raise snapshot.drain.wait.seconds or "
-                    "snapshot.reader.threads"
+                    f"Shared snapshot drain of '{table.exposed_name}' made no progress for "
+                    f"{idle_timeout:g}s and appears stalled; raise connection.wait.timeout"
+                    ".seconds or snapshot.reader.threads"
                 )
             manifest = self._read_snapshot_stage_manifest(table, pipeline_scope, schema_id)
             if manifest is None:

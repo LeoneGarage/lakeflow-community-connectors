@@ -215,7 +215,7 @@ drain runs on a bounded pool of `snapshot.reader.threads` (default
 `max(1, max.concurrent.connections // 3)`, matching the CDC-daemon reservation)
 driver-resident daemon workers. Keyless (append-only, no primary key) tables drain
 one-at-a-time through this pool, so a single worker serialized every keyless table's
-initial scan and the later tables timed out at `snapshot.drain.wait.seconds`; the
+initial scan and the later tables sat queued behind it; the
 pool-relative default parallelizes them on a 6+-slot pool. `false` (Model A): the drain runs inline but
 acquires its slot above `snapshot.connection.reservation`, so that many low slots
 are always reachable by non-snapshot readers and can never all be held by drains at
@@ -239,14 +239,20 @@ manifest durably, then closes to release its slot, so at most `snapshot.reader.t
 slots are held by snapshots at once and the drain is crash-recoverable exactly as
 the inline path is (a restart with no manifest re-drains). Keep `snapshot.reader.threads`
 below `max.concurrent.connections` so a floor of slots always remains for streaming
-readers. A worker acquires its slot as patiently as the consumer waits for the drain
-(`connection.wait.timeout.seconds` on the worker is raised to `snapshot.drain.wait.seconds`):
-the drain must acquire *and hold* a slot for the whole scan, so on a contended pool it is
-the most vulnerable reader, but because every other read releases its slot each microbatch
-the worker wins a slot as capacity churns rather than failing the query at the shorter
-default connection timeout. This does not create capacity — if the pool stays saturated for
-the whole drain window the drain still fails; size `max.concurrent.connections` for the
-number of tables that snapshot concurrently.
+readers. The consumer's wait is a **liveness watchdog, not a total-duration deadline**:
+the drain reports progress each time it stages a page, and the consumer trips only after
+the drain has reported nothing for a whole `connection.wait.timeout.seconds` window. A
+large table that keeps staging pages therefore drains for as long as it needs, while a
+wedged drain — a hung fetch, or a dead worker thread — stages nothing and trips after one
+window. Because progress is tied to *actual staged pages*, a hung fetch cannot masquerade
+as liveness; and picking a job up plus each staged page resets the clock, so a job queued
+behind other drains is not charged for the wait. The same `connection.wait.timeout.seconds`
+also bounds how long the worker waits for its connection slot — the drain must acquire
+*and hold* a slot for the whole scan, so on a contended pool it is the most vulnerable
+reader, but because every other read releases its slot each microbatch the worker wins a
+slot as capacity churns. This does not create capacity — if the worker cannot get a slot
+within the window it fails with `ConnectionCapacityUnavailable`, surfaced to the consumer;
+size `max.concurrent.connections` for the number of tables that snapshot concurrently.
 
 The per-table `snapshot.mode` option supports `incremental` (default), `initial`,
 `initial_only`, `cdc_only`, `auto_snapshot`, and `recovery`. `initial`
