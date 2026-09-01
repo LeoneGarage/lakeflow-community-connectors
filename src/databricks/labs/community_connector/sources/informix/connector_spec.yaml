@@ -684,11 +684,14 @@ connection:
       type: string
       required: false
       description: >
-        Number of shards / daemon reader threads (K) when `cdc.shared.session=true`.
-        Default = `max.concurrent.connections`; minimum `1`. K=1 collapses the whole
-        channel onto one session; larger K spreads tables across more parallel readers.
-        Bounds the driver thread count. Also caps concurrent daemon connection slots,
-        which draw from the same pool as consumer bootstrap.
+        Number of shards / daemon reader threads (K) per channel when
+        `cdc.shared.session=true`. Default = `max(1, max.concurrent.connections // 4)`;
+        minimum `1`. The upsert and delete channels shard independently, so K threads mean
+        up to 2K daemon connection slots; the default keeps that near half the pool, leaving
+        room for consumer bootstrap and the snapshot drain (the previous default of
+        `max.concurrent.connections` targeted 2N slots against an N-slot pool). K=1 collapses
+        a channel onto one session; larger K spreads tables across more parallel readers at
+        the cost of connection slots. Bounds the driver thread count.
 
     - name: cdc.shared.buffer.max.records
       type: string

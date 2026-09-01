@@ -6793,6 +6793,27 @@ class InformixLakeflowConnect(LakeflowConnect):
         # below the CDC daemon (not at the CDC floor), so a saturated CDC daemon cannot
         # starve it -- it always has slots the CDC daemon is locked out of.
         reader_options[_SNAPSHOT_DAEMON_SLOT_MARKER_OPTION] = "true"
+        # Wait for a slot as patiently as the consumer waits for the drain. The worker runs
+        # inside the consumer's ``pool.wait(snapshot.drain.wait.seconds)`` window, so giving
+        # up at the shorter ``connection.wait.timeout.seconds`` (default 600s) fails the
+        # query while the consumer would still have waited. Under a contended pool the drain
+        # is the most vulnerable reader -- it must acquire *and hold* a slot for the whole
+        # scan -- but consumer reads release their slot each microbatch, so a patient drain
+        # wins a slot as capacity churns instead of dying prematurely. Drop any inherited
+        # per-read attempt budget so it cannot cap the wait below the drain window.
+        # connection.wait.timeout.seconds is int-validated, while snapshot.drain.wait.seconds
+        # is a float; coerce to a whole-second integer string.
+        reader_options["connection.wait.timeout.seconds"] = str(
+            int(
+                float(
+                    self.options.get(
+                        "snapshot.drain.wait.seconds", str(_SNAPSHOT_DRAIN_WAIT_SECONDS)
+                    )
+                )
+            )
+        )
+        reader_options.pop(_CONNECTION_ATTEMPT_BUDGET_OPTION, None)
+        reader_options.pop(_REPLAY_CONNECTION_WAIT_BUDGET_OPTION, None)
         cls = type(self)
         return lambda: cls(reader_options)
 
@@ -6845,17 +6866,19 @@ class InformixLakeflowConnect(LakeflowConnect):
         return manifest
 
     def _shared_cdc_thread_count(self) -> int:
-        return max(
-            1,
-            int(
-                self.options.get(
-                    _SHARED_CDC_THREADS_OPTION,
-                    self.options.get(
-                        "max.concurrent.connections", str(_DEFAULT_MAX_CONCURRENT_CONNECTIONS)
-                    ),
-                )
-            ),
+        explicit = self.options.get(_SHARED_CDC_THREADS_OPTION)
+        if explicit is not None:
+            return max(1, int(explicit))
+        # Threads are per channel and the upsert/delete channels shard independently, so K
+        # threads means up to 2K daemon slot-holders. Default K to a quarter of the pool so
+        # total daemon demand stays near half the pool, leaving room for consumer bootstrap
+        # reads and the snapshot drain. The old default (= max.concurrent.connections)
+        # targeted 2N holders against an N-slot pool and pinned the entire daemon
+        # reservation band, starving bootstrap/drain reads on a small pool.
+        slot_count = int(
+            self.options.get("max.concurrent.connections", str(_DEFAULT_MAX_CONCURRENT_CONNECTIONS))
         )
+        return max(1, slot_count // 4)
 
     def _shared_cdc_reader_factory(self, channel: str) -> Callable[[], "InformixLakeflowConnect"]:
         # The daemon reader gets its OWN options copy: the connector mutates options
