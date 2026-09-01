@@ -8949,6 +8949,33 @@ class DaemonReservationFloorTests(unittest.TestCase):
                 }
             )
 
+    def test_snapshot_daemon_floors_one_band_below_cdc_daemon(self):
+        # Pool 6, daemon reservation 2, snapshot.reader.threads 1 -> the snapshot drain
+        # floors at 2 - 1 = 1, one slot below the CDC daemon (which floors at 2). That
+        # leaves slot [1, 2) reachable by the drain but NOT the CDC daemon, so a saturated
+        # CDC daemon cannot starve the drain. Slot 0 stays for consumer bootstrap.
+        bridge = self._bridge()
+        bridge.options[informix_module._SNAPSHOT_DAEMON_SLOT_MARKER_OPTION] = "true"
+        self.assertEqual(self._captured_floor(bridge), 1)
+
+    def test_snapshot_daemon_floor_tracks_reader_threads(self):
+        # More drain threads reserve a wider private band, pulling the floor further down.
+        bridge = self._bridge(
+            **{"daemon.connection.reservation": "3", "snapshot.reader.threads": "2"}
+        )
+        bridge.options[informix_module._SNAPSHOT_DAEMON_SLOT_MARKER_OPTION] = "true"
+        self.assertEqual(self._captured_floor(bridge), 1)
+
+    def test_snapshot_daemon_floor_collapses_to_zero_when_pool_cannot_spare_a_band(self):
+        # When the drain threads meet or exceed the daemon reservation there is no private
+        # band to carve; the floor collapses to 0, where the drain still reaches the
+        # CDC-free low slots rather than being confined to the CDC-contended band.
+        bridge = self._bridge(
+            **{"daemon.connection.reservation": "1", "snapshot.reader.threads": "2"}
+        )
+        bridge.options[informix_module._SNAPSHOT_DAEMON_SLOT_MARKER_OPTION] = "true"
+        self.assertEqual(self._captured_floor(bridge), 0)
+
 
 class DaemonReaderFactoryMarkerTests(unittest.TestCase):
     """Both daemon reader factories tag their reader so its slot acquisition is floored."""
@@ -8976,9 +9003,15 @@ class DaemonReaderFactoryMarkerTests(unittest.TestCase):
         reader = self._connector()._shared_cdc_reader_factory("upsert")()
         self.assertEqual(reader.options.get(informix_module._DAEMON_SLOT_MARKER_OPTION), "true")
 
-    def test_snapshot_drain_reader_factory_sets_daemon_marker(self):
+    def test_snapshot_drain_reader_factory_sets_snapshot_daemon_marker(self):
+        # The drain floors one band below the CDC daemon, so it carries the snapshot-daemon
+        # marker -- not the CDC daemon marker, which would confine it to the CDC-contended
+        # band and let a saturated CDC daemon starve it.
         reader = self._connector()._snapshot_drain_reader_factory()()
-        self.assertEqual(reader.options.get(informix_module._DAEMON_SLOT_MARKER_OPTION), "true")
+        self.assertEqual(
+            reader.options.get(informix_module._SNAPSHOT_DAEMON_SLOT_MARKER_OPTION), "true"
+        )
+        self.assertNotEqual(reader.options.get(informix_module._DAEMON_SLOT_MARKER_OPTION), "true")
 
 
 class SnapshotDrainMarkerTests(unittest.TestCase):
