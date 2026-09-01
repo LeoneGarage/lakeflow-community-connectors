@@ -422,6 +422,7 @@ class _FakeConnection:
         self._database = database
         self.closed = False
         self.commits = 0
+        self.rollbacks = 0
         self._holds_role_advisory_lock = False
 
     def cursor(self) -> _FakeCursor:
@@ -442,6 +443,7 @@ class _FakeConnection:
         self._release_role_advisory_lock()
 
     def rollback(self) -> None:
+        self.rollbacks += 1
         self._release_role_advisory_lock()
 
     def close(self) -> None:
@@ -680,6 +682,19 @@ class LakebaseStateRecordTests(unittest.TestCase):
         self.assertEqual(
             lakebase_state.read_state_record(self.connection, "ns", "key"), {"start_lsn": 7}
         )
+
+    def test_read_ends_its_transaction(self):
+        # Regression: a bare SELECT must not leave the connection idle-in-transaction.
+        # Lakebase reaps such connections after idle_in_transaction_session_timeout, which
+        # killed the snapshot-drain worker between its scan and its boundary write.
+        before = self.connection.rollbacks
+        lakebase_state.read_state_record(self.connection, "ns", "absent")
+        self.assertEqual(self.connection.rollbacks, before + 1)
+
+        lakebase_state.publish_state_record(self.connection, "ns", "key", {"start_lsn": 7})
+        before = self.connection.rollbacks
+        lakebase_state.read_state_record(self.connection, "ns", "key")
+        self.assertEqual(self.connection.rollbacks, before + 1)
 
     def test_second_writer_adopts_the_elected_record(self):
         first = lakebase_state.publish_state_record(self.connection, "ns", "key", {"v": 1})
