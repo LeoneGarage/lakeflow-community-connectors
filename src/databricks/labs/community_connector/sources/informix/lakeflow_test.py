@@ -1503,6 +1503,56 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(transport.timeouts, [65.0, 30.0])
 
+    def test_max_primary_key_extends_and_restores_socket_timeout(self):
+        # The seed's key-bound read (SELECT FIRST 1 ... ORDER BY pk DESC) can run a
+        # full scan + top-sort on a large table; it must get the snapshot read
+        # budget, not the bare 30s default, and restore the prior timeout after.
+        class TimedTransport:
+            def __init__(self):
+                self.socket_timeout = 30.0
+                self.timeouts = []
+
+            def set_socket_timeout(self, timeout):
+                self.socket_timeout = timeout
+                self.timeouts.append(timeout)
+
+            def execute(self, sql, params):  # noqa: ARG002
+                # Observed timeout must already be the extended budget mid-read.
+                assert self.socket_timeout == 300.0
+                return [{"id": 42}]
+
+        transport = TimedTransport()
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.transport = transport
+
+        result = bridge.max_primary_key("demo.app.orders", ["id"])
+
+        self.assertEqual(result, [42])
+        self.assertEqual(transport.timeouts, [300.0, 30.0])
+
+    def test_max_primary_key_honors_snapshot_timeout_option(self):
+        class TimedTransport:
+            def __init__(self):
+                self.socket_timeout = 30.0
+                self.timeouts = []
+
+            def set_socket_timeout(self, timeout):
+                self.socket_timeout = timeout
+                self.timeouts.append(timeout)
+
+            def execute(self, sql, params):  # noqa: ARG002
+                return [{"id": 7}]
+
+        transport = TimedTransport()
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {"snapshot.read.timeout.seconds": "900"}
+        bridge.transport = transport
+
+        bridge.max_primary_key("demo.app.orders", ["id"])
+
+        self.assertEqual(transport.timeouts, [900.0, 30.0])
+
     def test_default_cdc_poll_byte_bound_skips_accounting(self):
         transport = FakeCdcTransport([[{"op": "TIMEOUT", "lsn": 100}]])
         bridge = object.__new__(PurePythonInformixBridge)
