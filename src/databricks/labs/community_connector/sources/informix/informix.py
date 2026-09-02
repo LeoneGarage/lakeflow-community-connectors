@@ -2522,6 +2522,13 @@ class PurePythonInformixBridge:
         When ``chunk_exprs`` maps a key to an order-preserving SQL expression,
         that key is ordered and returned as its rendered string form so the
         upper bound matches the values chunk pages compare against.
+
+        A plain-column key resolves the maximum tuple one column at a time (see
+        ``_max_key_stepwise``) so every read is index-servable regardless of the
+        key index's per-column direction. A chunked (DATETIME) key keeps the
+        single composite read: its equality prefix would have to match an
+        order-preserving cast expression that no index serves, so a stepwise scan
+        would not avoid a sort there.
         """
 
         self._ensure_connected()
@@ -2530,33 +2537,85 @@ class PurePythonInformixBridge:
             if not _IDENTIFIER.fullmatch(identifier):
                 raise InformixError(f"Unsafe max-key identifier {identifier!r}")
         chunk_exprs = dict(chunk_exprs or {})
+        table_ref = f"{database}:{_sql_identifier(owner)}.{_sql_identifier(name)}"
+        if primary_keys and not chunk_exprs:
+            return self._max_key_stepwise(table_ref, list(primary_keys), snapshot_filter)
         select_terms = [
             f"{chunk_exprs[key]} AS __chunk_{key}" if key in chunk_exprs else key
             for key in primary_keys
         ]
         result_names = [f"__chunk_{key}" if key in chunk_exprs else key for key in primary_keys]
         order = ",".join(f"{chunk_exprs.get(key, key)} DESC" for key in primary_keys)
-        # {+FIRST_ROWS(1)} steers the optimizer to minimize time-to-first-row. For
-        # `ORDER BY <pk> DESC` that makes the reverse index scan -- which returns
-        # row 1 immediately -- beat a full scan + top-sort, which must sort the
-        # whole table before it can yield the first row. Without it, Informix has
-        # been observed sorting a large table here and blowing past even the
-        # extended snapshot read budget. It is a `{+ }` comment, so a server with
-        # external directives disabled ignores it rather than erroring. It cannot
-        # help when a key column is chunked to an order-preserving expression (no
-        # index serves that ordering); that path stays sort-bound by construction.
-        sql = (
-            f"SELECT {{+FIRST_ROWS(1)}} FIRST 1 {','.join(select_terms)} "
-            f"FROM {database}:{_sql_identifier(owner)}.{_sql_identifier(name)}"
-        )
+        # {+FIRST_ROWS(1)} steers the optimizer to minimize time-to-first-row so a
+        # DESC ordering is served by an index read (row 1 returns immediately)
+        # rather than a full scan + top-sort. It is a `{+ }` comment, so a server
+        # with external directives disabled ignores it rather than erroring. It
+        # cannot help when a key column is chunked to an order-preserving
+        # expression (no index serves that ordering); that path stays sort-bound.
+        sql = f"SELECT {{+FIRST_ROWS(1)}} FIRST 1 {','.join(select_terms)} FROM {table_ref}"
         if snapshot_filter:
             sql += f" WHERE ({snapshot_filter})"
         sql += f" ORDER BY {order}"
-        # The key bound belongs to the incremental-snapshot family, and on a large
-        # table Informix may serve `ORDER BY pk DESC` with a full scan + top-sort
-        # rather than a reverse index read. Give it the same read budget as the
-        # snapshot page reads instead of the bare ~30s default socket timeout, or a
-        # slow seed times out and crash-loops the stream on every restart.
+        rows = self._execute_with_snapshot_read_timeout(sql, ())
+        if not rows:
+            return None
+        row = rows[0]
+        if isinstance(row, dict):
+            return [row[name] for name in result_names]
+        return list(row)
+
+    def _max_key_stepwise(
+        self, table_ref: str, primary_keys: list[str], snapshot_filter: str | None
+    ) -> list[Any] | None:
+        """Resolve the maximum key tuple one column at a time.
+
+        Each step reads ``FIRST 1`` of one key column ordered ``DESC`` under an
+        equality filter that pins the already-resolved higher-order columns. A
+        single-column order within an equality prefix is served by a directional
+        sub-range scan of the key index -- no whole-table sort -- and it holds
+        even when the index mixes ASC/DESC column directions, where a composite
+        ``ORDER BY c1 DESC, c2 DESC`` matches neither scan direction and forces a
+        sort. Prior columns are pinned with ``?`` parameters, exactly as the
+        snapshot keyset does, so no key value is rendered back into SQL text.
+
+        All steps run inside one REPEATABLE READ view so the columns resolve
+        against a single point in time -- identical to what the equivalent
+        one-statement composite read would return -- and that view also carries
+        the snapshot read-timeout budget instead of the bare transport default.
+        """
+
+        with self._repeatable_read_transaction():
+            resolved: list[Any] = []
+            for index, key in enumerate(primary_keys):
+                predicates = [f"({snapshot_filter})"] if snapshot_filter else []
+                params: list[Any] = []
+                for previous in range(index):
+                    predicates.append(f"{primary_keys[previous]} = ?")
+                    params.append(resolved[previous])
+                where = f" WHERE {' AND '.join(predicates)}" if predicates else ""
+                sql = (
+                    f"SELECT {{+FIRST_ROWS(1)}} FIRST 1 {key} "
+                    f"FROM {table_ref}{where} ORDER BY {key} DESC"
+                )
+                rows = self.transport.execute(sql, tuple(params))
+                if not rows:
+                    # No row at the first column means the table (or filtered set)
+                    # is empty. A later column cannot come up empty under the
+                    # frozen read view once a higher column resolved, so an empty
+                    # result at any step is the empty-table answer.
+                    return None
+                row = rows[0]
+                resolved.append(row[key] if isinstance(row, dict) else row[0])
+            return resolved
+
+    def _execute_with_snapshot_read_timeout(self, sql: str, params: tuple) -> list:
+        """Run one read with the snapshot read-timeout budget, then restore it.
+
+        The incremental-snapshot key bound can run a full scan + top-sort on a
+        large table, so it must not be constrained by the bare ~30s transport
+        default or a slow seed times out and crash-loops the stream on restart.
+        """
+
         set_socket_timeout = getattr(self.transport, "set_socket_timeout", None)
         previous_socket_timeout = getattr(self.transport, "socket_timeout", None)
         if set_socket_timeout is not None:
@@ -2572,7 +2631,7 @@ class PurePythonInformixBridge:
                 )
             )
         try:
-            rows = self.transport.execute(sql, ())
+            return self.transport.execute(sql, params)
         finally:
             if set_socket_timeout is not None and previous_socket_timeout is not None:
                 try:
@@ -2582,12 +2641,6 @@ class PurePythonInformixBridge:
                         "Failed to restore Informix max-key socket timeout",
                         exc_info=True,
                     )
-        if not rows:
-            return None
-        row = rows[0]
-        if isinstance(row, dict):
-            return [row[name] for name in result_names]
-        return list(row)
 
     @_serialized_sqli_operation
     def consistent_snapshot(

@@ -1503,10 +1503,97 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(transport.timeouts, [65.0, 30.0])
 
-    def test_max_primary_key_extends_and_restores_socket_timeout(self):
-        # The seed's key-bound read (SELECT FIRST 1 ... ORDER BY pk DESC) can run a
-        # full scan + top-sort on a large table; it must get the snapshot read
-        # budget, not the bare 30s default, and restore the prior timeout after.
+    @staticmethod
+    def _stepwise_bridge(answers, options=None):
+        # A plain-column key resolves stepwise inside a REPEATABLE READ view, so
+        # the transport must answer the is_ansi probe and accept BEGIN/COMMIT.
+        class StepwiseTransport:
+            def __init__(self):
+                self.socket_timeout = 30.0
+                self.timeouts = []
+                self.selects = []
+                self._index = 0
+
+            def set_socket_timeout(self, timeout):
+                self.socket_timeout = timeout
+                self.timeouts.append(timeout)
+
+            def execute(self, sql, parameters=()):
+                if "sysmaster:sysdatabases" in sql:
+                    return [{"is_ansi": 0}]
+                if sql.startswith("SELECT"):
+                    # The read must run under the extended budget, not the default.
+                    assert self.socket_timeout == options_dict_timeout
+                    self.selects.append((sql, tuple(parameters)))
+                    rows = answers[self._index]
+                    self._index += 1
+                    return rows
+                return []
+
+            def execute_command(self, sql):
+                del sql
+
+        options_dict = dict(options or {})
+        options_dict_timeout = float(options_dict.get("snapshot.read.timeout.seconds", "300"))
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = options_dict
+        bridge.config = {"database": "demo"}
+        bridge.transport = StepwiseTransport()
+        return bridge
+
+    def test_max_primary_key_composite_resolves_stepwise(self):
+        # tw305's key: hpolicy (CHAR) + clm_no (DECIMAL). The max tuple is found
+        # one column at a time so each read is an index sub-range scan, never a
+        # whole-table sort -- and it holds even if the index mixes ASC/DESC.
+        bridge = self._stepwise_bridge([[{"hpolicy": "H9"}], [{"clm_no": 5}]])
+
+        result = bridge.max_primary_key("demo.app.tw305", ["hpolicy", "clm_no"])
+
+        self.assertEqual(result, ["H9", 5])
+        selects = bridge.transport.selects
+        self.assertEqual(len(selects), 2)
+        first_sql, first_params = selects[0]
+        second_sql, second_params = selects[1]
+        # First column: no equality prefix, ordered DESC, directive present.
+        self.assertIn("{+FIRST_ROWS(1)}", first_sql)
+        self.assertIn("FIRST 1 hpolicy", first_sql)
+        self.assertNotIn("WHERE", first_sql)
+        self.assertTrue(first_sql.rstrip().endswith("ORDER BY hpolicy DESC"))
+        self.assertEqual(first_params, ())
+        # Second column: pinned to the resolved first column via a bound param.
+        self.assertIn("FIRST 1 clm_no", second_sql)
+        self.assertIn("WHERE hpolicy = ?", second_sql)
+        self.assertTrue(second_sql.rstrip().endswith("ORDER BY clm_no DESC"))
+        self.assertEqual(second_params, ("H9",))
+
+    def test_max_primary_key_stepwise_empty_table_returns_none(self):
+        bridge = self._stepwise_bridge([[]])
+
+        self.assertIsNone(bridge.max_primary_key("demo.app.tw305", ["hpolicy", "clm_no"]))
+        # No second query once the first column has no rows.
+        self.assertEqual(len(bridge.transport.selects), 1)
+
+    def test_max_primary_key_stepwise_applies_and_restores_timeout(self):
+        bridge = self._stepwise_bridge([[{"id": 42}]])
+
+        result = bridge.max_primary_key("demo.app.orders", ["id"])
+
+        self.assertEqual(result, [42])
+        self.assertEqual(bridge.transport.timeouts, [300.0, 30.0])
+
+    def test_max_primary_key_honors_snapshot_timeout_option(self):
+        bridge = self._stepwise_bridge(
+            [[{"id": 7}]], options={"snapshot.read.timeout.seconds": "900"}
+        )
+
+        bridge.max_primary_key("demo.app.orders", ["id"])
+
+        self.assertEqual(bridge.transport.timeouts, [900.0, 30.0])
+
+    def test_max_primary_key_datetime_chunk_keeps_single_composite_read(self):
+        # A DATETIME-chunked key cannot use the stepwise equality prefix (no index
+        # serves an order-preserving cast expression), so it stays a single
+        # composite read with the FIRST_ROWS directive and the extended budget.
         class TimedTransport:
             def __init__(self):
                 self.socket_timeout = 30.0
@@ -1517,48 +1604,26 @@ class LakeflowContractTests(unittest.TestCase):
                 self.socket_timeout = timeout
                 self.timeouts.append(timeout)
 
-            def execute(self, sql, params):  # noqa: ARG002
-                # Observed timeout must already be the extended budget mid-read.
+            def execute(self, sql, params):
                 assert self.socket_timeout == 300.0
+                assert params == ()
                 self.sql = sql
-                return [{"id": 42}]
+                return [{"__chunk_ts": "2026-01-01"}]
 
         transport = TimedTransport()
         bridge = object.__new__(PurePythonInformixBridge)
         bridge.options = {}
         bridge.transport = transport
 
-        result = bridge.max_primary_key("demo.app.orders", ["id"])
+        result = bridge.max_primary_key(
+            "demo.app.events", ["ts"], chunk_exprs={"ts": "TO_CHAR(ts)"}
+        )
 
-        self.assertEqual(result, [42])
+        self.assertEqual(result, ["2026-01-01"])
         self.assertEqual(transport.timeouts, [300.0, 30.0])
-        # The FIRST_ROWS directive must ride on the seed query so Informix serves
-        # the DESC ordering with a reverse index scan instead of a full sort.
         self.assertIn("{+FIRST_ROWS(1)}", transport.sql)
-        self.assertIn("FIRST 1", transport.sql)
-        self.assertTrue(transport.sql.rstrip().endswith("ORDER BY id DESC"))
-
-    def test_max_primary_key_honors_snapshot_timeout_option(self):
-        class TimedTransport:
-            def __init__(self):
-                self.socket_timeout = 30.0
-                self.timeouts = []
-
-            def set_socket_timeout(self, timeout):
-                self.socket_timeout = timeout
-                self.timeouts.append(timeout)
-
-            def execute(self, sql, params):  # noqa: ARG002
-                return [{"id": 7}]
-
-        transport = TimedTransport()
-        bridge = object.__new__(PurePythonInformixBridge)
-        bridge.options = {"snapshot.read.timeout.seconds": "900"}
-        bridge.transport = transport
-
-        bridge.max_primary_key("demo.app.orders", ["id"])
-
-        self.assertEqual(transport.timeouts, [900.0, 30.0])
+        self.assertIn("TO_CHAR(ts) AS __chunk_ts", transport.sql)
+        self.assertTrue(transport.sql.rstrip().endswith("ORDER BY TO_CHAR(ts) DESC"))
 
     def test_default_cdc_poll_byte_bound_skips_accounting(self):
         transport = FakeCdcTransport([[{"op": "TIMEOUT", "lsn": 100}]])
