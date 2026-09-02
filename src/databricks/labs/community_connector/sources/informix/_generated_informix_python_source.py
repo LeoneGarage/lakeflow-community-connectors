@@ -7473,8 +7473,17 @@ def register_lakeflow_source(spark):
             ]
             result_names = [f"__chunk_{key}" if key in chunk_exprs else key for key in primary_keys]
             order = ",".join(f"{chunk_exprs.get(key, key)} DESC" for key in primary_keys)
+            # {+FIRST_ROWS(1)} steers the optimizer to minimize time-to-first-row. For
+            # `ORDER BY <pk> DESC` that makes the reverse index scan -- which returns
+            # row 1 immediately -- beat a full scan + top-sort, which must sort the
+            # whole table before it can yield the first row. Without it, Informix has
+            # been observed sorting a large table here and blowing past even the
+            # extended snapshot read budget. It is a `{+ }` comment, so a server with
+            # external directives disabled ignores it rather than erroring. It cannot
+            # help when a key column is chunked to an order-preserving expression (no
+            # index serves that ordering); that path stays sort-bound by construction.
             sql = (
-                f"SELECT FIRST 1 {','.join(select_terms)} "
+                f"SELECT {{+FIRST_ROWS(1)}} FIRST 1 {','.join(select_terms)} "
                 f"FROM {database}:{_sql_identifier(owner)}.{_sql_identifier(name)}"
             )
             if snapshot_filter:
