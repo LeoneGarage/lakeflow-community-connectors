@@ -213,7 +213,18 @@ connector keeps a single composite `SELECT {+FIRST_ROWS(1)} FIRST 1 ... ORDER BY
 index read over a full scan + top-sort (and is silently ignored where the server
 disables external directives). Either way the read gets the snapshot budget
 above, because the bare 30-second default would time out and crash-loop the
-stream on every restart. CDC session setup and teardown while validating the initial
+stream on every restart.
+
+The keyset **page reads** that copy a keyed table carry the same
+`{+FIRST_ROWS(n)}` directive. Their predicate is the OR-form
+`(k1 > ?) OR (k1 = ? AND k2 > ?)`, which optimizers often do not recognize as an
+index range start, so a composite `ORDER BY k1, k2` can tip into a full scan +
+top-sort per page on a large table. The directive asks the optimizer to stream
+the page from the key index in order instead; `UPDATE STATISTICS HIGH` on the
+source is the complementary fix, steering the cost model to the same plan even
+where external directives are disabled.
+
+CDC session setup and teardown while validating the initial
 CDC boundary use `cdc.read.timeout.seconds` (default `60`) for the same reason:
 `syscdcv1` open/start/activate/end/close calls can stall under many concurrent
 CDC sessions and should not fail against the 30-second default.
