@@ -204,6 +204,9 @@ class FakeBridge:
         self.validated_initial = []
         self.change_reads = []
         self.released_connections = 0
+        # Optional {(col, ...): [descending, ...]} for key_index_directions,
+        # simulating an index whose columns match a primary.keys override.
+        self.index_directions = {}
         # Renders the "__chunk_<key>" ordering string for keys chunked by
         # expression; identity by default, overridden to simulate a
         # DATETIME-to-string cast.
@@ -214,6 +217,12 @@ class FakeBridge:
 
     def get_table(self, identity):
         return next(t for t in self.tables if identity.endswith(f".{t['owner']}.{t['name']}"))
+
+    def key_index_directions(self, identity, columns):
+        # Directions of an index matching the override columns; configured per
+        # test via index_directions {(col, ...): [desc, ...]}. Default: no match.
+        del identity
+        return self.index_directions.get(tuple(columns))
 
     def current_lsn(self):
         return self.now
@@ -10371,7 +10380,70 @@ class MixedDirectionKeyTests(unittest.TestCase):
         with self.assertRaisesRegex(informix_module.InformixError, "Key direction metadata"):
             informix_module.Table.parse({**raw, "key_descending": [True]}, "demo")
 
-    def test_primary_key_override_clears_directions(self):
+    @staticmethod
+    def _keyless_table(*columns):
+        return informix_module.Table(
+            "demo",
+            "app",
+            "t",
+            tuple(
+                informix_module.Column(name, "INTEGER", False, 4, None, None, True)
+                for name in columns
+            ),
+            (),  # physically keyless; a primary.keys override supplies the key
+        )
+
+    @staticmethod
+    def _override_connector(index_directions):
+        connector = object.__new__(InformixLakeflowConnect)
+        connector._override_direction_cache = {}
+
+        class _StubBridge:
+            def __init__(self):
+                self.calls = 0
+
+            def key_index_directions(self, identity, columns):
+                del identity
+                self.calls += 1
+                return index_directions.get(tuple(columns))
+
+        connector._bridge_instance = _StubBridge()
+        return connector
+
+    def test_override_adopts_a_matching_index_direction(self):
+        # primary.keys names the columns of the (a ASC, b DESC) index; the override
+        # picks up that index's directions so it pages in the index's own order.
+        connector = self._override_connector({("a", "b"): [False, True]})
+        table = self._keyless_table("a", "b")
+
+        overridden = connector._apply_primary_key_override(table, {"primary.keys": "a,b"})
+
+        self.assertEqual(overridden.primary_keys, ("a", "b"))
+        self.assertEqual(overridden.key_descending, (False, True))
+
+    def test_override_pages_ascending_when_no_index_matches(self):
+        # No index matches the override columns, so paging stays all-ascending.
+        connector = self._override_connector({})
+        table = self._keyless_table("a", "b")
+
+        overridden = connector._apply_primary_key_override(table, {"primary.keys": "a,b"})
+
+        self.assertEqual(overridden.primary_keys, ("a", "b"))
+        self.assertEqual(overridden.key_descending, ())
+
+    def test_override_lookup_is_memoized_per_table_and_key(self):
+        connector = self._override_connector({("a", "b"): [False, True]})
+        table = self._keyless_table("a", "b")
+
+        for _ in range(3):
+            connector._apply_primary_key_override(table, {"primary.keys": "a,b"})
+
+        self.assertEqual(connector._bridge_instance.calls, 1)  # one catalog lookup, then cached
+
+    def test_override_restating_catalog_key_keeps_discovered_directions(self):
+        # When primary.keys just restates the discovered key, its already-known
+        # directions are kept and no catalog lookup happens.
+        connector = self._override_connector({})  # would return None if consulted
         table = informix_module.Table(
             "demo",
             "app",
@@ -10383,10 +10455,77 @@ class MixedDirectionKeyTests(unittest.TestCase):
             ("a", "b"),
             key_descending=(False, True),
         )
+
+        overridden = connector._apply_primary_key_override(table, {"primary.keys": "a,b"})
+
+        self.assertTrue(overridden.key_override)
+        self.assertEqual(overridden.key_descending, (False, True))
+        self.assertEqual(connector._bridge_instance.calls, 0)  # discovered directions reused
+
+    def test_refresh_preserves_override_directions(self):
+        # A schema refresh of an overridden table must keep the adopted key-index
+        # directions, or a mixed-direction override would revert to ascending
+        # paging mid-copy (and trip the key-order guard).
         connector = object.__new__(InformixLakeflowConnect)
-        overridden = connector._apply_primary_key_override(table, {"primary.keys": "a"})
-        self.assertEqual(overridden.primary_keys, ("a",))
-        self.assertEqual(overridden.key_descending, ())  # override columns have no known index
+        connector._tables = None
+
+        class _StubBridge:
+            def get_table(self, identity):
+                del identity
+                return {
+                    "database": "demo",
+                    "owner": "app",
+                    "name": "t",
+                    "columns": [
+                        {"name": "a", "type_name": "INTEGER", "nullable": False},
+                        {"name": "b", "type_name": "INTEGER", "nullable": False},
+                    ],
+                    "primary_keys": [],  # physically keyless; the override supplies the key
+                }
+
+        connector._bridge_instance = _StubBridge()
+        overridden = informix_module.Table(
+            "demo",
+            "app",
+            "t",
+            (
+                informix_module.Column("a", "INTEGER", False, 4, None, None, True),
+                informix_module.Column("b", "INTEGER", False, 4, None, None, True),
+            ),
+            ("a", "b"),
+            key_override=True,
+            key_descending=(False, True),
+        )
+
+        refreshed = connector._refresh_table_schema(overridden, None)
+
+        self.assertEqual(refreshed.primary_keys, ("a", "b"))
+        self.assertEqual(refreshed.key_descending, (False, True))
+
+    def test_key_index_directions_matches_index_columns_in_order(self):
+        class CatalogTransport:
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                del parameters, max_result_bytes
+                if "syscolumns" in sql:
+                    return [
+                        {"colname": "a", "colno": 1},
+                        {"colname": "b", "colno": 2},
+                        {"colname": "c", "colno": 3},
+                    ]
+                if "sysindexes" in sql:
+                    # One index on (a ASC, b DESC); b is a negative part.
+                    return [MixedDirectionKeyTests._pk_row(1, -2)]
+                return []
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.config = {"database": "demo"}
+        bridge.transport = CatalogTransport()
+
+        self.assertEqual(bridge.key_index_directions("demo.app.t", ["a", "b"]), [False, True])
+        # A column set no index covers in that order gets no directions.
+        self.assertIsNone(bridge.key_index_directions("demo.app.t", ["b", "a"]))
+        self.assertIsNone(bridge.key_index_directions("demo.app.t", ["c"]))
 
 
 class NullByteOptionTests(unittest.TestCase):

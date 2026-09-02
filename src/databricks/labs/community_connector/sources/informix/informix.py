@@ -1087,6 +1087,8 @@ class InformixBridge(Protocol):
 
     def get_table(self, identity: str) -> dict[str, Any]: ...
 
+    def key_index_directions(self, identity: str, columns: Sequence[str]) -> list[bool] | None: ...
+
     def current_lsn(self) -> int: ...
 
     def minimum_lsn(self) -> int: ...
@@ -2178,6 +2180,60 @@ class PurePythonInformixBridge:
             "key_descending": key_descending if any(key_descending) else [],
             "incarnation": str(tabid),
         }
+
+    @_serialized_sqli_operation
+    def key_index_directions(self, identity, columns):
+        """Return the per-column DESC flags of an index whose key columns exactly
+        match ``columns`` in order, or ``None`` if no index matches.
+
+        A ``primary.keys`` override names columns, not an index, so on its own it
+        pages all-ascending -- which sorts when the real key index is
+        mixed-direction. This finds any index (unique, duplicate, or the PK's)
+        whose ordered key columns equal the override and reports its directions,
+        so the override can page in that index's own order. A negative catalog
+        part number is a descending column. ``None`` leaves paging ascending.
+        """
+
+        self._ensure_connected()
+        database, owner, name = _split_identity(identity)
+        for identifier in (database, owner, name, *columns):
+            if not _IDENTIFIER.fullmatch(identifier):
+                raise InformixError(f"Unsafe key-index identifier {identifier!r}")
+        max_bytes = int(self.options.get("metadata.max.bytes", str(64 << 20))) or None
+        column_rows = self.transport.execute(
+            "SELECT c.colname, c.colno FROM systables t JOIN syscolumns c ON t.tabid = c.tabid "
+            "WHERE t.tabtype = 'T' AND t.owner = ? AND t.tabname = ?",
+            (owner, name),
+            max_result_bytes=max_bytes,
+        )
+        by_number = {
+            int(_field(row, "colno", 1)): str(_field(row, "colname", 0)) for row in column_rows
+        }
+        index_rows = self.transport.execute(
+            "SELECT i.part1,i.part2,i.part3,i.part4,i.part5,i.part6,i.part7,i.part8,"
+            "i.part9,i.part10,i.part11,i.part12,i.part13,i.part14,i.part15,i.part16 "
+            "FROM systables t JOIN sysindexes i ON t.tabid = i.tabid "
+            "WHERE t.tabtype = 'T' AND t.owner = ? AND t.tabname = ?",
+            (owner, name),
+            max_result_bytes=max_bytes,
+        )
+        target = list(columns)
+        for row in index_rows:
+            names: list[str] = []
+            directions: list[bool] = []
+            for position in range(16):
+                part = int(_field(row, f"part{position + 1}", position + 1))
+                if part == 0:
+                    break  # key columns are contiguous; the rest is padding
+                column_name = by_number.get(abs(part))
+                if column_name is None:
+                    names = []  # references a column we cannot name; skip this index
+                    break
+                names.append(column_name)
+                directions.append(part < 0)
+            if names == target:
+                return directions
+        return None
 
     @_serialized_sqli_operation
     def current_lsn(self) -> int:
@@ -4092,7 +4148,7 @@ def _run_shared_cdc_shard(shard: _SharedCdcShard) -> None:
                             fresh,
                             primary_keys=table.primary_keys,
                             key_override=True,
-                            key_descending=(),
+                            key_descending=table.key_descending,
                         )
                     schema_map[identity] = fresh
                 min_lsn = reader._bridge.minimum_lsn()
@@ -4531,6 +4587,11 @@ class InformixLakeflowConnect(LakeflowConnect):
         self._bridge_instance: InformixBridge | None = None
         self._tables: dict[str, Table] | None = None
         self._tables_complete = False
+        # Memoizes the key-index directions adopted for a primary.keys override,
+        # keyed by (identity, key columns). The override runs on every _table call
+        # (including cache hits), so the catalog lookup must happen at most once
+        # per table+key rather than per microbatch.
+        self._override_direction_cache: dict[tuple[str, tuple[str, ...]], tuple[bool, ...]] = {}
         self._snapshot_high_water: dict[tuple[str, str], int] = {}
         self._snapshot_schema_ids: dict[tuple[str, str], str] = {}
         self._trigger_available_now = False
@@ -5809,6 +5870,12 @@ class InformixLakeflowConnect(LakeflowConnect):
         also uses as the destination merge key). The caller MUST guarantee the
         columns are unique for the row: a non-unique override corrupts upserts,
         delete identification, and snapshot pagination.
+
+        The override adopts the per-column direction of an index whose key columns
+        exactly match it (see ``_override_key_directions``), so an override that
+        names a mixed-direction index's columns still pages in that index's own
+        order rather than forcing an all-ascending sort. When no index matches,
+        paging stays ascending.
         """
 
         raw = table_options.get(_PRIMARY_KEYS_OPTION)
@@ -5826,11 +5893,32 @@ class InformixLakeflowConnect(LakeflowConnect):
                 f"Option '{_PRIMARY_KEYS_OPTION}' names column(s) not present in "
                 f"'{table.exposed_name}': {', '.join(missing)}"
             )
-        if table.key_override and tuple(keys) == table.primary_keys:
-            return table
-        # The override names columns, not an index, so their key-index direction is
-        # unknown: clear it so paging uses the default lexicographic order.
-        return replace(table, primary_keys=tuple(keys), key_override=True, key_descending=())
+        if tuple(keys) == table.primary_keys:
+            # The override restates the catalog key; keep its discovered directions
+            # (which already reflect the key index) rather than looking them up again.
+            return table if table.key_override else replace(table, key_override=True)
+        directions = self._override_key_directions(table.identity, tuple(keys))
+        return replace(
+            table,
+            primary_keys=tuple(keys),
+            key_override=True,
+            key_descending=tuple(directions or ()),
+        )
+
+    def _override_key_directions(self, identity: str, keys: tuple[str, ...]) -> list[bool] | None:
+        """Memoized key-index direction lookup for a ``primary.keys`` override.
+
+        The override is applied on every ``_table`` call (cache hits included), so
+        the catalog lookup must run at most once per table+key, not per microbatch.
+        """
+
+        cache = self._override_direction_cache
+        cache_key = (identity, keys)
+        if cache_key not in cache:
+            found = self._bridge.key_index_directions(identity, list(keys))
+            cache[cache_key] = tuple(found) if found else ()
+        cached = cache[cache_key]
+        return list(cached) if cached else None
 
     def _snapshot_mode(self, table_options: dict[str, str]) -> str:
         mode = (
@@ -8126,12 +8214,14 @@ class InformixLakeflowConnect(LakeflowConnect):
             # Keep the primary.keys override (and therefore the fingerprint) across a
             # schema refresh instead of reverting to the catalog's keys. Only applies
             # when the caller was already overridden, so a genuine catalog key change
-            # on a normal table is still detected as drift.
+            # on a normal table is still detected as drift. The override's adopted
+            # key-index directions are preserved too, so a mixed-direction override
+            # keeps paging in its index order across the refresh.
             refreshed = replace(
                 refreshed,
                 primary_keys=table.primary_keys,
                 key_override=True,
-                key_descending=(),
+                key_descending=table.key_descending,
             )
         _ensure_materializable(refreshed)
         fingerprint = _schema_fingerprint(refreshed)
