@@ -1330,7 +1330,7 @@ class LakeflowContractTests(unittest.TestCase):
         with (
             mock.patch.object(informix_module, "CdcFrameParser", RecordParser),
             mock.patch.object(
-                informix_module, "decode_frame", side_effect=lambda frame, labels: dict(frame)
+                informix_module, "decode_frame", side_effect=lambda frame, labels, **_: dict(frame)
             ),
         ):
             bridge.read_changes([capture], 90, 1, default)
@@ -1382,7 +1382,7 @@ class LakeflowContractTests(unittest.TestCase):
         with (
             mock.patch.object(informix_module, "CdcFrameParser", RecordParser),
             mock.patch.object(
-                informix_module, "decode_frame", side_effect=lambda frame, labels: dict(frame)
+                informix_module, "decode_frame", side_effect=lambda frame, labels, **_: dict(frame)
             ),
         ):
             records = bridge.read_changes([capture], 90, 1, 2)
@@ -1416,7 +1416,7 @@ class LakeflowContractTests(unittest.TestCase):
         with (
             mock.patch.object(informix_module, "CdcFrameParser", RecordParser),
             mock.patch.object(
-                informix_module, "decode_frame", side_effect=lambda frame, labels: dict(frame)
+                informix_module, "decode_frame", side_effect=lambda frame, labels, **_: dict(frame)
             ),
             mock.patch.object(informix_module, "metadata_column_names", return_value=["id"]),
             mock.patch.object(bridge, "_assert_capture_layout"),
@@ -1463,7 +1463,7 @@ class LakeflowContractTests(unittest.TestCase):
         with (
             mock.patch.object(informix_module, "CdcFrameParser", RecordParser),
             mock.patch.object(
-                informix_module, "decode_frame", side_effect=lambda frame, labels: dict(frame)
+                informix_module, "decode_frame", side_effect=lambda frame, labels, **_: dict(frame)
             ),
             mock.patch.object(informix_module, "metadata_column_names", return_value=["id"]),
             mock.patch.object(bridge, "_assert_capture_layout"),
@@ -1496,7 +1496,7 @@ class LakeflowContractTests(unittest.TestCase):
         with (
             mock.patch.object(informix_module, "CdcFrameParser", RecordParser),
             mock.patch.object(
-                informix_module, "decode_frame", side_effect=lambda frame, labels: dict(frame)
+                informix_module, "decode_frame", side_effect=lambda frame, labels, **_: dict(frame)
             ),
         ):
             bridge.read_changes([capture], 90, 60, 2)
@@ -1518,7 +1518,7 @@ class LakeflowContractTests(unittest.TestCase):
         with (
             mock.patch.object(informix_module, "CdcFrameParser", RecordParser),
             mock.patch.object(
-                informix_module, "decode_frame", side_effect=lambda frame, labels: dict(frame)
+                informix_module, "decode_frame", side_effect=lambda frame, labels, **_: dict(frame)
             ),
             mock.patch.object(
                 informix_module, "_deep_size", side_effect=AssertionError("must not account")
@@ -1632,7 +1632,7 @@ class LakeflowContractTests(unittest.TestCase):
         with (
             mock.patch.object(informix_module, "CdcFrameParser", RecordParser),
             mock.patch.object(
-                informix_module, "decode_frame", side_effect=lambda frame, labels: dict(frame)
+                informix_module, "decode_frame", side_effect=lambda frame, labels, **_: dict(frame)
             ),
             self.assertRaisesRegex(InformixError, "CDC session cleanup failed"),
         ):
@@ -1681,7 +1681,7 @@ class LakeflowContractTests(unittest.TestCase):
         with (
             mock.patch.object(informix_module, "CdcFrameParser", RecordParser),
             mock.patch.object(
-                informix_module, "decode_frame", side_effect=lambda frame, labels: dict(frame)
+                informix_module, "decode_frame", side_effect=lambda frame, labels, **_: dict(frame)
             ),
         ):
             records = bridge.read_changes([capture], 90, 1, 2)
@@ -1703,7 +1703,7 @@ class LakeflowContractTests(unittest.TestCase):
         with (
             mock.patch.object(informix_module, "CdcFrameParser", RecordParser),
             mock.patch.object(
-                informix_module, "decode_frame", side_effect=lambda frame, labels: dict(frame)
+                informix_module, "decode_frame", side_effect=lambda frame, labels, **_: dict(frame)
             ),
             self.assertRaisesRegex(InformixError, "cdc.max.poll.records=2"),
         ):
@@ -1724,7 +1724,7 @@ class LakeflowContractTests(unittest.TestCase):
         with (
             mock.patch.object(informix_module, "CdcFrameParser", RecordParser),
             mock.patch.object(
-                informix_module, "decode_frame", side_effect=lambda frame, labels: dict(frame)
+                informix_module, "decode_frame", side_effect=lambda frame, labels, **_: dict(frame)
             ),
             self.assertRaisesRegex(InformixError, "cdc.max.poll.bytes=2"),
         ):
@@ -1758,7 +1758,7 @@ class LakeflowContractTests(unittest.TestCase):
         with (
             mock.patch.object(informix_module, "CdcFrameParser", RecordParser),
             mock.patch.object(
-                informix_module, "decode_frame", side_effect=lambda frame, labels: dict(frame)
+                informix_module, "decode_frame", side_effect=lambda frame, labels, **_: dict(frame)
             ),
         ):
             records = bridge.read_changes([capture], 90, 1, 2)
@@ -1792,7 +1792,7 @@ class LakeflowContractTests(unittest.TestCase):
         with (
             mock.patch.object(informix_module, "CdcFrameParser", RecordParser),
             mock.patch.object(
-                informix_module, "decode_frame", side_effect=lambda frame, labels: dict(frame)
+                informix_module, "decode_frame", side_effect=lambda frame, labels, **_: dict(frame)
             ),
         ):
             records = bridge.read_changes([capture], 90, 1, 2)
@@ -1828,7 +1828,7 @@ class LakeflowContractTests(unittest.TestCase):
         with (
             mock.patch.object(informix_module, "CdcFrameParser", BufferingParser),
             mock.patch.object(
-                informix_module, "decode_frame", side_effect=lambda frame, labels: dict(frame)
+                informix_module, "decode_frame", side_effect=lambda frame, labels, **_: dict(frame)
             ),
         ):
             records = bridge.read_changes([capture], 90, 1, 2)
@@ -1858,7 +1858,7 @@ class LakeflowContractTests(unittest.TestCase):
         with (
             mock.patch.object(informix_module, "CdcFrameParser", RecordParser),
             mock.patch.object(
-                informix_module, "decode_frame", side_effect=lambda frame, labels: dict(frame)
+                informix_module, "decode_frame", side_effect=lambda frame, labels, **_: dict(frame)
             ),
             self.assertRaisesRegex(
                 InformixError, "cdc.max.poll.records=2 before any transaction completed"
@@ -9963,6 +9963,40 @@ class UniqueIndexPrimaryKeyPromotionTests(unittest.TestCase):
         table = bridge._describe_table("app", "orders")
         self.assertEqual(table["primary_keys"], [])
         self.assertFalse(any("idxtype='U'" in sql for sql in seen))  # not even queried
+
+
+class NullByteOptionTests(unittest.TestCase):
+    """The string.null.byte option resolves to null (default), empty, or keep, and the
+    bridge threads the resolved mode into both decode paths."""
+
+    def test_default_is_null(self):
+        self.assertEqual(informix_module._null_byte_mode({}), "null")
+
+    def test_explicit_modes_and_alias(self):
+        self.assertEqual(informix_module._null_byte_mode({"string.null.byte": "empty"}), "empty")
+        self.assertEqual(informix_module._null_byte_mode({"string.null.byte": "KEEP"}), "keep")
+        self.assertEqual(
+            informix_module._null_byte_mode({"string.null.byte": "empty_string"}), "empty"
+        )
+        self.assertEqual(informix_module._null_byte_mode({"string.null.byte": ""}), "null")
+
+    def test_invalid_mode_raises(self):
+        with self.assertRaisesRegex(ValueError, "string.null.byte"):
+            informix_module._null_byte_mode({"string.null.byte": "blank"})
+
+    def test_bridge_threads_mode_to_the_sqli_client(self):
+        bridge = object.__new__(informix_module.PurePythonInformixBridge)
+        options = {
+            "hostname": "localhost",
+            "database": "demo",
+            "user": "informix",
+            "password": "secret",
+            "server": "demo_on",
+            "string.null.byte": "empty",
+        }
+        informix_module.PurePythonInformixBridge.__init__(bridge, options)
+        self.assertEqual(bridge._null_byte, "empty")
+        self.assertEqual(bridge.transport.null_byte, "empty")
 
 
 if __name__ == "__main__":

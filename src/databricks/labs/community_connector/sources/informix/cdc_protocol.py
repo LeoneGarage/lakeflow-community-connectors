@@ -156,7 +156,12 @@ class CdcFrameParser:
         return frames
 
 
-def decode_frame(frame: bytes, columns_by_label: dict[int, tuple[ColumnDescriptor, ...]]) -> dict:
+def decode_frame(
+    frame: bytes,
+    columns_by_label: dict[int, tuple[ColumnDescriptor, ...]],
+    *,
+    null_byte: str = "keep",
+) -> dict:
     if len(frame) < FIXED_HEADER:
         raise CdcProtocolError("truncated CDC fixed header")
     header_size, payload_size, reserved, kind = struct.unpack_from(">IIII", frame)
@@ -176,7 +181,7 @@ def decode_frame(frame: bytes, columns_by_label: dict[int, tuple[ColumnDescripto
         columns = columns_by_label.get(label)
         if columns is None:
             raise CdcProtocolError(f"operation references unknown capture label {label}")
-        record["row"] = decode_row(payload, columns)
+        record["row"] = decode_row(payload, columns, null_byte=null_byte)
     elif kind == 1:
         _require_header(header, 24, op)
         lsn, tx_id, timestamp, user_id = struct.unpack_from(">Qiqi", header)
@@ -224,11 +229,13 @@ def frame_log_file(frame: bytes) -> int | None:
     return struct.unpack_from(">Q", frame, FIXED_HEADER)[0] >> 32
 
 
-def decode_row(payload: memoryview, columns: Iterable[ColumnDescriptor]) -> dict[str, Any]:
+def decode_row(
+    payload: memoryview, columns: Iterable[ColumnDescriptor], *, null_byte: str = "keep"
+) -> dict[str, Any]:
     offset, row = 0, {}
     for column in columns:
         try:
-            value, consumed = decode_value(payload[offset:], column)
+            value, consumed = decode_value(payload[offset:], column, null_byte=null_byte)
         except (CdcProtocolError, UnicodeDecodeError) as error:
             # UnicodeDecodeError is raised by the text branches of decode_value
             # and is not a CdcProtocolError, so catching only the latter let a
@@ -248,7 +255,36 @@ def decode_row(payload: memoryview, columns: Iterable[ColumnDescriptor]) -> dict
     return row
 
 
-def decode_value(data: memoryview, column: ColumnDescriptor) -> tuple[Any, int]:
+def apply_null_byte(value: Any, mode: str) -> Any:
+    """Sanitize a decoded string that contains an embedded NUL (``\\x00``).
+
+    ``mode`` selects the behaviour (shared by the CDC and snapshot decode paths):
+
+    - ``"keep"`` -- return the value unchanged; a NUL passes straight through.
+    - ``"null"`` -- a string containing any NUL becomes ``None``. A NUL is genuine
+      content here (the decoders already trim real padding), so it cannot be
+      represented as a clean string; ``None`` says so honestly and is detectable
+      downstream rather than silently altering the value.
+    - ``"empty"`` -- strip the NUL characters, preserving the rest of the string.
+
+    Non-string values, and NUL-free strings, are returned unchanged regardless of mode.
+    """
+
+    if mode == "keep" or not isinstance(value, str) or "\x00" not in value:
+        return value
+    if mode == "null":
+        return None
+    return value.replace("\x00", "")
+
+
+def decode_value(
+    data: memoryview, column: ColumnDescriptor, *, null_byte: str = "keep"
+) -> tuple[Any, int]:
+    value, consumed = _decode_value_bytes(data, column)
+    return apply_null_byte(value, null_byte), consumed
+
+
+def _decode_value_bytes(data: memoryview, column: ColumnDescriptor) -> tuple[Any, int]:
     kind = column.type_name.upper().split("(", 1)[0].strip()
     if kind in {"SMALLINT", "INT2"}:
         value = _unpack(">h", data)
@@ -513,6 +549,7 @@ __all__ = [
     "ColumnDescriptor",
     "OpenTransactionRecords",
     "UnsupportedCdcType",
+    "apply_null_byte",
     "decode_frame",
     "metadata_column_names",
     "decode_packed_decimal",

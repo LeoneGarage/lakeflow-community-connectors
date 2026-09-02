@@ -772,6 +772,19 @@ connection:
         affects the snapshot-drain daemon; consumer and CDC-daemon reads always keep
         the plain deadline. Accepts true/false (1/yes, 0/no).
 
+    - name: string.null.byte
+      type: string
+      required: false
+      description: >
+        How a decoded string containing an embedded NUL (\x00) is sanitized, in
+        both the CDC and snapshot decode paths. A NUL is genuine content -- the
+        connector already trims real CHAR padding -- but many downstream consumers
+        cannot store it. null (default): a string containing any NUL becomes NULL
+        (honest and detectable rather than silently altered). empty: strip the NUL
+        characters, preserving the rest. keep: pass it through unchanged. Note a
+        key column (promoted unique index or primary.keys) is required non-null, so
+        prefer empty if text key columns may carry a NUL. Accepts null/empty/keep.
+
     - name: primary.key.from.unique.index
       type: string
       required: false

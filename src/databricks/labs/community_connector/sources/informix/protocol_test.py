@@ -13,6 +13,7 @@ from databricks.labs.community_connector.sources.informix.cdc_protocol import (
     CdcProtocolError,
     ColumnDescriptor,
     OpenTransactionRecords,
+    apply_null_byte,
     cdc_routine,
     decode_frame,
     decode_value,
@@ -1599,6 +1600,46 @@ class StaleCaptureLabelFrameTests(unittest.TestCase):
         self.assertEqual(good_label, stale_label)
         self.assertEqual(good_lsn >> 32, 12)
         self.assertEqual(stale_lsn >> 32, 7)
+
+
+class NullByteSanitizationTests(unittest.TestCase):
+    """A decoded string with an embedded NUL is sanitized per the string.null.byte mode,
+    in both decode paths (CDC decode_value and the snapshot/query _decode_result_value)."""
+
+    def test_apply_null_byte_modes(self):
+        self.assertEqual(apply_null_byte("a\x00b", "keep"), "a\x00b")  # pass through
+        self.assertIsNone(apply_null_byte("a\x00b", "null"))  # whole value -> NULL
+        self.assertEqual(apply_null_byte("a\x00b", "empty"), "ab")  # strip the NUL
+        self.assertEqual(apply_null_byte("\x00", "empty"), "")  # NUL-only -> ""
+        self.assertIsNone(apply_null_byte("\x00", "null"))
+
+    def test_apply_null_byte_leaves_clean_and_non_string_values(self):
+        self.assertEqual(apply_null_byte("abc", "null"), "abc")  # no NUL -> unchanged
+        self.assertEqual(apply_null_byte(123, "null"), 123)  # non-string -> unchanged
+        self.assertIsNone(apply_null_byte(None, "null"))
+
+    def test_cdc_decode_value_applies_the_mode_to_char(self):
+        char = ColumnDescriptor("c", "CHAR", length=3)
+        self.assertEqual(decode_value(memoryview(b"ab\x00"), char, null_byte="keep"), ("ab\x00", 3))
+        self.assertEqual(decode_value(memoryview(b"ab\x00"), char, null_byte="null"), (None, 3))
+        self.assertEqual(decode_value(memoryview(b"ab\x00"), char, null_byte="empty"), ("ab", 3))
+        # Default is keep, so existing callers/tests are unaffected.
+        self.assertEqual(decode_value(memoryview(b"ab\x00"), char), ("ab\x00", 3))
+
+    def test_cdc_decode_value_applies_the_mode_to_varchar(self):
+        varchar = ColumnDescriptor("v", "VARCHAR")
+        raw = memoryview(bytes([3]) + b"a\x00b")
+        self.assertEqual(decode_value(raw, varchar, null_byte="null"), (None, 4))
+        self.assertEqual(decode_value(raw, varchar, null_byte="empty"), ("ab", 4))
+
+    def test_snapshot_decode_applies_the_mode_to_char(self):
+        # type_code 0 = CHAR; encoded_length is the fixed width.
+        column = ResultColumn("c", 0, 0, 0, 3)
+        self.assertIsNone(_decode_result_value(b"ab\x00", column, "utf-8", False, "null"))
+        self.assertEqual(_decode_result_value(b"ab\x00", column, "utf-8", False, "empty"), "ab")
+        self.assertEqual(_decode_result_value(b"ab\x00", column, "utf-8", False, "keep"), "ab\x00")
+        # Default keeps the byte (backward compatible for any caller not passing the mode).
+        self.assertEqual(_decode_result_value(b"ab\x00", column, "utf-8"), "ab\x00")
 
 
 if __name__ == "__main__":
