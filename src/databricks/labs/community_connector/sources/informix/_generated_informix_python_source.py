@@ -7356,19 +7356,6 @@ def register_lakeflow_source(spark):
                             bound_after[index] = InformixDatetimeLiteral(
                                 bound_after[index], int(descriptor["length"])
                             )
-                # A leading-column range bound the optimizer recognizes as an index
-                # seek start. The OR-form keyset below, on its own, is frequently not
-                # treated as a range start, so the scan begins at the index head and
-                # re-reads then discards the entire already-copied prefix every page --
-                # cost grows with the cursor, and a large table eventually times a page
-                # out (observed on tw305, stuck at a fixed cursor). This bound is
-                # redundant (every keyset disjunct already implies it, so the result
-                # set is unchanged) but gives the optimizer a concrete lower bound to
-                # seek to, and it is honored even where optimizer directives are off.
-                if primary_keys:
-                    leading_comparison = "<=" if is_descending(0) else ">="
-                    predicates.append(f"{order_term(primary_keys[0])} {leading_comparison} ?")
-                    parameters.append(bound_after[0])
                 clauses = []
                 for index, key in enumerate(primary_keys):
                     prefix = " AND ".join(

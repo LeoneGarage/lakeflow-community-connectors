@@ -2457,10 +2457,10 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(
             bridge.transport.sql,
             "SELECT {+FIRST_ROWS(500)} FIRST 500 hpolicy,clm_no FROM demo:app.tw305 "
-            "WHERE hpolicy >= ? AND ((hpolicy > ?) OR (hpolicy = ? AND clm_no > ?)) "
+            "WHERE ((hpolicy > ?) OR (hpolicy = ? AND clm_no > ?)) "
             "ORDER BY hpolicy,clm_no",
         )
-        self.assertEqual(bridge.transport.parameters, (100, 100, 100, 34))
+        self.assertEqual(bridge.transport.parameters, (100, 100, 34))
 
     def test_snapshot_page_mixed_direction_pages_in_index_order(self):
         # Key (hpolicy ASC, clm_no DESC): the ORDER BY matches the index so a
@@ -2489,41 +2489,10 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(
             bridge.transport.sql,
             "SELECT {+FIRST_ROWS(500)} FIRST 500 hpolicy,clm_no FROM demo:app.tw305 "
-            "WHERE hpolicy >= ? AND ((hpolicy > ?) OR (hpolicy = ? AND clm_no < ?)) "
+            "WHERE ((hpolicy > ?) OR (hpolicy = ? AND clm_no < ?)) "
             "ORDER BY hpolicy,clm_no DESC",
         )
-        self.assertEqual(bridge.transport.parameters, (100, 100, 100, 34))
-
-    def test_snapshot_page_leading_descending_seek_bound_flips(self):
-        # Leading column DESC: the index seek bound is `a <= ?` (the scan enters
-        # the index from the high end) and the keyset comparison is `<`.
-        class SnapshotTransport:
-            def execute(self, sql, parameters=(), max_result_bytes=None):
-                del max_result_bytes
-                self.sql = sql
-                self.parameters = parameters
-                return []
-
-        bridge = object.__new__(PurePythonInformixBridge)
-        bridge.options = {}
-        bridge.transport = SnapshotTransport()
-
-        bridge.snapshot_page(
-            "demo.app.t",
-            ["a", "b"],
-            ["a", "b"],
-            [5, 2],
-            10,
-            key_descending=[True, False],
-        )
-
-        self.assertEqual(
-            bridge.transport.sql,
-            "SELECT {+FIRST_ROWS(10)} FIRST 10 a,b FROM demo:app.t "
-            "WHERE a <= ? AND ((a < ?) OR (a = ? AND b > ?)) "
-            "ORDER BY a DESC,b",
-        )
-        self.assertEqual(bridge.transport.parameters, (5, 5, 5, 2))
+        self.assertEqual(bridge.transport.parameters, (100, 100, 34))
 
     def test_snapshot_page_chunked_key_ignores_direction(self):
         # A chunked (DATETIME) key has no direction-aware index to match, so even
@@ -2576,9 +2545,9 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(
             bridge.transport.sql,
             "SELECT {+FIRST_ROWS(20)} FIRST 20 id FROM demo:app.orders "
-            "WHERE (status = 'A') AND id >= ? AND ((id > ?)) ORDER BY id",
+            "WHERE (status = 'A') AND ((id > ?)) ORDER BY id",
         )
-        self.assertEqual(bridge.transport.parameters, (10, 10))
+        self.assertEqual(bridge.transport.parameters, (10,))
 
     def test_snapshot_filter_rejects_statement_stacking_and_comments(self):
         for predicate in ("status = 'A'; DROP TABLE orders", "1=1 -- all", "/* all */ 1=1"):
