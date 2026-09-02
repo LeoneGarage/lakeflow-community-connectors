@@ -193,7 +193,11 @@ per-table read for that poll.
 
 Informix snapshot SQLI reads use `snapshot.read.timeout.seconds` (default
 `300`) so large staged pages are not constrained by the normal 30-second
-transport timeout. CDC session setup and teardown while validating the initial
+transport timeout. The same budget covers the incremental-snapshot key-bound
+read (`SELECT FIRST 1 ... ORDER BY <pk> DESC`) that seeds a keyed table: on a
+large table Informix may serve that ordering with a full scan and top-sort
+rather than a reverse index read, and the bare 30-second default would time out
+and crash-loop the stream on every restart. CDC session setup and teardown while validating the initial
 CDC boundary use `cdc.read.timeout.seconds` (default `60`) for the same reason:
 `syscdcv1` open/start/activate/end/close calls can stall under many concurrent
 CDC sessions and should not fail against the 30-second default.

@@ -2543,7 +2543,36 @@ class PurePythonInformixBridge:
         if snapshot_filter:
             sql += f" WHERE ({snapshot_filter})"
         sql += f" ORDER BY {order}"
-        rows = self.transport.execute(sql, ())
+        # The key bound belongs to the incremental-snapshot family, and on a large
+        # table Informix may serve `ORDER BY pk DESC` with a full scan + top-sort
+        # rather than a reverse index read. Give it the same read budget as the
+        # snapshot page reads instead of the bare ~30s default socket timeout, or a
+        # slow seed times out and crash-loops the stream on every restart.
+        set_socket_timeout = getattr(self.transport, "set_socket_timeout", None)
+        previous_socket_timeout = getattr(self.transport, "socket_timeout", None)
+        if set_socket_timeout is not None:
+            set_socket_timeout(
+                max(
+                    float(previous_socket_timeout or 30),
+                    float(
+                        self.options.get(
+                            "snapshot.read.timeout.seconds",
+                            str(_DEFAULT_SNAPSHOT_READ_TIMEOUT_SECONDS),
+                        )
+                    ),
+                )
+            )
+        try:
+            rows = self.transport.execute(sql, ())
+        finally:
+            if set_socket_timeout is not None and previous_socket_timeout is not None:
+                try:
+                    set_socket_timeout(float(previous_socket_timeout))
+                except Exception:
+                    logging.getLogger(__name__).warning(
+                        "Failed to restore Informix max-key socket timeout",
+                        exc_info=True,
+                    )
         if not rows:
             return None
         row = rows[0]
