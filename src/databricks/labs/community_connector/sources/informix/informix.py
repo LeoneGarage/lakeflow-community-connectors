@@ -2132,6 +2132,10 @@ class PurePythonInformixBridge:
         # forcing an all-ascending sort. Normalized to [] when every column is ASC
         # so the common case carries no extra state and behaves exactly as before.
         key_descending: list[bool] = []
+        # A UNIQUE index with nullable column(s) that could stand in as the key only if the
+        # per-table allow.nullable.index option is set. Reported as a catalog fact (columns
+        # + directions); the connector promotes it, since that option is table-level.
+        nullable_index_key: list[tuple[str, bool]] = []
         if keys:
             for position in range(16):
                 column_number = int(_field(keys[0], f"part{position + 1}", position))
@@ -2159,6 +2163,12 @@ class PurePythonInformixBridge:
             selected = _select_unique_index_key(index_parts, by_number, nullable_by_name)
             primary_keys = [name for name, _ in selected]
             key_descending = [is_desc for _, is_desc in selected]
+            if not primary_keys:
+                # No all-NOT-NULL unique index qualified. Offer the nullable-relaxed
+                # candidate for the connector to promote when allow.nullable.index is set.
+                nullable_index_key = _select_unique_index_key(
+                    index_parts, by_number, nullable_by_name, allow_nullable=True
+                )
         try:
             tabid = int(_field(columns[0], "tabid", 4))
         except (IndexError, KeyError, TypeError, ValueError) as error:
@@ -2178,6 +2188,9 @@ class PurePythonInformixBridge:
             # Only carry directions for a genuinely mixed/descending key; an
             # all-ascending key stays [] so nothing downstream changes for it.
             "key_descending": key_descending if any(key_descending) else [],
+            # The nullable-relaxed unique-index candidate as [[name, descending], ...],
+            # promotable only when the table sets allow.nullable.index.
+            "nullable_index_key": [[name, is_desc] for name, is_desc in nullable_index_key],
             "incarnation": str(tabid),
         }
 
@@ -3212,6 +3225,11 @@ _PRIMARY_KEYS_OPTION = "primary.keys"
 # ``primary.keys`` option still wins over the discovered index. Set false to keep the old
 # behaviour (only a real primary key makes a table keyed).
 _PROMOTE_UNIQUE_INDEX_OPTION = "primary.key.from.unique.index"
+# Per-table opt-in: when a table has no primary key and no all-NOT-NULL unique index, allow a
+# UNIQUE index that includes nullable column(s) to stand in as the key. The operator asserts
+# those columns are effectively unique and non-null for every row; a real NULL there would
+# mis-order or drop rows in keyset pagination and CDC dedup. Default false (stay key-less).
+_ALLOW_NULLABLE_INDEX_OPTION = "allow.nullable.index"
 
 
 class _DescendingKey:
@@ -3272,6 +3290,7 @@ def _select_unique_index_key(
     indexes: list[tuple[str, list[int]]],
     column_by_number: dict[int, str],
     nullable_by_name: dict[str, bool],
+    allow_nullable: bool = False,
 ) -> list[tuple[str, bool]]:
     """Choose a UNIQUE index to stand in for an absent primary key.
 
@@ -3279,10 +3298,12 @@ def _select_unique_index_key(
     ``syscolumns`` column numbers in key order, terminated by a ``0`` (a negative number
     is a descending column -- still part of the key, so its magnitude names the column).
 
-    Only indexes whose every column is NOT NULL are eligible: a primary key must be
-    non-null for keyset pagination (``WHERE key > ?``) and CDC dedup to be sound, exactly
+    By default only indexes whose every column is NOT NULL are eligible: a primary key must
+    be non-null for keyset pagination (``WHERE key > ?``) and CDC dedup to be sound, exactly
     as a real primary key is, and a NULL key value would silently drop or mis-order rows.
-    An index referencing a column not present in the projection is skipped too.
+    ``allow_nullable`` relaxes that -- the operator asserts the columns are effectively
+    unique and non-null -- so an index with a nullable column can stand in. An index
+    referencing a column not present in the projection is skipped either way.
 
     Among the eligible indexes, choose the one with the fewest columns; break ties by index
     name in ascending lexical order (deterministic and independent of catalog row order).
@@ -3300,8 +3321,11 @@ def _select_unique_index_key(
             if number == 0:
                 break  # key columns are contiguous; the rest of the parts are padding
             name = column_by_number.get(abs(number))
-            if name is None or nullable_by_name.get(name, True):
-                eligible = False  # unknown or nullable column -> not a safe primary key
+            if name is None:
+                eligible = False  # references a column we cannot name -> unusable
+                break
+            if not allow_nullable and nullable_by_name.get(name, True):
+                eligible = False  # nullable column -> not a safe primary key unless allowed
                 break
             columns.append((name, number < 0))  # negative part number == descending column
         if eligible and columns:
@@ -3719,6 +3743,14 @@ class Table:
     # keys, so it is not fingerprinted separately. Unknown for a primary.keys
     # override (no matching index), so it is cleared to () there.
     key_descending: tuple[bool, ...] = ()
+    # A nullable-column UNIQUE index the connector may promote to the key when the
+    # table sets allow.nullable.index (columns + parallel directions). A catalog
+    # fact, populated only when no PK and no all-NOT-NULL unique index exist; not
+    # fingerprinted. ``key_from_nullable_index`` records that the current
+    # primary_keys came from it, so a schema refresh preserves the promotion.
+    nullable_index_key: tuple[str, ...] = ()
+    nullable_index_descending: tuple[bool, ...] = ()
+    key_from_nullable_index: bool = False
 
     @property
     def exposed_name(self) -> str:
@@ -3772,7 +3804,26 @@ class Table:
                 f"Key direction metadata for {database}.{owner}.{name} does not match "
                 f"its {len(pks)} primary-key column(s)"
             )
-        return cls(database, owner, name, columns, pks, incarnation, key_descending=key_descending)
+        nullable_index_raw = list(raw.get("nullable_index_key", ()))
+        nullable_index_key = tuple(str(pair[0]) for pair in nullable_index_raw)
+        nullable_index_descending = tuple(bool(pair[1]) for pair in nullable_index_raw)
+        for column_name in nullable_index_key:
+            if column_name not in known:
+                raise InformixError(
+                    f"Nullable-index candidate for {database}.{owner}.{name} names unknown "
+                    f"column {column_name!r}"
+                )
+        return cls(
+            database,
+            owner,
+            name,
+            columns,
+            pks,
+            incarnation,
+            key_descending=key_descending,
+            nullable_index_key=nullable_index_key,
+            nullable_index_descending=nullable_index_descending,
+        )
 
 
 @dataclass
@@ -4149,6 +4200,15 @@ def _run_shared_cdc_shard(shard: _SharedCdcShard) -> None:
                             primary_keys=table.primary_keys,
                             key_override=True,
                             key_descending=table.key_descending,
+                        )
+                    elif table.key_from_nullable_index:
+                        # Same for a nullable-index promotion (a table-level option
+                        # the catalog re-derivation cannot see): keep the promoted key.
+                        fresh = replace(
+                            fresh,
+                            primary_keys=table.primary_keys,
+                            key_descending=table.key_descending,
+                            key_from_nullable_index=True,
                         )
                     schema_map[identity] = fresh
                 min_lsn = reader._bridge.minimum_lsn()
@@ -4845,7 +4905,7 @@ class InformixLakeflowConnect(LakeflowConnect):
             if self._tables is None:
                 self._tables = {}
             self._tables[exposed] = table
-            return self._apply_primary_key_override(table, table_options)
+            return self._apply_key_options(table, table_options)
 
     def _resolve_registration_table(self, exposed: str) -> Table:
         """Resolve a single configured table by exposed ``owner.name`` via a
@@ -5894,15 +5954,19 @@ class InformixLakeflowConnect(LakeflowConnect):
                 f"'{table.exposed_name}': {', '.join(missing)}"
             )
         if tuple(keys) == table.primary_keys:
-            # The override restates the catalog key; keep its discovered directions
-            # (which already reflect the key index) rather than looking them up again.
-            return table if table.key_override else replace(table, key_override=True)
+            # The override restates the current key; keep its directions (already
+            # reflecting the key index) rather than looking them up again. It is now
+            # owned by the override, not a nullable-index promotion.
+            if table.key_override:
+                return table
+            return replace(table, key_override=True, key_from_nullable_index=False)
         directions = self._override_key_directions(table.identity, tuple(keys))
         return replace(
             table,
             primary_keys=tuple(keys),
             key_override=True,
             key_descending=tuple(directions or ()),
+            key_from_nullable_index=False,
         )
 
     def _override_key_directions(self, identity: str, keys: tuple[str, ...]) -> list[bool] | None:
@@ -5919,6 +5983,38 @@ class InformixLakeflowConnect(LakeflowConnect):
             cache[cache_key] = tuple(found) if found else ()
         cached = cache[cache_key]
         return list(cached) if cached else None
+
+    def _apply_nullable_index_promotion(self, table: Table, table_options: dict[str, str]) -> Table:
+        """Promote a nullable-column UNIQUE index to the key when the table opts in.
+
+        Applies only when the table is otherwise key-less (no primary key and no
+        all-NOT-NULL unique index qualified) and the per-table ``allow.nullable.index``
+        option is set. The operator thereby asserts the index's columns are unique and
+        non-null for every row. ``key_from_nullable_index`` marks the result so a schema
+        refresh preserves the promotion (the catalog re-derives it as key-less). An
+        explicit ``primary.keys`` override still wins -- it is applied afterward.
+        """
+
+        if table.primary_keys or not table.nullable_index_key:
+            return table
+        if not _option_bool(table_options, _ALLOW_NULLABLE_INDEX_OPTION, False):
+            return table
+        return replace(
+            table,
+            primary_keys=table.nullable_index_key,
+            key_descending=table.nullable_index_descending,
+            key_from_nullable_index=True,
+        )
+
+    def _apply_key_options(self, table: Table, table_options: dict[str, str]) -> Table:
+        """Apply the per-table key options in precedence order: an explicit
+        ``primary.keys`` override wins over a nullable-index promotion, which wins
+        over the catalog-derived key. Promotion runs first so the override, applied
+        last, still takes precedence."""
+
+        return self._apply_primary_key_override(
+            self._apply_nullable_index_promotion(table, table_options), table_options
+        )
 
     def _snapshot_mode(self, table_options: dict[str, str]) -> str:
         mode = (
@@ -8223,6 +8319,17 @@ class InformixLakeflowConnect(LakeflowConnect):
                 key_override=True,
                 key_descending=table.key_descending,
             )
+        elif table.key_from_nullable_index:
+            # Preserve a nullable-index promotion across the refresh: the catalog
+            # re-derives the table as key-less (no all-NOT-NULL index), so without
+            # this the promoted key -- and its directions -- would be dropped and the
+            # key-order guard would trip mid-copy.
+            refreshed = replace(
+                refreshed,
+                primary_keys=table.primary_keys,
+                key_descending=table.key_descending,
+                key_from_nullable_index=True,
+            )
         _ensure_materializable(refreshed)
         fingerprint = _schema_fingerprint(refreshed)
         if expected_fingerprint is not None and expected_fingerprint != fingerprint:
@@ -9069,7 +9176,7 @@ class InformixLakeflowConnect(LakeflowConnect):
     def _table(self, name: str, options: dict[str, str], refresh: bool = False) -> Table:
         exposed = options.get("qualified_source_table", name)
         if self._tables is not None and exposed in self._tables and not refresh:
-            return self._apply_primary_key_override(self._tables[exposed], options)
+            return self._apply_key_options(self._tables[exposed], options)
         parts = _split_identity(exposed)
         if len(parts) == 2 and all(_IDENTIFIER.fullmatch(part) for part in parts):
             database = self.options.get("database", "")
@@ -9082,11 +9189,11 @@ class InformixLakeflowConnect(LakeflowConnect):
             if self._tables is None:
                 self._tables = {}
             self._tables[exposed] = table
-            return self._apply_primary_key_override(table, options)
+            return self._apply_key_options(table, options)
         tables = self._table_map(refresh=refresh)
         if exposed not in tables:
             raise ValueError(f"Unknown or excluded Informix table '{exposed}'")
-        return self._apply_primary_key_override(tables[exposed], options)
+        return self._apply_key_options(tables[exposed], options)
 
 
 # Conventional alias used by some connector loaders.

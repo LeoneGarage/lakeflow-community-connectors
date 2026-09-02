@@ -801,6 +801,20 @@ connection:
         Changing this changes a table's schema fingerprint, so enabling it on an
         already-running key-less table needs a full refresh. Accepts true/false.
 
+    - name: allow.nullable.index
+      type: string
+      required: false
+      description: >
+        Per-table opt-in (default false). When a table has no primary key and no
+        all-NOT-NULL UNIQUE index, setting this true lets a UNIQUE index that
+        includes nullable column(s) stand in as the key, so the table takes the
+        resumable keyed path instead of the one-shot key-less drain. The operator
+        thereby asserts those columns are unique and non-null for every row; a real
+        NULL there would mis-order or drop rows in keyset pagination and CDC dedup.
+        Only has effect when primary.key.from.unique.index is enabled (the default)
+        and no non-null key exists; an all-NOT-NULL index and an explicit
+        primary.keys option both still win. Accepts true/false.
+
     - name: connection.fair.queue.enabled
       type: string
       required: false
@@ -930,4 +944,4 @@ connection:
 
 # Exact per-table overrides consumed by the connector. `qualified_source_table` maps a
 # pipeline table to a dynamically discovered exposed name (`owner.table`).
-external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys"
+external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index"
