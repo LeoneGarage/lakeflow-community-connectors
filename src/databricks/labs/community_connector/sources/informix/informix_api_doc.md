@@ -194,10 +194,26 @@ per-table read for that poll.
 Informix snapshot SQLI reads use `snapshot.read.timeout.seconds` (default
 `300`) so large staged pages are not constrained by the normal 30-second
 transport timeout. The same budget covers the incremental-snapshot key-bound
-read (`SELECT FIRST 1 ... ORDER BY <pk> DESC`) that seeds a keyed table: on a
-large table Informix may serve that ordering with a full scan and top-sort
-rather than a reverse index read, and the bare 30-second default would time out
-and crash-loop the stream on every restart. CDC session setup and teardown while validating the initial
+read that seeds a keyed table.
+
+That key bound is read differently depending on the key. For a **plain-column
+key**, the connector resolves the maximum tuple one column at a time: it reads
+`FIRST 1 <col> ... ORDER BY <col> DESC` for the leading column, then repeats for
+each following column under an equality filter pinning the already-resolved
+columns (`WHERE c1 = ? [AND c2 = ?] ...`). Every step is a single-column ordered
+read within an equality prefix, which the key index serves as a directional
+sub-range scan — never a whole-table sort — and it stays index-servable even
+when the index mixes ASC/DESC column directions, where a single composite
+`ORDER BY c1 DESC, c2 DESC` would match neither scan direction and force a sort.
+All steps run in one REPEATABLE READ view so the columns resolve against a
+single point in time. For a **DATETIME-chunked key**, the equality prefix would
+have to match an order-preserving cast expression that no index serves, so the
+connector keeps a single composite `SELECT {+FIRST_ROWS(1)} FIRST 1 ... ORDER BY
+<expr> DESC` read; the `{+FIRST_ROWS(1)}` directive asks the optimizer for an
+index read over a full scan + top-sort (and is silently ignored where the server
+disables external directives). Either way the read gets the snapshot budget
+above, because the bare 30-second default would time out and crash-loop the
+stream on every restart. CDC session setup and teardown while validating the initial
 CDC boundary use `cdc.read.timeout.seconds` (default `60`) for the same reason:
 `syscdcv1` open/start/activate/end/close calls can stall under many concurrent
 CDC sessions and should not fail against the 30-second default.
