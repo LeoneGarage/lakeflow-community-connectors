@@ -7293,8 +7293,18 @@ def register_lakeflow_source(spark):
                 f"{chunk_exprs[key]} AS __chunk_{key}" for key in primary_keys if key in chunk_exprs
             ]
             window = f"SKIP {int(skip)} " if skip else ""
+            # {+FIRST_ROWS(n)} asks the optimizer to stream the page in key order from
+            # the index rather than sort the table: the keyset predicate below is the
+            # OR-form `(k1 > ?) OR (k1 = ? AND k2 > ?)`, which optimizers often fail to
+            # recognize as an index range start, and a composite `ORDER BY k1, k2` then
+            # tips into a full scan + top-sort on a large table -- observed timing out
+            # per page even under the extended snapshot budget. It is a `{+ }` comment,
+            # so a server with external directives disabled ignores it rather than
+            # erroring; UPDATE STATISTICS on the source is the complementary fix that
+            # steers the cost model to the same index-ordered plan on its own.
             sql = (
-                f"SELECT {window}FIRST {int(limit)} {','.join(projection)} "
+                f"SELECT {{+FIRST_ROWS({int(limit)})}} {window}FIRST {int(limit)} "
+                f"{','.join(projection)} "
                 f"FROM {database}:{_sql_identifier(owner)}.{_sql_identifier(name)}"
             )
             parameters: list[Any] = []

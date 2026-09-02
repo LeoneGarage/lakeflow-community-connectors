@@ -2396,6 +2396,43 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(rows, [{"id": 1}])
         self.assertEqual(bridge.transport.maximum, 1234)
 
+    def test_snapshot_page_composite_key_carries_first_rows_directive(self):
+        # tw305's shape: a two-column key paged by the OR-form keyset. The
+        # FIRST_ROWS directive must ride on it so Informix streams the page from
+        # the (hpolicy, clm_no) index in order rather than sorting the table.
+        class SnapshotTransport:
+            def __init__(self):
+                self.sql = None
+                self.parameters = None
+
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                del max_result_bytes
+                self.sql = sql
+                self.parameters = parameters
+                return []
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.transport = SnapshotTransport()
+
+        # Numeric bound values keep the keyset shape without triggering the
+        # DATETIME-key describe probe (orthogonal to the directive under test).
+        bridge.snapshot_page(
+            "demo.app.tw305",
+            ["hpolicy", "clm_no"],
+            ["hpolicy", "clm_no"],
+            [100, 34],
+            500,
+        )
+
+        self.assertEqual(
+            bridge.transport.sql,
+            "SELECT {+FIRST_ROWS(500)} FIRST 500 hpolicy,clm_no FROM demo:app.tw305 "
+            "WHERE ((hpolicy > ?) OR (hpolicy = ? AND clm_no > ?)) "
+            "ORDER BY hpolicy,clm_no",
+        )
+        self.assertEqual(bridge.transport.parameters, (100, 100, 34))
+
     def test_snapshot_page_combines_filter_with_keyset_predicate(self):
         class SnapshotTransport:
             def __init__(self):
@@ -2421,7 +2458,7 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(
             bridge.transport.sql,
-            "SELECT FIRST 20 id FROM demo:app.orders "
+            "SELECT {+FIRST_ROWS(20)} FIRST 20 id FROM demo:app.orders "
             "WHERE (status = 'A') AND ((id > ?)) ORDER BY id",
         )
         self.assertEqual(bridge.transport.parameters, (10,))
@@ -2454,7 +2491,8 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(rows, [{"event_time": "13:03:36"}])
         self.assertEqual(
             bridge.transport.sql,
-            "SELECT SKIP 10000 FIRST 2 event_time FROM demo:app.events " "ORDER BY event_time",
+            "SELECT {+FIRST_ROWS(2)} SKIP 10000 FIRST 2 event_time FROM demo:app.events "
+            "ORDER BY event_time",
         )
 
     def test_sql_identifier_delimits_only_when_needed(self):
@@ -2497,7 +2535,7 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(
             bridge.transport.sql,
-            'SELECT FIRST 5 id FROM demo:"jacqueline.clarke".orders ORDER BY id',
+            'SELECT {+FIRST_ROWS(5)} FIRST 5 id FROM demo:"jacqueline.clarke".orders ORDER BY id',
         )
 
     def test_snapshot_bridge_delimits_special_character_identifiers(self):
@@ -2517,7 +2555,7 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(
             bridge.transport.sql,
-            'SELECT FIRST 2 event_time FROM demo:"HCF+gbc"."a+b" ORDER BY event_time',
+            'SELECT {+FIRST_ROWS(2)} FIRST 2 event_time FROM demo:"HCF+gbc"."a+b" ORDER BY event_time',
         )
 
     def test_production_bridge_reads_consistent_snapshot_in_one_transaction(self):
@@ -2531,7 +2569,7 @@ class LakeflowContractTests(unittest.TestCase):
                     return [{"is_ansi": 0}]
                 if "sysmaster:syslogs" in sql:
                     return [{"uniqid": 2, "used": 3}]
-                if sql.startswith("SELECT FIRST"):
+                if "FIRST_ROWS" in sql:
                     return [{"id": 1}]
                 return []
 
@@ -2573,7 +2611,7 @@ class LakeflowContractTests(unittest.TestCase):
                     return [{"is_ansi": 0}]
                 if "sysmaster:syslogs" in sql:
                     return [{"uniqid": 2, "used": 3}]
-                if sql.startswith("SELECT FIRST"):
+                if "FIRST_ROWS" in sql:
                     return [{"id": 1}]
                 return []
 
@@ -2590,9 +2628,7 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(lsn, (2 << 32) + (3 << 12))
         self.assertEqual(rows, [{"id": 1}])
         lsn_index = next(i for i, sql in enumerate(bridge.transport.sql) if "syslogs" in sql)
-        select_index = next(
-            i for i, sql in enumerate(bridge.transport.sql) if sql.startswith("SELECT FIRST")
-        )
+        select_index = next(i for i, sql in enumerate(bridge.transport.sql) if "FIRST_ROWS" in sql)
         self.assertLess(
             lsn_index,
             select_index,
@@ -2610,7 +2646,7 @@ class LakeflowContractTests(unittest.TestCase):
                     return [{"is_ansi": 0}]
                 if "sysmaster:syslogs" in sql:
                     return [{"uniqid": 2, "used": 3}]
-                if sql.startswith("SELECT FIRST"):
+                if "FIRST_ROWS" in sql:
                     self.queries += 1
                     return (
                         [{"id": 1}, {"id": 2}]
@@ -2722,7 +2758,7 @@ class LakeflowContractTests(unittest.TestCase):
                     return [{"is_ansi": 1}]
                 if "sysmaster:syslogs" in sql:
                     return [{"uniqid": 2, "used": 3}]
-                if sql.startswith("SELECT FIRST"):
+                if "FIRST_ROWS" in sql:
                     return []
                 return []
 
@@ -2752,7 +2788,7 @@ class LakeflowContractTests(unittest.TestCase):
                     return [{"is_ansi": 1}]
                 if "sysmaster:syslogs" in sql:
                     return [{"uniqid": 2, "used": 3}]
-                if sql.startswith("SELECT FIRST"):
+                if "FIRST_ROWS" in sql:
                     raise RuntimeError("snapshot failed")
                 return []
 
@@ -2781,7 +2817,7 @@ class LakeflowContractTests(unittest.TestCase):
                     return [{"is_ansi": 0}]
                 if "sysmaster:syslogs" in sql:
                     return [{"uniqid": 2, "used": 3}]
-                if sql.startswith("SELECT FIRST"):
+                if "FIRST_ROWS" in sql:
                     return [{"id": 1}]
                 return []
 
