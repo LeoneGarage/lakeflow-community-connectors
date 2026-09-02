@@ -6717,6 +6717,12 @@ class InformixLakeflowConnect(LakeflowConnect):
             # different copy and cannot be trusted.
             "scope": pipeline_scope,
             "boundary_lsn": str(high_water),
+            # The key ordering the cursor and bound were paged in. If the table's
+            # key index direction later differs (e.g. an all-ascending checkpoint
+            # resumed under mixed-direction paging), the cursor is not comparable
+            # across the change and resuming would silently skip rows -- so the
+            # copy must restart. See the guard in _next_incremental_chunk.
+            "key_descending": [bool(v) for v in table.key_descending],
         }
         return table, schema_id, incremental
 
@@ -6810,6 +6816,18 @@ class InformixLakeflowConnect(LakeflowConnect):
     def _next_incremental_chunk(
         self, table: Table, incremental: dict, options: dict[str, str]
     ) -> tuple[list[dict[str, Any]], dict]:
+        # The cursor and bound were paged in the key ordering recorded at seed
+        # time. If the table's key index direction now differs -- e.g. an
+        # all-ascending checkpoint resumed under mixed-direction paging, or vice
+        # versa -- the persisted cursor is not comparable in the new order, and
+        # resuming would silently skip rows. Fail closed: the copy must restart.
+        seeded_descending = tuple(bool(v) for v in (incremental.get("key_descending") or ()))
+        if seeded_descending != tuple(table.key_descending):
+            raise InformixError(
+                f"Incremental snapshot for '{table.exposed_name}' was seeded with a "
+                "different key ordering than the table's current key index; the paged "
+                "cursor cannot be compared across the change. Run a full refresh."
+            )
         page_size = self._table_int_option(
             options, "snapshot.page.size", _DEFAULT_SNAPSHOT_PAGE_SIZE, minimum=1
         )
