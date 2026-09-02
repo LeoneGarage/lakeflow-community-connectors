@@ -215,14 +215,19 @@ disables external directives). Either way the read gets the snapshot budget
 above, because the bare 30-second default would time out and crash-loop the
 stream on every restart.
 
-The keyset **page reads** that copy a keyed table carry the same
-`{+FIRST_ROWS(n)}` directive. Their predicate is the OR-form
-`(k1 > ?) OR (k1 = ? AND k2 > ?)`, which optimizers often do not recognize as an
-index range start, so a composite `ORDER BY k1, k2` can tip into a full scan +
-top-sort per page on a large table. The directive asks the optimizer to stream
-the page from the key index in order instead; `UPDATE STATISTICS HIGH` on the
-source is the complementary fix, steering the cost model to the same plan even
-where external directives are disabled.
+The keyset **page reads** that copy a keyed table pin the scan to the key index
+two ways. First, the predicate carries a redundant **leading-column range bound**
+(`k1 >= ?`, or `k1 <= ?` when the leading column is DESC) alongside the OR-form
+keyset `(k1 > ?) OR (k1 = ? AND k2 > ?)`. The OR-form on its own is frequently
+not recognized as an index range start, so the scan begins at the head of the
+index and re-reads then discards the entire already-copied prefix on every page
+-- cost grows with the cursor until a page on a large table times out. The
+leading bound is implied by the keyset (so the result set is unchanged) but gives
+the optimizer a concrete lower bound to seek to, and it is honored even where
+external optimizer directives are disabled. Second, the read still carries the
+`{+FIRST_ROWS(n)}` directive so the ordered scan is preferred over a top-sort
+where directives are honored. `UPDATE STATISTICS HIGH` on the source is the
+complementary cost-model fix.
 
 **Mixed-direction key indexes.** When the key comes from a discovered index (a
 PRIMARY KEY constraint or a promoted UNIQUE index) whose columns are not all
