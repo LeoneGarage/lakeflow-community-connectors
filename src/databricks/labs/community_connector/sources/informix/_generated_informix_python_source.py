@@ -6960,10 +6960,31 @@ def register_lakeflow_source(spark):
                 (owner, name),
                 max_result_bytes=(int(self.options.get("metadata.max.bytes", str(64 << 20))) or None),
             )
-            return self._table_from_catalog_rows(owner, name, columns, keys)
+            unique_indexes: list[Any] = []
+            # No primary key: fall back to a UNIQUE index (see _select_unique_index_key). Only
+            # queried when the table is physically key-less and the feature is enabled, so a
+            # normal keyed table pays nothing extra. The index name is fetched so the selection
+            # can break ties on it deterministically.
+            if not keys and _option_bool(self.options, _PROMOTE_UNIQUE_INDEX_OPTION, True):
+                unique_indexes = self.transport.execute(
+                    "SELECT i.idxname,i.part1,i.part2,i.part3,i.part4,i.part5,i.part6,i.part7,"
+                    "i.part8,i.part9,i.part10,i.part11,i.part12,i.part13,i.part14,i.part15,i.part16 "
+                    "FROM systables t JOIN sysindexes i ON t.tabid=i.tabid "
+                    "WHERE t.tabtype='T' AND i.idxtype='U' AND t.owner=? AND t.tabname=?",
+                    (owner, name),
+                    max_result_bytes=(
+                        int(self.options.get("metadata.max.bytes", str(64 << 20))) or None
+                    ),
+                )
+            return self._table_from_catalog_rows(owner, name, columns, keys, unique_indexes)
 
         def _table_from_catalog_rows(
-            self, owner: str, name: str, columns: list[Any], keys: list[Any]
+            self,
+            owner: str,
+            name: str,
+            columns: list[Any],
+            keys: list[Any],
+            unique_indexes: list[Any] | None = None,
         ) -> dict[str, Any]:
             parsed_columns = [_catalog_column(row) for row in columns]
             for column in parsed_columns:
@@ -6985,6 +7006,25 @@ def register_lakeflow_source(spark):
                     column_number = int(_field(keys[0], f"part{position + 1}", position))
                     if column_number > 0:
                         primary_keys.append(by_number[column_number])
+            elif unique_indexes:
+                # No primary-key constraint: stand a UNIQUE index in for it (deterministically
+                # chosen -- see _select_unique_index_key). The resulting key is catalog-derived,
+                # so a schema refresh re-derives it; an explicit primary.keys option still
+                # overrides it downstream in _apply_primary_key_override.
+                nullable_by_name = {
+                    column["name"]: bool(column["nullable"]) for column in parsed_columns
+                }
+                index_parts = [
+                    (
+                        str(_field(index, "idxname", 0)),
+                        [
+                            int(_field(index, f"part{position + 1}", position + 1))
+                            for position in range(16)
+                        ],
+                    )
+                    for index in unique_indexes
+                ]
+                primary_keys = _select_unique_index_key(index_parts, by_number, nullable_by_name)
             try:
                 tabid = int(_field(columns[0], "tabid", 4))
             except (IndexError, KeyError, TypeError, ValueError) as error:
@@ -7801,6 +7841,54 @@ def register_lakeflow_source(spark):
 
 
     _PRIMARY_KEYS_OPTION = "primary.keys"
+    # When a table has no primary-key constraint, promote a UNIQUE index to stand in as the
+    # primary key, so a physically key-less table becomes keyed (resumable keyset snapshots and
+    # CDC dedup) instead of falling back to the one-shot key-less drain. Default on. An explicit
+    # ``primary.keys`` option still wins over the discovered index. Set false to keep the old
+    # behaviour (only a real primary key makes a table keyed).
+    _PROMOTE_UNIQUE_INDEX_OPTION = "primary.key.from.unique.index"
+
+
+    def _select_unique_index_key(
+        indexes: list[tuple[str, list[int]]],
+        column_by_number: dict[int, str],
+        nullable_by_name: dict[str, bool],
+    ) -> list[str]:
+        """Choose a UNIQUE index to stand in for an absent primary key.
+
+        ``indexes`` is ``(idxname, [part1..part16])`` per unique index; the parts are
+        ``syscolumns`` column numbers in key order, terminated by a ``0`` (a negative number
+        is a descending column -- still part of the key, so its magnitude names the column).
+
+        Only indexes whose every column is NOT NULL are eligible: a primary key must be
+        non-null for keyset pagination (``WHERE key > ?``) and CDC dedup to be sound, exactly
+        as a real primary key is, and a NULL key value would silently drop or mis-order rows.
+        An index referencing a column not present in the projection is skipped too.
+
+        Among the eligible indexes, choose the one with the fewest columns; break ties by index
+        name in ascending lexical order (deterministic and independent of catalog row order).
+        Returns the ordered key column list, or ``[]`` when no unique index qualifies (the table
+        stays key-less).
+        """
+
+        candidates: list[tuple[int, str, list[str]]] = []
+        for idxname, parts in indexes:
+            columns: list[str] = []
+            eligible = True
+            for part in parts:
+                number = int(part)
+                if number == 0:
+                    break  # key columns are contiguous; the rest of the parts are padding
+                name = column_by_number.get(abs(number))
+                if name is None or nullable_by_name.get(name, True):
+                    eligible = False  # unknown or nullable column -> not a safe primary key
+                    break
+                columns.append(name)
+            if eligible and columns:
+                candidates.append((len(columns), str(idxname), columns))
+        if not candidates:
+            return []
+        return min(candidates, key=lambda candidate: (candidate[0], candidate[1]))[2]
 
 
     def _parse_key_columns(raw: str) -> list[str]:
@@ -8980,6 +9068,7 @@ def register_lakeflow_source(spark):
             _option_bool(options, _SNAPSHOT_SHARED_SESSION_OPTION, True)
             _option_bool(options, _CONNECTION_FAIR_QUEUE_OPTION, True)
             _option_bool(options, _SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION, True)
+            _option_bool(options, _PROMOTE_UNIQUE_INDEX_OPTION, True)
             if _APPEND_INGESTION_OPTION in options:
                 _append_only_value(options[_APPEND_INGESTION_OPTION])
             if int(options.get("cdc.max.records", str(_DEFAULT_CDC_MAX_RECORDS))) > 256:

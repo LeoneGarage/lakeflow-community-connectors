@@ -9868,5 +9868,102 @@ class SnapshotDrainSlotLivenessTests(unittest.TestCase):
         self.assertNotIn("wedged", str(caught.exception))
 
 
+class UniqueIndexPrimaryKeyPromotionTests(unittest.TestCase):
+    """A physically key-less table with no primary key is promoted to keyed on a UNIQUE
+    index, so it takes the resumable keyed path instead of the one-shot key-less drain.
+    Selection is deterministic: fewest columns, ties broken by index name ascending, and
+    only all-NOT-NULL indexes qualify (a primary key must be non-null)."""
+
+    @staticmethod
+    def _uidx(name, *columns):
+        # (idxname, part1..part16) as a positional row, key columns then zero padding.
+        return (name, *columns) + (0,) * (16 - len(columns))
+
+    def test_selects_a_single_not_null_index(self):
+        key = informix_module._select_unique_index_key(
+            [("u_a", [1, 0])], {1: "a", 2: "b"}, {"a": False, "b": False}
+        )
+        self.assertEqual(key, ["a"])
+
+    def test_prefers_the_index_with_fewest_columns(self):
+        indexes = [("u_wide", [1, 2, 0]), ("u_narrow", [3, 0])]
+        key = informix_module._select_unique_index_key(
+            indexes, {1: "a", 2: "b", 3: "c"}, {"a": False, "b": False, "c": False}
+        )
+        self.assertEqual(key, ["c"])
+
+    def test_breaks_column_count_ties_on_index_name_ascending(self):
+        indexes = [("u_z", [1, 0]), ("u_a", [2, 0])]  # both one column
+        key = informix_module._select_unique_index_key(
+            indexes, {1: "a", 2: "b"}, {"a": False, "b": False}
+        )
+        self.assertEqual(key, ["b"])  # chosen from u_a, the lexically first name
+
+    def test_skips_an_index_with_a_nullable_column(self):
+        indexes = [("u_null", [3, 0]), ("u_ok", [1, 2, 0])]
+        key = informix_module._select_unique_index_key(
+            indexes, {1: "a", 2: "b", 3: "n"}, {"a": False, "b": False, "n": True}
+        )
+        # u_null is fewer columns but nullable, so the wider all-NOT-NULL index wins.
+        self.assertEqual(key, ["a", "b"])
+
+    def test_descending_column_is_included_by_magnitude_in_key_order(self):
+        # A descending index column is a negative part; it is still part of the key.
+        key = informix_module._select_unique_index_key(
+            [("u", [-2, 1, 0])], {1: "a", 2: "b"}, {"a": False, "b": False}
+        )
+        self.assertEqual(key, ["b", "a"])
+
+    def test_unknown_column_disqualifies_the_index(self):
+        key = informix_module._select_unique_index_key([("u", [9, 0])], {1: "a"}, {"a": False})
+        self.assertEqual(key, [])
+
+    def test_no_unique_index_stays_key_less(self):
+        self.assertEqual(informix_module._select_unique_index_key([], {1: "a"}, {"a": False}), [])
+
+    def test_describe_promotes_unique_index_when_no_primary_key(self):
+        class CatalogTransport:
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                if "syscolumns" in sql:
+                    return [
+                        {"colname": "id", "coltype": 258, "collength": 4, "colno": 1, "tabid": 7},
+                        {"colname": "code", "coltype": 258, "collength": 8, "colno": 2, "tabid": 7},
+                    ]
+                if "constrtype='P'" in sql:
+                    return []  # no primary-key constraint
+                if "idxtype='U'" in sql:
+                    return [UniqueIndexPrimaryKeyPromotionTests._uidx("u_code", 2)]
+                return []
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.config = {"database": "demo"}
+        bridge.transport = CatalogTransport()
+
+        table = bridge._describe_table("app", "orders")
+        self.assertEqual(table["primary_keys"], ["code"])
+
+    def test_describe_stays_key_less_when_promotion_is_disabled(self):
+        seen = []
+
+        class CatalogTransport:
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                seen.append(sql)
+                if "syscolumns" in sql:
+                    return [
+                        {"colname": "id", "coltype": 258, "collength": 4, "colno": 1, "tabid": 7}
+                    ]
+                return []
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {"primary.key.from.unique.index": "false"}
+        bridge.config = {"database": "demo"}
+        bridge.transport = CatalogTransport()
+
+        table = bridge._describe_table("app", "orders")
+        self.assertEqual(table["primary_keys"], [])
+        self.assertFalse(any("idxtype='U'" in sql for sql in seen))  # not even queried
+
+
 if __name__ == "__main__":
     unittest.main()

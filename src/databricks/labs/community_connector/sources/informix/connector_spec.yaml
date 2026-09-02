@@ -772,6 +772,22 @@ connection:
         affects the snapshot-drain daemon; consumer and CDC-daemon reads always keep
         the plain deadline. Accepts true/false (1/yes, 0/no).
 
+    - name: primary.key.from.unique.index
+      type: string
+      required: false
+      description: >
+        Whether a table with no primary-key constraint is promoted to keyed on a
+        UNIQUE index. Default true: the connector uses a qualifying unique index's
+        columns as the primary key, so the table takes the resumable keyed path
+        (keyset-paginated snapshots, CDC dedup) instead of the one-shot key-less
+        drain. Selection is deterministic: only indexes whose columns are all NOT
+        NULL qualify (a primary key must be non-null); among those the index with
+        the fewest columns wins, ties broken by index name in ascending order. An
+        explicit primary.keys option still overrides the discovered key. Set false
+        to keep the old behaviour (only a real primary key makes a table keyed).
+        Changing this changes a table's schema fingerprint, so enabling it on an
+        already-running key-less table needs a full refresh. Accepts true/false.
+
     - name: connection.fair.queue.enabled
       type: string
       required: false
