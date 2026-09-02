@@ -4098,6 +4098,53 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in replayed], [2])
         self.assertEqual(replayed_end, stream_end)
 
+    def test_staged_snapshot_resumes_across_a_new_update_scope(self):
+        # A stop/start mints a new update id, so a resumed reader's registration scope
+        # differs from the one that staged the pages. It must locate the manifest by the
+        # scope the checkpoint records, not its own -- otherwise it misses the staged
+        # pages and (before this fix) fails "run a full refresh" mid-load.
+        bridge = FakeBridge()
+        staging = self.connector(
+            bridge, registration_scope="update-1", **{"snapshot.page.size": "1"}
+        )
+        _, mid = staging.read_table("app.orders", {}, {})
+        self.assertEqual(mid["phase"], "snapshot")  # page 0 served, page 1 remains
+        self.assertEqual(mid["snapshot"]["page_index"], 1)
+        self.assertEqual(mid["pipeline_scope"], staging._pipeline_scope())
+
+        # New update: same durable stores (staging Volume + offline Lakebase), a fresh
+        # registration scope. Resuming from the prior checkpoint must reuse the pages.
+        resumed = self.connector(
+            bridge, registration_scope="update-2", **{"snapshot.page.size": "1"}
+        )
+        self.assertNotEqual(resumed._pipeline_scope(), staging._pipeline_scope())
+        rows, end = resumed.read_table("app.orders", mid, {})
+
+        self.assertEqual([row["id"] for row in rows], [2])  # resumed at the staged page 1
+        self.assertEqual(end["phase"], "stream")
+
+    def test_full_refresh_under_a_new_scope_re_snapshots(self):
+        # A full refresh clears the Spark checkpoint, so the reader arrives with no
+        # offset. Even though a prior update's staged pages persist in the durable
+        # stores, an empty offset must establish a fresh boundary and re-snapshot from
+        # page 0 -- the update-scoped initialization record guarantees this, so the
+        # resume fix above must not turn a full refresh into a stale-data reuse.
+        bridge = FakeBridge()
+        first_update = self.connector(
+            bridge, registration_scope="update-1", **{"snapshot.page.size": "1"}
+        )
+        first_update.read_table("app.orders", {}, {})
+
+        refreshed = self.connector(
+            bridge, registration_scope="update-2", **{"snapshot.page.size": "1"}
+        )
+        rows, end = refreshed.read_table("app.orders", {}, {})
+
+        self.assertEqual([row["id"] for row in rows], [1])  # fresh snapshot, page 0
+        self.assertEqual(end["phase"], "snapshot")
+        self.assertEqual(end["snapshot"]["page_index"], 1)
+        self.assertEqual(end["pipeline_scope"], refreshed._pipeline_scope())
+
     def test_snapshot_offset_primary_key_bounds_are_json_serializable(self):
         bridge = FakeBridge()
         bridge.tables[0]["columns"][0].update({"type_name": "DECIMAL", "precision": 5, "scale": 2})
