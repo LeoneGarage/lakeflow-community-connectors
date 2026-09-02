@@ -1511,6 +1511,7 @@ class LakeflowContractTests(unittest.TestCase):
             def __init__(self):
                 self.socket_timeout = 30.0
                 self.timeouts = []
+                self.sql = None
 
             def set_socket_timeout(self, timeout):
                 self.socket_timeout = timeout
@@ -1519,6 +1520,7 @@ class LakeflowContractTests(unittest.TestCase):
             def execute(self, sql, params):  # noqa: ARG002
                 # Observed timeout must already be the extended budget mid-read.
                 assert self.socket_timeout == 300.0
+                self.sql = sql
                 return [{"id": 42}]
 
         transport = TimedTransport()
@@ -1530,6 +1532,11 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(result, [42])
         self.assertEqual(transport.timeouts, [300.0, 30.0])
+        # The FIRST_ROWS directive must ride on the seed query so Informix serves
+        # the DESC ordering with a reverse index scan instead of a full sort.
+        self.assertIn("{+FIRST_ROWS(1)}", transport.sql)
+        self.assertIn("FIRST 1", transport.sql)
+        self.assertTrue(transport.sql.rstrip().endswith("ORDER BY id DESC"))
 
     def test_max_primary_key_honors_snapshot_timeout_option(self):
         class TimedTransport:
