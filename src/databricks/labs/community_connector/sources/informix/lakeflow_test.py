@@ -10292,6 +10292,117 @@ class UniqueIndexPrimaryKeyPromotionTests(unittest.TestCase):
         self.assertFalse(any("idxtype='U'" in sql for sql in seen))  # not even queried
 
 
+class NullableIndexPromotionTests(unittest.TestCase):
+    """A UNIQUE index with a nullable column is normally rejected as a key. The per-table
+    allow.nullable.index option lets the operator opt in when no non-null key exists."""
+
+    @staticmethod
+    def _catalog_bridge():
+        class CatalogTransport:
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                del parameters, max_result_bytes
+                if "syscolumns" in sql:
+                    # code is nullable; the only unique index (u_code) covers it.
+                    return [
+                        {
+                            "colname": "id",
+                            "coltype": 258,
+                            "collength": 4,
+                            "colno": 1,
+                            "tabid": 7,
+                        },
+                        {
+                            "colname": "code",
+                            "coltype": 2,
+                            "collength": 8,
+                            "colno": 2,
+                            "tabid": 7,
+                        },
+                    ]
+                if "constrtype='P'" in sql:
+                    return []
+                if "idxtype='U'" in sql:
+                    return [UniqueIndexPrimaryKeyPromotionTests._uidx("u_code", 2)]
+                return []
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.config = {"database": "demo"}
+        bridge.transport = CatalogTransport()
+        return bridge
+
+    def test_select_allows_nullable_columns_when_requested(self):
+        indexes = [("u", [1, 0])]
+        # Nullable column: rejected by default, accepted when allow_nullable is set.
+        self.assertEqual(
+            informix_module._select_unique_index_key(indexes, {1: "a"}, {"a": True}), []
+        )
+        self.assertEqual(
+            informix_module._select_unique_index_key(
+                indexes, {1: "a"}, {"a": True}, allow_nullable=True
+            ),
+            [("a", False)],
+        )
+
+    def test_describe_reports_nullable_candidate_but_not_a_key(self):
+        # Discovery leaves the table key-less (the only unique index has a nullable
+        # column) but records the candidate for the connector to promote.
+        table = self._catalog_bridge()._describe_table("app", "orders")
+        self.assertEqual(table["primary_keys"], [])
+        self.assertEqual(table["nullable_index_key"], [["code", False]])
+
+    def test_promotion_off_by_default(self):
+        connector = object.__new__(InformixLakeflowConnect)
+        table = informix_module.Table.parse(
+            self._catalog_bridge()._describe_table("app", "orders"), "demo"
+        )
+        promoted = connector._apply_nullable_index_promotion(table, {})
+        self.assertEqual(promoted.primary_keys, ())  # still key-less
+        self.assertFalse(promoted.key_from_nullable_index)
+
+    def test_promotion_on_when_opted_in(self):
+        connector = object.__new__(InformixLakeflowConnect)
+        table = informix_module.Table.parse(
+            self._catalog_bridge()._describe_table("app", "orders"), "demo"
+        )
+        promoted = connector._apply_nullable_index_promotion(
+            table, {"allow.nullable.index": "true"}
+        )
+        self.assertEqual(promoted.primary_keys, ("code",))
+        self.assertTrue(promoted.key_from_nullable_index)
+
+    def test_explicit_primary_keys_wins_over_promotion(self):
+        connector = object.__new__(InformixLakeflowConnect)
+        connector._override_direction_cache = {}
+        connector._bridge_instance = self._catalog_bridge()
+        table = informix_module.Table.parse(
+            self._catalog_bridge()._describe_table("app", "orders"), "demo"
+        )
+        # Both options set: primary.keys is applied last and takes precedence.
+        keyed = connector._apply_key_options(
+            table, {"allow.nullable.index": "true", "primary.keys": "id"}
+        )
+        self.assertEqual(keyed.primary_keys, ("id",))
+        self.assertTrue(keyed.key_override)
+        self.assertFalse(keyed.key_from_nullable_index)
+
+    def test_refresh_preserves_nullable_promotion(self):
+        connector = object.__new__(InformixLakeflowConnect)
+        connector._tables = None
+        connector._bridge_instance = self._catalog_bridge()
+        table = informix_module.Table.parse(
+            self._catalog_bridge()._describe_table("app", "orders"), "demo"
+        )
+        promoted = connector._apply_nullable_index_promotion(
+            table, {"allow.nullable.index": "true"}
+        )
+
+        refreshed = connector._refresh_table_schema(promoted, None)
+
+        self.assertEqual(refreshed.primary_keys, ("code",))
+        self.assertTrue(refreshed.key_from_nullable_index)
+
+
 class MixedDirectionKeyTests(unittest.TestCase):
     """A key index with a DESC column is paged in the index's own order so a forward
     scan serves it without a sort. Directions flow from catalog discovery through the
