@@ -6624,7 +6624,24 @@ class InformixLakeflowConnect(LakeflowConnect):
             options, "snapshot.page.size", _DEFAULT_SNAPSHOT_PAGE_SIZE, minimum=1
         )
         if checkpoint:
-            pipeline_scope = self._pipeline_scope(checkpoint)
+            # Resolve the staging scope from the *checkpoint*, not this update's
+            # registration scope. The staged pages and manifest were written under the
+            # update scope that created them (``{pipeline_id}_@_{update_id}``), which the
+            # checkpoint records; the current registration scope carries a fresh update_id
+            # after a stop/start. Locating the pages by their creating scope -- together
+            # with the schema_id and snapshot_lsn the checkpoint also pins -- lets a
+            # resumed read find them instead of missing the manifest and forcing a full
+            # refresh mid-load. Full-refresh semantics are untouched: a full refresh clears
+            # the Spark checkpoint, so it arrives with no offset and takes the else branch,
+            # where the update-scoped initialization record establishes a fresh boundary
+            # and re-snapshots. A legacy offset without a stored scope falls back to the
+            # registration scope (the prior behaviour).
+            pipeline_scope = checkpoint.get("pipeline_scope")
+            if (
+                not isinstance(pipeline_scope, str)
+                or _PIPELINE_SCOPE.fullmatch(pipeline_scope) is None
+            ):
+                pipeline_scope = self._pipeline_scope(checkpoint)
             high_water = int(checkpoint["snapshot_lsn"])
             schema_id = str(checkpoint["schema_id"])
             manifest = self._read_snapshot_stage_manifest(table, pipeline_scope, schema_id)
