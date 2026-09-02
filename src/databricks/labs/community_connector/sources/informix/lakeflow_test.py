@@ -7804,6 +7804,44 @@ class IncrementalSnapshotTests(unittest.TestCase):
         self.assertEqual({row["id"] for row in rows}, {1, 2})
         self.assertNotIn("incremental", offset)  # converged at the index-order max (2, 3)
 
+    def test_incremental_resume_under_changed_key_order_fails_closed(self):
+        # A checkpoint seeded under the old all-ascending order must not silently
+        # resume once the key index is discovered as mixed-direction: the cursor is
+        # not comparable across the change, so the copy has to restart.
+        bridge = FakeBridge()
+        bridge.tables = [
+            {
+                "database": "demo",
+                "owner": "app",
+                "name": "orders",
+                "columns": [
+                    {"name": "id", "type_name": "INTEGER", "nullable": False},
+                    {"name": "seq", "type_name": "INTEGER", "nullable": False},
+                    {"name": "value", "type_name": "VARCHAR", "length": 20},
+                ],
+                "primary_keys": ["id", "seq"],
+                "key_descending": [False, True],  # table is now mixed-direction
+            }
+        ]
+        bridge.rows = [{"id": 1, "seq": 1, "value": "a"}]
+        connector = self.connector(bridge, **{"snapshot.page.size": "1"})
+
+        # A block whose recorded ordering predates the mixed-direction discovery.
+        stale = {
+            "started": True,
+            "last_pk": informix_module._encode_snapshot_stage_value([1, 1]),
+            "max_pk": informix_module._encode_snapshot_stage_value([9, 9]),
+            "done": False,
+            "chunk_exprs": {},
+            "snapshot_filter": None,
+        }
+        with self.assertRaisesRegex(informix_module.InformixError, "full refresh"):
+            connector._next_incremental_chunk(
+                informix_module.Table.parse(bridge.tables[0], "demo"),
+                stale,
+                {"snapshot.page.size": "1"},
+            )
+
     def test_incremental_snapshot_begins_streaming_immediately(self):
         bridge = FakeBridge()
         bridge.rows = [{"id": 1, "value": "a"}, {"id": 2, "value": "b"}]
