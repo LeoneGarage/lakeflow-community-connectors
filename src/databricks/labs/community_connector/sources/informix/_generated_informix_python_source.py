@@ -779,7 +779,12 @@ def register_lakeflow_source(spark):
             return frames
 
 
-    def decode_frame(frame: bytes, columns_by_label: dict[int, tuple[ColumnDescriptor, ...]]) -> dict:
+    def decode_frame(
+        frame: bytes,
+        columns_by_label: dict[int, tuple[ColumnDescriptor, ...]],
+        *,
+        null_byte: str = "keep",
+    ) -> dict:
         if len(frame) < FIXED_HEADER:
             raise CdcProtocolError("truncated CDC fixed header")
         header_size, payload_size, reserved, kind = struct.unpack_from(">IIII", frame)
@@ -799,7 +804,7 @@ def register_lakeflow_source(spark):
             columns = columns_by_label.get(label)
             if columns is None:
                 raise CdcProtocolError(f"operation references unknown capture label {label}")
-            record["row"] = decode_row(payload, columns)
+            record["row"] = decode_row(payload, columns, null_byte=null_byte)
         elif kind == 1:
             _require_header(header, 24, op)
             lsn, tx_id, timestamp, user_id = struct.unpack_from(">Qiqi", header)
@@ -847,11 +852,13 @@ def register_lakeflow_source(spark):
         return struct.unpack_from(">Q", frame, FIXED_HEADER)[0] >> 32
 
 
-    def decode_row(payload: memoryview, columns: Iterable[ColumnDescriptor]) -> dict[str, Any]:
+    def decode_row(
+        payload: memoryview, columns: Iterable[ColumnDescriptor], *, null_byte: str = "keep"
+    ) -> dict[str, Any]:
         offset, row = 0, {}
         for column in columns:
             try:
-                value, consumed = decode_value(payload[offset:], column)
+                value, consumed = decode_value(payload[offset:], column, null_byte=null_byte)
             except (CdcProtocolError, UnicodeDecodeError) as error:
                 # UnicodeDecodeError is raised by the text branches of decode_value
                 # and is not a CdcProtocolError, so catching only the latter let a
@@ -871,7 +878,36 @@ def register_lakeflow_source(spark):
         return row
 
 
-    def decode_value(data: memoryview, column: ColumnDescriptor) -> tuple[Any, int]:
+    def apply_null_byte(value: Any, mode: str) -> Any:
+        """Sanitize a decoded string that contains an embedded NUL (``\\x00``).
+
+        ``mode`` selects the behaviour (shared by the CDC and snapshot decode paths):
+
+        - ``"keep"`` -- return the value unchanged; a NUL passes straight through.
+        - ``"null"`` -- a string containing any NUL becomes ``None``. A NUL is genuine
+          content here (the decoders already trim real padding), so it cannot be
+          represented as a clean string; ``None`` says so honestly and is detectable
+          downstream rather than silently altering the value.
+        - ``"empty"`` -- strip the NUL characters, preserving the rest of the string.
+
+        Non-string values, and NUL-free strings, are returned unchanged regardless of mode.
+        """
+
+        if mode == "keep" or not isinstance(value, str) or "\x00" not in value:
+            return value
+        if mode == "null":
+            return None
+        return value.replace("\x00", "")
+
+
+    def decode_value(
+        data: memoryview, column: ColumnDescriptor, *, null_byte: str = "keep"
+    ) -> tuple[Any, int]:
+        value, consumed = _decode_value_bytes(data, column)
+        return apply_null_byte(value, null_byte), consumed
+
+
+    def _decode_value_bytes(data: memoryview, column: ColumnDescriptor) -> tuple[Any, int]:
         kind = column.type_name.upper().split("(", 1)[0].strip()
         if kind in {"SMALLINT", "INT2"}:
             value = _unpack(">h", data)
@@ -1136,6 +1172,7 @@ def register_lakeflow_source(spark):
         "ColumnDescriptor",
         "OpenTransactionRecords",
         "UnsupportedCdcType",
+        "apply_null_byte",
         "decode_frame",
         "metadata_column_names",
         "decode_packed_decimal",
@@ -3946,6 +3983,19 @@ def register_lakeflow_source(spark):
 
 
     def _decode_result_value(
+        data: bytes,
+        column: ResultColumn,
+        encoding: str,
+        pad_varchar: bool = False,
+        null_byte: str = "keep",
+    ) -> object:
+        # The snapshot/query path decodes CHAR/VARCHAR/LVARCHAR itself (below), so apply the
+        # NUL sanitizer here as the CDC path does in decode_value. Numeric/metadata results
+        # are unaffected -- apply_null_byte only touches strings that contain a NUL.
+        return apply_null_byte(_decode_result_value_raw(data, column, encoding, pad_varchar), null_byte)
+
+
+    def _decode_result_value_raw(
         data: bytes, column: ResultColumn, encoding: str, pad_varchar: bool = False
     ) -> object:
         kind = _effective_result_kind(column)
@@ -4095,6 +4145,9 @@ def register_lakeflow_source(spark):
         ssl_context: ssl.SSLContext | None = None
         ca_file: str | None = None
         pad_varchar: bool = False
+        # How a decoded string containing an embedded NUL is sanitized: "keep"/"null"/"empty"
+        # (see cdc_protocol.apply_null_byte). The bridge sets this from the connection option.
+        null_byte: str = "keep"
         connect_timeout: float = 10.0
         socket_timeout: float = 30.0
         authentication_mode: str = "password"
@@ -4841,7 +4894,7 @@ def register_lakeflow_source(spark):
                         f"exceeds payload size {len(payload)}"
                     )
                 result[column.name] = _decode_result_value(
-                    payload[start:limit], column, self._encoding, self.pad_varchar
+                    payload[start:limit], column, self._encoding, self.pad_varchar, self.null_byte
                 )
                 cursor = limit
             return result
@@ -6123,6 +6176,9 @@ def register_lakeflow_source(spark):
                     f"Authentication mode {authentication!r} is unsupported; use password or pam."
                 )
             self.config = _bridge_config(options)
+            # Resolved once and applied in both decode paths: the CDC decode via decode_frame
+            # (see read_changes) and the snapshot/query decode inside the SQLI client.
+            self._null_byte = _null_byte_mode(options)
             factory_path = options.get("transport.factory")
             if factory_path:
                 self.transport = _load_factory(factory_path)(options)
@@ -6147,6 +6203,7 @@ def register_lakeflow_source(spark):
                     tls=self.config["tls"],
                     ca_file=self.config["ca_file"],
                     pad_varchar=self.config["pad_varchar"],
+                    null_byte=self._null_byte,
                     authentication_mode=authentication,
                     authentication_provider=provider,
                     pam_max_rounds=int(options.get("authentication.pam.max.rounds", "16")),
@@ -7653,7 +7710,9 @@ def register_lakeflow_source(spark):
                     empty_reads = 0
                     for frame in parser.feed(chunk):
                         try:
-                            record = decode_frame(frame, labels)
+                            record = decode_frame(
+                                frame, labels, null_byte=getattr(self, "_null_byte", "keep")
+                            )
                         except CdcProtocolError as error:
                             raise _stale_capture_label_error(frame, error, start_lsn) from error
                         if max_poll_bytes:
@@ -7818,6 +7877,32 @@ def register_lakeflow_source(spark):
         if normalized in {"0", "false", "no"}:
             return False
         raise ValueError(f"Option '{name}' must be one of: 1, true, yes, 0, false, no")
+
+
+    # How a decoded string containing an embedded NUL (\x00) is sanitized. A NUL is genuine
+    # content -- the decoders already trim real (space) padding -- but many downstream
+    # consumers cannot store it, so the default converts such a value to NULL (honest and
+    # detectable) rather than silently stripping it. "empty" strips the NUL characters;
+    # "keep" passes them through unchanged.
+    _NULL_BYTE_OPTION = "string.null.byte"
+    _NULL_BYTE_MODES = {"null", "empty", "keep"}
+    _DEFAULT_NULL_BYTE_MODE = "null"
+
+
+    def _null_byte_mode(options: dict[str, str]) -> str:
+        """Resolve the ``string.null.byte`` option to ``null`` (default), ``empty``, or ``keep``."""
+
+        raw = options.get(_NULL_BYTE_OPTION)
+        if raw is None:
+            return _DEFAULT_NULL_BYTE_MODE
+        mode = raw.strip().lower()
+        if mode == "empty_string":
+            mode = "empty"
+        if not mode:
+            return _DEFAULT_NULL_BYTE_MODE
+        if mode not in _NULL_BYTE_MODES:
+            raise ValueError(f"Option '{_NULL_BYTE_OPTION}' must be one of: null, empty, keep")
+        return mode
 
 
     def _append_only_value(raw: str) -> str:
@@ -9069,6 +9154,7 @@ def register_lakeflow_source(spark):
             _option_bool(options, _CONNECTION_FAIR_QUEUE_OPTION, True)
             _option_bool(options, _SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION, True)
             _option_bool(options, _PROMOTE_UNIQUE_INDEX_OPTION, True)
+            _null_byte_mode(options)
             if _APPEND_INGESTION_OPTION in options:
                 _append_only_value(options[_APPEND_INGESTION_OPTION])
             if int(options.get("cdc.max.records", str(_DEFAULT_CDC_MAX_RECORDS))) > 256:

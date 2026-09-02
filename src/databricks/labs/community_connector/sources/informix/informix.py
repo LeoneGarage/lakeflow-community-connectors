@@ -1239,6 +1239,9 @@ class PurePythonInformixBridge:
                 f"Authentication mode {authentication!r} is unsupported; use password or pam."
             )
         self.config = _bridge_config(options)
+        # Resolved once and applied in both decode paths: the CDC decode via decode_frame
+        # (see read_changes) and the snapshot/query decode inside the SQLI client.
+        self._null_byte = _null_byte_mode(options)
         factory_path = options.get("transport.factory")
         if factory_path:
             self.transport = _load_factory(factory_path)(options)
@@ -1263,6 +1266,7 @@ class PurePythonInformixBridge:
                 tls=self.config["tls"],
                 ca_file=self.config["ca_file"],
                 pad_varchar=self.config["pad_varchar"],
+                null_byte=self._null_byte,
                 authentication_mode=authentication,
                 authentication_provider=provider,
                 pam_max_rounds=int(options.get("authentication.pam.max.rounds", "16")),
@@ -2769,7 +2773,9 @@ class PurePythonInformixBridge:
                 empty_reads = 0
                 for frame in parser.feed(chunk):
                     try:
-                        record = decode_frame(frame, labels)
+                        record = decode_frame(
+                            frame, labels, null_byte=getattr(self, "_null_byte", "keep")
+                        )
                     except CdcProtocolError as error:
                         raise _stale_capture_label_error(frame, error, start_lsn) from error
                     if max_poll_bytes:
@@ -2934,6 +2940,32 @@ def _option_bool(options: dict[str, str], name: str, default: bool) -> bool:
     if normalized in {"0", "false", "no"}:
         return False
     raise ValueError(f"Option '{name}' must be one of: 1, true, yes, 0, false, no")
+
+
+# How a decoded string containing an embedded NUL (\x00) is sanitized. A NUL is genuine
+# content -- the decoders already trim real (space) padding -- but many downstream
+# consumers cannot store it, so the default converts such a value to NULL (honest and
+# detectable) rather than silently stripping it. "empty" strips the NUL characters;
+# "keep" passes them through unchanged.
+_NULL_BYTE_OPTION = "string.null.byte"
+_NULL_BYTE_MODES = {"null", "empty", "keep"}
+_DEFAULT_NULL_BYTE_MODE = "null"
+
+
+def _null_byte_mode(options: dict[str, str]) -> str:
+    """Resolve the ``string.null.byte`` option to ``null`` (default), ``empty``, or ``keep``."""
+
+    raw = options.get(_NULL_BYTE_OPTION)
+    if raw is None:
+        return _DEFAULT_NULL_BYTE_MODE
+    mode = raw.strip().lower()
+    if mode == "empty_string":
+        mode = "empty"
+    if not mode:
+        return _DEFAULT_NULL_BYTE_MODE
+    if mode not in _NULL_BYTE_MODES:
+        raise ValueError(f"Option '{_NULL_BYTE_OPTION}' must be one of: null, empty, keep")
+    return mode
 
 
 def _append_only_value(raw: str) -> str:
@@ -4185,6 +4217,7 @@ class InformixLakeflowConnect(LakeflowConnect):
         _option_bool(options, _CONNECTION_FAIR_QUEUE_OPTION, True)
         _option_bool(options, _SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION, True)
         _option_bool(options, _PROMOTE_UNIQUE_INDEX_OPTION, True)
+        _null_byte_mode(options)
         if _APPEND_INGESTION_OPTION in options:
             _append_only_value(options[_APPEND_INGESTION_OPTION])
         if int(options.get("cdc.max.records", str(_DEFAULT_CDC_MAX_RECORDS))) > 256:

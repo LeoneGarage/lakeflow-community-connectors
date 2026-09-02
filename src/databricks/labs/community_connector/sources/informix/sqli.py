@@ -28,6 +28,7 @@ from typing import BinaryIO, Callable, Protocol
 
 from databricks.labs.community_connector.sources.informix.cdc_protocol import (
     ColumnDescriptor,
+    apply_null_byte,
     decode_packed_decimal,
     decode_value,
 )
@@ -1127,6 +1128,19 @@ def _typed_bind(value: object) -> TypedBind:
 
 
 def _decode_result_value(
+    data: bytes,
+    column: ResultColumn,
+    encoding: str,
+    pad_varchar: bool = False,
+    null_byte: str = "keep",
+) -> object:
+    # The snapshot/query path decodes CHAR/VARCHAR/LVARCHAR itself (below), so apply the
+    # NUL sanitizer here as the CDC path does in decode_value. Numeric/metadata results
+    # are unaffected -- apply_null_byte only touches strings that contain a NUL.
+    return apply_null_byte(_decode_result_value_raw(data, column, encoding, pad_varchar), null_byte)
+
+
+def _decode_result_value_raw(
     data: bytes, column: ResultColumn, encoding: str, pad_varchar: bool = False
 ) -> object:
     kind = _effective_result_kind(column)
@@ -1276,6 +1290,9 @@ class InformixSqliClient:
     ssl_context: ssl.SSLContext | None = None
     ca_file: str | None = None
     pad_varchar: bool = False
+    # How a decoded string containing an embedded NUL is sanitized: "keep"/"null"/"empty"
+    # (see cdc_protocol.apply_null_byte). The bridge sets this from the connection option.
+    null_byte: str = "keep"
     connect_timeout: float = 10.0
     socket_timeout: float = 30.0
     authentication_mode: str = "password"
@@ -2022,7 +2039,7 @@ class InformixSqliClient:
                     f"exceeds payload size {len(payload)}"
                 )
             result[column.name] = _decode_result_value(
-                payload[start:limit], column, self._encoding, self.pad_varchar
+                payload[start:limit], column, self._encoding, self.pad_varchar, self.null_byte
             )
             cursor = limit
         return result
