@@ -239,11 +239,16 @@ class FakeBridge:
         skip=0,
         chunk_exprs=None,
         snapshot_filter=None,
+        key_descending=None,
     ):
         self.snapshot_max_bytes.append(max_bytes)
         self.snapshot_filters.append(snapshot_filter)
         self.snapshot_calls.append((identity, tuple(columns), tuple(primary_keys), after, limit))
         chunk_exprs = dict(chunk_exprs or {})
+        # Mirror the real bridge: page in the key index's own order, so a
+        # mixed-direction key sorts DESC columns descending. Chunked keys and
+        # all-ascending keys keep the plain lexicographic order.
+        descending = () if chunk_exprs else tuple(key_descending or ())
 
         def cursor_value(row, key):
             # Simulate the "__chunk_<key>" alias: chunk_key_fn renders the
@@ -252,19 +257,17 @@ class FakeBridge:
                 return self.chunk_key_fn(key, row[key])
             return row[key]
 
-        ordered = sorted(
-            self.rows,
-            key=lambda row: tuple(cursor_value(row, key) for key in primary_keys),
-        )
+        def order_key(row):
+            return informix_module._order_key(
+                tuple(cursor_value(row, key) for key in primary_keys), descending
+            )
+
+        ordered = sorted(self.rows, key=order_key)
         if after is not None:
             if len(after) != len(primary_keys):
                 raise AssertionError("snapshot continuation arity changed")
-            after_tuple = tuple(after)
-            ordered = [
-                row
-                for row in ordered
-                if tuple(cursor_value(row, key) for key in primary_keys) > after_tuple
-            ]
+            after_order = informix_module._order_key(tuple(after), descending)
+            ordered = [row for row in ordered if order_key(row) > after_order]
         page = ordered[:limit]
         result = []
         for row in page:
@@ -314,6 +317,7 @@ class FakeBridge:
         max_bytes=None,
         chunk_exprs=None,
         snapshot_filter=None,
+        key_descending=None,
     ):
         rows = self.snapshot_page(
             identity,
@@ -324,23 +328,30 @@ class FakeBridge:
             max_bytes,
             chunk_exprs=chunk_exprs,
             snapshot_filter=snapshot_filter,
+            key_descending=key_descending,
         )
         return self.now, rows
 
-    def max_primary_key(self, identity, primary_keys, chunk_exprs=None, snapshot_filter=None):
+    def max_primary_key(
+        self, identity, primary_keys, chunk_exprs=None, snapshot_filter=None, key_descending=None
+    ):
         self.snapshot_filters.append(snapshot_filter)
         if not self.rows:
             return None
         chunk_exprs = dict(chunk_exprs or {})
+        descending = () if chunk_exprs else tuple(key_descending or ())
 
         def cursor_value(row, key):
             if key in chunk_exprs:
                 return self.chunk_key_fn(key, row[key])
             return row[key]
 
+        # The "maximum" is the last tuple in the key's own paging order.
         top = max(
             self.rows,
-            key=lambda row: tuple(cursor_value(row, key) for key in primary_keys),
+            key=lambda row: informix_module._order_key(
+                tuple(cursor_value(row, key) for key in primary_keys), descending
+            ),
         )
         return [cursor_value(top, key) for key in primary_keys]
 
@@ -1590,6 +1601,24 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(bridge.transport.timeouts, [900.0, 30.0])
 
+    def test_max_primary_key_mixed_direction_flips_the_fetch_order(self):
+        # Key (hpolicy ASC, clm_no DESC). The last tuple in the index's own scan
+        # order is (max hpolicy, then MIN clm_no within it), so the leading column
+        # fetches DESC (its max) and the descending column fetches ASC (its min).
+        bridge = self._stepwise_bridge([[{"hpolicy": "H9"}], [{"clm_no": 1}]])
+
+        result = bridge.max_primary_key(
+            "demo.app.tw305", ["hpolicy", "clm_no"], key_descending=[False, True]
+        )
+
+        self.assertEqual(result, ["H9", 1])
+        first_sql, _ = bridge.transport.selects[0]
+        second_sql, second_params = bridge.transport.selects[1]
+        self.assertTrue(first_sql.rstrip().endswith("ORDER BY hpolicy DESC"))
+        self.assertIn("WHERE hpolicy = ?", second_sql)
+        self.assertTrue(second_sql.rstrip().endswith("ORDER BY clm_no ASC"))
+        self.assertEqual(second_params, ("H9",))
+
     def test_max_primary_key_datetime_chunk_keeps_single_composite_read(self):
         # A DATETIME-chunked key cannot use the stepwise equality prefix (no index
         # serves an order-preserving cast expression), so it stays a single
@@ -2432,6 +2461,63 @@ class LakeflowContractTests(unittest.TestCase):
             "ORDER BY hpolicy,clm_no",
         )
         self.assertEqual(bridge.transport.parameters, (100, 100, 34))
+
+    def test_snapshot_page_mixed_direction_pages_in_index_order(self):
+        # Key (hpolicy ASC, clm_no DESC): the ORDER BY matches the index so a
+        # forward scan serves it without a sort, and the keyset comparison flips
+        # to "<" for the DESC column ("next in scan order" is a smaller clm_no).
+        class SnapshotTransport:
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                del max_result_bytes
+                self.sql = sql
+                self.parameters = parameters
+                return []
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.transport = SnapshotTransport()
+
+        bridge.snapshot_page(
+            "demo.app.tw305",
+            ["hpolicy", "clm_no"],
+            ["hpolicy", "clm_no"],
+            [100, 34],
+            500,
+            key_descending=[False, True],
+        )
+
+        self.assertEqual(
+            bridge.transport.sql,
+            "SELECT {+FIRST_ROWS(500)} FIRST 500 hpolicy,clm_no FROM demo:app.tw305 "
+            "WHERE ((hpolicy > ?) OR (hpolicy = ? AND clm_no < ?)) "
+            "ORDER BY hpolicy,clm_no DESC",
+        )
+        self.assertEqual(bridge.transport.parameters, (100, 100, 34))
+
+    def test_snapshot_page_chunked_key_ignores_direction(self):
+        # A chunked (DATETIME) key has no direction-aware index to match, so even
+        # with key_descending set the page keeps the default ascending order.
+        class SnapshotTransport:
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                del parameters, max_result_bytes
+                self.sql = sql
+                return []
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.transport = SnapshotTransport()
+
+        bridge.snapshot_page(
+            "demo.app.events",
+            ["ts"],
+            ["ts"],
+            None,
+            2,
+            chunk_exprs={"ts": "TO_CHAR(ts)"},
+            key_descending=[True],
+        )
+
+        self.assertTrue(bridge.transport.sql.rstrip().endswith("ORDER BY TO_CHAR(ts)"))
 
     def test_snapshot_page_combines_filter_with_keyset_predicate(self):
         class SnapshotTransport:
@@ -7652,6 +7738,41 @@ class IncrementalSnapshotTests(unittest.TestCase):
         self.assertEqual(offset["phase"], "stream")
         self.assertNotIn("incremental", offset)
 
+    def test_incremental_mixed_direction_key_pages_in_index_order(self):
+        # Key (id ASC, seq DESC). The whole incremental copy -- max_pk, the paged
+        # reads, and the cursor/bound comparisons -- must run in the index's own
+        # order, not Python's all-ascending tuple order, or rows are emitted out
+        # of order and the copy stops at the wrong bound.
+        bridge = FakeBridge()
+        bridge.tables = [
+            {
+                "database": "demo",
+                "owner": "app",
+                "name": "orders",
+                "columns": [
+                    {"name": "id", "type_name": "INTEGER", "nullable": False},
+                    {"name": "seq", "type_name": "INTEGER", "nullable": False},
+                    {"name": "value", "type_name": "VARCHAR", "length": 20},
+                ],
+                "primary_keys": ["id", "seq"],
+                "key_descending": [False, True],
+            }
+        ]
+        bridge.rows = [
+            {"id": 1, "seq": 2, "value": "a"},
+            {"id": 1, "seq": 1, "value": "b"},
+            {"id": 2, "seq": 5, "value": "c"},
+            {"id": 2, "seq": 3, "value": "d"},
+        ]
+        connector = self.connector(bridge, **{"snapshot.page.size": "1"})
+
+        rows, offset = self._drain(connector, {"snapshot.page.size": "1"})
+
+        # id ascending, seq descending within each id: a, b, c, d.
+        self.assertEqual([row["value"] for row in rows], ["a", "b", "c", "d"])
+        self.assertEqual({row["id"] for row in rows}, {1, 2})
+        self.assertNotIn("incremental", offset)  # converged at the index-order max (2, 3)
+
     def test_incremental_snapshot_begins_streaming_immediately(self):
         bridge = FakeBridge()
         bridge.rows = [{"id": 1, "value": "a"}, {"id": 2, "value": "b"}]
@@ -10041,21 +10162,21 @@ class UniqueIndexPrimaryKeyPromotionTests(unittest.TestCase):
         key = informix_module._select_unique_index_key(
             [("u_a", [1, 0])], {1: "a", 2: "b"}, {"a": False, "b": False}
         )
-        self.assertEqual(key, ["a"])
+        self.assertEqual(key, [("a", False)])
 
     def test_prefers_the_index_with_fewest_columns(self):
         indexes = [("u_wide", [1, 2, 0]), ("u_narrow", [3, 0])]
         key = informix_module._select_unique_index_key(
             indexes, {1: "a", 2: "b", 3: "c"}, {"a": False, "b": False, "c": False}
         )
-        self.assertEqual(key, ["c"])
+        self.assertEqual(key, [("c", False)])
 
     def test_breaks_column_count_ties_on_index_name_ascending(self):
         indexes = [("u_z", [1, 0]), ("u_a", [2, 0])]  # both one column
         key = informix_module._select_unique_index_key(
             indexes, {1: "a", 2: "b"}, {"a": False, "b": False}
         )
-        self.assertEqual(key, ["b"])  # chosen from u_a, the lexically first name
+        self.assertEqual(key, [("b", False)])  # chosen from u_a, the lexically first name
 
     def test_skips_an_index_with_a_nullable_column(self):
         indexes = [("u_null", [3, 0]), ("u_ok", [1, 2, 0])]
@@ -10063,14 +10184,15 @@ class UniqueIndexPrimaryKeyPromotionTests(unittest.TestCase):
             indexes, {1: "a", 2: "b", 3: "n"}, {"a": False, "b": False, "n": True}
         )
         # u_null is fewer columns but nullable, so the wider all-NOT-NULL index wins.
-        self.assertEqual(key, ["a", "b"])
+        self.assertEqual(key, [("a", False), ("b", False)])
 
     def test_descending_column_is_included_by_magnitude_in_key_order(self):
-        # A descending index column is a negative part; it is still part of the key.
+        # A descending index column is a negative part; it is still part of the key,
+        # and its direction is reported so paging can match the index's own order.
         key = informix_module._select_unique_index_key(
             [("u", [-2, 1, 0])], {1: "a", 2: "b"}, {"a": False, "b": False}
         )
-        self.assertEqual(key, ["b", "a"])
+        self.assertEqual(key, [("b", True), ("a", False)])
 
     def test_unknown_column_disqualifies_the_index(self):
         key = informix_module._select_unique_index_key([("u", [9, 0])], {1: "a"}, {"a": False})
@@ -10121,6 +10243,112 @@ class UniqueIndexPrimaryKeyPromotionTests(unittest.TestCase):
         table = bridge._describe_table("app", "orders")
         self.assertEqual(table["primary_keys"], [])
         self.assertFalse(any("idxtype='U'" in sql for sql in seen))  # not even queried
+
+
+class MixedDirectionKeyTests(unittest.TestCase):
+    """A key index with a DESC column is paged in the index's own order so a forward
+    scan serves it without a sort. Directions flow from catalog discovery through the
+    Table to the paging queries and the key-bound read; an all-ascending key is
+    unaffected (carries no directions and behaves exactly as before)."""
+
+    @staticmethod
+    def _pk_row(*parts):
+        # A sysconstraints/sysindexes key row: part1..part16, key columns then 0 pad.
+        padded = list(parts) + [0] * (16 - len(parts))
+        return {f"part{i + 1}": padded[i] for i in range(16)}
+
+    def test_order_key_orders_descending_columns_in_reverse(self):
+        order_key = informix_module._order_key
+        desc = (False, True)  # (ASC, DESC)
+        # Within one leading value, the DESC column ranks a larger value first.
+        self.assertLess(order_key((1, 9), desc), order_key((1, 5), desc))
+        # The ascending leading column still dominates.
+        self.assertLess(order_key((1, 0), desc), order_key((2, 99), desc))
+        # Equality and >= behave.
+        self.assertTrue(order_key((1, 5), desc) >= order_key((1, 5), desc))
+        self.assertFalse(order_key((1, 5), desc) > order_key((1, 5), desc))
+        # Empty / all-ascending is the plain tuple order, untouched.
+        self.assertEqual(order_key((1, 2), ()), (1, 2))
+        self.assertLess(order_key((1, 5), (False, False)), order_key((1, 9), (False, False)))
+
+    def test_primary_key_constraint_captures_column_directions(self):
+        class CatalogTransport:
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                del parameters, max_result_bytes
+                if "syscolumns" in sql:
+                    return [
+                        {"colname": "a", "coltype": 258, "collength": 4, "colno": 1, "tabid": 7},
+                        {"colname": "b", "coltype": 258, "collength": 4, "colno": 2, "tabid": 7},
+                    ]
+                if "constrtype='P'" in sql:
+                    return [MixedDirectionKeyTests._pk_row(1, -2)]  # a ASC, b DESC
+                return []
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.config = {"database": "demo"}
+        bridge.transport = CatalogTransport()
+
+        table = bridge._describe_table("app", "t")
+        self.assertEqual(table["primary_keys"], ["a", "b"])
+        self.assertEqual(table["key_descending"], [False, True])
+
+    def test_all_ascending_key_carries_no_directions(self):
+        class CatalogTransport:
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                del parameters, max_result_bytes
+                if "syscolumns" in sql:
+                    return [
+                        {"colname": "a", "coltype": 258, "collength": 4, "colno": 1, "tabid": 7},
+                        {"colname": "b", "coltype": 258, "collength": 4, "colno": 2, "tabid": 7},
+                    ]
+                if "constrtype='P'" in sql:
+                    return [MixedDirectionKeyTests._pk_row(1, 2)]
+                return []
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.config = {"database": "demo"}
+        bridge.transport = CatalogTransport()
+
+        table = bridge._describe_table("app", "t")
+        self.assertEqual(table["primary_keys"], ["a", "b"])
+        self.assertEqual(table["key_descending"], [])  # normalized: nothing extra to carry
+
+    def test_table_parse_round_trips_directions_and_checks_arity(self):
+        raw = {
+            "database": "demo",
+            "owner": "app",
+            "name": "t",
+            "columns": [
+                {"name": "a", "type_name": "INTEGER", "nullable": False},
+                {"name": "b", "type_name": "INTEGER", "nullable": False},
+            ],
+            "primary_keys": ["a", "b"],
+            "key_descending": [False, True],
+        }
+        table = informix_module.Table.parse(raw, "demo")
+        self.assertEqual(table.key_descending, (False, True))
+        # A directions list that does not match the key arity is rejected.
+        with self.assertRaisesRegex(informix_module.InformixError, "Key direction metadata"):
+            informix_module.Table.parse({**raw, "key_descending": [True]}, "demo")
+
+    def test_primary_key_override_clears_directions(self):
+        table = informix_module.Table(
+            "demo",
+            "app",
+            "t",
+            (
+                informix_module.Column("a", "INTEGER", False, 4, None, None, True),
+                informix_module.Column("b", "INTEGER", False, 4, None, None, True),
+            ),
+            ("a", "b"),
+            key_descending=(False, True),
+        )
+        connector = object.__new__(InformixLakeflowConnect)
+        overridden = connector._apply_primary_key_override(table, {"primary.keys": "a"})
+        self.assertEqual(overridden.primary_keys, ("a",))
+        self.assertEqual(overridden.key_descending, ())  # override columns have no known index
 
 
 class NullByteOptionTests(unittest.TestCase):

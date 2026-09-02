@@ -1105,6 +1105,7 @@ class InformixBridge(Protocol):
         max_bytes: int | None = None,
         skip: int = 0,
         snapshot_filter: str | None = None,
+        key_descending: Sequence[bool] | None = None,
     ) -> list[dict[str, Any]]: ...
 
     def consistent_snapshot(
@@ -1130,6 +1131,7 @@ class InformixBridge(Protocol):
         max_bytes: int | None = None,
         chunk_exprs: dict[str, str] | None = None,
         snapshot_filter: str | None = None,
+        key_descending: Sequence[bool] | None = None,
     ) -> tuple[int, list[dict[str, Any]]]: ...
 
     def max_primary_key(
@@ -1138,6 +1140,7 @@ class InformixBridge(Protocol):
         primary_keys: Sequence[str],
         chunk_exprs: dict[str, str] | None = None,
         snapshot_filter: str | None = None,
+        key_descending: Sequence[bool] | None = None,
     ) -> list[Any] | None: ...
 
     def read_changes(
@@ -2121,11 +2124,18 @@ class PurePythonInformixBridge:
             int(_field(row, "colno", 3)): str(_field(row, "colname", 0)) for row in columns
         }
         primary_keys = []
+        # Per-column index direction, parallel to primary_keys: True == the column
+        # is stored DESC in the key index (a negative catalog part number). Kept so
+        # a mixed-direction key can be paged in the index's own order instead of
+        # forcing an all-ascending sort. Normalized to [] when every column is ASC
+        # so the common case carries no extra state and behaves exactly as before.
+        key_descending: list[bool] = []
         if keys:
             for position in range(16):
                 column_number = int(_field(keys[0], f"part{position + 1}", position))
-                if column_number > 0:
-                    primary_keys.append(by_number[column_number])
+                if column_number != 0:
+                    primary_keys.append(by_number[abs(column_number)])
+                    key_descending.append(column_number < 0)
         elif unique_indexes:
             # No primary-key constraint: stand a UNIQUE index in for it (deterministically
             # chosen -- see _select_unique_index_key). The resulting key is catalog-derived,
@@ -2144,7 +2154,9 @@ class PurePythonInformixBridge:
                 )
                 for index in unique_indexes
             ]
-            primary_keys = _select_unique_index_key(index_parts, by_number, nullable_by_name)
+            selected = _select_unique_index_key(index_parts, by_number, nullable_by_name)
+            primary_keys = [name for name, _ in selected]
+            key_descending = [is_desc for _, is_desc in selected]
         try:
             tabid = int(_field(columns[0], "tabid", 4))
         except (IndexError, KeyError, TypeError, ValueError) as error:
@@ -2161,6 +2173,9 @@ class PurePythonInformixBridge:
             "name": name,
             "columns": parsed_columns,
             "primary_keys": primary_keys,
+            # Only carry directions for a genuinely mixed/descending key; an
+            # all-ascending key stays [] so nothing downstream changes for it.
+            "key_descending": key_descending if any(key_descending) else [],
             "incarnation": str(tabid),
         }
 
@@ -2331,6 +2346,7 @@ class PurePythonInformixBridge:
         skip=0,
         chunk_exprs=None,
         snapshot_filter=None,
+        key_descending=None,
     ):
         self._ensure_connected()
         database, owner, name = _split_identity(identity)
@@ -2347,9 +2363,22 @@ class PurePythonInformixBridge:
         for key in chunk_exprs:
             if key not in primary_keys:
                 raise InformixError(f"Chunk expression names unknown key {key!r}")
+        # Page in the key index's own column directions when the key is mixed
+        # (some column DESC): then ORDER BY matches the index and a forward scan
+        # serves it without a sort. A chunked (DATETIME) key keeps the default
+        # ascending order -- its order-preserving cast has no direction-aware index
+        # to match -- and an all-ascending key is unaffected.
+        descending = list(key_descending or [])
+        direction_aware = any(descending) and not chunk_exprs
+
+        def is_descending(index: int) -> bool:
+            return direction_aware and index < len(descending) and descending[index]
 
         def order_term(key: str) -> str:
             return chunk_exprs.get(key, key)
+
+        def order_clause(index: int, key: str) -> str:
+            return f"{order_term(key)} DESC" if is_descending(index) else order_term(key)
 
         alias_names = [f"__chunk_{key}" for key in primary_keys if key in chunk_exprs]
         projection = list(columns) + [
@@ -2395,13 +2424,21 @@ class PurePythonInformixBridge:
                 prefix = " AND ".join(
                     f"{order_term(previous)} = ?" for previous in primary_keys[:index]
                 )
-                clauses.append(f"({prefix + ' AND ' if prefix else ''}{order_term(key)} > ?)")
+                # "Next in scan order" is a larger value for an ASC column and a
+                # smaller one for a DESC column, so the keyset comparison flips to
+                # match the index direction.
+                comparison = "<" if is_descending(index) else ">"
+                clauses.append(
+                    f"({prefix + ' AND ' if prefix else ''}{order_term(key)} {comparison} ?)"
+                )
                 parameters.extend(bound_after[: index + 1])
             predicates.append("(" + " OR ".join(clauses) + ")")
         if predicates:
             sql += " WHERE " + " AND ".join(predicates)
         if primary_keys:
-            sql += " ORDER BY " + ",".join(order_term(key) for key in primary_keys)
+            sql += " ORDER BY " + ",".join(
+                order_clause(index, key) for index, key in enumerate(primary_keys)
+            )
         rows = self.transport.execute(
             sql,
             tuple(parameters),
@@ -2499,6 +2536,7 @@ class PurePythonInformixBridge:
         max_bytes=None,
         chunk_exprs=None,
         snapshot_filter=None,
+        key_descending=None,
     ):
         """Read one PK-ordered chunk in its own repeatable-read transaction.
 
@@ -2508,6 +2546,8 @@ class PurePythonInformixBridge:
         transaction spans a single page, so no long-lived read view is held.
         ``chunk_exprs`` optionally maps primary-key columns to order-preserving
         SQL text expressions for keyset comparison (e.g. DATETIME-as-string).
+        ``key_descending`` optionally carries the per-column key index direction
+        so a mixed-direction key pages in the index's own order.
         """
 
         self._ensure_connected()
@@ -2522,12 +2562,19 @@ class PurePythonInformixBridge:
                 max_bytes,
                 chunk_exprs=chunk_exprs,
                 snapshot_filter=snapshot_filter,
+                key_descending=key_descending,
             )
             return chunk_lsn, rows
 
     @_serialized_sqli_operation
-    def max_primary_key(self, identity, primary_keys, chunk_exprs=None, snapshot_filter=None):
+    def max_primary_key(
+        self, identity, primary_keys, chunk_exprs=None, snapshot_filter=None, key_descending=None
+    ):
         """Return the largest primary-key tuple, or ``None`` for an empty table.
+
+        "Largest" is the last tuple in the key's paging order. For a plain-column
+        key that order follows the index's per-column direction (see
+        ``key_descending``); for an all-ascending key it is ordinary descending.
 
         When ``chunk_exprs`` maps a key to an order-preserving SQL expression,
         that key is ordered and returned as its rendered string form so the
@@ -2549,7 +2596,9 @@ class PurePythonInformixBridge:
         chunk_exprs = dict(chunk_exprs or {})
         table_ref = f"{database}:{_sql_identifier(owner)}.{_sql_identifier(name)}"
         if primary_keys and not chunk_exprs:
-            return self._max_key_stepwise(table_ref, list(primary_keys), snapshot_filter)
+            return self._max_key_stepwise(
+                table_ref, list(primary_keys), snapshot_filter, list(key_descending or [])
+            )
         select_terms = [
             f"{chunk_exprs[key]} AS __chunk_{key}" if key in chunk_exprs else key
             for key in primary_keys
@@ -2575,18 +2624,26 @@ class PurePythonInformixBridge:
         return list(row)
 
     def _max_key_stepwise(
-        self, table_ref: str, primary_keys: list[str], snapshot_filter: str | None
+        self,
+        table_ref: str,
+        primary_keys: list[str],
+        snapshot_filter: str | None,
+        descending: list[bool],
     ) -> list[Any] | None:
         """Resolve the maximum key tuple one column at a time.
 
-        Each step reads ``FIRST 1`` of one key column ordered ``DESC`` under an
-        equality filter that pins the already-resolved higher-order columns. A
-        single-column order within an equality prefix is served by a directional
-        sub-range scan of the key index -- no whole-table sort -- and it holds
-        even when the index mixes ASC/DESC column directions, where a composite
-        ``ORDER BY c1 DESC, c2 DESC`` matches neither scan direction and forces a
-        sort. Prior columns are pinned with ``?`` parameters, exactly as the
-        snapshot keyset does, so no key value is rendered back into SQL text.
+        Each step reads ``FIRST 1`` of one key column under an equality filter
+        that pins the already-resolved higher-order columns, ordered to return
+        that column's *last* value in the key's paging order: for an ASC column
+        that is its max (``ORDER BY col DESC``), for a DESC column its min
+        (``ORDER BY col ASC``) -- so the tuple is the last row a forward index
+        scan in the key's own order would reach. A single-column order within an
+        equality prefix is served by a directional sub-range scan of the key
+        index -- no whole-table sort -- and it holds for any mix of ASC/DESC
+        column directions, where a composite ``ORDER BY`` matches neither scan
+        direction and forces a sort. Prior columns are pinned with ``?``
+        parameters, exactly as the snapshot keyset does, so no key value is
+        rendered back into SQL text.
 
         All steps run inside one REPEATABLE READ view so the columns resolve
         against a single point in time -- identical to what the equivalent
@@ -2603,9 +2660,12 @@ class PurePythonInformixBridge:
                     predicates.append(f"{primary_keys[previous]} = ?")
                     params.append(resolved[previous])
                 where = f" WHERE {' AND '.join(predicates)}" if predicates else ""
+                # The last value in paging order is the min of a DESC column, the
+                # max of an ASC one; fetch it by ordering opposite the index.
+                fetch_order = "ASC" if index < len(descending) and descending[index] else "DESC"
                 sql = (
                     f"SELECT {{+FIRST_ROWS(1)}} FIRST 1 {key} "
-                    f"FROM {table_ref}{where} ORDER BY {key} DESC"
+                    f"FROM {table_ref}{where} ORDER BY {key} {fetch_order}"
                 )
                 rows = self.transport.execute(sql, tuple(params))
                 if not rows:
@@ -3098,11 +3158,65 @@ _PRIMARY_KEYS_OPTION = "primary.keys"
 _PROMOTE_UNIQUE_INDEX_OPTION = "primary.key.from.unique.index"
 
 
+class _DescendingKey:
+    """Order one key-column value descending inside a tuple comparison.
+
+    Index-native paging over a mixed-direction key compares tuples in the
+    index's order, not Python's all-ascending default. Wrapping the values of
+    the DESC columns flips just those positions; ASC columns stay bare. A
+    wrapper is only ever compared against another wrapper at the same tuple
+    position (same column, same type), so comparing the underlying values is
+    well-defined.
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _DescendingKey) and self.value == other.value
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+    def __lt__(self, other: "_DescendingKey") -> bool:
+        return other.value < self.value
+
+    def __le__(self, other: "_DescendingKey") -> bool:
+        return other.value <= self.value
+
+    def __gt__(self, other: "_DescendingKey") -> bool:
+        return other.value > self.value
+
+    def __ge__(self, other: "_DescendingKey") -> bool:
+        return other.value >= self.value
+
+    def __hash__(self) -> int:
+        return hash(self.value)
+
+
+def _order_key(values: Sequence[Any], descending: Sequence[bool]) -> tuple:
+    """Map a key tuple to a comparison key honoring per-column direction.
+
+    Empty or all-ascending ``descending`` returns the tuple unchanged, so the
+    common (all-ascending lexicographic) case keeps Python's native order and is
+    unaffected. Otherwise DESC columns are wrapped so tuple comparison reproduces
+    the index's own scan order.
+    """
+
+    if not descending or not any(descending):
+        return tuple(values)
+    return tuple(
+        _DescendingKey(value) if is_desc else value for value, is_desc in zip(values, descending)
+    )
+
+
 def _select_unique_index_key(
     indexes: list[tuple[str, list[int]]],
     column_by_number: dict[int, str],
     nullable_by_name: dict[str, bool],
-) -> list[str]:
+) -> list[tuple[str, bool]]:
     """Choose a UNIQUE index to stand in for an absent primary key.
 
     ``indexes`` is ``(idxname, [part1..part16])`` per unique index; the parts are
@@ -3116,13 +3230,14 @@ def _select_unique_index_key(
 
     Among the eligible indexes, choose the one with the fewest columns; break ties by index
     name in ascending lexical order (deterministic and independent of catalog row order).
-    Returns the ordered key column list, or ``[]`` when no unique index qualifies (the table
-    stays key-less).
+    Returns the ordered key as ``(column, descending)`` pairs -- ``descending`` records the
+    per-column index direction so paging can match the index's own order -- or ``[]`` when
+    no unique index qualifies (the table stays key-less).
     """
 
-    candidates: list[tuple[int, str, list[str]]] = []
+    candidates: list[tuple[int, str, list[tuple[str, bool]]]] = []
     for idxname, parts in indexes:
-        columns: list[str] = []
+        columns: list[tuple[str, bool]] = []
         eligible = True
         for part in parts:
             number = int(part)
@@ -3132,7 +3247,7 @@ def _select_unique_index_key(
             if name is None or nullable_by_name.get(name, True):
                 eligible = False  # unknown or nullable column -> not a safe primary key
                 break
-            columns.append(name)
+            columns.append((name, number < 0))  # negative part number == descending column
         if eligible and columns:
             candidates.append((len(columns), str(idxname), columns))
     if not candidates:
@@ -3540,6 +3655,14 @@ class Table:
     # catalog's (empty, for a physically keyless table). Not part of the schema
     # fingerprint -- only the resulting primary_keys are.
     key_override: bool = False
+    # Per-column key index direction, parallel to primary_keys: True == DESC.
+    # Empty means all-ascending (the common case) -- paging then uses the default
+    # lexicographic order untouched. A mixed/descending key carries the full
+    # per-column list so snapshot paging and the key bound match the index's own
+    # scan order instead of forcing a sort. Derived from the same index as the
+    # keys, so it is not fingerprinted separately. Unknown for a primary.keys
+    # override (no matching index), so it is cleared to () there.
+    key_descending: tuple[bool, ...] = ()
 
     @property
     def exposed_name(self) -> str:
@@ -3587,7 +3710,13 @@ class Table:
             raise InformixError(f"Invalid metadata for {database}.{owner}.{name}")
         incarnation_value = raw.get("incarnation")
         incarnation = None if incarnation_value is None else str(incarnation_value)
-        return cls(database, owner, name, columns, pks, incarnation)
+        key_descending = tuple(bool(v) for v in raw.get("key_descending", ()))
+        if key_descending and len(key_descending) != len(pks):
+            raise InformixError(
+                f"Key direction metadata for {database}.{owner}.{name} does not match "
+                f"its {len(pks)} primary-key column(s)"
+            )
+        return cls(database, owner, name, columns, pks, incarnation, key_descending=key_descending)
 
 
 @dataclass
@@ -3959,7 +4088,12 @@ def _run_shared_cdc_shard(shard: _SharedCdcShard) -> None:
                         # fingerprint never matches its checkpoint, so it would always
                         # fall back to a direct read and never benefit from sharding --
                         # and its PK-change detection would use the wrong keys.
-                        fresh = replace(fresh, primary_keys=table.primary_keys, key_override=True)
+                        fresh = replace(
+                            fresh,
+                            primary_keys=table.primary_keys,
+                            key_override=True,
+                            key_descending=(),
+                        )
                     schema_map[identity] = fresh
                 min_lsn = reader._bridge.minimum_lsn()
                 current_lsn = reader._bridge.current_lsn()
@@ -5694,7 +5828,9 @@ class InformixLakeflowConnect(LakeflowConnect):
             )
         if table.key_override and tuple(keys) == table.primary_keys:
             return table
-        return replace(table, primary_keys=tuple(keys), key_override=True)
+        # The override names columns, not an index, so their key-index direction is
+        # unknown: clear it so paging uses the default lexicographic order.
+        return replace(table, primary_keys=tuple(keys), key_override=True, key_descending=())
 
     def _snapshot_mode(self, table_options: dict[str, str]) -> str:
         mode = (
@@ -6554,6 +6690,7 @@ class InformixLakeflowConnect(LakeflowConnect):
             list(table.primary_keys),
             chunk_exprs=chunk_exprs or None,
             snapshot_filter=snapshot_filter,
+            key_descending=list(table.key_descending),
         )
         incremental = {
             "started": True,
@@ -6602,6 +6739,7 @@ class InformixLakeflowConnect(LakeflowConnect):
             list(table.primary_keys),
             chunk_exprs=chunk_exprs or None,
             snapshot_filter=incremental.get("snapshot_filter"),
+            key_descending=list(table.key_descending),
         )
         rebound = dict(incremental)
         rebound["max_pk"] = None if max_pk is None else _encode_snapshot_stage_value(list(max_pk))
@@ -6668,6 +6806,16 @@ class InformixLakeflowConnect(LakeflowConnect):
         cursor_names = [
             f"__chunk_{key}" if key in chunk_exprs else key for key in table.primary_keys
         ]
+        # The cursor/bound comparisons below must run in the key index's own scan
+        # order. For a mixed-direction key that is not Python's all-ascending tuple
+        # order, so wrap the DESC columns to flip just those positions. A chunked
+        # key compares on the always-ascending "__chunk_" strings, and an
+        # all-ascending key is left exactly as before.
+        order_desc = () if chunk_exprs else tuple(table.key_descending)
+
+        def order_key(values: Sequence[Any]) -> tuple:
+            return _order_key(values, order_desc)
+
         last_pk = (
             None
             if incremental.get("last_pk") is None
@@ -6690,7 +6838,8 @@ class InformixLakeflowConnect(LakeflowConnect):
         replaying_chunk = replay_stop_pk is not None
         bound = max_pk
         if replay_stop_pk is not None and replay_stop_pk is not _REPLAY_DRAIN_TO_MAX_PK:
-            bound = min(max_pk, replay_stop_pk)
+            # min() in the key's own paging order, not Python's default.
+            bound = replay_stop_pk if order_key(replay_stop_pk) < order_key(max_pk) else max_pk
 
         def cursor_key(row: dict[str, Any]) -> tuple:
             return tuple(row[name] for name in cursor_names)
@@ -6716,6 +6865,7 @@ class InformixLakeflowConnect(LakeflowConnect):
                 page_size + 1,
                 chunk_exprs=chunk_exprs or None,
                 snapshot_filter=incremental.get("snapshot_filter"),
+                key_descending=list(table.key_descending),
             )
             try:
                 fetch_lsn = _strict_lsn(fetch_lsn, "chunk_lsn")
@@ -6737,17 +6887,17 @@ class InformixLakeflowConnect(LakeflowConnect):
             stopped_at_bound = False
             for row in raw[:page_size]:
                 key = cursor_key(row)
-                if key > max_pk:
+                if order_key(key) > order_key(max_pk):
                     passed_upper_bound = True
                     break
-                if key > bound:
+                if order_key(key) > order_key(bound):
                     stopped_at_bound = True
                     break
                 page.append(row)
             bounded.extend(page)
             if page:
                 cursor = cursor_key(page[-1])
-            reached_bound = cursor is not None and tuple(cursor) >= bound
+            reached_bound = cursor is not None and order_key(cursor) >= order_key(bound)
             if not replaying_chunk or passed_upper_bound or stopped_at_bound:
                 break
             if reached_bound or not page or not has_more:
@@ -6775,7 +6925,7 @@ class InformixLakeflowConnect(LakeflowConnect):
         # committed cursor, which normally sits well below max_pk, so treating
         # that stop as completion would abandon the rest of the copy: the flow
         # would leave the incremental phase with most of the table uncopied.
-        reached_max_key = last_cursor is not None and last_cursor >= max_pk
+        reached_max_key = last_cursor is not None and order_key(last_cursor) >= order_key(max_pk)
         if replaying_chunk:
             done = passed_upper_bound or reached_max_key
         else:
@@ -7959,7 +8109,12 @@ class InformixLakeflowConnect(LakeflowConnect):
             # schema refresh instead of reverting to the catalog's keys. Only applies
             # when the caller was already overridden, so a genuine catalog key change
             # on a normal table is still detected as drift.
-            refreshed = replace(refreshed, primary_keys=table.primary_keys, key_override=True)
+            refreshed = replace(
+                refreshed,
+                primary_keys=table.primary_keys,
+                key_override=True,
+                key_descending=(),
+            )
         _ensure_materializable(refreshed)
         fingerprint = _schema_fingerprint(refreshed)
         if expected_fingerprint is not None and expected_fingerprint != fingerprint:

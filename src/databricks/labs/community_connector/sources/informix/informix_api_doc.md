@@ -224,6 +224,20 @@ the page from the key index in order instead; `UPDATE STATISTICS HIGH` on the
 source is the complementary fix, steering the cost model to the same plan even
 where external directives are disabled.
 
+**Mixed-direction key indexes.** When the key comes from a discovered index (a
+PRIMARY KEY constraint or a promoted UNIQUE index) whose columns are not all
+ascending — e.g. `(a ASC, b DESC)` — the connector pages in the index's *own*
+column order and direction rather than forcing an all-ascending order. The
+`ORDER BY` matches the index (`ORDER BY a, b DESC`), so a forward index scan
+serves every page without a sort; the keyset comparison flips per column (`>` for
+an ASC column, `<` for a DESC one); the key bound (`max_primary_key`) reads each
+column's last value in that order (an ASC column's max, a DESC column's min); and
+the driver-side cursor/bound comparisons run in the same order. This is the only
+sort-free option for a mixed-direction index, since no all-ascending `ORDER BY`
+can be served from it. It applies only to plain-column keys from a discovered
+index: a `primary.keys` override (no known index) and a DATETIME-chunked key both
+keep the default ascending order, and an all-ascending key is unaffected.
+
 CDC session setup and teardown while validating the initial
 CDC boundary use `cdc.read.timeout.seconds` (default `60`) for the same reason:
 `syscdcv1` open/start/activate/end/close calls can stall under many concurrent
