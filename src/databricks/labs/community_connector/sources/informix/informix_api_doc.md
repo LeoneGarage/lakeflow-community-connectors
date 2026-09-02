@@ -234,9 +234,17 @@ an ASC column, `<` for a DESC one); the key bound (`max_primary_key`) reads each
 column's last value in that order (an ASC column's max, a DESC column's min); and
 the driver-side cursor/bound comparisons run in the same order. This is the only
 sort-free option for a mixed-direction index, since no all-ascending `ORDER BY`
-can be served from it. It applies only to plain-column keys from a discovered
-index: a `primary.keys` override (no known index) and a DATETIME-chunked key both
-keep the default ascending order, and an all-ascending key is unaffected.
+can be served from it.
+
+A `primary.keys` **override** participates too: although it names columns rather
+than an index, the connector looks up an index whose key columns exactly match
+the override (in order) and adopts that index's per-column directions, so an
+override that restates a mixed-direction index's columns still pages in the
+index's own order. The lookup is memoized per table+key. When no index matches
+the override columns, paging stays ascending (and, lacking a matching index,
+would sort regardless). A DATETIME-chunked key keeps the default ascending order
+(its order-preserving cast has no direction-aware index to match), and an
+all-ascending key is unaffected.
 
 CDC session setup and teardown while validating the initial
 CDC boundary use `cdc.read.timeout.seconds` (default `60`) for the same reason:
