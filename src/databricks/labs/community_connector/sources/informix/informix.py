@@ -632,6 +632,14 @@ _CAPACITY_RETRY_MAX_RETRIES = 500
 _CDC_RECONNECT_MAX_RETRIES = 4
 _CDC_RECONNECT_BASE_SECONDS = 0.5
 _CDC_RECONNECT_MAX_SECONDS = 8.0
+# The incremental-snapshot page and key-bound reads drop their connection the same
+# way (a "truncated SQLI stream" EOF from an idle NLB/PrivateLink reset or a
+# server-side session reap), and recover the same way: each read advances no offset
+# and opens its own repeatable-read transaction, so the dead transport can be reset
+# and the identical read reissued in place. Mirrors the CDC budget above.
+_SNAPSHOT_RECONNECT_MAX_RETRIES = 4
+_SNAPSHOT_RECONNECT_BASE_SECONDS = 0.5
+_SNAPSHOT_RECONNECT_MAX_SECONDS = 8.0
 # Ceiling on the jittered pause a starved continuous reader takes before yielding,
 # and on the budget it spends acquiring a slot.
 #
@@ -6869,12 +6877,16 @@ class InformixLakeflowConnect(LakeflowConnect):
         table = self._refresh_table_schema(table, _schema_fingerprint(table))
         self._publish_snapshot_boundary(table, schema_id, high_water, high_water, pipeline_scope)
         # Strictly after the boundary above, never before it.
-        max_pk = self._bridge.max_primary_key(
-            table.identity,
-            list(table.primary_keys),
-            chunk_exprs=chunk_exprs or None,
-            snapshot_filter=snapshot_filter,
-            key_descending=list(table.key_descending),
+        max_pk = self._snapshot_read_with_reconnect(
+            lambda: self._bridge.max_primary_key(
+                table.identity,
+                list(table.primary_keys),
+                chunk_exprs=chunk_exprs or None,
+                snapshot_filter=snapshot_filter,
+                key_descending=list(table.key_descending),
+            ),
+            table=table,
+            operation="key bound read",
         )
         incremental = {
             "started": True,
@@ -6924,12 +6936,16 @@ class InformixLakeflowConnect(LakeflowConnect):
         nothing.
         """
 
-        max_pk = self._bridge.max_primary_key(
-            table.identity,
-            list(table.primary_keys),
-            chunk_exprs=chunk_exprs or None,
-            snapshot_filter=incremental.get("snapshot_filter"),
-            key_descending=list(table.key_descending),
+        max_pk = self._snapshot_read_with_reconnect(
+            lambda: self._bridge.max_primary_key(
+                table.identity,
+                list(table.primary_keys),
+                chunk_exprs=chunk_exprs or None,
+                snapshot_filter=incremental.get("snapshot_filter"),
+                key_descending=list(table.key_descending),
+            ),
+            table=table,
+            operation="key bound read",
         )
         rebound = dict(incremental)
         rebound["max_pk"] = None if max_pk is None else _encode_snapshot_stage_value(list(max_pk))
@@ -7059,15 +7075,19 @@ class InformixLakeflowConnect(LakeflowConnect):
             # Ask for one row more than the page keeps, so "the page filled" and
             # "rows remain" are distinguishable rather than inferred: the same
             # probe the blocking consistent_snapshot loop uses.
-            fetch_lsn, raw = self._bridge.snapshot_chunk(
-                table.identity,
-                [column.name for column in table.columns],
-                list(table.primary_keys),
-                cursor,
-                page_size + 1,
-                chunk_exprs=chunk_exprs or None,
-                snapshot_filter=incremental.get("snapshot_filter"),
-                key_descending=list(table.key_descending),
+            fetch_lsn, raw = self._snapshot_read_with_reconnect(
+                lambda cursor=cursor: self._bridge.snapshot_chunk(
+                    table.identity,
+                    [column.name for column in table.columns],
+                    list(table.primary_keys),
+                    cursor,
+                    page_size + 1,
+                    chunk_exprs=chunk_exprs or None,
+                    snapshot_filter=incremental.get("snapshot_filter"),
+                    key_descending=list(table.key_descending),
+                ),
+                table=table,
+                operation="chunk read",
             )
             try:
                 fetch_lsn = _strict_lsn(fetch_lsn, "chunk_lsn")
@@ -7497,14 +7517,18 @@ class InformixLakeflowConnect(LakeflowConnect):
         limit = self._table_int_option(options, "snapshot.max.rows", 0, minimum=0)
         if limit == 0:
             limit = 100000
-        rows = self._bridge.snapshot_page(
-            table.identity,
-            [c.name for c in table.columns],
-            (),
-            None,
-            limit + 1,
-            self._table_int_option(options, "snapshot.max.bytes", 0, minimum=0),
-            snapshot_filter=_snapshot_filter(options),
+        rows = self._snapshot_read_with_reconnect(
+            lambda: self._bridge.snapshot_page(
+                table.identity,
+                [c.name for c in table.columns],
+                (),
+                None,
+                limit + 1,
+                self._table_int_option(options, "snapshot.max.bytes", 0, minimum=0),
+                snapshot_filter=_snapshot_filter(options),
+            ),
+            table=table,
+            operation="snapshot read",
         )
         table = self._refresh_table_schema(table, fingerprint)
         if len(rows) > limit:
@@ -7562,6 +7586,59 @@ class InformixLakeflowConnect(LakeflowConnect):
                     error,
                     attempt + 1,
                     _CDC_RECONNECT_MAX_RETRIES,
+                    delay,
+                    exc_info=True,
+                )
+                reset = getattr(self._bridge, "reset_transport", None)
+                if reset is not None:
+                    reset()
+                time.sleep(delay)
+                attempt += 1
+
+    def _snapshot_read_with_reconnect(self, thunk, *, table: Table, operation: str):
+        """Run one snapshot page or key-bound read, retrying in place on a drop.
+
+        A connection dropped mid-read raises ``SqliTransportError`` ("truncated
+        SQLI stream ..."), a subclass of ``SqliProtocolError``; the enclosing
+        repeatable-read transaction's rollback then fails because the session is
+        already gone. The read has advanced no offset -- the incremental cursor is
+        committed only after the read returns, and each read (``max_primary_key``,
+        ``snapshot_chunk``, the keyless one-shot ``snapshot_page``) opens its own
+        repeatable-read transaction -- so the dead transport can be reset and the
+        identical read reissued under the connection slot already held. Bounded
+        attempts with short backoff absorb a transient blip; exhausting them
+        re-raises so a genuinely-down source still fails honestly. This is the
+        snapshot counterpart of ``_read_changes_with_reconnect``.
+
+        A deliberate lease-loss shutdown (``ConnectionCapacityUnavailable`` or a
+        set ``_connection_lease_lost``) is never retried; it propagates.
+        """
+
+        attempt = 0
+        while True:
+            try:
+                return thunk()
+            except ConnectionCapacityUnavailable:
+                raise
+            except SqliProtocolError as error:
+                lease_lost = getattr(self._bridge, "_connection_lease_lost", None)
+                if lease_lost is not None and lease_lost.is_set():
+                    # The drop is a deliberate lease-loss shutdown, not a blip.
+                    raise
+                if attempt >= _SNAPSHOT_RECONNECT_MAX_RETRIES:
+                    raise
+                delay = min(
+                    _SNAPSHOT_RECONNECT_BASE_SECONDS * (2**attempt),
+                    _SNAPSHOT_RECONNECT_MAX_SECONDS,
+                )
+                logging.getLogger(__name__).warning(
+                    "Informix snapshot %s for '%s' lost its connection (%s); resetting the "
+                    "transport and retrying the same read (attempt %d/%d) after %.1fs",
+                    operation,
+                    table.exposed_name,
+                    error,
+                    attempt + 1,
+                    _SNAPSHOT_RECONNECT_MAX_RETRIES,
                     delay,
                     exc_info=True,
                 )

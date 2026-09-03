@@ -774,6 +774,7 @@ Requirements and caveats:
 - Authentication errors commonly indicate a wrong `server`/locale, unsupported authentication mode or redirect, an untrusted/mismatched TLS certificate, or insufficient `syscdcv1` privileges.
 - Schema changes that alter captured column layout are not guaranteed to be safe during active capture. Restart and validate at a clean LSN boundary.
 - Ensure source log retention covers downtime and the oldest checkpoint. Otherwise resnapshotting is required.
+- A connection dropped mid-read (a `truncated SQLI stream` EOF from an idle NLB/PrivateLink reset or a server-side session reap) is absorbed in place rather than surfaced as a stream failure: the dead transport is reset and the identical read reissued under the slot already held, for both CDC polls and snapshot page/key-bound reads. Each read advances no offset and runs in its own repeatable-read transaction, so the retry is idempotent. A few bounded attempts with short backoff recover a transient blip; a genuinely-down source still fails once the attempts are exhausted.
 
 ## References
 
