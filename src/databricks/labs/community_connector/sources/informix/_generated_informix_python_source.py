@@ -5116,6 +5116,11 @@ def register_lakeflow_source(spark):
 
     _DATA_OPS = {"INSERT", "BEFORE_UPDATE", "AFTER_UPDATE", "DELETE", "TRUNCATE"}
     _DEFAULT_SNAPSHOT_PAGE_SIZE = 20000
+    # A keyless initial snapshot drains positionally (no seek cursor) and stages whole
+    # pages to the Volume, so a larger default page means fewer manifest entries and
+    # round trips for the same rows. Kept separate from the keyed paging size so it can
+    # be tuned without affecting keyset chunks.
+    _DEFAULT_KEYLESS_SNAPSHOT_PAGE_SIZE = 50000
     _DEFAULT_SNAPSHOT_READ_TIMEOUT_SECONDS = 300
     # CDC session setup/teardown (cdc_opensess/startcapture/activatesess/endcapture/
     # closesess) runs on the transport's default socket timeout unless raised here.
@@ -9459,6 +9464,11 @@ def register_lakeflow_source(spark):
             for name, default, minimum in (
                 ("snapshot.page.size", str(_DEFAULT_SNAPSHOT_PAGE_SIZE), 1),
                 (
+                    "keyless.snapshot.page.size",
+                    str(_DEFAULT_KEYLESS_SNAPSHOT_PAGE_SIZE),
+                    1,
+                ),
+                (
                     "snapshot.read.timeout.seconds",
                     str(_DEFAULT_SNAPSHOT_READ_TIMEOUT_SECONDS),
                     1,
@@ -12152,9 +12162,19 @@ def register_lakeflow_source(spark):
                     f"Table '{table.exposed_name}' is no longer CDC-capable after metadata refresh; "
                     "run a full refresh after restoring its primary key and supported schema"
                 )
-            page_size = self._table_int_option(
-                options, "snapshot.page.size", _DEFAULT_SNAPSHOT_PAGE_SIZE, minimum=1
-            )
+            if table.primary_keys:
+                page_size = self._table_int_option(
+                    options, "snapshot.page.size", _DEFAULT_SNAPSHOT_PAGE_SIZE, minimum=1
+                )
+            else:
+                # A keyless initial snapshot pages positionally and stages larger pages by
+                # default; its own knob so it never changes keyed keyset chunk sizing.
+                page_size = self._table_int_option(
+                    options,
+                    "keyless.snapshot.page.size",
+                    _DEFAULT_KEYLESS_SNAPSHOT_PAGE_SIZE,
+                    minimum=1,
+                )
             if checkpoint:
                 # Resolve the staging scope from the *checkpoint*, not this update's
                 # registration scope. The staged pages and manifest were written under the

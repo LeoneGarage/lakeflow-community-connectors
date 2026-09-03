@@ -199,6 +199,7 @@ class FakeBridge:
         self.snapshot_calls = []
         self.snapshot_max_bytes = []
         self.snapshot_max_rows = []
+        self.snapshot_page_sizes = []
         self.snapshot_filters = []
         self.snapshot_isolations = []
         self.prepared_identities = []
@@ -303,6 +304,7 @@ class FakeBridge:
         del identity, columns, primary_keys, datetime_primary_key
         self.snapshot_max_bytes.append(max_bytes)
         self.snapshot_max_rows.append(max_rows)
+        self.snapshot_page_sizes.append(page_size)
         self.snapshot_filters.append(snapshot_filter)
         self.snapshot_isolations.append(isolation)
         if max_rows and len(self.rows) > max_rows:
@@ -2240,6 +2242,7 @@ class LakeflowContractTests(unittest.TestCase):
 
     def test_batch_size_defaults(self):
         self.assertEqual(_DEFAULT_SNAPSHOT_PAGE_SIZE, 20000)
+        self.assertEqual(informix_module._DEFAULT_KEYLESS_SNAPSHOT_PAGE_SIZE, 50000)
         self.assertEqual(informix_module._DEFAULT_SNAPSHOT_READ_TIMEOUT_SECONDS, 300)
         self.assertEqual(informix_module._DEFAULT_CDC_READ_TIMEOUT_SECONDS, 60)
         self.assertEqual(_DEFAULT_MAX_RECORDS_PER_BATCH, 10000)
@@ -5672,6 +5675,51 @@ class LakeflowContractTests(unittest.TestCase):
             [0],
             "snapshot.max.rows must default to unlimited",
         )
+
+    def test_keyless_initial_snapshot_uses_its_own_page_size_default(self):
+        # A keyless initial drain has no seek cursor and stages whole pages, so it
+        # defaults to a larger page than keyed keyset paging.
+        connector, bridge = self._keyless_connector()
+        options = dict(self.APPEND, **{"snapshot.mode": "initial"})
+
+        connector.read_table("app.orders", {}, options)
+
+        self.assertEqual(bridge.snapshot_page_sizes, [50000])
+
+    def test_keyless_initial_snapshot_page_size_is_overridable(self):
+        connector, bridge = self._keyless_connector()
+        options = dict(
+            self.APPEND,
+            **{"snapshot.mode": "initial", "keyless.snapshot.page.size": "1234"},
+        )
+
+        connector.read_table("app.orders", {}, options)
+
+        self.assertEqual(bridge.snapshot_page_sizes, [1234])
+
+    def test_keyed_initial_snapshot_ignores_the_keyless_page_size(self):
+        # The keyed blocking snapshot keeps using snapshot.page.size regardless of
+        # the keyless knob, so the two options never interfere.
+        bridge = FakeBridge()  # default app.orders is keyed
+        connector = self.connector(bridge)
+
+        connector.read_table(
+            "app.orders",
+            {},
+            {"snapshot.mode": "initial", "keyless.snapshot.page.size": "1234"},
+        )
+
+        self.assertEqual(bridge.snapshot_page_sizes, [20000])
+
+    def test_keyless_snapshot_page_size_below_minimum_is_rejected(self):
+        connector, _ = self._keyless_connector()
+        options = dict(
+            self.APPEND,
+            **{"snapshot.mode": "initial", "keyless.snapshot.page.size": "0"},
+        )
+
+        with self.assertRaises(ValueError):
+            connector.read_table("app.orders", {}, options)
 
     def test_append_snapshot_backfill_fails_loudly_above_its_bound(self):
         connector, _ = self._keyless_connector()
