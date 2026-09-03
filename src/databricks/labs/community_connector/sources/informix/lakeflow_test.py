@@ -5818,6 +5818,98 @@ class LakeflowContractTests(unittest.TestCase):
             with self.assertRaises(informix_module.StagingTokenUnavailable):
                 connector.read_table("app.orders", {}, options)
 
+    def test_pipelining_engages_only_for_keyless_rest_drains(self):
+        keyless = types.SimpleNamespace(primary_keys=())
+        keyed = types.SimpleNamespace(primary_keys=("id",))
+
+        def _fake_provider(*_a, **_k):
+            provider = mock.Mock()
+            provider.bearer.return_value = "tok"
+            return provider
+
+        class _FakeFilesApi:
+            def __init__(self, host, provider):
+                pass
+
+            def put(self, path, data):
+                pass
+
+        rest_opts = {
+            "snapshot.staging.transport": "rest",
+            "lakebase.workspace.host": "https://ws",
+            "lakebase.workspace.token": "boot",
+        }
+        with (
+            mock.patch.object(informix_module, "StagingCredentialProvider", _fake_provider),
+            mock.patch.object(informix_module, "WorkspaceFilesApi", _FakeFilesApi),
+        ):
+            rest, _ = self._keyless_connector(**rest_opts)
+            self.assertTrue(
+                rest._should_pipeline_staging(keyless), "keyless REST drain should pipeline"
+            )
+            self.assertFalse(rest._should_pipeline_staging(keyed), "keyed drains are out of scope")
+
+            off, _ = self._keyless_connector(
+                **dict(rest_opts, **{"snapshot.staging.pipeline": "false"})
+            )
+            self.assertFalse(off._should_pipeline_staging(keyless), "the option must disable it")
+
+        fuse, _ = self._keyless_connector(**{"snapshot.staging.transport": "fuse"})
+        self.assertFalse(
+            fuse._should_pipeline_staging(keyless),
+            "pipelining FUSE writes would worsen the very issue REST avoids",
+        )
+
+    def test_rest_keyless_drain_pipelines_multiple_pages_without_loss(self):
+        created: list = []
+
+        class _FakeFilesApi:
+            def __init__(self, host, provider):
+                self.puts: list = []
+                created.append(self)
+
+            def put(self, path, data):
+                self.puts.append(path)
+                os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+                with open(path, "wb") as handle:
+                    handle.write(data)
+
+        def _fake_provider(*_a, **_k):
+            provider = mock.Mock()
+            provider.bearer.return_value = "tok"
+            return provider
+
+        with (
+            mock.patch.object(informix_module, "WorkspaceFilesApi", _FakeFilesApi),
+            mock.patch.object(informix_module, "StagingCredentialProvider", _fake_provider),
+        ):
+            bridge = FakeBridge()
+            bridge.tables = [_table(primary_keys=())]
+            bridge.rows = [{"id": i, "value": str(i)} for i in range(10)]
+            connector = self.connector(
+                bridge,
+                **{
+                    "snapshot.staging.transport": "rest",
+                    "lakebase.workspace.host": "https://ws",
+                    "lakebase.workspace.token": "boot",
+                },
+            )
+            options = dict(
+                self.APPEND, **{"snapshot.mode": "initial", "keyless.snapshot.page.size": "3"}
+            )
+            collected = []
+            offset: dict = {}
+            for _ in range(50):
+                rows, offset = connector.read_table("app.orders", offset, options)
+                collected.extend(rows)
+                if offset.get("phase") == "stream":
+                    break
+            else:
+                self.fail("append-only initial drain did not converge to the stream phase")
+
+        self.assertEqual(len(collected), 10, "every row must survive the pipelined drain")
+        self.assertGreater(len(created[0].puts), 1, "expected the drain to stage several pages")
+
     def test_append_snapshot_backfill_fails_loudly_above_its_bound(self):
         connector, _ = self._keyless_connector()
         options = dict(
@@ -10959,6 +11051,74 @@ class NullByteOptionTests(unittest.TestCase):
         informix_module.PurePythonInformixBridge.__init__(bridge, options)
         self.assertEqual(bridge._null_byte, "empty")
         self.assertEqual(bridge.transport.null_byte, "empty")
+
+
+class AsyncStagePipelineTests(unittest.TestCase):
+    """The background uploader that overlaps page fetch with page upload."""
+
+    def test_preserves_page_order(self):
+        seen: list[int] = []
+        pipeline = informix_module._AsyncStagePipeline(
+            lambda _lsn, index, _rows: seen.append(index)
+        )
+        for index in range(6):
+            pipeline.submit(10, index, [{"id": index}])
+        pipeline.close()
+        self.assertEqual(seen, [0, 1, 2, 3, 4, 5], "a single worker must keep page order")
+
+    def test_close_reraises_a_worker_error(self):
+        def boom(_lsn, _index, _rows):
+            raise InformixError("upload failed")
+
+        pipeline = informix_module._AsyncStagePipeline(boom)
+        with self.assertRaisesRegex(InformixError, "upload failed"):
+            for index in range(10):
+                pipeline.submit(10, index, [{"id": index}])
+            pipeline.close()
+
+    def test_shutdown_swallows_the_worker_error(self):
+        def boom(_lsn, _index, _rows):
+            raise InformixError("upload failed")
+
+        pipeline = informix_module._AsyncStagePipeline(boom)
+        pipeline.submit(10, 0, [{"id": 0}])
+        pipeline.shutdown()  # must join without raising, so a primary error can win
+
+    def test_close_without_any_submit_is_a_noop(self):
+        pipeline = informix_module._AsyncStagePipeline(lambda *_a: None)
+        pipeline.close()  # worker never started; nothing to join or raise
+
+    def test_backpressure_bounds_resident_pages(self):
+        # With a depth-1 queue and a slow worker, submit must block rather than let
+        # the producer race ahead and hold every page in memory at once.
+        import threading as _threading
+
+        release = _threading.Event()
+        started = _threading.Event()
+
+        def slow(_lsn, index, _rows):
+            if index == 0:
+                started.set()
+                release.wait(2.0)
+
+        pipeline = informix_module._AsyncStagePipeline(slow, queue_size=1)
+        pipeline.submit(10, 0, [{"id": 0}])  # worker picks this up and blocks
+        self.assertTrue(started.wait(2.0))
+        pipeline.submit(10, 1, [{"id": 1}])  # fills the depth-1 queue
+
+        blocked = _threading.Event()
+
+        def third():
+            pipeline.submit(10, 2, [{"id": 2}])  # must block until the worker drains
+            blocked.set()
+
+        producer = _threading.Thread(target=third)
+        producer.start()
+        self.assertFalse(blocked.wait(0.3), "submit should block while the queue is full")
+        release.set()
+        producer.join(2.0)
+        self.assertTrue(blocked.is_set(), "submit should unblock once the worker drains")
+        pipeline.close()
 
 
 if __name__ == "__main__":
