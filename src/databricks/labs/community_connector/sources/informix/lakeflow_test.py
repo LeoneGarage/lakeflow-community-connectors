@@ -139,6 +139,7 @@ from databricks.labs.community_connector.sources.informix.informix import (  # n
 from databricks.labs.community_connector.sources.informix.sqli import (  # noqa: E402
     SqliProtocolError,
     SqliSessionRejected,
+    SqliTransportError,
 )
 
 
@@ -8570,6 +8571,148 @@ class IncrementalSnapshotTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "requires the stream phase"):
             _validated_offset(offset)
+
+
+class SnapshotReconnectTests(unittest.TestCase):
+    """A connection dropped mid read during an incremental snapshot is reset and
+    the identical read reissued in place, mirroring the CDC poll's reconnect
+    path, rather than surfacing as a stream failure.
+
+    Regression: production tw305 crash-looped on ``SqliTransportError: truncated
+    SQLI stream: needed 2, got 0`` mid-chunk because the snapshot page and
+    key-bound reads had no reconnect wrapper -- only the CDC poll did.
+    """
+
+    def setUp(self):
+        self._shared_state = tempfile.TemporaryDirectory()
+        self._lakebase = _OfflineLakebase().install(self)
+
+    def tearDown(self):
+        self._shared_state.cleanup()
+
+    def connector(self, bridge=None, **options):
+        connector = InformixLakeflowConnect(
+            {
+                "database": "demo",
+                "snapshot.staging.location": self._shared_state.name,
+                "lakebase.password": "test-state-password",
+                # Inject the bridge directly; keep the daemon readers off.
+                "cdc.shared.session": "false",
+                "snapshot.shared.session": "false",
+                **options,
+            }
+        )
+        connector.set_registration_scope(hashlib.sha256(b"reconnect-pipeline").hexdigest()[:32])
+        connector._bridge_instance = bridge or FakeBridge()
+        return connector
+
+    def _drain(self, connector, options):
+        """Read microbatches until the incremental block clears; return all rows."""
+
+        offset: dict = {}
+        collected = []
+        for _ in range(100):
+            rows, offset = connector.read_table("app.orders", offset, options)
+            collected.extend(rows)
+            if "incremental" not in offset:
+                break
+        else:
+            self.fail("incremental snapshot did not converge")
+        return collected, offset
+
+    def _counting_reset(self, bridge):
+        bridge.reset_calls = 0
+        bridge.reset_transport = lambda: setattr(bridge, "reset_calls", bridge.reset_calls + 1)
+
+    def test_incremental_chunk_retries_in_place_after_connection_drop(self):
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": str(i)} for i in range(1, 6)]
+        self._counting_reset(bridge)
+        real_chunk = bridge.snapshot_chunk
+        drops = {"n": 0}
+
+        def flaky_chunk(*args, **kwargs):
+            # Drop the first two chunk reads, then serve the real page. The
+            # cursor has not advanced, so the reissued read is identical.
+            if drops["n"] < 2:
+                drops["n"] += 1
+                raise SqliTransportError("truncated SQLI stream: needed 2, got 0")
+            return real_chunk(*args, **kwargs)
+
+        bridge.snapshot_chunk = flaky_chunk
+        connector = self.connector(bridge)
+
+        with mock.patch.object(time, "sleep"):
+            rows, offset = self._drain(connector, {"snapshot.page.size": "2"})
+
+        self.assertEqual(drops["n"], 2)  # two drops absorbed in place
+        self.assertEqual(bridge.reset_calls, 2)  # one transport reset per drop
+        self.assertEqual([row["id"] for row in rows], [1, 2, 3, 4, 5])
+        self.assertNotIn("incremental", offset, "the copy must still converge")
+
+    def test_incremental_chunk_raises_after_reconnect_retries_exhausted(self):
+        # A persistent drop must fail honestly rather than loop forever.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": str(i)} for i in range(1, 6)]
+        self._counting_reset(bridge)
+
+        def always_drops(*args, **kwargs):
+            raise SqliTransportError("truncated SQLI stream: needed 2, got 0")
+
+        bridge.snapshot_chunk = always_drops
+        connector = self.connector(bridge)
+
+        with mock.patch.object(time, "sleep"):
+            with self.assertRaisesRegex(SqliTransportError, "truncated SQLI stream"):
+                self._drain(connector, {"snapshot.page.size": "2"})
+        # One reset per failed retry, bounded by the reconnect budget.
+        self.assertEqual(bridge.reset_calls, informix_module._SNAPSHOT_RECONNECT_MAX_RETRIES)
+
+    def test_key_bound_read_retries_in_place_after_connection_drop(self):
+        # The seed's max_primary_key read (where the earlier tw305 timeout also
+        # surfaced) recovers from a drop the same way.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": str(i)} for i in range(1, 4)]
+        self._counting_reset(bridge)
+        real_max = bridge.max_primary_key
+        drops = {"n": 0}
+
+        def flaky_max(*args, **kwargs):
+            if drops["n"] < 1:
+                drops["n"] += 1
+                raise SqliTransportError("truncated SQLI stream: needed 2, got 0")
+            return real_max(*args, **kwargs)
+
+        bridge.max_primary_key = flaky_max
+        connector = self.connector(bridge)
+
+        with mock.patch.object(time, "sleep"):
+            rows, offset = self._drain(connector, {"snapshot.page.size": "2"})
+
+        self.assertEqual(drops["n"], 1)
+        self.assertEqual(bridge.reset_calls, 1)
+        self.assertEqual([row["id"] for row in rows], [1, 2, 3])
+        self.assertNotIn("incremental", offset)
+
+    def test_connection_drop_during_lease_loss_is_not_retried(self):
+        # A deliberate lease-loss shutdown is not a blip: it must propagate at
+        # once, never reset-and-retry, exactly as the CDC path treats it.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": 1, "value": "a"}]
+        bridge._connection_lease_lost = threading.Event()
+        bridge._connection_lease_lost.set()
+        self._counting_reset(bridge)
+
+        def dropping_chunk(*args, **kwargs):
+            raise SqliTransportError("truncated SQLI stream: needed 2, got 0")
+
+        bridge.snapshot_chunk = dropping_chunk
+        connector = self.connector(bridge)
+
+        with mock.patch.object(time, "sleep"):
+            with self.assertRaises(SqliTransportError):
+                self._drain(connector, {"snapshot.page.size": "2"})
+        self.assertEqual(bridge.reset_calls, 0, "a lease-loss drop must not reset/retry")
 
 
 class ConnectionSlotLeaseLossTests(unittest.TestCase):

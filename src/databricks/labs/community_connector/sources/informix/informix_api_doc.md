@@ -196,6 +196,16 @@ Informix snapshot SQLI reads use `snapshot.read.timeout.seconds` (default
 transport timeout. The same budget covers the incremental-snapshot key-bound
 read that seeds a keyed table.
 
+A snapshot read whose connection is dropped mid-response (a `truncated SQLI
+stream` EOF from an idle NLB/PrivateLink reset or a server-side session reap)
+is retried in place rather than surfaced as a stream failure: the dead
+transport is reset and the identical read reissued under the connection slot
+already held, bounded by a few short-backoff attempts before it re-raises. This
+mirrors the CDC poll's reconnect and is safe because each snapshot read
+(`max_primary_key`, the incremental `snapshot_chunk`, and the keyless one-shot
+`snapshot_page`) advances no offset and runs in its own repeatable-read
+transaction, so the reissued read is idempotent.
+
 That key bound is read differently depending on the key. For a **plain-column
 key**, the connector resolves the maximum tuple one column at a time: it reads
 `FIRST 1 <col> ... ORDER BY <col> DESC` for the leading column, then repeats for
