@@ -86,6 +86,7 @@ import stat
 import struct
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -1246,9 +1247,41 @@ def register_lakeflow_source(spark):
     _API_ATTEMPTS = 4
     _DEFAULT_PROVISION_TIMEOUT_SECONDS = 180.0
 
+    # --- Snapshot-page staging over the Files REST API -------------------------------
+    # The connector can stage snapshot page payloads through the Files API instead of the
+    # UC Volume FUSE mount (see the connector's snapshot.staging.transport option), which
+    # sidesteps the FUSE-mount disconnects that recur under sustained write frequency.
+    # Reaching the Files API needs a bearer token, but the reader processes that stage
+    # pages have no ambient identity -- only the driver, at module-load, does. So a
+    # personal access token is minted from the driver-captured credential, carried to the
+    # reader in _CAPTURED_WORKSPACE, and thereafter refreshed by the still-valid token
+    # minting its own successor -- no ambient identity is needed after the first mint.
+    # Each token is tagged with the pipeline id so a restart can revoke its predecessors.
+    STAGING_TOKEN_COMMENT_PREFIX = "informix-snapshot-staging:"
+    _DEFAULT_STAGING_TOKEN_LIFETIME_SECONDS = 86400
+    # Refresh at half-life: a token minted with lifetime L is replaced after L/2, so a
+    # missed or slow refresh still leaves L/2 of validity before anything can 401.
+    _STAGING_TOKEN_REFRESH_FRACTION = 0.5
+    _STAGING_TOKEN_MIN_LIFETIME_SECONDS = 600
+    _FILES_API_TIMEOUT_SECONDS = 300.0
+    _FILES_API_ATTEMPTS = 4
+
 
     class LakebaseStateError(RuntimeError):
         """Raised when Lakebase-backed state cannot be provisioned or reached."""
+
+
+    class WorkspaceHttpError(LakebaseStateError):
+        """A workspace control-plane call returned a non-retriable HTTP status.
+
+        Subclasses ``LakebaseStateError`` so existing ``except LakebaseStateError``
+        handlers are unaffected; it merely carries ``status_code`` so a caller can
+        branch on, for example, a 403 that means a feature is disabled.
+        """
+
+        def __init__(self, message: str, status_code: int) -> None:
+            super().__init__(message)
+            self.status_code = status_code
 
 
     def project_id_for_connection(identity: str, prefix: str = "informix-state") -> str:
@@ -1319,8 +1352,9 @@ def register_lakeflow_source(spark):
                         raise LakebaseStateError(f"conflict on {method} {path}") from error
                     if error.code < 500 and error.code != 429:
                         detail = error.read().decode("utf-8", "replace")[:400]
-                        raise LakebaseStateError(
-                            f"{method} {path} failed with HTTP {error.code}: {detail}"
+                        raise WorkspaceHttpError(
+                            f"{method} {path} failed with HTTP {error.code}: {detail}",
+                            error.code,
                         ) from error
                     last_error = error
                 except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
@@ -1613,6 +1647,243 @@ def register_lakeflow_source(spark):
         if not token:
             raise LakebaseStateError(f"no Postgres credential returned for {endpoint}")
         return token
+
+
+    class StagingTokenUnavailable(RuntimeError):
+        """Personal access token creation is disabled or forbidden for this identity.
+
+        Raised so the connector can fall back to the FUSE staging transport instead
+        of failing the flow: the Files-API transport cannot authenticate without a
+        token, and many workspaces disable PAT creation by policy.
+        """
+
+
+    def mint_staging_token(
+        api: _WorkspaceApi, pipeline_id: str, lifetime_seconds: int
+    ) -> tuple[str, str]:
+        """Mint a personal access token for Files-API staging, tagged per pipeline.
+
+        Returns ``(token_value, token_id)``. Raises :class:`StagingTokenUnavailable`
+        when the workspace forbids token creation (HTTP 403) or rejects it as
+        unsupported (HTTP 400), so the caller can fall back to FUSE rather than fail.
+        """
+
+        comment = f"{STAGING_TOKEN_COMMENT_PREFIX}{pipeline_id}"
+        try:
+            response = (
+                api.request(
+                    "POST",
+                    "/api/2.0/token/create",
+                    {"comment": comment, "lifetime_seconds": int(lifetime_seconds)},
+                )
+                or {}
+            )
+        except WorkspaceHttpError as error:
+            if error.status_code in (400, 403):
+                raise StagingTokenUnavailable(
+                    "workspace forbids personal access token creation; snapshot staging "
+                    "cannot use the Files API transport"
+                ) from error
+            raise
+        token_value = str(response.get("token_value") or "")
+        token_id = str((response.get("token_info") or {}).get("token_id") or "")
+        if not token_value:
+            raise StagingTokenUnavailable("token creation returned no token value")
+        return token_value, token_id
+
+
+    def revoke_stale_staging_tokens(api: _WorkspaceApi, pipeline_id: str, keep_token_id: str) -> None:
+        """Delete this pipeline's previously-minted staging tokens, keeping the current one.
+
+        Best-effort: listing or deleting may fail (e.g. the identity cannot manage
+        tokens it did not create), and an orphaned token expires on its own, so a
+        failure here is logged and swallowed rather than blocking startup.
+        """
+
+        comment = f"{STAGING_TOKEN_COMMENT_PREFIX}{pipeline_id}"
+        try:
+            listing = api.request("GET", "/api/2.0/token/list") or {}
+        except LakebaseStateError:
+            _LOGGER.debug("Could not list personal access tokens for staging cleanup", exc_info=True)
+            return
+        for info in listing.get("token_infos") or []:
+            token_id = str(info.get("token_id") or "")
+            if info.get("comment") == comment and token_id and token_id != keep_token_id:
+                try:
+                    api.request("POST", "/api/2.0/token/delete", {"token_id": token_id})
+                except LakebaseStateError:
+                    _LOGGER.debug("Could not revoke stale staging token %s", token_id, exc_info=True)
+
+
+    def store_staging_secret(api: _WorkspaceApi, scope: str, key: str, value: str) -> None:
+        """Persist the current staging token as a workspace secret (best-effort).
+
+        The secret is a durable record for rotation/audit and cross-restart recovery;
+        it is *not* the reader's bootstrap source (reading a secret would itself need a
+        token). Staging always uses the in-process token carried in _CAPTURED_WORKSPACE,
+        so a failure to write the secret does not stop staging.
+        """
+
+        try:
+            api.request("POST", "/api/2.0/secrets/scopes/create", {"scope": scope})
+        except WorkspaceHttpError as error:
+            # 400 RESOURCE_ALREADY_EXISTS is the normal steady-state; anything else is
+            # non-fatal here because the in-process token still works.
+            if error.status_code not in (400, 409):
+                _LOGGER.debug("Could not create secret scope %s", scope, exc_info=True)
+        except LakebaseStateError:
+            _LOGGER.debug("Could not create secret scope %s", scope, exc_info=True)
+        try:
+            api.request(
+                "POST",
+                "/api/2.0/secrets/put",
+                {"scope": scope, "key": key, "string_value": value},
+            )
+        except LakebaseStateError:
+            _LOGGER.debug("Could not store staging-token secret", exc_info=True)
+
+
+    class StagingCredentialProvider:
+        """Supplies a Files-API bearer token, refreshing it before it can expire.
+
+        The first ``bearer()`` mints a token using ``bootstrap_token`` -- whatever
+        credential the reader could carry from the driver (the captured runtime
+        credential). Every later refresh, at half-life, uses the *current minted
+        token* to mint its successor, so no ambient identity is needed after startup
+        (the reader process has none). Each mint also refreshes the durable secret and
+        revokes this pipeline's older tokens. Refresh is lazy -- checked on each
+        ``bearer()`` call -- so there is no background thread to manage; page writes
+        call ``bearer()`` often enough to refresh well within the half-life.
+
+        A first-mint :class:`StagingTokenUnavailable` propagates so the caller falls
+        back to FUSE; a later *refresh* failure keeps the still-valid current token
+        rather than dropping a working credential.
+        """
+
+        def __init__(
+            self,
+            host: str,
+            bootstrap_token: str,
+            pipeline_id: str,
+            *,
+            lifetime_seconds: int = _DEFAULT_STAGING_TOKEN_LIFETIME_SECONDS,
+            secret_scope: str | None = None,
+            secret_key: str | None = None,
+            clock: Any = time.monotonic,
+        ) -> None:
+            self._host = host.rstrip("/")
+            self._bootstrap_token = bootstrap_token
+            self._pipeline_id = pipeline_id
+            self._lifetime_seconds = max(_STAGING_TOKEN_MIN_LIFETIME_SECONDS, int(lifetime_seconds))
+            self._refresh_after = self._lifetime_seconds * _STAGING_TOKEN_REFRESH_FRACTION
+            self._secret_scope = secret_scope
+            self._secret_key = secret_key
+            self._clock = clock
+            self._lock = threading.Lock()
+            self._token: str | None = None
+            self._token_id = ""
+            self._minted_at = 0.0
+
+        def bearer(self) -> str:
+            with self._lock:
+                now = self._clock()
+                if self._token is None:
+                    # First mint uses the carried bootstrap credential; a failure here is
+                    # fatal for REST and surfaces as StagingTokenUnavailable to the caller.
+                    self._mint(self._bootstrap_token)
+                elif now - self._minted_at >= self._refresh_after:
+                    try:
+                        self._mint(self._token)
+                    except Exception:  # noqa: BLE001 - keep the still-valid token on refresh failure
+                        _LOGGER.warning(
+                            "Snapshot-staging token refresh failed; reusing the current token",
+                            exc_info=True,
+                        )
+                return self._token or ""
+
+        def _mint(self, minting_token: str) -> None:
+            token, token_id = mint_staging_token(
+                _WorkspaceApi(self._host, minting_token), self._pipeline_id, self._lifetime_seconds
+            )
+            self._token = token
+            self._token_id = token_id
+            self._minted_at = self._clock()
+            # Durability/rotation with the new token: store the secret and revoke the
+            # tokens this pipeline minted before. Both are best-effort inside their helpers.
+            new_api = _WorkspaceApi(self._host, token)
+            if self._secret_scope and self._secret_key:
+                store_staging_secret(new_api, self._secret_scope, self._secret_key, token)
+            revoke_stale_staging_tokens(new_api, self._pipeline_id, token_id)
+
+
+    class WorkspaceFilesApi:
+        """Read/write UC Volume files over the Files REST API instead of the FUSE mount.
+
+        Only the verbs snapshot staging needs, stdlib-only for the same reason as
+        :class:`_WorkspaceApi`. The bearer token is fetched from the credential
+        provider on every attempt, so a token refreshed between attempts is picked up.
+        """
+
+        def __init__(self, host: str, credential: StagingCredentialProvider) -> None:
+            self._host = host.rstrip("/")
+            self._credential = credential
+
+        def put(self, volume_path: str, data: bytes) -> None:
+            """Upload ``data`` to ``volume_path`` (a /Volumes/... path), overwriting."""
+
+            self._request("PUT", volume_path, data=data, overwrite=True)
+
+        def get(self, volume_path: str) -> bytes:
+            """Download ``volume_path``; raises on any non-200."""
+
+            return self._request("GET", volume_path) or b""
+
+        def delete(self, volume_path: str) -> None:
+            """Delete ``volume_path`` if it exists; a 404 is tolerated."""
+
+            self._request("DELETE", volume_path, tolerate_missing=True)
+
+        def _request(
+            self,
+            method: str,
+            volume_path: str,
+            *,
+            data: bytes | None = None,
+            overwrite: bool = False,
+            tolerate_missing: bool = False,
+        ) -> bytes | None:
+            quoted = urllib.parse.quote(volume_path, safe="/")
+            url = f"{self._host}/api/2.0/fs/files{quoted}"
+            if overwrite:
+                url += "?overwrite=true"
+            last_error: Exception | None = None
+            for attempt in range(_FILES_API_ATTEMPTS):
+                headers = {"Authorization": f"Bearer {self._credential.bearer()}"}
+                if data is not None:
+                    headers["Content-Type"] = "application/octet-stream"
+                request = urllib.request.Request(url, data=data, method=method, headers=headers)
+                try:
+                    with urllib.request.urlopen(
+                        request, timeout=_FILES_API_TIMEOUT_SECONDS
+                    ) as response:
+                        return response.read()
+                except urllib.error.HTTPError as error:
+                    if error.code == 404 and tolerate_missing:
+                        return None
+                    if error.code < 500 and error.code != 429:
+                        detail = error.read().decode("utf-8", "replace")[:400]
+                        raise WorkspaceHttpError(
+                            f"{method} files {volume_path} failed with HTTP {error.code}: {detail}",
+                            error.code,
+                        ) from error
+                    last_error = error
+                except (urllib.error.URLError, TimeoutError) as error:
+                    last_error = error
+                if attempt + 1 < _FILES_API_ATTEMPTS:
+                    time.sleep(min(1.5 * (2**attempt), 8.0))
+            raise LakebaseStateError(
+                f"{method} files {volume_path} failed after {_FILES_API_ATTEMPTS} attempts"
+            ) from last_error
 
 
     def _quoted_identifier(connection: Any, name: str) -> str:
@@ -5232,6 +5503,19 @@ def register_lakeflow_source(spark):
     # README warning). REPEATABLE READ restores the exactly-once, table-locking behaviour.
     _SNAPSHOT_ISOLATION_OPTION = "snapshot.isolation"
     _DEFAULT_SNAPSHOT_ISOLATION = "committed_read_last_committed"
+
+    # Where snapshot page payloads are written. ``fuse`` uses the UC Volume FUSE mount
+    # (today's behaviour). ``rest`` writes them through the Files REST API, which never
+    # touches the mount and so avoids the ENOTCONN disconnects that recur under sustained
+    # write frequency, but needs a mintable personal access token (see
+    # StagingCredentialProvider). ``auto`` (the default) uses REST when a token can be
+    # minted and falls back to FUSE when the workspace forbids token creation.
+    _SNAPSHOT_STAGING_TRANSPORT_OPTION = "snapshot.staging.transport"
+    _SNAPSHOT_STAGING_TRANSPORTS = frozenset({"auto", "rest", "fuse"})
+    _DEFAULT_SNAPSHOT_STAGING_TRANSPORT = "auto"
+    _SNAPSHOT_STAGING_TOKEN_LIFETIME_OPTION = "snapshot.staging.token.lifetime.seconds"
+    # One secret scope holds every pipeline's current staging token, keyed per pipeline id.
+    _SNAPSHOT_STAGING_SECRET_SCOPE = "informix-snapshot-staging"
     _SNAPSHOT_ISOLATION_SQL = {
         "committed_read_last_committed": "COMMITTED READ LAST COMMITTED",
         "repeatable_read": "REPEATABLE READ",
@@ -9480,6 +9764,11 @@ def register_lakeflow_source(spark):
                     str(_DEFAULT_SNAPSHOT_STAGE_RETENTION_DAYS),
                     1,
                 ),
+                (
+                    _SNAPSHOT_STAGING_TOKEN_LIFETIME_OPTION,
+                    str(_DEFAULT_STAGING_TOKEN_LIFETIME_SECONDS),
+                    _STAGING_TOKEN_MIN_LIFETIME_SECONDS,
+                ),
                 ("metadata.max.bytes", str(64 << 20), 0),
                 ("max.records.per.batch", str(_DEFAULT_MAX_RECORDS_PER_BATCH), 1),
                 ("cdc.timeout", "5", 1),
@@ -9523,6 +9812,18 @@ def register_lakeflow_source(spark):
             _option_bool(options, _CONNECTION_FAIR_QUEUE_OPTION, True)
             _option_bool(options, _SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION, True)
             _option_bool(options, _PROMOTE_UNIQUE_INDEX_OPTION, True)
+            staging_transport = (
+                str(
+                    options.get(_SNAPSHOT_STAGING_TRANSPORT_OPTION, _DEFAULT_SNAPSHOT_STAGING_TRANSPORT)
+                )
+                .strip()
+                .lower()
+            )
+            if staging_transport not in _SNAPSHOT_STAGING_TRANSPORTS:
+                raise ValueError(
+                    f"Option '{_SNAPSHOT_STAGING_TRANSPORT_OPTION}' must be one of "
+                    f"{sorted(_SNAPSHOT_STAGING_TRANSPORTS)}; got {staging_transport!r}"
+                )
             _null_byte_mode(options)
             if _APPEND_INGESTION_OPTION in options:
                 _append_only_value(options[_APPEND_INGESTION_OPTION])
@@ -9614,6 +9915,11 @@ def register_lakeflow_source(spark):
             self._activity_touched: dict[tuple[str, str], float] = {}
             self._cleaned_update_scopes: set[tuple[str, str]] = set()
             self._cleaned_snapshot_stages: set[str] = set()
+            # Snapshot-page staging transport, resolved once on first use: None means the
+            # FUSE mount; a WorkspaceFilesApi means the Files REST API. See _staging_transport.
+            self._staging_transport_resolved = False
+            self._staging_files_api: WorkspaceFilesApi | None = None
+            self._staging_workspace_host = ""
             self._registration_scope: str | None = _INFORMIX_REGISTRATION_CONTEXT["scope"]
             self._metadata_session_lock = threading.RLock()
             self._metadata_release_timer: threading.Timer | None = None
@@ -11326,6 +11632,88 @@ def register_lakeflow_source(spark):
                 return
             self._cleaned_snapshot_stages.add(path)
 
+        def _staging_transport(self) -> WorkspaceFilesApi | None:
+            """Resolve the snapshot-page staging transport once, caching the choice.
+
+            Returns a :class:`WorkspaceFilesApi` to stage pages over the Files REST API,
+            or ``None`` to use the FUSE mount. ``fuse`` forces FUSE; ``rest`` forces REST
+            and raises if a token cannot be minted; ``auto`` (default) uses REST when a
+            staging token can be minted and falls back to FUSE when the workspace forbids
+            token creation. The first mint is forced here so a "creation disabled"
+            workspace falls back at resolution time rather than mid-drain.
+            """
+
+            if self._staging_transport_resolved:
+                return self._staging_files_api
+            self._staging_transport_resolved = True
+            mode = (
+                str(
+                    self.options.get(
+                        _SNAPSHOT_STAGING_TRANSPORT_OPTION, _DEFAULT_SNAPSHOT_STAGING_TRANSPORT
+                    )
+                )
+                .strip()
+                .lower()
+            )
+            if mode == "fuse":
+                return None
+            provider = self._build_staging_credential_provider(required=mode == "rest")
+            if provider is None:
+                return None
+            files_api = WorkspaceFilesApi(self._staging_workspace_host, provider)
+            try:
+                provider.bearer()
+            except StagingTokenUnavailable:
+                if mode == "rest":
+                    raise
+                logging.getLogger(__name__).info(
+                    "Personal access token creation is unavailable; snapshot staging uses "
+                    "the FUSE transport"
+                )
+                return None
+            self._staging_files_api = files_api
+            return files_api
+
+        def _build_staging_credential_provider(
+            self, *, required: bool
+        ) -> StagingCredentialProvider | None:
+            """Build the Files-API credential provider, or ``None`` to fall back to FUSE.
+
+            In ``auto`` mode with neither explicit workspace credentials nor a Databricks
+            runtime there is no ambient identity to mint from, so it returns ``None``
+            without probing the SDK -- which also keeps offline tests on FUSE. ``rest``
+            mode (``required``) always attempts resolution and lets a failure propagate.
+            """
+
+            explicit = bool(
+                self.options.get("lakebase.workspace.token")
+                and self.options.get("lakebase.workspace.host")
+            )
+            if not required and not explicit and not os.environ.get("DATABRICKS_RUNTIME_VERSION"):
+                return None
+            try:
+                host, token = _workspace_credentials(self.options)
+            except Exception:  # noqa: BLE001 - any resolution failure falls back to FUSE in auto
+                if required:
+                    raise
+                return None
+            self._staging_workspace_host = host
+            pipeline_id = (self._pipeline_scope().split("_@_", 1)[0] or "default").strip()
+            lifetime = self._table_int_option(
+                self.options,
+                _SNAPSHOT_STAGING_TOKEN_LIFETIME_OPTION,
+                _DEFAULT_STAGING_TOKEN_LIFETIME_SECONDS,
+                minimum=_STAGING_TOKEN_MIN_LIFETIME_SECONDS,
+            )
+            return StagingCredentialProvider(
+                host,
+                token,
+                pipeline_id,
+                lifetime_seconds=lifetime,
+                secret_scope=_SNAPSHOT_STAGING_SECRET_SCOPE,
+                secret_key=pipeline_id,
+            )
+
         def _publish_snapshot_stage_page(
             self,
             table: Table,
@@ -11341,11 +11729,6 @@ def register_lakeflow_source(spark):
                 "runs",
                 str(snapshot_lsn),
             )
-            # No filesystem capability probe: the exclusive-create and atomic-rename
-            # guarantees it checked were needed by the head-election protocol, which
-            # Postgres now performs. Writing a page needs only ordinary directory
-            # creation, and a failure surfaces from the write itself.
-            os.makedirs(namespace, mode=0o700, exist_ok=True)
             encoded_rows = _encode_snapshot_stage_value(rows)
             body = {
                 "lower_pk": _encode_snapshot_stage_value(lower_pk),
@@ -11376,6 +11759,20 @@ def register_lakeflow_source(spark):
                 )
             compressed = gzip.compress(payload, compresslevel=6, mtime=0)
             page_name = f"page-{page_index:08d}"
+            files_api = self._staging_transport()
+            if files_api is not None:
+                # REST transport: write the payload straight to the Volume over the Files
+                # API, never touching the FUSE mount. Head election lives in Postgres, so a
+                # single overwrite PUT is sufficient -- no candidate/atomic-rename fence is
+                # needed (a page's content is a pure function of its committed rows, so a
+                # re-published page is byte-identical). Reads still go through FUSE.
+                files_api.put(os.path.join(namespace, page_name, "data.json.gz"), compressed)
+                return
+            # No filesystem capability probe: the exclusive-create and atomic-rename
+            # guarantees it checked were needed by the head-election protocol, which
+            # Postgres now performs. Writing a page needs only ordinary directory
+            # creation, and a failure surfaces from the write itself.
+            os.makedirs(namespace, mode=0o700, exist_ok=True)
             target = os.path.join(namespace, page_name)
             candidate = os.path.join(namespace, f"candidate-{secrets.token_hex(16)}")
             try:

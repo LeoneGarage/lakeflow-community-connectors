@@ -47,6 +47,12 @@ from databricks.labs.community_connector.sources.informix.cdc_protocol import (
 )
 from databricks.labs.community_connector.sources.informix.lakebase_state import (
     LakebaseState,
+    StagingCredentialProvider,
+    StagingTokenUnavailable,
+    WorkspaceFilesApi,
+    _DEFAULT_STAGING_TOKEN_LIFETIME_SECONDS,
+    _STAGING_TOKEN_MIN_LIFETIME_SECONDS,
+    _workspace_credentials,
     acquire_slot,
     capture_workspace_credentials,
     collect_stale_table_state,
@@ -295,6 +301,19 @@ _SNAPSHOT_RESERVATION_OPTION = "snapshot.connection.reservation"
 # README warning). REPEATABLE READ restores the exactly-once, table-locking behaviour.
 _SNAPSHOT_ISOLATION_OPTION = "snapshot.isolation"
 _DEFAULT_SNAPSHOT_ISOLATION = "committed_read_last_committed"
+
+# Where snapshot page payloads are written. ``fuse`` uses the UC Volume FUSE mount
+# (today's behaviour). ``rest`` writes them through the Files REST API, which never
+# touches the mount and so avoids the ENOTCONN disconnects that recur under sustained
+# write frequency, but needs a mintable personal access token (see
+# StagingCredentialProvider). ``auto`` (the default) uses REST when a token can be
+# minted and falls back to FUSE when the workspace forbids token creation.
+_SNAPSHOT_STAGING_TRANSPORT_OPTION = "snapshot.staging.transport"
+_SNAPSHOT_STAGING_TRANSPORTS = frozenset({"auto", "rest", "fuse"})
+_DEFAULT_SNAPSHOT_STAGING_TRANSPORT = "auto"
+_SNAPSHOT_STAGING_TOKEN_LIFETIME_OPTION = "snapshot.staging.token.lifetime.seconds"
+# One secret scope holds every pipeline's current staging token, keyed per pipeline id.
+_SNAPSHOT_STAGING_SECRET_SCOPE = "informix-snapshot-staging"
 _SNAPSHOT_ISOLATION_SQL = {
     "committed_read_last_committed": "COMMITTED READ LAST COMMITTED",
     "repeatable_read": "REPEATABLE READ",
@@ -4543,6 +4562,11 @@ class InformixLakeflowConnect(LakeflowConnect):
                 str(_DEFAULT_SNAPSHOT_STAGE_RETENTION_DAYS),
                 1,
             ),
+            (
+                _SNAPSHOT_STAGING_TOKEN_LIFETIME_OPTION,
+                str(_DEFAULT_STAGING_TOKEN_LIFETIME_SECONDS),
+                _STAGING_TOKEN_MIN_LIFETIME_SECONDS,
+            ),
             ("metadata.max.bytes", str(64 << 20), 0),
             ("max.records.per.batch", str(_DEFAULT_MAX_RECORDS_PER_BATCH), 1),
             ("cdc.timeout", "5", 1),
@@ -4586,6 +4610,18 @@ class InformixLakeflowConnect(LakeflowConnect):
         _option_bool(options, _CONNECTION_FAIR_QUEUE_OPTION, True)
         _option_bool(options, _SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION, True)
         _option_bool(options, _PROMOTE_UNIQUE_INDEX_OPTION, True)
+        staging_transport = (
+            str(
+                options.get(_SNAPSHOT_STAGING_TRANSPORT_OPTION, _DEFAULT_SNAPSHOT_STAGING_TRANSPORT)
+            )
+            .strip()
+            .lower()
+        )
+        if staging_transport not in _SNAPSHOT_STAGING_TRANSPORTS:
+            raise ValueError(
+                f"Option '{_SNAPSHOT_STAGING_TRANSPORT_OPTION}' must be one of "
+                f"{sorted(_SNAPSHOT_STAGING_TRANSPORTS)}; got {staging_transport!r}"
+            )
         _null_byte_mode(options)
         if _APPEND_INGESTION_OPTION in options:
             _append_only_value(options[_APPEND_INGESTION_OPTION])
@@ -4677,6 +4713,11 @@ class InformixLakeflowConnect(LakeflowConnect):
         self._activity_touched: dict[tuple[str, str], float] = {}
         self._cleaned_update_scopes: set[tuple[str, str]] = set()
         self._cleaned_snapshot_stages: set[str] = set()
+        # Snapshot-page staging transport, resolved once on first use: None means the
+        # FUSE mount; a WorkspaceFilesApi means the Files REST API. See _staging_transport.
+        self._staging_transport_resolved = False
+        self._staging_files_api: WorkspaceFilesApi | None = None
+        self._staging_workspace_host = ""
         self._registration_scope: str | None = _INFORMIX_REGISTRATION_CONTEXT["scope"]
         self._metadata_session_lock = threading.RLock()
         self._metadata_release_timer: threading.Timer | None = None
@@ -6389,6 +6430,88 @@ class InformixLakeflowConnect(LakeflowConnect):
             return
         self._cleaned_snapshot_stages.add(path)
 
+    def _staging_transport(self) -> WorkspaceFilesApi | None:
+        """Resolve the snapshot-page staging transport once, caching the choice.
+
+        Returns a :class:`WorkspaceFilesApi` to stage pages over the Files REST API,
+        or ``None`` to use the FUSE mount. ``fuse`` forces FUSE; ``rest`` forces REST
+        and raises if a token cannot be minted; ``auto`` (default) uses REST when a
+        staging token can be minted and falls back to FUSE when the workspace forbids
+        token creation. The first mint is forced here so a "creation disabled"
+        workspace falls back at resolution time rather than mid-drain.
+        """
+
+        if self._staging_transport_resolved:
+            return self._staging_files_api
+        self._staging_transport_resolved = True
+        mode = (
+            str(
+                self.options.get(
+                    _SNAPSHOT_STAGING_TRANSPORT_OPTION, _DEFAULT_SNAPSHOT_STAGING_TRANSPORT
+                )
+            )
+            .strip()
+            .lower()
+        )
+        if mode == "fuse":
+            return None
+        provider = self._build_staging_credential_provider(required=mode == "rest")
+        if provider is None:
+            return None
+        files_api = WorkspaceFilesApi(self._staging_workspace_host, provider)
+        try:
+            provider.bearer()
+        except StagingTokenUnavailable:
+            if mode == "rest":
+                raise
+            logging.getLogger(__name__).info(
+                "Personal access token creation is unavailable; snapshot staging uses "
+                "the FUSE transport"
+            )
+            return None
+        self._staging_files_api = files_api
+        return files_api
+
+    def _build_staging_credential_provider(
+        self, *, required: bool
+    ) -> StagingCredentialProvider | None:
+        """Build the Files-API credential provider, or ``None`` to fall back to FUSE.
+
+        In ``auto`` mode with neither explicit workspace credentials nor a Databricks
+        runtime there is no ambient identity to mint from, so it returns ``None``
+        without probing the SDK -- which also keeps offline tests on FUSE. ``rest``
+        mode (``required``) always attempts resolution and lets a failure propagate.
+        """
+
+        explicit = bool(
+            self.options.get("lakebase.workspace.token")
+            and self.options.get("lakebase.workspace.host")
+        )
+        if not required and not explicit and not os.environ.get("DATABRICKS_RUNTIME_VERSION"):
+            return None
+        try:
+            host, token = _workspace_credentials(self.options)
+        except Exception:  # noqa: BLE001 - any resolution failure falls back to FUSE in auto
+            if required:
+                raise
+            return None
+        self._staging_workspace_host = host
+        pipeline_id = (self._pipeline_scope().split("_@_", 1)[0] or "default").strip()
+        lifetime = self._table_int_option(
+            self.options,
+            _SNAPSHOT_STAGING_TOKEN_LIFETIME_OPTION,
+            _DEFAULT_STAGING_TOKEN_LIFETIME_SECONDS,
+            minimum=_STAGING_TOKEN_MIN_LIFETIME_SECONDS,
+        )
+        return StagingCredentialProvider(
+            host,
+            token,
+            pipeline_id,
+            lifetime_seconds=lifetime,
+            secret_scope=_SNAPSHOT_STAGING_SECRET_SCOPE,
+            secret_key=pipeline_id,
+        )
+
     def _publish_snapshot_stage_page(
         self,
         table: Table,
@@ -6404,11 +6527,6 @@ class InformixLakeflowConnect(LakeflowConnect):
             "runs",
             str(snapshot_lsn),
         )
-        # No filesystem capability probe: the exclusive-create and atomic-rename
-        # guarantees it checked were needed by the head-election protocol, which
-        # Postgres now performs. Writing a page needs only ordinary directory
-        # creation, and a failure surfaces from the write itself.
-        os.makedirs(namespace, mode=0o700, exist_ok=True)
         encoded_rows = _encode_snapshot_stage_value(rows)
         body = {
             "lower_pk": _encode_snapshot_stage_value(lower_pk),
@@ -6439,6 +6557,20 @@ class InformixLakeflowConnect(LakeflowConnect):
             )
         compressed = gzip.compress(payload, compresslevel=6, mtime=0)
         page_name = f"page-{page_index:08d}"
+        files_api = self._staging_transport()
+        if files_api is not None:
+            # REST transport: write the payload straight to the Volume over the Files
+            # API, never touching the FUSE mount. Head election lives in Postgres, so a
+            # single overwrite PUT is sufficient -- no candidate/atomic-rename fence is
+            # needed (a page's content is a pure function of its committed rows, so a
+            # re-published page is byte-identical). Reads still go through FUSE.
+            files_api.put(os.path.join(namespace, page_name, "data.json.gz"), compressed)
+            return
+        # No filesystem capability probe: the exclusive-create and atomic-rename
+        # guarantees it checked were needed by the head-election protocol, which
+        # Postgres now performs. Writing a page needs only ordinary directory
+        # creation, and a failure surfaces from the write itself.
+        os.makedirs(namespace, mode=0o700, exist_ok=True)
         target = os.path.join(namespace, page_name)
         candidate = os.path.join(namespace, f"candidate-{secrets.token_hex(16)}")
         try:
