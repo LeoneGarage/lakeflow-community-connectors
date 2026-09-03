@@ -17,6 +17,7 @@ connector's imports require and which there is no reason to duplicate.
 from __future__ import annotations
 
 import concurrent.futures
+import io
 import json
 import os
 import sys
@@ -1833,6 +1834,226 @@ class LakebaseWaiterQueueTests(unittest.TestCase):
 
         self.assertEqual(len(issued), 4)
         self.assertEqual(len({slot.slot_id for slot in issued}), 4)
+
+
+class _StagingTokenApi:
+    """Records token/secret control-plane calls for staging-auth tests."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, str, dict | None]] = []
+        self.token_infos: list[dict] = []
+        self.deleted: list[str] = []
+        self.secrets: list[tuple[str, str, str]] = []
+        self.scopes: list[str] = []
+        self._next_id = 0
+        self.create_error: int | None = None
+        self.list_error = False
+        # Set by the test's _WorkspaceApi factory to the bearer token this client
+        # was built with, so create-token calls can be attributed to a credential.
+        self.auth_token: str | None = None
+        self.create_tokens: list[str | None] = []
+
+    def request(self, method, path, body=None, tolerate_missing=False):
+        self.calls.append((method, path, body))
+        if path == "/api/2.0/token/create":
+            self.create_tokens.append(self.auth_token)
+            if self.create_error is not None:
+                raise lakebase_state.WorkspaceHttpError("nope", self.create_error)
+            self._next_id += 1
+            token_id = f"tid-{self._next_id}"
+            return {"token_value": f"dapi-{self._next_id}", "token_info": {"token_id": token_id}}
+        if path == "/api/2.0/token/list":
+            if self.list_error:
+                raise lakebase_state.LakebaseStateError("list failed")
+            return {"token_infos": list(self.token_infos)}
+        if path == "/api/2.0/token/delete":
+            self.deleted.append(body["token_id"])
+            return {}
+        if path == "/api/2.0/secrets/scopes/create":
+            self.scopes.append(body["scope"])
+            return {}
+        if path == "/api/2.0/secrets/put":
+            self.secrets.append((body["scope"], body["key"], body["string_value"]))
+            return {}
+        return {}
+
+
+class StagingTokenTests(unittest.TestCase):
+    def test_mint_sends_tagged_comment_and_lifetime(self):
+        api = _StagingTokenApi()
+        value, token_id = lakebase_state.mint_staging_token(api, "pipe-1", 86400)
+        self.assertEqual(value, "dapi-1")
+        self.assertEqual(token_id, "tid-1")
+        method, path, body = api.calls[0]
+        self.assertEqual((method, path), ("POST", "/api/2.0/token/create"))
+        self.assertEqual(body["comment"], "informix-snapshot-staging:pipe-1")
+        self.assertEqual(body["lifetime_seconds"], 86400)
+
+    def test_mint_maps_forbidden_to_unavailable(self):
+        for code in (400, 403):
+            api = _StagingTokenApi()
+            api.create_error = code
+            with self.assertRaises(lakebase_state.StagingTokenUnavailable):
+                lakebase_state.mint_staging_token(api, "pipe-1", 86400)
+
+    def test_mint_reraises_other_http_errors(self):
+        api = _StagingTokenApi()
+        api.create_error = 500  # not a "disabled" signal
+        with self.assertRaises(lakebase_state.WorkspaceHttpError):
+            lakebase_state.mint_staging_token(api, "pipe-1", 86400)
+
+    def test_revoke_removes_only_this_pipelines_stale_tokens(self):
+        api = _StagingTokenApi()
+        api.token_infos = [
+            {"token_id": "keep", "comment": "informix-snapshot-staging:pipe-1"},
+            {"token_id": "stale", "comment": "informix-snapshot-staging:pipe-1"},
+            {"token_id": "other-pipeline", "comment": "informix-snapshot-staging:pipe-2"},
+            {"token_id": "unrelated", "comment": "someone else"},
+        ]
+        lakebase_state.revoke_stale_staging_tokens(api, "pipe-1", keep_token_id="keep")
+        self.assertEqual(api.deleted, ["stale"])
+
+    def test_revoke_swallows_list_failure(self):
+        api = _StagingTokenApi()
+        api.list_error = True
+        lakebase_state.revoke_stale_staging_tokens(api, "pipe-1", keep_token_id="keep")
+        self.assertEqual(api.deleted, [])
+
+
+class StagingCredentialProviderTests(unittest.TestCase):
+    def _provider(self, api, clock, **kwargs):
+        # Route the provider's internally-built _WorkspaceApi(host, token) to the
+        # shared fake, recording which token each mint authenticated with.
+        used_tokens: list[str] = []
+
+        def fake_api(host, token):
+            used_tokens.append(token)
+            api.auth_token = token
+            return api
+
+        patcher = mock.patch.object(lakebase_state, "_WorkspaceApi", fake_api)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        provider = lakebase_state.StagingCredentialProvider(
+            "https://ws", "bootstrap-token", "pipe-1", clock=clock, **kwargs
+        )
+        return provider, used_tokens
+
+    def test_first_bearer_mints_with_bootstrap_token(self):
+        api = _StagingTokenApi()
+        provider, used = self._provider(api, clock=lambda: 0.0, lifetime_seconds=86400)
+        self.assertEqual(provider.bearer(), "dapi-1")
+        # The very first mint authenticates with the carried bootstrap credential.
+        self.assertEqual(used[0], "bootstrap-token")
+
+    def test_refresh_at_half_life_uses_the_current_token(self):
+        api = _StagingTokenApi()
+        now = {"t": 0.0}
+        provider, used = self._provider(api, clock=lambda: now["t"], lifetime_seconds=1000)
+        self.assertEqual(provider.bearer(), "dapi-1")
+        now["t"] = 400.0  # below half-life: no refresh
+        self.assertEqual(provider.bearer(), "dapi-1")
+        now["t"] = 500.0  # at half-life: refresh
+        self.assertEqual(provider.bearer(), "dapi-2")
+        # The first mint used the bootstrap credential; the refresh mint used the
+        # previous minted token, so no ambient identity is needed after startup.
+        self.assertEqual(api.create_tokens, ["bootstrap-token", "dapi-1"])
+
+    def test_refresh_failure_keeps_the_current_token(self):
+        api = _StagingTokenApi()
+        now = {"t": 0.0}
+        provider, _ = self._provider(api, clock=lambda: now["t"], lifetime_seconds=1000)
+        self.assertEqual(provider.bearer(), "dapi-1")
+        api.create_error = 500  # refresh mint fails
+        now["t"] = 600.0
+        self.assertEqual(provider.bearer(), "dapi-1", "a failed refresh must keep the live token")
+
+    def test_first_mint_unavailable_propagates(self):
+        api = _StagingTokenApi()
+        api.create_error = 403
+        provider, _ = self._provider(api, clock=lambda: 0.0)
+        with self.assertRaises(lakebase_state.StagingTokenUnavailable):
+            provider.bearer()
+
+    def test_mint_stores_secret_and_revokes_prior(self):
+        api = _StagingTokenApi()
+        api.token_infos = [
+            {"token_id": "old", "comment": "informix-snapshot-staging:pipe-1"},
+        ]
+        provider, _ = self._provider(
+            api, clock=lambda: 0.0, secret_scope="informix", secret_key="pipe-1"
+        )
+        provider.bearer()
+        self.assertIn(("informix", "pipe-1", "dapi-1"), api.secrets)
+        self.assertEqual(api.deleted, ["old"])
+
+
+class _FakeHttpResponse:
+    def __init__(self, body=b""):
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self._body
+
+
+class WorkspaceFilesApiTests(unittest.TestCase):
+    def _client(self):
+        provider = mock.Mock()
+        provider.bearer.return_value = "dapi-token"
+        return lakebase_state.WorkspaceFilesApi("https://ws", provider), []
+
+    def test_put_issues_overwrite_octet_stream(self):
+        captured = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["url"] = request.full_url
+            captured["method"] = request.get_method()
+            captured["data"] = request.data
+            captured["auth"] = request.headers.get("Authorization")
+            captured["ctype"] = request.headers.get("Content-type")
+            return _FakeHttpResponse(b"")
+
+        client, _ = self._client()
+        with mock.patch.object(lakebase_state.urllib.request, "urlopen", fake_urlopen):
+            client.put("/Volumes/c/s/v/runs/1/page-00000000/data.json.gz", b"payload")
+        self.assertEqual(captured["method"], "PUT")
+        self.assertTrue(
+            captured["url"].endswith(
+                "/api/2.0/fs/files/Volumes/c/s/v/runs/1/page-00000000/data.json.gz?overwrite=true"
+            ),
+            captured["url"],
+        )
+        self.assertEqual(captured["data"], b"payload")
+        self.assertEqual(captured["auth"], "Bearer dapi-token")
+        self.assertEqual(captured["ctype"], "application/octet-stream")
+
+    def test_delete_tolerates_missing(self):
+        def fake_urlopen(request, timeout=None):
+            raise lakebase_state.urllib.error.HTTPError(
+                request.full_url, 404, "not found", {}, None
+            )
+
+        client, _ = self._client()
+        with mock.patch.object(lakebase_state.urllib.request, "urlopen", fake_urlopen):
+            client.delete("/Volumes/c/s/v/gone")  # must not raise
+
+    def test_client_error_raises_workspace_http_error(self):
+        def fake_urlopen(request, timeout=None):
+            raise lakebase_state.urllib.error.HTTPError(
+                request.full_url, 403, "forbidden", {}, io.BytesIO(b"denied")
+            )
+
+        client, _ = self._client()
+        with mock.patch.object(lakebase_state.urllib.request, "urlopen", fake_urlopen):
+            with self.assertRaises(lakebase_state.WorkspaceHttpError) as ctx:
+                client.put("/Volumes/c/s/v/x", b"data")
+        self.assertEqual(ctx.exception.status_code, 403)
 
 
 if __name__ == "__main__":

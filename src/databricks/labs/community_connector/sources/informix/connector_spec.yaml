@@ -374,6 +374,29 @@ connection:
         page by an internal byte ceiling and overall by `snapshot.max.rows` /
         `snapshot.max.bytes`.
 
+    - name: snapshot.staging.transport
+      type: string
+      required: false
+      description: >
+        How snapshot page payloads are written to the staging Volume. `fuse` uses the
+        UC Volume FUSE mount (the historical behaviour). `rest` writes them through the
+        Files REST API, which never touches the mount and so avoids the FUSE `ENOTCONN`
+        disconnects that recur under sustained write frequency; it requires the workspace
+        to allow personal-access-token creation for the pipeline's identity. `auto` (the
+        default) uses `rest` when a token can be minted and falls back to `fuse` when the
+        workspace forbids token creation. Only page *writes* use this transport; reads
+        and cleanup still use the mount. One of `auto`, `rest`, `fuse`.
+
+    - name: snapshot.staging.token.lifetime.seconds
+      type: string
+      required: false
+      description: >
+        Lifetime of the personal access token minted for the `rest`/`auto` staging
+        transport. The token is refreshed at half this value by the current token
+        minting its successor, so a long-running pipeline never lets it expire, and each
+        token is short-lived at rest. Default `86400` (24h); minimum `600`. Clamped to
+        the workspace's maximum-token-lifetime policy.
+
     - name: snapshot.read.timeout.seconds
       type: string
       required: false

@@ -5721,6 +5721,103 @@ class LakeflowContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             connector.read_table("app.orders", {}, options)
 
+    def test_invalid_staging_transport_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.connector(FakeBridge(), **{"snapshot.staging.transport": "sftp"})
+
+    def test_auto_transport_without_credentials_uses_fuse(self):
+        # Offline (no ambient identity, no explicit workspace creds), auto resolves to
+        # FUSE without probing for a token -- so existing pipelines are unaffected.
+        connector, _ = self._keyless_connector(**{"snapshot.staging.transport": "auto"})
+        options = dict(self.APPEND, **{"snapshot.mode": "initial"})
+
+        rows, _ = connector.read_table("app.orders", {}, options)
+
+        self.assertEqual(len(list(rows)), 2)
+        self.assertTrue(connector._staging_transport_resolved)
+        self.assertIsNone(connector._staging_files_api)
+
+    def test_rest_transport_writes_pages_via_files_api(self):
+        created: list = []
+
+        class _FakeFilesApi:
+            def __init__(self, host, provider):
+                self.puts: list = []
+                created.append(self)
+
+            def put(self, path, data):
+                # Persist to the staging path so the connector's FUSE read-back finds
+                # it -- mirroring production, where a REST write and a FUSE read address
+                # the same Volume file.
+                self.puts.append((path, data))
+                os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+                with open(path, "wb") as handle:
+                    handle.write(data)
+
+        def _fake_provider(*_a, **_k):
+            provider = mock.Mock()
+            provider.bearer.return_value = "tok"
+            return provider
+
+        with (
+            mock.patch.object(informix_module, "WorkspaceFilesApi", _FakeFilesApi),
+            mock.patch.object(informix_module, "StagingCredentialProvider", _fake_provider),
+        ):
+            connector, _ = self._keyless_connector(
+                **{
+                    "snapshot.staging.transport": "rest",
+                    "lakebase.workspace.host": "https://ws",
+                    "lakebase.workspace.token": "boot",
+                }
+            )
+            options = dict(self.APPEND, **{"snapshot.mode": "initial"})
+            connector.read_table("app.orders", {}, options)
+
+        self.assertTrue(created, "the REST files client was never built")
+        self.assertTrue(created[0].puts, "no snapshot page was written via the Files API")
+        path, data = created[0].puts[0]
+        self.assertTrue(path.endswith("/data.json.gz"), path)
+        self.assertEqual(data[:2], b"\x1f\x8b", "staged page must be gzip")
+
+    def test_auto_transport_falls_back_to_fuse_when_token_unavailable(self):
+        def _unavailable_provider(*_a, **_k):
+            provider = mock.Mock()
+            provider.bearer.side_effect = informix_module.StagingTokenUnavailable("disabled")
+            return provider
+
+        with mock.patch.object(informix_module, "StagingCredentialProvider", _unavailable_provider):
+            connector, _ = self._keyless_connector(
+                **{
+                    "snapshot.staging.transport": "auto",
+                    "lakebase.workspace.host": "https://ws",
+                    "lakebase.workspace.token": "boot",
+                }
+            )
+            options = dict(self.APPEND, **{"snapshot.mode": "initial"})
+            rows, _ = connector.read_table("app.orders", {}, options)
+
+        # Fell back to FUSE and still staged the history successfully.
+        self.assertEqual(len(list(rows)), 2)
+        self.assertIsNone(connector._staging_files_api)
+
+    def test_rest_transport_hard_fails_when_token_unavailable(self):
+        def _unavailable_provider(*_a, **_k):
+            provider = mock.Mock()
+            provider.bearer.side_effect = informix_module.StagingTokenUnavailable("disabled")
+            return provider
+
+        with mock.patch.object(informix_module, "StagingCredentialProvider", _unavailable_provider):
+            connector, _ = self._keyless_connector(
+                **{
+                    "snapshot.staging.transport": "rest",
+                    "lakebase.workspace.host": "https://ws",
+                    "lakebase.workspace.token": "boot",
+                }
+            )
+            options = dict(self.APPEND, **{"snapshot.mode": "initial"})
+            with self.assertRaises(informix_module.StagingTokenUnavailable):
+                connector.read_table("app.orders", {}, options)
+
     def test_append_snapshot_backfill_fails_loudly_above_its_bound(self):
         connector, _ = self._keyless_connector()
         options = dict(
