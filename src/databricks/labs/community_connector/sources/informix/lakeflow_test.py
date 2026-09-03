@@ -501,6 +501,18 @@ class _OfflineLakebase:
         lakebase_state.LakebaseState._provisioned.clear()
         informix_module._LAKEBASE_WAITER_STATE.clear()
         informix_module._LAKEBASE_WAITER_CONNECTION.clear()
+        # The state-validation coordinator memoizes resolved tables and leases by
+        # (scope, identity) for the life of the process. Reset it per test too: without
+        # this, a test asserting a cold-cache lookup (get_table called once) fails when
+        # a prior test -- e.g. the same class re-collected via the tests/unit re-export
+        # module -- already warmed the same hardcoded scope. Clearing it here is a
+        # between-tests reset, so tests that rely on cross-instance sharing within a
+        # single test are unaffected.
+        coordinator = informix_module._STATE_VALIDATION_COORDINATOR
+        coordinator.validated.clear()
+        coordinator.claims.clear()
+        coordinator.table_caches.clear()
+        coordinator.connection_limits.clear()
         return self
 
     def _connect(self, _state=None):
