@@ -358,7 +358,21 @@ connection:
     - name: snapshot.page.size
       type: string
       required: false
-      description: Snapshot rows per page for CDC-capable tables. Default `20000`; minimum `1`.
+      description: >
+        Snapshot rows per page for keyed tables -- keyset-paged incremental chunks and
+        the keyed blocking `initial` snapshot. Default `20000`; minimum `1`. A keyless
+        `initial` snapshot uses `keyless.snapshot.page.size` instead.
+
+    - name: keyless.snapshot.page.size
+      type: string
+      required: false
+      description: >
+        Snapshot rows per staged Volume page for a keyless `initial` snapshot (an
+        append-only keyless table with `snapshot.mode=initial`). Such a table drains
+        positionally with no seek cursor, so a larger page means fewer manifest entries
+        and round trips for the same rows. Default `50000`; minimum `1`. Bounded per
+        page by an internal byte ceiling and overall by `snapshot.max.rows` /
+        `snapshot.max.bytes`.
 
     - name: snapshot.read.timeout.seconds
       type: string
@@ -944,4 +958,4 @@ connection:
 
 # Exact per-table overrides consumed by the connector. `qualified_source_table` maps a
 # pipeline table to a dynamically discovered exposed name (`owner.table`).
-external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index"
+external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index"

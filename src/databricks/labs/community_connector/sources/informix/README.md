@@ -93,7 +93,8 @@ replicated — run a full refresh if the destination must match the source exact
 | `decimal.variable.type` | No | `decimal(38,18)` | Per-table option. Target Spark type for variable-scale `DECIMAL(p)`/`NUMERIC(p)` columns: `string`, `double`, `integer` (truncated), or `decimal(p,s)`. Explicit `DECIMAL(p,s)` remains fixed-scale. See [Variable-scale decimals](#variable-scale-decimals). |
 | `decimal.variable.column.type` | No | none | Per-table option. Comma-separated `column:type` overrides of `decimal.variable.type` for specific columns, e.g. `agt_no:decimal(9,0),bnk_acct_no:string`. |
 | `snapshot.mode` | No | `incremental` | Per-table snapshot policy: `incremental`, `initial`, `initial_only`, `cdc_only`, `auto_snapshot`, or `recovery`. See [Snapshot modes](#snapshot-modes). |
-| `snapshot.page.size` | No | `20000` | Rows per immutable staged page for CDC-capable tables; minimum `1`. Pages are read under one repeatable-read transaction and delivered through checkpointed Lakeflow microbatches. |
+| `snapshot.page.size` | No | `20000` | Rows per page for **keyed** tables — keyset-paged incremental chunks and the keyed blocking `initial` snapshot; minimum `1`. Pages are read under one repeatable-read transaction and delivered through checkpointed Lakeflow microbatches. A keyless `initial` snapshot uses `keyless.snapshot.page.size` instead. |
+| `keyless.snapshot.page.size` | No | `50000` | Rows per immutable staged Volume page for a **keyless** `initial` snapshot (an append-only keyless table with `snapshot.mode=initial`); minimum `1`. Such a table drains positionally (no seek cursor), so a larger page means fewer manifest entries and round trips for the same rows. A per-page byte ceiling still applies, and `snapshot.max.rows`/`snapshot.max.bytes` cap the whole drain. |
 | `snapshot.filter` | No | none | Per-table Informix SQL predicate appended to snapshot `SELECT` statements, without the `WHERE` keyword. It filters blocking, incremental, append-only initial, and snapshot-only copies. CDC events after the snapshot are not filtered. Semicolons, SQL comments, control characters, and predicates longer than 8,192 characters are rejected. |
 | `snapshot.isolation` | No | `committed_read_last_committed` | Per-table isolation level for the monolithic `snapshot.mode=initial` full-table snapshot. `committed_read_last_committed` (default) reads the last-committed image of a locked row instead of holding shared locks, so the snapshot does **not** lock the table against writers. `repeatable_read` restores the exactly-once, table-locking behavior. Tokens are case- and whitespace-insensitive; unknown values are rejected. **⚠️ Duplicate-row warning:** under `committed_read_last_committed` the table is no longer frozen at the snapshot LSN, so a row inserted **during** the scan can be captured by both the snapshot and the change stream. A keyed table de-duplicates these by primary key, but a **keyless (append-only) table has no key to de-duplicate on and may therefore emit duplicate rows**. Use `repeatable_read` for keyless tables that require exactly-once, or run the `initial` backfill during a quiet window. See [Snapshot isolation](#snapshot-isolation). |
 | `snapshot.read.timeout.seconds` | No | `300` | SQLI socket read timeout while fetching transactional snapshot pages and while reading the incremental-snapshot key bound that seeds a keyed table; raise it if a large table's key-bound read times out. Minimum `1`. |
@@ -124,7 +125,7 @@ replicated — run a full refresh if the destination must match the source exact
 Because per-table options are supported, configure the Unity Catalog connection with this exact `externalOptionsAllowList`:
 
 ```text
-qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records
+qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records
 ```
 
 Create the connection from the Lakeflow Community Connector flow on the **Add Data** page, with the Databricks CLI, or with the Databricks SDK for Python. The Unity Catalog connection type must be `COMMUNITY`, and `sourceName` must be `informix`.
@@ -157,7 +158,7 @@ databricks connections create --json "$(jq -n \
       encrypt: "true",
       "snapshot.staging.location": "/Volumes/main/informix_cdc/staging",
       "lakebase.password": $lakebase_password,
-      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index"
+      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index"
     }
   }')"
 
@@ -195,7 +196,7 @@ databricks connections update informix_sales --json "$(jq -n \
       "ssl.ca.file": "/Volumes/catalog/schema/artifacts/informix-ca.pem",
       "snapshot.staging.location": "/Volumes/main/informix_cdc/staging",
       "lakebase.password": $lakebase_password,
-      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index"
+      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index"
     }
   }')" \
   --profile "$DATABRICKS_PROFILE"
@@ -242,7 +243,7 @@ connection = w.connections.create(
         "lakebase.password": os.environ["LAKEBASE_PASSWORD"],
         "externalOptionsAllowList": (
             "qualified_source_table,decimal.variable.type,decimal.variable.column.type,"
-            "snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,"
+            "snapshot.mode,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,"
             "append.only.ingestion,"
             "max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index"
         ),
@@ -283,7 +284,7 @@ connection = w.connections.update(
         "lakebase.password": os.environ["LAKEBASE_PASSWORD"],
         "externalOptionsAllowList": (
             "qualified_source_table,decimal.variable.type,decimal.variable.column.type,"
-            "snapshot.mode,snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,"
+            "snapshot.mode,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,"
             "append.only.ingestion,"
             "max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index"
         ),
@@ -594,7 +595,7 @@ node is removed, the affected pipeline fails closed and requires a full refresh.
 }
 ```
 
-Supported source-specific table options are `qualified_source_table`, `decimal.variable.type`, `decimal.variable.column.type`, `snapshot.mode`, `snapshot.page.size`, `snapshot.filter`, `snapshot.isolation`, `snapshot.max.rows`, `snapshot.max.bytes`, `max.records.per.batch`, `cdc.timeout`, and `cdc.max.records`. `qualified_source_table` maps the pipeline's logical table name to an Informix `owner.table` name. Standard destination, SCD, key, sequence, and clustering options remain available.
+Supported source-specific table options are `qualified_source_table`, `decimal.variable.type`, `decimal.variable.column.type`, `snapshot.mode`, `snapshot.page.size`, `keyless.snapshot.page.size`, `snapshot.filter`, `snapshot.isolation`, `snapshot.max.rows`, `snapshot.max.bytes`, `max.records.per.batch`, `cdc.timeout`, and `cdc.max.records`. `qualified_source_table` maps the pipeline's logical table name to an Informix `owner.table` name. Standard destination, SCD, key, sequence, and clustering options remain available.
 
 ### Snapshot modes
 
