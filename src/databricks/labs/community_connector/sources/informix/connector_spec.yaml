@@ -397,6 +397,19 @@ connection:
         token is short-lived at rest. Default `86400` (24h); minimum `600`. Clamped to
         the workspace's maximum-token-lifetime policy.
 
+    - name: snapshot.staging.pipeline
+      type: string
+      required: false
+      description: >
+        Whether a keyless `initial` drain writing over the `rest` transport overlaps its
+        next page fetch with the previous page's shape-and-upload, through one bounded
+        background uploader. This roughly halves wall-clock for an I/O-bound keyless
+        drain without a second connection slot, at the cost of a few more pages resident
+        in memory. Only engaged for a keyless drain on the REST transport (pipelining
+        FUSE writes would raise the mount's write frequency, which the REST transport
+        exists to avoid); keyed drains are unaffected. Default `true`. Accepts
+        `true`/`false`.
+
     - name: snapshot.read.timeout.seconds
       type: string
       required: false

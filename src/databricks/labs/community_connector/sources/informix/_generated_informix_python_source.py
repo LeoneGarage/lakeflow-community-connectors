@@ -78,6 +78,7 @@ import importlib
 import ipaddress
 import logging
 import math
+import queue
 import random
 import secrets
 import socket
@@ -5516,6 +5517,11 @@ def register_lakeflow_source(spark):
     _SNAPSHOT_STAGING_TOKEN_LIFETIME_OPTION = "snapshot.staging.token.lifetime.seconds"
     # One secret scope holds every pipeline's current staging token, keyed per pipeline id.
     _SNAPSHOT_STAGING_SECRET_SCOPE = "informix-snapshot-staging"
+    # Overlap a keyless positional drain's next page fetch with the previous page's
+    # shape+upload, through one bounded background uploader. Only engaged for a keyless
+    # drain writing over the REST transport -- pipelining FUSE writes would raise the
+    # mount's write frequency, the very thing the REST transport exists to avoid.
+    _SNAPSHOT_STAGING_PIPELINE_OPTION = "snapshot.staging.pipeline"
     _SNAPSHOT_ISOLATION_SQL = {
         "committed_read_last_committed": "COMMITTED READ LAST COMMITTED",
         "repeatable_read": "REPEATABLE READ",
@@ -9710,6 +9716,71 @@ def register_lakeflow_source(spark):
                 pool.condition.notify_all()
 
 
+    class _AsyncStagePipeline:
+        """Overlap a drain's next page fetch with the previous page's shape+upload.
+
+        Wraps the ``page_consumer`` the consistent-snapshot loop calls. ``submit``
+        hands a page to a single background worker and returns, so the loop can fetch
+        the next page while the worker shapes, compresses, and uploads the previous one.
+        A single worker preserves page order; a depth-1 queue bounds resident pages to
+        roughly three (one being fetched, one queued, one uploading) and applies
+        backpressure by blocking ``submit`` when the worker falls behind.
+
+        The wrapped stage callable owns nonlocal counters (page/row counts); it runs
+        only on the worker thread, and ``close`` joins that thread before the caller
+        reads them. A stage error is captured and re-raised at the next ``submit`` (so
+        the fetch loop stops early) and again at ``close``; ``shutdown`` joins without
+        raising, for the path where a primary error is already propagating.
+        """
+
+        def __init__(self, stage: Callable[[int, int, list], None], *, queue_size: int = 1) -> None:
+            self._stage = stage
+            self._queue: queue.Queue = queue.Queue(maxsize=max(1, queue_size))
+            self._error: BaseException | None = None
+            self._started = False
+            self._thread = threading.Thread(
+                target=self._run, name="informix-snapshot-uploader", daemon=True
+            )
+
+        def submit(self, snapshot_lsn: int, page_index: int, page_rows: list) -> None:
+            if not self._started:
+                self._started = True
+                self._thread.start()
+            if self._error is not None:
+                raise self._error
+            self._queue.put((snapshot_lsn, page_index, page_rows))
+
+        def _run(self) -> None:
+            while True:
+                item = self._queue.get()
+                if item is None:
+                    return
+                if self._error is not None:
+                    # Drain the backlog without processing once a page has failed; the
+                    # error is surfaced to the caller through submit/close.
+                    continue
+                try:
+                    self._stage(*item)
+                except BaseException as error:  # noqa: BLE001 - re-raised on the caller's thread
+                    self._error = error
+
+        def close(self) -> None:
+            """Finish all queued pages, join the worker, then re-raise any stage error."""
+
+            if self._started:
+                self._queue.put(None)
+                self._thread.join()
+            if self._error is not None:
+                raise self._error
+
+        def shutdown(self) -> None:
+            """Join the worker without raising -- for use while another error propagates."""
+
+            if self._started:
+                self._queue.put(None)
+                self._thread.join()
+
+
     class InformixLakeflowConnect(LakeflowConnect):
         """Pure-Python connector live-validated on disposable Informix 15.
 
@@ -9812,6 +9883,7 @@ def register_lakeflow_source(spark):
             _option_bool(options, _CONNECTION_FAIR_QUEUE_OPTION, True)
             _option_bool(options, _SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION, True)
             _option_bool(options, _PROMOTE_UNIQUE_INDEX_OPTION, True)
+            _option_bool(options, _SNAPSHOT_STAGING_PIPELINE_OPTION, True)
             staging_transport = (
                 str(
                     options.get(_SNAPSHOT_STAGING_TRANSPORT_OPTION, _DEFAULT_SNAPSHOT_STAGING_TRANSPORT)
@@ -11674,6 +11746,20 @@ def register_lakeflow_source(spark):
             self._staging_files_api = files_api
             return files_api
 
+        def _should_pipeline_staging(self, table: Table) -> bool:
+            """Whether to overlap this drain's page fetch with the page upload.
+
+            Only for a keyless positional drain over the REST transport: keyed drains
+            are out of scope, and pipelining FUSE writes would raise the mount's write
+            frequency -- the exact condition the REST transport exists to avoid.
+            """
+
+            if table.primary_keys:
+                return False
+            if not _option_bool(self.options, _SNAPSHOT_STAGING_PIPELINE_OPTION, True):
+                return False
+            return self._staging_transport() is not None
+
         def _build_staging_credential_provider(
             self, *, required: bool
         ) -> StagingCredentialProvider | None:
@@ -12718,21 +12804,37 @@ def register_lakeflow_source(spark):
                     if self._drain_progress is not None:
                         self._drain_progress()
 
-                snapshot_lsn, rows = consistent_snapshot(
-                    table.identity,
-                    [c.name for c in table.columns],
-                    table.primary_keys,
-                    page_size,
-                    max_rows,
-                    self._table_int_option(options, "snapshot.max.bytes", 0, minimum=0),
-                    datetime_primary_key=any(
-                        column.name in table.primary_keys and column.type_name == "DATETIME"
-                        for column in table.columns
-                    ),
-                    page_consumer=stage_page,
-                    snapshot_filter=_snapshot_filter(options),
-                    isolation=self._snapshot_isolation(options),
+                # A keyless REST drain overlaps the next page fetch with the previous
+                # page's shape+upload through a bounded background uploader; the counters
+                # stage_page owns are then read only after the pipeline is joined below.
+                pipeline = (
+                    _AsyncStagePipeline(stage_page) if self._should_pipeline_staging(table) else None
                 )
+                page_consumer = pipeline.submit if pipeline is not None else stage_page
+                try:
+                    snapshot_lsn, rows = consistent_snapshot(
+                        table.identity,
+                        [c.name for c in table.columns],
+                        table.primary_keys,
+                        page_size,
+                        max_rows,
+                        self._table_int_option(options, "snapshot.max.bytes", 0, minimum=0),
+                        datetime_primary_key=any(
+                            column.name in table.primary_keys and column.type_name == "DATETIME"
+                            for column in table.columns
+                        ),
+                        page_consumer=page_consumer,
+                        snapshot_filter=_snapshot_filter(options),
+                        isolation=self._snapshot_isolation(options),
+                    )
+                    if pipeline is not None:
+                        # Finish and join every queued upload so page_count/row_count are
+                        # complete before the manifest is published, re-raising any error.
+                        pipeline.close()
+                except BaseException:
+                    if pipeline is not None:
+                        pipeline.shutdown()
+                    raise
                 try:
                     snapshot_lsn = _strict_lsn(snapshot_lsn, "snapshot_lsn")
                 except ValueError as error:
