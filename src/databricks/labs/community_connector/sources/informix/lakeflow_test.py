@@ -2479,13 +2479,16 @@ class LakeflowContractTests(unittest.TestCase):
             500,
         )
 
+        # The redundant leading-column seek bound (hpolicy >= ?) precedes the
+        # OR-form so the optimizer can seek to the cursor instead of scanning from
+        # the index head; its bind leads the OR-form binds.
         self.assertEqual(
             bridge.transport.sql,
             "SELECT {+FIRST_ROWS(500)} FIRST 500 hpolicy,clm_no FROM demo:app.tw305 "
-            "WHERE ((hpolicy > ?) OR (hpolicy = ? AND clm_no > ?)) "
+            "WHERE hpolicy >= ? AND ((hpolicy > ?) OR (hpolicy = ? AND clm_no > ?)) "
             "ORDER BY hpolicy,clm_no",
         )
-        self.assertEqual(bridge.transport.parameters, (100, 100, 34))
+        self.assertEqual(bridge.transport.parameters, (100, 100, 100, 34))
 
     def test_snapshot_page_mixed_direction_pages_in_index_order(self):
         # Key (hpolicy ASC, clm_no DESC): the ORDER BY matches the index so a
@@ -2511,13 +2514,108 @@ class LakeflowContractTests(unittest.TestCase):
             key_descending=[False, True],
         )
 
+        # Leading hpolicy is ASC, so the seek bound stays ">=" while the DESC
+        # trailing column keeps its flipped "<" in the OR-form -- the seek bound
+        # reuses is_descending(0) and does not disturb the index-direction order.
         self.assertEqual(
             bridge.transport.sql,
             "SELECT {+FIRST_ROWS(500)} FIRST 500 hpolicy,clm_no FROM demo:app.tw305 "
-            "WHERE ((hpolicy > ?) OR (hpolicy = ? AND clm_no < ?)) "
+            "WHERE hpolicy >= ? AND ((hpolicy > ?) OR (hpolicy = ? AND clm_no < ?)) "
             "ORDER BY hpolicy,clm_no DESC",
         )
-        self.assertEqual(bridge.transport.parameters, (100, 100, 34))
+        self.assertEqual(bridge.transport.parameters, (100, 100, 100, 34))
+
+    def test_snapshot_page_seek_bound_flips_for_descending_leading_column(self):
+        # A DESC leading column must seek with "<=" (next-in-scan-order is smaller),
+        # matching its index-direction iteration -- not ">=", which would drop the
+        # rest of the descending scan.
+        class SnapshotTransport:
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                del max_result_bytes
+                self.sql = sql
+                self.parameters = parameters
+                return []
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.transport = SnapshotTransport()
+
+        bridge.snapshot_page(
+            "demo.app.tw305",
+            ["hpolicy", "clm_no"],
+            ["hpolicy", "clm_no"],
+            [100, 34],
+            500,
+            key_descending=[True, False],
+        )
+
+        self.assertEqual(
+            bridge.transport.sql,
+            "SELECT {+FIRST_ROWS(500)} FIRST 500 hpolicy,clm_no FROM demo:app.tw305 "
+            "WHERE hpolicy <= ? AND ((hpolicy < ?) OR (hpolicy = ? AND clm_no > ?)) "
+            "ORDER BY hpolicy DESC,clm_no",
+        )
+        self.assertEqual(bridge.transport.parameters, (100, 100, 100, 34))
+
+    def test_snapshot_page_seek_bound_omitted_for_null_leading_cursor(self):
+        # A NULL leading cursor value (possible under allow.nullable.index) must
+        # NOT emit `k1 >= NULL` -- it is UNKNOWN for every row and would return an
+        # empty page, silently dropping the rest of the table. The OR-form, which
+        # already excludes NULL leading values, is kept as-is.
+        class SnapshotTransport:
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                del max_result_bytes
+                self.sql = sql
+                self.parameters = parameters
+                return []
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.transport = SnapshotTransport()
+
+        bridge.snapshot_page("demo.app.orders", ["id"], ["id"], [None], 20)
+
+        self.assertEqual(
+            bridge.transport.sql,
+            "SELECT {+FIRST_ROWS(20)} FIRST 20 id FROM demo:app.orders "
+            "WHERE ((id > ?)) ORDER BY id",
+        )
+        self.assertNotIn(">=", bridge.transport.sql)
+        self.assertEqual(bridge.transport.parameters, (None,))
+
+    def test_snapshot_page_seek_bound_omitted_for_chunked_leading_key(self):
+        # An order-preserving cast (chunk_exprs) leading key gets no seek bound:
+        # no index serves the cast, so the bound would neither seek nor stay
+        # provably redundant. (A numeric cursor here keeps the DATETIME describe
+        # probe out of the way; the guard is chunk_exprs membership, not value type.)
+        class SnapshotTransport:
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                del max_result_bytes
+                self.sql = sql
+                self.parameters = parameters
+                return []
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.transport = SnapshotTransport()
+
+        bridge.snapshot_page(
+            "demo.app.events",
+            ["ts"],
+            ["ts"],
+            [12345],
+            20,
+            chunk_exprs={"ts": "TO_CHAR(ts)"},
+        )
+
+        self.assertNotIn(">=", bridge.transport.sql)
+        self.assertNotIn("<=", bridge.transport.sql)
+        self.assertEqual(
+            bridge.transport.sql,
+            "SELECT {+FIRST_ROWS(20)} FIRST 20 ts,TO_CHAR(ts) AS __chunk_ts FROM demo:app.events "
+            "WHERE ((TO_CHAR(ts) > ?)) ORDER BY TO_CHAR(ts)",
+        )
+        self.assertEqual(bridge.transport.parameters, (12345,))
 
     def test_snapshot_page_chunked_key_ignores_direction(self):
         # A chunked (DATETIME) key has no direction-aware index to match, so even
@@ -2570,9 +2668,9 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(
             bridge.transport.sql,
             "SELECT {+FIRST_ROWS(20)} FIRST 20 id FROM demo:app.orders "
-            "WHERE (status = 'A') AND ((id > ?)) ORDER BY id",
+            "WHERE (status = 'A') AND id >= ? AND ((id > ?)) ORDER BY id",
         )
-        self.assertEqual(bridge.transport.parameters, (10,))
+        self.assertEqual(bridge.transport.parameters, (10, 10))
 
     def test_snapshot_filter_rejects_statement_stacking_and_comments(self):
         for predicate in ("status = 'A'; DROP TABLE orders", "1=1 -- all", "/* all */ 1=1"):
