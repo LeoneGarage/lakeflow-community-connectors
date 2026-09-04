@@ -8964,6 +8964,166 @@ class SnapshotReconnectTests(unittest.TestCase):
         self.assertEqual(bridge.reset_calls, 0, "a lease-loss drop must not reset/retry")
 
 
+class LakebaseStateReconnectTests(unittest.TestCase):
+    """A Lakebase (Postgres) state connection reaped while idle is dropped and the
+    identical, idempotent state operation reissued on a fresh connection, rather
+    than surfacing as a stream failure.
+
+    Regression: production tw305 crash-looped on
+    ``psycopg2.OperationalError: SSL SYSCALL error: EOF detected`` from
+    ``publish_minimum_lsn_state_record`` -- the connector held its state
+    connection idle across a long wait for capacity (``backlog_streak`` 4), the
+    server reaped it, psycopg left ``.closed`` False so ``_lakebase_connection``
+    handed the dead handle back, and the state path had no reconnect wrapper
+    (only the Informix SQLI reads did).
+    """
+
+    class _FakeConnLost(Exception):
+        """Stands in for psycopg's OperationalError/InterfaceError."""
+
+    def setUp(self):
+        self._shared_state = tempfile.TemporaryDirectory()
+        self._lakebase = _OfflineLakebase().install(self)
+
+    def tearDown(self):
+        self._shared_state.cleanup()
+
+    def _connector(self):
+        connector = InformixLakeflowConnect(
+            {
+                "database": "demo",
+                "snapshot.staging.location": self._shared_state.name,
+                "lakebase.password": "test-state-password",
+                "cdc.shared.session": "false",
+                "snapshot.shared.session": "false",
+            }
+        )
+        connector.set_registration_scope(hashlib.sha256(b"lakebase-reconnect").hexdigest()[:32])
+        return connector
+
+    def _instrument(self, connector, *, closed_after_drop=True):
+        """Wire a counting reset that mimics the real one (drops the handle)."""
+
+        resets = {"n": 0}
+
+        def fake_reset():
+            resets["n"] += 1
+            connector._lakebase_conn = None
+
+        connector._reset_lakebase_connection = fake_reset
+        # The handle the loop inspects after a drop: closed => a genuine reap that
+        # is safe to reconnect; open => a live-connection error left as-is.
+        connector._lakebase_conn = types.SimpleNamespace(closed=closed_after_drop)
+        return resets
+
+    def test_state_op_reconnects_and_retries_after_dropped_connection(self):
+        connector = self._connector()
+        resets = self._instrument(connector)
+        drops = {"n": 0}
+
+        def flaky():
+            if drops["n"] < 2:
+                drops["n"] += 1
+                # A drop leaves the cached handle closed, as psycopg does once a
+                # query fails on a reaped socket.
+                connector._lakebase_conn = types.SimpleNamespace(closed=True)
+                raise self._FakeConnLost("SSL SYSCALL error: EOF detected")
+            return "elected"
+
+        with (
+            mock.patch.object(
+                informix_module,
+                "connection_lost_error_types",
+                return_value=(self._FakeConnLost,),
+            ),
+            mock.patch.object(time, "sleep"),
+        ):
+            result = connector._state_op_with_reconnect(flaky, operation="unit publish")
+
+        self.assertEqual(result, "elected")
+        self.assertEqual(drops["n"], 2)  # two reaps absorbed in place
+        self.assertEqual(resets["n"], 2)  # one reconnect per reap
+
+    def test_state_op_does_not_retry_a_live_connection_error(self):
+        # A failure on a still-open connection (e.g. a serialization conflict,
+        # also an OperationalError subclass) is not a drop: propagate at once,
+        # never reconnect.
+        connector = self._connector()
+        resets = self._instrument(connector, closed_after_drop=False)
+
+        def live_error():
+            connector._lakebase_conn = types.SimpleNamespace(closed=False)
+            raise self._FakeConnLost("could not serialize access")
+
+        with (
+            mock.patch.object(
+                informix_module,
+                "connection_lost_error_types",
+                return_value=(self._FakeConnLost,),
+            ),
+            mock.patch.object(time, "sleep"),
+        ):
+            with self.assertRaisesRegex(self._FakeConnLost, "serialize"):
+                connector._state_op_with_reconnect(live_error, operation="unit publish")
+        self.assertEqual(resets["n"], 0, "a live-connection error must not reconnect")
+
+    def test_state_op_raises_after_reconnect_retries_exhausted(self):
+        connector = self._connector()
+        resets = self._instrument(connector)
+
+        def always_drops():
+            connector._lakebase_conn = types.SimpleNamespace(closed=True)
+            raise self._FakeConnLost("server closed the connection unexpectedly")
+
+        with (
+            mock.patch.object(
+                informix_module,
+                "connection_lost_error_types",
+                return_value=(self._FakeConnLost,),
+            ),
+            mock.patch.object(time, "sleep"),
+        ):
+            with self.assertRaisesRegex(self._FakeConnLost, "server closed"):
+                connector._state_op_with_reconnect(always_drops, operation="unit publish")
+        self.assertEqual(resets["n"], informix_module._LAKEBASE_RECONNECT_MAX_RETRIES)
+
+    def test_state_op_passes_through_when_driver_reports_no_error_types(self):
+        # Neither psycopg2 nor psycopg importable => no types to catch => the
+        # operation runs once and any error propagates unwrapped.
+        connector = self._connector()
+        resets = self._instrument(connector)
+
+        with mock.patch.object(informix_module, "connection_lost_error_types", return_value=()):
+            self.assertEqual(
+                connector._state_op_with_reconnect(lambda: "ok", operation="unit"),
+                "ok",
+            )
+            with self.assertRaises(self._FakeConnLost):
+                connector._state_op_with_reconnect(self._raise_conn_lost, operation="unit")
+        self.assertEqual(resets["n"], 0)
+
+    def _raise_conn_lost(self):
+        raise self._FakeConnLost("boom")
+
+    def test_connection_lost_error_types_are_resolved_from_the_driver(self):
+        from databricks.labs.community_connector.sources.informix import lakebase_state
+
+        lakebase_state._CONNECTION_LOST_ERROR_TYPES = None
+        try:
+            types_tuple = lakebase_state.connection_lost_error_types()
+        finally:
+            lakebase_state._CONNECTION_LOST_ERROR_TYPES = None
+        self.assertIsInstance(types_tuple, tuple)
+        for error_type in types_tuple:
+            self.assertTrue(issubclass(error_type, BaseException))
+        try:
+            import psycopg2  # noqa: PLC0415
+        except ImportError:
+            self.skipTest("psycopg2 not installed in this environment")
+        self.assertIn(psycopg2.OperationalError, types_tuple)
+        self.assertIn(psycopg2.InterfaceError, types_tuple)
+
+
 class ConnectionSlotLeaseLossTests(unittest.TestCase):
     """The heartbeat's lease-loss path.
 

@@ -1816,6 +1816,39 @@ RETURNING record
 """
 
 
+_CONNECTION_LOST_ERROR_TYPES: tuple[type[BaseException], ...] | None = None
+
+
+def connection_lost_error_types() -> tuple[type[BaseException], ...]:
+    """Return the driver exception types raised when a connection is severed.
+
+    A Lakebase (Postgres) connection left idle -- e.g. across a long wait for
+    connection capacity -- is reaped by the server, and the next query on it
+    fails with ``OperationalError`` ("SSL SYSCALL error: EOF detected", "server
+    closed the connection unexpectedly") or ``InterfaceError`` ("connection
+    already closed"). Callers catch these to reconnect and retry an idempotent
+    state operation. Resolved once against whichever driver is installed
+    (``psycopg2`` or ``psycopg`` v3); an empty tuple when neither is importable
+    so the caller simply never matches and propagates.
+    """
+
+    global _CONNECTION_LOST_ERROR_TYPES  # noqa: PLW0603
+    if _CONNECTION_LOST_ERROR_TYPES is not None:
+        return _CONNECTION_LOST_ERROR_TYPES
+    types: list[type[BaseException]] = []
+    for module_name in ("psycopg2", "psycopg"):
+        try:
+            module = __import__(module_name)
+        except ImportError:
+            continue
+        for attribute in ("OperationalError", "InterfaceError"):
+            error_type = getattr(module, attribute, None)
+            if isinstance(error_type, type) and issubclass(error_type, BaseException):
+                types.append(error_type)
+    _CONNECTION_LOST_ERROR_TYPES = tuple(types)
+    return _CONNECTION_LOST_ERROR_TYPES
+
+
 def publish_state_record(
     connection: Any,
     namespace: str,
