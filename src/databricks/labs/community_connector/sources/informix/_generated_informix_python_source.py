@@ -7773,6 +7773,34 @@ def register_lakeflow_source(spark):
                             bound_after[index] = InformixDatetimeLiteral(
                                 bound_after[index], int(descriptor["length"])
                             )
+                # Guarded leading-column seek bound. The OR-form keyset below is
+                # frequently not recognized by the optimizer as an index range start,
+                # so the scan begins at the index head and re-reads then discards the
+                # whole already-copied prefix every page -- cost grows with the cursor
+                # and a large table eventually times a page out (tw305). This redundant
+                # bound gives the optimizer a concrete value to seek to, and unlike the
+                # {+FIRST_ROWS} directive it is honored where external directives are
+                # disabled. It is added as a separate conjunct and does not touch the
+                # ORDER BY or the OR-form, so the index-direction (ASC/DESC) ordered
+                # iteration is unchanged; it only reuses is_descending(0) to pick the
+                # matching comparator (>= for ASC, <= for DESC).
+                #
+                # It is result-preserving only under guards, so it is omitted otherwise
+                # rather than risk silently dropping rows:
+                #   * leading key must be a plain indexed column, not an order-preserving
+                #     cast (chunk_exprs): no index serves the cast, and its ordering can
+                #     diverge from the column's, so the bound would neither seek nor stay
+                #     provably redundant;
+                #   * the leading cursor value must be non-NULL: `k1 >= NULL` is UNKNOWN
+                #     for every row and would return an empty page (a nullable leading
+                #     column under allow.nullable.index can resume from NULL). Rows whose
+                #     leading value IS NULL are already excluded by the OR-form itself
+                #     (NULL > ? / NULL < ? are UNKNOWN), so the bound removes exactly the
+                #     same rows the OR-form does -- it never drops a row the OR-form keeps.
+                if primary_keys and primary_keys[0] not in chunk_exprs and bound_after[0] is not None:
+                    seek_comparison = "<=" if is_descending(0) else ">="
+                    predicates.append(f"{order_term(primary_keys[0])} {seek_comparison} ?")
+                    parameters.append(bound_after[0])
                 clauses = []
                 for index, key in enumerate(primary_keys):
                     prefix = " AND ".join(

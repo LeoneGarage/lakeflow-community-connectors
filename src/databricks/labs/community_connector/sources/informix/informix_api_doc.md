@@ -229,10 +229,23 @@ The keyset **page reads** that copy a keyed table carry the same
 `{+FIRST_ROWS(n)}` directive. Their predicate is the OR-form
 `(k1 > ?) OR (k1 = ? AND k2 > ?)`, which optimizers often do not recognize as an
 index range start, so a composite `ORDER BY k1, k2` can tip into a full scan +
-top-sort per page on a large table. The directive asks the optimizer to stream
-the page from the key index in order instead; `UPDATE STATISTICS HIGH` on the
-source is the complementary fix, steering the cost model to the same plan even
-where external directives are disabled.
+top-sort per page — and since each page then rescans and discards the whole
+already-copied prefix, cost grows with the cursor until a page times out on a
+large table (the tw305 signature). Three things steer it back to an index seek:
+the `{+FIRST_ROWS(n)}` directive; `UPDATE STATISTICS HIGH` on the source, which
+steers the cost model to the same plan; and a **guarded leading-column seek
+bound** — a redundant `k1 >= ?` (`k1 <= ?` when the leading column is DESC)
+prepended to the predicate. Unlike the directive, the bound is honored even where
+external directives are disabled, and it gives the optimizer a concrete value to
+seek to. It is result-preserving because every OR-form disjunct already implies
+it (and the OR-form already excludes NULL leading values, so the bound removes
+exactly the same rows), and it does not touch the `ORDER BY` or the OR-form, so
+mixed-direction iteration (below) is unchanged. It is **guarded** — omitted
+rather than risk silently dropping rows — when the leading key is an
+order-preserving cast (`chunk_exprs`, which no index serves) or the leading
+cursor value is NULL (`k1 >= NULL` is UNKNOWN for every row and would return an
+empty page; a nullable leading column under `allow.nullable.index` can resume
+from NULL).
 
 **Mixed-direction key indexes.** When the key comes from a discovered index (a
 PRIMARY KEY constraint or a promoted UNIQUE index) whose columns are not all
