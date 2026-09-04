@@ -2916,6 +2916,39 @@ def register_lakeflow_source(spark):
     """
 
 
+    _CONNECTION_LOST_ERROR_TYPES: tuple[type[BaseException], ...] | None = None
+
+
+    def connection_lost_error_types() -> tuple[type[BaseException], ...]:
+        """Return the driver exception types raised when a connection is severed.
+
+        A Lakebase (Postgres) connection left idle -- e.g. across a long wait for
+        connection capacity -- is reaped by the server, and the next query on it
+        fails with ``OperationalError`` ("SSL SYSCALL error: EOF detected", "server
+        closed the connection unexpectedly") or ``InterfaceError`` ("connection
+        already closed"). Callers catch these to reconnect and retry an idempotent
+        state operation. Resolved once against whichever driver is installed
+        (``psycopg2`` or ``psycopg`` v3); an empty tuple when neither is importable
+        so the caller simply never matches and propagates.
+        """
+
+        global _CONNECTION_LOST_ERROR_TYPES  # noqa: PLW0603
+        if _CONNECTION_LOST_ERROR_TYPES is not None:
+            return _CONNECTION_LOST_ERROR_TYPES
+        types: list[type[BaseException]] = []
+        for module_name in ("psycopg2", "psycopg"):
+            try:
+                module = __import__(module_name)
+            except ImportError:
+                continue
+            for attribute in ("OperationalError", "InterfaceError"):
+                error_type = getattr(module, attribute, None)
+                if isinstance(error_type, type) and issubclass(error_type, BaseException):
+                    types.append(error_type)
+        _CONNECTION_LOST_ERROR_TYPES = tuple(types)
+        return _CONNECTION_LOST_ERROR_TYPES
+
+
     def publish_state_record(
         connection: Any,
         namespace: str,
@@ -5872,6 +5905,18 @@ def register_lakeflow_source(spark):
     _SNAPSHOT_RECONNECT_MAX_RETRIES = 4
     _SNAPSHOT_RECONNECT_BASE_SECONDS = 0.5
     _SNAPSHOT_RECONNECT_MAX_SECONDS = 8.0
+    # The Lakebase (Postgres) state connection drops the same way but on the other
+    # transport: a connection left idle across a long wait for capacity is reaped by
+    # the server, and because psycopg leaves ``.closed`` False until the next query,
+    # the cached handle is handed back dead and the next ``execute`` raises
+    # ``OperationalError`` ("SSL SYSCALL error: EOF detected"). State operations are
+    # idempotent (monotonic-min upsert, DO-NOTHING election, bare SELECT, idempotent
+    # DELETE) and commit only after the round-trip succeeds, so a dead connection can
+    # be dropped and the identical operation reissued on a fresh one. Mirrors the two
+    # SQLI budgets above.
+    _LAKEBASE_RECONNECT_MAX_RETRIES = 4
+    _LAKEBASE_RECONNECT_BASE_SECONDS = 0.5
+    _LAKEBASE_RECONNECT_MAX_SECONDS = 8.0
     # Ceiling on the jittered pause a starved continuous reader takes before yielding,
     # and on the budget it spends acquiring a slot.
     #
@@ -13104,6 +13149,60 @@ def register_lakeflow_source(spark):
                     time.sleep(delay)
                     attempt += 1
 
+        def _state_op_with_reconnect(self, thunk, *, operation: str):
+            """Run one Lakebase state read/write, retrying in place on a dropped connection.
+
+            A state connection reaped while idle (typically across a long wait for
+            connection capacity) is handed back by ``_lakebase_connection`` because
+            psycopg leaves ``.closed`` False until a query fails; the next
+            ``cursor.execute`` then raises ``OperationalError``/``InterfaceError``.
+            The operation committed nothing (the failure precedes ``commit``) and is
+            idempotent, so the dead handle is dropped and the identical operation
+            reissued on a fresh connection. ``thunk`` must re-fetch
+            ``self._lakebase_connection()`` each call so the retry uses the reopened
+            handle. Bounded attempts with short backoff absorb a transient reap;
+            exhausting them re-raises. Postgres counterpart of
+            ``_snapshot_read_with_reconnect``.
+
+            Only a genuinely-dead connection is retried: after the error the cached
+            handle must report closed. A failure on a still-live connection (e.g. a
+            serialization conflict, also an ``OperationalError`` subclass) is not a
+            drop and propagates unchanged.
+            """
+
+            connection_lost = connection_lost_error_types()
+            if not connection_lost:
+                return thunk()
+            attempt = 0
+            while True:
+                try:
+                    return thunk()
+                except connection_lost as error:
+                    connection = getattr(self, "_lakebase_conn", None)
+                    try:
+                        still_alive = connection is not None and not connection.closed
+                    except Exception:  # pragma: no cover - a broken handle counts as dead
+                        still_alive = False
+                    if still_alive or attempt >= _LAKEBASE_RECONNECT_MAX_RETRIES:
+                        raise
+                    delay = min(
+                        _LAKEBASE_RECONNECT_BASE_SECONDS * (2**attempt),
+                        _LAKEBASE_RECONNECT_MAX_SECONDS,
+                    )
+                    logging.getLogger(__name__).warning(
+                        "Informix Lakebase state %s lost its connection (%s); reconnecting and "
+                        "retrying the same operation (attempt %d/%d) after %.1fs",
+                        operation,
+                        error,
+                        attempt + 1,
+                        _LAKEBASE_RECONNECT_MAX_RETRIES,
+                        delay,
+                        exc_info=True,
+                    )
+                    self._reset_lakebase_connection()
+                    time.sleep(delay)
+                    attempt += 1
+
         def _shared_cdc_enabled(self) -> bool:
             return _option_bool(self.options, _SHARED_CDC_SESSION_OPTION, True)
 
@@ -13941,21 +14040,24 @@ def register_lakeflow_source(spark):
             """
 
             namespace = self._immutable_namespace(table, "channel-starts", scope, "upsert")
-            winner = publish_minimum_lsn_state_record(
-                self._lakebase_connection(),
-                self._lakebase_state_namespace(),
-                namespace,
-                {
-                    "created_at": time.time(),
-                    "fingerprint": fingerprint,
-                    "format_version": _IMMUTABLE_STATE_VERSION,
-                    "record_type": "channel-start",
-                    "schema_id": schema_id,
-                    "scope": scope,
-                    "start_lsn": str(start_lsn),
-                    "table": table.native_identity,
-                },
-                record_type="channel-start",
+            winner = self._state_op_with_reconnect(
+                lambda: publish_minimum_lsn_state_record(
+                    self._lakebase_connection(),
+                    self._lakebase_state_namespace(),
+                    namespace,
+                    {
+                        "created_at": time.time(),
+                        "fingerprint": fingerprint,
+                        "format_version": _IMMUTABLE_STATE_VERSION,
+                        "record_type": "channel-start",
+                        "schema_id": schema_id,
+                        "scope": scope,
+                        "start_lsn": str(start_lsn),
+                        "table": table.native_identity,
+                    },
+                    record_type="channel-start",
+                ),
+                operation="upsert channel-start publish",
             )
             self._validate_immutable_record_header(winner, "channel-start", table.exposed_name)
             winner_start = self._immutable_lsn(winner, "start_lsn", table.exposed_name)
@@ -14053,7 +14155,11 @@ def register_lakeflow_source(spark):
                 )
             )
             return (
-                read_state_record(self._lakebase_connection(), connection_key, record_key) is not None
+                self._state_op_with_reconnect(
+                    lambda: read_state_record(self._lakebase_connection(), connection_key, record_key),
+                    operation="channel-start probe",
+                )
+                is not None
             )
 
         def _native_table_state_identity(self, exposed: str) -> tuple[str, str, str] | None:
@@ -14116,21 +14222,24 @@ def register_lakeflow_source(spark):
                     "upsert",
                 )
             )
-            winner = publish_minimum_lsn_state_record(
-                self._lakebase_connection(),
-                connection_key,
-                record_key,
-                {
-                    "created_at": time.time(),
-                    "fingerprint": fingerprint,
-                    "format_version": _IMMUTABLE_STATE_VERSION,
-                    "record_type": "channel-start",
-                    "schema_id": schema_id,
-                    "scope": scope,
-                    "start_lsn": str(start_lsn),
-                    "table": native_identity,
-                },
-                record_type="channel-start",
+            winner = self._state_op_with_reconnect(
+                lambda: publish_minimum_lsn_state_record(
+                    self._lakebase_connection(),
+                    connection_key,
+                    record_key,
+                    {
+                        "created_at": time.time(),
+                        "fingerprint": fingerprint,
+                        "format_version": _IMMUTABLE_STATE_VERSION,
+                        "record_type": "channel-start",
+                        "schema_id": schema_id,
+                        "scope": scope,
+                        "start_lsn": str(start_lsn),
+                        "table": native_identity,
+                    },
+                    record_type="channel-start",
+                ),
+                operation="pre-capacity channel-start publish",
             )
             winner_start = self._immutable_lsn(winner, "start_lsn", exposed)
             if (
@@ -14492,23 +14601,28 @@ def register_lakeflow_source(spark):
                 return
             prefix = self._immutable_namespace(table)
             pipeline_key = hashlib.sha256(pipeline_id.encode()).hexdigest()[:32]
-            connection = self._lakebase_connection()
             namespace = self._lakebase_state_namespace()
-            touch_table_activity(
-                connection,
-                namespace,
-                f"{prefix}/activity/{pipeline_key}",
-                prefix,
-                pipeline_id,
-                touch_seconds,
+            self._state_op_with_reconnect(
+                lambda: touch_table_activity(
+                    self._lakebase_connection(),
+                    namespace,
+                    f"{prefix}/activity/{pipeline_key}",
+                    prefix,
+                    pipeline_id,
+                    touch_seconds,
+                ),
+                operation="table-activity touch",
             )
             self._activity_touched[cache_key] = now
-            deleted = collect_stale_table_state(
-                connection,
-                namespace,
-                "state-gc/table-activity",
-                retention_days,
-                interval_hours,
+            deleted = self._state_op_with_reconnect(
+                lambda: collect_stale_table_state(
+                    self._lakebase_connection(),
+                    namespace,
+                    "state-gc/table-activity",
+                    retention_days,
+                    interval_hours,
+                ),
+                operation="stale-state GC",
             )
             if deleted:
                 logging.getLogger(__name__).info(
@@ -14558,13 +14672,16 @@ def register_lakeflow_source(spark):
                     and _PIPELINE_SCOPE.fullmatch(candidate) is not None
                 ):
                     retained_scope = candidate
-            deleted = delete_obsolete_scoped_state_records(
-                self._lakebase_connection(),
-                self._lakebase_state_namespace(),
-                self._immutable_namespace(table),
-                f"{pipeline_id}_@_",
-                current,
-                retained_scope,
+            deleted = self._state_op_with_reconnect(
+                lambda: delete_obsolete_scoped_state_records(
+                    self._lakebase_connection(),
+                    self._lakebase_state_namespace(),
+                    self._immutable_namespace(table),
+                    f"{pipeline_id}_@_",
+                    current,
+                    retained_scope,
+                ),
+                operation="obsolete-scope cleanup",
             )
             self._cleaned_update_scopes.add(cache_key)
             if deleted:
@@ -14596,8 +14713,11 @@ def register_lakeflow_source(spark):
         def _read_immutable_head(self, namespace: str) -> dict[str, object] | None:
             """Return the elected record for a key, or None when unwritten."""
 
-            return read_state_record(
-                self._lakebase_connection(), self._lakebase_state_namespace(), namespace
+            return self._state_op_with_reconnect(
+                lambda: read_state_record(
+                    self._lakebase_connection(), self._lakebase_state_namespace(), namespace
+                ),
+                operation="head read",
             )
 
         def _publish_immutable_head(
@@ -14615,16 +14735,19 @@ def register_lakeflow_source(spark):
             winner rather than assume its own value took effect.
             """
 
-            return publish_state_record(
-                self._lakebase_connection(),
-                self._lakebase_state_namespace(),
-                namespace,
-                {
-                    **record,
-                    "format_version": _IMMUTABLE_STATE_VERSION,
-                    "record_type": record_type,
-                },
-                record_type=record_type,
+            return self._state_op_with_reconnect(
+                lambda: publish_state_record(
+                    self._lakebase_connection(),
+                    self._lakebase_state_namespace(),
+                    namespace,
+                    {
+                        **record,
+                        "format_version": _IMMUTABLE_STATE_VERSION,
+                        "record_type": record_type,
+                    },
+                    record_type=record_type,
+                ),
+                operation="head publish",
             )
 
         @staticmethod
