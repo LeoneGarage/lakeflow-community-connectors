@@ -12222,11 +12222,7 @@ def register_lakeflow_source(spark):
                     schema_id,
                     pipeline_scope,
                 )
-            # Drain-and-release: yield each row and drop the list's reference to it, so a
-            # row the write has consumed is freed during the write instead of being held
-            # (with the whole page) until the microbatch finishes. last_pk was already
-            # taken from decoded[-1] above, so draining the list now is safe.
-            return _iter_release(decoded), end
+            return iter(decoded), end
 
         @staticmethod
         def _datetime_primary_key(table: Table) -> bool:
@@ -15768,24 +15764,6 @@ def register_lakeflow_source(spark):
                 raise InformixError("Snapshot row contains reserved staging key '$informix'")
             return {key: _encode_snapshot_stage_value(item) for key, item in value.items()}
         raise InformixError(f"Snapshot value of type {type(value).__name__} cannot be staged safely")
-
-
-    def _iter_release(rows: list) -> Iterator[Any]:
-        """Yield each row, dropping the backing list's reference to it as it is emitted.
-
-        Serving a staged page hands its whole row list to the write. Iterating the list
-        directly keeps every row alive until the microbatch finishes; instead this
-        releases each row from the list the moment it is yielded, so a row the write has
-        already consumed can be collected mid-write rather than at the end. It does not
-        lower the initial peak (the full decoded page still exists at the first yield),
-        but it shrinks the resident set as the write drains a large wide page. The list
-        is mutated, so it must not be reused after being passed here.
-        """
-
-        for index in range(len(rows)):
-            row = rows[index]
-            rows[index] = None
-            yield row
 
 
     def _decode_snapshot_stage_value(value: Any) -> Any:
