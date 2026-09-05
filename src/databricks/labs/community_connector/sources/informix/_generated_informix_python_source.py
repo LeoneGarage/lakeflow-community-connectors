@@ -68,7 +68,6 @@ from pyspark.sql.types import (
     VariantVal,
 )
 import base64
-import concurrent.futures
 import contextlib
 import errno
 import fnmatch
@@ -5535,14 +5534,6 @@ def register_lakeflow_source(spark):
     _SNAPSHOT_READER_THREADS_OPTION = "snapshot.reader.threads"
     _DEFAULT_SNAPSHOT_READER_THREADS = 1
     _SNAPSHOT_RESERVATION_OPTION = "snapshot.connection.reservation"
-    # Overlap serving one staged snapshot page with reading+decoding the next: a
-    # background daemon thread prepares the next page's rows from the Volume while
-    # Spark writes the current page. On by default; it holds no connection slot and
-    # shares no mutable connection, costing only one extra page in driver memory, and
-    # only engages in the staged-serve phase (keyed blocking / keyless `initial`
-    # snapshots), not the keyed `incremental` path.
-    _SNAPSHOT_PREFETCH_OPTION = "snapshot.prefetch.enabled"
-    _DEFAULT_SNAPSHOT_PREFETCH = True
     # Isolation level for the monolithic ``snapshot.mode=initial`` full-table snapshot. A
     # table option: the isolation trade-off is per table, not per connection. Maps a small
     # validated token to a fixed SQL clause (so the value can never be SQL-injected). The
@@ -9805,87 +9796,6 @@ def register_lakeflow_source(spark):
                 pool.condition.notify_all()
 
 
-    class _StagedPagePrefetcher:
-        """Single-slot async prefetch of the next staged snapshot page.
-
-        Serving a staged snapshot pages one immutable Volume blob per microbatch: read
-        + gunzip + hash-verify + JSON-decode, all on the driver, then Spark writes the
-        page. This overlaps the *next* page's read+decode with the *current* page's
-        write by running it on a background thread, so the next ``read()`` takes it
-        from memory. The work is pure Volume I/O + CPU on an immutable blob -- no
-        Lakebase, no Informix, no connection slot -- so the worker shares no mutable
-        connection with the foreground and needs no capacity.
-
-        Holds at most one page. ``submit`` for a new key supersedes any pending entry;
-        a superseded worker still finishes but its result is discarded. ``take`` blocks
-        until the matching prefetch completes (that is the work the foreground needed
-        anyway) and, on any prefetch error, returns ``None`` so the caller reads
-        synchronously through the normal error/retry path -- prefetch is strictly
-        best-effort and never introduces a failure the synchronous read would not have.
-        Each worker is a daemon thread, so a stuck Volume read never blocks interpreter
-        exit.
-        """
-
-        def __init__(self) -> None:
-            self._lock = threading.Lock()
-            self._key: object = None
-            self._rows: list | None = None
-            self._error: BaseException | None = None
-            self._done = threading.Event()
-
-        def submit(self, key: object, loader: Callable[[], list]) -> None:
-            with self._lock:
-                if self._key == key:
-                    # Already prefetching or holding this exact page.
-                    return
-                self._key = key
-                self._rows = None
-                self._error = None
-                event = threading.Event()
-                self._done = event
-            thread = threading.Thread(
-                target=self._run,
-                args=(key, loader, event),
-                name="informix-page-prefetch",
-                daemon=True,
-            )
-            thread.start()
-
-        def _run(self, key: object, loader: Callable[[], list], event: threading.Event) -> None:
-            rows: list | None = None
-            error: BaseException | None = None
-            try:
-                rows = loader()
-            except BaseException as exc:  # noqa: BLE001 - surfaced only if this page is taken
-                error = exc
-            with self._lock:
-                if self._key == key:  # not superseded by a newer submit
-                    self._rows = rows
-                    self._error = error
-            event.set()
-
-        def take(self, key: object) -> list | None:
-            with self._lock:
-                if self._key != key:
-                    return None
-                event = self._done
-            event.wait()
-            with self._lock:
-                if self._key != key:  # superseded while we waited
-                    return None
-                rows, error = self._rows, self._error
-                self._key = None
-                self._rows = None
-                self._error = None
-            if error is not None:
-                logging.getLogger(__name__).debug(
-                    "staged snapshot page prefetch failed; reading synchronously",
-                    exc_info=(type(error), error, error.__traceback__),
-                )
-                return None
-            return rows
-
-
     class _AsyncStagePipeline:
         """Overlap a drain's next page fetch with the previous page's shape+upload.
 
@@ -10054,7 +9964,6 @@ def register_lakeflow_source(spark):
             _option_bool(options, _SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION, True)
             _option_bool(options, _PROMOTE_UNIQUE_INDEX_OPTION, True)
             _option_bool(options, _SNAPSHOT_STAGING_PIPELINE_OPTION, True)
-            _option_bool(options, _SNAPSHOT_PREFETCH_OPTION, _DEFAULT_SNAPSHOT_PREFETCH)
             staging_transport = (
                 str(
                     options.get(_SNAPSHOT_STAGING_TRANSPORT_OPTION, _DEFAULT_SNAPSHOT_STAGING_TRANSPORT)
@@ -10163,10 +10072,6 @@ def register_lakeflow_source(spark):
             self._staging_transport_resolved = False
             self._staging_files_api: WorkspaceFilesApi | None = None
             self._staging_workspace_host = ""
-            # Lazily created on the first staged-page prefetch; one per connector
-            # instance (one flow), reused across microbatches. Instance attribute, not
-            # a module global, so the merged single-file deployment is unaffected.
-            self._staged_page_prefetcher: _StagedPagePrefetcher | None = None
             self._registration_scope: str | None = _INFORMIX_REGISTRATION_CONTEXT["scope"]
             self._metadata_session_lock = threading.RLock()
             self._metadata_release_timer: threading.Timer | None = None
@@ -12240,12 +12145,16 @@ def register_lakeflow_source(spark):
                 raise InformixError(
                     f"Invalid staged snapshot page index {page_index} for " f"'{table.exposed_name}'"
                 )
-            # Serve this page (from the prefetch cache when a prior microbatch prepared
-            # it, else read+decode it now), and prefetch the next page so its read+decode
-            # overlaps this microbatch's write.
-            decoded = self._take_or_load_staged_page(
+            record = self._read_snapshot_stage_page_record(
                 table, pipeline_scope, schema_id, snapshot_lsn, page_index
             )
+            if _strict_lsn(record.get("snapshot_lsn"), "snapshot_lsn") != snapshot_lsn:
+                raise InformixError(f"Staged snapshot boundary mismatch for '{table.exposed_name}'")
+            decoded = _decode_snapshot_stage_value(record.get("rows"))
+            if not isinstance(decoded, list) or not all(isinstance(row, dict) for row in decoded):
+                raise InformixError(f"Invalid staged snapshot rows for '{table.exposed_name}'")
+            if int(record["row_count"]) != len(decoded):
+                raise InformixError(f"Staged snapshot row count mismatch for '{table.exposed_name}'")
             # The shared reader replays a batch from its start offset. Receiving
             # page_index=N as that start means Spark has advanced beyond every page
             # below N; retries continue from N, so those earlier immutable pages are
@@ -12259,11 +12168,6 @@ def register_lakeflow_source(spark):
             )
             next_page = page_index + 1
             if next_page < page_count:
-                # More pages remain in the snapshot phase (never across the stream
-                # boundary), so prefetching the next one is always useful work.
-                self._submit_staged_page_prefetch(
-                    table, pipeline_scope, schema_id, snapshot_lsn, next_page
-                )
                 last_pk = _encode_snapshot_stage_value([decoded[-1][key] for key in table.primary_keys])
                 end = _offset(
                     snapshot_lsn,
@@ -12298,85 +12202,6 @@ def register_lakeflow_source(spark):
                     pipeline_scope,
                 )
             return iter(decoded), end
-
-        def _load_staged_page_rows(
-            self,
-            table: Table,
-            pipeline_scope: str,
-            schema_id: str,
-            snapshot_lsn: int,
-            page_index: int,
-        ) -> list[dict[str, Any]]:
-            """Read, verify, and decode one staged page into its row list.
-
-            Pure Volume I/O + CPU on an immutable blob (``_read_snapshot_stage_page_record``
-            is an os-level FUSE read + gzip + hmac using only immutable state), so it is
-            safe to run either synchronously on the microbatch thread or on the prefetch
-            worker.
-            """
-
-            record = self._read_snapshot_stage_page_record(
-                table, pipeline_scope, schema_id, snapshot_lsn, page_index
-            )
-            if _strict_lsn(record.get("snapshot_lsn"), "snapshot_lsn") != snapshot_lsn:
-                raise InformixError(f"Staged snapshot boundary mismatch for '{table.exposed_name}'")
-            decoded = _decode_snapshot_stage_value(record.get("rows"))
-            if not isinstance(decoded, list) or not all(isinstance(row, dict) for row in decoded):
-                raise InformixError(f"Invalid staged snapshot rows for '{table.exposed_name}'")
-            if int(record["row_count"]) != len(decoded):
-                raise InformixError(f"Staged snapshot row count mismatch for '{table.exposed_name}'")
-            return decoded
-
-        def _take_or_load_staged_page(
-            self,
-            table: Table,
-            pipeline_scope: str,
-            schema_id: str,
-            snapshot_lsn: int,
-            page_index: int,
-        ) -> list[dict[str, Any]]:
-            """Return the page from the prefetch cache, else read+decode it now."""
-
-            prefetcher = self._staged_page_prefetcher
-            if prefetcher is not None:
-                cached = prefetcher.take((snapshot_lsn, page_index))
-                if cached is not None:
-                    return cached
-            return self._load_staged_page_rows(
-                table, pipeline_scope, schema_id, snapshot_lsn, page_index
-            )
-
-        def _submit_staged_page_prefetch(
-            self,
-            table: Table,
-            pipeline_scope: str,
-            schema_id: str,
-            snapshot_lsn: int,
-            page_index: int,
-        ) -> None:
-            """Kick off the background read+decode of the next staged page.
-
-            Best-effort and disabled by default. The prefetcher shares no mutable
-            connection with the foreground, holds no slot, and caps resident pages at
-            one, so the only cost is the extra page's memory while the current one is
-            written.
-            """
-
-            if not self._snapshot_prefetch_enabled():
-                return
-            prefetcher = self._staged_page_prefetcher
-            if prefetcher is None:
-                prefetcher = _StagedPagePrefetcher()
-                self._staged_page_prefetcher = prefetcher
-            prefetcher.submit(
-                (snapshot_lsn, page_index),
-                lambda: self._load_staged_page_rows(
-                    table, pipeline_scope, schema_id, snapshot_lsn, page_index
-                ),
-            )
-
-        def _snapshot_prefetch_enabled(self) -> bool:
-            return _option_bool(self.options, _SNAPSHOT_PREFETCH_OPTION, _DEFAULT_SNAPSHOT_PREFETCH)
 
         @staticmethod
         def _datetime_primary_key(table: Table) -> bool:
