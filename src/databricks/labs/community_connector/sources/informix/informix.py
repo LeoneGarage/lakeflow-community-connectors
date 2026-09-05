@@ -6884,7 +6884,7 @@ class InformixLakeflowConnect(LakeflowConnect):
         except UnicodeError as error:
             raise invalid() from error
         try:
-            header, rows_span, sha_span = _scan_staged_page(text)
+            header, array_start, sha_span = _scan_staged_page(text)
         except InformixError as error:
             raise invalid() from error
         # Integrity over the exact canonical body: the page bytes with the sha256
@@ -6925,7 +6925,6 @@ class InformixLakeflowConnect(LakeflowConnect):
             raise invalid()
 
         exposed_name = table.exposed_name
-        array_start, array_end = rows_span
 
         def stream_rows() -> Iterator[dict[str, Any]]:
             row_decoder = json.JSONDecoder()
@@ -10633,52 +10632,42 @@ def _skip_json_whitespace(text: str, index: int) -> int:
     return index
 
 
-def _skip_json_array(text: str, start: int) -> int:
-    """Given ``text[start] == '['``, return the index just past the matching ``]``.
-
-    Scans structurally -- tracking string state (with escapes) and nesting depth --
-    so brackets or quotes inside string values do not confuse the match. Used to
-    step over the huge ``rows`` array while parsing a staged page's header without
-    materializing the rows. Raises on an unterminated array.
-    """
-
-    depth = 0
-    index = start
-    length = len(text)
-    in_string = False
-    escaped = False
-    while index < length:
-        char = text[index]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-        elif char == '"':
-            in_string = True
-        elif char in "[{":
-            depth += 1
-        elif char in "]}":
-            depth -= 1
-            if depth == 0:
-                return index + 1
-        index += 1
-    raise InformixError("Unterminated array in staged snapshot page")
+# Header fields that sort *after* ``rows`` in a staged page's canonical
+# (``sort_keys=True``) serialization -- see ``_publish_snapshot_stage_page``. They
+# are located from the tail by ``_scan_staged_page`` rather than by walking the rows
+# array. ``sha256`` is added to the record after the body and re-sorted between
+# ``schema_id`` and ``snapshot_lsn``.
+_SNAPSHOT_STAGE_TRAILING_KEYS = (
+    "schema_id",
+    "sha256",
+    "snapshot_lsn",
+    "table",
+    "upper_pk",
+    "version",
+)
 
 
-def _scan_staged_page(text: str) -> tuple[dict[str, Any], tuple[int, int], tuple[int, int]]:
-    """Structurally walk a staged page's top-level object without parsing ``rows``.
+def _scan_staged_page(text: str) -> tuple[dict[str, Any], int, tuple[int, int]]:
+    """Locate a staged page's header fields without ever walking the ``rows`` array.
 
-    Returns ``(header, rows_span, sha_span)``: ``header`` holds every field except
-    ``rows`` (decoded with ``raw_decode``); ``rows_span`` is the ``[start, end)`` of
-    the ``rows`` array, *located* rather than parsed so its huge contents are never
-    materialized; ``sha_span`` is the ``[start, end)`` of the ``"sha256":"...",``
-    field including its trailing comma, so the caller can excise it to recover the
-    exact canonical body the digest covers. Raises ``InformixError`` on any
-    structural problem. Non-``rows`` values are small, so ``raw_decode`` on them is
-    cheap; only the ``rows`` array is skipped wholesale.
+    Returns ``(header, array_start, sha_span)``. ``header`` holds every field except
+    ``rows``; ``array_start`` is the index of the ``rows`` array's opening ``[`` (the
+    single serve pass streams from there and finds the closing ``]`` itself);
+    ``sha_span`` is the ``[start, end)`` of the ``"sha256":"...",`` field including its
+    trailing comma, so the caller can excise it to recover the exact canonical body
+    the digest covers.
+
+    The rows array is the one field with unbounded, arbitrary content, so it is never
+    scanned. Leading fields (those sorting before ``rows``) are forward-parsed with
+    ``raw_decode`` and are small; the parse stops at the ``rows`` key. Trailing fields
+    (sorting after ``rows``) are found from the tail with ``str.rfind`` on their
+    ``,"key":`` marker: each trailing field is structurally the *last* occurrence of
+    its key in the payload -- any same-named row column lives inside the earlier rows
+    array, and an unescaped ``,"key":`` only ever appears as a JSON key (a string
+    *value* containing that text is escaped as ``,\\"key\\":``) -- so the reverse find
+    lands on the real header field. Those fields occupy the payload's final few
+    hundred bytes, so the reverse finds are effectively free while the multi-hundred-MB
+    rows array is skipped entirely. Raises ``InformixError`` on any structural problem.
     """
 
     length = len(text)
@@ -10688,14 +10677,14 @@ def _scan_staged_page(text: str) -> tuple[dict[str, Any], tuple[int, int], tuple
     index += 1
     decoder = json.JSONDecoder()
     header: dict[str, Any] = {}
-    rows_span: tuple[int, int] | None = None
+    array_start: int | None = None
     sha_span: tuple[int, int] | None = None
     try:
+        # Forward-parse the small leading fields, stopping at the rows array.
         while True:
             index = _skip_json_whitespace(text, index)
             if index < length and text[index] == "}":
                 break
-            field_start = index
             key, index = decoder.raw_decode(text, index)
             if not isinstance(key, str):
                 raise InformixError("Malformed staged snapshot page")
@@ -10706,29 +10695,38 @@ def _scan_staged_page(text: str) -> tuple[dict[str, Any], tuple[int, int], tuple
             if key == "rows":
                 if index >= length or text[index] != "[":
                     raise InformixError("Malformed staged snapshot page")
-                rows_span = (index, _skip_json_array(text, index))
-                index = rows_span[1]
-            else:
-                value, index = decoder.raw_decode(text, index)
-                header[key] = value
+                array_start = index
+                break
+            value, index = decoder.raw_decode(text, index)
+            header[key] = value
             index = _skip_json_whitespace(text, index)
-            has_comma = index < length and text[index] == ","
-            if has_comma:
+            if index < length and text[index] == ",":
                 index += 1
             elif index >= length or text[index] != "}":
                 raise InformixError("Malformed staged snapshot page")
+        if array_start is None:
+            raise InformixError("Malformed staged snapshot page")
+        # Locate the trailing fields from the tail. Each key's last occurrence is its
+        # header field (row columns of the same name sit inside the earlier array).
+        for key in _SNAPSHOT_STAGE_TRAILING_KEYS:
+            marker = f',"{key}":'
+            marker_pos = text.rfind(marker)
+            if marker_pos < array_start:
+                raise InformixError("Malformed staged snapshot page")
+            value, value_end = decoder.raw_decode(text, marker_pos + len(marker))
+            header[key] = value
             if key == "sha256":
-                # Excise the field and its trailing comma; sha256 is never the last
-                # sorted key (snapshot_lsn/table/upper_pk/version follow), so a
-                # trailing comma is always present.
-                if not has_comma:
+                # Excise "sha256":"...", (key through trailing comma) to recover the
+                # canonical body. sha256 is never the last sorted key (snapshot_lsn,
+                # table, upper_pk, version follow), so a trailing comma is present.
+                if value_end >= length or text[value_end] != ",":
                     raise InformixError("Malformed staged snapshot page")
-                sha_span = (field_start, index)
+                sha_span = (marker_pos + 1, value_end + 1)
     except (json.JSONDecodeError, IndexError) as error:
         raise InformixError("Malformed staged snapshot page") from error
-    if rows_span is None or sha_span is None:
+    if sha_span is None:
         raise InformixError("Malformed staged snapshot page")
-    return header, rows_span, sha_span
+    return header, array_start, sha_span
 
 
 def _encode_snapshot_stage_value(value: Any) -> Any:

@@ -4526,6 +4526,46 @@ class LakeflowContractTests(unittest.TestCase):
         with self.assertRaisesRegex(informix_module.InformixError, "Invalid staged snapshot page"):
             connector._staged_snapshot_result(table, scope, schema_id, manifest, 0)
 
+    def test_staged_page_serves_rows_whose_columns_shadow_trailing_header_keys(self):
+        # The serve path locates trailing header fields (upper_pk, sha256, version,
+        # ...) from the tail with rfind, so a *row column* named exactly like one of
+        # them must not be mistaken for the header field: the header field is always
+        # the last occurrence (row columns live inside the earlier rows array). Stage
+        # rows that shadow every trailing key and confirm they round-trip and the
+        # resume cursor is the real header upper_pk (the last row's id), not a column.
+        connector = self.connector()
+        table = connector._table("app.orders", {})
+        scope = connector._pipeline_scope()
+        schema_id = "schema-shadow"
+        snapshot_lsn = 100
+        rows = [
+            {
+                "id": 1,
+                "sha256": "not-a-digest",
+                "upper_pk": [999],
+                "version": 42,
+                "table": "decoy",
+                "snapshot_lsn": "0",
+            },
+            {
+                "id": 2,
+                "sha256": "still-not",
+                "upper_pk": [888],
+                "version": 7,
+                "table": "decoy2",
+                "snapshot_lsn": "0",
+            },
+        ]
+        connector._publish_snapshot_stage_page(table, scope, schema_id, snapshot_lsn, 0, rows, None)
+
+        # Two pages so the served page is non-final and carries a resume cursor.
+        manifest = {"page_count": 2, "snapshot_lsn": str(snapshot_lsn)}
+        served, end = connector._staged_snapshot_result(table, scope, schema_id, manifest, 0)
+        self.assertEqual(list(served), rows)  # shadowing columns round-trip untouched
+        # upper_pk is the real header field (last row's primary key), not row content.
+        self.assertEqual(end["snapshot"]["last_pk"], [2])
+        self.assertEqual(end["snapshot"]["page_index"], 1)
+
     def test_a_staged_snapshot_with_pages_remaining_records_a_backlog_streak(self):
         # The staged (blocking) snapshot knows its remaining page count exactly, so
         # a reader mid-snapshot has certain outstanding work and must rank above an
