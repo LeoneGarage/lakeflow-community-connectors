@@ -4493,6 +4493,17 @@ class LakeflowContractTests(unittest.TestCase):
             "backlog_streak", final, "the final snapshot page kept a stale backlog streak"
         )
 
+    def test_iter_release_yields_in_order_and_frees_each_row(self):
+        # Drain-and-release: rows come out in order, and each is dropped from the
+        # backing list the moment it is yielded so the write can free it mid-batch.
+        rows = [{"id": 1}, {"id": 2}, {"id": 3}]
+        iterator = informix_module._iter_release(rows)
+
+        self.assertEqual(next(iterator), {"id": 1})
+        self.assertIsNone(rows[0], "a yielded row is released from the backing list")
+        self.assertEqual(list(iterator), [{"id": 2}, {"id": 3}])
+        self.assertEqual(rows, [None, None, None], "every consumed row is released")
+
     def test_snapshot_pages_replay_exactly_after_source_changes(self):
         bridge = FakeBridge()
         connector = self.connector(
