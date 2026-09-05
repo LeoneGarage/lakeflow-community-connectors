@@ -974,6 +974,41 @@ class LakeflowContractTests(unittest.TestCase):
 
         cloudpickle.loads(cloudpickle.dumps(source_class))
 
+    def test_generated_state_op_reconnect_resolves_connection_lost_types(self):
+        # Regression: connection_lost_error_types cached via a `global` rebind
+        # crashed with NameError in the single-file merged deployment, where the
+        # whole module is nested inside register_lakeflow_source() so its module
+        # globals become that function's locals and `global` addresses a name
+        # nothing ever assigns. The standalone-module unit tests import the real
+        # module (where the global exists) and could not catch it -- this drives
+        # the merged form the pipeline actually runs.
+        generated = importlib.import_module(
+            "databricks.labs.community_connector.sources.informix."
+            "_generated_informix_python_source"
+        )
+        registry = mock.Mock()
+        spark = types.SimpleNamespace(dataSource=registry)
+        generated.register_lakeflow_source(spark)
+        source_class = registry.register.call_args.args[0]
+
+        with tempfile.TemporaryDirectory() as staging:
+            source = source_class(
+                {
+                    "database": "demo",
+                    "snapshot.staging.location": staging,
+                    "lakebase.password": "test-state-password",
+                    "cdc.shared.session": "false",
+                    "snapshot.shared.session": "false",
+                }
+            )
+            connector = source.lakeflow_connect
+            sentinel = object()
+            # Exercises the merge-nested connection_lost_error_types() closure that
+            # raised NameError in production; the trivial thunk touches no Lakebase
+            # connection, so this stays offline.
+            result = connector._state_op_with_reconnect(lambda: sentinel, operation="probe")
+        self.assertIs(result, sentinel)
+
     def test_state_connection_key_includes_port(self):
         # The key pair identifies which Informix endpoint and table a state record
         # belongs to, so two ports must never collide while equivalent spellings
@@ -9206,11 +9241,11 @@ class LakebaseStateReconnectTests(unittest.TestCase):
     def test_connection_lost_error_types_are_resolved_from_the_driver(self):
         from databricks.labs.community_connector.sources.informix import lakebase_state
 
-        lakebase_state._CONNECTION_LOST_ERROR_TYPES = None
+        lakebase_state._CONNECTION_LOST_ERROR_TYPES.clear()
         try:
             types_tuple = lakebase_state.connection_lost_error_types()
         finally:
-            lakebase_state._CONNECTION_LOST_ERROR_TYPES = None
+            lakebase_state._CONNECTION_LOST_ERROR_TYPES.clear()
         self.assertIsInstance(types_tuple, tuple)
         for error_type in types_tuple:
             self.assertTrue(issubclass(error_type, BaseException))

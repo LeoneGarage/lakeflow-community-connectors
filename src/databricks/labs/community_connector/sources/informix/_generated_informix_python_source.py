@@ -2916,7 +2916,13 @@ def register_lakeflow_source(spark):
     """
 
 
-    _CONNECTION_LOST_ERROR_TYPES: tuple[type[BaseException], ...] | None = None
+    # Resolved once and cached, but in a dict mutated in place -- never a bare module
+    # global rebound via ``global``. The single-file merged deployment nests this whole
+    # module inside a function, turning module globals into that function's locals, so a
+    # ``global`` rebinding helper would address a name nothing ever assigns and raise
+    # ``NameError`` at runtime (mirrors _LAKEBASE_WAITER_LOCK in informix.py). Mutating a
+    # dict needs no rebinding, so it survives both the standalone and merged forms.
+    _CONNECTION_LOST_ERROR_TYPES: dict[str, tuple[type[BaseException], ...]] = {}
 
 
     def connection_lost_error_types() -> tuple[type[BaseException], ...]:
@@ -2932,9 +2938,9 @@ def register_lakeflow_source(spark):
         so the caller simply never matches and propagates.
         """
 
-        global _CONNECTION_LOST_ERROR_TYPES  # noqa: PLW0603
-        if _CONNECTION_LOST_ERROR_TYPES is not None:
-            return _CONNECTION_LOST_ERROR_TYPES
+        cached = _CONNECTION_LOST_ERROR_TYPES.get("types")
+        if cached is not None:
+            return cached
         types: list[type[BaseException]] = []
         for module_name in ("psycopg2", "psycopg"):
             try:
@@ -2945,8 +2951,9 @@ def register_lakeflow_source(spark):
                 error_type = getattr(module, attribute, None)
                 if isinstance(error_type, type) and issubclass(error_type, BaseException):
                     types.append(error_type)
-        _CONNECTION_LOST_ERROR_TYPES = tuple(types)
-        return _CONNECTION_LOST_ERROR_TYPES
+        # setdefault resolves the race: concurrent callers may each resolve the tuple,
+        # but every one returns whichever landed first.
+        return _CONNECTION_LOST_ERROR_TYPES.setdefault("types", tuple(types))
 
 
     def publish_state_record(
