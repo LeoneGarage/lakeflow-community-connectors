@@ -410,6 +410,24 @@ connection:
         exists to avoid); keyed drains are unaffected. Default `true`. Accepts
         `true`/`false`.
 
+    - name: snapshot.prefetch.enabled
+      type: string
+      required: false
+      description: >
+        Whether serving a staged snapshot prefetches the next page while the current
+        one is written. When a staged snapshot is served back page by page, each page
+        is an immutable Volume blob read, decompressed, and decoded on the driver, then
+        written by Spark. With this on, a single background daemon thread prepares the
+        next page's rows while Spark writes the current page, so the next microbatch
+        takes it from memory. It holds no connection slot and shares no mutable
+        connection with the read path (the page read is pure Volume I/O + CPU on an
+        immutable blob), so the only cost is one extra page resident in driver memory;
+        a prefetch error simply falls back to a synchronous read. It never prefetches
+        across the snapshot-to-stream boundary, and only engages in the staged-serve
+        phase (keyed blocking / keyless `initial` snapshots), not the keyed
+        `incremental` path. Default `true`; set `false` to serve pages synchronously.
+        Accepts `true`/`false`.
+
     - name: snapshot.read.timeout.seconds
       type: string
       required: false
