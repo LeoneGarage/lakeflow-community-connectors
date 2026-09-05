@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import errno
+import gzip
 import hashlib
 import importlib
 import json
@@ -4415,6 +4416,60 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(list(deletes), [])
         self.assertEqual(delete_offset["commit_lsn"], str(bridge.now))
         self.assertEqual(bridge.released_connections, 3)
+
+    def test_staged_page_serves_typed_rows_in_order(self):
+        # The serve path decodes a staged page's typed values row-by-row in place
+        # (so the encoded and decoded copies never both exist in full -- the memory
+        # fix for wide pages). That must preserve row order and decode typed values
+        # exactly, identical to a whole-list decode.
+        connector = self.connector()
+        table = connector._table("app.orders", {})
+        scope = connector._pipeline_scope()
+        schema_id = "schema-typed-serve"
+        snapshot_lsn = 100
+        rows = [
+            {"id": 1, "value": Decimal("1.50"), "when": date(2026, 1, 1)},
+            {"id": 2, "value": Decimal("2.50"), "when": date(2026, 1, 2)},
+            {"id": 3, "value": Decimal("3.50"), "when": date(2026, 1, 3)},
+        ]
+        connector._publish_snapshot_stage_page(table, scope, schema_id, snapshot_lsn, 0, rows, None)
+
+        manifest = {"page_count": 1, "snapshot_lsn": str(snapshot_lsn)}
+        served, end = connector._staged_snapshot_result(table, scope, schema_id, manifest, 0)
+
+        self.assertEqual(list(served), rows)  # order + Decimal/date preserved
+        self.assertEqual(end["phase"], "stream")
+
+    def test_staged_page_rejects_a_row_count_mismatch(self):
+        # The pre-decode row_count guard still fires after the in-place refactor.
+        connector = self.connector()
+        table = connector._table("app.orders", {})
+        scope = connector._pipeline_scope()
+        schema_id = "schema-typed-serve"
+        snapshot_lsn = 100
+        rows = [{"id": 1, "value": "a"}, {"id": 2, "value": "b"}]
+        connector._publish_snapshot_stage_page(table, scope, schema_id, snapshot_lsn, 0, rows, None)
+
+        # A manifest is not consulted for row_count, but the page record's own
+        # row_count/len(rows) agreement is validated inside the page reader; corrupt
+        # the staged file to prove the serve path still refuses a bad page.
+        page_path = os.path.join(
+            connector._snapshot_stage_namespace(table, scope, schema_id),
+            "runs",
+            str(snapshot_lsn),
+            "page-00000000",
+            "data.json.gz",
+        )
+        full = os.path.join(connector._snapshot_staging_location, page_path)
+        with gzip.open(full, "rb") as handle:
+            record = json.loads(handle.read())
+        record["rows"] = record["rows"][:1]  # drop a row without fixing row_count/sha256
+        with gzip.open(full, "wb") as handle:
+            handle.write(json.dumps(record).encode("utf-8"))
+
+        manifest = {"page_count": 1, "snapshot_lsn": str(snapshot_lsn)}
+        with self.assertRaisesRegex(informix_module.InformixError, "Invalid staged snapshot page"):
+            connector._staged_snapshot_result(table, scope, schema_id, manifest, 0)
 
     def test_a_staged_snapshot_with_pages_remaining_records_a_backlog_streak(self):
         # The staged (blocking) snapshot knows its remaining page count exactly, so

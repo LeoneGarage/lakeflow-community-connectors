@@ -12017,6 +12017,10 @@ def register_lakeflow_source(spark):
                         "exceeds its decoded size bound"
                     )
                 record = json.loads(payload)
+                # Free the decompressed page bytes (up to the 256 MB ceiling) before
+                # building the canonical form and the row graph, so they do not stack
+                # on top of the peak. Matters for a wide table's large page.
+                del payload
             except (OSError, EOFError, UnicodeError, json.JSONDecodeError) as error:
                 raise InformixError(
                     f"Cannot read staged snapshot page {page_index} for " f"'{table.exposed_name}'"
@@ -12027,9 +12031,12 @@ def register_lakeflow_source(spark):
                 )
             digest = record.get("sha256")
             body = {key: value for key, value in record.items() if key != "sha256"}
-            canonical = json.dumps(body, allow_nan=False, separators=(",", ":"), sort_keys=True).encode(
-                "utf-8"
-            )
+            # Hash the canonical body, then release that (also up to ~256 MB) before the
+            # validation so it does not coexist with the row graph the caller decodes.
+            computed_digest = hashlib.sha256(
+                json.dumps(body, allow_nan=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            del body
             if (
                 record.get("version") != _SNAPSHOT_STAGE_VERSION
                 or record.get("table") != table.native_identity
@@ -12039,7 +12046,7 @@ def register_lakeflow_source(spark):
                 or isinstance(record.get("row_count"), bool)
                 or record.get("row_count") != len(record.get("rows", []))
                 or not isinstance(digest, str)
-                or not hmac.compare_digest(digest, hashlib.sha256(canonical).hexdigest())
+                or not hmac.compare_digest(digest, computed_digest)
             ):
                 raise InformixError(
                     f"Invalid staged snapshot page {page_index} for '{table.exposed_name}'"
@@ -12150,11 +12157,25 @@ def register_lakeflow_source(spark):
             )
             if _strict_lsn(record.get("snapshot_lsn"), "snapshot_lsn") != snapshot_lsn:
                 raise InformixError(f"Staged snapshot boundary mismatch for '{table.exposed_name}'")
-            decoded = _decode_snapshot_stage_value(record.get("rows"))
-            if not isinstance(decoded, list) or not all(isinstance(row, dict) for row in decoded):
+            decoded = record.get("rows")
+            if not isinstance(decoded, list):
                 raise InformixError(f"Invalid staged snapshot rows for '{table.exposed_name}'")
-            if int(record["row_count"]) != len(decoded):
+            expected_row_count = int(record["row_count"])
+            # Drop the record wrapper now; only the rows list is still needed. Decode
+            # each row's typed values *in place* -- replacing the encoded dict with its
+            # decoded form frees the encoded dict immediately, so the encoded and
+            # decoded copies of the page never both exist in full. A wide table's page
+            # expands to a large Python object graph, and the previous list-comprehension
+            # decode held two of them at once, doubling peak memory and OOM-ing the
+            # serverless Python worker; this keeps the peak at ~one page.
+            record = None
+            if expected_row_count != len(decoded):
                 raise InformixError(f"Staged snapshot row count mismatch for '{table.exposed_name}'")
+            for index in range(len(decoded)):
+                decoded_row = _decode_snapshot_stage_value(decoded[index])
+                if not isinstance(decoded_row, dict):
+                    raise InformixError(f"Invalid staged snapshot rows for '{table.exposed_name}'")
+                decoded[index] = decoded_row
             # The shared reader replays a batch from its start offset. Receiving
             # page_index=N as that start means Spark has advanced beyond every page
             # below N; retries continue from N, so those earlier immutable pages are
