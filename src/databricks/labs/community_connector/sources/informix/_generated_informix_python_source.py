@@ -11984,14 +11984,21 @@ def register_lakeflow_source(spark):
                         exc_info=True,
                     )
 
-        def _read_snapshot_stage_page_record(
+        def _read_staged_page_payload(
             self,
             table: Table,
             pipeline_scope: str,
             schema_id: str,
             snapshot_lsn: int,
             page_index: int,
-        ) -> dict[str, Any]:
+        ) -> bytes:
+            """Open, size-guard, and decompress one staged page into its raw JSON bytes.
+
+            Both the whole-record reader (used by the staging conflict check) and the
+            streaming serve reader go through this, so the file-open/decompress/ceiling
+            logic lives in one place.
+            """
+
             path = os.path.join(
                 self._snapshot_stage_namespace(table, pipeline_scope, schema_id),
                 "runs",
@@ -12011,17 +12018,35 @@ def register_lakeflow_source(spark):
                 with os.fdopen(descriptor, "rb") as raw_handle:
                     with gzip.GzipFile(fileobj=raw_handle, mode="rb") as handle:
                         payload = handle.read(_MAX_SNAPSHOT_STAGE_PAGE_BYTES + 1)
-                if len(payload) > _MAX_SNAPSHOT_STAGE_PAGE_BYTES:
-                    raise InformixError(
-                        f"Staged snapshot page {page_index} for '{table.exposed_name}' "
-                        "exceeds its decoded size bound"
-                    )
+            except (OSError, EOFError) as error:
+                raise InformixError(
+                    f"Cannot read staged snapshot page {page_index} for " f"'{table.exposed_name}'"
+                ) from error
+            if len(payload) > _MAX_SNAPSHOT_STAGE_PAGE_BYTES:
+                raise InformixError(
+                    f"Staged snapshot page {page_index} for '{table.exposed_name}' "
+                    "exceeds its decoded size bound"
+                )
+            return payload
+
+        def _read_snapshot_stage_page_record(
+            self,
+            table: Table,
+            pipeline_scope: str,
+            schema_id: str,
+            snapshot_lsn: int,
+            page_index: int,
+        ) -> dict[str, Any]:
+            payload = self._read_staged_page_payload(
+                table, pipeline_scope, schema_id, snapshot_lsn, page_index
+            )
+            try:
                 record = json.loads(payload)
                 # Free the decompressed page bytes (up to the 256 MB ceiling) before
                 # building the canonical form and the row graph, so they do not stack
                 # on top of the peak. Matters for a wide table's large page.
                 del payload
-            except (OSError, EOFError, UnicodeError, json.JSONDecodeError) as error:
+            except (UnicodeError, json.JSONDecodeError) as error:
                 raise InformixError(
                     f"Cannot read staged snapshot page {page_index} for " f"'{table.exposed_name}'"
                 ) from error
@@ -12052,6 +12077,121 @@ def register_lakeflow_source(spark):
                     f"Invalid staged snapshot page {page_index} for '{table.exposed_name}'"
                 )
             return record
+
+        def _stream_staged_page(
+            self,
+            table: Table,
+            pipeline_scope: str,
+            schema_id: str,
+            snapshot_lsn: int,
+            page_index: int,
+        ) -> tuple[dict[str, Any], Iterator[dict[str, Any]]]:
+            """Read a staged page without ever materializing its whole row graph.
+
+            The blocker for wide pages is that ``json.loads`` builds the entire page's
+            Python object graph (multiple GB) before a row is served, OOM-ing the
+            worker. Here the page is parsed structurally instead: the small header
+            fields are decoded, the huge ``rows`` array is *located* (not parsed), and
+            the rows are streamed one at a time by the returned generator, so peak
+            memory is the ~256 MB page text plus a single row rather than the whole
+            graph.
+
+            Integrity is still verified over the exact same bytes the writer hashed.
+            The writer stores ``sha256(json.dumps(body))`` and the page is
+            ``json.dumps({**body, "sha256": digest})`` with identical ``json.dumps``
+            settings, so the page bytes with the ``"sha256":"..."`` field excised are
+            byte-for-byte that canonical body -- hashed here via a ``memoryview`` (no
+            copy). ``json.dumps`` defaults to ``ensure_ascii=True``, so the page is
+            ASCII and character offsets equal byte offsets, letting the text scan and
+            the byte hash share indices.
+
+            Returns ``(header, rows)`` where ``header`` holds every field except
+            ``rows`` (already validated for version/identity/scope/schema/page and
+            integrity) and ``rows`` is a single-use generator of decoded rows that also
+            enforces the row count.
+            """
+
+            payload = self._read_staged_page_payload(
+                table, pipeline_scope, schema_id, snapshot_lsn, page_index
+            )
+
+            def invalid() -> InformixError:
+                return InformixError(
+                    f"Invalid staged snapshot page {page_index} for '{table.exposed_name}'"
+                )
+
+            try:
+                text = payload.decode("ascii")
+            except UnicodeError as error:
+                raise invalid() from error
+            try:
+                header, rows_span, sha_span = _scan_staged_page(text)
+            except InformixError as error:
+                raise invalid() from error
+            # Integrity over the exact canonical body: the page bytes with the sha256
+            # field excised are byte-identical to what the writer hashed. memoryview
+            # slices avoid copying the (up to 256 MB) payload.
+            stored_digest = header.get("sha256")
+            digest = hashlib.sha256()
+            view = memoryview(payload)
+            digest.update(view[: sha_span[0]])
+            digest.update(view[sha_span[1] :])
+            computed_digest = digest.hexdigest()
+            view.release()
+            del payload
+            if not isinstance(stored_digest, str) or not hmac.compare_digest(
+                computed_digest, stored_digest
+            ):
+                raise invalid()
+            expected_row_count = header.get("row_count")
+            expected_identity = (
+                _SNAPSHOT_STAGE_VERSION,
+                table.native_identity,
+                pipeline_scope,
+                schema_id,
+                page_index,
+            )
+            actual_identity = (
+                header.get("version"),
+                header.get("table"),
+                header.get("pipeline_scope"),
+                header.get("schema_id"),
+                header.get("page_index"),
+            )
+            if (
+                actual_identity != expected_identity
+                or isinstance(expected_row_count, bool)
+                or not isinstance(expected_row_count, int)
+            ):
+                raise invalid()
+
+            exposed_name = table.exposed_name
+            array_start, array_end = rows_span
+
+            def stream_rows() -> Iterator[dict[str, Any]]:
+                row_decoder = json.JSONDecoder()
+                position = _skip_json_whitespace(text, array_start + 1)
+                count = 0
+                # array_end is just past the matching ']'; a non-empty array has an
+                # element here, an empty one has the ']' itself.
+                if text[position] != "]":
+                    while True:
+                        row, position = row_decoder.raw_decode(text, position)
+                        if not isinstance(row, dict):
+                            raise InformixError(f"Invalid staged snapshot rows for '{exposed_name}'")
+                        count += 1
+                        yield _decode_snapshot_stage_value(row)
+                        position = _skip_json_whitespace(text, position)
+                        if position < len(text) and text[position] == ",":
+                            position = _skip_json_whitespace(text, position + 1)
+                        elif position < len(text) and text[position] == "]":
+                            break
+                        else:
+                            raise InformixError(f"Invalid staged snapshot rows for '{exposed_name}'")
+                if count != expected_row_count:
+                    raise InformixError(f"Staged snapshot row count mismatch for '{exposed_name}'")
+
+            return header, stream_rows()
 
         def _cleanup_consumed_snapshot_stage_pages(
             self,
@@ -12152,30 +12292,14 @@ def register_lakeflow_source(spark):
                 raise InformixError(
                     f"Invalid staged snapshot page index {page_index} for " f"'{table.exposed_name}'"
                 )
-            record = self._read_snapshot_stage_page_record(
+            # Stream the page: the header (all fields except rows) is parsed and
+            # integrity-verified eagerly, and rows are yielded one at a time by the
+            # returned generator, so the whole-page object graph is never materialized.
+            header, rows = self._stream_staged_page(
                 table, pipeline_scope, schema_id, snapshot_lsn, page_index
             )
-            if _strict_lsn(record.get("snapshot_lsn"), "snapshot_lsn") != snapshot_lsn:
+            if _strict_lsn(header.get("snapshot_lsn"), "snapshot_lsn") != snapshot_lsn:
                 raise InformixError(f"Staged snapshot boundary mismatch for '{table.exposed_name}'")
-            decoded = record.get("rows")
-            if not isinstance(decoded, list):
-                raise InformixError(f"Invalid staged snapshot rows for '{table.exposed_name}'")
-            expected_row_count = int(record["row_count"])
-            # Drop the record wrapper now; only the rows list is still needed. Decode
-            # each row's typed values *in place* -- replacing the encoded dict with its
-            # decoded form frees the encoded dict immediately, so the encoded and
-            # decoded copies of the page never both exist in full. A wide table's page
-            # expands to a large Python object graph, and the previous list-comprehension
-            # decode held two of them at once, doubling peak memory and OOM-ing the
-            # serverless Python worker; this keeps the peak at ~one page.
-            record = None
-            if expected_row_count != len(decoded):
-                raise InformixError(f"Staged snapshot row count mismatch for '{table.exposed_name}'")
-            for index in range(len(decoded)):
-                decoded_row = _decode_snapshot_stage_value(decoded[index])
-                if not isinstance(decoded_row, dict):
-                    raise InformixError(f"Invalid staged snapshot rows for '{table.exposed_name}'")
-                decoded[index] = decoded_row
             # The shared reader replays a batch from its start offset. Receiving
             # page_index=N as that start means Spark has advanced beyond every page
             # below N; retries continue from N, so those earlier immutable pages are
@@ -12189,7 +12313,10 @@ def register_lakeflow_source(spark):
             )
             next_page = page_index + 1
             if next_page < page_count:
-                last_pk = _encode_snapshot_stage_value([decoded[-1][key] for key in table.primary_keys])
+                # The stored ``upper_pk`` is the encoded PK of the page's last row --
+                # identical to encoding decoded[-1]'s key columns -- so the resume cursor
+                # matches the whole-decode path without holding any row in memory.
+                last_pk = header.get("upper_pk")
                 end = _offset(
                     snapshot_lsn,
                     snapshot_lsn,
@@ -12222,7 +12349,7 @@ def register_lakeflow_source(spark):
                     schema_id,
                     pipeline_scope,
                 )
-            return iter(decoded), end
+            return rows, end
 
         @staticmethod
         def _datetime_primary_key(table: Table) -> bool:
@@ -15732,6 +15859,117 @@ def register_lakeflow_source(spark):
         if isinstance(value, (list, tuple, set, frozenset)):
             return size + sum(_deep_size(item, seen) for item in value)
         return size
+
+
+    def _skip_json_whitespace(text: str, index: int) -> int:
+        """Return the first index at or after ``index`` that is not JSON whitespace.
+
+        Staged pages are written with ``separators=(",",":")`` (no whitespace), but
+        tolerating it keeps the hand-rolled scan robust to a compliant re-serializer.
+        """
+
+        length = len(text)
+        while index < length and text[index] in " \t\n\r":
+            index += 1
+        return index
+
+
+    def _skip_json_array(text: str, start: int) -> int:
+        """Given ``text[start] == '['``, return the index just past the matching ``]``.
+
+        Scans structurally -- tracking string state (with escapes) and nesting depth --
+        so brackets or quotes inside string values do not confuse the match. Used to
+        step over the huge ``rows`` array while parsing a staged page's header without
+        materializing the rows. Raises on an unterminated array.
+        """
+
+        depth = 0
+        index = start
+        length = len(text)
+        in_string = False
+        escaped = False
+        while index < length:
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+            elif char == '"':
+                in_string = True
+            elif char in "[{":
+                depth += 1
+            elif char in "]}":
+                depth -= 1
+                if depth == 0:
+                    return index + 1
+            index += 1
+        raise InformixError("Unterminated array in staged snapshot page")
+
+
+    def _scan_staged_page(text: str) -> tuple[dict[str, Any], tuple[int, int], tuple[int, int]]:
+        """Structurally walk a staged page's top-level object without parsing ``rows``.
+
+        Returns ``(header, rows_span, sha_span)``: ``header`` holds every field except
+        ``rows`` (decoded with ``raw_decode``); ``rows_span`` is the ``[start, end)`` of
+        the ``rows`` array, *located* rather than parsed so its huge contents are never
+        materialized; ``sha_span`` is the ``[start, end)`` of the ``"sha256":"...",``
+        field including its trailing comma, so the caller can excise it to recover the
+        exact canonical body the digest covers. Raises ``InformixError`` on any
+        structural problem. Non-``rows`` values are small, so ``raw_decode`` on them is
+        cheap; only the ``rows`` array is skipped wholesale.
+        """
+
+        length = len(text)
+        index = _skip_json_whitespace(text, 0)
+        if index >= length or text[index] != "{":
+            raise InformixError("Malformed staged snapshot page")
+        index += 1
+        decoder = json.JSONDecoder()
+        header: dict[str, Any] = {}
+        rows_span: tuple[int, int] | None = None
+        sha_span: tuple[int, int] | None = None
+        try:
+            while True:
+                index = _skip_json_whitespace(text, index)
+                if index < length and text[index] == "}":
+                    break
+                field_start = index
+                key, index = decoder.raw_decode(text, index)
+                if not isinstance(key, str):
+                    raise InformixError("Malformed staged snapshot page")
+                index = _skip_json_whitespace(text, index)
+                if index >= length or text[index] != ":":
+                    raise InformixError("Malformed staged snapshot page")
+                index = _skip_json_whitespace(text, index + 1)
+                if key == "rows":
+                    if index >= length or text[index] != "[":
+                        raise InformixError("Malformed staged snapshot page")
+                    rows_span = (index, _skip_json_array(text, index))
+                    index = rows_span[1]
+                else:
+                    value, index = decoder.raw_decode(text, index)
+                    header[key] = value
+                index = _skip_json_whitespace(text, index)
+                has_comma = index < length and text[index] == ","
+                if has_comma:
+                    index += 1
+                elif index >= length or text[index] != "}":
+                    raise InformixError("Malformed staged snapshot page")
+                if key == "sha256":
+                    # Excise the field and its trailing comma; sha256 is never the last
+                    # sorted key (snapshot_lsn/table/upper_pk/version follow), so a
+                    # trailing comma is always present.
+                    if not has_comma:
+                        raise InformixError("Malformed staged snapshot page")
+                    sha_span = (field_start, index)
+        except (json.JSONDecodeError, IndexError) as error:
+            raise InformixError("Malformed staged snapshot page") from error
+        if rows_span is None or sha_span is None:
+            raise InformixError("Malformed staged snapshot page")
+        return header, rows_span, sha_span
 
 
     def _encode_snapshot_stage_value(value: Any) -> Any:
