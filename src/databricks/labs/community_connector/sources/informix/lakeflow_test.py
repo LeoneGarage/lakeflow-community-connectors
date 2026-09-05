@@ -4471,6 +4471,61 @@ class LakeflowContractTests(unittest.TestCase):
         with self.assertRaisesRegex(informix_module.InformixError, "Invalid staged snapshot page"):
             connector._staged_snapshot_result(table, scope, schema_id, manifest, 0)
 
+    def test_staged_page_streams_values_that_look_like_json_structure(self):
+        # The streaming serve locates the rows array and the top-level sha256 field
+        # *structurally* (string-aware), so column values full of JSON structural
+        # characters -- brackets, quotes, commas, escapes, even a fake
+        # "sha256":"..." and "rows":[ -- must neither confuse the scan nor the
+        # integrity check, and must round-trip byte-for-byte.
+        connector = self.connector()
+        table = connector._table("app.orders", {})
+        scope = connector._pipeline_scope()
+        schema_id = "schema-adversarial"
+        snapshot_lsn = 100
+        rows = [
+            {"id": 1, "value": "brackets ] [ } { comma , colon :"},
+            {"id": 2, "value": 'quote " backslash \\ escaped \\" end'},
+            {"id": 3, "value": '"sha256":"deadbeef","rows":[nope],"version":9'},
+            {"id": 4, "value": "unicode ☃ and tab \t and newline \n"},
+        ]
+        connector._publish_snapshot_stage_page(table, scope, schema_id, snapshot_lsn, 0, rows, None)
+
+        manifest = {"page_count": 1, "snapshot_lsn": str(snapshot_lsn)}
+        served, _ = connector._staged_snapshot_result(table, scope, schema_id, manifest, 0)
+        self.assertEqual(list(served), rows)
+
+    def test_staged_page_streaming_detects_a_tampered_row_value(self):
+        # Flipping a byte inside a row value changes the canonical body, so the
+        # streamed integrity check must reject it even though row_count is intact.
+        connector = self.connector()
+        table = connector._table("app.orders", {})
+        scope = connector._pipeline_scope()
+        schema_id = "schema-tamper"
+        snapshot_lsn = 100
+        rows = [{"id": 1, "value": "alpha"}, {"id": 2, "value": "bravo"}]
+        connector._publish_snapshot_stage_page(table, scope, schema_id, snapshot_lsn, 0, rows, None)
+
+        page_path = os.path.join(
+            connector._snapshot_stage_namespace(table, scope, schema_id),
+            "runs",
+            str(snapshot_lsn),
+            "page-00000000",
+            "data.json.gz",
+        )
+        full = os.path.join(connector._snapshot_staging_location, page_path)
+        with gzip.open(full, "rb") as handle:
+            text = handle.read().decode("ascii")
+        tampered = text.replace("alpha", "alpXa")  # same length, sha256 not updated
+        self.assertNotEqual(tampered, text)
+        with gzip.open(full, "wb") as handle:
+            handle.write(tampered.encode("ascii"))
+
+        # Integrity is verified eagerly, before any row is yielded, so the serve
+        # call itself refuses the tampered page.
+        manifest = {"page_count": 1, "snapshot_lsn": str(snapshot_lsn)}
+        with self.assertRaisesRegex(informix_module.InformixError, "Invalid staged snapshot page"):
+            connector._staged_snapshot_result(table, scope, schema_id, manifest, 0)
+
     def test_a_staged_snapshot_with_pages_remaining_records_a_backlog_streak(self):
         # The staged (blocking) snapshot knows its remaining page count exactly, so
         # a reader mid-snapshot has certain outstanding work and must rank above an
