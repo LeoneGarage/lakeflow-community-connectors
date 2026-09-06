@@ -365,6 +365,15 @@ _DEFAULT_SNAPSHOT_STAGE_RETENTION_DAYS = 4
 # path. A small pool drains the one-page-per-microbatch steady state easily and
 # clears any post-restart backlog quickly without hammering the Volume.
 _SNAPSHOT_CLEANUP_THREADS = 4
+# How often a resumed snapshot re-reads the live Informix schema to detect drift.
+# Serving immutable staged pages needs no live schema, so a per-microbatch
+# get_table query (plus the connection/slot it opens) dominated serve time.
+# Checking periodically instead keeps the drift guard -- a mid-snapshot schema
+# change is caught within this window and aborts the copy -- while most pages skip
+# Informix entirely. The window trades detection latency for throughput; the pages
+# served in between are immutable as-of snapshot_lsn, so serving a few extra before
+# an abort is harmless.
+_SNAPSHOT_SCHEMA_REFRESH_INTERVAL_SECONDS = 60
 # Bootstrap reads a delete reader spends waiting for *this* update's scoped
 # initialization record before it will consider the scope-independent schema node.
 #
@@ -4852,6 +4861,12 @@ class InformixLakeflowConnect(LakeflowConnect):
             None
         )
         self._snapshot_cleanup_watermark: dict[tuple[str, str, int], int] = {}
+        # Per-stream monotonic timestamp of the last live schema refresh, keyed by table
+        # identity, so a resumed snapshot re-queries Informix for drift only every
+        # _snapshot_schema_refresh_interval seconds rather than every microbatch. The
+        # interval is an instance attribute so tests can force per-page (0) refreshes.
+        self._snapshot_schema_refreshed_at: dict[str, float] = {}
+        self._snapshot_schema_refresh_interval = float(_SNAPSHOT_SCHEMA_REFRESH_INTERVAL_SECONDS)
 
     def set_registration_scope(self, scope: str) -> None:
         """Install the scope shared by every reader serialized from one registration."""
@@ -4866,6 +4881,7 @@ class InformixLakeflowConnect(LakeflowConnect):
             self._cleaned_update_scopes.clear()
             self._cleaned_snapshot_stages.clear()
             self._snapshot_cleanup_watermark.clear()
+            self._snapshot_schema_refreshed_at.clear()
             self._trigger_available_now = False
         self._registration_scope = scope
 
@@ -7685,7 +7701,27 @@ class InformixLakeflowConnect(LakeflowConnect):
                 "schema-safe offsets; run a full refresh"
             )
         expected_fingerprint = checkpoint.get("schema_fingerprint") if checkpoint else None
-        table = self._refresh_table_schema(table, expected_fingerprint)
+        if checkpoint:
+            # Staged serve reads immutable, self-describing pages from the Volume, so it
+            # needs no live Informix schema. Re-query it only every
+            # _snapshot_schema_refresh_interval seconds to catch mid-snapshot drift;
+            # between refreshes, validate the pinned fingerprint against the cached table
+            # (no connection, no catalog query). The first resume microbatch always
+            # refreshes (no timestamp yet), and drift is caught within the interval and at
+            # the snapshot->CDC transition -- a change cannot invalidate pages frozen
+            # as-of snapshot_lsn, so serving a few extra before an abort is harmless.
+            now = time.monotonic()
+            last = self._snapshot_schema_refreshed_at.get(table.identity)
+            if last is None or now - last >= self._snapshot_schema_refresh_interval:
+                table = self._refresh_table_schema(table, expected_fingerprint)
+                self._snapshot_schema_refreshed_at[table.identity] = now
+            elif expected_fingerprint != _schema_fingerprint(table):
+                raise InformixError(
+                    f"Informix schema changed for '{table.exposed_name}' during ingestion; "
+                    "run a full refresh before reading additional snapshot or CDC records"
+                )
+        else:
+            table = self._refresh_table_schema(table, expected_fingerprint)
         if not _cdc_capable(table) and not (
             allow_keyless and all(column.cdc_supported for column in table.columns)
         ):

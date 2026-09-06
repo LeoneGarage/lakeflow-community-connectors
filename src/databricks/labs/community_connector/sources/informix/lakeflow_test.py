@@ -5754,6 +5754,42 @@ class LakeflowContractTests(unittest.TestCase):
         with self.assertRaisesRegex(InformixError, "schema changed"):
             connector.read_table("app.orders", offset, {})
 
+    def test_staged_serve_skips_the_live_schema_query_within_the_refresh_interval(self):
+        # A resumed snapshot re-queries Informix for drift only periodically, not per page.
+        # The first resume microbatch refreshes; later ones within the interval serve
+        # straight from the Volume with no get_table catalog query -- that per-page Informix
+        # connection was the dominant serve cost.
+        bridge = FakeBridge()
+        bridge.rows.append({"id": 3, "value": "c"})  # three rows -> three single-row pages
+        connector = self.connector(bridge, **{"snapshot.page.size": "1"})
+        connector._snapshot_schema_refresh_interval = 3600  # no second refresh this stream
+        _, o0 = connector.read_table("app.orders", {}, {})  # fresh -> page 0
+        _, o1 = connector.read_table("app.orders", o0, {})  # first resume -> page 1 (refreshes)
+        with mock.patch.object(bridge, "get_table", wraps=bridge.get_table) as get_table:
+            _, o2 = connector.read_table("app.orders", o1, {})  # resume -> page 2, within interval
+        self.assertEqual(o2["phase"], "stream", "expected the final page")
+        self.assertEqual(
+            get_table.call_count,
+            0,
+            "staged serve re-queried Informix within the refresh interval",
+        )
+
+    def test_staged_serve_detects_drift_when_the_refresh_interval_elapses(self):
+        # With the interval elapsed (forced to 0 = every page), a resumed snapshot re-reads
+        # the live schema and still aborts on drift on a non-first page: the guard is
+        # preserved, just applied periodically rather than on every microbatch.
+        bridge = FakeBridge()
+        bridge.rows.append({"id": 3, "value": "c"})
+        connector = self.connector(bridge, **{"snapshot.page.size": "1"})
+        connector._snapshot_schema_refresh_interval = 0.0
+        _, o0 = connector.read_table("app.orders", {}, {})  # fresh -> page 0
+        _, o1 = connector.read_table("app.orders", o0, {})  # resume -> page 1 (refresh, no drift)
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        with self.assertRaisesRegex(InformixError, "schema changed"):
+            connector.read_table("app.orders", o1, {})  # resume -> page 2, refresh detects drift
+
     def test_snapshot_and_delete_continuations_reject_legacy_fingerprint(self):
         bridge = FakeBridge()
         connector = self.connector(bridge, **{"snapshot.page.size": "1"})
