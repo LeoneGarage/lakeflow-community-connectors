@@ -36,6 +36,9 @@ from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from typing import Any, Callable, Iterable, Iterator, Protocol, Sequence
 
 from databricks.labs.community_connector.interface import LakeflowConnect
+from databricks.labs.community_connector.interface.supports_partition import (
+    SupportsPartitionedStream,
+)
 from databricks.labs.community_connector.sources.informix.cdc_protocol import (
     CdcFrameParser,
     CdcProtocolError,
@@ -260,6 +263,23 @@ _APPEND_INGESTION_OPTION = "append.only.ingestion"
 # under many concurrent sessions), reads are guaranteed parallel across the K daemon
 # threads, and the driver thread count is bounded by K. Both the upsert and delete
 # channels are sharded independently (the shard is keyed by channel).
+# Partitioned stream reader. When enabled (default), the connector advertises the
+# SupportsPartitionedStream contract so Spark uses the partitioned DataSourceStreamReader.
+# Its one win is the staged-snapshot page-serve phase: instead of serving one page per
+# microbatch on the driver, a microbatch spans up to `stream.partitioned.snapshot.pages.
+# per.batch` pages, each read+decoded on a separate Spark executor. Every other phase
+# (staging bootstrap, the live CDC/incremental stream, transitions, deletes) degrades to a
+# single driver-computed partition whose rows are embedded in the descriptor -- byte-for-
+# byte the current output, just wrapped. Both readers persist the connector's bare offset
+# dict, so flipping this option and restarting resumes an existing checkpoint in place (no
+# full refresh); serverless SDP was verified to resume across the reader-class swap.
+_PARTITIONED_STREAM_OPTION = "stream.partitioned"
+_PARTITIONED_SNAPSHOT_PAGES_PER_BATCH_OPTION = "stream.partitioned.snapshot.pages.per.batch"
+_DEFAULT_PARTITIONED_SNAPSHOT_PAGES_PER_BATCH = 8
+# The framework tags a delete-channel reader's options with this key (see
+# sparkpds/lakeflow_datasource.py). The partitioned reader reads it to route the embedded
+# path to read_table_deletes rather than read_table; the delete channel never page-serves.
+_IS_DELETE_FLOW_OPTION = "isDeleteFlow"
 _SHARED_CDC_SESSION_OPTION = "cdc.shared.session"
 _SHARED_CDC_THREADS_OPTION = "cdc.shared.reader.threads"
 _SHARED_CDC_BUFFER_OPTION = "cdc.shared.buffer.max.records"
@@ -4634,7 +4654,7 @@ class _AsyncStagePipeline:
             self._thread.join()
 
 
-class InformixLakeflowConnect(LakeflowConnect):
+class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     """Pure-Python connector live-validated on disposable Informix 15.
 
     Normal auth, queries, discovery, snapshots, transactional CDC, and
@@ -4716,6 +4736,11 @@ class InformixLakeflowConnect(LakeflowConnect):
             ("redirect.max", "3", 0),
             ("cdc.shared.state.wait.seconds", str(_SHARED_STATE_WAIT_SECONDS), 1),
             (_SHARED_CDC_BUFFER_OPTION, str(_DEFAULT_SHARED_CDC_BUFFER), 1),
+            (
+                _PARTITIONED_SNAPSHOT_PAGES_PER_BATCH_OPTION,
+                str(_DEFAULT_PARTITIONED_SNAPSHOT_PAGES_PER_BATCH),
+                1,
+            ),
         ):
             if int(options.get(name, default)) < minimum:
                 raise ValueError(f"Option '{name}' must be >= {minimum}")
@@ -4737,6 +4762,7 @@ class InformixLakeflowConnect(LakeflowConnect):
         _option_bool(options, _SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION, True)
         _option_bool(options, _PROMOTE_UNIQUE_INDEX_OPTION, True)
         _option_bool(options, _SNAPSHOT_STAGING_PIPELINE_OPTION, True)
+        _option_bool(options, _PARTITIONED_STREAM_OPTION, True)
         staging_transport = (
             str(
                 options.get(_SNAPSHOT_STAGING_TRANSPORT_OPTION, _DEFAULT_SNAPSHOT_STAGING_TRANSPORT)
@@ -4867,6 +4893,12 @@ class InformixLakeflowConnect(LakeflowConnect):
         # interval is an instance attribute so tests can force per-page (0) refreshes.
         self._snapshot_schema_refreshed_at: dict[str, float] = {}
         self._snapshot_schema_refresh_interval = float(_SNAPSHOT_SCHEMA_REFRESH_INTERVAL_SECONDS)
+        # Driver-only bridge between the partitioned reader's latest_offset and
+        # get_partitions for an *embedded* (non-page-serve) microbatch: the rows the
+        # driver already materialized, keyed by the start offset. Excluded from pickling
+        # (driver-only) and cleared on scope change. A cache miss recomputes via read_table,
+        # so correctness never depends on it -- it only avoids a second driver read.
+        self._partition_embedded_rows: dict[str, list[dict[str, Any]]] = {}
 
     def set_registration_scope(self, scope: str) -> None:
         """Install the scope shared by every reader serialized from one registration."""
@@ -4882,6 +4914,7 @@ class InformixLakeflowConnect(LakeflowConnect):
             self._cleaned_snapshot_stages.clear()
             self._snapshot_cleanup_watermark.clear()
             self._snapshot_schema_refreshed_at.clear()
+            self._partition_embedded_rows.clear()
             self._trigger_available_now = False
         self._registration_scope = scope
 
@@ -4960,6 +4993,9 @@ class InformixLakeflowConnect(LakeflowConnect):
         state["_bridge_instance"] = None
         state["_metadata_session_lock"] = None
         state["_metadata_release_timer"] = None
+        # Driver-only; never ship materialized embedded rows to a worker. The worker
+        # gets its rows from the partition descriptor, not from this cache.
+        state["_partition_embedded_rows"] = {}
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
@@ -5353,6 +5389,229 @@ class InformixLakeflowConnect(LakeflowConnect):
                 return iter(()), self._capacity_retry_offset(start_offset)
         finally:
             self._release_worker_connection()
+
+    # ------------------------------------------------------------------
+    # SupportsPartitionedStream -- partitioned snapshot-page reader
+    # ------------------------------------------------------------------
+    # Default on (see _PARTITIONED_STREAM_OPTION). Only the staged-snapshot
+    # page-serve phase fans out: a microbatch spans up to pages-per-batch staged
+    # pages, each read+decoded on its own Spark executor via read_partition. Every
+    # other phase (bootstrap, live CDC/incremental stream, transitions, deletes)
+    # is a single embedded partition whose rows the driver computed via read_table
+    # / read_table_deletes -- byte-for-byte the simple reader's output, just
+    # wrapped. The delicate phase machine (read_table, _read_stream, _read_snapshot,
+    # transitions, _recover) is reused verbatim; only its (rows, offset) output is
+    # reshaped into the partitioned contract.
+
+    def _partitioned_stream_enabled(self) -> bool:
+        return _option_bool(self.options, _PARTITIONED_STREAM_OPTION, True)
+
+    def _partitioned_pages_per_batch(self) -> int:
+        return int(
+            self.options.get(
+                _PARTITIONED_SNAPSHOT_PAGES_PER_BATCH_OPTION,
+                str(_DEFAULT_PARTITIONED_SNAPSHOT_PAGES_PER_BATCH),
+            )
+        )
+
+    def _is_delete_flow(self) -> bool:
+        return self.options.get(_IS_DELETE_FLOW_OPTION) == "true"
+
+    @staticmethod
+    def _partition_offset_key(start_offset: dict | None) -> str:
+        return json.dumps(start_offset or {}, sort_keys=True)
+
+    def is_partitioned(self, table_name: str) -> bool:
+        """Gate the partitioned reader (default on).
+
+        True only for tables with a bounded staged-snapshot -> stream lifecycle:
+        keyed CDC tables and append-only tables. Their snapshot serves immutable
+        staged pages that fan out across executors, and every microbatch is bounded
+        so the embedded fallback never ships an unbounded batch. Snapshot-only
+        (non-CDC, non-append) tables drain unbounded and stay on the simple reader.
+        Cheap and exception-safe: any doubt returns False -> simpleStreamReader.
+        """
+
+        if not self._partitioned_stream_enabled():
+            return False
+        try:
+            table = self._table(table_name, self.options)
+            return bool(_cdc_capable(table) or self._append_only_table(table, self.options))
+        except Exception:  # pylint: disable=broad-except
+            return False
+
+    def _snapshot_page_batch(
+        self, table: Table, effective_start: dict, table_options: dict[str, str]
+    ) -> tuple[str, str, int, int, int, int] | None:
+        """Resolve a staged-snapshot page-serve microbatch, else None.
+
+        Returns ``(scope, schema_id, snapshot_lsn, start_page, end_page,
+        page_count)`` for a snapshot-phase checkpoint whose staged manifest exists,
+        mirroring the resume resolution in :meth:`_read_snapshot`. Deterministic
+        given the start offset + immutable manifest + pages-per-batch, so
+        ``latest_offset`` and ``get_partitions`` agree without sharing state. None
+        means "not a page-serve" -> the embedded path. Never a page-serve for the
+        delete channel (deletes stage no pages).
+        """
+
+        if self._is_delete_flow():
+            return None
+        if not effective_start or effective_start.get("phase") not in (None, "snapshot"):
+            return None
+        try:
+            checkpoint = _validated_offset(effective_start)
+        except Exception:  # pylint: disable=broad-except
+            return None
+        snapshot = checkpoint.get("snapshot")
+        if not isinstance(snapshot, dict) or "page_index" not in snapshot:
+            return None
+        scope = checkpoint.get("pipeline_scope")
+        if not isinstance(scope, str) or _PIPELINE_SCOPE.fullmatch(scope) is None:
+            scope = self._pipeline_scope(checkpoint)
+        schema_id = str(checkpoint["schema_id"])
+        snapshot_lsn = int(checkpoint["snapshot_lsn"])
+        manifest = self._read_snapshot_stage_manifest(table, scope, schema_id)
+        if manifest is None or int(manifest["snapshot_lsn"]) != snapshot_lsn:
+            return None
+        page_count = int(manifest["page_count"])
+        start_page = int(snapshot.get("page_index", 0))
+        if start_page < 0 or start_page >= page_count:
+            return None
+        end_page = min(start_page + self._partitioned_pages_per_batch(), page_count)
+        return (scope, schema_id, snapshot_lsn, start_page, end_page, page_count)
+
+    def _embedded_read(
+        self, table_name: str, start_offset: dict, table_options: dict[str, str]
+    ) -> tuple[Iterator[dict], dict]:
+        if self._is_delete_flow():
+            return self.read_table_deletes(table_name, start_offset, table_options)
+        return self.read_table(table_name, start_offset, table_options)
+
+    def latest_offset(
+        self,
+        table_name: str,
+        table_options: dict[str, str],
+        start_offset: dict | None = None,
+    ) -> dict:
+        start_offset = start_offset or {}
+        table = self._table(table_name, table_options)
+        effective_start = self._effective_start_offset(start_offset)
+        batch = self._snapshot_page_batch(table, effective_start, table_options)
+        if batch is not None:
+            return self._snapshot_page_batch_offset(table, effective_start, batch)
+        rows, next_offset = self._embedded_read(table_name, start_offset, table_options)
+        self._partition_embedded_rows[self._partition_offset_key(start_offset)] = list(rows)
+        return next_offset
+
+    def _snapshot_page_batch_offset(
+        self,
+        table: Table,
+        effective_start: dict,
+        batch: tuple[str, str, int, int, int, int],
+    ) -> dict:
+        """Build the end offset for a page-serve microbatch spanning [start,end) pages.
+
+        Mirrors :meth:`_staged_snapshot_result`'s offset construction: a
+        snapshot-phase offset that advances ``page_index`` to ``end_page`` and
+        carries the boundary page's ``upper_pk`` as ``last_pk``, or the stream-phase
+        transition offset once the last page is served. The schema fingerprint is
+        carried forward from the checkpoint rather than recomputed from a live
+        catalog read -- staged pages are frozen as-of ``snapshot_lsn`` so a
+        mid-snapshot schema change cannot invalidate them, and drift is still caught
+        at the snapshot->CDC transition by ``_read_stream``. In the (overwhelming)
+        no-drift case this is byte-identical to what the simple reader commits.
+        """
+
+        scope, schema_id, snapshot_lsn, start_page, end_page, page_count = batch
+        expected_fingerprint = effective_start.get("schema_fingerprint")
+        # Pages below this batch's first page are committed -- schedule their async
+        # cleanup, exactly as the serial serve does off its own serve path.
+        self._cleanup_consumed_snapshot_stage_pages(
+            table, scope, schema_id, snapshot_lsn, start_page
+        )
+        if end_page >= page_count:
+            end = _offset(
+                snapshot_lsn, snapshot_lsn, snapshot_lsn, None, "stream", table, schema_id, scope
+            )
+            if expected_fingerprint is not None:
+                end["schema_fingerprint"] = expected_fingerprint
+            return end
+        # Non-terminal: last_pk is the boundary page's upper_pk. Read only that one
+        # page's header; its row generator is discarded, so no rows are decoded.
+        header, _rows = self._stream_staged_page(
+            table, scope, schema_id, snapshot_lsn, end_page - 1
+        )
+        last_pk = header.get("upper_pk")
+        end = _offset(
+            snapshot_lsn, snapshot_lsn, snapshot_lsn, None, "snapshot", table, schema_id, scope
+        )
+        if expected_fingerprint is not None:
+            end["schema_fingerprint"] = expected_fingerprint
+        end.update(
+            {
+                "snapshot_lsn": str(snapshot_lsn),
+                "snapshot": {"last_pk": last_pk, "page_index": end_page},
+            }
+        )
+        return _with_backlog_streak(end, effective_start, True)
+
+    def get_partitions(
+        self,
+        table_name: str,
+        table_options: dict[str, str],
+        start_offset: dict | None = None,
+        end_offset: dict | None = None,
+    ) -> Sequence[dict]:
+        if start_offset is None and end_offset is None:
+            # Batch read. Not partitioned here -- raising makes LakeflowBatchReader
+            # fall back to read_table (a single non-partitioned batch).
+            raise NotImplementedError("Informix does not support partitioned batch reads")
+        if start_offset == end_offset:
+            return []
+        table = self._table(table_name, table_options)
+        effective_start = self._effective_start_offset(start_offset or {})
+        batch = self._snapshot_page_batch(table, effective_start, table_options)
+        if batch is not None:
+            scope, schema_id, snapshot_lsn, start_page, end_page, _ = batch
+            return [
+                {
+                    "kind": "page",
+                    "native_identity": table.native_identity,
+                    "exposed_name": table.exposed_name,
+                    "pipeline_scope": scope,
+                    "schema_id": schema_id,
+                    "snapshot_lsn": snapshot_lsn,
+                    "page_index": page_index,
+                }
+                for page_index in range(start_page, end_page)
+            ]
+        rows = self._partition_embedded_rows.pop(self._partition_offset_key(start_offset), None)
+        if rows is None:
+            rows, _ = self._embedded_read(table_name, start_offset or {}, table_options)
+            rows = list(rows)
+        return [{"kind": "embedded", "rows": rows}]
+
+    def read_partition(
+        self, table_name: str, partition: dict, table_options: dict[str, str]
+    ) -> Iterator[dict]:
+        kind = partition.get("kind")
+        if kind == "embedded":
+            yield from partition.get("rows", [])
+            return
+        if kind == "page":
+            # Executor side: read the staged page by identity only -- no Table and no
+            # Informix catalog connection.
+            _header, rows = self._stream_staged_page_for(
+                partition["native_identity"],
+                partition["exposed_name"],
+                partition["pipeline_scope"],
+                partition["schema_id"],
+                int(partition["snapshot_lsn"]),
+                int(partition["page_index"]),
+            )
+            yield from rows
+            return
+        raise InformixError(f"Unknown Informix partition descriptor kind: {kind!r}")
 
     def read_table_deletes(
         self, table_name: str, start_offset: dict, table_options: dict[str, str]
@@ -6510,6 +6769,16 @@ class InformixLakeflowConnect(LakeflowConnect):
         is gone.
         """
 
+        return self._table_state_keys_for(table.native_identity)
+
+    def _table_state_keys_for(self, native_identity: str) -> tuple[str, str]:
+        """Identity-string form of :meth:`_table_state_keys`.
+
+        Depends only on ``native_identity`` and the connection options (both
+        available on a Spark executor), so the staged-page read path can run there
+        without a ``Table`` -- i.e. without a live Informix catalog lookup.
+        """
+
         namespace = "\0".join(
             (
                 "v2",
@@ -6521,15 +6790,20 @@ class InformixLakeflowConnect(LakeflowConnect):
         )
         return (
             hashlib.sha256(namespace.encode()).hexdigest()[:24],
-            hashlib.sha256(table.native_identity.encode()).hexdigest()[:24],
+            hashlib.sha256(native_identity.encode()).hexdigest()[:24],
         )
 
     def _snapshot_stage_namespace(self, table: Table, pipeline_scope: str, schema_id: str) -> str:
+        return self._snapshot_stage_namespace_for(table.native_identity, pipeline_scope, schema_id)
+
+    def _snapshot_stage_namespace_for(
+        self, native_identity: str, pipeline_scope: str, schema_id: str
+    ) -> str:
         # Computed directly from the table's identity rather than recovered by
         # relpath against the shared state location, so staging no longer depends
         # on that location existing at all. The resulting path is byte-identical
         # to what the relpath form produced.
-        connection_key, table_key = self._table_state_keys(table)
+        connection_key, table_key = self._table_state_keys_for(native_identity)
         return os.path.join(
             self._snapshot_staging_location,
             connection_key,
@@ -6796,8 +7070,33 @@ class InformixLakeflowConnect(LakeflowConnect):
         logic lives in one place.
         """
 
+        return self._read_staged_page_payload_for(
+            table.native_identity,
+            table.exposed_name,
+            pipeline_scope,
+            schema_id,
+            snapshot_lsn,
+            page_index,
+        )
+
+    def _read_staged_page_payload_for(
+        self,
+        native_identity: str,
+        exposed_name: str,
+        pipeline_scope: str,
+        schema_id: str,
+        snapshot_lsn: int,
+        page_index: int,
+    ) -> bytes:
+        """Identity-string form of :meth:`_read_staged_page_payload`.
+
+        Uses only the page's identity strings + the staging location, so it runs on
+        a Spark executor (the partitioned reader's ``read_partition``) with no live
+        Informix ``Table`` and therefore no catalog connection.
+        """
+
         path = os.path.join(
-            self._snapshot_stage_namespace(table, pipeline_scope, schema_id),
+            self._snapshot_stage_namespace_for(native_identity, pipeline_scope, schema_id),
             "runs",
             str(snapshot_lsn),
             f"page-{page_index:08d}",
@@ -6810,18 +7109,18 @@ class InformixLakeflowConnect(LakeflowConnect):
                 os.close(descriptor)
                 raise InformixError(
                     f"Compressed staged snapshot page {page_index} for "
-                    f"'{table.exposed_name}' is too large"
+                    f"'{exposed_name}' is too large"
                 )
             with os.fdopen(descriptor, "rb") as raw_handle:
                 with gzip.GzipFile(fileobj=raw_handle, mode="rb") as handle:
                     payload = handle.read(_MAX_SNAPSHOT_STAGE_PAGE_BYTES + 1)
         except (OSError, EOFError) as error:
             raise InformixError(
-                f"Cannot read staged snapshot page {page_index} for " f"'{table.exposed_name}'"
+                f"Cannot read staged snapshot page {page_index} for " f"'{exposed_name}'"
             ) from error
         if len(payload) > _MAX_SNAPSHOT_STAGE_PAGE_BYTES:
             raise InformixError(
-                f"Staged snapshot page {page_index} for '{table.exposed_name}' "
+                f"Staged snapshot page {page_index} for '{exposed_name}' "
                 "exceeds its decoded size bound"
             )
         return payload
@@ -6908,14 +7207,38 @@ class InformixLakeflowConnect(LakeflowConnect):
         enforces the row count.
         """
 
-        payload = self._read_staged_page_payload(
-            table, pipeline_scope, schema_id, snapshot_lsn, page_index
+        return self._stream_staged_page_for(
+            table.native_identity,
+            table.exposed_name,
+            pipeline_scope,
+            schema_id,
+            snapshot_lsn,
+            page_index,
+        )
+
+    def _stream_staged_page_for(
+        self,
+        native_identity: str,
+        exposed_name: str,
+        pipeline_scope: str,
+        schema_id: str,
+        snapshot_lsn: int,
+        page_index: int,
+    ) -> tuple[dict[str, Any], Iterator[dict[str, Any]]]:
+        """Identity-string form of :meth:`_stream_staged_page`.
+
+        Takes the page's identity strings instead of a ``Table`` so it runs on a
+        Spark executor (the partitioned reader's ``read_partition``) without a live
+        Informix catalog lookup. Integrity, structural scan, and row-count checks
+        are identical.
+        """
+
+        payload = self._read_staged_page_payload_for(
+            native_identity, exposed_name, pipeline_scope, schema_id, snapshot_lsn, page_index
         )
 
         def invalid() -> InformixError:
-            return InformixError(
-                f"Invalid staged snapshot page {page_index} for '{table.exposed_name}'"
-            )
+            return InformixError(f"Invalid staged snapshot page {page_index} for '{exposed_name}'")
 
         try:
             text = payload.decode("ascii")
@@ -6943,7 +7266,7 @@ class InformixLakeflowConnect(LakeflowConnect):
         expected_row_count = header.get("row_count")
         expected_identity = (
             _SNAPSHOT_STAGE_VERSION,
-            table.native_identity,
+            native_identity,
             pipeline_scope,
             schema_id,
             page_index,
@@ -6961,8 +7284,6 @@ class InformixLakeflowConnect(LakeflowConnect):
             or not isinstance(expected_row_count, int)
         ):
             raise invalid()
-
-        exposed_name = table.exposed_name
 
         def stream_rows() -> Iterator[dict[str, Any]]:
             row_decoder = json.JSONDecoder()

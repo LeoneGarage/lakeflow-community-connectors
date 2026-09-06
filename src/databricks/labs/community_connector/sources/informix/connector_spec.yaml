@@ -374,6 +374,33 @@ connection:
         page by an internal byte ceiling and overall by `snapshot.max.rows` /
         `snapshot.max.bytes`.
 
+    - name: stream.partitioned
+      type: string
+      required: false
+      description: >
+        Whether the connector uses the partitioned stream reader. Default `true`. When
+        enabled, the staged-snapshot page-serve phase fans out -- a microbatch spans up
+        to `stream.partitioned.snapshot.pages.per.batch` immutable staged pages, each
+        read and decoded on a separate Spark executor rather than one page per microbatch
+        on the driver. Every other phase (staging bootstrap, the live CDC/incremental
+        stream, snapshot->CDC transitions, deletes) is a single driver-computed partition
+        whose rows are byte-for-byte the current output, just wrapped. Applies only to
+        tables with a bounded staged-snapshot->stream lifecycle (keyed CDC tables and
+        append-only tables); snapshot-only tables always use the simple reader. Both
+        readers persist the same offset, so flipping this and restarting resumes an
+        existing checkpoint in place with no full refresh. Set `false` to force the
+        simple (single-partition, driver) reader. Accepts `true`/`false`.
+
+    - name: stream.partitioned.snapshot.pages.per.batch
+      type: string
+      required: false
+      description: >
+        How many staged snapshot pages a single partitioned microbatch spans -- the
+        maximum executor fan-out per batch. Default `8`; minimum `1`. Only meaningful
+        when `stream.partitioned=true`. Larger values read more pages in parallel per
+        microbatch at the cost of a larger batch; the driver reads one boundary page's
+        header per microbatch to record the resume cursor, independent of this value.
+
     - name: snapshot.staging.transport
       type: string
       required: false
