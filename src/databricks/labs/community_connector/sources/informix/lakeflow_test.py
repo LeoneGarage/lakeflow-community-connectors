@@ -10247,6 +10247,18 @@ class SharedCdcOptionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._connector(**{"cdc.shared.slot.liveness.enabled": "maybe"})
 
+    def test_negative_startup_jitter_rejected(self):
+        with self.assertRaises(ValueError):
+            self._connector(**{"connection.startup.jitter.seconds": "-1"})
+
+    def test_non_numeric_startup_jitter_rejected(self):
+        with self.assertRaises(ValueError):
+            self._connector(**{"connection.startup.jitter.seconds": "soon"})
+
+    def test_zero_startup_jitter_accepted(self):
+        # 0 is the disabled default and must construct.
+        self._connector(**{"connection.startup.jitter.seconds": "0"})
+
 
 class SharedCdcConsumerSeamTests(unittest.TestCase):
     """The streaming consumer reads from the shard and touches Informix for nothing."""
@@ -11527,6 +11539,72 @@ class CdcDaemonSlotLivenessTests(unittest.TestCase):
 
         token.assert_not_called()
         self.assertNotIn("wedged", str(caught.exception))
+
+
+class ConnectionStartupJitterTests(unittest.TestCase):
+    """A reader sleeps a one-shot jittered delay before its first connection so a pipeline
+    starting dozens of flows does not open all their CDC sessions at once."""
+
+    def _bridge(self, **options):
+        return informix_module.PurePythonInformixBridge(
+            {
+                "hostname": "localhost",
+                "database": "demo",
+                "user": "informix",
+                "password": "secret",
+                "server": "demo_on",
+                "lakebase.password": "test-state-password",
+                **options,
+            }
+        )
+
+    def test_jitter_sleeps_once_before_first_connect(self):
+        bridge = self._bridge(**{"connection.startup.jitter.seconds": "5"})
+        with (
+            mock.patch.object(informix_module.random, "uniform", return_value=1.23) as unif,
+            mock.patch.object(informix_module.time, "sleep") as slept,
+        ):
+            bridge._apply_startup_jitter()
+            bridge._apply_startup_jitter()  # one-shot: the second call does nothing
+
+        unif.assert_called_once_with(0, 5.0)
+        slept.assert_called_once_with(1.23)
+        self.assertTrue(bridge._startup_jitter_applied)
+
+    def test_disabled_by_default(self):
+        bridge = self._bridge()
+        with mock.patch.object(informix_module.time, "sleep") as slept:
+            bridge._apply_startup_jitter()
+        slept.assert_not_called()
+        self.assertTrue(bridge._startup_jitter_applied)  # flag still set, so no re-check
+
+    def test_zero_does_not_sleep(self):
+        bridge = self._bridge(**{"connection.startup.jitter.seconds": "0"})
+        with mock.patch.object(informix_module.time, "sleep") as slept:
+            bridge._apply_startup_jitter()
+        slept.assert_not_called()
+
+    def test_ensure_connected_applies_jitter_before_acquiring_a_slot(self):
+        # The jitter runs inside _ensure_connected before slot acquisition, so a jittering
+        # reader holds no slot while it waits. Assert ordering via a recording sequence.
+        bridge = self._bridge(**{"connection.startup.jitter.seconds": "3"})
+        bridge._connected = False
+        order = []
+        with (
+            mock.patch.object(informix_module.random, "uniform", return_value=0.5),
+            mock.patch.object(
+                informix_module.time, "sleep", side_effect=lambda *_: order.append("jitter")
+            ),
+            mock.patch.object(
+                bridge, "_acquire_connection_slot", side_effect=lambda *a, **k: order.append("slot")
+            ),
+            mock.patch.object(
+                bridge, "_connect_transport", side_effect=lambda *a, **k: order.append("connect")
+            ),
+        ):
+            bridge._ensure_connected()
+
+        self.assertEqual(order, ["jitter", "slot", "connect"])
 
 
 class SnapshotDrainSlotLivenessTests(unittest.TestCase):
