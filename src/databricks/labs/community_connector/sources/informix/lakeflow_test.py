@@ -4566,6 +4566,90 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(end["snapshot"]["last_pk"], [2])
         self.assertEqual(end["snapshot"]["page_index"], 1)
 
+    def _flush_snapshot_cleanup(self, connector):
+        # Force the background cleanup pool to finish, then drop it so the next
+        # cleanup call lazily starts a fresh one -- makes async deletion deterministic
+        # to assert in tests.
+        executor = connector._snapshot_cleanup_executor_instance
+        if executor is not None:
+            executor.shutdown(wait=True)
+            connector._snapshot_cleanup_executor_instance = None
+
+    def test_consumed_snapshot_pages_are_cleaned_incrementally_off_the_serve_path(self):
+        # Cleanup deletes only the pages advanced past since the last call (tracked by
+        # a per-stream high-water mark), on a background pool -- never the old
+        # O(page_index) rescan of every earlier page each microbatch. Verify the
+        # observable outcome: the right pages are gone, the current page is kept, and
+        # a second advance touches only the newly-consumed pages.
+        connector = self.connector()
+        table = connector._table("app.orders", {})
+        scope = connector._pipeline_scope()
+        schema_id = "cleanup"
+        snapshot_lsn = 100
+        for i in range(6):
+            connector._publish_snapshot_stage_page(
+                table, scope, schema_id, snapshot_lsn, i, [{"id": i}], None
+            )
+        run = os.path.join(
+            connector._snapshot_stage_namespace(table, scope, schema_id), "runs", str(snapshot_lsn)
+        )
+
+        def page_dir(i):
+            return os.path.join(run, f"page-{i:08d}")
+
+        # Advancing to page 3 deletes 0,1,2 (async); 3,4,5 remain.
+        connector._cleanup_consumed_snapshot_stage_pages(table, scope, schema_id, snapshot_lsn, 3)
+        self._flush_snapshot_cleanup(connector)
+        self.assertFalse(any(os.path.isdir(page_dir(i)) for i in (0, 1, 2)))
+        self.assertTrue(all(os.path.isdir(page_dir(i)) for i in (3, 4, 5)))
+        self.assertEqual(connector._snapshot_cleanup_watermark[(scope, schema_id, snapshot_lsn)], 3)
+
+        # Advancing to page 5 deletes only 3,4; page 5 (the current page) is kept.
+        connector._cleanup_consumed_snapshot_stage_pages(table, scope, schema_id, snapshot_lsn, 5)
+        self._flush_snapshot_cleanup(connector)
+        self.assertFalse(any(os.path.isdir(page_dir(i)) for i in range(5)))
+        self.assertTrue(os.path.isdir(page_dir(5)))
+
+    def test_cleanup_schedules_each_consumed_page_exactly_once(self):
+        # The high-water mark makes cleanup incremental: re-serving the same page is a
+        # no-op, and advancing schedules only the delta -- each page exactly once, the
+        # current page never. This is what kills the old O(page_index)-per-microbatch
+        # (O(N^2)-per-snapshot) FUSE rescan.
+        connector = self.connector()
+        table = connector._table("app.orders", {})
+        scope = connector._pipeline_scope()
+        schema_id = "cleanup2"
+        snapshot_lsn = 200
+        run = os.path.join(
+            connector._snapshot_stage_namespace(table, scope, schema_id), "runs", str(snapshot_lsn)
+        )
+        recorded, lock = [], threading.Lock()
+
+        def record(path):
+            with lock:
+                recorded.append(path)
+
+        with mock.patch.object(
+            informix_module.InformixLakeflowConnect,
+            "_delete_snapshot_page",
+            staticmethod(record),
+        ):
+            connector._cleanup_consumed_snapshot_stage_pages(
+                table, scope, schema_id, snapshot_lsn, 3
+            )
+            self._flush_snapshot_cleanup(connector)
+            connector._cleanup_consumed_snapshot_stage_pages(
+                table, scope, schema_id, snapshot_lsn, 3
+            )
+            connector._cleanup_consumed_snapshot_stage_pages(
+                table, scope, schema_id, snapshot_lsn, 5
+            )
+            self._flush_snapshot_cleanup(connector)
+
+        expected = [os.path.join(run, f"page-{i:08d}") for i in range(5)]
+        self.assertEqual(sorted(recorded), sorted(expected))
+        self.assertEqual(len(recorded), 5)  # pages 0..4 once each; page 5 (current) never
+
     def test_a_staged_snapshot_with_pages_remaining_records_a_backlog_streak(self):
         # The staged (blocking) snapshot knows its remaining page count exactly, so
         # a reader mid-snapshot has certain outstanding work and must rank above an
@@ -4634,6 +4718,9 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual([row["id"] for row in rows], [2])
         self.assertEqual(stream_end["phase"], "stream")
+        # Consumed-page deletion is scheduled on a background pool during the read;
+        # wait for it before asserting the page is gone.
+        self._flush_snapshot_cleanup(connector)
         self.assertFalse(os.path.lexists(first_page))
         self.assertTrue(os.path.isdir(current_page))
         # The manifest is metadata, so it is a state record rather than a
