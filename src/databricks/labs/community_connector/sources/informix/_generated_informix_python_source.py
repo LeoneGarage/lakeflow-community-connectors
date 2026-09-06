@@ -2012,9 +2012,25 @@ def register_lakeflow_source(spark):
         """,
         # Add the class column in place for a slot_waiters table created by an older
         # deployment, so a mixed-version rollout is safe: tickets written before the
-        # upgrade default to class 0.
+        # upgrade default to class 0. Guarded by an existence check rather than a bare
+        # ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS``: that form still takes an
+        # ACCESS EXCLUSIVE lock on slot_waiters *every* time ensure_schema runs (even when
+        # the column already exists), which deadlocks against the concurrent acquire_slot
+        # transactions that read slot_waiters and write conn_slots/slot_rr_cursor. The DO
+        # block only issues the ALTER (and takes the lock) on the one run that actually
+        # migrates; once the column exists it is a lock-free catalog read.
         """
-        ALTER TABLE slot_waiters ADD COLUMN IF NOT EXISTS waiter_class smallint NOT NULL DEFAULT 0
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'slot_waiters'
+                  AND column_name = 'waiter_class'
+            ) THEN
+                ALTER TABLE slot_waiters ADD COLUMN waiter_class smallint NOT NULL DEFAULT 0;
+            END IF;
+        END $$
         """,
         # Ordering scans walk a namespace's tickets oldest-first; the reaper filters by age.
         """
