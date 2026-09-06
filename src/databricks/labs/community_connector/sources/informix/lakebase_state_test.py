@@ -70,7 +70,10 @@ class _FakeCursor:
             text.startswith("CREATE TABLE")
             or text.startswith("CREATE INDEX")
             or text.startswith("ALTER TABLE")
+            or text.startswith("DO $$")
         ):
+            # DDL / the guarded waiter_class migration DO block: the fake always models
+            # the column as present (see _enqueue_waiter), so the migration is a no-op here.
             return
         if "INSERT INTO conn_slots" in text:
             self._seed_slots(args)
@@ -619,6 +622,21 @@ class LakebaseSlotTests(unittest.TestCase):
         self.assertIn("state_records_activity_age_idx", schema)
         self.assertIn("(record->>'last_used_at')::double precision", schema)
         self.assertIn("WHERE record_type = 'table-activity'", schema)
+
+    def test_waiter_class_migration_is_lock_guarded(self):
+        # The waiter_class migration MUST NOT be a bare ALTER TABLE ... ADD COLUMN: that
+        # takes an ACCESS EXCLUSIVE lock on slot_waiters every time ensure_schema runs (even
+        # when the column exists) and deadlocks against concurrent acquire_slot transactions.
+        # It must be guarded by an existence check so the ALTER only fires when migrating.
+        schema = "\n".join(lakebase_state._SCHEMA_STATEMENTS)
+        self.assertNotIn("ALTER TABLE slot_waiters ADD COLUMN IF NOT EXISTS waiter_class", schema)
+        migration = next(
+            s
+            for s in lakebase_state._SCHEMA_STATEMENTS
+            if "waiter_class" in s and "ALTER TABLE slot_waiters" in s
+        )
+        self.assertIn("information_schema.columns", migration)
+        self.assertIn("IF NOT EXISTS (", migration)
 
     def test_ensure_schema_locks_before_creating_tables(self):
         # CREATE TABLE IF NOT EXISTS races on the catalog insert when several workers
