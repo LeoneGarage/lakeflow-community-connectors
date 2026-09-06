@@ -7738,7 +7738,6 @@ class InformixLakeflowConnect(LakeflowConnect):
                     f"Incremental snapshot boundary mismatch for '{table.exposed_name}'"
                 )
             page_index = int(checkpoint["snapshot"].get("page_index", -1))
-            table = self._refresh_table_schema(table, expected_fingerprint)
             return self._staged_snapshot_result(
                 table, pipeline_scope, schema_id, manifest, page_index, checkpoint
             )
