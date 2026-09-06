@@ -5143,6 +5143,63 @@ class LakeflowContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "snapshot.staging.retention.days.*>= 1"):
             self.connector(**{"snapshot.staging.retention.days": "0"})
 
+    def test_retention_sweep_removes_stale_runs_and_keeps_fresh(self):
+        # Build the staging layout by hand with one old run and one fresh run, then run
+        # the background sweep worker directly and assert only the stale run is reclaimed.
+        with tempfile.TemporaryDirectory() as root:
+            runs = os.path.join(root, "scope", "schema", "runs")
+            stale = os.path.join(runs, "1000")
+            fresh = os.path.join(runs, "2000")
+            for run in (stale, fresh):
+                os.makedirs(run)
+            open(os.path.join(stale, "page-00000000"), "wb").close()
+            open(os.path.join(fresh, "page-00000000"), "wb").close()
+            now = time.time()
+            os.utime(os.path.join(stale, "page-00000000"), (now - 10_000, now - 10_000))
+            os.utime(os.path.join(fresh, "page-00000000"), (now, now))
+
+            InformixLakeflowConnect._sweep_stale_snapshot_stages(root, retention_seconds=100.0)
+
+            self.assertFalse(os.path.exists(stale))
+            self.assertTrue(os.path.isdir(fresh))
+
+    def test_retention_sweep_tolerates_missing_root(self):
+        # A table that never staged has no root; the sweep must be a quiet no-op.
+        InformixLakeflowConnect._sweep_stale_snapshot_stages(
+            os.path.join(self._shared_state.name, "never-staged"), retention_seconds=100.0
+        )
+
+    def test_maybe_sweep_submits_once_per_table(self):
+        connector = self.connector()
+        table = Table.parse(FakeBridge().tables[0], "demo")
+
+        class _RecordingExecutor:
+            def __init__(self):
+                self.submitted = []
+
+            def submit(self, fn, *args):
+                self.submitted.append((fn, args))
+
+        rec = _RecordingExecutor()
+        with mock.patch.object(connector, "_snapshot_cleanup_executor", return_value=rec):
+            connector._maybe_sweep_stale_snapshot_stages(table)
+            connector._maybe_sweep_stale_snapshot_stages(table)  # one-shot: no second submit
+
+        self.assertEqual(len(rec.submitted), 1)
+        fn, args = rec.submitted[0]
+        self.assertEqual(fn, connector._sweep_stale_snapshot_stages)
+        root = args[0]
+        self.assertTrue(root.startswith(connector._snapshot_staging_location))
+        self.assertTrue(root.endswith("snapshot-page-data"))
+
+    def test_maybe_sweep_is_a_noop_without_a_staging_location(self):
+        connector = self.connector()
+        connector._snapshot_staging_location = ""
+        table = Table.parse(FakeBridge().tables[0], "demo")
+        with mock.patch.object(connector, "_snapshot_cleanup_executor") as executor:
+            connector._maybe_sweep_stale_snapshot_stages(table)
+        executor.assert_not_called()
+
     def test_snapshot_staging_location_can_be_configured_separately(self):
         with tempfile.TemporaryDirectory() as staging:
             connector = self.connector(

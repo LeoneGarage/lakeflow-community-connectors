@@ -3661,6 +3661,26 @@ def _newest_created_entry_mtime(path: str, recursive: bool = False) -> float:
         raise
 
 
+def _staging_subdirectories(path: str) -> list[str]:
+    """Immediate subdirectory paths of ``path``; empty if it is absent or unreadable.
+
+    Best-effort helper for the retention sweep: a missing path (nothing staged) is not
+    an error, and a scan failure must never fail a read -- the sweep is a background
+    safety net.
+    """
+
+    try:
+        with os.scandir(path) as entries:
+            return [entry.path for entry in entries if entry.is_dir(follow_symlinks=False)]
+    except FileNotFoundError:
+        return []
+    except OSError:
+        logging.getLogger(__name__).warning(
+            "Cannot scan Informix snapshot staging path: %s", path, exc_info=True
+        )
+        return []
+
+
 def _remove_candidate_tree_at(parent_descriptor: int, name: str) -> None:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     root = os.open(name, flags, dir_fd=parent_descriptor)
@@ -5052,6 +5072,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # Values are codec-encoded (JSON-safe) rows -- the exact descriptor payload
         # get_partitions emits and read_partition decodes; see _encode_embedded_rows.
         self._partition_embedded_rows: dict[str, list[Any]] = {}
+        # Tables whose stale-stage retention sweep has already been submitted by this
+        # reader instance, so the age-based safety net runs at most once per table per
+        # instance (off the serve path) instead of every microbatch.
+        self._retention_swept: set[str] = set()
 
     def set_registration_scope(self, scope: str) -> None:
         """Install the scope shared by every reader serialized from one registration."""
@@ -5068,6 +5092,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             self._snapshot_cleanup_watermark.clear()
             self._snapshot_schema_refreshed_at.clear()
             self._partition_embedded_rows.clear()
+            self._retention_swept.clear()
             self._trigger_available_now = False
         self._registration_scope = scope
 
@@ -5408,6 +5433,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 table = self._table(table_name, table_options)
                 self._cleanup_previous_update_scopes(table, effective_start)
                 self._touch_table_state(table)
+                self._maybe_sweep_stale_snapshot_stages(table)
                 _ensure_materializable(table, table_options)
                 if (
                     _cdc_capable(table)
@@ -7568,6 +7594,60 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         for page_index in range(already_scheduled, before_page_index):
             path = os.path.join(run, f"page-{page_index:08d}")
             executor.submit(self._delete_snapshot_page, path)
+
+    def _maybe_sweep_stale_snapshot_stages(self, table: Table) -> None:
+        """Submit a one-shot background sweep of this table's stale staged snapshot runs.
+
+        The consumed-page and completed-stage cleanups reclaim staging in the normal
+        lifecycle, but a crash, an abandoned resnapshot, or a superseded schema/scope can
+        leave a whole ``runs/<snapshot_lsn>`` subtree behind. This is the age-based safety
+        net that ``snapshot.staging.retention.days`` promises. It runs off the serve path
+        (on the same background pool as page deletion) and at most once per table per
+        reader instance -- so it never blocks a microbatch and never rescans -- and it is
+        keyed on file mtime, so an active run (recent page writes) is never swept.
+        """
+
+        location = self._snapshot_staging_location
+        retention = self._snapshot_staging_retention_seconds
+        if not location or retention <= 0:
+            return
+        identity = table.native_identity
+        if identity in self._retention_swept:
+            return
+        self._retention_swept.add(identity)
+        connection_key, table_key = self._table_state_keys_for(identity)
+        root = os.path.join(location, connection_key, table_key, "snapshot-page-data")
+        self._snapshot_cleanup_executor().submit(
+            self._sweep_stale_snapshot_stages, root, float(retention)
+        )
+
+    @staticmethod
+    def _sweep_stale_snapshot_stages(root: str, retention_seconds: float) -> None:
+        """Delete ``runs/<snapshot_lsn>`` subtrees under a table's staging root whose
+        newest page is older than the retention window.
+
+        Best-effort and idempotent, and safe to run concurrently with serving: an active
+        run's pages carry a recent mtime so it is never selected, and a path that is
+        missing or removed by a racing cleanup is skipped. Runs on a background thread.
+        """
+
+        cutoff = time.time() - retention_seconds
+        for scope in _staging_subdirectories(root):
+            for schema in _staging_subdirectories(scope):
+                for run in _staging_subdirectories(os.path.join(schema, "runs")):
+                    try:
+                        if _newest_created_entry_mtime(run, recursive=True) >= cutoff:
+                            continue
+                    except OSError:
+                        continue  # vanished or unreadable -- nothing to reclaim
+                    try:
+                        PurePythonInformixBridge._remove_connection_slot_tree(run)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        logging.getLogger(__name__).warning(
+                            "Cannot remove stale Informix snapshot run: %s", run, exc_info=True
+                        )
 
     def _read_snapshot_stage_manifest(
         self, table: Table, pipeline_scope: str, schema_id: str
