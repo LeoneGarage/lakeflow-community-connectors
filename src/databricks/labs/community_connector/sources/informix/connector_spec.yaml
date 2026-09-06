@@ -742,9 +742,15 @@ connection:
       type: string
       required: false
       description: >
-        Days to retain abandoned immutable snapshot page scopes before
-        best-effort cleanup. Default `4`; minimum `1`. Active and
-        checkpoint-referenced snapshot scopes are never removed.
+        Age threshold for the background retention sweep that reclaims abandoned
+        snapshot staging. Default `4`; minimum `1`. Normal cleanup removes consumed
+        pages incrementally and the whole stage at the snapshot->CDC transition; this
+        sweep is the safety net for a run left behind by a crash, an abandoned
+        resnapshot, or a superseded schema/scope. It runs asynchronously (off the read
+        path) at most once per table per reader and deletes only runs/<snapshot_lsn>
+        subtrees whose newest page file is older than this window, so an active run
+        (recent writes) is never removed. Best-effort: a leftover only wastes Volume
+        space, never affects correctness.
 
     - name: cdc.shared.state.wait.seconds
       type: string
