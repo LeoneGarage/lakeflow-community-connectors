@@ -68,6 +68,7 @@ from pyspark.sql.types import (
     VariantVal,
 )
 import base64
+import concurrent.futures
 import contextlib
 import errno
 import fnmatch
@@ -5601,6 +5602,10 @@ def register_lakeflow_source(spark):
     _SHARED_STATE_WAIT_SECONDS = 300
     _MAX_SNAPSHOT_STAGE_PAGE_BYTES = 256 << 20
     _DEFAULT_SNAPSHOT_STAGE_RETENTION_DAYS = 4
+    # Background threads that delete consumed staged pages off the microbatch serve
+    # path. A small pool drains the one-page-per-microbatch steady state easily and
+    # clears any post-restart backlog quickly without hammering the Volume.
+    _SNAPSHOT_CLEANUP_THREADS = 4
     # Bootstrap reads a delete reader spends waiting for *this* update's scoped
     # initialization record before it will consider the scope-independent schema node.
     #
@@ -10079,6 +10084,15 @@ def register_lakeflow_source(spark):
             # Set by a snapshot-drain worker to a callback that reports a staged page to the
             # pool, resetting the consumer's liveness watchdog. None on a normal reader.
             self._drain_progress: Callable[[], None] | None = None
+            # Consumed-page cleanup runs off the serve path on a background pool, and a
+            # per-stream high-water mark (keyed by scope/schema/snapshot_lsn) makes it
+            # incremental: each microbatch schedules only the pages newly advanced past,
+            # not a rescan of every earlier page. The executor is lazily created (and
+            # excluded from pickling) because it is a driver-only, non-serializable object.
+            self._snapshot_cleanup_executor_instance: concurrent.futures.ThreadPoolExecutor | None = (
+                None
+            )
+            self._snapshot_cleanup_watermark: dict[tuple[str, str, int], int] = {}
 
         def set_registration_scope(self, scope: str) -> None:
             """Install the scope shared by every reader serialized from one registration."""
@@ -10092,6 +10106,7 @@ def register_lakeflow_source(spark):
                 self._activity_touched.clear()
                 self._cleaned_update_scopes.clear()
                 self._cleaned_snapshot_stages.clear()
+                self._snapshot_cleanup_watermark.clear()
                 self._trigger_available_now = False
             self._registration_scope = scope
 
@@ -10112,6 +10127,13 @@ def register_lakeflow_source(spark):
         def close(self) -> None:
             """Close the live SQLI transport, if one was opened."""
 
+            # Stop the background page-cleanup pool without blocking on in-flight
+            # deletes -- cleanup is best-effort, so a few pages may be left for the
+            # retention sweep. Nulling it lets a later read lazily start a fresh pool.
+            executor = self._snapshot_cleanup_executor_instance
+            if executor is not None:
+                self._snapshot_cleanup_executor_instance = None
+                executor.shutdown(wait=False)
             with self._metadata_session_lock:
                 self._metadata_session_generation += 1
                 timer = self._metadata_release_timer
@@ -12192,6 +12214,37 @@ def register_lakeflow_source(spark):
 
             return header, stream_rows()
 
+        def _snapshot_cleanup_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+            """Lazily start the background pool that deletes consumed staged pages.
+
+            Created on first use rather than in ``__init__`` and never pickled (see
+            ``close``/``__getstate__``): it is a driver-only, non-serializable object.
+            """
+
+            executor = self._snapshot_cleanup_executor_instance
+            if executor is None:
+                executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=_SNAPSHOT_CLEANUP_THREADS,
+                    thread_name_prefix="informix-page-cleanup",
+                )
+                self._snapshot_cleanup_executor_instance = executor
+            return executor
+
+        @staticmethod
+        def _delete_snapshot_page(path: str) -> None:
+            """Remove one consumed staged page. Best-effort: a leak only wastes space."""
+
+            try:
+                PurePythonInformixBridge._remove_connection_slot_tree(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logging.getLogger(__name__).warning(
+                    "Cannot remove consumed Informix snapshot page: %s",
+                    path,
+                    exc_info=True,
+                )
+
         def _cleanup_consumed_snapshot_stage_pages(
             self,
             table: Table,
@@ -12200,25 +12253,34 @@ def register_lakeflow_source(spark):
             snapshot_lsn: int,
             before_page_index: int,
         ) -> None:
-            """Best-effort delete pages acknowledged by an advanced start offset."""
+            """Schedule deletion of pages the reader has advanced past.
 
+            Incremental and off the serve path. A per-stream high-water mark makes
+            this schedule only the pages consumed since the last call, so it is O(1)
+            amortized per microbatch instead of the old O(page_index) rescan that
+            re-walked every earlier page each time -- at thousands of pages that
+            quadratic pile of FUSE lookups, not decode, dominated serve time. The
+            deletes run on a background pool so the microbatch never blocks on the
+            Volume. The mark lives on the reader instance, so a fresh stream (or a
+            restart) starts at zero and schedules every earlier page once; that
+            catch-up is still asynchronous. Deletion stays best-effort: a leaked page
+            only wastes space and is reclaimed by the retention sweep.
+            """
+
+            key = (pipeline_scope, schema_id, snapshot_lsn)
+            already_scheduled = self._snapshot_cleanup_watermark.get(key, 0)
+            if before_page_index <= already_scheduled:
+                return
+            self._snapshot_cleanup_watermark[key] = before_page_index
             run = os.path.join(
                 self._snapshot_stage_namespace(table, pipeline_scope, schema_id),
                 "runs",
                 str(snapshot_lsn),
             )
-            for page_index in range(before_page_index):
+            executor = self._snapshot_cleanup_executor()
+            for page_index in range(already_scheduled, before_page_index):
                 path = os.path.join(run, f"page-{page_index:08d}")
-                try:
-                    PurePythonInformixBridge._remove_connection_slot_tree(path)
-                except FileNotFoundError:
-                    continue
-                except OSError:
-                    logging.getLogger(__name__).warning(
-                        "Cannot remove consumed Informix snapshot page: %s",
-                        path,
-                        exc_info=True,
-                    )
+                executor.submit(self._delete_snapshot_page, path)
 
         def _read_snapshot_stage_manifest(
             self, table: Table, pipeline_scope: str, schema_id: str
