@@ -4650,6 +4650,213 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(sorted(recorded), sorted(expected))
         self.assertEqual(len(recorded), 5)  # pages 0..4 once each; page 5 (current) never
 
+    # ------------------------------------------------------------------
+    # Partitioned snapshot-page reader (SupportsPartitionedStream)
+    # ------------------------------------------------------------------
+
+    def _drive_partitioned_snapshot(self, connector, table_name="app.orders", options=None):
+        """Drive the partitioned reader through the snapshot, mirroring Spark's cycle.
+
+        Each iteration: latest_offset(start) -> partitions(start,end) -> read each
+        partition, then advance. Stops when the stream phase is reached. Returns the
+        (served_rows, offsets) collected, so a test can assert fan-out, order, and
+        the snapshot->stream transition.
+        """
+
+        options = options or {}
+        served: list[dict] = []
+        offsets: list[dict] = []
+        start: dict = {}
+        for _ in range(1000):  # safety bound
+            end = connector.latest_offset(table_name, options, start)
+            for part in connector.get_partitions(table_name, options, start, end):
+                served.extend(connector.read_partition(table_name, part, options))
+            offsets.append(end)
+            start = end
+            if end.get("phase") == "stream":
+                break
+        self._flush_snapshot_cleanup(connector)
+        return served, offsets
+
+    def test_partitioned_reader_is_gated_by_the_option(self):
+        # Default on for a keyed (CDC-capable) table; off suppresses it so the
+        # framework falls back to simpleStreamReader (byte-for-byte current behavior).
+        on = self.connector()
+        self.assertTrue(on.is_partitioned("app.orders"))
+        off = self.connector(**{"stream.partitioned": "false"})
+        self.assertFalse(off.is_partitioned("app.orders"))
+
+    def test_partitioned_pages_per_batch_must_be_positive(self):
+        with self.assertRaises(ValueError):
+            self.connector(**{"stream.partitioned.snapshot.pages.per.batch": "0"})
+
+    def test_partitioned_snapshot_fans_pages_out_and_preserves_order(self):
+        # A staged snapshot of several one-row pages fans out k pages per microbatch,
+        # each served by read_partition, and the union equals the full snapshot in
+        # page (id) order -- with no page served twice.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 6)]  # 5 rows -> 5 pages
+        connector = self.connector(
+            bridge,
+            **{"snapshot.page.size": "1", "stream.partitioned.snapshot.pages.per.batch": "3"},
+        )
+
+        served, offsets = self._drive_partitioned_snapshot(connector)
+
+        self.assertEqual([row["id"] for row in served], [1, 2, 3, 4, 5])
+        self.assertEqual(offsets[-1]["phase"], "stream", "snapshot must transition to stream")
+        # A middle microbatch fanned out more than one page (proof of parallelism).
+        self.assertTrue(
+            any(o.get("phase") == "snapshot" for o in offsets),
+            "expected at least one non-terminal snapshot batch",
+        )
+
+    def test_partitioned_snapshot_matches_the_serial_serve(self):
+        # The partitioned drive yields exactly the rows a serial read_table drive
+        # yields, in the same order -- the fan-out changes only how pages are read.
+        def serial_rows():
+            bridge = FakeBridge()
+            bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 6)]
+            connector = self.connector(
+                bridge, registration_scope="serial", **{"snapshot.page.size": "1"}
+            )
+            rows: list[dict] = []
+            start: dict = {}
+            for _ in range(1000):
+                page, end = connector.read_table("app.orders", start, {})
+                rows.extend(page)
+                start = end
+                if end.get("phase") == "stream":
+                    break
+            return rows
+
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 6)]
+        connector = self.connector(
+            bridge,
+            registration_scope="partitioned",
+            **{"snapshot.page.size": "1", "stream.partitioned.snapshot.pages.per.batch": "2"},
+        )
+
+        served, _ = self._drive_partitioned_snapshot(connector)
+        self.assertEqual(served, serial_rows())
+
+    def test_partitioned_snapshot_offset_last_pk_matches_the_boundary_page(self):
+        # A non-terminal fan-out offset carries the boundary page's upper_pk as
+        # last_pk -- the same resume cursor the serial serve records at that
+        # page_index. Validates the boundary-page-header read in latest_offset.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 6)]
+        connector = self.connector(
+            bridge,
+            **{"snapshot.page.size": "1", "stream.partitioned.snapshot.pages.per.batch": "2"},
+        )
+
+        # Bootstrap page 0 (embedded), then take one fan-out step from page 1.
+        first = connector.latest_offset("app.orders", {}, {})
+        second = connector.latest_offset("app.orders", {}, first)
+
+        self.assertEqual(second["phase"], "snapshot")
+        end_page = second["snapshot"]["page_index"]
+        table = connector._table("app.orders", {})
+        scope = connector._pipeline_scope(second)
+        header, _ = connector._stream_staged_page(
+            table, scope, str(second["schema_id"]), int(second["snapshot_lsn"]), end_page - 1
+        )
+        self.assertEqual(second["snapshot"]["last_pk"], header.get("upper_pk"))
+
+    def test_partitioned_page_read_touches_no_bridge(self):
+        # read_partition serves a staged page from identity strings only -- it must
+        # make no Informix catalog call, so it is safe to run on an executor.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 6)]
+        connector = self.connector(
+            bridge,
+            **{"snapshot.page.size": "1", "stream.partitioned.snapshot.pages.per.batch": "3"},
+        )
+        first = connector.latest_offset("app.orders", {}, {})
+        second = connector.latest_offset("app.orders", {}, first)
+        partitions = connector.get_partitions("app.orders", {}, first, second)
+        self.assertTrue(partitions and all(p["kind"] == "page" for p in partitions))
+
+        bridge.get_table = mock.Mock(wraps=bridge.get_table)
+        served = []
+        for part in partitions:
+            served.extend(connector.read_partition("app.orders", part, {}))
+
+        bridge.get_table.assert_not_called()
+        # Page 0 (id 1) was served via the embedded bootstrap; this fan-out covers
+        # pages 1..3, which hold ids 2, 3, 4.
+        self.assertEqual([row["id"] for row in served], [2, 3, 4])
+
+    def test_partitioned_embedded_path_matches_read_table(self):
+        # A non-page-serve microbatch (stream phase) yields a single embedded
+        # partition whose rows and offset are exactly read_table's output.
+        connector = self.connector()
+        stream_start = {"phase": "stream", "commit_lsn": "5"}
+        sentinel_rows = [{"id": 7, "value": "x"}]
+        sentinel_end = {"phase": "stream", "commit_lsn": "9"}
+        with mock.patch.object(
+            connector, "read_table", return_value=(iter(sentinel_rows), sentinel_end)
+        ) as read_table:
+            end = connector.latest_offset("app.orders", {}, stream_start)
+            partitions = connector.get_partitions("app.orders", {}, stream_start, end)
+            rows = [
+                row
+                for part in partitions
+                for row in connector.read_partition("app.orders", part, {})
+            ]
+
+        self.assertEqual(end, sentinel_end)
+        self.assertEqual(partitions, [{"kind": "embedded", "rows": sentinel_rows}])
+        self.assertEqual(rows, sentinel_rows)
+        read_table.assert_called_once()
+
+    def test_partitioned_embedded_delete_flow_routes_to_read_table_deletes(self):
+        # A delete-channel reader (isDeleteFlow) never page-serves; its embedded
+        # partition comes from read_table_deletes, not read_table.
+        connector = self.connector(**{"isDeleteFlow": "true"})
+        start = {"phase": "stream", "commit_lsn": "5"}
+        sentinel = ([{"id": 1}], {"phase": "stream", "commit_lsn": "6"})
+        with (
+            mock.patch.object(
+                connector, "read_table_deletes", return_value=(iter(sentinel[0]), sentinel[1])
+            ) as deletes,
+            mock.patch.object(connector, "read_table") as upserts,
+        ):
+            end = connector.latest_offset("app.orders", {}, start)
+
+        self.assertEqual(end, sentinel[1])
+        deletes.assert_called_once()
+        upserts.assert_not_called()
+
+    def test_partitioned_embedded_recomputes_on_cache_miss(self):
+        # get_partitions rebuilds the embedded rows via read_table if the driver
+        # bridge cache was dropped between latest_offset and partitions (a re-plan),
+        # so correctness never depends on the cache surviving.
+        connector = self.connector()
+        start = {"phase": "stream", "commit_lsn": "5"}
+        with mock.patch.object(
+            connector,
+            "read_table",
+            side_effect=lambda *a, **k: (iter([{"id": 3}]), {"phase": "stream", "commit_lsn": "6"}),
+        ) as read_table:
+            connector.latest_offset("app.orders", {}, start)
+            connector._partition_embedded_rows.clear()  # simulate a re-plan
+            partitions = connector.get_partitions(
+                "app.orders", {}, start, {"phase": "stream", "commit_lsn": "6"}
+            )
+
+        self.assertEqual(partitions, [{"kind": "embedded", "rows": [{"id": 3}]}])
+        self.assertEqual(read_table.call_count, 2)  # once in latest_offset, once on miss
+
+    def test_partitioned_batch_get_partitions_falls_back(self):
+        # The 2-arg (batch) form must raise so LakeflowBatchReader falls back to a
+        # single non-partitioned read_table batch.
+        connector = self.connector()
+        with self.assertRaises(NotImplementedError):
+            connector.get_partitions("app.orders", {})
+
     def test_a_staged_snapshot_with_pages_remaining_records_a_backlog_streak(self):
         # The staged (blocking) snapshot knows its remaining page count exactly, so
         # a reader mid-snapshot has certain outstanding work and must rank above an
