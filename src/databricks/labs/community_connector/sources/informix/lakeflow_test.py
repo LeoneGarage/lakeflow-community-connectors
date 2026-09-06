@@ -4929,9 +4929,9 @@ class LakeflowContractTests(unittest.TestCase):
         InformixLakeflowConnect(base)  # both default on -> valid
 
     def test_partitioned_malformed_snapshot_offset_falls_back_to_embedded(self):
-        # F5: a snapshot-phase offset carrying a page_index but no snapshot_lsn must
-        # degrade to the embedded path (any doubt -> None), never raise out of
-        # latest_offset / get_partitions.
+        # A malformed snapshot-phase offset (here: missing the required `version`, so
+        # `_validated_offset` rejects it) must degrade to the embedded path rather than
+        # raise out of latest_offset / get_partitions.
         connector = self._partitioned_connector()
         bad = {"phase": "snapshot", "schema_id": "s1", "snapshot": {"page_index": 0}}
         with mock.patch.object(
