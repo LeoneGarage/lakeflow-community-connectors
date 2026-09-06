@@ -10225,6 +10225,28 @@ class SharedCdcOptionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._connector(**{"cdc.shared.buffer.max.records": "0"})
 
+    def test_fair_queue_policy_defaults_to_round_robin(self):
+        connector = self._connector()
+        self.assertEqual(
+            connector.options.get(
+                informix_module._CONNECTION_FAIR_QUEUE_POLICY_OPTION,
+                informix_module._DEFAULT_CONNECTION_FAIR_QUEUE_POLICY,
+            ),
+            informix_module._CONNECTION_FAIR_QUEUE_POLICY_ROUND_ROBIN,
+        )
+
+    def test_fair_queue_policy_accepts_fifo(self):
+        # No raise: fifo is the kill-switch value.
+        self._connector(**{"connection.fair.queue.policy": "fifo"})
+
+    def test_invalid_fair_queue_policy_rejected(self):
+        with self.assertRaises(ValueError):
+            self._connector(**{"connection.fair.queue.policy": "lifo"})
+
+    def test_invalid_daemon_liveness_value_rejected(self):
+        with self.assertRaises(ValueError):
+            self._connector(**{"cdc.shared.slot.liveness.enabled": "maybe"})
+
 
 class SharedCdcConsumerSeamTests(unittest.TestCase):
     """The streaming consumer reads from the shard and touches Informix for nothing."""
@@ -10736,6 +10758,15 @@ class DaemonReaderFactoryMarkerTests(unittest.TestCase):
     def test_cdc_reader_factory_sets_daemon_marker(self):
         reader = self._connector()._shared_cdc_reader_factory("upsert")()
         self.assertEqual(reader.options.get(informix_module._DAEMON_SLOT_MARKER_OPTION), "true")
+
+    def test_cdc_reader_factory_drops_inherited_attempt_budget(self):
+        # The daemon waits on the turnover watchdog, so a short per-read consumer budget
+        # inherited from the parent's options must not cap that wait and send it back to
+        # the end of the queue.
+        connector = self._connector()
+        connector.options[informix_module._CONNECTION_ATTEMPT_BUDGET_OPTION] = "0.8"
+        reader = connector._shared_cdc_reader_factory("upsert")()
+        self.assertIsNone(reader.options.get(informix_module._CONNECTION_ATTEMPT_BUDGET_OPTION))
 
     def test_snapshot_drain_reader_factory_sets_snapshot_daemon_marker(self):
         # The drain floors one band below the CDC daemon, so it carries the snapshot-daemon
@@ -11360,6 +11391,142 @@ class FairSlotQueueWiringTests(unittest.TestCase):
         # It cleaned up only its own ticket; the older waiter's is untouched.
         self.assertEqual(self._waiters(namespace), [older])
         self.assertIsNone(getattr(bridge, "_lakebase_slot", None))
+
+    def _captured_acquire_kwargs(self, bridge):
+        captured = {}
+        real = informix_module.acquire_slot
+
+        def spy(*args, **kwargs):
+            captured.update(kwargs)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(informix_module, "acquire_slot", side_effect=spy):
+            bridge._acquire_connection_slot()
+        self.addCleanup(self._stop_heartbeat, bridge)
+        return captured
+
+    def test_round_robin_is_the_default_policy(self):
+        captured = self._captured_acquire_kwargs(self._bridge())
+        self.assertEqual(captured.get("policy"), "round_robin")
+        self.assertEqual(captured.get("waiter_class"), informix_module._SLOT_CLASS_CONSUMER)
+        self.assertEqual(captured.get("num_classes"), informix_module._SLOT_CLASS_COUNT)
+
+    def test_policy_option_can_select_fifo(self):
+        captured = self._captured_acquire_kwargs(
+            self._bridge(**{"connection.fair.queue.policy": "fifo"})
+        )
+        self.assertEqual(captured.get("policy"), "fifo")
+
+    def test_waiter_class_reflects_the_slot_markers(self):
+        self.assertEqual(
+            self._bridge()._connection_waiter_class(), informix_module._SLOT_CLASS_CONSUMER
+        )
+        self.assertEqual(
+            self._bridge(
+                **{informix_module._DAEMON_SLOT_MARKER_OPTION: "true"}
+            )._connection_waiter_class(),
+            informix_module._SLOT_CLASS_CDC_DAEMON,
+        )
+        self.assertEqual(
+            self._bridge(
+                **{informix_module._SNAPSHOT_DAEMON_SLOT_MARKER_OPTION: "true"}
+            )._connection_waiter_class(),
+            informix_module._SLOT_CLASS_SNAPSHOT_DAEMON,
+        )
+        self.assertEqual(
+            self._bridge(
+                **{informix_module._SNAPSHOT_DRAIN_MARKER_OPTION: "true"}
+            )._connection_waiter_class(),
+            informix_module._SLOT_CLASS_SNAPSHOT_CONSUMER,
+        )
+
+
+class CdcDaemonSlotLivenessTests(unittest.TestCase):
+    """The CDC shard daemon uses the same turnover watchdog as the snapshot drain, so it
+    holds its queue ticket while the pool is turning over (letting the round-robin rotation
+    reach it) and only gives up -- degrading its consumers to direct reads -- when the pool
+    is wedged. A consumer read (no daemon marker) keeps the plain deadline."""
+
+    def setUp(self):
+        self._lakebase = _OfflineLakebase().install(self)
+
+    def _bridge(self, *, daemon=True, **options):
+        bridge = informix_module.PurePythonInformixBridge(
+            {
+                "hostname": "localhost",
+                "database": "demo",
+                "user": "informix",
+                "password": "secret",
+                "server": "demo_on",
+                "lakebase.password": "test-state-password",
+                "max.concurrent.connections": "6",
+                **options,
+            }
+        )
+        if daemon:
+            bridge.options[informix_module._DAEMON_SLOT_MARKER_OPTION] = "true"
+        return bridge
+
+    def _stop_heartbeat(self, bridge):
+        stop = getattr(bridge, "_connection_slot_heartbeat_stop", None)
+        if stop is not None:
+            stop.set()
+
+    def test_turnover_resets_the_deadline_and_acquires(self):
+        # Pool keeps claiming slots (token climbs) for three sweeps while every slot is
+        # busy, then one frees and the daemon wins. The wait must not give up meanwhile.
+        bridge = self._bridge()
+        real_acquire = informix_module.acquire_slot
+        calls = {"n": 0}
+
+        def acquire(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] <= 3:
+                return None
+            return real_acquire(*args, **kwargs)
+
+        token = {"v": 0}
+
+        def climbing_token(*_args, **_kwargs):
+            token["v"] += 1
+            return token["v"]
+
+        with (
+            mock.patch.object(informix_module, "acquire_slot", side_effect=acquire),
+            mock.patch.object(informix_module, "pool_progress_token", side_effect=climbing_token),
+            mock.patch.object(informix_module.random, "uniform", return_value=0),
+        ):
+            bridge._acquire_connection_slot()
+        self.addCleanup(self._stop_heartbeat, bridge)
+
+        self.assertIsNotNone(bridge._lakebase_slot)
+
+    def test_wedged_pool_raises_the_specific_capacity_error(self):
+        bridge = self._bridge()
+
+        with (
+            mock.patch.object(informix_module, "acquire_slot", return_value=None),
+            mock.patch.object(informix_module, "pool_progress_token", return_value=7),
+            mock.patch.object(informix_module.random, "uniform", return_value=0),
+        ):
+            with self.assertRaises(informix_module.ConnectionCapacityUnavailable) as caught:
+                bridge._acquire_connection_slot(budget_seconds=0.0)
+
+        self.assertIn("wedged", str(caught.exception))
+
+    def test_kill_switch_reverts_to_the_plain_deadline(self):
+        bridge = self._bridge(**{"cdc.shared.slot.liveness.enabled": "false"})
+
+        with (
+            mock.patch.object(informix_module, "acquire_slot", return_value=None),
+            mock.patch.object(informix_module, "pool_progress_token") as token,
+            mock.patch.object(informix_module.random, "uniform", return_value=0),
+        ):
+            with self.assertRaises(informix_module.ConnectionCapacityUnavailable) as caught:
+                bridge._acquire_connection_slot(budget_seconds=0.0)
+
+        token.assert_not_called()
+        self.assertNotIn("wedged", str(caught.exception))
 
 
 class SnapshotDrainSlotLivenessTests(unittest.TestCase):

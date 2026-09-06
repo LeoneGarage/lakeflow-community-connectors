@@ -66,13 +66,25 @@ class _FakeCursor:
         text = " ".join(statement.split())
         args = parameters or {}
         self._result = []
-        if text.startswith("CREATE TABLE") or text.startswith("CREATE INDEX"):
+        if (
+            text.startswith("CREATE TABLE")
+            or text.startswith("CREATE INDEX")
+            or text.startswith("ALTER TABLE")
+        ):
             return
         if "INSERT INTO conn_slots" in text:
             self._seed_slots(args)
             return
-        if text.startswith("UPDATE conn_slots SET owner = %(owner)s"):
+        # Round-robin acquisition leads with a CTE, so it does not start with the plain
+        # ``UPDATE conn_slots``; route both to _acquire, which honours the statement's
+        # own ordering clauses.
+        if text.startswith("WITH cur AS") or text.startswith(
+            "UPDATE conn_slots SET owner = %(owner)s"
+        ):
             self._acquire(args, text)
+            return
+        if "INSERT INTO slot_rr_cursor" in text:
+            self._advance_rr_cursor(args)
             return
         if "UPDATE conn_slots SET renewed_at = now()" in text:
             self._heartbeat(args, text)
@@ -204,10 +216,12 @@ class _FakeCursor:
         bounded_above = "slot_id < %(ceiling)s" in text
         expires = "renewed_at < now() - make_interval(secs => %(lease)s)" in text
         # The fair variant carries the NOT EXISTS over slot_waiters: a slot is
-        # eligible only when no older, still-heartbeating waiter is also eligible for
-        # it. Model that ordering so a dropped clause changes behaviour here as it
-        # would in Postgres.
-        fair = "slot_waiters" in text
+        # eligible only when no earlier-ordered, still-heartbeating waiter is also
+        # eligible for it. The round-robin variant orders by (rank-within-class, class,
+        # ticket) rather than by arrival; the FIFO variant orders by ticket alone. Model
+        # both so a dropped clause changes behaviour here as it would in Postgres.
+        round_robin = "slot_rr_cursor" in text
+        fair = "slot_waiters" in text and not round_robin
         now = self._database.now()
         with self._database.lock:
             eligible = sorted(
@@ -237,6 +251,8 @@ class _FakeCursor:
                         for (ns, ticket), waiter in self._database.waiters.items()
                     )
                 ]
+            elif round_robin:
+                eligible = self._round_robin_eligible(args, eligible, now)
             if not eligible:
                 return
             # SKIP LOCKED semantics: the lock is held for the whole claim, so a
@@ -250,6 +266,50 @@ class _FakeCursor:
             row["scope"] = args["scope"]
             row["renewed_at"] = now
             self._result = [(slot_id, row["epoch"])]
+
+    def _round_robin_eligible(self, args: dict, eligible: list, now: float) -> list:
+        """Filter ``eligible`` to the slots this ticket may claim under round-robin.
+
+        Mirrors _ACQUIRE_SLOT_ROUND_ROBIN: read the namespace rotation cursor
+        (``last_class``, default -1), rank each live waiter's class by cyclic distance
+        after it -- rot = (class - last - 1) mod N -- key it (rot, ticket), and keep a
+        slot only when no live waiter with a *lower* key has a band covering it. So the
+        class next in rotation is served first, wrapping, one class per grant. Called
+        under the database lock.
+        """
+
+        ttl = float(args["waiter_ttl"])
+        num_classes = int(args["num_classes"])
+        last_class = self._database.rr_cursor.get(args["namespace"], -1)
+        live = {
+            ticket: waiter
+            for (ns, ticket), waiter in self._database.waiters.items()
+            if ns == args["namespace"] and now - waiter["heartbeat_at"] <= ttl
+        }
+
+        def rr_key(ticket: int) -> tuple:
+            waiter_class = live[ticket].get("waiter_class", 0)
+            rot = (waiter_class - last_class - 1 + num_classes) % num_classes
+            return (rot, ticket)
+
+        me_ticket = args["ticket_id"]
+        if me_ticket not in live:
+            # A reaped/stale ticket wins nothing until it heartbeats again -- the CROSS
+            # JOIN me produces no row.
+            return []
+        my_key = rr_key(me_ticket)
+        return [
+            slot_id
+            for slot_id in eligible
+            if not any(
+                waiter["floor"] <= slot_id < waiter["ceiling"] and rr_key(ticket) < my_key
+                for ticket, waiter in live.items()
+            )
+        ]
+
+    def _advance_rr_cursor(self, args: dict) -> None:
+        with self._database.lock:
+            self._database.rr_cursor[args["namespace"]] = int(args["waiter_class"])
 
     def _guarded(self, args: dict, text: str) -> dict | None:
         # Apply only the guards the statement actually carries: dropping
@@ -294,6 +354,7 @@ class _FakeCursor:
                 "owner": args["owner"],
                 "floor": int(args["floor"]),
                 "ceiling": int(args["ceiling"]),
+                "waiter_class": int(args.get("waiter_class", 0)),
                 "heartbeat_at": self._database.now(),
             }
             self._result = [(ticket_id,)]
@@ -481,6 +542,8 @@ class _FakeDatabase:
         # bigserial sequence behind ticket_id.
         self.waiters: dict[tuple[str, int], dict] = {}
         self.waiter_seq: int = 0
+        # Round-robin rotation cursor: namespace -> class served most recently.
+        self.rr_cursor: dict[str, int] = {}
         self.hints: dict[tuple[str, str], dict] = {}
         self.limits: dict[str, dict] = {}
         self.records: dict[tuple[str, str], str] = {}
@@ -1829,6 +1892,143 @@ class LakebaseWaiterQueueTests(unittest.TestCase):
             if slot is not None:
                 # A winner dequeues its ticket, exactly as the connector does, so it
                 # does not linger and block the next acquirer.
+                lakebase_state.dequeue_waiter(self.connection, "ns", ticket)
+        issued = [slot for slot in held if slot is not None]
+
+        self.assertEqual(len(issued), 4)
+        self.assertEqual(len({slot.slot_id for slot in issued}), 4)
+
+
+class LakebaseRoundRobinQueueTests(unittest.TestCase):
+    """The round-robin policy: service rotates across requester classes so a
+    high-volume class cannot crowd out a low-volume one by ticket count."""
+
+    CONSUMER = 0
+    SNAPSHOT_DAEMON = 1
+    CDC_DAEMON = 2
+    NUM_CLASSES = 4
+
+    def setUp(self) -> None:
+        self.database = _FakeDatabase()
+        self.connection = _FakeConnection(self.database)
+        lakebase_state.ensure_schema(self.connection)
+
+    def _seed(self, count: int) -> None:
+        lakebase_state.seed_slots(self.connection, "ns", count)
+
+    def _enqueue(self, owner: str, waiter_class: int, *, floor: int = 0, ceiling: int = 4) -> int:
+        return lakebase_state.enqueue_waiter(
+            self.connection, "ns", owner, floor=floor, ceiling=ceiling, waiter_class=waiter_class
+        )
+
+    def _rr_acquire(self, owner: str, ticket_id: int, waiter_class: int, *, slot_count, floor=0):
+        return lakebase_state.acquire_slot(
+            self.connection,
+            "ns",
+            owner,
+            slot_count=slot_count,
+            floor=floor,
+            ticket_id=ticket_id,
+            policy="round_robin",
+            waiter_class=waiter_class,
+            num_classes=self.NUM_CLASSES,
+        )
+
+    def test_daemon_is_not_crowded_out_by_consumer_ticket_volume(self):
+        # The headline guarantee. One slot, five consumer tickets, one CDC-daemon
+        # ticket: the daemon must be served after a single consumer, not after all
+        # five, because the rotation cursor moves past the consumer class once served.
+        self._seed(1)
+        consumers = [self._enqueue(f"c{i}", self.CONSUMER, ceiling=1) for i in range(5)]
+        daemon = self._enqueue("daemon", self.CDC_DAEMON, ceiling=1)
+
+        # While a consumer is at the head of the rotation, the daemon cannot jump it.
+        self.assertIsNone(self._rr_acquire("daemon", daemon, self.CDC_DAEMON, slot_count=1))
+        # The first consumer wins and frees the slot (dequeue + release, as the connector does).
+        first = self._rr_acquire("c0", consumers[0], self.CONSUMER, slot_count=1)
+        self.assertIsNotNone(first)
+        lakebase_state.dequeue_waiter(self.connection, "ns", consumers[0])
+        lakebase_state.release_slot(self.connection, first)
+
+        # Now the daemon wins even though four consumer tickets are still queued ahead
+        # of it by arrival: the rotation has moved to the next class.
+        self.assertIsNotNone(self._rr_acquire("daemon", daemon, self.CDC_DAEMON, slot_count=1))
+
+    def test_service_rotates_across_classes(self):
+        # One ticket each in three classes, one slot recycled between grants: the grant
+        # order follows the rotation 0 -> 1 -> 2, not arrival or class number ties.
+        self._seed(1)
+        tickets = {
+            self.CONSUMER: self._enqueue("consumer", self.CONSUMER, ceiling=1),
+            self.SNAPSHOT_DAEMON: self._enqueue("snap", self.SNAPSHOT_DAEMON, ceiling=1),
+            self.CDC_DAEMON: self._enqueue("cdc", self.CDC_DAEMON, ceiling=1),
+        }
+        served = []
+        for _ in range(3):
+            for waiter_class, ticket in tickets.items():
+                if ticket in served:
+                    continue
+                slot = self._rr_acquire(f"o{waiter_class}", ticket, waiter_class, slot_count=1)
+                if slot is not None:
+                    served.append(ticket)
+                    lakebase_state.dequeue_waiter(self.connection, "ns", ticket)
+                    lakebase_state.release_slot(self.connection, slot)
+                    break
+
+        self.assertEqual(
+            served,
+            [tickets[self.CONSUMER], tickets[self.SNAPSHOT_DAEMON], tickets[self.CDC_DAEMON]],
+        )
+
+    def test_cursor_advances_past_the_served_class(self):
+        # After a CDC-daemon win the cursor sits on class 2, so a subsequent contest
+        # between a consumer and another daemon ticket goes to the consumer -- the
+        # rotation has moved past the daemon class.
+        self._seed(1)
+        daemon = self._enqueue("daemon", self.CDC_DAEMON, ceiling=1)
+        slot = self._rr_acquire("daemon", daemon, self.CDC_DAEMON, slot_count=1)
+        self.assertIsNotNone(slot)
+        lakebase_state.dequeue_waiter(self.connection, "ns", daemon)
+        lakebase_state.release_slot(self.connection, slot)
+        self.assertEqual(self.database.rr_cursor["ns"], self.CDC_DAEMON)
+
+        consumer = self._enqueue("consumer", self.CONSUMER, ceiling=1)
+        daemon2 = self._enqueue("daemon2", self.CDC_DAEMON, ceiling=1)
+        self.assertIsNone(self._rr_acquire("daemon2", daemon2, self.CDC_DAEMON, slot_count=1))
+        self.assertIsNotNone(self._rr_acquire("consumer", consumer, self.CONSUMER, slot_count=1))
+
+    def test_oldest_ticket_wins_within_a_class(self):
+        # Two consumer tickets, no other class: within a class the rotation degenerates
+        # to FIFO, so the older ticket wins.
+        self._seed(1)
+        older = self._enqueue("older", self.CONSUMER, ceiling=1)
+        younger = self._enqueue("younger", self.CONSUMER, ceiling=1)
+
+        self.assertIsNone(self._rr_acquire("younger", younger, self.CONSUMER, slot_count=1))
+        self.assertIsNotNone(self._rr_acquire("older", older, self.CONSUMER, slot_count=1))
+
+    def test_stale_lower_class_ticket_does_not_block(self):
+        # A consumer ticket that stopped heartbeating is ignored, so the daemon is not
+        # held behind a dead predecessor even though class 0 would otherwise rotate first.
+        self._seed(1)
+        self._enqueue("dead", self.CONSUMER, ceiling=1)
+        # Age the consumer past the TTL, then enqueue the daemon so only the daemon is live.
+        self.database.advance(lakebase_state._DEFAULT_WAITER_TTL_SECONDS + 1.0)
+        daemon = self._enqueue("daemon", self.CDC_DAEMON, ceiling=1)
+
+        self.assertIsNotNone(self._rr_acquire("daemon", daemon, self.CDC_DAEMON, slot_count=1))
+
+    def test_capacity_is_never_exceeded_under_round_robin(self):
+        # Fairness must not weaken the capacity guarantee: N round-robin acquirers on an
+        # N-slot pool get N distinct slots and no more.
+        self._seed(4)
+        held = []
+        for index in range(6):
+            waiter_class = index % self.NUM_CLASSES
+            ticket = self._enqueue(f"o{index}", waiter_class, ceiling=4)
+            slot = self._rr_acquire(f"o{index}", ticket, waiter_class, slot_count=4)
+            held.append(slot)
+            if slot is not None:
                 lakebase_state.dequeue_waiter(self.connection, "ns", ticket)
         issued = [slot for slot in held if slot is not None]
 

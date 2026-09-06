@@ -846,8 +846,24 @@ connection:
         so it waits out a busy multi-table backfill on a small pool instead of timing
         out against a pool that is full but healthy, and gives up only when the pool
         is genuinely wedged. Set false to revert to a plain fixed deadline. Only
-        affects the snapshot-drain daemon; consumer and CDC-daemon reads always keep
-        the plain deadline. Accepts true/false (1/yes, 0/no).
+        affects the snapshot-drain daemon; the CDC shard daemon has its own
+        cdc.shared.slot.liveness.enabled and consumer reads always keep the plain
+        deadline. Accepts true/false (1/yes, 0/no).
+
+    - name: cdc.shared.slot.liveness.enabled
+      type: string
+      required: false
+      description: >
+        Whether the CDC shard daemon treats its connection-slot wait as the same
+        turnover-based liveness watchdog the snapshot drain uses. Default true: while
+        actively catching up, a shard daemon blocked acquiring its slot keeps its
+        queue ticket and resets its connection.wait.timeout.seconds window every time
+        the pool claims a slot (turnover), so the round-robin rotation has time to
+        reach it -- a round is paid in slot turnover, not wall-clock -- rather than
+        failing fast and re-queuing at the back. It gives up only when the pool is
+        genuinely wedged (no turnover for a whole window), then degrades its consumers
+        to direct reads. Set false to revert to the plain connection.wait.timeout.seconds
+        deadline. Accepts true/false (1/yes, 0/no).
 
     - name: string.null.byte
       type: string
@@ -903,6 +919,19 @@ connection:
         reader reserved to high slots never blocks a younger one from a low slot it
         could not use. Set false to revert to the unordered race (a kill-switch if the
         queue ever misbehaves). Accepts true/false (1/yes, 0/no).
+
+    - name: connection.fair.queue.policy
+      type: string
+      required: false
+      description: >
+        How the fair waiter queue (connection.fair.queue.enabled) orders waiters.
+        round_robin (default) rotates service across requester classes -- consumer
+        reads, the CDC shard daemon, and the snapshot drain -- so a class gets a turn
+        regardless of how many tickets another class holds; this stops a burst of
+        consumer bootstrap/fallback tickets from crowding out the few CDC-daemon
+        tickets by sheer count. fifo serves strictly by arrival (the older behaviour),
+        which is fair per ticket but not per class. Only has effect when
+        connection.fair.queue.enabled is true. Accepts round_robin/fifo.
 
     - name: capacity.retry.max.delay.seconds
       type: string
