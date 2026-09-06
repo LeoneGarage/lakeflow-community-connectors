@@ -9994,13 +9994,13 @@ def register_lakeflow_source(spark):
             # Validate boolean capacity options eagerly (they are otherwise only
             # checked on first read, deep inside a running flow).
             _option_bool(options, "snapshot.incremental.blocking", True)
-            _option_bool(options, _SHARED_CDC_SESSION_OPTION, True)
+            shared_cdc_enabled = _option_bool(options, _SHARED_CDC_SESSION_OPTION, True)
             _option_bool(options, _SNAPSHOT_SHARED_SESSION_OPTION, True)
             _option_bool(options, _CONNECTION_FAIR_QUEUE_OPTION, True)
             _option_bool(options, _SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION, True)
             _option_bool(options, _PROMOTE_UNIQUE_INDEX_OPTION, True)
             _option_bool(options, _SNAPSHOT_STAGING_PIPELINE_OPTION, True)
-            _option_bool(options, _PARTITIONED_STREAM_OPTION, True)
+            partitioned_enabled = _option_bool(options, _PARTITIONED_STREAM_OPTION, True)
             # Fail closed on the unsafe partitioned-mode combination. Partitioned
             # streaming routes every non-page-serve (CDC / incremental / append /
             # delete) microbatch through a single embedded partition whose rows are
@@ -10012,9 +10012,7 @@ def register_lakeflow_source(spark):
             # default, so any config that turns the shared session off MUST also set
             # stream.partitioned=false; otherwise construction fails fast here rather
             # than corrupt data silently. There is no silent fallback.
-            if _option_bool(options, _PARTITIONED_STREAM_OPTION, True) and not _option_bool(
-                options, _SHARED_CDC_SESSION_OPTION, True
-            ):
+            if partitioned_enabled and not shared_cdc_enabled:
                 raise ValueError(
                     f"Option '{_PARTITIONED_STREAM_OPTION}=true' (the default) requires "
                     f"'{_SHARED_CDC_SESSION_OPTION}=true'. Partitioned streaming recomputes "
@@ -10160,7 +10158,9 @@ def register_lakeflow_source(spark):
             # driver already materialized, keyed by the start offset. Excluded from pickling
             # (driver-only) and cleared on scope change. A cache miss recomputes via read_table,
             # so correctness never depends on it -- it only avoids a second driver read.
-            self._partition_embedded_rows: dict[str, list[dict[str, Any]]] = {}
+            # Values are codec-encoded (JSON-safe) rows -- the exact descriptor payload
+            # get_partitions emits and read_partition decodes; see _encode_embedded_rows.
+            self._partition_embedded_rows: dict[str, list[Any]] = {}
 
         def set_registration_scope(self, scope: str) -> None:
             """Install the scope shared by every reader serialized from one registration."""
@@ -10743,18 +10743,14 @@ def register_lakeflow_source(spark):
             snapshot = checkpoint.get("snapshot")
             if not isinstance(snapshot, dict) or "page_index" not in snapshot:
                 return None
-            # F5: read the offset's own fields under guard. _validated_offset does not
-            # guarantee schema_id/snapshot_lsn/page_index are present and well-typed, so a
-            # malformed snapshot-phase offset must degrade to the embedded path rather than
-            # raise out of latest_offset/get_partitions.
-            if "schema_id" not in checkpoint or "snapshot_lsn" not in checkpoint:
-                return None
-            try:
-                schema_id = str(checkpoint["schema_id"])
-                snapshot_lsn = int(checkpoint["snapshot_lsn"])
-                start_page = int(snapshot["page_index"])
-            except (TypeError, ValueError):
-                return None
+            # _validated_offset (above) already verified, for a snapshot-phase offset,
+            # that schema_id is 32-hex, snapshot_lsn is present and non-negative, and
+            # snapshot.page_index is a non-negative int -- so these reads cannot raise. A
+            # malformed offset raises inside _validated_offset and is caught above,
+            # returning None -> the embedded path.
+            schema_id = str(checkpoint["schema_id"])
+            snapshot_lsn = int(checkpoint["snapshot_lsn"])
+            start_page = int(snapshot["page_index"])
             scope = checkpoint.get("pipeline_scope")
             if not isinstance(scope, str) or _PIPELINE_SCOPE.fullmatch(scope) is None:
                 scope = self._pipeline_scope(checkpoint)
