@@ -10001,6 +10001,30 @@ def register_lakeflow_source(spark):
             _option_bool(options, _PROMOTE_UNIQUE_INDEX_OPTION, True)
             _option_bool(options, _SNAPSHOT_STAGING_PIPELINE_OPTION, True)
             _option_bool(options, _PARTITIONED_STREAM_OPTION, True)
+            # Fail closed on the unsafe partitioned-mode combination. Partitioned
+            # streaming routes every non-page-serve (CDC / incremental / append /
+            # delete) microbatch through a single embedded partition whose rows are
+            # recomputed from the committed start offset if Spark replays an
+            # uncommitted batch. That recompute is only deterministic when the shared
+            # CDC session is on -- its peek-don't-pop reads return the same rows for a
+            # committed start -- whereas a live per-table CDC session re-read is not,
+            # and can duplicate or drop CDC rows on replay. stream.partitioned is on by
+            # default, so any config that turns the shared session off MUST also set
+            # stream.partitioned=false; otherwise construction fails fast here rather
+            # than corrupt data silently. There is no silent fallback.
+            if _option_bool(options, _PARTITIONED_STREAM_OPTION, True) and not _option_bool(
+                options, _SHARED_CDC_SESSION_OPTION, True
+            ):
+                raise ValueError(
+                    f"Option '{_PARTITIONED_STREAM_OPTION}=true' (the default) requires "
+                    f"'{_SHARED_CDC_SESSION_OPTION}=true'. Partitioned streaming recomputes "
+                    "an embedded CDC microbatch from its committed start offset when Spark "
+                    "replays an uncommitted batch, which is only deterministic with the "
+                    "shared CDC session's idempotent reads; with the shared session off, a "
+                    "live per-table re-read can duplicate or drop CDC rows on replay. "
+                    f"Enable '{_SHARED_CDC_SESSION_OPTION}=true', or set "
+                    f"'{_PARTITIONED_STREAM_OPTION}=false'."
+                )
             staging_transport = (
                 str(
                     options.get(_SNAPSHOT_STAGING_TRANSPORT_OPTION, _DEFAULT_SNAPSHOT_STAGING_TRANSPORT)
@@ -10659,6 +10683,20 @@ def register_lakeflow_source(spark):
         def _partition_offset_key(start_offset: dict | None) -> str:
             return json.dumps(start_offset or {}, sort_keys=True)
 
+        @staticmethod
+        def _encode_embedded_rows(rows: Iterable[dict[str, Any]]) -> list[Any]:
+            # F1: the framework JSON-serializes each partition descriptor
+            # (InputPartition(json.dumps(descriptor))), but read_table rows carry native
+            # Decimal / bytes / etc. that json cannot encode. Round-trip every row through
+            # the staging codec -- the same lossless JSON-safe form staged pages use -- so
+            # the descriptor serializes and read_partition reconstructs the exact rows.
+            return [_encode_snapshot_stage_value(row) for row in rows]
+
+        @staticmethod
+        def _decode_embedded_rows(rows: Iterable[Any]) -> Iterator[dict[str, Any]]:
+            for row in rows:
+                yield _decode_snapshot_stage_value(row)
+
         def is_partitioned(self, table_name: str) -> bool:
             """Gate the partitioned reader (default on).
 
@@ -10672,6 +10710,8 @@ def register_lakeflow_source(spark):
 
             if not self._partitioned_stream_enabled():
                 return False
+            # A partitioned-on + shared-CDC-off config cannot be constructed (__init__
+            # fails fast on it), so no shared-session check is needed here.
             try:
                 table = self._table(table_name, self.options)
                 return bool(_cdc_capable(table) or self._append_only_table(table, self.options))
@@ -10703,16 +10743,25 @@ def register_lakeflow_source(spark):
             snapshot = checkpoint.get("snapshot")
             if not isinstance(snapshot, dict) or "page_index" not in snapshot:
                 return None
+            # F5: read the offset's own fields under guard. _validated_offset does not
+            # guarantee schema_id/snapshot_lsn/page_index are present and well-typed, so a
+            # malformed snapshot-phase offset must degrade to the embedded path rather than
+            # raise out of latest_offset/get_partitions.
+            if "schema_id" not in checkpoint or "snapshot_lsn" not in checkpoint:
+                return None
+            try:
+                schema_id = str(checkpoint["schema_id"])
+                snapshot_lsn = int(checkpoint["snapshot_lsn"])
+                start_page = int(snapshot["page_index"])
+            except (TypeError, ValueError):
+                return None
             scope = checkpoint.get("pipeline_scope")
             if not isinstance(scope, str) or _PIPELINE_SCOPE.fullmatch(scope) is None:
                 scope = self._pipeline_scope(checkpoint)
-            schema_id = str(checkpoint["schema_id"])
-            snapshot_lsn = int(checkpoint["snapshot_lsn"])
             manifest = self._read_snapshot_stage_manifest(table, scope, schema_id)
             if manifest is None or int(manifest["snapshot_lsn"]) != snapshot_lsn:
                 return None
             page_count = int(manifest["page_count"])
-            start_page = int(snapshot.get("page_index", 0))
             if start_page < 0 or start_page >= page_count:
                 return None
             end_page = min(start_page + self._partitioned_pages_per_batch(), page_count)
@@ -10738,7 +10787,16 @@ def register_lakeflow_source(spark):
             if batch is not None:
                 return self._snapshot_page_batch_offset(table, effective_start, batch)
             rows, next_offset = self._embedded_read(table_name, start_offset, table_options)
-            self._partition_embedded_rows[self._partition_offset_key(start_offset)] = list(rows)
+            # F1: cache the JSON-safe encoded rows (they are the descriptor payload).
+            # F6: keep only this microbatch's entry, so a latest_offset call Spark never
+            # follows with get_partitions (speculative discovery, or an empty start==end
+            # batch) cannot leak driver memory. A later cache miss recomputes -- safe
+            # because partitioned mode requires the shared CDC session, whose reads are
+            # idempotent for a committed start.
+            self._partition_embedded_rows.clear()
+            self._partition_embedded_rows[self._partition_offset_key(start_offset)] = (
+                self._encode_embedded_rows(rows)
+            )
             return next_offset
 
         def _snapshot_page_batch_offset(
@@ -10823,18 +10881,26 @@ def register_lakeflow_source(spark):
                     }
                     for page_index in range(start_page, end_page)
                 ]
-            rows = self._partition_embedded_rows.pop(self._partition_offset_key(start_offset), None)
-            if rows is None:
+            encoded = self._partition_embedded_rows.pop(self._partition_offset_key(start_offset), None)
+            if encoded is None:
+                # F2: a cache miss (e.g. Spark replaying an uncommitted batch after a
+                # restart) recomputes the read. Safe only because partitioned mode requires
+                # the shared CDC session (enforced in __init__), whose peek-don't-pop reads
+                # return the same rows for a committed start -- so the recompute matches the
+                # offset the batch will commit, with no duplicates or loss.
                 rows, _ = self._embedded_read(table_name, start_offset or {}, table_options)
-                rows = list(rows)
-            return [{"kind": "embedded", "rows": rows}]
+                encoded = self._encode_embedded_rows(rows)
+            return [{"kind": "embedded", "rows": encoded}]
 
         def read_partition(
             self, table_name: str, partition: dict, table_options: dict[str, str]
         ) -> Iterator[dict]:
             kind = partition.get("kind")
             if kind == "embedded":
-                yield from partition.get("rows", [])
+                # F1: reverse the staging-codec encoding get_partitions applied, so the
+                # exact read_table rows (Decimal / bytes / etc.) are yielded to the
+                # framework -- identical to what the simple reader produces.
+                yield from self._decode_embedded_rows(partition.get("rows", []))
                 return
             if kind == "page":
                 # Executor side: read the staged page by identity only -- no Table and no
@@ -13839,6 +13905,9 @@ def register_lakeflow_source(spark):
             # same connection budget so ``snapshot.reader.threads`` bounds the slots it holds.
             reader_options = dict(self.options)
             reader_options[_SNAPSHOT_SHARED_SESSION_OPTION] = "false"
+            # The inline drain reader is never partitioned (it drains via _read_snapshot);
+            # pin it off so it stays valid even if this connector runs shared CDC off.
+            reader_options[_PARTITIONED_STREAM_OPTION] = "false"
             # The drain runs on a daemon thread and holds its slot for the whole scan, but it
             # is bootstrap work that must finish to unblock its consumer. Floor it one band
             # below the CDC daemon (not at the CDC floor), so a saturated CDC daemon cannot
@@ -13939,6 +14008,9 @@ def register_lakeflow_source(spark):
             reader_options = dict(self.options)
             reader_options[_CONNECTION_CHANNEL_OPTION] = channel
             reader_options[_SHARED_CDC_SESSION_OPTION] = "false"
+            # This inline daemon reader must not itself be partitioned; clearing the shared
+            # session above would otherwise trip the partitioned+shared-off construction guard.
+            reader_options[_PARTITIONED_STREAM_OPTION] = "false"
             # The shard reads on a daemon thread, so floor its slot above the daemon
             # reservation to leave headroom for consumer bootstrap reads.
             reader_options[_DAEMON_SLOT_MARKER_OPTION] = "true"
