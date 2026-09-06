@@ -1993,7 +1993,11 @@ def register_lakeflow_source(spark):
         # its eligible band [floor, ceiling). ``ticket_id`` is a global monotonic
         # sequence, so a smaller ticket enqueued earlier -- acquisition consults it to
         # give the oldest still-heartbeating waiter first claim on each slot (see
-        # _ACQUIRE_SLOT_FAIR), turning the raw race into per-slot FIFO.
+        # _ACQUIRE_SLOT_FAIR), turning the raw race into per-slot FIFO. ``waiter_class``
+        # tags each ticket with its requester class so the round-robin policy
+        # (_ACQUIRE_SLOT_ROUND_ROBIN) can interleave classes rather than serve strictly by
+        # arrival; it defaults to 0 (the consumer class) so an un-tagged ticket behaves as
+        # before.
         """
         CREATE TABLE IF NOT EXISTS slot_waiters (
             namespace    text        NOT NULL,
@@ -2001,14 +2005,32 @@ def register_lakeflow_source(spark):
             owner        text        NOT NULL,
             floor        integer     NOT NULL,
             ceiling      integer     NOT NULL,
+            waiter_class smallint    NOT NULL DEFAULT 0,
             heartbeat_at timestamptz NOT NULL DEFAULT now(),
             PRIMARY KEY (namespace, ticket_id)
         )
+        """,
+        # Add the class column in place for a slot_waiters table created by an older
+        # deployment, so a mixed-version rollout is safe: tickets written before the
+        # upgrade default to class 0.
+        """
+        ALTER TABLE slot_waiters ADD COLUMN IF NOT EXISTS waiter_class smallint NOT NULL DEFAULT 0
         """,
         # Ordering scans walk a namespace's tickets oldest-first; the reaper filters by age.
         """
         CREATE INDEX IF NOT EXISTS slot_waiters_order_idx
             ON slot_waiters (namespace, ticket_id)
+        """,
+        # Round-robin rotation cursor: the requester class served most recently in a namespace.
+        # The round-robin acquire reads it to rotate service to the next class; the winner
+        # stamps its own class here. One row per namespace; -1 (the read-time default) means
+        # nothing served yet, so the rotation begins at class 0.
+        """
+        CREATE TABLE IF NOT EXISTS slot_rr_cursor (
+            namespace  text     NOT NULL,
+            last_class smallint NOT NULL,
+            PRIMARY KEY (namespace)
+        )
         """,
         """
         CREATE TABLE IF NOT EXISTS conn_limits (
@@ -2474,13 +2496,79 @@ def register_lakeflow_source(spark):
     RETURNING slot_id, epoch
     """
 
+    # Round-robin acquisition: same claim and same CAS as _ACQUIRE_SLOT_FAIR, but the order in
+    # which waiters are served rotates across requester *classes* instead of going by arrival.
+    # A per-namespace cursor (slot_rr_cursor) records the class served last; ``rot`` ranks each
+    # live waiter's class by cyclic distance *after* that cursor -- MOD(class - last - 1, N) --
+    # so the class next in rotation has rot 0 and is served first, then the next, wrapping
+    # around. One class per grant, in rotation, so a class gets a turn every N grants no matter
+    # how many tickets another class holds. That is what a rank-within-class scheme cannot do:
+    # because a served waiter dequeues, the next same-class ticket would inherit rank 0 and the
+    # high-volume class would keep winning; the cursor rotates past a class once it is served,
+    # so a burst of consumer tickets cannot crowd out the few CDC-daemon tickets. Within the
+    # chosen class the oldest ticket wins (ticket_id tiebreak); empty classes are skipped for
+    # free since only live waiters appear in ``live``. The ``live`` CTE drops tickets that
+    # stopped heartbeating so a dead ticket cannot block a slot even between reaper sweeps. As
+    # with the FIFO variant this ordering is advisory: FOR UPDATE SKIP LOCKED + the epoch CAS
+    # serialise the actual grant, so a stale cursor or a read race costs at most one extra
+    # sweep, never an over-issued slot. The winner advances the cursor to its own class (see
+    # _ADVANCE_RR_CURSOR) in the same transaction as the claim.
+    #
+    # ``num_classes`` is the rotation modulus (the count of distinct classes); ``1`` makes rot
+    # uniformly 0 and degrades this to FIFO-by-ticket, which is the safe default for a caller
+    # that does not classify its waiters.
+    _ACQUIRE_SLOT_ROUND_ROBIN = """
+    WITH cur AS (
+        SELECT COALESCE(
+            (SELECT last_class FROM slot_rr_cursor WHERE namespace = %(namespace)s), -1
+        ) AS last_class
+    ),
+    live AS (
+        SELECT ticket_id, floor, ceiling,
+               MOD(waiter_class - (SELECT last_class FROM cur) - 1 + %(num_classes)s,
+                   %(num_classes)s) AS rot
+        FROM slot_waiters
+        WHERE namespace = %(namespace)s
+          AND heartbeat_at >= now() - make_interval(secs => %(waiter_ttl)s)
+    ),
+    me AS (
+        SELECT rot, ticket_id FROM live WHERE ticket_id = %(ticket_id)s
+    )
+    UPDATE conn_slots SET owner = %(owner)s, epoch = epoch + 1,
+                          scope = %(scope)s, renewed_at = now()
+    WHERE (namespace, slot_id) = (
+        SELECT s.namespace, s.slot_id FROM conn_slots s
+        CROSS JOIN me
+        WHERE s.namespace = %(namespace)s
+          AND s.slot_id >= %(floor)s
+          AND s.slot_id < %(ceiling)s
+          AND (s.owner IS NULL OR s.renewed_at < now() - make_interval(secs => %(lease)s))
+          AND NOT EXISTS (
+              SELECT 1 FROM live w
+              WHERE w.floor <= s.slot_id AND s.slot_id < w.ceiling
+                AND (w.rot, w.ticket_id) < (me.rot, me.ticket_id)
+          )
+        ORDER BY s.slot_id
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    )
+    RETURNING slot_id, epoch
+    """
+
+    # The winner stamps the cursor with its own class so the next grant rotates to the class
+    # after it. Upsert because the row may not exist yet on the first grant in a namespace.
+    _ADVANCE_RR_CURSOR = """
+    INSERT INTO slot_rr_cursor (namespace, last_class) VALUES (%(namespace)s, %(waiter_class)s)
+    ON CONFLICT (namespace) DO UPDATE SET last_class = EXCLUDED.last_class
+    """
+
     # A waiter enqueues one ticket for the whole time it blocks, heartbeats it each sweep,
     # and deletes it the instant it wins a slot (or gives up). The heartbeat doubles as the
     # reaper -- it drops any ticket whose owner stopped heartbeating -- so a crashed or
     # timed-out waiter cannot wedge the queue and the table needs no separate GC.
     _ENQUEUE_WAITER = """
-    INSERT INTO slot_waiters (namespace, owner, floor, ceiling)
-    VALUES (%(namespace)s, %(owner)s, %(floor)s, %(ceiling)s)
+    INSERT INTO slot_waiters (namespace, owner, floor, ceiling, waiter_class)
+    VALUES (%(namespace)s, %(owner)s, %(floor)s, %(ceiling)s, %(waiter_class)s)
     RETURNING ticket_id
     """
     _HEARTBEAT_WAITER = """
@@ -2528,6 +2616,9 @@ def register_lakeflow_source(spark):
         lease_seconds: float = 120.0,
         ticket_id: int | None = None,
         waiter_ttl: float = _DEFAULT_WAITER_TTL_SECONDS,
+        policy: str = "fifo",
+        waiter_class: int = 0,
+        num_classes: int = 1,
     ) -> ConnectionSlot | None:
         """Claim one slot, or return ``None`` when every eligible slot is busy.
 
@@ -2539,8 +2630,15 @@ def register_lakeflow_source(spark):
 
         ``ticket_id`` opts into the fair queue: pass the id returned by
         ``enqueue_waiter`` (with the same ``waiter_ttl`` used to heartbeat it) and the
-        claim yields any slot an older, still-heartbeating waiter is also eligible for,
-        so this caller waits its turn. Omit it (the default) for the raw first-come race.
+        claim yields any slot an earlier-ordered, still-heartbeating waiter is also
+        eligible for, so this caller waits its turn. Omit it (the default) for the raw
+        first-come race. ``policy`` selects how the queue orders waiters: ``"fifo"``
+        (default) serves strictly by arrival (``_ACQUIRE_SLOT_FAIR``); ``"round_robin"``
+        interleaves requester classes so ticket volume in one class cannot crowd out
+        another (``_ACQUIRE_SLOT_ROUND_ROBIN``). Both only matter when ``ticket_id`` is set.
+        ``waiter_class`` is this caller's class (matching the ticket) and ``num_classes`` the
+        rotation modulus; on a round-robin win the cursor is advanced to ``waiter_class`` in
+        the same transaction as the claim.
         """
 
         parameters = {
@@ -2551,26 +2649,47 @@ def register_lakeflow_source(spark):
             "ceiling": slot_count,
             "lease": float(lease_seconds),
         }
+        round_robin = ticket_id is not None and policy == "round_robin"
         if ticket_id is None:
             statement = _ACQUIRE_SLOT
         else:
-            statement = _ACQUIRE_SLOT_FAIR
+            statement = _ACQUIRE_SLOT_ROUND_ROBIN if round_robin else _ACQUIRE_SLOT_FAIR
             parameters["ticket_id"] = int(ticket_id)
             parameters["waiter_ttl"] = float(waiter_ttl)
+            if round_robin:
+                parameters["num_classes"] = max(1, int(num_classes))
         with connection.cursor() as cursor:
             cursor.execute(statement, parameters)
             row = cursor.fetchone()
+            if row is not None and round_robin:
+                # Advance the rotation cursor to this class inside the same transaction as the
+                # claim, so the next grant rotates past it. Best-effort ordering only -- a lost
+                # advance under a race just repeats a class, never over-issues a slot.
+                cursor.execute(
+                    _ADVANCE_RR_CURSOR,
+                    {"namespace": namespace, "waiter_class": int(waiter_class)},
+                )
         connection.commit()
         if row is None:
             return None
         return ConnectionSlot(namespace, int(row[0]), int(row[1]), owner)
 
 
-    def enqueue_waiter(connection: Any, namespace: str, owner: str, *, floor: int, ceiling: int) -> int:
+    def enqueue_waiter(
+        connection: Any,
+        namespace: str,
+        owner: str,
+        *,
+        floor: int,
+        ceiling: int,
+        waiter_class: int = 0,
+    ) -> int:
         """Register this caller as a slot waiter and return its queue ticket.
 
         The ticket records the eligible band [floor, ceiling); acquisition consults it
-        so an older waiter in the same band is served first. Commit it before waiting so
+        so an earlier-ordered waiter in the same band is served first. ``waiter_class``
+        tags the ticket with its requester class for the round-robin policy (it is inert
+        under FIFO); it defaults to 0, the consumer class. Commit it before waiting so
         other waiters' connections can see it.
         """
 
@@ -2582,6 +2701,7 @@ def register_lakeflow_source(spark):
                     "owner": owner,
                     "floor": max(0, floor),
                     "ceiling": int(ceiling),
+                    "waiter_class": int(waiter_class),
                 },
             )
             row = cursor.fetchone()
@@ -5681,6 +5801,16 @@ def register_lakeflow_source(spark):
     # Private marker set on a daemon reader's options so its lazy slot acquisition applies the
     # daemon reservation floor. Set by the CDC reader factory only.
     _DAEMON_SLOT_MARKER_OPTION = "_informix.daemon.slot"
+    # Master switch (default on) for the CDC shard daemon's slot-wait liveness watchdog. When
+    # on, a shard daemon blocked acquiring its slot keeps its queue ticket and resets its
+    # deadline as long as the pool keeps recycling slots (turnover), giving the round-robin
+    # rotation time to reach it, and gives up only once the pool is genuinely wedged (no
+    # turnover for a whole window) -- at which point it degrades to consumer fallback reads.
+    # When off it falls back to the plain ``connection.wait.timeout.seconds`` deadline. This
+    # is the companion to round-robin: RR bounds the daemon's wait in rounds, but a round is
+    # paid in slot turnover, so the daemon must hold its ticket long enough for those rounds
+    # to happen rather than fail fast and re-queue at the back.
+    _DAEMON_SLOT_LIVENESS_OPTION = "cdc.shared.slot.liveness.enabled"
     # Private marker for the snapshot-drain daemon reader. Unlike the CDC daemon (deferrable,
     # floored highest), a drain is bootstrap work that must make progress to unblock its
     # append-only consumer, so it is floored *below* the CDC daemon -- into a band the CDC
@@ -5722,6 +5852,27 @@ def register_lakeflow_source(spark):
     # under contention. On by default; the kill-switch reverts to the raw race without a
     # redeploy if the queue ever misbehaves on a live pipeline.
     _CONNECTION_FAIR_QUEUE_OPTION = "connection.fair.queue.enabled"
+    # How the fair queue orders waiters. ``fifo`` serves strictly by arrival; ``round_robin``
+    # (the default) interleaves requester classes so a high-volume class (many consumer
+    # bootstrap/fallback tickets) cannot crowd out a low-volume one (the few CDC-daemon
+    # tickets) by ticket count alone -- each class is served once per rotation. The class is
+    # derived from the private slot markers already on a reader's options (see
+    # _connection_waiter_class). ``fifo`` remains available as a kill-switch.
+    _CONNECTION_FAIR_QUEUE_POLICY_OPTION = "connection.fair.queue.policy"
+    _CONNECTION_FAIR_QUEUE_POLICY_FIFO = "fifo"
+    _CONNECTION_FAIR_QUEUE_POLICY_ROUND_ROBIN = "round_robin"
+    _DEFAULT_CONNECTION_FAIR_QUEUE_POLICY = _CONNECTION_FAIR_QUEUE_POLICY_ROUND_ROBIN
+    # Requester classes for the round-robin policy's rotation. The value is only a
+    # within-round tiebreak -- every class is still served once per round -- so the ordering
+    # among them does not starve any class. Consumer work is class 0 so that, all else equal,
+    # the reads that must finish to make progress are not deprioritised.
+    _SLOT_CLASS_CONSUMER = 0
+    _SLOT_CLASS_SNAPSHOT_DAEMON = 1
+    _SLOT_CLASS_CDC_DAEMON = 2
+    _SLOT_CLASS_SNAPSHOT_CONSUMER = 3
+    # The rotation modulus for the round-robin policy: the number of distinct classes above,
+    # so the cursor cycles through exactly them.
+    _SLOT_CLASS_COUNT = 4
     # A ticket stays authoritative for this long without a heartbeat. A waiter heartbeats
     # every sweep (<= _LAKEBASE_SWEEP_MAX_SECONDS), so this is many sweeps of slack for a
     # briefly-stalled live waiter, yet far below the slot lease so a crashed waiter's ticket
@@ -6901,6 +7052,23 @@ def register_lakeflow_source(spark):
             fraction = min(1.0, rank / top)
             return 1.0 - (1.0 - _SLOT_SWEEP_RANK_FLOOR) * fraction
 
+        def _connection_waiter_class(self) -> int:
+            """The requester class this reader enqueues under for the round-robin policy.
+
+            Derived from the private slot markers already on the reader's options, checked
+            daemon-first so a daemon reader is never misclassified as a plain consumer. The
+            class only interleaves the queue; it does not change which slots a reader may
+            claim (that is the reservation ``floor``).
+            """
+
+            if self.options.get(_SNAPSHOT_DAEMON_SLOT_MARKER_OPTION) == "true":
+                return _SLOT_CLASS_SNAPSHOT_DAEMON
+            if self.options.get(_DAEMON_SLOT_MARKER_OPTION) == "true":
+                return _SLOT_CLASS_CDC_DAEMON
+            if self.options.get(_SNAPSHOT_DRAIN_MARKER_OPTION) == "true":
+                return _SLOT_CLASS_SNAPSHOT_CONSUMER
+            return _SLOT_CLASS_CONSUMER
+
         def _acquire_connection_slot(self, budget_seconds: float | None = None) -> None:
             """Claim a capacity slot from Postgres.
 
@@ -6931,7 +7099,8 @@ def register_lakeflow_source(spark):
             # every slot and starve a fresh consumer bootstrap read (which then times out and
             # fails the query). Floor it above the daemon reservation so those low slots stay
             # reachable by consumer reads.
-            if self.options.get(_DAEMON_SLOT_MARKER_OPTION) == "true":
+            is_cdc_daemon = self.options.get(_DAEMON_SLOT_MARKER_OPTION) == "true"
+            if is_cdc_daemon:
                 floor = max(floor, self._daemon_connection_reservation(slot_count))
             # The snapshot-drain daemon also holds its slot for the whole scan, but it is
             # bootstrap work that must finish to unblock its consumer -- so it floors *below*
@@ -6961,24 +7130,38 @@ def register_lakeflow_source(spark):
             owner = f"{secrets.token_hex(16)}"
             scope = self.options.get("_informix.pipeline.scope") or None
             deadline = time.monotonic() + connection_wait_timeout
-            # Slot-wait liveness (snapshot-drain daemon only, default on). The drain is bootstrap
-            # work that must finish, so unlike a consumer read it must not fail merely because the
-            # pool is *full* -- only when the pool is *wedged*. So its deadline is a liveness
-            # watchdog keyed on pool turnover: as long as slots keep being claimed (the token
-            # advances -- other work is completing and recycling capacity), reset the deadline and
-            # ping the waiting consumer that the drain is still live; give up only after a whole
-            # window with zero turnover. Other callers keep the plain deadline (a consumer that
-            # cannot get a slot should fail its microbatch and retry, not wait out a backfill).
-            liveness = is_snapshot_daemon and _option_bool(
-                self.options, _SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION, True
-            )
+            # Slot-wait liveness (the two daemon roles, default on). A daemon is not a consumer
+            # microbatch: it must not fail merely because the pool is *full* -- only when it is
+            # *wedged*. So its deadline is a liveness watchdog keyed on pool turnover: as long as
+            # slots keep being claimed (the token advances -- other work is completing and
+            # recycling capacity), reset the deadline; give up only after a whole window with zero
+            # turnover. The snapshot drain additionally pings its waiting consumer each turnover.
+            # The CDC shard daemon uses the same watchdog so it holds its queue ticket long enough
+            # for the round-robin rotation to reach it -- a round is paid in turnover, not
+            # wall-clock -- rather than failing fast on a short budget and re-queuing at the back;
+            # on a genuine wedge it gives up and its consumers degrade to direct reads. Other
+            # callers keep the plain deadline (a consumer that cannot get a slot should fail its
+            # microbatch and retry, not wait out a backfill).
+            liveness = (
+                is_snapshot_daemon
+                and _option_bool(self.options, _SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION, True)
+            ) or (is_cdc_daemon and _option_bool(self.options, _DAEMON_SLOT_LIVENESS_OPTION, True))
             progress_token = pool_progress_token(connection, namespace) if liveness else None
-            # Fair queue (default on): enqueue a ticket so acquisition is first-come per slot
-            # instead of a raw race, then heartbeat it each sweep and drop it the moment we win
-            # or give up. The kill-switch falls back to the unticketed race.
+            # Fair queue (default on): enqueue a ticket so acquisition waits its turn instead of
+            # a raw race, then heartbeat it each sweep and drop it the moment we win or give up.
+            # The ticket carries this reader's requester class so the round-robin policy can
+            # interleave classes; the policy option chooses round-robin (default) or FIFO. The
+            # kill-switch (_CONNECTION_FAIR_QUEUE_OPTION off) falls back to the unticketed race.
             fair = _option_bool(self.options, _CONNECTION_FAIR_QUEUE_OPTION, True)
             ticket_id = (
-                enqueue_waiter(connection, namespace, owner, floor=floor, ceiling=slot_count)
+                enqueue_waiter(
+                    connection,
+                    namespace,
+                    owner,
+                    floor=floor,
+                    ceiling=slot_count,
+                    waiter_class=self._connection_waiter_class(),
+                )
                 if fair
                 else None
             )
@@ -7001,6 +7184,12 @@ def register_lakeflow_source(spark):
                         lease_seconds=_CONNECTION_SLOT_LEASE_SECONDS,
                         ticket_id=ticket_id,
                         waiter_ttl=_LAKEBASE_WAITER_TTL_SECONDS,
+                        policy=self.options.get(
+                            _CONNECTION_FAIR_QUEUE_POLICY_OPTION,
+                            _DEFAULT_CONNECTION_FAIR_QUEUE_POLICY,
+                        ),
+                        waiter_class=self._connection_waiter_class(),
+                        num_classes=_SLOT_CLASS_COUNT,
                     )
                     if slot is not None:
                         self._connection_slot = f"slot-{slot.slot_id:04d}"
@@ -9998,6 +10187,19 @@ def register_lakeflow_source(spark):
             _option_bool(options, _SNAPSHOT_SHARED_SESSION_OPTION, True)
             _option_bool(options, _CONNECTION_FAIR_QUEUE_OPTION, True)
             _option_bool(options, _SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION, True)
+            _option_bool(options, _DAEMON_SLOT_LIVENESS_OPTION, True)
+            queue_policy = options.get(
+                _CONNECTION_FAIR_QUEUE_POLICY_OPTION, _DEFAULT_CONNECTION_FAIR_QUEUE_POLICY
+            )
+            if queue_policy not in (
+                _CONNECTION_FAIR_QUEUE_POLICY_FIFO,
+                _CONNECTION_FAIR_QUEUE_POLICY_ROUND_ROBIN,
+            ):
+                raise ValueError(
+                    f"Option '{_CONNECTION_FAIR_QUEUE_POLICY_OPTION}' must be "
+                    f"'{_CONNECTION_FAIR_QUEUE_POLICY_FIFO}' or "
+                    f"'{_CONNECTION_FAIR_QUEUE_POLICY_ROUND_ROBIN}'"
+                )
             _option_bool(options, _PROMOTE_UNIQUE_INDEX_OPTION, True)
             _option_bool(options, _SNAPSHOT_STAGING_PIPELINE_OPTION, True)
             partitioned_enabled = _option_bool(options, _PARTITIONED_STREAM_OPTION, True)
@@ -14010,6 +14212,14 @@ def register_lakeflow_source(spark):
             # The shard reads on a daemon thread, so floor its slot above the daemon
             # reservation to leave headroom for consumer bootstrap reads.
             reader_options[_DAEMON_SLOT_MARKER_OPTION] = "true"
+            # The daemon waits for its slot on the turnover watchdog (see the liveness path in
+            # _acquire_connection_slot), using ``connection.wait.timeout.seconds`` as a
+            # per-turnover window rather than a hard cap, so it holds its queue ticket long
+            # enough for the round-robin rotation to reach it. Drop any per-read attempt budget
+            # inherited from the parent's options so a short consumer budget cannot cap that
+            # wait below the window and send the daemon back to the end of the queue.
+            reader_options.pop(_CONNECTION_ATTEMPT_BUDGET_OPTION, None)
+            reader_options.pop(_REPLAY_CONNECTION_WAIT_BUDGET_OPTION, None)
             cls = type(self)
             return lambda: cls(reader_options)
 

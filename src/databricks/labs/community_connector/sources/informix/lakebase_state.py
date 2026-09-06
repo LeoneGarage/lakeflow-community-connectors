@@ -892,7 +892,11 @@ _SCHEMA_STATEMENTS = (
     # its eligible band [floor, ceiling). ``ticket_id`` is a global monotonic
     # sequence, so a smaller ticket enqueued earlier -- acquisition consults it to
     # give the oldest still-heartbeating waiter first claim on each slot (see
-    # _ACQUIRE_SLOT_FAIR), turning the raw race into per-slot FIFO.
+    # _ACQUIRE_SLOT_FAIR), turning the raw race into per-slot FIFO. ``waiter_class``
+    # tags each ticket with its requester class so the round-robin policy
+    # (_ACQUIRE_SLOT_ROUND_ROBIN) can interleave classes rather than serve strictly by
+    # arrival; it defaults to 0 (the consumer class) so an un-tagged ticket behaves as
+    # before.
     """
     CREATE TABLE IF NOT EXISTS slot_waiters (
         namespace    text        NOT NULL,
@@ -900,14 +904,32 @@ _SCHEMA_STATEMENTS = (
         owner        text        NOT NULL,
         floor        integer     NOT NULL,
         ceiling      integer     NOT NULL,
+        waiter_class smallint    NOT NULL DEFAULT 0,
         heartbeat_at timestamptz NOT NULL DEFAULT now(),
         PRIMARY KEY (namespace, ticket_id)
     )
+    """,
+    # Add the class column in place for a slot_waiters table created by an older
+    # deployment, so a mixed-version rollout is safe: tickets written before the
+    # upgrade default to class 0.
+    """
+    ALTER TABLE slot_waiters ADD COLUMN IF NOT EXISTS waiter_class smallint NOT NULL DEFAULT 0
     """,
     # Ordering scans walk a namespace's tickets oldest-first; the reaper filters by age.
     """
     CREATE INDEX IF NOT EXISTS slot_waiters_order_idx
         ON slot_waiters (namespace, ticket_id)
+    """,
+    # Round-robin rotation cursor: the requester class served most recently in a namespace.
+    # The round-robin acquire reads it to rotate service to the next class; the winner
+    # stamps its own class here. One row per namespace; -1 (the read-time default) means
+    # nothing served yet, so the rotation begins at class 0.
+    """
+    CREATE TABLE IF NOT EXISTS slot_rr_cursor (
+        namespace  text     NOT NULL,
+        last_class smallint NOT NULL,
+        PRIMARY KEY (namespace)
+    )
     """,
     """
     CREATE TABLE IF NOT EXISTS conn_limits (
@@ -1373,13 +1395,79 @@ WHERE (namespace, slot_id) = (
 RETURNING slot_id, epoch
 """
 
+# Round-robin acquisition: same claim and same CAS as _ACQUIRE_SLOT_FAIR, but the order in
+# which waiters are served rotates across requester *classes* instead of going by arrival.
+# A per-namespace cursor (slot_rr_cursor) records the class served last; ``rot`` ranks each
+# live waiter's class by cyclic distance *after* that cursor -- MOD(class - last - 1, N) --
+# so the class next in rotation has rot 0 and is served first, then the next, wrapping
+# around. One class per grant, in rotation, so a class gets a turn every N grants no matter
+# how many tickets another class holds. That is what a rank-within-class scheme cannot do:
+# because a served waiter dequeues, the next same-class ticket would inherit rank 0 and the
+# high-volume class would keep winning; the cursor rotates past a class once it is served,
+# so a burst of consumer tickets cannot crowd out the few CDC-daemon tickets. Within the
+# chosen class the oldest ticket wins (ticket_id tiebreak); empty classes are skipped for
+# free since only live waiters appear in ``live``. The ``live`` CTE drops tickets that
+# stopped heartbeating so a dead ticket cannot block a slot even between reaper sweeps. As
+# with the FIFO variant this ordering is advisory: FOR UPDATE SKIP LOCKED + the epoch CAS
+# serialise the actual grant, so a stale cursor or a read race costs at most one extra
+# sweep, never an over-issued slot. The winner advances the cursor to its own class (see
+# _ADVANCE_RR_CURSOR) in the same transaction as the claim.
+#
+# ``num_classes`` is the rotation modulus (the count of distinct classes); ``1`` makes rot
+# uniformly 0 and degrades this to FIFO-by-ticket, which is the safe default for a caller
+# that does not classify its waiters.
+_ACQUIRE_SLOT_ROUND_ROBIN = """
+WITH cur AS (
+    SELECT COALESCE(
+        (SELECT last_class FROM slot_rr_cursor WHERE namespace = %(namespace)s), -1
+    ) AS last_class
+),
+live AS (
+    SELECT ticket_id, floor, ceiling,
+           MOD(waiter_class - (SELECT last_class FROM cur) - 1 + %(num_classes)s,
+               %(num_classes)s) AS rot
+    FROM slot_waiters
+    WHERE namespace = %(namespace)s
+      AND heartbeat_at >= now() - make_interval(secs => %(waiter_ttl)s)
+),
+me AS (
+    SELECT rot, ticket_id FROM live WHERE ticket_id = %(ticket_id)s
+)
+UPDATE conn_slots SET owner = %(owner)s, epoch = epoch + 1,
+                      scope = %(scope)s, renewed_at = now()
+WHERE (namespace, slot_id) = (
+    SELECT s.namespace, s.slot_id FROM conn_slots s
+    CROSS JOIN me
+    WHERE s.namespace = %(namespace)s
+      AND s.slot_id >= %(floor)s
+      AND s.slot_id < %(ceiling)s
+      AND (s.owner IS NULL OR s.renewed_at < now() - make_interval(secs => %(lease)s))
+      AND NOT EXISTS (
+          SELECT 1 FROM live w
+          WHERE w.floor <= s.slot_id AND s.slot_id < w.ceiling
+            AND (w.rot, w.ticket_id) < (me.rot, me.ticket_id)
+      )
+    ORDER BY s.slot_id
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+)
+RETURNING slot_id, epoch
+"""
+
+# The winner stamps the cursor with its own class so the next grant rotates to the class
+# after it. Upsert because the row may not exist yet on the first grant in a namespace.
+_ADVANCE_RR_CURSOR = """
+INSERT INTO slot_rr_cursor (namespace, last_class) VALUES (%(namespace)s, %(waiter_class)s)
+ON CONFLICT (namespace) DO UPDATE SET last_class = EXCLUDED.last_class
+"""
+
 # A waiter enqueues one ticket for the whole time it blocks, heartbeats it each sweep,
 # and deletes it the instant it wins a slot (or gives up). The heartbeat doubles as the
 # reaper -- it drops any ticket whose owner stopped heartbeating -- so a crashed or
 # timed-out waiter cannot wedge the queue and the table needs no separate GC.
 _ENQUEUE_WAITER = """
-INSERT INTO slot_waiters (namespace, owner, floor, ceiling)
-VALUES (%(namespace)s, %(owner)s, %(floor)s, %(ceiling)s)
+INSERT INTO slot_waiters (namespace, owner, floor, ceiling, waiter_class)
+VALUES (%(namespace)s, %(owner)s, %(floor)s, %(ceiling)s, %(waiter_class)s)
 RETURNING ticket_id
 """
 _HEARTBEAT_WAITER = """
@@ -1427,6 +1515,9 @@ def acquire_slot(
     lease_seconds: float = 120.0,
     ticket_id: int | None = None,
     waiter_ttl: float = _DEFAULT_WAITER_TTL_SECONDS,
+    policy: str = "fifo",
+    waiter_class: int = 0,
+    num_classes: int = 1,
 ) -> ConnectionSlot | None:
     """Claim one slot, or return ``None`` when every eligible slot is busy.
 
@@ -1438,8 +1529,15 @@ def acquire_slot(
 
     ``ticket_id`` opts into the fair queue: pass the id returned by
     ``enqueue_waiter`` (with the same ``waiter_ttl`` used to heartbeat it) and the
-    claim yields any slot an older, still-heartbeating waiter is also eligible for,
-    so this caller waits its turn. Omit it (the default) for the raw first-come race.
+    claim yields any slot an earlier-ordered, still-heartbeating waiter is also
+    eligible for, so this caller waits its turn. Omit it (the default) for the raw
+    first-come race. ``policy`` selects how the queue orders waiters: ``"fifo"``
+    (default) serves strictly by arrival (``_ACQUIRE_SLOT_FAIR``); ``"round_robin"``
+    interleaves requester classes so ticket volume in one class cannot crowd out
+    another (``_ACQUIRE_SLOT_ROUND_ROBIN``). Both only matter when ``ticket_id`` is set.
+    ``waiter_class`` is this caller's class (matching the ticket) and ``num_classes`` the
+    rotation modulus; on a round-robin win the cursor is advanced to ``waiter_class`` in
+    the same transaction as the claim.
     """
 
     parameters = {
@@ -1450,26 +1548,47 @@ def acquire_slot(
         "ceiling": slot_count,
         "lease": float(lease_seconds),
     }
+    round_robin = ticket_id is not None and policy == "round_robin"
     if ticket_id is None:
         statement = _ACQUIRE_SLOT
     else:
-        statement = _ACQUIRE_SLOT_FAIR
+        statement = _ACQUIRE_SLOT_ROUND_ROBIN if round_robin else _ACQUIRE_SLOT_FAIR
         parameters["ticket_id"] = int(ticket_id)
         parameters["waiter_ttl"] = float(waiter_ttl)
+        if round_robin:
+            parameters["num_classes"] = max(1, int(num_classes))
     with connection.cursor() as cursor:
         cursor.execute(statement, parameters)
         row = cursor.fetchone()
+        if row is not None and round_robin:
+            # Advance the rotation cursor to this class inside the same transaction as the
+            # claim, so the next grant rotates past it. Best-effort ordering only -- a lost
+            # advance under a race just repeats a class, never over-issues a slot.
+            cursor.execute(
+                _ADVANCE_RR_CURSOR,
+                {"namespace": namespace, "waiter_class": int(waiter_class)},
+            )
     connection.commit()
     if row is None:
         return None
     return ConnectionSlot(namespace, int(row[0]), int(row[1]), owner)
 
 
-def enqueue_waiter(connection: Any, namespace: str, owner: str, *, floor: int, ceiling: int) -> int:
+def enqueue_waiter(
+    connection: Any,
+    namespace: str,
+    owner: str,
+    *,
+    floor: int,
+    ceiling: int,
+    waiter_class: int = 0,
+) -> int:
     """Register this caller as a slot waiter and return its queue ticket.
 
     The ticket records the eligible band [floor, ceiling); acquisition consults it
-    so an older waiter in the same band is served first. Commit it before waiting so
+    so an earlier-ordered waiter in the same band is served first. ``waiter_class``
+    tags the ticket with its requester class for the round-robin policy (it is inert
+    under FIFO); it defaults to 0, the consumer class. Commit it before waiting so
     other waiters' connections can see it.
     """
 
@@ -1481,6 +1600,7 @@ def enqueue_waiter(connection: Any, namespace: str, owner: str, *, floor: int, c
                 "owner": owner,
                 "floor": max(0, floor),
                 "ceiling": int(ceiling),
+                "waiter_class": int(waiter_class),
             },
         )
         row = cursor.fetchone()

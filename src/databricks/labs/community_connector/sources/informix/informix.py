@@ -443,6 +443,16 @@ _DEFAULT_DAEMON_CONNECTION_RESERVATION = 0
 # Private marker set on a daemon reader's options so its lazy slot acquisition applies the
 # daemon reservation floor. Set by the CDC reader factory only.
 _DAEMON_SLOT_MARKER_OPTION = "_informix.daemon.slot"
+# Master switch (default on) for the CDC shard daemon's slot-wait liveness watchdog. When
+# on, a shard daemon blocked acquiring its slot keeps its queue ticket and resets its
+# deadline as long as the pool keeps recycling slots (turnover), giving the round-robin
+# rotation time to reach it, and gives up only once the pool is genuinely wedged (no
+# turnover for a whole window) -- at which point it degrades to consumer fallback reads.
+# When off it falls back to the plain ``connection.wait.timeout.seconds`` deadline. This
+# is the companion to round-robin: RR bounds the daemon's wait in rounds, but a round is
+# paid in slot turnover, so the daemon must hold its ticket long enough for those rounds
+# to happen rather than fail fast and re-queue at the back.
+_DAEMON_SLOT_LIVENESS_OPTION = "cdc.shared.slot.liveness.enabled"
 # Private marker for the snapshot-drain daemon reader. Unlike the CDC daemon (deferrable,
 # floored highest), a drain is bootstrap work that must make progress to unblock its
 # append-only consumer, so it is floored *below* the CDC daemon -- into a band the CDC
@@ -484,6 +494,27 @@ _LAKEBASE_SWEEP_MAX_SECONDS = 2.0
 # under contention. On by default; the kill-switch reverts to the raw race without a
 # redeploy if the queue ever misbehaves on a live pipeline.
 _CONNECTION_FAIR_QUEUE_OPTION = "connection.fair.queue.enabled"
+# How the fair queue orders waiters. ``fifo`` serves strictly by arrival; ``round_robin``
+# (the default) interleaves requester classes so a high-volume class (many consumer
+# bootstrap/fallback tickets) cannot crowd out a low-volume one (the few CDC-daemon
+# tickets) by ticket count alone -- each class is served once per rotation. The class is
+# derived from the private slot markers already on a reader's options (see
+# _connection_waiter_class). ``fifo`` remains available as a kill-switch.
+_CONNECTION_FAIR_QUEUE_POLICY_OPTION = "connection.fair.queue.policy"
+_CONNECTION_FAIR_QUEUE_POLICY_FIFO = "fifo"
+_CONNECTION_FAIR_QUEUE_POLICY_ROUND_ROBIN = "round_robin"
+_DEFAULT_CONNECTION_FAIR_QUEUE_POLICY = _CONNECTION_FAIR_QUEUE_POLICY_ROUND_ROBIN
+# Requester classes for the round-robin policy's rotation. The value is only a
+# within-round tiebreak -- every class is still served once per round -- so the ordering
+# among them does not starve any class. Consumer work is class 0 so that, all else equal,
+# the reads that must finish to make progress are not deprioritised.
+_SLOT_CLASS_CONSUMER = 0
+_SLOT_CLASS_SNAPSHOT_DAEMON = 1
+_SLOT_CLASS_CDC_DAEMON = 2
+_SLOT_CLASS_SNAPSHOT_CONSUMER = 3
+# The rotation modulus for the round-robin policy: the number of distinct classes above,
+# so the cursor cycles through exactly them.
+_SLOT_CLASS_COUNT = 4
 # A ticket stays authoritative for this long without a heartbeat. A waiter heartbeats
 # every sweep (<= _LAKEBASE_SWEEP_MAX_SECONDS), so this is many sweeps of slack for a
 # briefly-stalled live waiter, yet far below the slot lease so a crashed waiter's ticket
@@ -1663,6 +1694,23 @@ class PurePythonInformixBridge:
         fraction = min(1.0, rank / top)
         return 1.0 - (1.0 - _SLOT_SWEEP_RANK_FLOOR) * fraction
 
+    def _connection_waiter_class(self) -> int:
+        """The requester class this reader enqueues under for the round-robin policy.
+
+        Derived from the private slot markers already on the reader's options, checked
+        daemon-first so a daemon reader is never misclassified as a plain consumer. The
+        class only interleaves the queue; it does not change which slots a reader may
+        claim (that is the reservation ``floor``).
+        """
+
+        if self.options.get(_SNAPSHOT_DAEMON_SLOT_MARKER_OPTION) == "true":
+            return _SLOT_CLASS_SNAPSHOT_DAEMON
+        if self.options.get(_DAEMON_SLOT_MARKER_OPTION) == "true":
+            return _SLOT_CLASS_CDC_DAEMON
+        if self.options.get(_SNAPSHOT_DRAIN_MARKER_OPTION) == "true":
+            return _SLOT_CLASS_SNAPSHOT_CONSUMER
+        return _SLOT_CLASS_CONSUMER
+
     def _acquire_connection_slot(self, budget_seconds: float | None = None) -> None:
         """Claim a capacity slot from Postgres.
 
@@ -1693,7 +1741,8 @@ class PurePythonInformixBridge:
         # every slot and starve a fresh consumer bootstrap read (which then times out and
         # fails the query). Floor it above the daemon reservation so those low slots stay
         # reachable by consumer reads.
-        if self.options.get(_DAEMON_SLOT_MARKER_OPTION) == "true":
+        is_cdc_daemon = self.options.get(_DAEMON_SLOT_MARKER_OPTION) == "true"
+        if is_cdc_daemon:
             floor = max(floor, self._daemon_connection_reservation(slot_count))
         # The snapshot-drain daemon also holds its slot for the whole scan, but it is
         # bootstrap work that must finish to unblock its consumer -- so it floors *below*
@@ -1723,24 +1772,38 @@ class PurePythonInformixBridge:
         owner = f"{secrets.token_hex(16)}"
         scope = self.options.get("_informix.pipeline.scope") or None
         deadline = time.monotonic() + connection_wait_timeout
-        # Slot-wait liveness (snapshot-drain daemon only, default on). The drain is bootstrap
-        # work that must finish, so unlike a consumer read it must not fail merely because the
-        # pool is *full* -- only when the pool is *wedged*. So its deadline is a liveness
-        # watchdog keyed on pool turnover: as long as slots keep being claimed (the token
-        # advances -- other work is completing and recycling capacity), reset the deadline and
-        # ping the waiting consumer that the drain is still live; give up only after a whole
-        # window with zero turnover. Other callers keep the plain deadline (a consumer that
-        # cannot get a slot should fail its microbatch and retry, not wait out a backfill).
-        liveness = is_snapshot_daemon and _option_bool(
-            self.options, _SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION, True
-        )
+        # Slot-wait liveness (the two daemon roles, default on). A daemon is not a consumer
+        # microbatch: it must not fail merely because the pool is *full* -- only when it is
+        # *wedged*. So its deadline is a liveness watchdog keyed on pool turnover: as long as
+        # slots keep being claimed (the token advances -- other work is completing and
+        # recycling capacity), reset the deadline; give up only after a whole window with zero
+        # turnover. The snapshot drain additionally pings its waiting consumer each turnover.
+        # The CDC shard daemon uses the same watchdog so it holds its queue ticket long enough
+        # for the round-robin rotation to reach it -- a round is paid in turnover, not
+        # wall-clock -- rather than failing fast on a short budget and re-queuing at the back;
+        # on a genuine wedge it gives up and its consumers degrade to direct reads. Other
+        # callers keep the plain deadline (a consumer that cannot get a slot should fail its
+        # microbatch and retry, not wait out a backfill).
+        liveness = (
+            is_snapshot_daemon
+            and _option_bool(self.options, _SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION, True)
+        ) or (is_cdc_daemon and _option_bool(self.options, _DAEMON_SLOT_LIVENESS_OPTION, True))
         progress_token = pool_progress_token(connection, namespace) if liveness else None
-        # Fair queue (default on): enqueue a ticket so acquisition is first-come per slot
-        # instead of a raw race, then heartbeat it each sweep and drop it the moment we win
-        # or give up. The kill-switch falls back to the unticketed race.
+        # Fair queue (default on): enqueue a ticket so acquisition waits its turn instead of
+        # a raw race, then heartbeat it each sweep and drop it the moment we win or give up.
+        # The ticket carries this reader's requester class so the round-robin policy can
+        # interleave classes; the policy option chooses round-robin (default) or FIFO. The
+        # kill-switch (_CONNECTION_FAIR_QUEUE_OPTION off) falls back to the unticketed race.
         fair = _option_bool(self.options, _CONNECTION_FAIR_QUEUE_OPTION, True)
         ticket_id = (
-            enqueue_waiter(connection, namespace, owner, floor=floor, ceiling=slot_count)
+            enqueue_waiter(
+                connection,
+                namespace,
+                owner,
+                floor=floor,
+                ceiling=slot_count,
+                waiter_class=self._connection_waiter_class(),
+            )
             if fair
             else None
         )
@@ -1763,6 +1826,12 @@ class PurePythonInformixBridge:
                     lease_seconds=_CONNECTION_SLOT_LEASE_SECONDS,
                     ticket_id=ticket_id,
                     waiter_ttl=_LAKEBASE_WAITER_TTL_SECONDS,
+                    policy=self.options.get(
+                        _CONNECTION_FAIR_QUEUE_POLICY_OPTION,
+                        _DEFAULT_CONNECTION_FAIR_QUEUE_POLICY,
+                    ),
+                    waiter_class=self._connection_waiter_class(),
+                    num_classes=_SLOT_CLASS_COUNT,
                 )
                 if slot is not None:
                     self._connection_slot = f"slot-{slot.slot_id:04d}"
@@ -4760,6 +4829,19 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         _option_bool(options, _SNAPSHOT_SHARED_SESSION_OPTION, True)
         _option_bool(options, _CONNECTION_FAIR_QUEUE_OPTION, True)
         _option_bool(options, _SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION, True)
+        _option_bool(options, _DAEMON_SLOT_LIVENESS_OPTION, True)
+        queue_policy = options.get(
+            _CONNECTION_FAIR_QUEUE_POLICY_OPTION, _DEFAULT_CONNECTION_FAIR_QUEUE_POLICY
+        )
+        if queue_policy not in (
+            _CONNECTION_FAIR_QUEUE_POLICY_FIFO,
+            _CONNECTION_FAIR_QUEUE_POLICY_ROUND_ROBIN,
+        ):
+            raise ValueError(
+                f"Option '{_CONNECTION_FAIR_QUEUE_POLICY_OPTION}' must be "
+                f"'{_CONNECTION_FAIR_QUEUE_POLICY_FIFO}' or "
+                f"'{_CONNECTION_FAIR_QUEUE_POLICY_ROUND_ROBIN}'"
+            )
         _option_bool(options, _PROMOTE_UNIQUE_INDEX_OPTION, True)
         _option_bool(options, _SNAPSHOT_STAGING_PIPELINE_OPTION, True)
         partitioned_enabled = _option_bool(options, _PARTITIONED_STREAM_OPTION, True)
@@ -8772,6 +8854,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # The shard reads on a daemon thread, so floor its slot above the daemon
         # reservation to leave headroom for consumer bootstrap reads.
         reader_options[_DAEMON_SLOT_MARKER_OPTION] = "true"
+        # The daemon waits for its slot on the turnover watchdog (see the liveness path in
+        # _acquire_connection_slot), using ``connection.wait.timeout.seconds`` as a
+        # per-turnover window rather than a hard cap, so it holds its queue ticket long
+        # enough for the round-robin rotation to reach it. Drop any per-read attempt budget
+        # inherited from the parent's options so a short consumer budget cannot cap that
+        # wait below the window and send the daemon back to the end of the queue.
+        reader_options.pop(_CONNECTION_ATTEMPT_BUDGET_OPTION, None)
+        reader_options.pop(_REPLAY_CONNECTION_WAIT_BUDGET_OPTION, None)
         cls = type(self)
         return lambda: cls(reader_options)
 
