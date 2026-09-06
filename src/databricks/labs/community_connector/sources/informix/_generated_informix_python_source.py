@@ -5828,6 +5828,14 @@ def register_lakeflow_source(spark):
     # because a *blocking* reader has no budget at all yet still needs a rank.
     _CONNECTION_ATTEMPT_RANK_OPTION = "_informix.connection.attempt.backlog.rank"
     _DEFAULT_CONNECTION_WAIT_TIMEOUT_SECONDS = 10 * 60
+    # One-shot jittered delay a reader sleeps before its *first* connection, so a pipeline that
+    # starts dozens of flows at once does not open all their Informix CDC sessions in the same
+    # instant -- the syscdcv1 subsystem can stall under many concurrent session open/teardowns
+    # (see validate_initial_lsn). Each reader sleeps random.uniform(0, this) once, before it
+    # acquires a slot (so it holds nothing while waiting), spreading the startup wave over the
+    # window. 0 (default) disables it; steady-state reads are never delayed (the flag is set
+    # after the first connect).
+    _CONNECTION_STARTUP_JITTER_OPTION = "connection.startup.jitter.seconds"
     _CONNECTION_SLOT_LEASE_SECONDS = 120
     _CONNECTION_SLOT_HEARTBEAT_SECONDS = 30
     # How long a lease-loss handler waits for the in-flight operation before closing
@@ -6766,6 +6774,28 @@ def register_lakeflow_source(spark):
             # ``_acquire_connection_slot`` can report "still alive, pool is turning over" up to
             # the waiting consumer's liveness watchdog. None (the default) for every other read.
             self._slot_wait_liveness: Callable[[], None] | None = None
+            # Startup jitter is one-shot: set once the first connection has applied its delay so
+            # steady-state polls and reconnects are never delayed.
+            self._startup_jitter_applied = False
+
+        def _apply_startup_jitter(self) -> None:
+            """Sleep a one-time jittered delay before this reader's first connection.
+
+            Spreads a pipeline's startup connection/CDC-session opens over a window so dozens of
+            flows do not hit syscdcv1 simultaneously. One-shot per reader instance: the flag is
+            set before sleeping, so a failed connect that retries does not re-delay, and every
+            connection after the first is immediate.
+            """
+
+            if getattr(self, "_startup_jitter_applied", True):
+                return
+            self._startup_jitter_applied = True
+            try:
+                jitter = float(self.options.get(_CONNECTION_STARTUP_JITTER_OPTION, "0") or 0)
+            except (TypeError, ValueError):
+                jitter = 0.0
+            if jitter > 0:
+                time.sleep(random.uniform(0, jitter))
 
         def _ensure_connected(self) -> None:
             # Tests and injected bridges built with ``object.__new__`` already
@@ -6775,6 +6805,8 @@ def register_lakeflow_source(spark):
             with self._connect_lock:
                 if self._connected:
                     return
+                # Before acquiring a slot -- a jittering reader holds nothing while it waits.
+                self._apply_startup_jitter()
                 bypass_capacity = self.options.get("_informix.bypass.connection.capacity") == "true"
                 if not bypass_capacity:
                     budget = self.options.get(_CONNECTION_ATTEMPT_BUDGET_OPTION)
@@ -8712,6 +8744,18 @@ def register_lakeflow_source(spark):
         raise ValueError(f"Option '{name}' must be one of: 1, true, yes, 0, false, no")
 
 
+    def _validate_nonneg_float_option(options: dict[str, str], name: str) -> None:
+        """Raise if ``name`` is present and not a number >= 0. Absent means the default."""
+
+        if name not in options:
+            return
+        try:
+            if float(options[name]) < 0:
+                raise ValueError
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Option '{name}' must be a number >= 0") from error
+
+
     # How a decoded string containing an embedded NUL (\x00) is sanitized. A NUL is genuine
     # content -- the decoders already trim real (space) padding -- but many downstream
     # consumers cannot store it, so the default converts such a value to NULL (honest and
@@ -10171,6 +10215,9 @@ def register_lakeflow_source(spark):
             ):
                 if int(options.get(name, default)) < minimum:
                     raise ValueError(f"Option '{name}' must be >= {minimum}")
+            # Startup jitter is a float (fractional seconds), validated here rather than in the
+            # integer loop above; 0 disables it.
+            _validate_nonneg_float_option(options, _CONNECTION_STARTUP_JITTER_OPTION)
             # Shared-reader thread count defaults to the connection budget, so it is
             # validated here rather than in the static-default loop above.
             if _SHARED_CDC_THREADS_OPTION in options and int(options[_SHARED_CDC_THREADS_OPTION]) < 1:

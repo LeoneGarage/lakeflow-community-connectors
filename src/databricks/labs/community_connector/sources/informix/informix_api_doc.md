@@ -272,7 +272,15 @@ all-ascending key is unaffected.
 CDC session setup and teardown while validating the initial
 CDC boundary use `cdc.read.timeout.seconds` (default `60`) for the same reason:
 `syscdcv1` open/start/activate/end/close calls can stall under many concurrent
-CDC sessions and should not fail against the 30-second default.
+CDC sessions and should not fail against the 30-second default. That stall is most
+likely at **startup**, when a pipeline brings up dozens of flows at once and each opens
+its CDC session in the same instant; `connection.startup.jitter.seconds` (default `0`,
+off) staggers it by having each reader sleep a one-shot random delay in `[0, jitter)`
+before its first connection (before acquiring a slot, so it holds nothing while waiting).
+Steady-state polls and reconnects are never delayed. Set it to a few seconds on a large
+multi-table pipeline that intermittently fails at startup with `validate_initial_lsn`
+socket-read timeouts; it spreads the first connects over the window without lowering the
+`max.concurrent.connections` ceiling or steady-state throughput.
 
 When the shared reader supplies snapshot page N as its new start offset,
 pages below N are acknowledged and removed best-effort. Page N, later pages,

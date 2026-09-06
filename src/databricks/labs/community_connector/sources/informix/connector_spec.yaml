@@ -850,6 +850,20 @@ connection:
         cdc.shared.slot.liveness.enabled and consumer reads always keep the plain
         deadline. Accepts true/false (1/yes, 0/no).
 
+    - name: connection.startup.jitter.seconds
+      type: string
+      required: false
+      description: >
+        One-shot jittered delay (fractional seconds) a reader sleeps before its first
+        connection, so a pipeline that starts many flows at once does not open all their
+        Informix CDC sessions in the same instant -- the syscdcv1 subsystem can stall under
+        many concurrent session open/teardowns at startup, surfacing as a socket read
+        timeout in validate_initial_lsn. Each reader sleeps a random duration in [0, this)
+        once, before acquiring a connection slot (so it holds nothing while waiting),
+        spreading the startup wave over the window. Default 0 (disabled); steady-state polls
+        and reconnects are never delayed. Set it to a few seconds on a large multi-table
+        pipeline that intermittently fails at startup. Must be a number >= 0.
+
     - name: cdc.shared.slot.liveness.enabled
       type: string
       required: false
