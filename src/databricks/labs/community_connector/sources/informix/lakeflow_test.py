@@ -555,6 +555,10 @@ class LakeflowContractTests(unittest.TestCase):
                 # a real connection). Shared-mode tests opt in explicitly.
                 "cdc.shared.session": "false",
                 "snapshot.shared.session": "false",
+                # Partitioned streaming (on by default) requires the shared CDC session,
+                # so a shared-off config must pin it off too or construction fails fast.
+                # Partitioned-reader tests opt in explicitly (shared on + partitioned on).
+                "stream.partitioned": "false",
                 **options,
             }
         )
@@ -1000,6 +1004,7 @@ class LakeflowContractTests(unittest.TestCase):
                     "lakebase.password": "test-state-password",
                     "cdc.shared.session": "false",
                     "snapshot.shared.session": "false",
+                    "stream.partitioned": "false",
                 }
             )
             connector = source.lakeflow_connect
@@ -4654,6 +4659,14 @@ class LakeflowContractTests(unittest.TestCase):
     # Partitioned snapshot-page reader (SupportsPartitionedStream)
     # ------------------------------------------------------------------
 
+    def _partitioned_connector(self, bridge=None, **options):
+        """A connector configured for the partitioned reader: both stream.partitioned
+        and cdc.shared.session on (the base connector pins both off). The unsafe
+        partitioned + shared-off combination fails construction, so partitioned-reader
+        tests must enable the shared session too."""
+        opts = {"stream.partitioned": "true", "cdc.shared.session": "true", **options}
+        return self.connector(bridge, **opts)
+
     def _drive_partitioned_snapshot(self, connector, table_name="app.orders", options=None):
         """Drive the partitioned reader through the snapshot, mirroring Spark's cycle.
 
@@ -4679,16 +4692,16 @@ class LakeflowContractTests(unittest.TestCase):
         return served, offsets
 
     def test_partitioned_reader_is_gated_by_the_option(self):
-        # Default on for a keyed (CDC-capable) table; off suppresses it so the
-        # framework falls back to simpleStreamReader (byte-for-byte current behavior).
-        on = self.connector()
+        # On for a keyed (CDC-capable) table when partitioned + shared CDC are both on;
+        # off suppresses it so the framework falls back to simpleStreamReader.
+        on = self._partitioned_connector()
         self.assertTrue(on.is_partitioned("app.orders"))
-        off = self.connector(**{"stream.partitioned": "false"})
+        off = self.connector(**{"stream.partitioned": "false", "cdc.shared.session": "true"})
         self.assertFalse(off.is_partitioned("app.orders"))
 
     def test_partitioned_pages_per_batch_must_be_positive(self):
         with self.assertRaises(ValueError):
-            self.connector(**{"stream.partitioned.snapshot.pages.per.batch": "0"})
+            self._partitioned_connector(**{"stream.partitioned.snapshot.pages.per.batch": "0"})
 
     def test_partitioned_snapshot_fans_pages_out_and_preserves_order(self):
         # A staged snapshot of several one-row pages fans out k pages per microbatch,
@@ -4696,7 +4709,7 @@ class LakeflowContractTests(unittest.TestCase):
         # page (id) order -- with no page served twice.
         bridge = FakeBridge()
         bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 6)]  # 5 rows -> 5 pages
-        connector = self.connector(
+        connector = self._partitioned_connector(
             bridge,
             **{"snapshot.page.size": "1", "stream.partitioned.snapshot.pages.per.batch": "3"},
         )
@@ -4732,7 +4745,7 @@ class LakeflowContractTests(unittest.TestCase):
 
         bridge = FakeBridge()
         bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 6)]
-        connector = self.connector(
+        connector = self._partitioned_connector(
             bridge,
             registration_scope="partitioned",
             **{"snapshot.page.size": "1", "stream.partitioned.snapshot.pages.per.batch": "2"},
@@ -4747,7 +4760,7 @@ class LakeflowContractTests(unittest.TestCase):
         # page_index. Validates the boundary-page-header read in latest_offset.
         bridge = FakeBridge()
         bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 6)]
-        connector = self.connector(
+        connector = self._partitioned_connector(
             bridge,
             **{"snapshot.page.size": "1", "stream.partitioned.snapshot.pages.per.batch": "2"},
         )
@@ -4770,7 +4783,7 @@ class LakeflowContractTests(unittest.TestCase):
         # make no Informix catalog call, so it is safe to run on an executor.
         bridge = FakeBridge()
         bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 6)]
-        connector = self.connector(
+        connector = self._partitioned_connector(
             bridge,
             **{"snapshot.page.size": "1", "stream.partitioned.snapshot.pages.per.batch": "3"},
         )
@@ -4792,7 +4805,7 @@ class LakeflowContractTests(unittest.TestCase):
     def test_partitioned_embedded_path_matches_read_table(self):
         # A non-page-serve microbatch (stream phase) yields a single embedded
         # partition whose rows and offset are exactly read_table's output.
-        connector = self.connector()
+        connector = self._partitioned_connector()
         stream_start = {"phase": "stream", "commit_lsn": "5"}
         sentinel_rows = [{"id": 7, "value": "x"}]
         sentinel_end = {"phase": "stream", "commit_lsn": "9"}
@@ -4815,7 +4828,7 @@ class LakeflowContractTests(unittest.TestCase):
     def test_partitioned_embedded_delete_flow_routes_to_read_table_deletes(self):
         # A delete-channel reader (isDeleteFlow) never page-serves; its embedded
         # partition comes from read_table_deletes, not read_table.
-        connector = self.connector(**{"isDeleteFlow": "true"})
+        connector = self._partitioned_connector(**{"isDeleteFlow": "true"})
         start = {"phase": "stream", "commit_lsn": "5"}
         sentinel = ([{"id": 1}], {"phase": "stream", "commit_lsn": "6"})
         with (
@@ -4834,7 +4847,7 @@ class LakeflowContractTests(unittest.TestCase):
         # get_partitions rebuilds the embedded rows via read_table if the driver
         # bridge cache was dropped between latest_offset and partitions (a re-plan),
         # so correctness never depends on the cache surviving.
-        connector = self.connector()
+        connector = self._partitioned_connector()
         start = {"phase": "stream", "commit_lsn": "5"}
         with mock.patch.object(
             connector,
@@ -4853,9 +4866,99 @@ class LakeflowContractTests(unittest.TestCase):
     def test_partitioned_batch_get_partitions_falls_back(self):
         # The 2-arg (batch) form must raise so LakeflowBatchReader falls back to a
         # single non-partitioned read_table batch.
-        connector = self.connector()
+        connector = self._partitioned_connector()
         with self.assertRaises(NotImplementedError):
             connector.get_partitions("app.orders", {})
+
+    def test_partitioned_embedded_rows_survive_json_and_round_trip(self):
+        # F1: the framework JSON-serializes every partition descriptor
+        # (InputPartition(json.dumps(descriptor))). read_table rows carry native
+        # Decimal / bytes, which json cannot encode, so get_partitions must emit a
+        # JSON-safe descriptor and read_partition must reconstruct the exact values.
+        # The other embedded tests use int/str rows and so never crossed this boundary.
+        connector = self._partitioned_connector()
+        start = {"phase": "stream", "commit_lsn": "5"}
+        row = {"id": 1, "amount": Decimal("10.50"), "blob": b"\x00\xffdata"}
+        with mock.patch.object(
+            connector,
+            "read_table",
+            return_value=(iter([dict(row)]), {"phase": "stream", "commit_lsn": "6"}),
+        ):
+            connector.latest_offset("app.orders", {}, start)
+            partitions = connector.get_partitions(
+                "app.orders", {}, start, {"phase": "stream", "commit_lsn": "6"}
+            )
+        # The framework serializes the descriptor with json.dumps; it must not raise.
+        wire = json.dumps(partitions[0])
+        restored = json.loads(wire)
+        served = list(connector.read_partition("app.orders", restored, {}))
+        self.assertEqual(served, [row])
+        self.assertIsInstance(served[0]["amount"], Decimal)
+        self.assertEqual(served[0]["blob"], b"\x00\xffdata")
+
+    def test_partitioned_requires_shared_cdc_session(self):
+        # F2/F4: partitioned mode recomputes an embedded CDC microbatch from its committed
+        # start on a Spark replay, which is only deterministic with the shared CDC session
+        # on. stream.partitioned is on by DEFAULT, so any shared-off config -- whether
+        # partitioned is set explicitly or left defaulted -- fails fast at construction
+        # (no silent fallback). Construct directly to bypass the base helper, which pins
+        # both options off.
+        base = {
+            "database": "demo",
+            "snapshot.staging.location": self._shared_state.name,
+            "lakebase.password": "test-state-password",
+        }
+        # Explicit partitioned=true + shared off -> raises with an explanatory message.
+        with self.assertRaises(ValueError) as ctx:
+            InformixLakeflowConnect(
+                {**base, "stream.partitioned": "true", "cdc.shared.session": "false"}
+            )
+        message = str(ctx.exception)
+        self.assertIn("stream.partitioned", message)
+        self.assertIn("cdc.shared.session", message)
+        # DEFAULTED partitioned (on) + explicit shared off -> ALSO raises (always-throw).
+        with self.assertRaises(ValueError):
+            InformixLakeflowConnect({**base, "cdc.shared.session": "false"})
+        # Safe combinations construct fine.
+        InformixLakeflowConnect(
+            {**base, "stream.partitioned": "false", "cdc.shared.session": "false"}
+        )
+        InformixLakeflowConnect(
+            {**base, "stream.partitioned": "true", "cdc.shared.session": "true"}
+        )
+        InformixLakeflowConnect(base)  # both default on -> valid
+
+    def test_partitioned_malformed_snapshot_offset_falls_back_to_embedded(self):
+        # F5: a snapshot-phase offset carrying a page_index but no snapshot_lsn must
+        # degrade to the embedded path (any doubt -> None), never raise out of
+        # latest_offset / get_partitions.
+        connector = self._partitioned_connector()
+        bad = {"phase": "snapshot", "schema_id": "s1", "snapshot": {"page_index": 0}}
+        with mock.patch.object(
+            connector,
+            "read_table",
+            return_value=(iter([{"id": 1}]), {"phase": "snapshot", "commit_lsn": "1"}),
+        ) as read_table:
+            end = connector.latest_offset("app.orders", {}, bad)
+        self.assertEqual(end, {"phase": "snapshot", "commit_lsn": "1"})
+        read_table.assert_called_once()
+
+    def test_partitioned_embedded_cache_stays_bounded(self):
+        # F6: repeated latest_offset calls that Spark never follows with get_partitions
+        # (speculative discovery, empty batches) must not accumulate driver cache
+        # entries -- only the latest microbatch is retained.
+        connector = self._partitioned_connector()
+        with mock.patch.object(
+            connector,
+            "read_table",
+            side_effect=lambda name, start, opts: (
+                iter([{"id": 1}]),
+                {"phase": "stream", "commit_lsn": str(int(start.get("commit_lsn", "0")) + 1)},
+            ),
+        ):
+            for lsn in ("1", "2", "3"):
+                connector.latest_offset("app.orders", {}, {"phase": "stream", "commit_lsn": lsn})
+        self.assertLessEqual(len(connector._partition_embedded_rows), 1)
 
     def test_a_staged_snapshot_with_pages_remaining_records_a_backlog_streak(self):
         # The staged (blocking) snapshot knows its remaining page count exactly, so
@@ -8505,6 +8608,7 @@ class IncrementalSnapshotTests(unittest.TestCase):
                 # tests inject a bridge directly and must not start a daemon reader.
                 "cdc.shared.session": "false",
                 "snapshot.shared.session": "false",
+                "stream.partitioned": "false",
                 **options,
             }
         )
@@ -9461,6 +9565,7 @@ class SnapshotReconnectTests(unittest.TestCase):
                 # Inject the bridge directly; keep the daemon readers off.
                 "cdc.shared.session": "false",
                 "snapshot.shared.session": "false",
+                "stream.partitioned": "false",
                 **options,
             }
         )
@@ -9609,6 +9714,7 @@ class LakebaseStateReconnectTests(unittest.TestCase):
                 "lakebase.password": "test-state-password",
                 "cdc.shared.session": "false",
                 "snapshot.shared.session": "false",
+                "stream.partitioned": "false",
             }
         )
         connector.set_registration_scope(hashlib.sha256(b"lakebase-reconnect").hexdigest()[:32])
@@ -10064,6 +10170,9 @@ class SharedCdcOptionTests(unittest.TestCase):
                 "database": "demo",
                 "snapshot.staging.location": self._shared_state.name,
                 "lakebase.password": "test-state-password",
+                # Shared-off tests override cdc.shared.session; pin partitioned off so
+                # that override does not trip the partitioned + shared-off guard.
+                "stream.partitioned": "false",
                 **options,
             }
         )
@@ -10282,6 +10391,9 @@ class SnapshotFairnessOptionTests(unittest.TestCase):
                 "database": "demo",
                 "snapshot.staging.location": self._shared_state.name,
                 "lakebase.password": "test-state-password",
+                # Shared-off tests override cdc.shared.session; pin partitioned off so
+                # that override does not trip the partitioned + shared-off guard.
+                "stream.partitioned": "false",
                 **options,
             }
         )
@@ -10677,6 +10789,7 @@ class SnapshotDrainMarkerTests(unittest.TestCase):
                 "lakebase.password": "test-state-password",
                 "snapshot.mode": "initial",
                 "cdc.shared.session": "false",
+                "stream.partitioned": "false",
                 # Model A by default here; the shared-mode marker test overrides this.
                 "snapshot.shared.session": "false",
                 **options,
@@ -10952,6 +11065,7 @@ class SnapshotDaemonSeamTests(unittest.TestCase):
             "lakebase.password": "test-state-password",
             "snapshot.mode": "initial",
             "cdc.shared.session": "false",
+            "stream.partitioned": "false",
             **extra,
         }
 
@@ -11084,6 +11198,7 @@ class SnapshotIsolationOptionTests(unittest.TestCase):
                 "snapshot.mode": "initial",
                 "snapshot.shared.session": "false",
                 "cdc.shared.session": "false",
+                "stream.partitioned": "false",
                 **options,
             }
         )
