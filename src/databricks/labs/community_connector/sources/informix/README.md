@@ -95,7 +95,7 @@ replicated — run a full refresh if the destination must match the source exact
 | `table.exclude.list` | No | none | Comma-separated shell-style patterns excluded after inclusion filtering. |
 | `decimal.variable.type` | No | `decimal(38,18)` | Per-table option. Target Spark type for variable-scale `DECIMAL(p)`/`NUMERIC(p)` columns: `string`, `double`, `integer` (truncated), or `decimal(p,s)`. Explicit `DECIMAL(p,s)` remains fixed-scale. See [Variable-scale decimals](#variable-scale-decimals). |
 | `decimal.variable.column.type` | No | none | Per-table option. Comma-separated `column:type` overrides of `decimal.variable.type` for specific columns, e.g. `agt_no:decimal(9,0),bnk_acct_no:string`. |
-| `snapshot.mode` | No | `incremental` | Per-table snapshot policy: `incremental`, `initial`, `initial_only`, `cdc_only`, `auto_snapshot`, or `recovery`. See [Snapshot modes](#snapshot-modes). |
+| `snapshot.mode` | No | `incremental` | Per-table snapshot policy: `incremental`, `initial`, `initial_only`, `cdc_only`, `auto_snapshot`, `recovery`, or `handoff`. See [Snapshot modes](#snapshot-modes). |
 | `snapshot.page.size` | No | `20000` | Rows per page for **keyed** tables — keyset-paged incremental chunks and the keyed blocking `initial` snapshot; minimum `1`. Pages are read under one repeatable-read transaction and delivered through checkpointed Lakeflow microbatches. A keyless `initial` snapshot uses `keyless.snapshot.page.size` instead. |
 | `keyless.snapshot.page.size` | No | `50000` | Rows per immutable staged Volume page for a **keyless** `initial` snapshot (an append-only keyless table with `snapshot.mode=initial`); minimum `1`. Such a table drains positionally (no seek cursor), so a larger page means fewer manifest entries and round trips for the same rows. A per-page byte ceiling still applies, and `snapshot.max.rows`/`snapshot.max.bytes` cap the whole drain. |
 | `snapshot.filter` | No | none | Per-table Informix SQL predicate appended to snapshot `SELECT` statements, without the `WHERE` keyword. It filters blocking, incremental, append-only initial, and snapshot-only copies. CDC events after the snapshot are not filtered. Semicolons, SQL comments, control characters, and predicates longer than 8,192 characters are rejected. |
@@ -626,6 +626,7 @@ progress and are rejected.
 | `cdc_only` | Do not copy existing rows. Enable full-row logging, record the current schema and LSN, and stream only transactions after that boundary. It requires CDC-supported column types; keyless tables use append-only ingestion. |
 | `auto_snapshot` | Behave like `incremental`, but automatically begin a new PK-chunked snapshot if the checkpoint's restart LSN has fallen out of the retained Informix logical logs. CDC begins immediately at the new deterministic boundary while existing rows are copied in chunks; the independently checkpointed delete reader adopts the same boundary. Other checkpoint or schema errors still fail closed. |
 | `recovery` | Rebuild missing immutable schema-history state from an existing stream checkpoint, then resume CDC without copying table data. It is accepted only when the current source schema fingerprint exactly matches the checkpoint and the checkpoint LSN is still retained. If either condition is false, run a full refresh. Do not use this mode to accommodate a real schema change. |
+| `handoff` | Carry a table's CDC position across a **new flow** — an SCD1→append-only switch or a destination relocation — so it resumes streaming instead of re-snapshotting. Handoff records a checkpoint, emits no rows, and stops; it never streams. Run in two triggered steps: on the old flow it parks the current stream offset in Lakebase and stops; on the new flow (fresh checkpoint) it seeds from that parked offset and stops. Removing `snapshot.mode=handoff` afterward (Restore) resumes streaming from the recorded position. The seam is exact — `_recover`'s strict `commit_lsn >` filter means no change is dropped or double-counted at the boundary. See [Handoff: switching or relocating without a re-snapshot](#handoff-switching-or-relocating-without-a-re-snapshot). |
 
 For example, to start CDC at the current source position without ingesting
 existing rows:
@@ -643,6 +644,139 @@ existing rows:
 Changing `snapshot.mode` does not erase a checkpoint. Use a pipeline full
 refresh when deliberately replacing existing destination contents or when
 forcing a fresh snapshot of a table that already has a checkpoint.
+
+#### Handoff: switching or relocating without a re-snapshot
+
+Two changes normally force a table to be re-snapshotted from scratch, because each
+one gives the table a **new Lakeflow flow with an empty checkpoint**:
+
+- **Changing `scd_type`** between a keyed merge (`SCD_TYPE_1`/`SCD_TYPE_2`) and
+  `APPEND_ONLY` — the pipeline swaps a merge flow for an append flow.
+- **Moving a table's destination** to a different catalog or schema — a new
+  destination name is a new streaming table and flow.
+
+`snapshot.mode=handoff` lets the table keep its place in the change stream across
+that switch instead of re-reading it. Every handoff run **records a checkpoint,
+emits no rows, and stops** — it never streams. The first run parks the table's
+current CDC position in the connector's Lakebase state (keyed by the **source**
+table, so it survives any destination or flow change); the second seeds the new flow
+from that parked position and stops. Removing `snapshot.mode=handoff` afterward (the
+**Restore** step) is what resumes streaming, now from the recorded position. The
+boundary is exact — no change is dropped or duplicated at the seam — and no snapshot
+is re-read.
+
+The runbook differs slightly for the two cases. In both, "run the pipeline" means a
+normal triggered update, and every edit is to the table's `table_configuration` in
+your pipeline spec.
+
+##### Case 1 — switch `scd_type` (e.g. SCD Type 1 → append-only)
+
+1. **Capture.** On the existing (keyed) configuration, add `snapshot.mode: handoff`
+   and run the pipeline. The table parks its CDC position and stops. Make this the
+   **last** run before the switch — a normal run in between moves the table past the
+   parked position. (Re-running the capture step itself is safe.)
+
+   ```json
+   {
+     "source_table": "orders",
+     "table_configuration": {
+       "qualified_source_table": "informix.orders",
+       "snapshot.mode": "handoff"
+     }
+   }
+   ```
+
+2. **Cutover.** Change `scd_type` to `APPEND_ONLY` and add
+   `append.only.ingestion: true` (required so a **keyed** table is streamed as
+   append rather than re-snapshotted), keeping `snapshot.mode: handoff`. Run the
+   pipeline. The append flow records the parked position as its checkpoint and stops —
+   no re-snapshot, no rows yet. (Restoring in step 3 resumes streaming from there.)
+
+   ```json
+   {
+     "source_table": "orders",
+     "table_configuration": {
+       "qualified_source_table": "informix.orders",
+       "scd_type": "APPEND_ONLY",
+       "append.only.ingestion": "true",
+       "snapshot.mode": "handoff"
+     }
+   }
+   ```
+
+3. **Restore.** Remove `snapshot.mode: handoff` (or set it to `cdc_only`) and run
+   normally from then on. This run resumes streaming from the recorded checkpoint,
+   and clearing the mode also lets a future full refresh rebuild the table normally.
+
+Because the destination table is unchanged, its existing rows stay in place and the
+append stream simply continues on top of them.
+
+##### Case 2 — migrate the destination to a new catalog/schema
+
+1. **Capture.** Same as Case 1, step 1: add `snapshot.mode: handoff` on the current
+   configuration and run the pipeline once to park the position.
+
+2. **Backfill the new table.** `handoff` resumes the *stream* position but does not
+   copy existing rows, so a brand-new destination would otherwise contain only
+   changes after the switch. Copy the current table into the new location first
+   (for example `CREATE TABLE new_catalog.new_schema.orders DEEP CLONE
+   old_catalog.old_schema.orders`, or a one-time backfill flow). Do this after the
+   capture run so the copy matches the parked position.
+
+3. **Cutover.** Point the table at the new catalog/schema and add
+   `snapshot.mode: handoff`, then run the pipeline. The flow for the new destination
+   records the parked position as its checkpoint and stops — no re-snapshot, no rows
+   yet.
+
+4. **Restore.** Remove `snapshot.mode: handoff` and run normally. This run resumes
+   streaming, appending new changes onto the backfilled rows.
+
+##### Notes and safeguards
+
+- **Capturing a table that is still snapshotting.** You do not have to wait for a
+  table to finish its initial load before capturing — either snapshot strategy can be
+  handed off mid-flight, and neither triggers a *second* snapshot.
+  - **Incremental** (the default: a primary-key-chunked copy interleaved with CDC) is
+    already a stream-phase position, so capture parks it directly; after Restore the new
+    flow **continues the copy from its cursor**, re-reading nothing and copying only the
+    remaining rows.
+  - **Blocking `initial`** (`snapshot.mode=initial`, a single bulk read) parks its
+    mid-serve position too. Its staged pages are carried **by reference**: the cutover
+    records the capturing flow's scope on the offset (`stage_scope`) so the new flow
+    reads those already-staged pages **in place** — no copy — finishes the snapshot from
+    the parked page, then streams under its own scope. Because the pages are referenced,
+    the cutover must happen within `snapshot.staging.retention.days` (the age-based sweep
+    reclaims abandoned staging); a longer gap reclaims the pages and forces a re-snapshot.
+- **Keep the two runs close together.** The parked position must still be within
+  Informix's retained logical logs at cutover; a long gap risks it aging out.
+- **Fail-closed when there is nothing to hand off.** Handoff never snapshots, so if a
+  run finds an empty checkpoint with no parked token it stops with an explanatory error
+  rather than silently starting a snapshot. This covers both a cutover whose capture was
+  never run (or was already consumed) and a capture applied to a flow that has not yet
+  reached a hand-off-able position (steady-state streaming, an in-flight incremental
+  copy, or a mid-serve snapshot). Run the flow without `snapshot.mode=handoff` until it
+  is streaming (or mid initial snapshot), then apply handoff — for an `scd_type` switch,
+  capture before you change `scd_type`.
+- **Fail-closed on a schema change.** The parked position is tagged with the source
+  schema at capture time. If the source table's schema changes between capture and
+  cutover, the cutover stops with an explanatory error instead of resuming at a
+  position that no longer aligns with the current columns. Re-run the capture step
+  against the current schema, or start fresh (`cdc_only`/`initial`).
+- **Deletes are carried across the seam.** For a relocation that keeps a keyed
+  `scd_type` (a table with a delete channel), the delete reader's position is handed
+  off on its own channel alongside the upsert position, so deletes are resumed at
+  exactly the parked point — none are dropped or double-applied at the boundary. (An
+  `scd_type` switch to append-only has no delete channel, so this does not apply.)
+- **Relocation baseline.** For a destination move, `handoff` resumes the read
+  position but does not re-emit rows already written to the old destination, so the
+  portion emitted before cutover — a mid-incremental prefix, or the snapshot pages a
+  blocking `initial` serve had already delivered — must still be backfilled into the new
+  table (Case 2, step 2). The remaining, not-yet-served blocking-snapshot pages are
+  finished into the new destination automatically (by reference; see the note above).
+  An `scd_type` switch reuses the same table and needs no backfill.
+- **Alternatives to handoff.** To start a table fresh instead of preserving its
+  position, skip `handoff` and use `snapshot.mode=cdc_only` (stream new changes
+  only, no history) or `snapshot.mode=initial` (a full one-time snapshot).
 
 #### Incremental snapshot and append-only targets
 

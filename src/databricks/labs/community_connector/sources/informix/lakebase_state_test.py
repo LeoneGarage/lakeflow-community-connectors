@@ -119,6 +119,15 @@ class _FakeCursor:
         if "SELECT table_name, lsn FROM backlog_hints" in text:
             self._read_hints(args, text)
             return
+        if "INSERT INTO cdc_handoff" in text:
+            self._put_handoff(args)
+            return
+        if "FROM cdc_handoff" in text and text.startswith("SELECT"):
+            self._get_handoff(args)
+            return
+        if text.startswith("DELETE FROM cdc_handoff"):
+            self._delete_handoff(args)
+            return
         if "INSERT INTO conn_limits" in text:
             self._write_limit(args)
             return
@@ -411,6 +420,28 @@ class _FakeCursor:
                 and (not fresh_only or now - row["updated_at"] < float(args["max_age"]))
             ]
 
+    # -- cdc_handoff --------------------------------------------------------
+
+    def _put_handoff(self, args: dict) -> None:
+        key = (args["namespace"], args["table_key"], int(args["channel"]))
+        with self._database.lock:
+            self._database.handoff[key] = {
+                "offset_json": args["offset_json"],
+                "schema_fp": args["schema_fp"],
+            }
+
+    def _get_handoff(self, args: dict) -> None:
+        key = (args["namespace"], args["table_key"], int(args["channel"]))
+        with self._database.lock:
+            row = self._database.handoff.get(key)
+            if row is not None:
+                self._result = [(row["offset_json"], row["schema_fp"])]
+
+    def _delete_handoff(self, args: dict) -> None:
+        key = (args["namespace"], args["table_key"], int(args["channel"]))
+        with self._database.lock:
+            self._database.handoff.pop(key, None)
+
     # -- conn_limits --------------------------------------------------------
 
     def _write_limit(self, args: dict) -> None:
@@ -550,6 +581,8 @@ class _FakeDatabase:
         self.hints: dict[tuple[str, str], dict] = {}
         self.limits: dict[str, dict] = {}
         self.records: dict[tuple[str, str], str] = {}
+        # Checkpoint-handoff tokens, keyed (namespace, table_key, channel).
+        self.handoff: dict[tuple[str, str, int], dict] = {}
         # Postgres roles, so password provisioning and validation are testable
         # without a live endpoint.
         self.roles: dict[str, dict] = {}
