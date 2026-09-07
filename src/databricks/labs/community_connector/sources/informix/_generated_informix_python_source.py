@@ -10917,6 +10917,19 @@ def register_lakeflow_source(spark):
                         # After Restore (mode no longer handoff) the stage_scope guard inside
                         # _cleanup_previous_update_scopes protects it until the serve completes.
                         self._cleanup_previous_update_scopes(table, effective_start)
+                        if effective_start.get("handoff_seeded"):
+                            # First post-Restore read still carrying the marker: drop any token
+                            # the cutover run left behind (see _drop_orphaned_handoff_tokens).
+                            # The upsert channel always; the delete channel too when this is an
+                            # append flow, which has no delete reader to drop it.
+                            channels = [_HANDOFF_CHANNEL_UPSERT]
+                            if self._append_only_table(table, table_options):
+                                channels.append(_HANDOFF_CHANNEL_DELETE)
+                            self._drop_orphaned_handoff_tokens(table, channels)
+                            # Strip the marker so this is one-shot: nothing post-Restore reads
+                            # it, and a quiet (no-advance) read would otherwise return it and
+                            # re-drop every poll until the stream advances off it.
+                            effective_start.pop("handoff_seeded", None)
                     self._touch_table_state(table)
                     self._maybe_sweep_stale_snapshot_stages(table)
                     _ensure_materializable(table, table_options)
@@ -11445,6 +11458,16 @@ def register_lakeflow_source(spark):
 
             try:
                 try:
+                    if snapshot_mode != "handoff" and effective_start.get("handoff_seeded"):
+                        # First post-Restore delete read still carrying the marker: drop the
+                        # delete-channel token the cutover left behind, one-shot and best-effort
+                        # (see _drop_orphaned_handoff_tokens).
+                        self._drop_orphaned_handoff_tokens(
+                            self._table(table_name, table_options), [_HANDOFF_CHANNEL_DELETE]
+                        )
+                        effective_start.pop(
+                            "handoff_seeded", None
+                        )  # one-shot (see _read_table_attempt)
                     if snapshot_mode == "handoff":
                         # Capture parks the delete position and freezes; cutover seeds from it
                         # (keyed relocation keeps the delete channel) or, for the SCD1->append
@@ -12548,6 +12571,31 @@ def register_lakeflow_source(spark):
                 lambda: delete_cdc_handoff(self._lakebase_connection(), namespace, table_key, channel),
                 operation="handoff token delete",
             )
+
+        def _drop_orphaned_handoff_tokens(self, table: Table, channels: list[int]) -> None:
+            """Best-effort, one-shot drop of a handoff token left behind after Restore.
+
+            The committed seed drops the token from inside ``_read_handoff`` /
+            ``_read_handoff_deletes`` -- but only while ``snapshot.mode=handoff`` is still set.
+            If a cutover run committed the seed without a later same-mode read to consume it
+            (and Restore then removed the mode, so reads no longer enter those methods), the
+            token would linger: it has no TTL, and a *future* cutover of the same table could
+            adopt it. So when a post-Restore read still carries the ``handoff_seeded`` marker,
+            drop the token here. This is one-shot -- the marker is not carried onto this read's
+            output offset -- and best-effort: a lingering token never justifies failing a read.
+            """
+
+            for channel in channels:
+                try:
+                    self._delete_handoff_token(table, channel)
+                except Exception:  # pylint: disable=broad-except
+                    logging.getLogger(__name__).warning(
+                        "Best-effort cleanup of a lingering handoff token for '%s' (channel %s) "
+                        "failed; it will be retried on a later read",
+                        table.exposed_name,
+                        channel,
+                        exc_info=True,
+                    )
 
         def _handoff_seed_from_token(self, table: Table, token: dict[str, str]) -> dict:
             """Build the seed offset from a parked token, failing closed on schema drift.

@@ -5772,6 +5772,43 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(len(self._lakebase.database.handoff), 1)
 
+    def test_restore_drops_a_handoff_token_the_cutover_left_behind(self):
+        # Belt-and-suspenders: if a cutover committed the seed without a later same-mode
+        # read to drop the token, the first post-Restore read (still carrying
+        # handoff_seeded) must drop it -- otherwise it lingers (no TTL) and a future cutover
+        # could adopt it. One-shot: the marker is not carried onto the output offset.
+        bridge = FakeBridge()
+        # Capture parks the upsert token.
+        self.connector(bridge).read_table(
+            "app.orders", _stream_offset(125), {"snapshot.mode": "handoff"}
+        )
+        self.assertEqual(len(self._lakebase.database.handoff), 1)
+
+        # Orphan scenario: a committed seed offset that still carries the marker, read
+        # AFTER Restore (no snapshot.mode=handoff).
+        seed = dict(_stream_offset(125))
+        seed["handoff_seeded"] = True
+        _, offset = self.connector(bridge).read_table("app.orders", seed, {})
+
+        self.assertEqual(self._lakebase.database.handoff, {})  # lingering token dropped
+        self.assertNotIn("handoff_seeded", offset)  # one-shot: marker not carried forward
+
+    def test_restore_drops_a_delete_channel_handoff_token_left_behind(self):
+        # Same as above for the independently checkpointed delete channel (channel 1).
+        bridge = FakeBridge()
+        self.connector(bridge).read_table_deletes(
+            "app.orders", _stream_offset(125), {"snapshot.mode": "handoff"}
+        )
+        self.assertEqual(len(self._lakebase.database.handoff), 1)
+        (_, _, channel), _token = next(iter(self._lakebase.database.handoff.items()))
+        self.assertEqual(channel, 1)
+
+        seed = dict(_stream_offset(125))
+        seed["handoff_seeded"] = True
+        self.connector(bridge).read_table_deletes("app.orders", seed, {})
+
+        self.assertEqual(self._lakebase.database.handoff, {})  # delete-channel token dropped
+
     def test_handoff_requires_a_cdc_capable_table(self):
         bridge = FakeBridge()
         bridge.tables = [_table(cdc=False)]
