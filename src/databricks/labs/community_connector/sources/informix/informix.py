@@ -5492,21 +5492,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     # table follows the identical CDC path from here on.
                     if effective_start and effective_start.get("phase") == "stream":
                         if migration:
-                            # Migration cutover, seed committed: migration never streams. Drop
-                            # the now-consumed token(s) and stop -- record the checkpoint,
-                            # emit no rows. Streaming resumes only once the operator clears
-                            # table.migration (Restore), when this same committed offset takes
-                            # the streaming branches below. Dropping the token is crash-safe:
-                            # a crash before the seed committed re-seeds from the still-present
-                            # token, and a later full refresh under table.migration then finds
-                            # no token and fails closed rather than silently re-seeding. The
-                            # delete-channel token is dropped too -- an append flow has no
-                            # delete reader to consume the position parked while the table was
-                            # still SCD1. The marker is kept on the outgoing offset so a later
-                            # steady-state read stays a stop.
-                            self._delete_handoff_token(table)
-                            self._delete_handoff_token(table, _HANDOFF_CHANNEL_DELETE)
-                            result = (iter(()), dict(effective_start))
+                            result = self._append_migration_record_and_stop(table, effective_start)
                         # After Restore, a handoff seed can carry an in-flight incremental
                         # copy (phase=="stream" with an "incremental" block, only ever from a
                         # keyed capture that was mid-copy); continue the copy from its cursor
@@ -7133,6 +7119,35 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             lambda: delete_cdc_handoff(self._lakebase_connection(), namespace, table_key, channel),
             operation="handoff token delete",
         )
+
+    def _append_migration_record_and_stop(
+        self, table: Table, effective_start: dict
+    ) -> tuple[Iterator[dict], dict]:
+        """Record-and-stop for an append flow at stream phase under table.migration.
+
+        Migration never streams, so emit no rows and return the same offset. Capture and
+        the committed cutover seed are told apart by ``handoff_seeded`` exactly as on the
+        keyed path in :meth:`_read_handoff`:
+
+        * **Capture** (no marker) -- this append flow is the *source* of a relocation (an
+          already-append table moving destination), so park its current stream offset for
+          the new flow to seed from. Append has no delete channel, so only the upsert
+          offset is parked.
+        * **Cutover, seed committed** (marker present) -- drop the now-consumed token(s).
+          Crash-safe: a crash before the seed committed re-seeds from the still-present
+          token, and a later full refresh under table.migration then finds no token and
+          fails closed rather than silently re-seeding. The delete-channel token is dropped
+          too: an SCD1->append switch parked one while the table was still keyed, and an
+          append flow has no delete reader to consume it. The marker is kept on the
+          outgoing offset so a later steady-state read stays a stop.
+        """
+
+        if effective_start.get("handoff_seeded"):
+            self._delete_handoff_token(table)
+            self._delete_handoff_token(table, _HANDOFF_CHANNEL_DELETE)
+        else:
+            self._write_handoff_token(table, effective_start)
+        return iter(()), dict(effective_start)
 
     def _drop_orphaned_handoff_tokens(self, table: Table, channels: list[int]) -> None:
         """Best-effort, one-shot drop of a handoff token left behind after Restore.
