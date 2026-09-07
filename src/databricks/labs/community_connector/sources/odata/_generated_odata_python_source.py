@@ -8404,6 +8404,98 @@ def register_lakeflow_source(spark):
     # rarely emitted on those, and we shouldn't trust it if it is).
     _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 
+    # Status codes the connector never lets ``retry_extra_errors`` retry: each
+    # has dedicated non-terminal handling elsewhere that an outer retry would
+    # defeat. 404/410 drive the contained-expand walk's vanished-parent recovery
+    # (``_recover_expand_item`` / ``_is_vanished_error``), which needs them to
+    # surface as an ``HTTPError`` rather than be retried-then-RuntimeError'd.
+    _RETRY_EXTRA_FORBIDDEN_CODES = frozenset({404, 410})
+
+
+    def _parse_retry_extra_errors(raw: str | None) -> list[tuple[int, str | None]]:
+        """Parse the ``retry_extra_errors`` connection option into
+        ``(status_code, signature_or_None)`` rules.
+
+        Some OData services (e.g. Hexagon SCApi under load) intermittently fail a
+        well-formed request with a spurious 4xx that succeeds on replay. This
+        option lets an operator opt specific such errors into the same
+        retry/backoff path the built-in transient statuses use, WITHOUT the
+        connector hard-coding any source-specific signatures. Two forms:
+
+        * **CSV of status codes** — ``"400,403"``: retry any response with one of
+          these statuses, whatever the body.
+        * **JSON** — an array (or single object) of ``{"code": <int>,
+          "signature": <optional substring>}``: retry when the status matches AND
+          (if given) the ``signature`` occurs case-insensitively in the response
+          body. A bare int in the array is a code with no signature. Rules are
+          OR-ed. Example (the two Hexagon 400 shapes, matched narrowly)::
+
+            [{"code": 400, "signature": "context url"},
+             {"code": 400, "signature": "specified argument was out of the range"}]
+
+        Empty/unset → ``[]`` (no extra retries; 400/403 stay terminal). Codes
+        must be integers in 400–599 and not in
+        :data:`_RETRY_EXTRA_FORBIDDEN_CODES`. Any parse/validation problem raises
+        a ``ValueError`` naming the option, so a typo fails the read up front
+        rather than silently disabling the retry.
+        """
+        raw = (raw or "").strip()
+        if not raw:
+            return []
+
+        def _rule(code, signature) -> tuple[int, str | None]:
+            if isinstance(code, bool) or not isinstance(code, int):
+                raise ValueError(f"Invalid retry_extra_errors: status code {code!r} is not an integer.")
+            if not 400 <= code <= 599 or code in _RETRY_EXTRA_FORBIDDEN_CODES:
+                raise ValueError(
+                    f"Invalid retry_extra_errors: status code {code} is not retryable "
+                    f"(expected 400–599, excluding {sorted(_RETRY_EXTRA_FORBIDDEN_CODES)} "
+                    f"which drive contained-walk vanished-parent recovery)."
+                )
+            if signature is not None and not isinstance(signature, str):
+                raise ValueError(
+                    f"Invalid retry_extra_errors: signature {signature!r} for code "
+                    f"{code} is not a string."
+                )
+            sig = (
+                signature.strip().lower() if isinstance(signature, str) and signature.strip() else None
+            )
+            return code, sig
+
+        rules: list[tuple[int, str | None]] = []
+        if raw[0] in "[{":
+            try:
+                data = json.loads(raw)
+            except ValueError as exc:
+                raise ValueError(f"Invalid retry_extra_errors: not valid JSON ({exc}).") from None
+            entries = data if isinstance(data, list) else [data]
+            for entry in entries:
+                if isinstance(entry, int) and not isinstance(entry, bool):
+                    rules.append(_rule(entry, None))
+                elif isinstance(entry, dict):
+                    rules.append(_rule(entry.get("code"), entry.get("signature")))
+                else:
+                    raise ValueError(
+                        f"Invalid retry_extra_errors: entry {entry!r} is neither a status "
+                        f"code nor a {{'code', 'signature'}} object."
+                    )
+        else:
+            for tok in raw.split(","):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                try:
+                    code = int(tok)
+                except ValueError:
+                    raise ValueError(
+                        f"Invalid retry_extra_errors: {tok!r} is not a status code. Use a "
+                        f"comma-separated list of codes (e.g. '400,403') or a JSON array of "
+                        f"{{'code', 'signature'}} objects."
+                    ) from None
+                rules.append(_rule(code, None))
+        return rules
+
+
     # Cap on manually-followed same-origin redirects per request (redirect-loop
     # guard). Off-origin redirects never count — they raise immediately.
     _MAX_SAME_ORIGIN_REDIRECTS = 5
@@ -9170,6 +9262,15 @@ def register_lakeflow_source(spark):
             # than this (some misbehaving servers emit hour-long values).
             self.max_retries = _parse_conn_int(options, "max_retries", "5", 0)
             self.retry_max_delay_seconds = _parse_conn_int(options, "retry_max_delay_seconds", "60", 0)
+            # Operator-configured extra retryable errors, for a source that
+            # spuriously fails a well-formed request under load (e.g. Hexagon
+            # SCApi). Empty by default: only the built-in transient statuses
+            # (408/429/5xx + network) are retried and 400/403 stay terminal. When
+            # set, each matching response joins the same backoff/retry path. See
+            # ``_parse_retry_extra_errors`` for the CSV / JSON forms; the parse is
+            # eager so a typo fails the read up front. 404/410 are rejected there
+            # (they drive contained-walk vanished-parent recovery).
+            self._retry_extra_rules = _parse_retry_extra_errors(options.get("retry_extra_errors"))
             # Per-request diagnostic logging. Off by default — when on,
             # writes one INFO line per HTTP request (URL + status + body
             # snippet) to the module logger. The body snippet is the
@@ -11717,6 +11818,42 @@ def register_lakeflow_source(spark):
                     )
                     time.sleep(self._retry_after_delay(resp, attempt))
                     continue
+                # Operator-configured extra retryable errors (``retry_extra_errors``
+                # — off unless set, so this is a no-op by default and the built-in
+                # transient handling above is unchanged). A 401/403 reaches here
+                # only because ``_http_get_once`` returned it under a matching
+                # rule. No ``Retry-After`` on these, so pure exponential backoff;
+                # the identical request succeeds on a later attempt when the
+                # failure was a spurious under-load glitch.
+                if self._is_user_retryable(resp):
+                    if attempt >= self.max_retries:
+                        if resp.status_code in (401, 403):
+                            # Preserve the actionable auth remediation for an
+                            # auth error that never cleared (may be a genuine
+                            # permission gap the operator opted to retry).
+                            raise PermissionError(self._no_refresh_auth_error(resp, url))
+                        raise RuntimeError(
+                            f"OData service returned {resp.status_code} for {url!r} "
+                            f"on every attempt ({attempt + 1}). It matched a "
+                            f"'retry_extra_errors' rule (an operator-configured "
+                            f"transient error for a source that flakes under load) "
+                            f"but did not clear within the retry budget. Raise "
+                            f"'max_retries' (current: {self.max_retries}) or reduce "
+                            f"read concurrency via 'num_partitions' if the source "
+                            f"is overloaded; if it never clears, the error is not "
+                            f"actually transient — drop it from 'retry_extra_errors'. "
+                            f"Server response: {_truncate(resp.text, 300)}"
+                        )
+                    _LOG.warning(
+                        "OData %d on %s %s matched retry_extra_errors — retrying (%d/%d)",
+                        resp.status_code,
+                        method,
+                        url,
+                        attempt + 1,
+                        self.max_retries,
+                    )
+                    time.sleep(self._backoff_delay(attempt))
+                    continue
                 return resp
             # Defensive: the loop always returns or raises before exiting.
             raise RuntimeError(  # pragma: no cover
@@ -11836,6 +11973,24 @@ def register_lakeflow_source(spark):
                 f"redirects starting from {url!r} — likely a redirect loop."
             )
 
+        def _is_user_retryable(self, resp: requests.Response) -> bool:
+            """True iff ``resp`` matches an operator-configured
+            ``retry_extra_errors`` rule (status, optionally + body signature).
+            Empty config → always ``False`` (built-in transient handling only)."""
+            if not self._retry_extra_rules:
+                return False
+            body: str | None = None
+            for code, sig in self._retry_extra_rules:
+                if resp.status_code != code:
+                    continue
+                if sig is None:
+                    return True
+                if body is None:
+                    body = (resp.text or "").lower()
+                if sig in body:
+                    return True
+            return False
+
         def _http_get_once(
             self, session: requests.Session, url: str, method: str = "GET", **kwargs: Any
         ) -> requests.Response:
@@ -11844,10 +11999,13 @@ def register_lakeflow_source(spark):
             Token refresh happens here only for connector-side OAuth
             (``auth_type=oauth2``): a known-expiry token is refreshed
             pre-emptively before the request, and a 401 with a usable grant
-            triggers one re-mint + retry. Every other auth mode — including the
-            UC-injected ``access_token`` path, where the COMMUNITY connection
-            layer owns refresh — treats 401/403 as terminal and surfaces the
-            per-auth-mode remediation."""
+            triggers one re-mint + retry. Otherwise a 401/403 is terminal —
+            including the UC-injected ``access_token`` path, where the COMMUNITY
+            connection layer owns refresh — and surfaces the per-auth-mode
+            remediation, EXCEPT that a 401/403 matching a ``retry_extra_errors``
+            rule is returned to ``_http_get`` so its backoff loop can retry it
+            (an operator opting a spuriously-failing source's auth error into
+            retry)."""
             self._require_same_origin(url)
             if self._should_preemptively_refresh():
                 session.headers["Authorization"] = f"Bearer {self._oauth2_token()}"
@@ -11877,6 +12035,8 @@ def register_lakeflow_source(spark):
                     )
                 return resp
             if resp.status_code in (401, 403):
+                if self._is_user_retryable(resp):
+                    return resp
                 raise PermissionError(self._no_refresh_auth_error(resp, url))
             return resp
 
