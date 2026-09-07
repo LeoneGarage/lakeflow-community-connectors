@@ -5809,6 +5809,34 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(self._lakebase.database.handoff, {})  # delete-channel token dropped
 
+    def test_restore_upsert_read_drops_an_orphaned_delete_token(self):
+        # A keyed table's delete-channel token (channel 1) is normally dropped by the delete
+        # reader -- but only when the delete offset carries handoff_seeded, which never
+        # happens if the cutover delete flow arrived with a non-empty checkpoint and
+        # re-parked instead of seeding. The token then lingers with no TTL. The first
+        # post-Restore UPSERT read (guaranteed to fire, carrying the marker) must drop BOTH
+        # channels so a keyed table's delete token cannot be orphaned. Regression: this read
+        # used to add the delete channel only for append-only tables, stranding channel-1
+        # tokens for keyed relocations whose delete flow never seeded from empty.
+        bridge = FakeBridge()
+        # Capture parks both the upsert (channel 0) and delete (channel 1) tokens.
+        self.connector(bridge).read_table(
+            "app.orders", _stream_offset(125), {"table.migration": "true"}
+        )
+        self.connector(bridge).read_table_deletes(
+            "app.orders", _stream_offset(125), {"table.migration": "true"}
+        )
+        self.assertEqual(sorted(ch for (_, _, ch) in self._lakebase.database.handoff), [0, 1])
+
+        # First post-Restore upsert read: the delete offset never got the marker, so the
+        # delete reader would never drop channel 1 -- the upsert read must clear both.
+        seed = dict(_stream_offset(125))
+        seed["handoff_seeded"] = True
+        _, offset = self.connector(bridge).read_table("app.orders", seed, {})
+
+        self.assertEqual(self._lakebase.database.handoff, {})  # both channels dropped
+        self.assertNotIn("handoff_seeded", offset)  # one-shot
+
     def test_handoff_requires_a_cdc_capable_table(self):
         bridge = FakeBridge()
         bridge.tables = [_table(cdc=False)]
