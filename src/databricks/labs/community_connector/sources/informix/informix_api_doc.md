@@ -359,7 +359,7 @@ and `snapshot.reader.threads`). Set `snapshot.drain.slot.liveness.enabled=false`
 the worker to a plain fixed deadline.
 
 The per-table `snapshot.mode` option supports `incremental` (default), `initial`,
-`initial_only`, `cdc_only`, `auto_snapshot`, `recovery`, and `handoff`. `initial`
+`initial_only`, `cdc_only`, `auto_snapshot`, and `recovery`. `initial`
 snapshots only without a checkpoint. `initial_only` completes snapshot pages but
 does not subsequently poll CDC. `cdc_only` publishes the current schema and LSN
 as a completed zero-row snapshot so both channels begin at the same future-only
@@ -374,9 +374,11 @@ checkpoint, request a Lakeflow full refresh for that update. `configuration_base
 rejected because they depend on external framework extensions that cannot preserve the Python
 connector's two-reader checkpoint protocol.
 
-`handoff` carries a table's CDC position across a *new* flow — an SCD1→append-only switch, or a
-destination relocation — so it resumes instead of re-snapshotting when the new flow starts with an
-empty Lakeflow checkpoint. It runs in two triggered steps. On the current (source) flow, capture
+The per-table `table.migration` option (default false; orthogonal to `snapshot.mode`, which the
+table keeps unchanged) carries a table's CDC position across a *new* flow — an SCD1→append-only
+switch, or a destination relocation — so it resumes instead of re-snapshotting when the new flow
+starts with an empty Lakeflow checkpoint. It runs in two triggered steps. On the current (source)
+flow, capture
 parks the reader's current offset in a Lakebase `cdc_handoff` row and returns an empty batch at the
 same offset, freezing the flow at exactly its committed position. Capture parks any stream-phase
 offset — steady-state CDC, or an in-flight `incremental` copy (phase `stream` with an `incremental`
@@ -394,14 +396,14 @@ run within `snapshot.staging.retention.days` before the age-based sweep reclaims
 no hand-off-able position — an empty offset with no parked token (the flow never reached streaming, an
 in-flight copy, or a mid-serve snapshot) — **fails closed** rather than starting a snapshot. Because
 the row is keyed by the source endpoint and table (never the destination or flow), it is visible to
-any later flow reading that table. Handoff **never streams and never snapshots**: on every read it
+any later flow reading that table. Migration **never streams and never snapshots**: on every read it
 records a checkpoint, emits no rows, and stops (or fails closed); streaming and finishing an in-flight
-snapshot resume only once the operator removes `snapshot.mode=handoff` (the "Restore" step), after
+snapshot resume only once the operator clears `table.migration` (the "Restore" step), after
 which the flow reads normally from the recorded checkpoint. On the new flow the empty checkpoint plus
-`snapshot.mode=handoff` seeds from the parked offset (no rows) and drops the token once Lakeflow
+`table.migration=true` seeds from the parked offset (no rows) and drops the token once Lakeflow
 commits the seed — so a crash before commit re-seeds rather than failing closed, while a later full
-refresh in `handoff` mode with no token fails closed with an explanatory error instead of silently
-re-snapshotting. Both cutover shapes record-and-stop
+refresh under `table.migration` with no token fails closed with an explanatory error instead of
+silently re-snapshotting. Both cutover shapes record-and-stop
 identically: an SCD1→append switch lands in `_read_append_only` (the ingestion type changed), while a
 destination relocation that keeps a keyed `scd_type` stays in `_read_handoff` — there capture and
 cutover share one method and are told apart by a `handoff_seeded` marker stamped on the seed offset.

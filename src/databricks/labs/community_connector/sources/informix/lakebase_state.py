@@ -1005,7 +1005,7 @@ _SCHEMA_STATEMENTS = (
     # derived from the source only, so it is visible to any flow reading that source
     # table regardless of destination or flow type. Mutable (re-capture overwrites) and
     # deletable (consumed once the new flow has committed the seed), unlike the
-    # write-once state_records. See snapshot.mode=handoff.
+    # write-once state_records. Populated by the table.migration option.
     """
     CREATE TABLE IF NOT EXISTS cdc_handoff (
         namespace   text        NOT NULL,

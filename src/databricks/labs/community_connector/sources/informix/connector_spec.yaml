@@ -459,19 +459,32 @@ connection:
       description: >
         Per-table snapshot policy, also accepted at connection scope as the
         default for every table. Supported values are `incremental` (default),
-        `initial`, `initial_only`, `cdc_only`, `auto_snapshot`, `recovery`, and
-        `handoff`. `incremental` copies existing rows in primary-key chunks
+        `initial`, `initial_only`, `cdc_only`, `auto_snapshot`, and `recovery`.
+        `incremental` copies existing rows in primary-key chunks
         interleaved with the change stream; `initial` takes a single blocking
         repeatable-read snapshot. `auto_snapshot` uses the incremental strategy and
         starts a new chunked copy when a checkpoint LSN is no longer retained.
-        `handoff` carries a table's CDC position across a new flow (an
-        SCD1->append-only switch or a destination relocation) so it resumes
-        streaming instead of re-snapshotting: run it once on the old flow to park
-        the stream offset in Lakebase and once on the new flow to seed from it.
         Keyless append-only tables default to `cdc_only` when this option is unset
-        and accept `cdc_only`, `initial`, or `handoff`; `initial` streams one
+        and accept `cdc_only` or `initial`; `initial` streams one
         unordered forward-only cursor into durable bounded pages before CDC.
-        The extension modes `configuration_based` and `custom` are not supported.
+        To move a table to a new flow without re-snapshotting, keep its snapshot.mode
+        and set `table.migration=true` instead (see that option). The extension modes
+        `configuration_based` and `custom` are not supported.
+
+    - name: table.migration
+      type: string
+      required: false
+      description: >
+        Per-table boolean, also accepted at connection scope; default false.
+        When true the table runs a two-run checkpoint handoff instead of its normal
+        read, so it can move to a new Lakeflow flow -- an SCD Type 1 to append-only
+        switch, or a destination relocation -- without re-snapshotting. It is
+        orthogonal to `snapshot.mode`, which the table keeps unchanged. Migration
+        never streams: every read records a checkpoint, emits no rows, and stops.
+        Run it once on the old flow to park the current stream (or mid-serve snapshot)
+        offset in Lakebase, then once on the new flow (fresh checkpoint) to seed from
+        that parked offset; clearing `table.migration` (Restore) resumes normal reads
+        from the recorded offset, gapless and duplicate-free. Accepts `true`/`false`.
 
     - name: snapshot.incremental.datetime.as.string
       type: string
@@ -1074,4 +1087,4 @@ connection:
 
 # Exact per-table overrides consumed by the connector. `qualified_source_table` maps a
 # pipeline table to a dynamically discovered exposed name (`owner.table`).
-external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index"
+external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
