@@ -10922,12 +10922,18 @@ def register_lakeflow_source(spark):
                         if effective_start.get("handoff_seeded"):
                             # First post-Restore read still carrying the marker: drop any token
                             # the cutover run left behind (see _drop_orphaned_handoff_tokens).
-                            # The upsert channel always; the delete channel too when this is an
-                            # append flow, which has no delete reader to drop it.
-                            channels = [_HANDOFF_CHANNEL_UPSERT]
-                            if self._append_only_table(table, table_options):
-                                channels.append(_HANDOFF_CHANNEL_DELETE)
-                            self._drop_orphaned_handoff_tokens(table, channels)
+                            # Both channels, unconditionally. Once table.migration is cleared the
+                            # delete reader can no longer seed from its token (that path is
+                            # migration-only), so a lingering delete token is always dead here.
+                            # The delete reader drops its own token only when its offset carries
+                            # the marker, which never happens if the cutover delete flow arrived
+                            # with a non-empty checkpoint (it re-parked instead of seeding), so
+                            # its token would otherwise be orphaned with no TTL. This upsert read
+                            # is guaranteed to fire post-Restore, so dropping both here is the
+                            # reliable one-shot.
+                            self._drop_orphaned_handoff_tokens(
+                                table, [_HANDOFF_CHANNEL_UPSERT, _HANDOFF_CHANNEL_DELETE]
+                            )
                             # Strip the marker so this is one-shot: nothing post-Restore reads
                             # it, and a quiet (no-advance) read would otherwise return it and
                             # re-drop every poll until the stream advances off it.
