@@ -359,7 +359,7 @@ and `snapshot.reader.threads`). Set `snapshot.drain.slot.liveness.enabled=false`
 the worker to a plain fixed deadline.
 
 The per-table `snapshot.mode` option supports `incremental` (default), `initial`,
-`initial_only`, `cdc_only`, `auto_snapshot`, and `recovery`. `initial`
+`initial_only`, `cdc_only`, `auto_snapshot`, `recovery`, and `handoff`. `initial`
 snapshots only without a checkpoint. `initial_only` completes snapshot pages but
 does not subsequently poll CDC. `cdc_only` publishes the current schema and LSN
 as a completed zero-row snapshot so both channels begin at the same future-only
@@ -373,6 +373,50 @@ as recoverable. To force a fresh snapshot of a table that already has a
 checkpoint, request a Lakeflow full refresh for that update. `configuration_based` and `custom` are
 rejected because they depend on external framework extensions that cannot preserve the Python
 connector's two-reader checkpoint protocol.
+
+`handoff` carries a table's CDC position across a *new* flow — an SCD1→append-only switch, or a
+destination relocation — so it resumes instead of re-snapshotting when the new flow starts with an
+empty Lakeflow checkpoint. It runs in two triggered steps. On the current (source) flow, capture
+parks the reader's current offset in a Lakebase `cdc_handoff` row and returns an empty batch at the
+same offset, freezing the flow at exactly its committed position. Capture parks any stream-phase
+offset — steady-state CDC, or an in-flight `incremental` copy (phase `stream` with an `incremental`
+block); the cutover continues an in-flight copy from its cursor via the ordinary incremental-resume
+path (`_rebound_incremental_block` recaptures only the bound, keeping `last_pk`), so an incremental
+snapshot need not finish before switching. A blocking `initial` snapshot parked mid bulk-read (phase
+`snapshot`) is also portable — **by reference**: its staged pages stay under the capturing flow's
+scope, and the cutover records that scope on the seed offset as `stage_scope`, so the new flow reads
+the already-staged pages **in place** (no copy), finishes the snapshot from the parked page index,
+then drops `stage_scope` at the stream transition and streams under its own scope. `stage_scope`
+redirects only the page/manifest reads and consumed-page cleanup; the emitted offsets always carry the
+new flow's own `pipeline_scope`, and while it is present the obsolete-scope cleanup is suppressed so
+the capturing scope's manifest survives the serve. Because the pages are referenced, the cutover must
+run within `snapshot.staging.retention.days` before the age-based sweep reclaims them. A capture with
+no hand-off-able position — an empty offset with no parked token (the flow never reached streaming, an
+in-flight copy, or a mid-serve snapshot) — **fails closed** rather than starting a snapshot. Because
+the row is keyed by the source endpoint and table (never the destination or flow), it is visible to
+any later flow reading that table. Handoff **never streams and never snapshots**: on every read it
+records a checkpoint, emits no rows, and stops (or fails closed); streaming and finishing an in-flight
+snapshot resume only once the operator removes `snapshot.mode=handoff` (the "Restore" step), after
+which the flow reads normally from the recorded checkpoint. On the new flow the empty checkpoint plus
+`snapshot.mode=handoff` seeds from the parked offset (no rows) and drops the token once Lakeflow
+commits the seed — so a crash before commit re-seeds rather than failing closed, while a later full
+refresh in `handoff` mode with no token fails closed with an explanatory error instead of silently
+re-snapshotting. Both cutover shapes record-and-stop
+identically: an SCD1→append switch lands in `_read_append_only` (the ingestion type changed), while a
+destination relocation that keeps a keyed `scd_type` stays in `_read_handoff` — there capture and
+cutover share one method and are told apart by a `handoff_seeded` marker stamped on the seed offset.
+On the committed-seed read the token is dropped and the flow stops; the marker is kept on the outgoing
+offset so a later steady-state read (a plain `phase=="stream"` offset, otherwise indistinguishable
+from a fresh capture on this shared path) is not mistaken for a capture and re-parked — it simply
+stays stopped until Restore. The delete channel is handed off on its own token channel
+(`_HANDOFF_CHANNEL_DELETE`) in parallel, so a keyed relocation records the delete reader's position
+across the seam too — resumed (after Restore) at exactly the parked point rather than re-derived from
+the upsert boundary (an SCD1→append switch has no delete flow, so its lingering delete token is dropped
+at cutover). The parked offset records the source schema fingerprint; if the schema
+changes between capture and cutover the seed fails closed rather than resuming at a misaligned
+position. `_recover`'s strict `commit_lsn >` filter makes the stream seam gapless and
+duplicate-free. The parked position must still be in the retained logical logs at cutover, so keep the
+two steps close together.
 
 Lakeflow creates upsert and delete streams independently and does not transfer offsets between them, so the two channels coordinate through shared state in a Lakebase Postgres endpoint the connector provisions on first use. For each table, only the upsert reader enables full-row logging and publishes initialization, completed-snapshot, triggered-update, and schema-transition boundaries; the delete reader consumes the same records. Each is elected by `INSERT ... ON CONFLICT DO NOTHING RETURNING`, so exactly one writer commits a record and every loser reads back the winner's value. A record cannot be partially visible, so there is no incomplete state to quarantine.
 

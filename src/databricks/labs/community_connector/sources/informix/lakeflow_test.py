@@ -5538,6 +5538,420 @@ class LakeflowContractTests(unittest.TestCase):
             with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "CDC-capable"):
                 self.connector(bridge).read_table("app.orders", {}, {"snapshot.mode": mode})
 
+    def test_handoff_captures_stream_offset_and_stops(self):
+        bridge = FakeBridge()
+        checkpoint = _stream_offset(125)
+
+        rows, returned = self.connector(bridge).read_table(
+            "app.orders", checkpoint, {"snapshot.mode": "handoff"}
+        )
+
+        # No rows, same offset back -> the flow freezes at exactly this position.
+        self.assertEqual(list(rows), [])
+        self.assertEqual(returned, checkpoint)
+        self.assertEqual(bridge.snapshot_calls, [])
+        # The offset is parked in Lakebase for a later flow to resume from.
+        self.assertEqual(len(self._lakebase.database.handoff), 1)
+        (_, _, channel), token = next(iter(self._lakebase.database.handoff.items()))
+        self.assertEqual(channel, 0)
+        self.assertEqual(json.loads(token["offset_json"])["commit_lsn"], "125")
+
+    def test_handoff_fails_closed_without_a_hand_off_able_position(self):
+        bridge = FakeBridge()
+
+        # No checkpoint and no parked token means the flow never reached a hand-off-able
+        # position (streaming, an in-flight incremental copy, or a mid-serve snapshot).
+        # Handoff never snapshots, so it fails closed rather than silently starting one.
+        with self.assertRaisesRegex(InformixError, "no checkpoint to record and no parked token"):
+            self.connector(bridge).read_table(
+                "app.orders", {}, {"snapshot.mode": "handoff", "snapshot.page.size": "1"}
+            )
+        self.assertEqual(self._lakebase.database.handoff, {})
+
+    def test_handoff_captures_an_in_flight_incremental_copy(self):
+        # phase=="stream" with the PK-chunked copy still in flight (an "incremental"
+        # block present). This is a resumable position, so capture parks it and freezes
+        # -- the cutover continues the copy from its cursor.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": 1, "value": "a"}, {"id": 2, "value": "b"}, {"id": 3, "value": "c"}]
+        _, mid = self.connector(bridge).read_table(
+            "app.orders", {}, {"snapshot.mode": "incremental", "snapshot.page.size": "1"}
+        )
+        self.assertIn("incremental", mid)
+        self.assertFalse(mid["incremental"]["done"])
+
+        rows, offset = self.connector(bridge).read_table(
+            "app.orders", mid, {"snapshot.mode": "handoff", "snapshot.page.size": "1"}
+        )
+
+        # Parked and frozen: no rows, same offset back, one token holding the mid-copy state.
+        self.assertEqual(list(rows), [])
+        self.assertEqual(offset, mid)
+        self.assertEqual(len(self._lakebase.database.handoff), 1)
+        (_, _, channel), token = next(iter(self._lakebase.database.handoff.items()))
+        self.assertEqual(channel, 0)
+        self.assertIn("incremental", json.loads(token["offset_json"]))
+
+    def test_handoff_cutover_records_and_continues_the_copy_after_restore(self):
+        # End to end: capture a table mid incremental copy, cut over to append (handoff
+        # records the checkpoint and stops -- no rows, no re-snapshot), then Restore
+        # (remove handoff) and confirm the copy *continues* from its cursor, losing no rows.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": 1, "value": "a"}, {"id": 2, "value": "b"}, {"id": 3, "value": "c"}]
+        opts = {"snapshot.mode": "incremental", "snapshot.page.size": "1"}
+        first, mid = self.connector(bridge).read_table("app.orders", {}, opts)
+        self.assertFalse(mid["incremental"]["done"])
+        copied = {row["id"] for row in first}
+
+        # Capture parks the mid-copy offset.
+        self.connector(bridge).read_table("app.orders", mid, {"snapshot.mode": "handoff"})
+
+        # Cutover (handoff): seed from the token, then record-and-stop -- neither read emits
+        # rows and no re-snapshot is taken.
+        append_handoff = {"snapshot.mode": "handoff", "append.only.ingestion": "true"}
+        connector = self.connector(bridge)
+        rows1, seeded = connector.read_table("app.orders", {}, append_handoff)
+        self.assertEqual(list(rows1), [])  # seed emits no rows
+        self.assertIn("incremental", seeded)  # seeded the in-flight copy, not a stream offset
+        rows2, stopped = connector.read_table("app.orders", seeded, append_handoff)
+        self.assertEqual(list(rows2), [])  # committed seed: record-and-stop, still no rows
+        self.assertIn("incremental", stopped)  # copy state preserved for Restore to continue
+        self.assertEqual(self._lakebase.database.handoff, {})  # token consumed
+
+        # Restore: remove handoff and continue the copy from the recorded checkpoint.
+        append = {"append.only.ingestion": "true"}
+        offset = stopped
+        for _ in range(6):  # drain remaining chunks to completion
+            rows, offset = connector.read_table("app.orders", offset, append)
+            copied |= {row["id"] for row in rows if row.get("_informix_op") == "r"}
+            if "incremental" not in offset:
+                break
+
+        self.assertNotIn("incremental", offset)  # copy finished -> pure stream
+        self.assertEqual(copied, {1, 2, 3})  # every existing row was emitted, none lost
+
+    def test_handoff_relocates_a_blocking_snapshot_by_reference(self):
+        # A blocking `initial` snapshot parked mid-serve carries phase=="snapshot" (unlike
+        # an incremental copy, whose in-flight state is phase=="stream"). Capture parks
+        # that offset as the token and stops -- no rows, no ride-out. The cutover under a
+        # *new* scope records the capturing scope on stage_scope so the new flow reads the
+        # staged pages in place, and after Restore finishes the snapshot from the parked
+        # page_index before streaming under its own scope. The pages are referenced, never
+        # copied.
+        bridge = FakeBridge()
+
+        # Old flow (scope A) serves page 0 of a 2-page blocking snapshot, parking at page 1.
+        old = self.connector(
+            bridge, registration_scope="old-location", **{"snapshot.page.size": "1"}
+        )
+        _, mid = old.read_table("app.orders", {}, {})
+        self.assertEqual(mid["phase"], "snapshot")
+        stage_scope = mid["pipeline_scope"]
+
+        # Capture: park the snapshot-phase offset and stop -- no rows, same offset back.
+        rows, parked = old.read_table("app.orders", mid, {"snapshot.mode": "handoff"})
+        self.assertEqual(list(rows), [])
+        self.assertEqual(parked, mid)
+        self.assertEqual(len(self._lakebase.database.handoff), 1)
+        (_, _, channel), token = next(iter(self._lakebase.database.handoff.items()))
+        self.assertEqual(channel, 0)
+        self.assertEqual(json.loads(token["offset_json"])["phase"], "snapshot")
+
+        # Cutover on a NEW scope: the seed records stage_scope=A / pipeline_scope=B, stops.
+        new = self.connector(
+            bridge, registration_scope="new-location", **{"snapshot.page.size": "1"}
+        )
+        rows1, seed = new.read_table("app.orders", {}, {"snapshot.mode": "handoff"})
+        self.assertEqual(list(rows1), [])
+        self.assertEqual(seed["phase"], "snapshot")
+        self.assertEqual(seed["stage_scope"], stage_scope)  # references the old pages
+        self.assertNotEqual(seed["pipeline_scope"], stage_scope)  # owns a fresh scope
+
+        # Seed committed: drop the token, still no rows, marker + stage_scope kept.
+        rows2, stopped = new.read_table("app.orders", seed, {"snapshot.mode": "handoff"})
+        self.assertEqual(list(rows2), [])
+        self.assertEqual(stopped["stage_scope"], stage_scope)
+        self.assertEqual(self._lakebase.database.handoff, {})  # token consumed
+
+        # Restore: finish the snapshot from the parked page against the old scope's pages,
+        # then transition to stream under the NEW scope with stage_scope dropped.
+        rows3, done = new.read_table("app.orders", stopped, {})
+        self.assertEqual([row["id"] for row in rows3], [2])  # remaining page served
+        self.assertEqual(done["phase"], "stream")
+        self.assertNotIn("stage_scope", done)  # dropped at the transition
+        self.assertEqual(done["pipeline_scope"], seed["pipeline_scope"])
+
+    def test_handoff_reads_skip_obsolete_scope_cleanup(self):
+        # In production, obsolete-scope cleanup runs real SQL. On a same-pipeline
+        # relocation the capturing flow's scope (`{pipelineId}_@_{oldUpdate}`) looks like an
+        # obsolete previous update, so an un-guarded cleanup on the cutover-*seed* read
+        # (empty checkpoint -> no stage_scope yet to trigger the in-method guard) would
+        # delete the snapshot manifest the Restore serve still needs. Guard it directly:
+        # cleanup must not run at all while snapshot.mode=handoff.
+        #
+        # (An end-to-end deletion test is not possible offline: the fake Postgres routes
+        # `DELETE FROM state_records` to a no-op catch-all, so it never models the delete.)
+        bridge = FakeBridge()
+        capture_src = self.connector(bridge, **{"snapshot.page.size": "1"})
+        _, mid = capture_src.read_table("app.orders", {}, {})
+        capture_src.read_table("app.orders", mid, {"snapshot.mode": "handoff"})
+
+        connector = self.connector(bridge, **{"snapshot.page.size": "1"})
+        with mock.patch.object(connector, "_cleanup_previous_update_scopes") as cleanup:
+            # Cutover seed (empty checkpoint) then the committed seed -- both under handoff.
+            _, seed = connector.read_table("app.orders", {}, {"snapshot.mode": "handoff"})
+            connector.read_table("app.orders", seed, {"snapshot.mode": "handoff"})
+        cleanup.assert_not_called()
+
+    def test_handoff_capture_defers_to_embedded_in_partitioned_mode(self):
+        # Partitioned mode intercepts snapshot-phase offsets in _snapshot_page_batch before
+        # the embedded read. Under handoff that must defer to _read_handoff (park +
+        # record-and-stop) instead of serving pages -- otherwise capture never parks its
+        # token and the committed seed never drops it.
+        bridge = FakeBridge()
+        seed_connector = self._partitioned_connector(bridge, **{"snapshot.page.size": "1"})
+        mid = seed_connector.latest_offset("app.orders", {}, {})
+        self.assertEqual(mid["phase"], "snapshot")
+
+        capture = self._partitioned_connector(bridge, **{"snapshot.page.size": "1"})
+        parked = capture.latest_offset("app.orders", {"snapshot.mode": "handoff"}, mid)
+
+        # Record-and-stop: the page index did not advance (no serve), and the snapshot-phase
+        # offset was parked as the token.
+        self.assertEqual(parked["phase"], "snapshot")
+        self.assertEqual(parked["snapshot"]["page_index"], mid["snapshot"]["page_index"])
+        self.assertEqual(len(self._lakebase.database.handoff), 1)
+        (_, _, _channel), token = next(iter(self._lakebase.database.handoff.items()))
+        self.assertEqual(json.loads(token["offset_json"])["phase"], "snapshot")
+
+    def test_handoff_relocation_serves_staged_pages_in_partitioned_mode(self):
+        # After Restore, the partitioned reader must finish a relocated blocking snapshot
+        # by reading the capturing scope's staged pages via stage_scope -- exercising the
+        # partitioned path's own stage_scope threading (_snapshot_page_batch page range,
+        # partition descriptors, and the flow-scope/stage-scope split in the end offset).
+        bridge = FakeBridge()
+
+        # Capture under scope A: serve page 0 of a 2-page blocking snapshot, park at page 1.
+        old = self.connector(bridge, **{"snapshot.page.size": "1"})
+        old.set_registration_scope("a" * 32)
+        _, mid = old.read_table("app.orders", {}, {})
+        self.assertEqual(mid["phase"], "snapshot")
+        old.read_table("app.orders", mid, {"snapshot.mode": "handoff"})
+
+        # New partitioned flow under scope B: cutover seed + committed seed (both defer to
+        # the embedded record-and-stop; Fix routes handoff snapshot offsets off the serve).
+        new = self._partitioned_connector(bridge, **{"snapshot.page.size": "1"})
+        new.set_registration_scope("b" * 32)
+        seed = new.latest_offset("app.orders", {"snapshot.mode": "handoff"}, {})
+        self.assertEqual(seed["stage_scope"], "a" * 32)
+        self.assertEqual(seed["pipeline_scope"], "b" * 32)
+        stopped = new.latest_offset("app.orders", {"snapshot.mode": "handoff"}, seed)
+        self.assertEqual(stopped["snapshot"]["page_index"], 1)  # no serve under handoff
+
+        # Restore: drive the partitioned serve from the seed with handoff removed.
+        served, final = [], stopped
+        for _ in range(10):
+            end = new.latest_offset("app.orders", {}, final)
+            for part in new.get_partitions("app.orders", {}, final, end):
+                served.extend(new.read_partition("app.orders", part, {}))
+            final = end
+            if end.get("phase") == "stream":
+                break
+
+        self.assertEqual([row["id"] for row in served], [2])  # remaining page, from scope A
+        self.assertEqual(final["phase"], "stream")
+        self.assertEqual(final["pipeline_scope"], "b" * 32)  # streams under its own scope
+        self.assertNotIn("stage_scope", final)  # dropped at the transition
+        self._flush_snapshot_cleanup(new)  # drain background page cleanup this serve queued
+
+    def test_handoff_capture_re_capture_is_idempotent(self):
+        bridge = FakeBridge()
+        checkpoint = _stream_offset(125)
+        self.connector(bridge).read_table("app.orders", checkpoint, {"snapshot.mode": "handoff"})
+        self.connector(bridge).read_table("app.orders", checkpoint, {"snapshot.mode": "handoff"})
+
+        self.assertEqual(len(self._lakebase.database.handoff), 1)
+
+    def test_handoff_requires_a_cdc_capable_table(self):
+        bridge = FakeBridge()
+        bridge.tables = [_table(cdc=False)]
+
+        with self.assertRaisesRegex(ValueError, "CDC-capable"):
+            self.connector(bridge).read_table(
+                "app.orders", _stream_offset(), {"snapshot.mode": "handoff"}
+            )
+
+    def test_handoff_cutover_seeds_from_parked_offset_without_snapshot(self):
+        bridge = FakeBridge()
+        # Capture on the still-keyed flow.
+        self.connector(bridge).read_table(
+            "app.orders", _stream_offset(125), {"snapshot.mode": "handoff"}
+        )
+
+        # Cutover: a fresh append flow (empty checkpoint) seeds from the token.
+        rows, seeded = self.connector(bridge).read_table(
+            "app.orders",
+            {},
+            {"snapshot.mode": "handoff", "append.only.ingestion": "true"},
+        )
+
+        self.assertEqual(list(rows), [])
+        self.assertEqual(seeded["phase"], "stream")
+        self.assertEqual(seeded["commit_lsn"], "125")
+        self.assertEqual(bridge.snapshot_calls, [])
+        # Not deleted until the seed is committed (survives a crash before commit).
+        self.assertEqual(len(self._lakebase.database.handoff), 1)
+
+    def test_handoff_cutover_drops_token_once_the_seed_is_committed(self):
+        bridge = FakeBridge()
+        self.connector(bridge).read_table(
+            "app.orders", _stream_offset(125), {"snapshot.mode": "handoff"}
+        )
+        options = {"snapshot.mode": "handoff", "append.only.ingestion": "true"}
+        _, seeded = self.connector(bridge).read_table("app.orders", {}, options)
+
+        # The next read arrives with the committed (non-empty) seed -> token is dropped.
+        self.connector(bridge).read_table("app.orders", seeded, options)
+
+        self.assertEqual(self._lakebase.database.handoff, {})
+
+    def test_handoff_cutover_without_a_parked_offset_fails_closed(self):
+        bridge = FakeBridge()
+
+        with self.assertRaisesRegex(InformixError, "no parked checkpoint"):
+            self.connector(bridge).read_table(
+                "app.orders",
+                {},
+                {"snapshot.mode": "handoff", "append.only.ingestion": "true"},
+            )
+
+    def test_handoff_keyed_relocation_cutover_seeds_without_snapshot(self):
+        # Finding 1: a keyed table that keeps its scd_type (a destination relocation)
+        # must resume from the parked position on cutover, NOT re-snapshot. The cutover
+        # flow stays keyed, so it lands in _read_handoff (not _read_append_only).
+        bridge = FakeBridge()
+        # Capture on the source flow.
+        self.connector(bridge, registration_scope="old-flow").read_table(
+            "app.orders", _stream_offset(125), {"snapshot.mode": "handoff"}
+        )
+        self.assertEqual(len(self._lakebase.database.handoff), 1)
+
+        # Cutover: a fresh keyed flow (new scope, empty checkpoint) seeds from the token.
+        connector = self.connector(bridge, registration_scope="new-flow")
+        rows, seeded = connector.read_table("app.orders", {}, {"snapshot.mode": "handoff"})
+
+        self.assertEqual(list(rows), [])
+        self.assertEqual(seeded["commit_lsn"], "125")
+        self.assertEqual(seeded["phase"], "stream")
+        self.assertTrue(seeded["handoff_seeded"])  # one-shot cutover marker
+        self.assertEqual(bridge.snapshot_calls, [])  # crucially, NO re-snapshot
+        self.assertEqual(len(self._lakebase.database.handoff), 1)  # kept until committed
+
+    def test_handoff_keyed_relocation_cutover_records_and_stops(self):
+        bridge = FakeBridge()
+        self.connector(bridge, registration_scope="old-flow").read_table(
+            "app.orders", _stream_offset(125), {"snapshot.mode": "handoff"}
+        )
+        connector = self.connector(bridge, registration_scope="new-flow")
+        rows1, seeded = connector.read_table("app.orders", {}, {"snapshot.mode": "handoff"})
+        self.assertEqual(list(rows1), [])  # seed emits no rows
+
+        # The committed seed carries the marker -> record and stop: no rows, same offset
+        # back, token consumed. Handoff never streams; the marker is kept so the offset is
+        # not mistaken for a fresh capture and re-parked.
+        rows2, resumed = connector.read_table("app.orders", seeded, {"snapshot.mode": "handoff"})
+        self.assertEqual(list(rows2), [])
+        self.assertEqual(resumed["commit_lsn"], "125")
+        self.assertTrue(resumed["handoff_seeded"])
+        self.assertEqual(self._lakebase.database.handoff, {})  # token consumed
+
+        # A later steady-state read stays stopped -- no rows, no orphan token re-parked --
+        # even with snapshot.mode=handoff still set (operator has not run Restore yet).
+        rows3, steady = connector.read_table("app.orders", resumed, {"snapshot.mode": "handoff"})
+        self.assertEqual(list(rows3), [])
+        self.assertEqual(steady["commit_lsn"], "125")
+        self.assertEqual(self._lakebase.database.handoff, {})  # no orphan token re-parked
+
+        # Restore: remove snapshot.mode=handoff and the flow streams normally from 125.
+        _, restored = connector.read_table("app.orders", steady, {})
+        self.assertEqual(restored["phase"], "stream")
+
+    def test_handoff_cutover_fails_closed_on_schema_change(self):
+        # Finding 3: the parked schema_fp must be validated at cutover. If the source
+        # schema drifted since capture, resuming would misread the stream -> fail closed.
+        bridge = FakeBridge()
+        self.connector(bridge).read_table(
+            "app.orders", _stream_offset(125), {"snapshot.mode": "handoff"}
+        )
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "VARCHAR", "length": 10, "cdc_supported": True}
+        )
+
+        with self.assertRaisesRegex(InformixError, "schema changed"):
+            self.connector(bridge).read_table(
+                "app.orders",
+                {},
+                {"snapshot.mode": "handoff", "append.only.ingestion": "true"},
+            )
+
+    def test_handoff_delete_channel_captures_and_freezes(self):
+        # Finding 2: the delete channel is handed off on its own token (channel 1), so a
+        # keyed relocation carries the delete position across the seam. Capture parks and
+        # freezes, exactly like the upsert channel.
+        bridge = FakeBridge()
+
+        rows, offset = self.connector(bridge).read_table_deletes(
+            "app.orders", _stream_offset(125), {"snapshot.mode": "handoff"}
+        )
+
+        self.assertEqual(list(rows), [])
+        self.assertEqual(dict(offset), _stream_offset(125))
+        self.assertEqual(len(self._lakebase.database.handoff), 1)
+        (_, _, channel), token = next(iter(self._lakebase.database.handoff.items()))
+        self.assertEqual(channel, 1)  # the delete channel, distinct from the upsert token
+        self.assertEqual(json.loads(token["offset_json"])["commit_lsn"], "125")
+
+    def test_handoff_delete_channel_cutover_seeds_and_drops_token(self):
+        bridge = FakeBridge()
+        # Capture the delete position on the source flow.
+        self.connector(bridge, registration_scope="old-flow").read_table_deletes(
+            "app.orders", _stream_offset(125), {"snapshot.mode": "handoff"}
+        )
+        connector = self.connector(bridge, registration_scope="new-flow")
+
+        # Cutover: a fresh delete flow seeds from the channel-1 token at exactly 125.
+        _, seeded = connector.read_table_deletes("app.orders", {}, {"snapshot.mode": "handoff"})
+        self.assertEqual(seeded["commit_lsn"], "125")
+        self.assertTrue(seeded["handoff_seeded"])
+        self.assertEqual(len(self._lakebase.database.handoff), 1)  # kept until committed
+
+        # Committed seed: drop the channel-1 token and record-and-stop (no rows). The
+        # marker is kept so the offset is not mistaken for a fresh capture and re-parked.
+        rows, resumed = connector.read_table_deletes(
+            "app.orders", seeded, {"snapshot.mode": "handoff"}
+        )
+        self.assertEqual(list(rows), [])
+        self.assertTrue(resumed["handoff_seeded"])
+        self.assertEqual(self._lakebase.database.handoff, {})
+
+        # A later steady-state delete read stays stopped -- no orphan token re-parked.
+        connector.read_table_deletes("app.orders", resumed, {"snapshot.mode": "handoff"})
+        self.assertEqual(self._lakebase.database.handoff, {})
+
+    def test_handoff_delete_channel_without_token_falls_back_to_upsert_boundary(self):
+        # If only the upsert channel was captured, the delete cutover has no parked token;
+        # it must not crash -- it falls back to the ordinary bootstrap that adopts the
+        # upsert boundary published under the new scope.
+        bridge = FakeBridge()
+        list(self.connector(bridge).read_table("app.orders", {}, {})[0])
+
+        rows, offset = self.connector(bridge).read_table_deletes(
+            "app.orders", {}, {"snapshot.mode": "handoff"}
+        )
+
+        self.assertEqual(list(rows), [])
+        self.assertEqual(offset["commit_lsn"], "90")  # adopted the upsert boundary
+
     def test_consistent_snapshot_publishes_fresh_resume_lsn_to_both_readers(self):
         bridge = FakeBridge()
 

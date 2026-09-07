@@ -998,6 +998,25 @@ _SCHEMA_STATEMENTS = (
         )
         WHERE record_type = 'table-activity'
     """,
+    # A checkpoint-handoff token, parked by a source flow so a *different* flow --
+    # one with a fresh Spark checkpoint after an SCD1->append switch or a destination
+    # relocation -- can resume the CDC stream at the exact offset the old flow stopped
+    # at, instead of re-snapshotting. Keyed by (namespace, table_key, channel), all
+    # derived from the source only, so it is visible to any flow reading that source
+    # table regardless of destination or flow type. Mutable (re-capture overwrites) and
+    # deletable (consumed once the new flow has committed the seed), unlike the
+    # write-once state_records. See snapshot.mode=handoff.
+    """
+    CREATE TABLE IF NOT EXISTS cdc_handoff (
+        namespace   text        NOT NULL,
+        table_key   text        NOT NULL,
+        channel     smallint    NOT NULL DEFAULT 0,
+        offset_json text        NOT NULL,
+        schema_fp   text        NOT NULL,
+        created_at  timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (namespace, table_key, channel)
+    )
+    """,
 )
 
 
@@ -1651,6 +1670,78 @@ def dequeue_waiter(connection: Any, namespace: str, ticket_id: int) -> None:
         cursor.execute(
             _DEQUEUE_WAITER,
             {"namespace": namespace, "ticket_id": int(ticket_id)},
+        )
+    connection.commit()
+
+
+_PUT_CDC_HANDOFF = """
+INSERT INTO cdc_handoff (namespace, table_key, channel, offset_json, schema_fp)
+VALUES (%(namespace)s, %(table_key)s, %(channel)s, %(offset_json)s, %(schema_fp)s)
+ON CONFLICT (namespace, table_key, channel)
+DO UPDATE SET offset_json = EXCLUDED.offset_json,
+              schema_fp = EXCLUDED.schema_fp,
+              created_at = now()
+"""
+
+_GET_CDC_HANDOFF = """
+SELECT offset_json, schema_fp FROM cdc_handoff
+WHERE namespace = %(namespace)s AND table_key = %(table_key)s AND channel = %(channel)s
+"""
+
+_DELETE_CDC_HANDOFF = """
+DELETE FROM cdc_handoff
+WHERE namespace = %(namespace)s AND table_key = %(table_key)s AND channel = %(channel)s
+"""
+
+
+def put_cdc_handoff(
+    connection: Any,
+    namespace: str,
+    table_key: str,
+    channel: int,
+    offset_json: str,
+    schema_fp: str,
+) -> None:
+    """Park (or overwrite) a table's checkpoint-handoff token. Idempotent re-capture."""
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            _PUT_CDC_HANDOFF,
+            {
+                "namespace": namespace,
+                "table_key": table_key,
+                "channel": int(channel),
+                "offset_json": offset_json,
+                "schema_fp": schema_fp,
+            },
+        )
+    connection.commit()
+
+
+def get_cdc_handoff(
+    connection: Any, namespace: str, table_key: str, channel: int
+) -> dict[str, str] | None:
+    """Return the parked ``{offset_json, schema_fp}`` token, or ``None`` when absent."""
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            _GET_CDC_HANDOFF,
+            {"namespace": namespace, "table_key": table_key, "channel": int(channel)},
+        )
+        row = cursor.fetchone()
+    connection.commit()
+    if row is None:
+        return None
+    return {"offset_json": row[0], "schema_fp": row[1]}
+
+
+def delete_cdc_handoff(connection: Any, namespace: str, table_key: str, channel: int) -> None:
+    """Remove a consumed handoff token. Idempotent (a missing row is a no-op)."""
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            _DELETE_CDC_HANDOFF,
+            {"namespace": namespace, "table_key": table_key, "channel": int(channel)},
         )
     connection.commit()
 

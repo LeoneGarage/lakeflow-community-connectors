@@ -62,9 +62,12 @@ from databricks.labs.community_connector.sources.informix.lakebase_state import 
     capture_workspace_credentials,
     collect_stale_table_state,
     connection_lost_error_types,
+    delete_cdc_handoff,
     delete_obsolete_scoped_state_records,
     dequeue_waiter,
     enqueue_waiter,
+    get_cdc_handoff,
+    put_cdc_handoff,
     heartbeat_slot,
     heartbeat_waiter,
     publish_backlog_hint,
@@ -218,8 +221,20 @@ _SNAPSHOT_MODES = frozenset(
         "cdc_only",
         "auto_snapshot",
         "recovery",
+        # A two-run checkpoint handoff (see _read_handoff / _read_append_only). It never
+        # streams -- every read records a checkpoint, emits no rows, and stops. While
+        # still on the old flow it rides out any snapshot like ``incremental`` and, at
+        # the first stream-phase read, parks that offset in Lakebase and stops. On the
+        # new flow (fresh checkpoint after an SCD1->append switch or a destination move)
+        # it seeds from that parked offset and stops instead of re-snapshotting; removing
+        # snapshot.mode=handoff (Restore) then resumes streaming from the recorded offset.
+        "handoff",
     }
 )
+# Handoff-token channels. Only the upsert channel's offset is parked: append ingestion
+# has no separate delete channel, and deletes after the boundary surface as append rows.
+_HANDOFF_CHANNEL_UPSERT = 0
+_HANDOFF_CHANNEL_DELETE = 1
 _DEFAULT_SNAPSHOT_MODE = "incremental"
 _UNSUPPORTED_SNAPSHOT_MODES = frozenset({"configuration_based", "custom"})
 # Opt-in append-only ingestion, for a table Informix can capture but this connector
@@ -5431,7 +5446,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         try:
             try:
                 table = self._table(table_name, table_options)
-                self._cleanup_previous_update_scopes(table, effective_start)
+                if snapshot_mode != "handoff":
+                    # Skip obsolete-scope cleanup for the whole handoff window. On a
+                    # same-pipeline relocation the *capturing* flow's scope looks like an
+                    # ordinary previous update, and the cutover-seed read (empty checkpoint,
+                    # so no stage_scope yet to trigger the in-method guard) would otherwise
+                    # delete its still-needed snapshot manifest before Restore serves it.
+                    # After Restore (mode no longer handoff) the stage_scope guard inside
+                    # _cleanup_previous_update_scopes protects it until the serve completes.
+                    self._cleanup_previous_update_scopes(table, effective_start)
                 self._touch_table_state(table)
                 self._maybe_sweep_stale_snapshot_stages(table)
                 _ensure_materializable(table, table_options)
@@ -5453,11 +5476,36 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     # then stream. _read_stream needs no primary key, so a key-less
                     # table follows the identical CDC path from here on.
                     if effective_start and effective_start.get("phase") == "stream":
-                        result = self._read_stream(
-                            table, effective_start, table_options, deletes=False
-                        )
+                        if snapshot_mode == "handoff":
+                            # Handoff cutover, seed committed: handoff never streams. Drop
+                            # the now-consumed token(s) and stop -- record the checkpoint,
+                            # emit no rows. Streaming resumes only once the operator removes
+                            # snapshot.mode=handoff (Restore), when this same committed
+                            # offset takes the streaming branches below. Dropping the token
+                            # is crash-safe: a crash before the seed committed re-seeds from
+                            # the still-present token, and a later full refresh in handoff
+                            # mode then finds no token and fails closed rather than silently
+                            # re-seeding. The delete-channel token is dropped too -- an
+                            # append flow has no delete reader to consume the position parked
+                            # while the table was still SCD1. The marker is kept on the
+                            # outgoing offset so a later steady-state read stays a stop.
+                            self._delete_handoff_token(table)
+                            self._delete_handoff_token(table, _HANDOFF_CHANNEL_DELETE)
+                            result = (iter(()), dict(effective_start))
+                        # After Restore, a handoff seed can carry an in-flight incremental
+                        # copy (phase=="stream" with an "incremental" block, only ever from a
+                        # keyed capture that was mid-copy); continue the copy from its cursor
+                        # rather than treating it as pure CDC, or the un-copied rows are lost.
+                        elif self._offset_is_incremental_reader(effective_start):
+                            result = self._read_incremental(table, effective_start, table_options)
+                        else:
+                            result = self._read_stream(
+                                table, effective_start, table_options, deletes=False
+                            )
                     else:
                         result = self._read_append_only(table, effective_start, table_options)
+                elif snapshot_mode == "handoff":
+                    result = self._read_handoff(table, effective_start)
                 elif not _cdc_capable(table):
                     if snapshot_mode in {"cdc_only", "recovery"}:
                         raise ValueError(
@@ -5640,8 +5688,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     ) -> tuple[str, str, int, int, int, int] | None:
         """Resolve a staged-snapshot page-serve microbatch, else None.
 
-        Returns ``(scope, schema_id, snapshot_lsn, start_page, end_page,
+        Returns ``(stage_scope, schema_id, snapshot_lsn, start_page, end_page,
         page_count)`` for a snapshot-phase checkpoint whose staged manifest exists,
+        where ``stage_scope`` is the scope the pages are stored under (the capturing
+        flow's, for a handoff relocation; otherwise the offset's own scope),
         mirroring the resume resolution in :meth:`_read_snapshot`. Deterministic
         given the start offset + immutable manifest + pages-per-batch, so
         ``latest_offset`` and ``get_partitions`` agree without sharing state. None
@@ -5650,6 +5700,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         """
 
         if self._is_delete_flow():
+            return None
+        if self._snapshot_mode(table_options) == "handoff":
+            # Handoff is record-and-stop: a snapshot-phase offset under handoff must reach
+            # the embedded _read_handoff (park the token on capture, drop it on the
+            # committed seed) rather than being served here. After Restore (mode no longer
+            # handoff) this returns a batch and serves the pages -- under stage_scope for a
+            # relocation -- as normal.
             return None
         if not effective_start or effective_start.get("phase") not in (None, "snapshot"):
             return None
@@ -5668,17 +5725,27 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         schema_id = str(checkpoint["schema_id"])
         snapshot_lsn = int(checkpoint["snapshot_lsn"])
         start_page = int(snapshot["page_index"])
-        scope = checkpoint.get("pipeline_scope")
-        if not isinstance(scope, str) or _PIPELINE_SCOPE.fullmatch(scope) is None:
-            scope = self._pipeline_scope(checkpoint)
-        manifest = self._read_snapshot_stage_manifest(table, scope, schema_id)
+        flow_scope = checkpoint.get("pipeline_scope")
+        if not isinstance(flow_scope, str) or _PIPELINE_SCOPE.fullmatch(flow_scope) is None:
+            flow_scope = self._pipeline_scope(checkpoint)
+        # Staged pages live under the scope that created them. For a handoff relocation
+        # that is the *capturing* flow's scope, carried on stage_scope while the offset's
+        # own pipeline_scope is already the new flow's; otherwise stage_scope == the
+        # offset scope and behaviour is unchanged. The returned scope is the *stage*
+        # scope -- it drives the manifest read, the page reads (driver + executor), and
+        # consumed-page cleanup. The emitted offset's scope is resolved separately from
+        # the checkpoint in _snapshot_page_batch_offset.
+        stage_scope = checkpoint.get("stage_scope")
+        if not isinstance(stage_scope, str) or _PIPELINE_SCOPE.fullmatch(stage_scope) is None:
+            stage_scope = flow_scope
+        manifest = self._read_snapshot_stage_manifest(table, stage_scope, schema_id)
         if manifest is None or int(manifest["snapshot_lsn"]) != snapshot_lsn:
             return None
         page_count = int(manifest["page_count"])
         if start_page < 0 or start_page >= page_count:
             return None
         end_page = min(start_page + self._partitioned_pages_per_batch(), page_count)
-        return (scope, schema_id, snapshot_lsn, start_page, end_page, page_count)
+        return (stage_scope, schema_id, snapshot_lsn, start_page, end_page, page_count)
 
     def _embedded_read(
         self, table_name: str, start_offset: dict, table_options: dict[str, str]
@@ -5731,16 +5798,31 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         no-drift case this is byte-identical to what the simple reader commits.
         """
 
-        scope, schema_id, snapshot_lsn, start_page, end_page, page_count = batch
+        stage_scope, schema_id, snapshot_lsn, start_page, end_page, page_count = batch
         expected_fingerprint = effective_start.get("schema_fingerprint")
+        # The flow owns its own scope for the emitted offsets; stage_scope (where the
+        # staged pages physically live) drives only the page reads and cleanup, and is
+        # carried forward on the non-terminal offset until the snapshot completes.
+        flow_scope = effective_start.get("pipeline_scope")
+        if not isinstance(flow_scope, str) or _PIPELINE_SCOPE.fullmatch(flow_scope) is None:
+            flow_scope = self._pipeline_scope(effective_start)
         # Pages below this batch's first page are committed -- schedule their async
-        # cleanup, exactly as the serial serve does off its own serve path.
+        # cleanup under the scope that stores them, exactly as the serial serve does.
         self._cleanup_consumed_snapshot_stage_pages(
-            table, scope, schema_id, snapshot_lsn, start_page
+            table, stage_scope, schema_id, snapshot_lsn, start_page
         )
         if end_page >= page_count:
+            # Snapshot complete: transition to the stream phase under the flow's own
+            # scope and drop stage_scope -- the offset is now an ordinary stream offset.
             end = _offset(
-                snapshot_lsn, snapshot_lsn, snapshot_lsn, None, "stream", table, schema_id, scope
+                snapshot_lsn,
+                snapshot_lsn,
+                snapshot_lsn,
+                None,
+                "stream",
+                table,
+                schema_id,
+                flow_scope,
             )
             if expected_fingerprint is not None:
                 end["schema_fingerprint"] = expected_fingerprint
@@ -5748,11 +5830,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # Non-terminal: last_pk is the boundary page's upper_pk. Read only that one
         # page's header; its row generator is discarded, so no rows are decoded.
         header, _rows = self._stream_staged_page(
-            table, scope, schema_id, snapshot_lsn, end_page - 1
+            table, stage_scope, schema_id, snapshot_lsn, end_page - 1
         )
         last_pk = header.get("upper_pk")
         end = _offset(
-            snapshot_lsn, snapshot_lsn, snapshot_lsn, None, "snapshot", table, schema_id, scope
+            snapshot_lsn, snapshot_lsn, snapshot_lsn, None, "snapshot", table, schema_id, flow_scope
         )
         if expected_fingerprint is not None:
             end["schema_fingerprint"] = expected_fingerprint
@@ -5762,6 +5844,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 "snapshot": {"last_pk": last_pk, "page_index": end_page},
             }
         )
+        if stage_scope != flow_scope:
+            end["stage_scope"] = stage_scope
         return _with_backlog_streak(end, effective_start, True)
 
     def get_partitions(
@@ -5841,9 +5925,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # Lakebase before resolving Informix metadata: _table() opens Informix and
         # would otherwise let coordination waiters consume every scarce slot from
         # the upsert readers that must unblock them.
+        # handoff is excluded too: a delete cutover seeds from its own parked token
+        # (see _read_handoff_deletes), which does not depend on the upsert boundary, so
+        # it must reach the attempt rather than parking here to wait for that boundary.
         if (
             not effective_start
-            and snapshot_mode not in {"initial_only", "recovery"}
+            and snapshot_mode not in {"initial_only", "recovery", "handoff"}
             and not self._upsert_channel_start_exists(table_name, table_options)
         ):
             return iter(()), self._schema_node_fallback_offset(start_offset)
@@ -5896,7 +5983,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
 
         try:
             try:
-                if snapshot_mode == "initial_only":
+                if snapshot_mode == "handoff":
+                    # Capture parks the delete position and freezes; cutover seeds from it
+                    # (keyed relocation keeps the delete channel) or, for the SCD1->append
+                    # switch, there is no delete flow so this is never reached.
+                    result = self._read_handoff_deletes(
+                        table_name, effective_start, table_options, start_offset
+                    )
+                elif snapshot_mode == "initial_only":
                     result = (iter(()), dict(effective_start))
                 elif snapshot_mode == "recovery" and (
                     not effective_start or effective_start.get("phase") != "stream"
@@ -6950,6 +7044,206 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             except Exception:  # pragma: no cover - best-effort teardown
                 pass
 
+    def _write_handoff_token(
+        self, table: Table, offset: dict, channel: int = _HANDOFF_CHANNEL_UPSERT
+    ) -> None:
+        """Park a stream-phase offset so a later flow can resume from it."""
+
+        _, table_key = self._table_state_keys(table)
+        namespace = self._lakebase_state_namespace()
+        offset_json = json.dumps(_validated_offset(offset))
+        schema_fp = str(offset.get("schema_fingerprint") or _schema_fingerprint(table))
+        self._state_op_with_reconnect(
+            lambda: put_cdc_handoff(
+                self._lakebase_connection(),
+                namespace,
+                table_key,
+                channel,
+                offset_json,
+                schema_fp,
+            ),
+            operation="handoff token write",
+        )
+
+    def _read_handoff_token(
+        self, table: Table, channel: int = _HANDOFF_CHANNEL_UPSERT
+    ) -> dict[str, str] | None:
+        """Return the parked handoff token for this table, or None when absent."""
+
+        _, table_key = self._table_state_keys(table)
+        namespace = self._lakebase_state_namespace()
+        return self._state_op_with_reconnect(
+            lambda: get_cdc_handoff(self._lakebase_connection(), namespace, table_key, channel),
+            operation="handoff token read",
+        )
+
+    def _delete_handoff_token(self, table: Table, channel: int = _HANDOFF_CHANNEL_UPSERT) -> None:
+        """Drop a consumed handoff token. Best-effort and idempotent."""
+
+        _, table_key = self._table_state_keys(table)
+        namespace = self._lakebase_state_namespace()
+        self._state_op_with_reconnect(
+            lambda: delete_cdc_handoff(self._lakebase_connection(), namespace, table_key, channel),
+            operation="handoff token delete",
+        )
+
+    def _handoff_seed_from_token(self, table: Table, token: dict[str, str]) -> dict:
+        """Build the seed offset from a parked token, failing closed on schema drift.
+
+        The parked ``schema_fp`` is the source schema at capture time. If the source
+        schema changed before cutover the parked LSN position no longer aligns with the
+        current layout, so resuming would misread the stream -- fail closed and tell the
+        operator to re-capture or start fresh instead of silently corrupting the seam.
+        """
+
+        current = self._refresh_table_schema(table, None)
+        parked_fp = token.get("schema_fp")
+        if parked_fp and parked_fp != _schema_fingerprint(current):
+            raise InformixError(
+                f"snapshot.mode=handoff for '{table.exposed_name}' cannot resume: the "
+                "source schema changed between capture and cutover, so the parked "
+                "position no longer aligns with the current schema. Re-run the capture "
+                "step against the current schema, or start fresh with "
+                "snapshot.mode=cdc_only (no history) or snapshot.mode=initial (full "
+                "snapshot)."
+            )
+        # Adopt this flow's scope, and stamp a one-shot marker so the *next* read on this
+        # flow (once Spark has committed the seed) recognises it as a cutover continuation
+        # rather than a fresh capture -- the two are otherwise indistinguishable on the
+        # keyed path, where capture and cutover share _read_handoff. The token is dropped
+        # only when that marked offset arrives, so a crash before commit re-seeds.
+        seeded = _validated_offset(json.loads(token["offset_json"]))
+        origin_scope = seeded.get("pipeline_scope")
+        seeded["pipeline_scope"] = self._pipeline_scope()
+        if seeded.get("phase") == "snapshot" and origin_scope:
+            # A blocking initial snapshot parked mid-serve. The new flow owns a fresh
+            # scope for its boundary and stream, but the staged pages physically live
+            # under the capturing flow's scope. stage_scope redirects *only* the
+            # page/manifest reads and consumed-page cleanup there; it is dropped at the
+            # snapshot->stream transition, after which the offset is an ordinary
+            # new-scope stream offset. See _snapshot_page_batch / _staged_snapshot_result.
+            seeded["stage_scope"] = origin_scope
+        seeded["handoff_seeded"] = True
+        return seeded
+
+    def _read_handoff(self, table: Table, effective_start: dict) -> tuple[Iterator[dict], dict]:
+        """Both sides of snapshot.mode=handoff for a **keyed** (merge) CDC flow.
+
+        A keyed table keeps its ``scd_type`` across a destination relocation, so both
+        the capture (old flow) and the cutover (new flow) reach here -- unlike the
+        SCD1->append switch, whose cutover changes ingestion type and lands in
+        :meth:`_read_append_only`. Handoff **never streams and never snapshots**: every
+        read records a checkpoint, emits no rows, and stops, or fails closed. Streaming
+        (and finishing an in-flight snapshot) resumes only once the operator removes
+        ``snapshot.mode=handoff`` (the "Restore" step), after which the flow reads
+        normally from the checkpoint recorded here. The states:
+
+        * **Capture** (old flow) -- a stream-phase offset (steady-state CDC, or an
+          in-flight incremental copy whose ``incremental`` block fully describes a
+          resumable position), or a blocking ``initial`` snapshot parked mid-serve
+          (``phase=="snapshot"``, whose staged pages are portable *by reference* -- a new
+          flow reads them under the capturing scope via ``stage_scope``). Park it and
+          stop: an empty batch at the same offset is the AvailableNow "caught up, stop"
+          signal, so the parked offset equals the flow's committed position exactly.
+        * **Cutover seed** (new flow) -- an empty checkpoint with a parked token. Adopt
+          the parked offset as this flow's checkpoint, emit no rows, and stop. The token
+          is kept (not dropped) so a crash before the seed commits re-seeds rather than
+          failing closed; a ``handoff_seeded`` marker on the seed lets the next read drop
+          it (see :meth:`_handoff_seed_from_token`).
+        * **Seed committed** (new flow) -- the marker is present, so the seed committed.
+          Drop the now-consumed token and stop, still emitting no rows. The marker is
+          **kept on the outgoing offset** so a later steady-state read is not mistaken for
+          a fresh capture and re-parked; the flow idles here until Restore removes handoff.
+        * **Fail closed** -- an empty checkpoint with no parked token means the flow has
+          not reached a hand-off-able position (steady-state streaming, an in-flight
+          incremental copy, or a mid-serve blocking snapshot). There is nothing to record,
+          so raise rather than silently snapshotting: the operator must run the flow
+          without handoff until it is streaming (or mid initial snapshot), then apply it.
+        """
+
+        if not _cdc_capable(table):
+            raise ValueError(
+                f"snapshot.mode=handoff requires a CDC-capable table; "
+                f"'{table.exposed_name}' is snapshot-only"
+            )
+        if effective_start and effective_start.get("handoff_seeded"):
+            # The committed seed has arrived: the token has served its purpose, so drop it
+            # (crash-safe -- a crash before this re-seeds from the still-present token).
+            # Record and stop: no rows, same offset back. Keep the marker so a later
+            # steady-state read is not mistaken for a fresh capture and re-parked. Streaming
+            # resumes only after Restore removes snapshot.mode=handoff.
+            self._delete_handoff_token(table)
+            return iter(()), dict(effective_start)
+        if not effective_start:
+            token = self._read_handoff_token(table)
+            if token is not None:
+                return iter(()), self._handoff_seed_from_token(table, token)
+            raise InformixError(
+                f"snapshot.mode=handoff for '{table.exposed_name}' has no checkpoint to "
+                "record and no parked token: the flow has not reached a hand-off-able "
+                "position. Run it without snapshot.mode=handoff until it is streaming (or "
+                "mid initial snapshot), then apply handoff so it parks its offset -- or "
+                "start fresh with snapshot.mode=cdc_only (no history) or "
+                "snapshot.mode=initial (full snapshot)."
+            )
+        # A stream-phase offset, or a blocking initial snapshot parked mid-serve
+        # (phase=="snapshot"): both are portable, so park the offset as the token and
+        # stop. A snapshot offset's staged pages stay under this (capturing) scope; the
+        # cutover records that scope on stage_scope so the new flow can read them, and
+        # after Restore finishes the snapshot from the parked page_index before streaming.
+        self._write_handoff_token(table, effective_start)
+        return iter(()), dict(effective_start)
+
+    def _read_handoff_deletes(
+        self,
+        table_name: str,
+        effective_start: dict,
+        options: dict[str, str],
+        bootstrap_offset: dict,
+    ) -> tuple[Iterator[dict], dict]:
+        """Delete-channel side of snapshot.mode=handoff.
+
+        Mirrors :meth:`_read_handoff` on the independently checkpointed delete reader,
+        so a keyed relocation that keeps its ``scd_type`` records the delete position
+        across the seam too -- so that, after Restore, the delete reader resumes at
+        *exactly* where the old flow's delete reader stopped, rather than restarting from
+        the upsert boundary (which could skip deletes that lay between the two readers'
+        independent positions). Like :meth:`_read_handoff`, it never streams: it records a
+        checkpoint, emits no rows, and stops. The delete token uses a separate channel
+        from the upsert token.
+
+        The SCD1->append switch has no delete flow at all, so this is only reached for
+        a table that keeps a delete channel; a snapshot-only or append table freezes.
+        """
+
+        table = self._table(table_name, options)
+        if self._append_only_table(table, options) or not _cdc_capable(table):
+            # No delete channel to hand off; freeze at the current offset like any other
+            # handoff read so the flow stops without advancing.
+            return iter(()), dict(effective_start)
+        if effective_start and effective_start.get("handoff_seeded"):
+            # Seed committed: drop the delete-channel token and stop, like _read_handoff.
+            # Keep the marker so a later read is not mistaken for a capture and re-parked.
+            self._delete_handoff_token(table, _HANDOFF_CHANNEL_DELETE)
+            return iter(()), dict(effective_start)
+        if not effective_start:
+            token = self._read_handoff_token(table, _HANDOFF_CHANNEL_DELETE)
+            if token is not None:
+                return iter(()), self._handoff_seed_from_token(table, token)
+            # No parked delete position (e.g. capture ran before the delete reader had a
+            # checkpoint): fall back to the ordinary bootstrap, which adopts the upsert
+            # channel's newly published boundary under this flow's scope.
+            return self._read_table_deletes(
+                table_name,
+                effective_start,
+                options,
+                snapshot_mode="cdc_only",
+                bootstrap_offset=bootstrap_offset,
+            )
+        if effective_start.get("phase") == "stream":
+            self._write_handoff_token(table, effective_start, _HANDOFF_CHANNEL_DELETE)
+        return iter(()), dict(effective_start)
+
     def _read_cdc_only(self, table: Table, options: dict[str, str]) -> tuple[Iterator[dict], dict]:
         """Establish a schema-safe CDC boundary without reading existing rows."""
 
@@ -7713,7 +8007,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         manifest: dict[str, Any],
         page_index: int,
         checkpoint: dict | None = None,
+        *,
+        stage_scope: str | None = None,
     ) -> tuple[Iterator[dict], dict]:
+        # stage_scope is where the pages physically live (the capturing flow's scope for
+        # a handoff relocation); pipeline_scope is this flow's own scope, stamped on the
+        # emitted offsets. They coincide for every non-handoff serve.
+        stage_scope = stage_scope or pipeline_scope
         page_count = int(manifest["page_count"])
         snapshot_lsn = _strict_lsn(manifest["snapshot_lsn"], "snapshot_lsn")
         if page_index < 0 or page_index >= page_count:
@@ -7724,7 +8024,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # integrity-verified eagerly, and rows are yielded one at a time by the
         # returned generator, so the whole-page object graph is never materialized.
         header, rows = self._stream_staged_page(
-            table, pipeline_scope, schema_id, snapshot_lsn, page_index
+            table, stage_scope, schema_id, snapshot_lsn, page_index
         )
         if _strict_lsn(header.get("snapshot_lsn"), "snapshot_lsn") != snapshot_lsn:
             raise InformixError(f"Staged snapshot boundary mismatch for '{table.exposed_name}'")
@@ -7734,7 +8034,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # no longer required. Keep the current page and manifest intact.
         self._cleanup_consumed_snapshot_stage_pages(
             table,
-            pipeline_scope,
+            stage_scope,
             schema_id,
             snapshot_lsn,
             page_index,
@@ -7761,6 +8061,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     "snapshot": {"last_pk": last_pk, "page_index": next_page},
                 }
             )
+            # Carry stage_scope forward so the next microbatch still finds the pages under
+            # the capturing scope; it is dropped at the stream transition (else branch),
+            # after which the offset is an ordinary new-scope stream offset.
+            if stage_scope != pipeline_scope:
+                end["stage_scope"] = stage_scope
             # Staged pages remain, so work outstanding is a certainty rather than
             # an estimate. Carrying the streak here keeps a mid-snapshot reader
             # ranked above an idle one while it competes for slots; the streak is
@@ -8353,9 +8658,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 or _PIPELINE_SCOPE.fullmatch(pipeline_scope) is None
             ):
                 pipeline_scope = self._pipeline_scope(checkpoint)
+            # For a handoff relocation the pages live under the *capturing* flow's scope,
+            # carried on stage_scope; the offset's own pipeline_scope is already the new
+            # flow's. stage_scope drives the manifest and page reads; pipeline_scope drives
+            # the emitted offsets. Absent stage_scope, the two coincide (unchanged).
+            stage_scope = checkpoint.get("stage_scope")
+            if not isinstance(stage_scope, str) or _PIPELINE_SCOPE.fullmatch(stage_scope) is None:
+                stage_scope = pipeline_scope
             high_water = int(checkpoint["snapshot_lsn"])
             schema_id = str(checkpoint["schema_id"])
-            manifest = self._read_snapshot_stage_manifest(table, pipeline_scope, schema_id)
+            manifest = self._read_snapshot_stage_manifest(table, stage_scope, schema_id)
             if manifest is None:
                 raise InformixError(
                     f"Incremental snapshot state for '{table.exposed_name}' is missing; "
@@ -8367,7 +8679,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 )
             page_index = int(checkpoint["snapshot"].get("page_index", -1))
             return self._staged_snapshot_result(
-                table, pipeline_scope, schema_id, manifest, page_index, checkpoint
+                table,
+                pipeline_scope,
+                schema_id,
+                manifest,
+                page_index,
+                checkpoint,
+                stage_scope=stage_scope,
             )
         else:
             consistent_snapshot = getattr(self._bridge, "consistent_snapshot", None)
@@ -8595,6 +8913,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             uses one forward-only cursor and one REPEATABLE READ transaction. Fetched
             rows are written to immutable staged pages and become visible only after
             the completed snapshot manifest is published.
+
+        ``handoff``
+            Record a checkpoint from the offset a prior flow parked in Lakebase
+            (see _read_handoff), emit no rows, and stop -- skipping the snapshot
+            entirely. Used to switch a table SCD1->append-only, or relocate its
+            destination, without a re-snapshot. Handoff never streams; removing
+            snapshot.mode=handoff (Restore) resumes streaming from the recorded
+            offset, and _recover's strict ``commit_lsn > C`` filter keeps the seam
+            gapless and duplicate-free.
         """
 
         _ensure_materializable(table, options)
@@ -8604,11 +8931,32 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         snapshot_mode = (
             "cdc_only" if configured_mode is None else str(configured_mode).strip().lower()
         )
-        if snapshot_mode not in {"initial", "cdc_only"}:
+        if snapshot_mode not in {"initial", "cdc_only", "handoff"}:
             raise ValueError(
                 f"Append-only table '{table.exposed_name}' supports only "
-                "snapshot.mode=initial or snapshot.mode=cdc_only"
+                "snapshot.mode=initial, snapshot.mode=cdc_only, or snapshot.mode=handoff"
             )
+
+        if snapshot_mode == "handoff":
+            token = self._read_handoff_token(table)
+            if token is None:
+                raise InformixError(
+                    f"snapshot.mode=handoff for '{table.exposed_name}' found no parked "
+                    "checkpoint in Lakebase. Before switching a table to append-only (or "
+                    "relocating it), run its source flow once in triggered mode with "
+                    "snapshot.mode=handoff so it parks its stream offset, then switch. To "
+                    "start fresh instead, use snapshot.mode=cdc_only (no history) or "
+                    "snapshot.mode=initial (full snapshot)."
+                )
+            # Seed from the parked position and stop (no rows); handoff never streams.
+            # Adopts this flow's scope -- the seam is carried by the scope-independent LSNs,
+            # and the first stream read (after Restore removes handoff) re-publishes the
+            # scoped channel-start record under the new scope. Schema drift since capture
+            # fails closed inside the helper. The token is not deleted here -- it is dropped
+            # only once Spark has committed this seed (see the append+stream branch in
+            # _read_table_attempt), so a crash before commit re-seeds rather than failing
+            # closed.
+            return iter(()), self._handoff_seed_from_token(table, token)
 
         if snapshot_mode == "initial":
             return self._read_snapshot(table, start, options, allow_keyless=True)
@@ -10300,6 +10648,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     ) -> None:
         """Clean obsolete scopes without deleting state referenced by Spark."""
 
+        if checkpoint and checkpoint.get("stage_scope"):
+            # A handoff relocation is still serving staged pages that live under the
+            # capturing flow's scope (carried on stage_scope). That scope's records --
+            # the snapshot manifest above all -- must survive until the serve completes,
+            # so skip obsolete-scope cleanup while it is present. Not cached, so normal
+            # cleanup resumes on the first read after the stream transition drops it.
+            return
         current = self._pipeline_scope()
         cache_key = (table.identity, current)
         if cache_key in self._cleaned_update_scopes or "_@_" not in current:
@@ -11702,6 +12057,18 @@ def _validated_offset(offset: dict[str, Any]) -> dict[str, Any]:
             "Informix offset has an invalid pipeline_scope; run a full refresh with this "
             "connector version"
         )
+    # stage_scope, when present, redirects a handoff relocation's staged-page reads to
+    # the capturing flow's scope. Only valid on a snapshot-phase offset (it is dropped at
+    # the stream transition) and must be a well-formed scope.
+    stage_scope = result.get("stage_scope")
+    if stage_scope is not None:
+        if not isinstance(stage_scope, str) or _PIPELINE_SCOPE.fullmatch(stage_scope) is None:
+            raise ValueError(
+                "Informix offset has an invalid stage_scope; run a full refresh with this "
+                "connector version"
+            )
+        if phase != "snapshot":
+            raise ValueError("Informix offset stage_scope requires the snapshot phase")
     trigger_generation = result.get("trigger_generation")
     if trigger_generation is not None and (
         not isinstance(trigger_generation, str)
