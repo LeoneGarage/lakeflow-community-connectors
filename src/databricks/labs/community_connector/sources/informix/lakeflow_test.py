@@ -5826,6 +5826,33 @@ class LakeflowContractTests(unittest.TestCase):
                 "app.orders", _stream_offset(125), {"snapshot.mode": "handoff"}
             )
 
+    def test_migration_capture_on_an_append_flow_parks_the_token(self):
+        # Relocating an already-append table: the capture side is itself an append flow, so
+        # it must PARK its stream offset -- not drop it, as the SCD1->append cutover-commit
+        # does. Capture vs committed-seed is told apart by the handoff_seeded marker (absent
+        # on capture). Regression: the append+stream branch used to drop unconditionally, so
+        # capturing an append table parked nothing and the cutover then found no token.
+        bridge = FakeBridge()
+        append_migrate = {"table.migration": "true", "append.only.ingestion": "true"}
+
+        rows, offset = self.connector(bridge).read_table(
+            "app.orders", _stream_offset(125), append_migrate
+        )
+        # Record-and-stop: no rows, same offset, token parked on the upsert channel.
+        self.assertEqual(list(rows), [])
+        self.assertEqual(offset["commit_lsn"], "125")
+        self.assertEqual(len(self._lakebase.database.handoff), 1)
+        (_, _, channel), token = next(iter(self._lakebase.database.handoff.items()))
+        self.assertEqual(channel, 0)
+        self.assertEqual(json.loads(token["offset_json"])["commit_lsn"], "125")
+
+        # Cutover: a fresh append flow (new destination, empty checkpoint) seeds from it.
+        rows2, seed = self.connector(bridge).read_table("app.orders", {}, append_migrate)
+        self.assertEqual(list(rows2), [])
+        self.assertEqual(seed["phase"], "stream")
+        self.assertEqual(seed["commit_lsn"], "125")
+        self.assertTrue(seed.get("handoff_seeded"))
+
     def test_handoff_cutover_seeds_from_parked_offset_without_snapshot(self):
         bridge = FakeBridge()
         # Capture on the still-keyed flow.
