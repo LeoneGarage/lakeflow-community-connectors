@@ -61,7 +61,7 @@ TABLES = [
     "tw316_ovhc",
 ]
 
-WAREHOUSE = "d89a8d7e553b80fd"
+WAREHOUSE = "fdd50316baff6701"
 
 
 def make_args(instance_id: str) -> argparse.Namespace:
