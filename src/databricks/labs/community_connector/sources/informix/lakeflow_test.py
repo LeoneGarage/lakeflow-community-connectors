@@ -2240,6 +2240,120 @@ class LakeflowContractTests(unittest.TestCase):
         with self.assertRaisesRegex(InformixError, "cleanup failed"):
             bridge.validate_initial_lsn({"identity": "demo:app.orders", "columns": ["id"]}, 80)
 
+    def test_initial_lsn_validation_retries_a_transient_primary_timeout(self):
+        # A socket-read timeout during the primary open/start/activate calls is transient
+        # syscdcv1 contention under a startup storm, not a real failure: validate_initial_lsn
+        # resets the transport and retries with backoff, and a later attempt succeeds. The
+        # dead-socket teardown is skipped on a timed-out attempt (only the succeeding attempt
+        # tears its session down), so a retry does not pay a second timeout on cleanup.
+        class FlakyActivateTransport:
+            def __init__(self):
+                self.socket_timeout = 30.0
+                self.activate_attempts = 0
+                self.endcapture_calls = 0
+
+            def set_socket_timeout(self, timeout):
+                self.socket_timeout = timeout
+
+            def execute(self, sql, parameters=()):
+                if "sysenv" in sql:
+                    return [{"env_value": "demo_server"}]
+                if "cdc_opensess" in sql:
+                    return [{"session_id": 7}]
+                if "cdc_activatesess" in sql:
+                    self.activate_attempts += 1
+                    if self.activate_attempts <= 2:
+                        raise TimeoutError("The read operation timed out")
+                    return [{"status": 0}]
+                if "cdc_endcapture" in sql:
+                    self.endcapture_calls += 1
+                return [{"status": 0}]
+
+        transport = FlakyActivateTransport()
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.transport = transport
+        bridge.options = {}
+        reset_calls = []
+        bridge.reset_transport = lambda: reset_calls.append(True)
+
+        with mock.patch.object(informix_module.time, "sleep", lambda *_: None):
+            bridge.validate_initial_lsn({"identity": "demo:app.orders", "columns": ["id"]}, 80)
+
+        self.assertEqual(transport.activate_attempts, 3)  # two timeouts, then success
+        self.assertEqual(reset_calls, [True, True])  # one transport reset per timed-out attempt
+        self.assertEqual(transport.endcapture_calls, 1)  # teardown only on the succeeding attempt
+
+    def test_initial_lsn_validation_reraises_an_exhausted_primary_timeout(self):
+        # If the primary calls keep timing out past the retry budget, validate_initial_lsn
+        # stops retrying and re-raises so a genuinely-unreachable source fails honestly.
+        class AlwaysTimeoutTransport:
+            def __init__(self):
+                self.socket_timeout = 30.0
+                self.activate_attempts = 0
+
+            def set_socket_timeout(self, timeout):
+                self.socket_timeout = timeout
+
+            def execute(self, sql, parameters=()):
+                if "sysenv" in sql:
+                    return [{"env_value": "demo_server"}]
+                if "cdc_opensess" in sql:
+                    return [{"session_id": 7}]
+                if "cdc_activatesess" in sql:
+                    self.activate_attempts += 1
+                    raise TimeoutError("The read operation timed out")
+                return [{"status": 0}]
+
+        transport = AlwaysTimeoutTransport()
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.transport = transport
+        bridge.options = {}
+        bridge.reset_transport = lambda: None
+
+        with (
+            mock.patch.object(informix_module.time, "sleep", lambda *_: None),
+            self.assertRaises(TimeoutError),
+        ):
+            bridge.validate_initial_lsn({"identity": "demo:app.orders", "columns": ["id"]}, 80)
+
+        # One initial attempt plus the full retry budget, then it gives up.
+        self.assertEqual(
+            transport.activate_attempts, informix_module._VALIDATE_LSN_RETRY_MAX_RETRIES + 1
+        )
+
+    def test_initial_lsn_validation_does_not_retry_a_non_timeout_primary_error(self):
+        # A server-returned failure (nonzero cdc_startcapture) is a real error, not transient
+        # contention, so it is raised on the first attempt without any retry.
+        class BadStartTransport:
+            def __init__(self):
+                self.start_attempts = 0
+
+            def set_socket_timeout(self, timeout):
+                pass
+
+            def execute(self, sql, parameters=()):
+                if "sysenv" in sql:
+                    return [{"env_value": "demo_server"}]
+                if "cdc_opensess" in sql:
+                    return [{"session_id": 7}]
+                if "cdc_startcapture" in sql:
+                    self.start_attempts += 1
+                    return [{"status": -1}]  # non-timeout server failure
+                return [{"status": 0}]
+
+        transport = BadStartTransport()
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.transport = transport
+        bridge.options = {}
+        reset_calls = []
+        bridge.reset_transport = lambda: reset_calls.append(True)
+
+        with self.assertRaisesRegex(InformixError, "cdc_startcapture"):
+            bridge.validate_initial_lsn({"identity": "demo:app.orders", "columns": ["id"]}, 80)
+
+        self.assertEqual(transport.start_attempts, 1)  # no retry
+        self.assertEqual(reset_calls, [])
+
     def test_initial_lsn_validation_extends_and_restores_socket_timeout(self):
         class TimedTransport:
             def __init__(self):
