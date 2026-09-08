@@ -6214,6 +6214,16 @@ def register_lakeflow_source(spark):
     _CDC_RECONNECT_MAX_RETRIES = 4
     _CDC_RECONNECT_BASE_SECONDS = 0.5
     _CDC_RECONNECT_MAX_SECONDS = 8.0
+    # Initial-LSN validation (cdc_opensess/startcapture/activatesess) can have its socket read
+    # time out under a startup storm -- many flows opening CDC sessions against syscdcv1 at
+    # once. That is transient contention, not a real validation failure, so a few bounded
+    # attempts with short backoff -- reconnecting a fresh transport between them -- ride it
+    # out; exhausting them re-raises so a genuinely-unreachable source still fails. Timeout-
+    # only: a server error (a nonzero cdc_* return, a negative session id) is a real failure
+    # and is never retried.
+    _VALIDATE_LSN_RETRY_MAX_RETRIES = 4
+    _VALIDATE_LSN_RETRY_BASE_SECONDS = 0.5
+    _VALIDATE_LSN_RETRY_MAX_SECONDS = 8.0
     # The incremental-snapshot page and key-bound reads drop their connection the same
     # way (a "truncated SQLI stream" EOF from an idle NLB/PrivateLink reset or a
     # server-side session reap), and recover the same way: each read advances no offset
@@ -7954,7 +7964,46 @@ def register_lakeflow_source(spark):
 
         @_serialized_sqli_operation
         def validate_initial_lsn(self, capture: dict[str, Any], start_lsn: int) -> None:
-            """Validate CDC registration/activation without reading LODATA records."""
+            """Validate CDC registration/activation without reading LODATA records.
+
+            Retries on a socket-read *timeout*, which under a startup storm (many flows
+            opening CDC sessions against syscdcv1 at once) is transient contention rather
+            than a real validation failure. Each attempt reconnects a fresh transport;
+            bounded attempts with short backoff ride out the storm, and exhausting them
+            re-raises so a genuinely-unreachable source still fails honestly. A non-timeout
+            failure (a nonzero cdc_* return, a negative session id) is a real error and is
+            never retried. Idempotent: each attempt opens its own CDC session, and the
+            server reclaims an abandoned one on its own.
+            """
+
+            attempt = 0
+            while True:
+                try:
+                    self._validate_initial_lsn_once(capture, start_lsn)
+                    return
+                except Exception as error:  # pylint: disable=broad-except
+                    if not _is_timeout_error(error) or attempt >= _VALIDATE_LSN_RETRY_MAX_RETRIES:
+                        raise
+                    delay = min(
+                        _VALIDATE_LSN_RETRY_BASE_SECONDS * (2**attempt),
+                        _VALIDATE_LSN_RETRY_MAX_SECONDS,
+                    )
+                    logging.getLogger(__name__).warning(
+                        "Informix CDC initial-LSN validation timed out (%s); resetting the "
+                        "transport and retrying (attempt %d/%d) after %.1fs. Raise "
+                        "cdc.read.timeout.seconds or reduce concurrent CDC sessions if this recurs.",
+                        error,
+                        attempt + 1,
+                        _VALIDATE_LSN_RETRY_MAX_RETRIES,
+                        delay,
+                        exc_info=True,
+                    )
+                    self.reset_transport()
+                    time.sleep(delay)
+                    attempt += 1
+
+        def _validate_initial_lsn_once(self, capture: dict[str, Any], start_lsn: int) -> None:
+            """One attempt of :meth:`validate_initial_lsn` (which owns the retry policy)."""
 
             self._ensure_connected()
 
@@ -8004,68 +8053,94 @@ def register_lakeflow_source(spark):
                 primary_error = error
                 raise
             finally:
-                cleanup_errors = []
-                cleanup_timed_out = False
-                if started:
-                    try:
-                        _expect_zero(
-                            self.transport.execute(
-                                f"EXECUTE FUNCTION {cdc_routine('cdc_endcapture')}(?, 0, ?)",
-                                (session, native),
-                            ),
-                            "cdc_endcapture",
-                        )
-                    except Exception as error:
-                        cleanup_errors.append(error)
-                        cleanup_timed_out = cleanup_timed_out or _is_timeout_error(error)
+                if primary_error is None or not _is_timeout_error(primary_error):
+                    self._teardown_validation_session(
+                        started,
+                        session,
+                        native,
+                        primary_error,
+                        set_socket_timeout,
+                        previous_socket_timeout,
+                    )
+                # else: the socket is mid-read on a timed-out CDC session. Skip teardown --
+                # issuing it on a dead socket would only time out again, tripling this
+                # attempt's cost. validate_initial_lsn resets the transport and retries; the
+                # server reclaims the abandoned session on its own.
+
+        def _teardown_validation_session(
+            self,
+            started: bool,
+            session: int,
+            native: str,
+            primary_error: BaseException | None,
+            set_socket_timeout,
+            previous_socket_timeout,
+        ) -> None:
+            """Best-effort teardown for :meth:`_validate_initial_lsn_once`.
+
+            The purpose of the validation -- proving the CDC boundary registers and
+            activates -- is already met once activation succeeds (``primary_error`` is
+            None). cdc_endcapture/cdc_closesess are best-effort: the server reclaims an
+            abandoned CDC session on its own, and the validation returns no value derived
+            from them. A teardown that merely *times out* under heavy syscdcv1 load must not
+            fail an otherwise-successful validation -- doing so was observed wedging a flow
+            (e.g. tw101) purely on a slow teardown. Poison the transport so the next use
+            reconnects rather than resuming a half-torn-down session, and treat it as
+            non-fatal. A non-timeout cleanup failure, or any failure alongside a real primary
+            error, is still surfaced.
+            """
+
+            cleanup_errors = []
+            cleanup_timed_out = False
+            if started:
                 try:
                     _expect_zero(
                         self.transport.execute(
-                            f"EXECUTE FUNCTION {cdc_routine('cdc_closesess')}(?)", (session,)
+                            f"EXECUTE FUNCTION {cdc_routine('cdc_endcapture')}(?, 0, ?)",
+                            (session, native),
                         ),
-                        "cdc_closesess",
+                        "cdc_endcapture",
                     )
                 except Exception as error:
                     cleanup_errors.append(error)
                     cleanup_timed_out = cleanup_timed_out or _is_timeout_error(error)
-                if set_socket_timeout is not None and previous_socket_timeout is not None:
-                    try:
-                        set_socket_timeout(float(previous_socket_timeout))
-                    except Exception as error:
-                        cleanup_errors.append(error)
-                # The purpose of this method -- proving the CDC boundary registers and
-                # activates -- is already met once activation succeeds (primary_error is
-                # None). cdc_endcapture/cdc_closesess are best-effort teardown: the server
-                # reclaims an abandoned CDC session on its own, and this method returns no
-                # value derived from them. A teardown that merely *times out* under heavy
-                # syscdcv1 load (many tables opening CDC sessions at once) must not fail an
-                # otherwise-successful validation -- doing so was observed wedging a flow
-                # (e.g. tw101) purely on a slow teardown. Poison the transport so the next
-                # use reconnects rather than resuming a half-torn-down session, and treat it
-                # as non-fatal. A non-timeout cleanup failure, or any failure alongside a
-                # real primary error, is still surfaced.
-                if cleanup_errors and primary_error is None:
-                    if cleanup_timed_out and all(_is_timeout_error(e) for e in cleanup_errors):
-                        # The socket is mid-read on a half-torn-down CDC session; drop the
-                        # transport so the next operation reconnects instead of resuming it,
-                        # keeping the connection slot (this is not a capacity problem).
-                        reset_transport = getattr(self, "reset_transport", None)
-                        if callable(reset_transport):
-                            reset_transport()
-                        logging.getLogger(__name__).warning(
-                            "Informix CDC validation succeeded but session teardown timed out; "
-                            "treating as non-fatal and reconnecting. Raise cdc.read.timeout.seconds "
-                            "or reduce concurrent CDC sessions if this recurs.",
-                            exc_info=cleanup_errors[0],
-                        )
-                        return
-                    raise InformixError("Initial CDC validation cleanup failed") from cleanup_errors[0]
-                if cleanup_errors and primary_error is not None:
-                    for error in cleanup_errors:
-                        add_informix_exception_note(
-                            primary_error,
-                            f"Initial Informix CDC validation cleanup also failed: {error}",
-                        )
+            try:
+                _expect_zero(
+                    self.transport.execute(
+                        f"EXECUTE FUNCTION {cdc_routine('cdc_closesess')}(?)", (session,)
+                    ),
+                    "cdc_closesess",
+                )
+            except Exception as error:
+                cleanup_errors.append(error)
+                cleanup_timed_out = cleanup_timed_out or _is_timeout_error(error)
+            if set_socket_timeout is not None and previous_socket_timeout is not None:
+                try:
+                    set_socket_timeout(float(previous_socket_timeout))
+                except Exception as error:
+                    cleanup_errors.append(error)
+            if cleanup_errors and primary_error is None:
+                if cleanup_timed_out and all(_is_timeout_error(e) for e in cleanup_errors):
+                    # The socket is mid-read on a half-torn-down CDC session; drop the
+                    # transport so the next operation reconnects instead of resuming it,
+                    # keeping the connection slot (this is not a capacity problem).
+                    reset_transport = getattr(self, "reset_transport", None)
+                    if callable(reset_transport):
+                        reset_transport()
+                    logging.getLogger(__name__).warning(
+                        "Informix CDC validation succeeded but session teardown timed out; "
+                        "treating as non-fatal and reconnecting. Raise cdc.read.timeout.seconds "
+                        "or reduce concurrent CDC sessions if this recurs.",
+                        exc_info=cleanup_errors[0],
+                    )
+                    return
+                raise InformixError("Initial CDC validation cleanup failed") from cleanup_errors[0]
+            if cleanup_errors and primary_error is not None:
+                for error in cleanup_errors:
+                    add_informix_exception_note(
+                        primary_error,
+                        f"Initial Informix CDC validation cleanup also failed: {error}",
+                    )
 
         @_serialized_sqli_operation
         def snapshot_page(
