@@ -400,6 +400,8 @@ connection:
         when `stream.partitioned=true`. Larger values read more pages in parallel per
         microbatch at the cost of a larger batch; the driver reads one boundary page's
         header per microbatch to record the resume cursor, independent of this value.
+        The same window also governs a `snapshot.source` (`.unl`) serve: it advances that
+        many byte splits per microbatch, making the file snapshot resumable mid-way.
 
     - name: snapshot.staging.transport
       type: string
@@ -470,6 +472,52 @@ connection:
         To move a table to a new flow without re-snapshotting, keep its snapshot.mode
         and set `table.migration=true` instead (see that option). The extension modes
         `configuration_based` and `custom` are not supported.
+
+    - name: snapshot.source
+      type: string
+      required: false
+      description: >
+        Per-table UC Volume directory of Informix UNLOAD (`.unl` or gzip `.unl.gz`)
+        extract files, also accepted at connection scope. When set (with
+        `snapshot.mode=initial`) the table's initial snapshot is served from those files
+        instead of a live repeatable-read scan of the source, then transitions to the CDC
+        stream at the boundary the connector pins itself -- no operator-supplied LSN and no
+        schema fingerprint. The files must be Informix UNLOAD-delimited (`|` delimiter,
+        backslash escaping, empty field = NULL); parallel executor reads use ranged GETs
+        over the Files REST API and split each plain file into ~`snapshot.split.bytes`
+        pieces at record boundaries. A gzip file (detected by its `1f 8b` magic bytes, not
+        its name) is not seekable, so it is one non-splittable unit -- parallelism and
+        mid-snapshot resume for compressed extracts come from using multiple `.unl.gz`
+        files, not from splitting within one. The operator is responsible for the extract
+        reflecting the table at ingest time (quiesce, or extract-then-ingest); the
+        connector does not verify alignment. Reads via UNLOAD/HPL host-side tools are
+        Phase A and out of the connector's scope.
+
+    - name: snapshot.split.bytes
+      type: string
+      required: false
+      description: >
+        Per-table target byte size for each parallel `.unl` split, also accepted at
+        connection scope; a positive integer, default 52428800 (50 MiB). Each executor
+        reads roughly this many bytes, snapped up to the next record boundary, so a
+        large extract fans out into byte-balanced pieces. Splitting by bytes rather than
+        rows lets the connector plan splits with a few small reads instead of scanning
+        the whole file. Only meaningful with `snapshot.source`.
+
+    - name: snapshot.boundary.lsn
+      type: string
+      required: false
+      description: >
+        Per-table operator-supplied CDC boundary LSN for a `snapshot.source` extract,
+        also accepted at connection scope; a non-negative integer. The LSN the extract
+        was taken at, so the CDC stream resumes at exactly that position
+        (`initial_lsn == snapshot_lsn == this`). Resolution per table, first hit wins:
+        this option; else a `_manifest.json` in the `snapshot.source` directory with a
+        `{"boundary_lsn": "<X>"}` field (other keys ignored); else the connector
+        self-pins its own registration LSN. A supplied boundary is validated against the
+        source's retained/current log range (below the minimum retained LSN means the
+        logical log recycled past it -- a gap -- and fails closed). Only meaningful with
+        `snapshot.source`.
 
     - name: table.migration
       type: string
@@ -1087,4 +1135,4 @@ connection:
 
 # Exact per-table overrides consumed by the connector. `qualified_source_table` maps a
 # pipeline table to a dynamically discovered exposed name (`owner.table`).
-external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
+external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"

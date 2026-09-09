@@ -12951,5 +12951,546 @@ class AsyncStagePipelineTests(unittest.TestCase):
         pipeline.close()
 
 
+class UnloadHelperTests(unittest.TestCase):
+    """Pure-function tests for the UNLOAD parser, typed converter, and splitter."""
+
+    @staticmethod
+    def _reader(data: bytes):
+        return lambda offset, length: data[offset : offset + length]
+
+    def test_parse_unload_fields_handles_delimiter_escapes_and_terminator(self):
+        parse = informix_module._parse_unload_fields
+        # Trailing terminator delimiter yields no spurious field; a line without one
+        # still yields its last field.
+        self.assertEqual(parse("a|b|"), ["a", "b"])
+        self.assertEqual(parse("a|b"), ["a", "b"])
+        # Escaped delimiter and newline stay inside the field.
+        self.assertEqual(parse("a\\|b|c|"), ["a|b", "c"])
+        self.assertEqual(parse("x\\ny|"), ["x\ny"])
+        # An empty (NULL) field is preserved as "".
+        self.assertEqual(parse("|a|"), ["", "a"])
+
+    def test_unload_value_maps_types_and_empty_to_none(self):
+        value = informix_module._unload_value
+        self.assertIsNone(value("", "INTEGER"))
+        self.assertEqual(value("42", "INTEGER"), 42)
+        self.assertEqual(value("3.14", "DECIMAL(6,2)"), Decimal("3.14"))
+        self.assertEqual(value("2.5", "FLOAT"), 2.5)
+        self.assertEqual(value("2024-01-15", "DATE"), date(2024, 1, 15))
+        self.assertEqual(
+            value("2024-01-15 10:30:00", "DATETIME YEAR TO SECOND"),
+            datetime(2024, 1, 15, 10, 30, 0),
+        )
+        self.assertTrue(value("t", "BOOLEAN"))
+        self.assertFalse(value("f", "BOOLEAN"))
+        self.assertEqual(value("hello", "VARCHAR"), "hello")
+
+    def test_unl_byte_splits_cover_every_record_exactly_once(self):
+        # The correctness gate: splits must tile [0,size) with no gap/overlap, each split
+        # must end right after a newline (records never span a boundary), and their union
+        # must be every record exactly once -- across empty, single, and multi-record
+        # sizes, with a tiny target/chunk so boundary-snapping crosses chunks.
+        for count in (0, 1, 3, 6, 7):
+            data = b"".join(b"row-%03d|\n" % i for i in range(count))
+            reader = self._reader(data)
+            splits = informix_module._unl_byte_splits(
+                reader, len(data), target_bytes=10, chunk_bytes=3
+            )
+            if splits:
+                self.assertEqual(splits[0][0], 0)
+                self.assertEqual(splits[-1][1], len(data))
+                for (_, end), (start, _) in zip(splits, splits[1:]):
+                    self.assertEqual(end, start)  # contiguous, no gap/overlap
+                    self.assertEqual(data[end - 1 : end], b"\n")  # boundary after a newline
+            records = []
+            for start, end in splits:
+                records.extend(informix_module._iter_unl_records(reader, start, end, chunk_bytes=4))
+            self.assertEqual(records, [b"row-%03d|" % i for i in range(count)])
+
+    def test_unl_byte_splits_target_bounds_the_split_size(self):
+        # A ~10-byte target over 8-byte records ("row-NNN|\n") cuts one record per split.
+        data = b"".join(b"row-%03d|\n" % i for i in range(5))
+        reader = self._reader(data)
+        splits = informix_module._unl_byte_splits(reader, len(data), target_bytes=1, chunk_bytes=64)
+        # target=1 snaps to the very next newline, so every record is its own split.
+        self.assertEqual(len(splits), 5)
+        self.assertTrue(all(end - start == 9 for start, end in splits))
+
+    def test_unl_byte_splits_include_a_trailing_unterminated_record(self):
+        data = b"a|\nb|"  # second record has no trailing newline
+        reader = self._reader(data)
+        splits = informix_module._unl_byte_splits(reader, len(data), target_bytes=1, chunk_bytes=3)
+        records = []
+        for start, end in splits:
+            records.extend(list(informix_module._iter_unl_records(reader, start, end)))
+        self.assertEqual(records, [b"a|", b"b|"])
+
+    def test_unl_file_is_gzip_detects_magic_bytes(self):
+        is_gzip = informix_module._unl_file_is_gzip
+        self.assertTrue(is_gzip(self._reader(gzip.compress(b"1|a|\n"))))
+        self.assertFalse(is_gzip(self._reader(b"1|a|\n")))
+        self.assertFalse(is_gzip(self._reader(b"")))  # empty file is not gzip
+
+    def test_iter_gzip_unl_records_matches_the_plain_iterator(self):
+        # Round-trip: the records decompressed from a gzipped .unl equal the records the
+        # plain iterator yields on the same bytes -- across a trailing unterminated record
+        # and a chunk size far smaller than the payload so decompression crosses chunks.
+        for data in (
+            b"",
+            b"1|a|\n",
+            b"1|a|\n2|b|\n3|c|",
+            b"".join(b"r-%03d|\n" % i for i in range(20)),
+        ):
+            compressed = gzip.compress(data)
+            gz = list(
+                informix_module._iter_gzip_unl_records(
+                    self._reader(compressed), len(compressed), chunk_bytes=4
+                )
+            )
+            plain = list(informix_module._iter_unl_records(self._reader(data), 0, len(data)))
+            self.assertEqual(gz, plain, data)
+
+    def test_iter_gzip_unl_records_handles_concatenated_members(self):
+        # `cat a.gz b.gz` -> two gzip members; the reader must decode both, in order.
+        compressed = gzip.compress(b"1|a|\n2|b|\n") + gzip.compress(b"3|c|\n4|d|\n")
+        records = list(
+            informix_module._iter_gzip_unl_records(
+                self._reader(compressed), len(compressed), chunk_bytes=5
+            )
+        )
+        self.assertEqual(records, [b"1|a|", b"2|b|", b"3|c|", b"4|d|"])
+
+
+class UnloadSnapshotSourceTests(LakeflowContractTests):
+    """End-to-end serial serve of a `.unl` snapshot source (offline, FakeBridge)."""
+
+    def _source(self, *lines: str) -> str:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        for index, content in enumerate(lines):
+            with open(os.path.join(directory.name, f"part-{index:03d}.unl"), "w") as handle:
+                handle.write(content)
+        return directory.name
+
+    def _gzip_source(self, *files: str) -> str:
+        """A source dir whose `.unl.gz` files hold the given (already-joined) contents."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        for index, content in enumerate(files):
+            path = os.path.join(directory.name, f"part-{index:03d}.unl.gz")
+            with open(path, "wb") as handle:
+                handle.write(gzip.compress(content.encode()))
+        return directory.name
+
+    def test_unl_source_serves_shaped_rows_and_transitions_to_stream(self):
+        source = self._source("1|alpha|\n2|beta|\n")
+        rows, offset = self.connector(FakeBridge()).read_table(
+            "app.orders", {}, {"snapshot.source": source}
+        )
+        rows = list(rows)
+        # Straight to the stream phase at the connector-pinned boundary (FakeBridge
+        # current_lsn = 90), exactly like a completed live snapshot.
+        self.assertEqual(offset["phase"], "stream")
+        self.assertEqual(offset["commit_lsn"], "90")
+        self.assertEqual([(row["id"], row["value"]) for row in rows], [(1, "alpha"), (2, "beta")])
+        for row in rows:
+            self.assertEqual(row[informix_module.OP], "r")
+            self.assertIsNone(row[informix_module.TX_ID])
+            self.assertEqual(row[informix_module.COMMIT_LSN], informix_module._sortable_lsn(90))
+            self.assertEqual(row[informix_module.CURSOR], informix_module._sortable_lsn(90))
+
+    def test_unl_source_reads_files_in_name_order(self):
+        source = self._source("1|alpha|\n", "2|beta|\n")
+        rows, _ = self.connector(FakeBridge()).read_table(
+            "app.orders", {}, {"snapshot.source": source}
+        )
+        self.assertEqual([row["id"] for row in rows], [1, 2])
+
+    def test_unl_gzip_source_serves_shaped_rows(self):
+        # A gzip-compressed .unl.gz extract shapes to the same rows as a plain one and
+        # transitions to the stream phase at the pinned boundary.
+        source = self._gzip_source("1|alpha|\n2|beta|\n")
+        rows, offset = self.connector(FakeBridge()).read_table(
+            "app.orders", {}, {"snapshot.source": source}
+        )
+        rows = list(rows)
+        self.assertEqual(offset["phase"], "stream")
+        self.assertEqual([(r["id"], r["value"]) for r in rows], [(1, "alpha"), (2, "beta")])
+        for row in rows:
+            self.assertEqual(row[informix_module.OP], "r")
+
+    def test_unl_all_splits_flags_gzip_whole_file_and_byte_splits_plain(self):
+        # A mixed directory: the gzip file is one non-splittable whole-file split
+        # (gzip=True, spanning [0, size)); the plain file byte-splits (gzip=False).
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        with open(os.path.join(directory.name, "a.unl"), "wb") as handle:
+            handle.write(b"1|a|\n2|b|\n3|c|\n")
+        gz_path = os.path.join(directory.name, "b.unl.gz")
+        with open(gz_path, "wb") as handle:
+            handle.write(gzip.compress(b"4|d|\n5|e|\n"))
+
+        connector = self.connector(FakeBridge())
+        table = connector._table("app.orders", {})
+        options = {"snapshot.source": directory.name, "snapshot.split.bytes": "1"}
+        splits = connector._unl_all_splits(table, options)
+        gzip_splits = [s for s in splits if s[0] == gz_path]
+        plain_splits = [s for s in splits if s[0] != gz_path]
+        self.assertEqual(len(gzip_splits), 1)
+        self.assertTrue(gzip_splits[0][3])  # gzip flag
+        self.assertEqual(gzip_splits[0][1], 0)
+        self.assertEqual(gzip_splits[0][2], os.path.getsize(gz_path))
+        self.assertEqual(len(plain_splits), 3)  # target=1 -> one split per record
+        self.assertTrue(all(not s[3] for s in plain_splits))
+
+    def test_unl_gzip_partitioned_fan_out_matches_serial(self):
+        # A gzip file fans out as a single unl_split (gzip=True) whose read_partition
+        # output equals the serial serve, row-for-row.
+        source = self._gzip_source("1|a|\n2|b|\n3|c|\n")
+        options = {"snapshot.source": source}
+        serial = list(self.connector(FakeBridge()).read_table("app.orders", {}, options)[0])
+
+        connector = self.connector(FakeBridge())
+        offset = connector.latest_offset("app.orders", options, {})
+        partitions = connector.get_partitions("app.orders", options, {}, offset)
+        self.assertEqual([p["kind"] for p in partitions], ["unl_split"])
+        self.assertTrue(partitions[0]["gzip"])
+        fanned = [
+            row
+            for partition in partitions
+            for row in connector.read_partition("app.orders", partition, options)
+        ]
+        self.assertEqual(fanned, serial)
+
+    def test_unl_source_null_field_becomes_none(self):
+        source = self._source("1||\n")
+        rows, _ = self.connector(FakeBridge()).read_table(
+            "app.orders", {}, {"snapshot.source": source}
+        )
+        rows = list(rows)
+        self.assertEqual(rows[0]["id"], 1)
+        self.assertIsNone(rows[0]["value"])
+
+    def test_unl_source_column_count_mismatch_fails_closed(self):
+        source = self._source("1|a|extra|\n")
+        rows, _ = self.connector(FakeBridge()).read_table(
+            "app.orders", {}, {"snapshot.source": source}
+        )
+        with self.assertRaisesRegex(InformixError, "fields but the table has"):
+            list(rows)
+
+    def test_unl_source_missing_path_fails_closed(self):
+        with self.assertRaisesRegex(InformixError, "not readable"):
+            rows, _ = self.connector(FakeBridge()).read_table(
+                "app.orders", {}, {"snapshot.source": "/no/such/unl/dir"}
+            )
+            list(rows)
+
+    def test_unl_source_empty_directory_fails_closed(self):
+        source = self._source()  # no files
+        with self.assertRaisesRegex(InformixError, "no .unl files"):
+            rows, _ = self.connector(FakeBridge()).read_table(
+                "app.orders", {}, {"snapshot.source": source}
+            )
+            list(rows)
+
+    def test_unl_partitioned_fan_out_matches_serial_and_covers_all_rows(self):
+        # The fan-out gate: latest_offset pins the boundary, get_partitions emits one
+        # unl_split per ~target-byte split (target forced to 8B here to split a single
+        # 5-record file into 3 pieces), and the UNION of read_partition over every
+        # descriptor equals the serial serve output row-for-row -- no dup, no loss,
+        # identical shaping.
+        source = self._source("1|a|\n2|b|\n3|c|\n4|d|\n5|e|\n")
+        options = {"snapshot.source": source}
+        serial = list(self.connector(FakeBridge()).read_table("app.orders", {}, options)[0])
+
+        connector = self.connector(FakeBridge())
+        with mock.patch.object(informix_module, "_UNL_SPLIT_TARGET_BYTES", 8):
+            offset = connector.latest_offset("app.orders", options, {})
+            partitions = connector.get_partitions("app.orders", options, {}, offset)
+            fanned = [
+                row
+                for partition in partitions
+                for row in connector.read_partition("app.orders", partition, options)
+            ]
+        # Boundary offset transitions straight to the stream phase at the pinned LSN.
+        self.assertEqual(offset["phase"], "stream")
+        self.assertEqual(offset["commit_lsn"], "90")
+        # One 25B file at an 8B target -> 3 splits, all unl_split at the boundary LSN.
+        self.assertEqual([p["kind"] for p in partitions], ["unl_split"] * 3)
+        self.assertEqual({p["snapshot_lsn"] for p in partitions}, {90})
+        # Splits tile the file contiguously (no gap/overlap).
+        self.assertEqual(partitions[0]["start_byte"], 0)
+        for earlier, later in zip(partitions, partitions[1:]):
+            self.assertEqual(earlier["end_byte"], later["start_byte"])
+        self.assertEqual(fanned, serial)
+        self.assertEqual(
+            [(r["id"], r["value"]) for r in fanned],
+            [(i, c) for i, c in [(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")]],
+        )
+
+    def test_unl_split_bytes_option_controls_the_split_count(self):
+        # The snapshot.split.bytes table option flows through to the byte target: a huge
+        # target yields one split, a tiny one splits per record -- both serve every row.
+        source = self._source("1|a|\n2|b|\n3|c|\n4|d|\n5|e|\n")
+        base = {"snapshot.source": source}
+        expected = [(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")]
+
+        for target, want_splits in (("1000000", 1), ("1", 5)):
+            options = {**base, "snapshot.split.bytes": target}
+            connector = self.connector(FakeBridge())
+            offset = connector.latest_offset("app.orders", options, {})
+            partitions = connector.get_partitions("app.orders", options, {}, offset)
+            self.assertEqual(len(partitions), want_splits, target)
+            fanned = [
+                row
+                for partition in partitions
+                for row in connector.read_partition("app.orders", partition, options)
+            ]
+            self.assertEqual([(r["id"], r["value"]) for r in fanned], expected, target)
+
+    def test_unl_split_bytes_option_rejects_a_non_positive_value(self):
+        with self.assertRaises(ValueError):
+            self.connector(FakeBridge(), **{"snapshot.split.bytes": "0"})
+
+    def _drain_unl_windows(self, connector, options):
+        """Drive the windowed partitioned serve to completion; return (rows, offsets)."""
+        start: dict = {}
+        rows: list[dict] = []
+        offsets: list[dict] = []
+        for _ in range(50):
+            end = connector.latest_offset("app.orders", options, start)
+            partitions = connector.get_partitions("app.orders", options, start, end)
+            for partition in partitions:
+                rows.extend(connector.read_partition("app.orders", partition, options))
+            offsets.append(end)
+            if end["phase"] == "stream":
+                break
+            start = end
+        else:
+            self.fail("windowed .unl serve did not reach the stream phase")
+        return rows, offsets
+
+    def test_unl_snapshot_windows_across_microbatches(self):
+        # The windowing gate: with pages.per.batch=2 and a byte target that makes each
+        # record its own split (5 splits), the serve runs 3 microbatches (2+2+1). Their
+        # union equals the serial serve row-for-row -- no dup, no loss -- the split index
+        # advances 2 -> 4, and only the final microbatch transitions to the stream phase.
+        source = self._source("1|a|\n2|b|\n3|c|\n4|d|\n5|e|\n")
+        options = {"snapshot.source": source, "snapshot.split.bytes": "1"}
+        serial = list(self.connector(FakeBridge()).read_table("app.orders", {}, options)[0])
+
+        connector = self.connector(
+            FakeBridge(), **{"stream.partitioned.snapshot.pages.per.batch": "2"}
+        )
+        rows, offsets = self._drain_unl_windows(connector, options)
+
+        self.assertEqual(len(offsets), 3)
+        self.assertEqual([o["phase"] for o in offsets], ["snapshot", "snapshot", "stream"])
+        # Non-terminal offsets advance the split index; all pin the same boundary LSN.
+        self.assertEqual(offsets[0]["snapshot"]["page_index"], 2)
+        self.assertEqual(offsets[1]["snapshot"]["page_index"], 4)
+        self.assertEqual({o["commit_lsn"] for o in offsets}, {"90"})
+        self.assertEqual(rows, serial)
+        self.assertEqual(
+            [(r["id"], r["value"]) for r in rows],
+            [(i, c) for i, c in [(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")]],
+        )
+
+    def test_unl_snapshot_resumes_from_a_mid_snapshot_offset(self):
+        # Resume: a snapshot-phase offset at split index 2 serves exactly splits [2,4) and
+        # advances the index to 4 -- so a restart mid-snapshot neither repeats nor skips.
+        source = self._source("1|a|\n2|b|\n3|c|\n4|d|\n5|e|\n")
+        options = {"snapshot.source": source, "snapshot.split.bytes": "1"}
+        connector = self.connector(
+            FakeBridge(), **{"stream.partitioned.snapshot.pages.per.batch": "2"}
+        )
+        first = connector.latest_offset("app.orders", options, {})
+        self.assertEqual(first["snapshot"]["page_index"], 2)
+
+        resumed = connector.latest_offset("app.orders", options, first)
+        self.assertEqual(resumed["snapshot"]["page_index"], 4)
+        partitions = connector.get_partitions("app.orders", options, first, resumed)
+        rows = [
+            row
+            for partition in partitions
+            for row in connector.read_partition("app.orders", partition, options)
+        ]
+        self.assertEqual([(r["id"], r["value"]) for r in rows], [(3, "c"), (4, "d")])
+
+    def test_unl_read_partition_shapes_without_a_live_table(self):
+        # A descriptor carries the column metadata, so the executor shapes rows with no
+        # Table and no connection; local fallback reads (no token/host).
+        source = self._source("7|hi|\n")
+        path = os.path.join(source, "part-000.unl")
+        partition = {
+            "kind": "unl_split",
+            "path": path,
+            "start_byte": 0,
+            "end_byte": os.path.getsize(path),
+            "columns": [
+                {"name": "id", "type_name": "INTEGER"},
+                {"name": "value", "type_name": "VARCHAR"},
+            ],
+            "snapshot_lsn": 90,
+            "exposed_name": "app.orders",
+            "encoding": "iso8859-1",
+        }
+        rows = list(self.connector(FakeBridge()).read_partition("app.orders", partition, {}))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["id"], rows[0]["value"]), (7, "hi"))
+        self.assertEqual(rows[0][informix_module.OP], "r")
+        self.assertIsNone(rows[0][informix_module.TX_ID])
+        self.assertEqual(rows[0][informix_module.COMMIT_LSN], informix_module._sortable_lsn(90))
+
+    def test_unl_read_partition_ranged_rest_read(self):
+        # A descriptor with token+host reads via a Files-API ranged GET; the fake HTTP
+        # layer honours the inclusive Range header, so the executor pulls exactly its
+        # split's bytes without a local file.
+        payload = b"3|x|\n4|y|\n"
+
+        class _RangeResponse:
+            def __init__(self, body):
+                self._body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return self._body
+
+        def fake_urlopen(request, timeout=None):
+            header = request.headers.get("Range")
+            span = header.split("=", 1)[1]
+            start, end = (int(part) for part in span.split("-"))
+            return _RangeResponse(payload[start : end + 1])
+
+        partition = {
+            "kind": "unl_split",
+            "path": "/Volumes/c/s/v/extract.unl",
+            "start_byte": 0,
+            "end_byte": len(payload),
+            "columns": [
+                {"name": "id", "type_name": "INTEGER"},
+                {"name": "value", "type_name": "VARCHAR"},
+            ],
+            "snapshot_lsn": 90,
+            "exposed_name": "app.orders",
+            "encoding": "iso8859-1",
+            "token": "dapi-batch-token",
+            "host": "https://ws",
+        }
+        from databricks.labs.community_connector.sources.informix import lakebase_state
+
+        with mock.patch.object(lakebase_state.urllib.request, "urlopen", fake_urlopen):
+            rows = list(self.connector(FakeBridge()).read_partition("app.orders", partition, {}))
+        self.assertEqual([(r["id"], r["value"]) for r in rows], [(3, "x"), (4, "y")])
+
+    def test_unl_snapshot_serve_gate_excludes_delete_flow(self):
+        options = {"snapshot.source": "/vol/x"}
+        upsert = self.connector(FakeBridge())
+        self.assertTrue(upsert._unl_snapshot_serve(options, {}))
+        # A snapshot-phase offset is a continuation window -> still the file serve.
+        self.assertTrue(upsert._unl_snapshot_serve(options, {"phase": "snapshot"}))
+        # A committed (stream) offset means the snapshot finished -> ordinary CDC path.
+        self.assertFalse(upsert._unl_snapshot_serve(options, _stream_offset()))
+        # The delete channel never serves the file snapshot.
+        deletes = self.connector(FakeBridge(), **{"isDeleteFlow": "true"})
+        self.assertFalse(deletes._unl_snapshot_serve(options, {}))
+
+    def _manifest(self, source: str, boundary) -> None:
+        with open(os.path.join(source, "_manifest.json"), "w") as handle:
+            json.dump({"boundary_lsn": boundary, "note": "ignored key"}, handle)
+
+    def test_unl_boundary_lsn_option_sets_the_boundary(self):
+        # FakeBridge: minimum_lsn=1, current_lsn=90. An operator LSN of 50 is used as
+        # the authoritative boundary instead of the connector self-pinning at 90.
+        source = self._source("1|a|\n2|b|\n")
+        rows, offset = self.connector(FakeBridge()).read_table(
+            "app.orders", {}, {"snapshot.source": source, "snapshot.boundary.lsn": "50"}
+        )
+        rows = list(rows)
+        self.assertEqual(offset["phase"], "stream")
+        self.assertEqual(offset["commit_lsn"], "50")
+        for row in rows:
+            self.assertEqual(row[informix_module.OP], "r")
+            self.assertEqual(row[informix_module.COMMIT_LSN], informix_module._sortable_lsn(50))
+
+    def test_unl_boundary_lsn_from_manifest(self):
+        source = self._source("1|a|\n")
+        self._manifest(source, "55")
+        _, offset = self.connector(FakeBridge()).read_table(
+            "app.orders", {}, {"snapshot.source": source}
+        )
+        self.assertEqual(offset["commit_lsn"], "55")
+
+    def test_unl_boundary_lsn_option_wins_over_manifest(self):
+        source = self._source("1|a|\n")
+        self._manifest(source, "55")
+        _, offset = self.connector(FakeBridge()).read_table(
+            "app.orders", {}, {"snapshot.source": source, "snapshot.boundary.lsn": "50"}
+        )
+        self.assertEqual(offset["commit_lsn"], "50")
+
+    def test_unl_boundary_lsn_absent_self_pins(self):
+        source = self._source("1|a|\n")
+        _, offset = self.connector(FakeBridge()).read_table(
+            "app.orders", {}, {"snapshot.source": source}
+        )
+        # No option, no manifest -> self-pin at the bridge high_water (90).
+        self.assertEqual(offset["commit_lsn"], "90")
+
+    def test_unl_boundary_lsn_below_minimum_fails_closed(self):
+        bridge = FakeBridge()
+        bridge.minimum = 60  # log recycled past 50 -> gap
+        source = self._source("1|a|\n")
+        with self.assertRaisesRegex(InformixError, "retained/current log range"):
+            rows, _ = self.connector(bridge).read_table(
+                "app.orders", {}, {"snapshot.source": source, "snapshot.boundary.lsn": "50"}
+            )
+            list(rows)
+
+    def test_unl_boundary_lsn_above_current_fails_closed(self):
+        source = self._source("1|a|\n")
+        with self.assertRaisesRegex(InformixError, "retained/current log range"):
+            rows, _ = self.connector(FakeBridge()).read_table(
+                "app.orders", {}, {"snapshot.source": source, "snapshot.boundary.lsn": "95"}
+            )
+            list(rows)
+
+    def test_unl_boundary_lsn_non_integer_option_fails_closed(self):
+        source = self._source("1|a|\n")
+        with self.assertRaises(InformixError):
+            rows, _ = self.connector(FakeBridge()).read_table(
+                "app.orders", {}, {"snapshot.source": source, "snapshot.boundary.lsn": "abc"}
+            )
+            list(rows)
+
+    def test_unl_boundary_lsn_non_integer_manifest_fails_closed(self):
+        source = self._source("1|a|\n")
+        self._manifest(source, "not-a-number")
+        with self.assertRaises(InformixError):
+            rows, _ = self.connector(FakeBridge()).read_table(
+                "app.orders", {}, {"snapshot.source": source}
+            )
+            list(rows)
+
+    def test_unl_boundary_lsn_connection_option_validated_at_construction(self):
+        with self.assertRaisesRegex(ValueError, "snapshot.boundary.lsn"):
+            self.connector(FakeBridge(), **{"snapshot.boundary.lsn": "-3"})
+
+    def test_unl_boundary_lsn_idempotent_across_latest_offset_calls(self):
+        source = self._source("1|a|\n")
+        options = {"snapshot.source": source, "snapshot.boundary.lsn": "50"}
+        connector = self.connector(FakeBridge())
+        first = connector.latest_offset("app.orders", options, {})
+        second = connector.latest_offset("app.orders", options, {})
+        self.assertEqual(first["commit_lsn"], "50")
+        self.assertEqual(first, second)
+
+
 if __name__ == "__main__":
     unittest.main()

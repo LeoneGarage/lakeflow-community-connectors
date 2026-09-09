@@ -75,6 +75,7 @@ import fnmatch
 import gzip
 import hashlib
 import hmac
+import http.client
 import importlib
 import ipaddress
 import logging
@@ -90,6 +91,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 
 
 def register_lakeflow_source(spark):
@@ -1840,6 +1842,20 @@ def register_lakeflow_source(spark):
 
             return self._request("GET", volume_path) or b""
 
+        def get_range(self, volume_path: str, start: int, end: int) -> bytes:
+            """Download the half-open byte range ``[start, end)`` of ``volume_path``.
+
+            Issues a ranged GET (``Range: bytes=start-end-1``, inclusive per RFC 9110),
+            which the Files API answers with ``206 Partial Content``. Lets a reader pull
+            one split of a large file straight from object storage without materializing
+            the whole file (the serverless FUSE mount caches the whole file on first
+            access, so it is unsuitable for large files). ``end <= start`` yields ``b""``.
+            """
+
+            if end <= start:
+                return b""
+            return self._request("GET", volume_path, byte_range=(start, end - 1)) or b""
+
         def delete(self, volume_path: str) -> None:
             """Delete ``volume_path`` if it exists; a 404 is tolerated."""
 
@@ -1853,6 +1869,7 @@ def register_lakeflow_source(spark):
             data: bytes | None = None,
             overwrite: bool = False,
             tolerate_missing: bool = False,
+            byte_range: tuple[int, int] | None = None,
         ) -> bytes | None:
             quoted = urllib.parse.quote(volume_path, safe="/")
             url = f"{self._host}/api/2.0/fs/files{quoted}"
@@ -1861,6 +1878,9 @@ def register_lakeflow_source(spark):
             last_error: Exception | None = None
             for attempt in range(_FILES_API_ATTEMPTS):
                 headers = {"Authorization": f"Bearer {self._credential.bearer()}"}
+                if byte_range is not None:
+                    # Inclusive, zero-based per RFC 9110; the Files API answers 206.
+                    headers["Range"] = f"bytes={byte_range[0]}-{byte_range[1]}"
                 if data is not None:
                     headers["Content-Type"] = "application/octet-stream"
                 request = urllib.request.Request(url, data=data, method=method, headers=headers)
@@ -1879,7 +1899,13 @@ def register_lakeflow_source(spark):
                             error.code,
                         ) from error
                     last_error = error
-                except (urllib.error.URLError, TimeoutError) as error:
+                except (urllib.error.URLError, TimeoutError, http.client.IncompleteRead) as error:
+                    # IncompleteRead: the server sent a valid response (for a ranged GET,
+                    # a 206 with the full Content-Length) but the body transfer was cut
+                    # short mid-stream. It is not a URLError/HTTPError, so without this it
+                    # would escape the retry loop and kill the read. The request is
+                    # deterministic and idempotent -- a ranged GET returns the same bytes
+                    # every time -- so re-issuing it recovers the truncated transfer.
                     last_error = error
                 if attempt + 1 < _FILES_API_ATTEMPTS:
                     time.sleep(min(1.5 * (2**attempt), 8.0))
@@ -5812,6 +5838,35 @@ def register_lakeflow_source(spark):
     _SNAPSHOT_STAGING_TRANSPORT_OPTION = "snapshot.staging.transport"
     _SNAPSHOT_STAGING_TRANSPORTS = frozenset({"auto", "rest", "fuse"})
     _DEFAULT_SNAPSHOT_STAGING_TRANSPORT = "auto"
+    # Per-table option: a UC Volume directory of Informix UNLOAD (`.unl`) extract files.
+    # When set, the table's ``snapshot.mode=initial`` phase reads its history from those
+    # files instead of a live ``consistent_snapshot()`` scan, then transitions to the CDC
+    # stream at the connector-pinned boundary exactly as a live snapshot does. The extract
+    # is the operator's responsibility to align with the boundary (quiesce/extract-then-run);
+    # the connector pins the boundary itself and does no operator-supplied LSN or fingerprint.
+    _SNAPSHOT_SOURCE_OPTION = "snapshot.source"
+    # Per-table operator-supplied CDC boundary for a `.unl` snapshot source: the LSN the
+    # extract was taken at (captured by the extract step). Resolution order per table:
+    # this option, then a `_manifest.json` (``{"boundary_lsn": "<X>"}``) in snapshot.source,
+    # then self-pin (the connector's own registration LSN). A supplied LSN is authoritative
+    # (initial_lsn == snapshot_lsn == X) so the CDC stream resumes at exactly that position.
+    _SNAPSHOT_BOUNDARY_LSN_OPTION = "snapshot.boundary.lsn"
+    _SNAPSHOT_MANIFEST_NAME = "_manifest.json"
+    # A large `.unl` fans out across executors in byte-bounded pieces: each split targets
+    # this many bytes and ends at the next record boundary (splits never cross a file).
+    # Byte splitting -- unlike a row cap -- needs no whole-file scan to plan: the planner
+    # seeks to each target and reads only a small window to snap to the next newline.
+    _UNL_SPLIT_TARGET_BYTES = 50 << 20
+    # Per-table (connection-fallback) override of the split target byte size.
+    _UNL_SPLIT_BYTES_OPTION = "snapshot.split.bytes"
+    # Fixed buffer for the streaming range reads and the boundary-snap scan: constant
+    # memory regardless of `.unl` size (never load a whole file).
+    _UNL_SCAN_CHUNK_BYTES = 4 << 20
+    # Informix integer/float type names, for mapping UNLOAD text back to Python values.
+    _UNLOAD_INT_TYPES = frozenset(
+        {"INTEGER", "INT", "SMALLINT", "BIGINT", "INT8", "SERIAL", "SERIAL8", "BIGSERIAL"}
+    )
+    _UNLOAD_FLOAT_TYPES = frozenset({"FLOAT", "SMALLFLOAT", "REAL", "DOUBLE", "DOUBLE PRECISION"})
     _SNAPSHOT_STAGING_TOKEN_LIFETIME_OPTION = "snapshot.staging.token.lifetime.seconds"
     # One secret scope holds every pipeline's current staging token, keyed per pipeline id.
     _SNAPSHOT_STAGING_SECRET_SCOPE = "informix-snapshot-staging"
@@ -10427,6 +10482,7 @@ def register_lakeflow_source(spark):
                     str(_DEFAULT_PARTITIONED_SNAPSHOT_PAGES_PER_BATCH),
                     1,
                 ),
+                (_UNL_SPLIT_BYTES_OPTION, str(_UNL_SPLIT_TARGET_BYTES), 1),
             ):
                 if int(options.get(name, default)) < minimum:
                     raise ValueError(f"Option '{name}' must be >= {minimum}")
@@ -10499,6 +10555,7 @@ def register_lakeflow_source(spark):
                     f"Option '{_SNAPSHOT_STAGING_TRANSPORT_OPTION}' must be one of "
                     f"{sorted(_SNAPSHOT_STAGING_TRANSPORTS)}; got {staging_transport!r}"
                 )
+            self._validate_unl_source_options(options)
             _null_byte_mode(options)
             if _APPEND_INGESTION_OPTION in options:
                 _append_only_value(options[_APPEND_INGESTION_OPTION])
@@ -11307,6 +11364,11 @@ def register_lakeflow_source(spark):
             start_offset = start_offset or {}
             table = self._table(table_name, table_options)
             effective_start = self._effective_start_offset(start_offset)
+            if self._unl_snapshot_serve(table_options, effective_start):
+                # File source: serve the extract as a window of splits per microbatch. Leaving
+                # the embedded cache untouched steers the following get_partitions to the
+                # unl_split fan-out instead of the driver-side embedded path.
+                return self._unl_snapshot_offset(table, table_options, effective_start)
             batch = self._snapshot_page_batch(table, effective_start, table_options)
             if batch is not None:
                 return self._snapshot_page_batch_offset(table, effective_start, batch)
@@ -11407,6 +11469,24 @@ def register_lakeflow_source(spark):
                 return []
             table = self._table(table_name, table_options)
             effective_start = self._effective_start_offset(start_offset or {})
+            if self._unl_snapshot_serve(table_options, effective_start):
+                # File source: fan this microbatch's split window across executors -- one
+                # unl_split descriptor per byte split in [start_split, start_split+window). The
+                # boundary was pinned by latest_offset; take snapshot_lsn from end_offset and
+                # the resume point from the start offset's split index (0 on the first read).
+                snapshot_lsn = int((end_offset or {})["commit_lsn"])
+                start_split = (
+                    int(_validated_offset(effective_start)["snapshot"]["page_index"])
+                    if effective_start
+                    else 0
+                )
+                return self._unl_split_descriptors(
+                    table,
+                    table_options,
+                    snapshot_lsn,
+                    start_split=start_split,
+                    window=self._partitioned_pages_per_batch(),
+                )
             batch = self._snapshot_page_batch(table, effective_start, table_options)
             if batch is not None:
                 scope, schema_id, snapshot_lsn, start_page, end_page, _ = batch
@@ -11455,6 +11535,11 @@ def register_lakeflow_source(spark):
                     int(partition["page_index"]),
                 )
                 yield from rows
+                return
+            if kind == "unl_split":
+                # Executor side: read one `.unl` byte split by descriptor only -- no Table
+                # and no Informix connection; shape rows identically to the serial path.
+                yield from self._read_unl_split(partition, table_options)
                 return
             raise InformixError(f"Unknown Informix partition descriptor kind: {kind!r}")
 
@@ -14320,6 +14405,28 @@ def register_lakeflow_source(spark):
                     checkpoint,
                     stage_scope=stage_scope,
                 )
+            elif self._table_snapshot_source(options):
+                # File source: serve the initial snapshot from Informix UNLOAD (`.unl`) files
+                # on a Volume instead of a live scan. Serial driver fallback used when the
+                # partitioned reader is off; the partitioned path fans the same splits across
+                # executors (see get_partitions/read_partition). Both pin the boundary via
+                # _pin_unl_boundary and hand back the shaped rows with a stream-phase offset --
+                # the same transition a completed live snapshot makes, so the CDC stream
+                # resumes at the boundary and _recover discards anything at/below it. The whole
+                # extract serves in one microbatch (rows stream lazily, so driver memory stays
+                # bounded); a restart before the offset commits simply replays it (idempotent).
+                table, schema_id, snapshot_lsn = self._pin_unl_boundary(table, options, pipeline_scope)
+                rows = self._serve_unl_snapshot(table, options, snapshot_lsn)
+                return rows, _offset(
+                    snapshot_lsn,
+                    snapshot_lsn,
+                    snapshot_lsn,
+                    None,
+                    "stream",
+                    table,
+                    schema_id,
+                    pipeline_scope,
+                )
             else:
                 consistent_snapshot = getattr(self._bridge, "consistent_snapshot", None)
                 if not callable(consistent_snapshot):
@@ -14520,6 +14627,452 @@ def register_lakeflow_source(spark):
                         pipeline_scope,
                     )
                 return self._staged_snapshot_result(table, pipeline_scope, schema_id, manifest, 0)
+
+        @staticmethod
+        def _validate_unl_source_options(options: dict[str, str]) -> None:
+            """Eagerly validate the connection-level `.unl` source options (per-table too)."""
+
+            if _SNAPSHOT_SOURCE_OPTION in options and not str(options[_SNAPSHOT_SOURCE_OPTION]).strip():
+                raise ValueError(f"Option '{_SNAPSHOT_SOURCE_OPTION}' must be a non-empty path")
+            if _SNAPSHOT_BOUNDARY_LSN_OPTION in options:
+                raw = str(options[_SNAPSHOT_BOUNDARY_LSN_OPTION]).strip()
+                if not raw or not raw.isdigit():
+                    raise ValueError(
+                        f"Option '{_SNAPSHOT_BOUNDARY_LSN_OPTION}' must be a non-negative integer"
+                    )
+
+        def _table_snapshot_source(self, table_options: dict[str, str]) -> str | None:
+            """The table's ``snapshot.source`` Volume path (table option, then connection)."""
+
+            value = table_options.get(_SNAPSHOT_SOURCE_OPTION) or self.options.get(
+                _SNAPSHOT_SOURCE_OPTION
+            )
+            value = str(value).strip() if value is not None else ""
+            return value or None
+
+        def _unl_snapshot_serve(self, table_options: dict[str, str], effective_start: dict) -> bool:
+            """Whether this read belongs to a file-source initial snapshot's split serve.
+
+            The single gate the partitioned ``latest_offset``/``get_partitions`` branches
+            share: a non-delete flow, ``snapshot.source`` set, and ``snapshot.mode=initial``
+            (the only mode that routes to the file serve, keyed or keyless-append). It fires
+            on the first read (no committed offset) and on every continuation microbatch (a
+            snapshot-phase offset), so the serve fans out ``stream.partitioned.snapshot.pages.
+            per.batch`` splits at a time until the boundary offset transitions to the stream
+            phase; after that ``effective_start`` is a stream offset and every later read
+            takes the ordinary CDC path. A ``.unl`` table never stages pages, so a
+            snapshot-phase offset here is always a ``.unl`` split window (never a staged page).
+            """
+
+            if self._is_delete_flow():
+                return False
+            if self._table_snapshot_source(table_options) is None:
+                return False
+            if self._snapshot_mode(table_options) != "initial":
+                return False
+            return not effective_start or effective_start.get("phase") == "snapshot"
+
+        def _list_unl_files(self, source: str, exposed_name: str) -> list[str]:
+            """Sorted `.unl`/`.unl.gz` files under ``source`` (listing/stat only -- no content read).
+
+            Both plain and gzip-compressed extracts are listed; whether a given file is gzip is
+            decided per file by its magic bytes at read time (see :func:`_unl_file_is_gzip`), not
+            by its name, so a mislabelled file is still handled correctly.
+            """
+
+            try:
+                names = sorted(
+                    name for name in os.listdir(source) if name.endswith((".unl", ".unl.gz"))
+                )
+            except OSError as error:
+                raise InformixError(
+                    f"snapshot.source '{source}' for '{exposed_name}' is not readable"
+                ) from error
+            files = [
+                os.path.join(source, name)
+                for name in names
+                if os.path.isfile(os.path.join(source, name))
+            ]
+            if not files:
+                raise InformixError(
+                    f"snapshot.source '{source}' for '{exposed_name}' contains no .unl files"
+                )
+            return files
+
+        def _unl_read_chunk(self, path: str) -> Callable[[int, int], bytes]:
+            """A ``(offset, length) -> bytes`` range reader for one `.unl` file.
+
+            Prefers the Files REST API (ranged GET, 206) when a staging token can be
+            minted -- the whole point, since serverless FUSE caches an entire file to
+            local disk on first access, fatal for a large `.unl`. Falls back to a local
+            seek/read when REST is unavailable (offline tests, or a workspace that forbids
+            token minting), mirroring ``snapshot.staging.transport=auto`` for writes.
+            """
+
+            files_api = self._staging_transport()
+            if files_api is not None:
+                return lambda offset, length: files_api.get_range(path, offset, offset + length)
+
+            def local(offset: int, length: int) -> bytes:
+                with open(path, "rb") as handle:
+                    handle.seek(offset)
+                    return handle.read(length)
+
+            return local
+
+        def _resolve_unl_boundary_lsn(self, table_options: dict[str, str], source: str) -> int | None:
+            """Resolve the operator-supplied boundary LSN, or None to self-pin.
+
+            Order (first hit wins): the ``snapshot.boundary.lsn`` table option (table
+            options first, connection fallback -- same shape as :meth:`_table_snapshot_source`),
+            then ``_manifest.json`` in the source directory (``{"boundary_lsn": "<X>"}``).
+            Fails closed on a non-integer value in either place.
+            """
+
+            raw = table_options.get(_SNAPSHOT_BOUNDARY_LSN_OPTION) or self.options.get(
+                _SNAPSHOT_BOUNDARY_LSN_OPTION
+            )
+            if raw is not None and str(raw).strip():
+                try:
+                    return _strict_lsn(str(raw).strip(), _SNAPSHOT_BOUNDARY_LSN_OPTION)
+                except ValueError as error:
+                    raise InformixError(str(error)) from error
+            manifest = self._read_unl_manifest(source)
+            if manifest is None or manifest.get("boundary_lsn") is None:
+                return None
+            try:
+                return _strict_lsn(manifest["boundary_lsn"], f"{_SNAPSHOT_MANIFEST_NAME} boundary_lsn")
+            except ValueError as error:
+                raise InformixError(str(error)) from error
+
+        def _read_unl_manifest(self, source: str) -> dict | None:
+            """Read ``<source>/_manifest.json`` (small file, whole), or None if absent.
+
+            Uses the Files REST API when a staging token is available (a 404 means absent),
+            else a local read (a missing file means absent). A present-but-malformed
+            manifest fails closed.
+            """
+
+            path = os.path.join(source, _SNAPSHOT_MANIFEST_NAME)
+            files_api = self._staging_transport()
+            try:
+                if files_api is not None:
+                    data = files_api.get(path)
+                else:
+                    with open(path, "rb") as handle:
+                        data = handle.read()
+            except FileNotFoundError:
+                return None
+            except WorkspaceHttpError as error:
+                if getattr(error, "status_code", None) == 404:
+                    return None
+                raise
+            try:
+                parsed = json.loads(data.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError) as error:
+                raise InformixError(
+                    f"snapshot.source '{source}' has an unreadable {_SNAPSHOT_MANIFEST_NAME}"
+                ) from error
+            return parsed if isinstance(parsed, dict) else None
+
+        def _publish_unl_initialization(self, table: Table, scope: str, boundary: int) -> str:
+            """Publish the durable initialization record at an operator-supplied ``boundary``.
+
+            A variant of the owner path in :meth:`_shared_table_lsn` that pins ``initial_lsn``
+            to the operator's LSN (X) rather than the connector's freshly-captured
+            registration LSN -- X is authoritative, so the schema node's ``start_lsn`` and
+            the init record's ``initial_lsn`` are both X. Full-row logging is still enabled
+            (idempotent) and the boundary validated at X. Election makes it idempotent: a
+            re-call with the same X adopts the same winner; a table already initialized at a
+            different LSN loses the election and fails closed (run a full refresh).
+            """
+
+            capture = _capture_descriptor(table, _client_encoding(self.options))
+            self._bridge.prepare_initial_capture([table.native_identity])
+            self._bridge.validate_initial_lsn(capture, boundary)
+            node = _schema_state(table, boundary)
+            winner = self._publish_immutable_head(
+                self._immutable_namespace(table, "initialization", scope),
+                {
+                    "created_at": time.time(),
+                    "initial_lsn": str(boundary),
+                    "schema": node,
+                    "scope": scope,
+                    "table": table.native_identity,
+                },
+                record_type="initialization",
+            )
+            self._validate_immutable_record_header(winner, "initialization", table.exposed_name)
+            if (
+                self._immutable_lsn(winner, "initial_lsn", table.exposed_name) != boundary
+                or winner.get("scope") != scope
+                or winner.get("table") != table.native_identity
+            ):
+                raise InformixError(
+                    f"Conflicting Informix initialization boundary for '{table.exposed_name}': "
+                    "the table was already initialized at a different LSN; run a full refresh"
+                )
+            return str(node["id"])
+
+        def _pin_unl_boundary(
+            self, table: Table, options: dict[str, str], pipeline_scope: str
+        ) -> tuple[Table, str, int]:
+            """Pin and durably publish the file-source snapshot boundary; idempotent.
+
+            With an operator-supplied boundary (``snapshot.boundary.lsn`` or ``_manifest.json``,
+            see :meth:`_resolve_unl_boundary_lsn`) the LSN X is authoritative: guard
+            ``minimum_lsn() <= X <= current_lsn()`` (below min = the logical log recycled past
+            X -> gap; above current = bogus), then publish the initialization + snapshot
+            boundary at ``initial_lsn == snapshot_lsn == X`` so the CDC stream and the
+            delete-channel bootstrap both start at X. Otherwise self-pin via ``_initial_lsn``
+            (the connector's registration LSN, cached -> stable across re-calls). Either way
+            the durable records are elected/immutable, so a speculative ``latest_offset``
+            re-call is idempotent.
+            """
+
+            boundary = self._resolve_unl_boundary_lsn(options, self._table_snapshot_source(options))
+            if boundary is None:
+                high_water = self._initial_lsn(table, scope=pipeline_scope)
+                schema_id = self._snapshot_schema_ids[(pipeline_scope, table.identity)]
+                table = self._refresh_table_schema(table, _schema_fingerprint(table))
+                self._publish_snapshot_boundary(
+                    table, schema_id, high_water, high_water, pipeline_scope
+                )
+                return table, schema_id, high_water
+            minimum = self._bridge.minimum_lsn()
+            current = self._bridge.current_lsn()
+            if not minimum <= boundary <= current:
+                raise InformixError(
+                    f"{_SNAPSHOT_BOUNDARY_LSN_OPTION}={boundary} for '{table.exposed_name}' is "
+                    f"outside the retained/current log range [{minimum}, {current}]: below the "
+                    "minimum means the logical log recycled past it (gap); above current is "
+                    "invalid. Re-extract at a retained position."
+                )
+            table = self._refresh_table_schema(table, _schema_fingerprint(table))
+            schema_id = self._publish_unl_initialization(table, pipeline_scope, boundary)
+            self._publish_snapshot_boundary(table, schema_id, boundary, boundary, pipeline_scope)
+            return table, schema_id, boundary
+
+        def _unl_snapshot_offset(
+            self, table: Table, table_options: dict[str, str], effective_start: dict
+        ) -> dict:
+            """End offset for one windowed ``.unl`` snapshot microbatch.
+
+            On the first read (empty start) the boundary is pinned durably and idempotently
+            (see :meth:`_pin_unl_boundary`) and the serve begins at split 0; on a continuation
+            the boundary/schema come from the checkpoint and the serve resumes at the recorded
+            split index. Each read advances by ``stream.partitioned.snapshot.pages.per.batch``
+            splits: a non-terminal microbatch returns a snapshot-phase offset carrying the next
+            split index (so the serve is resumable mid-snapshot), and the microbatch that
+            reaches the last split transitions to the stream phase at the boundary -- where the
+            CDC stream resumes and ``_recover`` discards everything at or below it. The schema
+            fingerprint is carried forward from the checkpoint on a continuation (the extract is
+            frozen as of the boundary; drift is still caught at the snapshot->CDC transition by
+            ``_read_stream``), matching the staged-page serve. An empty extract transitions to
+            the stream phase immediately.
+            """
+
+            if not effective_start:
+                pipeline_scope = self._pipeline_scope()
+                table, schema_id, snapshot_lsn = self._pin_unl_boundary(
+                    table, table_options, pipeline_scope
+                )
+                start_split = 0
+                expected_fingerprint = None
+            else:
+                checkpoint = _validated_offset(effective_start)
+                pipeline_scope = self._pipeline_scope(checkpoint)
+                schema_id = str(checkpoint["schema_id"])
+                snapshot_lsn = int(checkpoint["snapshot_lsn"])
+                start_split = int(checkpoint["snapshot"]["page_index"])
+                expected_fingerprint = checkpoint.get("schema_fingerprint")
+            total = len(self._unl_all_splits(table, table_options))
+            end_split = min(start_split + self._partitioned_pages_per_batch(), total)
+            if end_split >= total:
+                # Last window (or empty extract): the snapshot is complete -> transition to the
+                # stream phase at the boundary, an ordinary stream offset from here on.
+                end = _offset(
+                    snapshot_lsn,
+                    snapshot_lsn,
+                    snapshot_lsn,
+                    None,
+                    "stream",
+                    table,
+                    schema_id,
+                    pipeline_scope,
+                )
+                if expected_fingerprint is not None:
+                    end["schema_fingerprint"] = expected_fingerprint
+                return end
+            end = _offset(
+                snapshot_lsn,
+                snapshot_lsn,
+                snapshot_lsn,
+                None,
+                "snapshot",
+                table,
+                schema_id,
+                pipeline_scope,
+            )
+            if expected_fingerprint is not None:
+                end["schema_fingerprint"] = expected_fingerprint
+            end.update(
+                {
+                    "snapshot_lsn": str(snapshot_lsn),
+                    # No PK cursor for byte splits: page_index is the split index; last_pk is
+                    # an unused placeholder that satisfies the snapshot-offset schema.
+                    "snapshot": {"last_pk": [], "page_index": end_split},
+                }
+            )
+            return end
+
+        def _serve_unl_snapshot(
+            self, table: Table, options: dict[str, str], snapshot_lsn: int
+        ) -> Iterator[dict[str, Any]]:
+            """Lazily yield shaped rows read from the table's `.unl` files (serial driver path).
+
+            The partitioned executor path (``read_partition`` ``unl_split``) shapes each
+            record through the same :func:`_shape_unl_record`, so both produce identical
+            rows. Streams each file record by record (constant memory); the serial path
+            reads the whole file, the executor path reads one byte split. A gzip file (magic
+            bytes ``1f 8b``) is decompressed as a single non-splittable stream.
+            """
+
+            source = self._table_snapshot_source(options)
+            files = self._list_unl_files(source, table.exposed_name)
+            encoding = _client_encoding(self.options)
+            for path in files:
+                size = os.path.getsize(path)
+                read_chunk = self._unl_read_chunk(path)
+                if _unl_file_is_gzip(read_chunk):
+                    records = _iter_gzip_unl_records(read_chunk, size)
+                else:
+                    records = _iter_unl_records(read_chunk, 0, size)
+                for raw in records:
+                    yield _shape_unl_record(raw, table, snapshot_lsn, options, encoding)
+
+        def _read_unl_split(
+            self, partition: dict, table_options: dict[str, str]
+        ) -> Iterator[dict[str, Any]]:
+            """Executor side: shape the rows of one `.unl` byte split, without a live Table.
+
+            The descriptor carries the column metadata, so a Table is rebuilt from it
+            purely for shaping (variable-scale DECIMAL coercion needs the column list); no
+            catalog connection and no Informix session run here. The range is read via a
+            Files-API ranged GET when the descriptor carries a token/host, else a local
+            seek -- the same fallback shape as the driver's ``_unl_read_chunk``. A gzip split
+            (``gzip=True``) spans the whole file and is decompressed as one stream.
+            """
+
+            columns = tuple(Column.parse(raw) for raw in partition["columns"])
+            table = Table(
+                database="",
+                owner="",
+                name=str(partition.get("exposed_name", "")),
+                columns=columns,
+                primary_keys=(),
+            )
+            snapshot_lsn = int(partition["snapshot_lsn"])
+            encoding = str(partition.get("encoding") or "utf-8")
+            exposed_name = str(partition.get("exposed_name", ""))
+            read_chunk = _unl_split_read_chunk(partition)
+            start = int(partition["start_byte"])
+            end = int(partition["end_byte"])
+            if partition.get("gzip"):
+                records = _iter_gzip_unl_records(read_chunk, end)
+            else:
+                records = _iter_unl_records(read_chunk, start, end)
+            for raw in records:
+                yield _shape_unl_record(
+                    raw, table, snapshot_lsn, table_options, encoding, exposed_name=exposed_name
+                )
+
+        def _unl_all_splits(
+            self, table: Table, table_options: dict[str, str]
+        ) -> list[tuple[str, int, int, bool]]:
+            """The full ordered ``(path, start_byte, end_byte, gzip)`` split plan for the extract.
+
+            Files are listed sorted; a plain file is split into ~``snapshot.split.bytes`` byte
+            pieces (per-table, connection fallback, then :data:`_UNL_SPLIT_TARGET_BYTES`), while
+            a gzip file (magic bytes ``1f 8b``) is non-splittable and yields a single whole-file
+            split flagged ``gzip=True``. The plan is deterministic given the immutable extract
+            and target size, so ``latest_offset`` and ``get_partitions`` -- separate calls --
+            agree on the same global split ordering without sharing state, and a windowed serve
+            tiles ``[0, total)`` across microbatches with no gap, overlap, or duplication.
+            """
+
+            target_bytes = self._table_int_option(
+                table_options, _UNL_SPLIT_BYTES_OPTION, _UNL_SPLIT_TARGET_BYTES, minimum=1
+            )
+            source = self._table_snapshot_source(table_options)
+            splits: list[tuple[str, int, int, bool]] = []
+            for path in self._list_unl_files(source, table.exposed_name):
+                size = os.path.getsize(path)
+                read_chunk = self._unl_read_chunk(path)
+                if _unl_file_is_gzip(read_chunk):
+                    # Gzip is not seekable, so the whole compressed file is one split.
+                    splits.append((path, 0, size, True))
+                    continue
+                for start_byte, end_byte in _unl_byte_splits(
+                    read_chunk, size, target_bytes=target_bytes
+                ):
+                    splits.append((path, start_byte, end_byte, False))
+            return splits
+
+        def _unl_split_descriptors(
+            self,
+            table: Table,
+            table_options: dict[str, str],
+            snapshot_lsn: int,
+            *,
+            start_split: int,
+            window: int,
+        ) -> list[dict]:
+            """``unl_split`` partition descriptors for the split window ``[start_split, +window)``.
+
+            The window (``stream.partitioned.snapshot.pages.per.batch`` splits) is sliced from
+            the deterministic :meth:`_unl_all_splits` plan, so this microbatch serves only its
+            slice and the offset advances by ``window`` splits per read. Mints a per-batch
+            staging token when REST is available so executors read via ranged GET; omitting it
+            makes executors fall back to a local seek. The token rides only this batch's
+            transient descriptors, never the checkpoint offset.
+            """
+
+            all_splits = self._unl_all_splits(table, table_options)
+            end_split = min(start_split + window, len(all_splits))
+            columns = [
+                {
+                    "name": column.name,
+                    "type_name": column.type_name,
+                    "nullable": column.nullable,
+                    "length": column.length,
+                    "precision": column.precision,
+                    "scale": column.scale,
+                }
+                for column in table.columns
+            ]
+            files_api = self._staging_transport()
+            token = files_api._credential.bearer() if files_api is not None else None
+            host = files_api._host if files_api is not None else None
+            encoding = _client_encoding(self.options)
+            descriptors: list[dict] = []
+            for path, start_byte, end_byte, is_gzip in all_splits[start_split:end_split]:
+                descriptor = {
+                    "kind": "unl_split",
+                    "path": path,
+                    "start_byte": start_byte,
+                    "end_byte": end_byte,
+                    "gzip": is_gzip,
+                    "columns": columns,
+                    "snapshot_lsn": snapshot_lsn,
+                    "exposed_name": table.exposed_name,
+                    "encoding": encoding,
+                }
+                if token and host:
+                    descriptor["token"] = token
+                    descriptor["host"] = host
+                descriptors.append(descriptor)
+            return descriptors
 
         def _read_append_only(self, table: Table, start: dict | None, options: dict[str, str]):
             """Begin an append-only flow, then hand off to the ordinary CDC stream.
@@ -17170,6 +17723,289 @@ def register_lakeflow_source(spark):
             target = _variable_decimal_target(column, options)
             result[column.name] = _coerce_variable_decimal_value(value, column, target)
         return result
+
+
+    def _parse_unload_fields(line: str) -> list[str]:
+        """Split one Informix UNLOAD record into raw field strings.
+
+        UNLOAD is pipe-delimited with backslash escaping: ``\\n``/``\\r``/``\\t`` decode
+        to the control chars, ``\\<other>`` to the literal char, ``|`` separates fields.
+        A record ends with a terminating delimiter, so a line ending in ``|`` yields no
+        spurious trailing field (the final ``value`` is empty and dropped); a line
+        without one still yields its last field. An empty field is the empty string
+        here -- ``_unload_value`` maps it to NULL (UNLOAD writes NULL as an empty field).
+        """
+
+        values: list[str] = []
+        value: list[str] = []
+        escaped = False
+        for character in line.rstrip("\n").rstrip("\r"):
+            if escaped:
+                value.append({"n": "\n", "r": "\r", "t": "\t"}.get(character, character))
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == "|":
+                values.append("".join(value))
+                value = []
+            else:
+                value.append(character)
+        if value:
+            values.append("".join(value))
+        return values
+
+
+    def _unload_value(text: str, type_name: str) -> Any:
+        """Convert one UNLOAD field to the Python value the live snapshot would yield.
+
+        Keyed on the column's Informix ``type_name`` so ``_shape_snapshot`` (which
+        isoformats date/datetime and quantizes decimals) then produces a row
+        byte-identical to a live ``consistent_snapshot`` row. An empty field is NULL.
+        Exotic/binary types and locale-sensitive date formats are best-effort and must
+        be validated against the count/data-compare tool in live mode.
+        """
+
+        if text == "":
+            return None
+        upper = type_name.upper()
+        if upper in _UNLOAD_INT_TYPES:
+            return int(text)
+        if upper.startswith(("DECIMAL", "NUMERIC", "MONEY")):
+            return Decimal(text)
+        if upper in _UNLOAD_FLOAT_TYPES:
+            return float(text)
+        if upper == "DATE":
+            try:
+                return date.fromisoformat(text)
+            except ValueError:
+                return datetime.strptime(text, "%m/%d/%Y").date()
+        if upper.startswith("DATETIME"):
+            normalized = text.replace("T", " ")
+            for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                try:
+                    return datetime.strptime(normalized, fmt)
+                except ValueError:
+                    continue
+            return datetime.fromisoformat(text)
+        if upper == "BOOLEAN":
+            return text.strip().lower() in {"t", "true", "1", "y"}
+        return text
+
+
+    def _unl_byte_splits(
+        read_chunk: Callable[[int, int], bytes],
+        size: int,
+        *,
+        target_bytes: int = _UNL_SPLIT_TARGET_BYTES,
+        chunk_bytes: int = _UNL_SCAN_CHUNK_BYTES,
+    ) -> list[tuple[int, int]]:
+        """Index one `.unl` file into ``[start, end)`` byte splits of ~``target_bytes`` each.
+
+        Cheap to plan and constant-memory: for each split, seek to ``start + target_bytes``
+        and read forward via ``read_chunk`` only until the next physical ``\\n``, cutting the
+        split just after it (the next split resumes there). This reads a small window near
+        each cut point rather than the whole file -- the reason byte splitting is preferred
+        over a row cap, which cannot know row counts without reading every byte.
+
+        ``_iter_unl_records`` splits the same range on physical ``\\n``, so ending a split
+        right after a newline keeps records from spanning a boundary -- the same contract the
+        row splitter had. One physical ``\\n`` is one UNLOAD record (embedded newlines are
+        escaped). A trailing unterminated record is included in the final split; a split
+        whose target lands past the last newline runs to EOF. An empty file yields no splits.
+        """
+
+        target_bytes = max(1, target_bytes)
+        splits: list[tuple[int, int]] = []
+        split_start = 0
+        while split_start < size:
+            target = split_start + target_bytes
+            if target >= size:
+                splits.append((split_start, size))
+                break
+            boundary = _unl_next_record_boundary(read_chunk, target, size, chunk_bytes)
+            if boundary >= size:
+                splits.append((split_start, size))
+                break
+            splits.append((split_start, boundary))
+            split_start = boundary
+        return splits
+
+
+    def _unl_next_record_boundary(
+        read_chunk: Callable[[int, int], bytes],
+        target: int,
+        size: int,
+        chunk_bytes: int,
+    ) -> int:
+        """Return the offset just after the first physical ``\\n`` at or after ``target``.
+
+        Reads forward from ``target`` in ``chunk_bytes`` windows (never the whole file) and
+        returns ``size`` when no newline remains before EOF, so the caller runs the final
+        split to the end of the file.
+        """
+
+        offset = target
+        while offset < size:
+            chunk = read_chunk(offset, min(chunk_bytes, size - offset))
+            if not chunk:
+                break
+            index = chunk.find(b"\n")
+            if index != -1:
+                return offset + index + 1
+            offset += len(chunk)
+        return size
+
+
+    def _iter_unl_records(
+        read_chunk: Callable[[int, int], bytes],
+        start: int,
+        end: int,
+        *,
+        chunk_bytes: int = _UNL_SCAN_CHUNK_BYTES,
+    ) -> Iterator[bytes]:
+        """Yield the raw record bytes (no trailing newline) whose bytes lie in ``[start, end)``.
+
+        Splits produced by :func:`_unl_byte_splits` begin at a record start and end right
+        after a record's newline, so this reads the range and splits on physical ``\\n``.
+        Streaming/constant-memory. A final unterminated record (end of file) is yielded.
+        """
+
+        offset = start
+        buffer = b""
+        while offset < end:
+            chunk = read_chunk(offset, min(chunk_bytes, end - offset))
+            if not chunk:
+                break
+            offset += len(chunk)
+            buffer += chunk
+            parts = buffer.split(b"\n")
+            buffer = parts.pop()
+            yield from parts
+        if buffer:
+            yield buffer
+
+
+    def _unl_file_is_gzip(read_chunk: Callable[[int, int], bytes]) -> bool:
+        """Whether a `.unl` file is gzip-compressed, by its two magic bytes ``1f 8b``.
+
+        Authoritative over the file name, so a mislabelled extract is still handled
+        correctly. An empty file (no bytes) is not gzip.
+        """
+
+        return read_chunk(0, 2) == b"\x1f\x8b"
+
+
+    def _iter_gzip_unl_records(
+        read_chunk: Callable[[int, int], bytes],
+        size: int,
+        *,
+        chunk_bytes: int = _UNL_SCAN_CHUNK_BYTES,
+    ) -> Iterator[bytes]:
+        """Yield raw record bytes from a gzip-compressed `.unl` file (whole file, streaming).
+
+        Gzip is not seekable, so a compressed file is one non-splittable unit: read the
+        compressed bytes ``[0, size)`` in ``chunk_bytes`` windows, decompress incrementally,
+        split the decompressed stream on physical ``\\n``, and yield records. Constant memory
+        -- only one compressed window, the current decompressed run, and the trailing partial
+        line are held. Concatenated gzip members (``cat a.gz b.gz``) are handled by starting a
+        fresh decompressor from each member's trailing ``unused_data``. A final unterminated
+        record is yielded. An empty extract (gzip of no rows) yields nothing.
+        """
+
+        decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        offset = 0
+        tail = b""
+        while offset < size:
+            compressed = read_chunk(offset, min(chunk_bytes, size - offset))
+            if not compressed:
+                break
+            offset += len(compressed)
+            while compressed:
+                tail += decompressor.decompress(compressed)
+                if not decompressor.eof:
+                    break
+                # Member finished; its leftover bytes begin the next concatenated member.
+                compressed = decompressor.unused_data
+                decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            parts = tail.split(b"\n")
+            tail = parts.pop()
+            yield from parts
+        tail += decompressor.flush()
+        parts = tail.split(b"\n")
+        tail = parts.pop()
+        yield from parts
+        if tail:
+            yield tail
+
+
+    class _StaticStagingCredential:
+        """Fixed-bearer credential for a ``WorkspaceFilesApi`` rebuilt on an executor.
+
+        The driver mints and refreshes the real staging token; an executor receives just
+        the bearer for one batch in its partition descriptor, so it needs no minting or
+        refresh -- only ``bearer()``, which ``WorkspaceFilesApi`` calls per request.
+        """
+
+        def __init__(self, token: str) -> None:
+            self._token = token
+
+        def bearer(self) -> str:
+            return self._token
+
+
+    def _unl_split_read_chunk(partition: dict) -> Callable[[int, int], bytes]:
+        """A ``(offset, length) -> bytes`` range reader for one ``unl_split`` descriptor.
+
+        Ranged GET over the Files REST API when the descriptor carries a token+host
+        (executors have no ambient workspace credential, so the driver passes one per
+        batch); otherwise a local seek/read -- the same fallback shape as the driver's
+        ``_unl_read_chunk``, used offline or when no token could be minted.
+        """
+
+        token = partition.get("token")
+        host = partition.get("host")
+        path = partition["path"]
+        if token and host:
+            files_api = WorkspaceFilesApi(host, _StaticStagingCredential(token))
+            return lambda offset, length: files_api.get_range(path, offset, offset + length)
+
+        def local(offset: int, length: int) -> bytes:
+            with open(path, "rb") as handle:
+                handle.seek(offset)
+                return handle.read(length)
+
+        return local
+
+
+    def _shape_unl_record(
+        raw: bytes,
+        table: Table,
+        snapshot_lsn: int,
+        options: dict[str, str],
+        encoding: str,
+        *,
+        exposed_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Parse, type-convert, and shape one UNLOAD record -- shared by both serve paths.
+
+        Fails closed on a per-record column-count mismatch (the cheap misalignment guard
+        that stands in for the absent schema-fingerprint check). ``exposed_name`` names the
+        table in the error when the caller's ``table`` is a shaping-only stand-in.
+        """
+
+        fields = _parse_unload_fields(raw.decode(encoding, "strict"))
+        columns = table.columns
+        if len(fields) != len(columns):
+            name = exposed_name if exposed_name is not None else table.exposed_name
+            raise InformixError(
+                f"UNLOAD record in snapshot.source for '{name}' has {len(fields)} fields "
+                f"but the table has {len(columns)} columns"
+            )
+        row = {
+            column.name: _unload_value(fields[index], column.type_name)
+            for index, column in enumerate(columns)
+        }
+        return _shape_snapshot(row, snapshot_lsn, table, options)
 
 
     def _shape_snapshot(

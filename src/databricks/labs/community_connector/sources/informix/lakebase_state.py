@@ -77,6 +77,7 @@ what the public shape suggests:
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import logging
 import math
@@ -739,6 +740,20 @@ class WorkspaceFilesApi:
 
         return self._request("GET", volume_path) or b""
 
+    def get_range(self, volume_path: str, start: int, end: int) -> bytes:
+        """Download the half-open byte range ``[start, end)`` of ``volume_path``.
+
+        Issues a ranged GET (``Range: bytes=start-end-1``, inclusive per RFC 9110),
+        which the Files API answers with ``206 Partial Content``. Lets a reader pull
+        one split of a large file straight from object storage without materializing
+        the whole file (the serverless FUSE mount caches the whole file on first
+        access, so it is unsuitable for large files). ``end <= start`` yields ``b""``.
+        """
+
+        if end <= start:
+            return b""
+        return self._request("GET", volume_path, byte_range=(start, end - 1)) or b""
+
     def delete(self, volume_path: str) -> None:
         """Delete ``volume_path`` if it exists; a 404 is tolerated."""
 
@@ -752,6 +767,7 @@ class WorkspaceFilesApi:
         data: bytes | None = None,
         overwrite: bool = False,
         tolerate_missing: bool = False,
+        byte_range: tuple[int, int] | None = None,
     ) -> bytes | None:
         quoted = urllib.parse.quote(volume_path, safe="/")
         url = f"{self._host}/api/2.0/fs/files{quoted}"
@@ -760,6 +776,9 @@ class WorkspaceFilesApi:
         last_error: Exception | None = None
         for attempt in range(_FILES_API_ATTEMPTS):
             headers = {"Authorization": f"Bearer {self._credential.bearer()}"}
+            if byte_range is not None:
+                # Inclusive, zero-based per RFC 9110; the Files API answers 206.
+                headers["Range"] = f"bytes={byte_range[0]}-{byte_range[1]}"
             if data is not None:
                 headers["Content-Type"] = "application/octet-stream"
             request = urllib.request.Request(url, data=data, method=method, headers=headers)
@@ -778,7 +797,13 @@ class WorkspaceFilesApi:
                         error.code,
                     ) from error
                 last_error = error
-            except (urllib.error.URLError, TimeoutError) as error:
+            except (urllib.error.URLError, TimeoutError, http.client.IncompleteRead) as error:
+                # IncompleteRead: the server sent a valid response (for a ranged GET,
+                # a 206 with the full Content-Length) but the body transfer was cut
+                # short mid-stream. It is not a URLError/HTTPError, so without this it
+                # would escape the retry loop and kill the read. The request is
+                # deterministic and idempotent -- a ranged GET returns the same bytes
+                # every time -- so re-issuing it recovers the truncated transfer.
                 last_error = error
             if attempt + 1 < _FILES_API_ATTEMPTS:
                 time.sleep(min(1.5 * (2**attempt), 8.0))
