@@ -483,8 +483,12 @@ connection:
         `snapshot.mode=initial`) the table's initial snapshot is served from those files
         instead of a live repeatable-read scan of the source, then transitions to the CDC
         stream at the boundary the connector pins itself -- no operator-supplied LSN and no
-        schema fingerprint. The files must be Informix UNLOAD-delimited (`|` delimiter,
-        backslash escaping, empty field = NULL); parallel executor reads use ranged GETs
+        schema fingerprint. The files must be newline-terminated, escaped, delimited text
+        -- Informix UNLOAD (`|` delimiter, backslash escaping, empty field = NULL) or
+        High-Performance Loader (onpload/ipload) DELIMITED output, whose job-configured
+        delimiter/escape are set with `snapshot.unl.delimiter`/`snapshot.unl.escape` (HPL's
+        fixed-position, COBOL, and Informix-internal binary formats are not supported --
+        configure the HPL job to emit DELIMITED output); parallel executor reads use ranged GETs
         over the Files REST API and split each plain file into ~`snapshot.split.bytes`
         pieces at record boundaries. A gzip file (detected by its `1f 8b` magic bytes, not
         its name) is not seekable, so it is one non-splittable unit -- parallelism and
@@ -504,6 +508,29 @@ connection:
         large extract fans out into byte-balanced pieces. Splitting by bytes rather than
         rows lets the connector plan splits with a few small reads instead of scanning
         the whole file. Only meaningful with `snapshot.source`.
+
+    - name: snapshot.unl.delimiter
+      type: string
+      required: false
+      description: >
+        Field delimiter for a `.unl` extract read via `snapshot.source`, also accepted at
+        connection scope; a single character, default `|` (Informix UNLOAD). Set it when
+        the extract is HPL DELIMITED output whose job uses a non-pipe delimiter -- unlike
+        UNLOAD, HPL does not honor DBDELIMITER, so the delimiter is whatever the ipload job
+        set. The record terminator is always a newline. Only meaningful with
+        `snapshot.source`; must differ from `snapshot.unl.escape`.
+
+    - name: snapshot.unl.escape
+      type: string
+      required: false
+      description: >
+        Escape character for a `.unl` extract read via `snapshot.source`, also accepted at
+        connection scope; a single character, default `\` (Informix UNLOAD backslash
+        escaping, where `\n`/`\r`/`\t` decode to control chars and `\<other>` to the literal
+        char). Set it to match an HPL job that uses a different escape character, or to the
+        empty string to disable escape processing entirely for an HPL job that writes no
+        escapes. Only meaningful with `snapshot.source`; must differ from
+        `snapshot.unl.delimiter`.
 
     - name: snapshot.boundary.lsn
       type: string
@@ -1136,4 +1163,4 @@ connection:
 
 # Exact per-table overrides consumed by the connector. `qualified_source_table` maps a
 # pipeline table to a dynamically discovered exposed name (`owner.table`).
-external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
+external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
