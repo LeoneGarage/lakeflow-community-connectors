@@ -5862,6 +5862,21 @@ def register_lakeflow_source(spark):
     # Fixed buffer for the streaming range reads and the boundary-snap scan: constant
     # memory regardless of `.unl` size (never load a whole file).
     _UNL_SCAN_CHUNK_BYTES = 4 << 20
+    # A `.unl` extract need not be dbaccess UNLOAD: Informix's High-Performance Loader
+    # (onpload/ipload) DELIMITED output is the same newline-terminated, escaped, delimited
+    # shape, but with a job-configured field delimiter and escape character -- and, unlike
+    # UNLOAD, HPL does not honor DBDELIMITER, so an HPL job commonly uses a non-`|`
+    # delimiter. These per-table (connection-fallback) options let the file serve parse an
+    # HPL DELIMITED extract whose delimiter/escape differ from UNLOAD's `|`/backslash
+    # defaults; the defaults leave a plain UNLOAD extract parsed exactly as before. Both are
+    # a single character (an empty escape disables escape processing for an HPL job that
+    # writes none). The record terminator stays a physical newline; HPL's fixed-position,
+    # COBOL, and Informix-internal binary formats are not supported (they are not
+    # self-describing) -- configure the HPL job to emit newline-terminated DELIMITED output.
+    _UNL_DELIMITER_OPTION = "snapshot.unl.delimiter"
+    _UNL_ESCAPE_OPTION = "snapshot.unl.escape"
+    _UNL_DEFAULT_DELIMITER = "|"
+    _UNL_DEFAULT_ESCAPE = "\\"
     # Informix integer/float type names, for mapping UNLOAD text back to Python values.
     _UNLOAD_INT_TYPES = frozenset(
         {"INTEGER", "INT", "SMALLINT", "BIGINT", "INT8", "SERIAL", "SERIAL8", "BIGSERIAL"}
@@ -10506,6 +10521,10 @@ def register_lakeflow_source(spark):
             _option_bool(options, _CONNECTION_FAIR_QUEUE_OPTION, True)
             _option_bool(options, _SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION, True)
             _option_bool(options, _DAEMON_SLOT_LIVENESS_OPTION, True)
+            # Validate the .unl / HPL DELIMITED field format eagerly (single-character
+            # delimiter and optionally-empty escape, which must differ), rather than only
+            # on the first file-source read deep inside a running flow.
+            _validate_unl_field_format(options)
             queue_policy = options.get(
                 _CONNECTION_FAIR_QUEUE_POLICY_OPTION, _DEFAULT_CONNECTION_FAIR_QUEUE_POLICY
             )
@@ -14650,6 +14669,37 @@ def register_lakeflow_source(spark):
             value = str(value).strip() if value is not None else ""
             return value or None
 
+        def _unl_field_format(self, table_options: dict[str, str]) -> tuple[str, str]:
+            """The ``(delimiter, escape)`` for a `.unl`/HPL DELIMITED serve.
+
+            Resolved table option, then connection, then the UNLOAD defaults (``|``/backslash),
+            so a plain UNLOAD extract needs no options and an HPL extract sets only what differs.
+            Both are validated to a single character (empty escape allowed = escaping disabled),
+            and the two must differ.
+            """
+
+            delimiter = _unl_char(
+                table_options.get(
+                    _UNL_DELIMITER_OPTION,
+                    self.options.get(_UNL_DELIMITER_OPTION, _UNL_DEFAULT_DELIMITER),
+                ),
+                _UNL_DELIMITER_OPTION,
+                allow_empty=False,
+            )
+            escape = _unl_char(
+                table_options.get(
+                    _UNL_ESCAPE_OPTION,
+                    self.options.get(_UNL_ESCAPE_OPTION, _UNL_DEFAULT_ESCAPE),
+                ),
+                _UNL_ESCAPE_OPTION,
+                allow_empty=True,
+            )
+            if escape and escape == delimiter:
+                raise ValueError(
+                    f"Options '{_UNL_DELIMITER_OPTION}' and '{_UNL_ESCAPE_OPTION}' must differ"
+                )
+            return delimiter, escape
+
         def _unl_snapshot_serve(self, table_options: dict[str, str], effective_start: dict) -> bool:
             """Whether this read belongs to a file-source initial snapshot's split serve.
 
@@ -14941,6 +14991,7 @@ def register_lakeflow_source(spark):
             source = self._table_snapshot_source(options)
             files = self._list_unl_files(source, table.exposed_name)
             encoding = _client_encoding(self.options)
+            delimiter, escape = self._unl_field_format(options)
             for path in files:
                 size = os.path.getsize(path)
                 read_chunk = self._unl_read_chunk(path)
@@ -14949,7 +15000,9 @@ def register_lakeflow_source(spark):
                 else:
                     records = _iter_unl_records(read_chunk, 0, size)
                 for raw in records:
-                    yield _shape_unl_record(raw, table, snapshot_lsn, options, encoding)
+                    yield _shape_unl_record(
+                        raw, table, snapshot_lsn, options, encoding, delimiter=delimiter, escape=escape
+                    )
 
         def _read_unl_split(
             self, partition: dict, table_options: dict[str, str]
@@ -14975,6 +15028,12 @@ def register_lakeflow_source(spark):
             snapshot_lsn = int(partition["snapshot_lsn"])
             encoding = str(partition.get("encoding") or "utf-8")
             exposed_name = str(partition.get("exposed_name", ""))
+            # Delimiter/escape ride the descriptor so an HPL DELIMITED extract parses on the
+            # executor exactly as on the driver; absent (older descriptor) they fall back to
+            # the UNLOAD defaults. An escape stored as "" means escaping is disabled.
+            delimiter = str(partition.get("delimiter") or _UNL_DEFAULT_DELIMITER)
+            escape = partition.get("escape", _UNL_DEFAULT_ESCAPE)
+            escape = "" if escape is None else str(escape)
             read_chunk = _unl_split_read_chunk(partition)
             start = int(partition["start_byte"])
             end = int(partition["end_byte"])
@@ -14984,7 +15043,14 @@ def register_lakeflow_source(spark):
                 records = _iter_unl_records(read_chunk, start, end)
             for raw in records:
                 yield _shape_unl_record(
-                    raw, table, snapshot_lsn, table_options, encoding, exposed_name=exposed_name
+                    raw,
+                    table,
+                    snapshot_lsn,
+                    table_options,
+                    encoding,
+                    exposed_name=exposed_name,
+                    delimiter=delimiter,
+                    escape=escape,
                 )
 
         def _unl_all_splits(
@@ -15055,6 +15121,7 @@ def register_lakeflow_source(spark):
             token = files_api._credential.bearer() if files_api is not None else None
             host = files_api._host if files_api is not None else None
             encoding = _client_encoding(self.options)
+            delimiter, escape = self._unl_field_format(table_options)
             descriptors: list[dict] = []
             for path, start_byte, end_byte, is_gzip in all_splits[start_split:end_split]:
                 descriptor = {
@@ -15067,6 +15134,8 @@ def register_lakeflow_source(spark):
                     "snapshot_lsn": snapshot_lsn,
                     "exposed_name": table.exposed_name,
                     "encoding": encoding,
+                    "delimiter": delimiter,
+                    "escape": escape,
                 }
                 if token and host:
                     descriptor["token"] = token
@@ -17725,27 +17794,78 @@ def register_lakeflow_source(spark):
         return result
 
 
-    def _parse_unload_fields(line: str) -> list[str]:
-        """Split one Informix UNLOAD record into raw field strings.
+    def _unl_char(value: object, name: str, *, allow_empty: bool) -> str:
+        """Validate a `.unl`/HPL delimiter or escape option to a single character.
 
-        UNLOAD is pipe-delimited with backslash escaping: ``\\n``/``\\r``/``\\t`` decode
-        to the control chars, ``\\<other>`` to the literal char, ``|`` separates fields.
-        A record ends with a terminating delimiter, so a line ending in ``|`` yields no
-        spurious trailing field (the final ``value`` is empty and dropped); a line
-        without one still yields its last field. An empty field is the empty string
-        here -- ``_unload_value`` maps it to NULL (UNLOAD writes NULL as an empty field).
+        HPL and UNLOAD field delimiters and escape characters are each one character. A
+        multi-character value is a configuration error, caught eagerly rather than silently
+        truncated. An empty value is rejected for the delimiter and accepted for the escape
+        (``allow_empty``), where it disables escape processing for an HPL extract that writes
+        no escapes.
+        """
+
+        text = "" if value is None else str(value)
+        if text == "":
+            if allow_empty:
+                return ""
+            raise ValueError(f"Option '{name}' must be a single character")
+        if len(text) != 1:
+            raise ValueError(f"Option '{name}' must be a single character, got {text!r}")
+        return text
+
+
+    def _validate_unl_field_format(options: dict[str, str]) -> None:
+        """Eagerly validate the connection-scope `.unl`/HPL delimiter and escape options.
+
+        Table-scope overrides are validated the same way at resolve time by
+        ``_unl_field_format``; this catches a bad connection default at construction.
+        """
+
+        delimiter = _unl_char(
+            options.get(_UNL_DELIMITER_OPTION, _UNL_DEFAULT_DELIMITER),
+            _UNL_DELIMITER_OPTION,
+            allow_empty=False,
+        )
+        escape = _unl_char(
+            options.get(_UNL_ESCAPE_OPTION, _UNL_DEFAULT_ESCAPE),
+            _UNL_ESCAPE_OPTION,
+            allow_empty=True,
+        )
+        if escape and escape == delimiter:
+            raise ValueError(
+                f"Options '{_UNL_DELIMITER_OPTION}' and '{_UNL_ESCAPE_OPTION}' must differ"
+            )
+
+
+    def _parse_unload_fields(
+        line: str,
+        *,
+        delimiter: str = _UNL_DEFAULT_DELIMITER,
+        escape: str = _UNL_DEFAULT_ESCAPE,
+    ) -> list[str]:
+        """Split one UNLOAD / HPL DELIMITED record into raw field strings.
+
+        Delimited with a single-character field ``delimiter`` (``|`` for UNLOAD) and, when
+        ``escape`` is non-empty (backslash for UNLOAD), backslash-style escaping: ``<esc>n``/
+        ``<esc>r``/``<esc>t`` decode to the control chars and ``<esc><other>`` to the literal
+        char. UNLOAD terminates each record with a trailing delimiter and HPL DELIMITED does
+        not; both are handled -- a line ending in the delimiter yields no spurious trailing
+        field (the final ``value`` is empty and dropped) and a line without one still yields
+        its last field. An empty field is the empty string here -- ``_unload_value`` maps it
+        to NULL (both writers render NULL as an empty field). An empty ``escape`` disables
+        escape processing (raw split on the delimiter), for an HPL job that writes no escapes.
         """
 
         values: list[str] = []
         value: list[str] = []
         escaped = False
         for character in line.rstrip("\n").rstrip("\r"):
-            if escaped:
+            if escape and escaped:
                 value.append({"n": "\n", "r": "\r", "t": "\t"}.get(character, character))
                 escaped = False
-            elif character == "\\":
+            elif escape and character == escape:
                 escaped = True
-            elif character == "|":
+            elif character == delimiter:
                 values.append("".join(value))
                 value = []
             else:
@@ -17985,15 +18105,22 @@ def register_lakeflow_source(spark):
         encoding: str,
         *,
         exposed_name: str | None = None,
+        delimiter: str = _UNL_DEFAULT_DELIMITER,
+        escape: str = _UNL_DEFAULT_ESCAPE,
     ) -> dict[str, Any]:
-        """Parse, type-convert, and shape one UNLOAD record -- shared by both serve paths.
+        """Parse, type-convert, and shape one UNLOAD / HPL DELIMITED record -- shared by both
+        serve paths.
 
         Fails closed on a per-record column-count mismatch (the cheap misalignment guard
         that stands in for the absent schema-fingerprint check). ``exposed_name`` names the
         table in the error when the caller's ``table`` is a shaping-only stand-in.
+        ``delimiter``/``escape`` select the delimited dialect (UNLOAD's ``|``/backslash by
+        default, or an HPL job's configured pair).
         """
 
-        fields = _parse_unload_fields(raw.decode(encoding, "strict"))
+        fields = _parse_unload_fields(
+            raw.decode(encoding, "strict"), delimiter=delimiter, escape=escape
+        )
         columns = table.columns
         if len(fields) != len(columns):
             name = exposed_name if exposed_name is not None else table.exposed_name

@@ -12970,6 +12970,18 @@ class UnloadHelperTests(unittest.TestCase):
         # An empty (NULL) field is preserved as "".
         self.assertEqual(parse("|a|"), ["", "a"])
 
+    def test_parse_unload_fields_supports_hpl_custom_delimiter_and_escape(self):
+        parse = informix_module._parse_unload_fields
+        # HPL DELIMITED is the same shape with a job-configured delimiter/escape and no
+        # trailing delimiter: a tab-delimited record with a `~` escape parses like UNLOAD.
+        self.assertEqual(parse("a\tb\tc", delimiter="\t"), ["a", "b", "c"])
+        self.assertEqual(parse("a~\tb\tc", delimiter="\t", escape="~"), ["a\tb", "c"])
+        self.assertEqual(parse("x~ny", delimiter="\t", escape="~"), ["x\ny"])
+        # `d1 d2` empty field is NULL for both writers, regardless of the delimiter.
+        self.assertEqual(parse("a;;c", delimiter=";"), ["a", "", "c"])
+        # An empty escape disables escape processing: a backslash is literal data.
+        self.assertEqual(parse("a\\|b", escape=""), ["a\\", "b"])
+
     def test_unload_value_maps_types_and_empty_to_none(self):
         value = informix_module._unload_value
         self.assertIsNone(value("", "INTEGER"))
@@ -13161,6 +13173,59 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
             for row in connector.read_partition("app.orders", partition, options)
         ]
         self.assertEqual(fanned, serial)
+
+    def test_unl_hpl_custom_delimiter_serves_shaped_rows(self):
+        # An HPL DELIMITED extract: tab-delimited, no trailing delimiter. With the
+        # matching snapshot.unl.delimiter it shapes to the same rows as an UNLOAD extract
+        # and transitions to the stream phase at the pinned boundary.
+        source = self._source("1\talpha\n2\tbeta\n")
+        options = {"snapshot.source": source, "snapshot.unl.delimiter": "\t"}
+        rows, offset = self.connector(FakeBridge()).read_table("app.orders", {}, options)
+        rows = list(rows)
+        self.assertEqual(offset["phase"], "stream")
+        self.assertEqual([(r["id"], r["value"]) for r in rows], [(1, "alpha"), (2, "beta")])
+        for row in rows:
+            self.assertEqual(row[informix_module.OP], "r")
+
+    def test_unl_hpl_custom_delimiter_partitioned_fan_out_matches_serial(self):
+        # The delimiter rides each unl_split descriptor, so the executor path parses an
+        # HPL extract identically to the serial driver path -- row-for-row, no dup/loss.
+        source = self._source("1\ta\n2\tb\n3\tc\n")
+        options = {"snapshot.source": source, "snapshot.unl.delimiter": "\t"}
+        serial = list(self.connector(FakeBridge()).read_table("app.orders", {}, options)[0])
+
+        connector = self.connector(FakeBridge())
+        with mock.patch.object(informix_module, "_UNL_SPLIT_TARGET_BYTES", 1):
+            offset = connector.latest_offset("app.orders", options, {})
+            partitions = connector.get_partitions("app.orders", options, {}, offset)
+            fanned = [
+                row
+                for partition in partitions
+                for row in connector.read_partition("app.orders", partition, options)
+            ]
+        self.assertTrue(partitions)
+        self.assertTrue(all(p.get("delimiter") == "\t" for p in partitions))
+        self.assertEqual(fanned, serial)
+
+    def test_unl_hpl_escape_disabled_treats_backslash_as_literal_data(self):
+        # snapshot.unl.escape="" disables escape processing (an HPL job that writes no
+        # escapes): a backslash in a VARCHAR is literal rather than starting an escape.
+        source = self._source("1|a\\b|\n")
+        options = {"snapshot.source": source, "snapshot.unl.escape": ""}
+        rows, _ = self.connector(FakeBridge()).read_table("app.orders", {}, options)
+        rows = list(rows)
+        self.assertEqual(rows[0]["value"], "a\\b")
+
+    def test_unl_delimiter_option_rejects_a_multi_character_value(self):
+        with self.assertRaises(ValueError):
+            self.connector(FakeBridge(), **{"snapshot.unl.delimiter": "||"})
+
+    def test_unl_escape_equal_to_delimiter_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.connector(
+                FakeBridge(),
+                **{"snapshot.unl.delimiter": ",", "snapshot.unl.escape": ","},
+            )
 
     def test_unl_source_null_field_becomes_none(self):
         source = self._source("1||\n")
