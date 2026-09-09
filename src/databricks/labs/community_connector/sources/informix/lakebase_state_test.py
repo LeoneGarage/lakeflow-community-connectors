@@ -17,6 +17,7 @@ connector's imports require and which there is no reason to duplicate.
 from __future__ import annotations
 
 import concurrent.futures
+import http.client
 import io
 import json
 import os
@@ -2305,6 +2306,62 @@ class WorkspaceFilesApiTests(unittest.TestCase):
             with self.assertRaises(lakebase_state.WorkspaceHttpError) as ctx:
                 client.put("/Volumes/c/s/v/x", b"data")
         self.assertEqual(ctx.exception.status_code, 403)
+
+    def test_get_range_sends_inclusive_byte_range_header(self):
+        captured = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["method"] = request.get_method()
+            captured["range"] = request.headers.get("Range")
+            captured["url"] = request.full_url
+            return _FakeHttpResponse(b"partial-body")
+
+        client, _ = self._client()
+        with mock.patch.object(lakebase_state.urllib.request, "urlopen", fake_urlopen):
+            data = client.get_range("/Volumes/c/s/v/extract.unl", 10, 30)
+        self.assertEqual(data, b"partial-body")
+        self.assertEqual(captured["method"], "GET")
+        # Half-open [10, 30) -> inclusive HTTP range bytes=10-29 (RFC 9110).
+        self.assertEqual(captured["range"], "bytes=10-29")
+        self.assertTrue(captured["url"].endswith("/api/2.0/fs/files/Volumes/c/s/v/extract.unl"))
+
+    def test_get_range_returns_empty_without_a_request_when_empty(self):
+        def fake_urlopen(request, timeout=None):
+            raise AssertionError("an empty range must not issue an HTTP request")
+
+        client, _ = self._client()
+        with mock.patch.object(lakebase_state.urllib.request, "urlopen", fake_urlopen):
+            self.assertEqual(client.get_range("/Volumes/c/s/v/x.unl", 5, 5), b"")
+
+    def test_get_range_retries_a_truncated_body_transfer(self):
+        # A 206 whose body transfer is cut short surfaces as http.client.IncompleteRead,
+        # which is not a URLError/HTTPError. Without it in the retry set the read would
+        # escape the loop and kill the flow; the ranged GET is idempotent, so a retry
+        # must recover the full body.
+        attempts = {"n": 0}
+
+        def fake_urlopen(request, timeout=None):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise http.client.IncompleteRead(b"2703360-bytes", 1490944)
+            return _FakeHttpResponse(b"whole-range-body")
+
+        client, _ = self._client()
+        with mock.patch.object(lakebase_state.urllib.request, "urlopen", fake_urlopen):
+            with mock.patch.object(lakebase_state.time, "sleep", lambda _s: None):
+                data = client.get_range("/Volumes/c/s/v/extract.unl", 0, 4 << 20)
+        self.assertEqual(data, b"whole-range-body")
+        self.assertEqual(attempts["n"], 2)
+
+    def test_get_range_exhausts_attempts_on_persistent_truncation(self):
+        def fake_urlopen(request, timeout=None):
+            raise http.client.IncompleteRead(b"short", 99)
+
+        client, _ = self._client()
+        with mock.patch.object(lakebase_state.urllib.request, "urlopen", fake_urlopen):
+            with mock.patch.object(lakebase_state.time, "sleep", lambda _s: None):
+                with self.assertRaises(lakebase_state.LakebaseStateError):
+                    client.get_range("/Volumes/c/s/v/extract.unl", 0, 4 << 20)
 
 
 if __name__ == "__main__":

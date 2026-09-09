@@ -96,13 +96,16 @@ replicated — run a full refresh if the destination must match the source exact
 | `decimal.variable.type` | No | `decimal(38,18)` | Per-table option. Target Spark type for variable-scale `DECIMAL(p)`/`NUMERIC(p)` columns: `string`, `double`, `integer` (truncated), or `decimal(p,s)`. Explicit `DECIMAL(p,s)` remains fixed-scale. See [Variable-scale decimals](#variable-scale-decimals). |
 | `decimal.variable.column.type` | No | none | Per-table option. Comma-separated `column:type` overrides of `decimal.variable.type` for specific columns, e.g. `agt_no:decimal(9,0),bnk_acct_no:string`. |
 | `snapshot.mode` | No | `incremental` | Per-table snapshot policy: `incremental`, `initial`, `initial_only`, `cdc_only`, `auto_snapshot`, or `recovery`. See [Snapshot modes](#snapshot-modes). |
+| `snapshot.source` | No | none | Per-table (also connection-scope) UC Volume directory of Informix UNLOAD (`.unl` or gzip `.unl.gz`) extract files. With `snapshot.mode=initial`, the initial snapshot is served from those files instead of a live scan, then transitions to CDC at the boundary. Files must be UNLOAD-delimited (`\|` delimiter, backslash escaping, empty field = NULL); parallel executor reads use ranged GETs over the Files REST API, splitting each plain file into ~`snapshot.split.bytes` (default 50 MiB) pieces at record boundaries. A gzip file (detected by magic bytes, not name) is not seekable, so it is one non-splittable unit — for compressed extracts, parallelism and mid-snapshot resume come from using **multiple `.unl.gz` files**. The operator must ensure the extract reflects the table at ingest time (quiesce, or extract-then-ingest); the connector does not verify alignment. Producing the `.unl` files via UNLOAD/HPL is out of scope. See [File-sourced initial snapshot](#file-sourced-initial-snapshot). |
+| `snapshot.boundary.lsn` | No | self-pin | Per-table (also connection-scope) operator-supplied CDC boundary LSN for a `snapshot.source` extract — the LSN the extract was captured at, so the CDC stream resumes at exactly that position. **Resolution per table, first hit wins:** this option; else a `_manifest.json` file in the `snapshot.source` directory containing `{"boundary_lsn": "<X>"}` (other keys ignored); else the connector self-pins its own registration LSN. A supplied boundary is validated against the source's retained/current log range and **fails closed** if below the minimum retained LSN (the logical log recycled past it → gap) or above current. Non-negative integer. |
+| `snapshot.split.bytes` | No | `52428800` | Per-table (also connection-scope) target byte size for each parallel `.unl` split — each executor reads roughly this many bytes, snapped up to the next record boundary. Splitting by bytes rather than rows lets the connector plan splits with a few small reads instead of scanning the whole file. Positive integer; default 50 MiB. Only meaningful with `snapshot.source`. |
 | `table.migration` | No | `false` | Per-table (also connection-scope) boolean. When `true`, the table runs a two-run checkpoint handoff instead of its normal read, so it can move to a new Lakeflow flow — an SCD Type 1 → append-only switch, or a destination relocation — **without re-snapshotting**. Orthogonal to `snapshot.mode`, which the table keeps unchanged. Migration never streams: every read records a checkpoint, emits no rows, and stops. Clearing it (Restore) resumes normal reads from the recorded offset. See [Migrating a table without a re-snapshot](#migrating-a-table-without-a-re-snapshot). Accepts `true`/`false`. |
 | `snapshot.page.size` | No | `20000` | Rows per page for **keyed** tables — keyset-paged incremental chunks and the keyed blocking `initial` snapshot; minimum `1`. Pages are read under one repeatable-read transaction and delivered through checkpointed Lakeflow microbatches. A keyless `initial` snapshot uses `keyless.snapshot.page.size` instead. |
 | `keyless.snapshot.page.size` | No | `50000` | Rows per immutable staged Volume page for a **keyless** `initial` snapshot (an append-only keyless table with `snapshot.mode=initial`); minimum `1`. Such a table drains positionally (no seek cursor), so a larger page means fewer manifest entries and round trips for the same rows. A per-page byte ceiling still applies, and `snapshot.max.rows`/`snapshot.max.bytes` cap the whole drain. |
 | `snapshot.filter` | No | none | Per-table Informix SQL predicate appended to snapshot `SELECT` statements, without the `WHERE` keyword. It filters blocking, incremental, append-only initial, and snapshot-only copies. CDC events after the snapshot are not filtered. Semicolons, SQL comments, control characters, and predicates longer than 8,192 characters are rejected. |
 | `snapshot.isolation` | No | `committed_read_last_committed` | Per-table isolation level for the monolithic `snapshot.mode=initial` full-table snapshot. `committed_read_last_committed` (default) reads the last-committed image of a locked row instead of holding shared locks, so the snapshot does **not** lock the table against writers. `repeatable_read` restores the exactly-once, table-locking behavior. Tokens are case- and whitespace-insensitive; unknown values are rejected. **⚠️ Duplicate-row warning:** under `committed_read_last_committed` the table is no longer frozen at the snapshot LSN, so a row inserted **during** the scan can be captured by both the snapshot and the change stream. A keyed table de-duplicates these by primary key, but a **keyless (append-only) table has no key to de-duplicate on and may therefore emit duplicate rows**. Use `repeatable_read` for keyless tables that require exactly-once, or run the `initial` backfill during a quiet window. See [Snapshot isolation](#snapshot-isolation). |
 | `stream.partitioned` | No | `true` | Whether the connector uses the **partitioned stream reader**. When enabled (default), the staged-snapshot page-serve phase **fans out**: a microbatch spans up to `stream.partitioned.snapshot.pages.per.batch` immutable staged pages, each read and decoded on a **separate Spark executor** instead of one page per microbatch on the driver — the parallel-read win for large snapshots. Every other phase (staging bootstrap, the live CDC/incremental stream, snapshot→CDC transitions, deletes) is a **single driver-computed partition** whose rows are byte-for-byte the current output, just wrapped — **CDC is never parallelized here** (the shard daemon remains the CDC lever; see `cdc.shared.session`). Applies only to tables with a bounded staged-snapshot→stream lifecycle (keyed CDC tables and append-only tables); snapshot-only tables always use the simple reader. Both readers persist the **same offset**, so this can be flipped on a **running** pipeline and it resumes the existing checkpoint in place with **no full refresh** (verified: serverless SDP resumes across the reader-class swap). **Requires `cdc.shared.session=true` (the default)**, because an embedded CDC microbatch is recomputed from its committed start offset on a Spark uncommitted-batch replay, and only the shared session's idempotent (peek-don't-pop) reads make that recompute deterministic — a live per-table re-read could duplicate or drop CDC rows. Because `stream.partitioned` is on by default, **if you set `cdc.shared.session=false` you must also set `stream.partitioned=false`**; otherwise the connector **fails fast at construction** with an explanatory error. There is no silent fallback. Set `false` to force the simple single-partition driver reader. Accepts `true`/`false`. |
-| `stream.partitioned.snapshot.pages.per.batch` | No | `8` | Maximum staged snapshot pages a single partitioned microbatch spans — the executor fan-out per batch; minimum `1`. Only meaningful when `stream.partitioned=true`. Larger values read more pages in parallel per microbatch at the cost of a larger batch. Independent of this value, the driver reads one boundary page's header per microbatch to record the resume cursor (`last_pk`). |
+| `stream.partitioned.snapshot.pages.per.batch` | No | `8` | Maximum staged snapshot pages a single partitioned microbatch spans — the executor fan-out per batch; minimum `1`. Only meaningful when `stream.partitioned=true`. Larger values read more pages in parallel per microbatch at the cost of a larger batch. Independent of this value, the driver reads one boundary page's header per microbatch to record the resume cursor (`last_pk`). **Also governs a `snapshot.source` (`.unl`) serve**: it advances that many byte splits per microbatch, so the file snapshot drains over several bounded, resumable microbatches instead of one. |
 | `snapshot.staging.transport` | No | `auto` | How snapshot page payloads are written to the staging Volume. `fuse` uses the UC Volume FUSE mount (historical behavior). `rest` writes them through the **Files REST API**, which never touches the mount and so avoids the FUSE `ENOTCONN` disconnects that recur under sustained write frequency; it needs the workspace to permit **personal-access-token creation** for the pipeline's identity. `auto` (default) uses `rest` when a token can be minted and **falls back to `fuse`** when token creation is forbidden. Only page *writes* use this transport; reads and cleanup still use the mount. One of `auto`, `rest`, `fuse`. |
 | `snapshot.staging.token.lifetime.seconds` | No | `86400` | Lifetime of the personal access token minted for the `rest`/`auto` staging transport. The token is refreshed at half this value — the current token mints its successor — so a long-running pipeline never lets it expire while each token stays short-lived at rest. On every startup a fresh token is minted (per pipeline id) and the pipeline's prior tokens are revoked. Minimum `600`; clamped to the workspace's maximum-token-lifetime policy. |
 | `snapshot.staging.pipeline` | No | `true` | Whether a **keyless** `initial` drain on the `rest` transport overlaps its next page fetch with the previous page's shape-and-upload, through one bounded background uploader — roughly halving wall-clock for an I/O-bound keyless drain, at the cost of a few more pages resident in memory. Only engaged for a keyless drain on the REST transport (pipelining FUSE writes would raise the mount's write frequency, which REST exists to avoid); keyed drains are unaffected. Set `false` to force serial staging. |
@@ -134,7 +137,7 @@ replicated — run a full refresh if the destination must match the source exact
 Because per-table options are supported, configure the Unity Catalog connection with this exact `externalOptionsAllowList`:
 
 ```text
-qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration
+qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration
 ```
 
 Create the connection from the Lakeflow Community Connector flow on the **Add Data** page, with the Databricks CLI, or with the Databricks SDK for Python. The Unity Catalog connection type must be `COMMUNITY`, and `sourceName` must be `informix`.
@@ -167,7 +170,7 @@ databricks connections create --json "$(jq -n \
       encrypt: "true",
       "snapshot.staging.location": "/Volumes/main/informix_cdc/staging",
       "lakebase.password": $lakebase_password,
-      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
+      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
     }
   }')"
 
@@ -205,7 +208,7 @@ databricks connections update informix_sales --json "$(jq -n \
       "ssl.ca.file": "/Volumes/catalog/schema/artifacts/informix-ca.pem",
       "snapshot.staging.location": "/Volumes/main/informix_cdc/staging",
       "lakebase.password": $lakebase_password,
-      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
+      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
     }
   }')" \
   --profile "$DATABRICKS_PROFILE"
@@ -252,7 +255,7 @@ connection = w.connections.create(
         "lakebase.password": os.environ["LAKEBASE_PASSWORD"],
         "externalOptionsAllowList": (
             "qualified_source_table,decimal.variable.type,decimal.variable.column.type,"
-            "snapshot.mode,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,"
+            "snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,"
             "append.only.ingestion,"
             "max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
         ),
@@ -293,7 +296,7 @@ connection = w.connections.update(
         "lakebase.password": os.environ["LAKEBASE_PASSWORD"],
         "externalOptionsAllowList": (
             "qualified_source_table,decimal.variable.type,decimal.variable.column.type,"
-            "snapshot.mode,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,"
+            "snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,"
             "append.only.ingestion,"
             "max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
         ),
@@ -604,7 +607,7 @@ node is removed, the affected pipeline fails closed and requires a full refresh.
 }
 ```
 
-Supported source-specific table options are `qualified_source_table`, `decimal.variable.type`, `decimal.variable.column.type`, `snapshot.mode`, `snapshot.page.size`, `keyless.snapshot.page.size`, `snapshot.filter`, `snapshot.isolation`, `snapshot.max.rows`, `snapshot.max.bytes`, `max.records.per.batch`, `cdc.timeout`, and `cdc.max.records`. `qualified_source_table` maps the pipeline's logical table name to an Informix `owner.table` name. Standard destination, SCD, key, sequence, and clustering options remain available.
+Supported source-specific table options are `qualified_source_table`, `decimal.variable.type`, `decimal.variable.column.type`, `snapshot.mode`, `snapshot.source`, `snapshot.boundary.lsn`, `snapshot.split.bytes`, `snapshot.page.size`, `keyless.snapshot.page.size`, `snapshot.filter`, `snapshot.isolation`, `snapshot.max.rows`, `snapshot.max.bytes`, `max.records.per.batch`, `cdc.timeout`, and `cdc.max.records`. `qualified_source_table` maps the pipeline's logical table name to an Informix `owner.table` name. Standard destination, SCD, key, sequence, and clustering options remain available.
 
 ### Snapshot modes
 
@@ -800,6 +803,50 @@ value at a nearby LSN. An append-only consumer that reconstructs state by
 ordering on `_informix_change_lsn` (the documented contract) still resolves the
 correct value. If you require an append changelog with no duplicated snapshot
 rows, use `snapshot.mode=initial` for that table.
+
+#### File-sourced initial snapshot
+
+Set `snapshot.source=<Volume path>` (with `snapshot.mode=initial`) to serve a
+table's initial snapshot from Informix **UNLOAD (`.unl`) files** you extracted to a
+Unity Catalog Volume, instead of a live repeatable-read scan of the source. The
+connector reads and shapes those files (`_informix_op="r"`), then transitions to the
+CDC stream at the boundary — the same handoff a live snapshot makes, so the stream
+resumes at the boundary and never re-emits snapshot rows. It reads splits in parallel
+across executors via Files-API ranged GETs, splitting each file into ~`snapshot.split.bytes`
+(default 50 MiB) pieces at record boundaries, so a large table fans out into byte-balanced
+splits. Splitting by bytes needs no whole-file scan to plan — the connector seeks to each
+target and reads only a small window to snap to the next record. The serve is **windowed
+and resumable**: each microbatch advances `stream.partitioned.snapshot.pages.per.batch`
+splits (default 8), so a large extract drains over several bounded microbatches and a
+restart mid-snapshot picks up at the last committed split rather than restarting. Files
+must be UNLOAD-delimited (`|` delimiter, backslash escaping, empty field = NULL), and every
+file in the directory is treated as one snapshot at a single boundary.
+
+**Gzip.** A file is decompressed transparently when it is gzip-compressed — detected by its
+`1f 8b` magic bytes, so `.unl.gz` (or even a mislabelled `.unl` that is actually gzip) works.
+Because a gzip stream is not seekable, a compressed file is **one non-splittable split**: it
+is streamed and decompressed whole on a single executor, and a restart re-reads it from the
+start. So parallelism and mid-snapshot resume for compressed extracts come from producing
+**multiple `.unl.gz` files** (e.g. `UNLOAD` to N files, gzip each), not from splitting within
+a file. `snapshot.split.bytes` has no effect on a gzip file. Plain and gzip files may be
+mixed in one directory. Concatenated gzip members (`cat a.gz b.gz`) are handled.
+
+**Boundary LSN.** For CDC to resume correctly the connector needs the log position the
+extract corresponds to. It is resolved per table, **first hit wins**:
+
+1. `snapshot.boundary.lsn=<X>` — the LSN you captured at extract time.
+2. else a `_manifest.json` in the `snapshot.source` directory: `{"boundary_lsn": "<X>"}`
+   (other keys are ignored, so the marker is extensible).
+3. else the connector **self-pins** its own registration LSN (the fallback; correct
+   only if the extract reflects the table at ingest time).
+
+A supplied boundary is authoritative (the CDC stream and delete-channel bootstrap both
+start at it) and is validated against the source's retained/current log range — a
+boundary **below the minimum retained LSN fails closed** (the logical log recycled past
+it, so there would be a gap), as does one above the current LSN. You are responsible for
+the extract reflecting the table at the boundary (quiesce, or extract-then-ingest);
+the connector does not verify alignment, and producing the `.unl` files (via `UNLOAD`
+or HPL) is outside the connector's scope.
 
 ### SCD Type 2 sequencing and validity columns
 
