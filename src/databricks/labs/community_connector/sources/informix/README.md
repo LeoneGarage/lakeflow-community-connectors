@@ -848,6 +848,106 @@ the extract reflecting the table at the boundary (quiesce, or extract-then-inges
 the connector does not verify alignment, and producing the `.unl` files (via `UNLOAD`
 or HPL) is outside the connector's scope.
 
+#### Reference recipe: extracting `.unl` files and their manifest
+
+Producing the extract is your responsibility, not the connector's — but the
+consistency requirement above (the `.unl` files and the `boundary_lsn` must describe
+the **same** point in the log) is easy to get subtly wrong, so this is a reference
+recipe that gets it right. It is not a shipped tool; adapt it to your environment.
+
+The key idea is that the boundary LSN and the `UNLOAD` are read in **one
+`REPEATABLE READ` transaction, LSN first**. Under that isolation the `UNLOAD` sees the
+table as of the transaction's read view, and the LSN captured just before it is `≤`
+that view — so the connector's CDC stream, which discards commits at or below the
+boundary, re-applies every change made after the extract with neither gap nor loss.
+The LSN encoding must match the connector's: `(uniqid << 32) + (used << 12)`, read
+from the current logical log in `sysmaster:syslogs`.
+
+Run this **on a host with `dbaccess`**. Per table it writes, under `OUTDIR/<table>/`,
+the `<table>.unl` extract and a `_manifest.json` holding `{"boundary_lsn": "<X>"}`:
+
+```bash
+#!/usr/bin/env bash
+# extract_unl.sh <database> <outdir> <table> [table ...]
+set -euo pipefail
+
+DB="${1:?usage: extract_unl.sh <database> <outdir> <table> [table ...]}"
+OUTDIR="${2:?output directory}"
+shift 2
+TABLES=("$@")
+[ "${#TABLES[@]}" -gt 0 ] || { echo "no tables given" >&2; exit 2; }
+
+for tbl in "${TABLES[@]}"; do
+  dir="$OUTDIR/$tbl"; mkdir -p "$dir"
+  lsn_file="$dir/.lsn.unl"; unl_file="$dir/$tbl.unl"
+
+  # One session, one transaction: LSN capture then table UNLOAD.
+  dbaccess - <<SQL
+DATABASE $DB;
+SET ISOLATION TO REPEATABLE READ;
+BEGIN WORK;
+UNLOAD TO '$lsn_file' DELIMITER '|'
+  SELECT uniqid, used FROM sysmaster:syslogs WHERE is_current = 1;
+UNLOAD TO '$unl_file' DELIMITER '|'
+  SELECT * FROM $tbl;
+COMMIT WORK;
+SQL
+
+  IFS='|' read -r uniqid used _ < "$lsn_file"          # ".lsn.unl" is "uniqid|used|"
+  boundary_lsn=$(( uniqid * 4294967296 + used * 4096 )) # (uniqid<<32)+(used<<12)
+  rm -f "$lsn_file"
+
+  # Informix UNLOAD on Windows terminates records with CRLF; the connector splits
+  # records on \n, so a trailing CR would ride along on each row's last field.
+  # Normalize CRLF -> LF on Windows shells. No-op on Unix hosts (UNLOAD writes LF).
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*|Windows_NT) perl -i -pe 's/\r\n/\n/g' "$unl_file" ;;
+  esac
+
+  printf '{"boundary_lsn": "%s"}\n' "$boundary_lsn" > "$dir/_manifest.json"
+  echo "extracted $tbl: $(wc -l < "$unl_file") rows, boundary_lsn=$boundary_lsn -> $dir"
+done
+```
+
+The script is portable across every OS Informix runs on — it uses `perl` (present in
+the base install on Unix hosts and bundled with Git Bash/MSYS2/Cygwin) rather than
+GNU-specific `sed`, so it behaves the same on BSD userland too. Per platform:
+
+- **Linux** (x86-64, POWER, IBM Z), **AIX**, **Solaris**, **HP-UX** — run as-is.
+  `UNLOAD` writes bare-LF records, so the CRLF branch is a no-op; just ensure
+  `dbaccess` is on `PATH` and the extract user can write `OUTDIR`.
+- **Windows** (x86-64) — run it under **Git Bash, MSYS2, Cygwin, or WSL** (native
+  `cmd.exe`/PowerShell cannot run the bash script). Informix `UNLOAD` on Windows
+  terminates records with **CRLF**; the connector splits on `\n`, so the script
+  normalizes CRLF → LF (equivalent to running `dos2unix` on each `.unl`). Under WSL
+  the Informix binaries are Linux and write LF, so the branch stays a no-op.
+- **macOS** — Developer Edition only (dev/test, not production). `UNLOAD` writes LF and
+  the BSD `perl` handles the script unchanged.
+
+`dbaccess` `UNLOAD` writes to the **local filesystem of the host running it**, not to a
+UC Volume, so upload each table's directory to the Volume the pipeline's
+`snapshot.source` points at, then run the pipeline:
+
+```bash
+./extract_unl.sh mydb /tmp/extract members orders
+
+databricks fs cp -r /tmp/extract/members \
+  dbfs:/Volumes/<catalog>/<schema>/informix_unl/members
+```
+
+Notes:
+
+- The explicit `DELIMITER '|'` guards against a site-customized `DBDELIMITER`; the rest
+  is `UNLOAD` default format (backslash escaping, empty field = NULL, trailing `|`),
+  which is what the decoder assumes. `SELECT *` yields column-definition order, which
+  the connector maps positionally.
+- One plain `.unl` per table is the best default — the connector byte-splits it across
+  executors with no whole-file scan. Only reach for `gzip` when transfer size matters,
+  and then produce **multiple** `.unl.gz` files (`UNLOAD` ranges to N files, gzip each),
+  because a gzip file is one non-splittable split.
+- If you set `snapshot.boundary.lsn` on the table it overrides the manifest, so the
+  `_manifest.json` is only needed when you would rather not carry the LSN in the spec.
+
 ### SCD Type 2 sequencing and validity columns
 
 Set `scd_type` to `SCD_TYPE_2` to retain row history. Lakeflow derives the types and values of `__START_AT` and `__END_AT` from `sequence_by`. The default `_informix_change_lsn` sequence is the safest ordering value, but it produces string validity columns containing zero-padded 20-digit decimal LSNs:
