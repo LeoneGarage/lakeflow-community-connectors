@@ -482,6 +482,34 @@ def compare_table(
         for row in destination:
             handle.write("|".join(pipe_value(row.get(column)) for column in columns) + "|\n")
 
+    if key_count == 0:
+        # Keyless (append-only) table: there is no primary key to pair rows across
+        # sides, so compare full rows as a multiset -- every source row must appear in
+        # the destination the same number of times. A value difference surfaces as one
+        # missing + one extra row (not a cell-level mismatch, which needs a key), and
+        # legitimately duplicated source rows are handled by the multiplicity counts.
+        full_row = lambda row: tuple(normalize(row.get(c), types[c]) for c in columns)
+        source_counter = collections.Counter(full_row(row) for row in source)
+        destination_counter = collections.Counter(full_row(row) for row in destination)
+        missing = source_counter - destination_counter
+        extra = destination_counter - source_counter
+        return {
+            "table": table,
+            "keyless": True,
+            "source_rows": len(source),
+            "destination_rows": len(destination),
+            "missing_rows": sum(missing.values()),
+            "extra_rows": sum(extra.values()),
+            "mismatched_rows": 0,
+            "mismatched_cells": 0,
+            "duplicate_source_keys": 0,
+            "duplicate_destination_keys": 0,
+            "mismatches_by_column": {},
+            "missing_key_examples": [list(row) for row in list(missing)[:5]],
+            "extra_key_examples": [list(row) for row in list(extra)[:5]],
+            "mismatch_examples": [],
+        }
+
     key_columns = columns[:key_count]
     key = lambda row: tuple(normalize(row.get(c), types[c]) for c in key_columns)
     source_by_key = {key(row): row for row in source}
@@ -652,7 +680,7 @@ def main() -> int:
         results_by_table: dict[str, dict[str, Any]] = {}
 
         def extract_and_compare(table: str) -> dict[str, Any]:
-            rows = destination_rows(args, table, columns[table], keys[table])
+            rows = destination_rows(args, table, columns[table], keys.get(table, 0))
             progress(f"{table}: destination extraction complete ({len(rows)} rows)")
             return compare_table(
                 table,
@@ -660,7 +688,7 @@ def main() -> int:
                 rows,
                 columns[table],
                 types[table],
-                keys[table],
+                keys.get(table, 0),
                 output / f"{table}.destination.unl",
             )
 
