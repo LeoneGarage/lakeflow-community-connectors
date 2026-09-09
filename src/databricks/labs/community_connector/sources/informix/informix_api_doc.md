@@ -306,7 +306,8 @@ Decoded string values are sanitized for embedded NUL (`\x00`) bytes by the `stri
 An `initial`-mode snapshot drains the whole table through one repeatable-read
 transaction, holding a connection slot for the entire scan; with many tables this
 can consume every slot and starve the streaming/CDC readers waiting for one.
-`snapshot.shared.session` selects the mitigation. Default `true` (Model C): the
+`snapshot.shared.session` selects one of two drain strategies. Default `true`
+(the **off-thread drain**): the
 drain runs on a bounded pool of `snapshot.reader.threads` (default
 `max(1, daemon.connection.reservation − 1)`, i.e. one below the CDC-daemon reservation)
 driver-resident daemon workers. Keyless (append-only, no primary key) tables drain
@@ -315,7 +316,7 @@ initial scan and the later tables sat queued behind it. Keeping the default one 
 the reservation guarantees the snapshot-drain floor never collapses to 0, so a low slot
 stays reachable by consumer reads even while the drains hold their slots for whole scans;
 it parallelizes drains once the pool is large enough to spare a drain band and still keep
-that consumer floor. `false` (Model A): the drain runs inline but
+that consumer floor. `false` (the **inline drain**): the drain runs on the microbatch thread but
 acquires its slot above `snapshot.connection.reservation`, so that many low slots
 are always reachable by non-snapshot readers and can never all be held by drains at
 once — the same slot-floor mechanism the delete-channel reservation uses. Only the
@@ -324,11 +325,11 @@ holds one connection for the whole scan) takes the floor; every other read relea
 its slot after each microbatch — a keyed table's default `incremental` /
 `auto_snapshot` snapshot reads one bounded chunk per microbatch, and stream/CDC reads
 are one bounded poll each — so they never hold long enough to starve anyone and may
-freely borrow the reserved slots. A `0` (unset) reservation is interpreted in Model A
+freely borrow the reserved slots. A `0` (unset) reservation is interpreted for the inline drain
 as `floor(max.concurrent.connections / 3)`, rounded up to at least 1 whenever the
 pool has 2 or more slots (0 only for a single-slot pool, which cannot spare one), so
 a long drain leaves streaming readers about two-thirds of the pool without any
-tuning; a positive value overrides it. Under Model C, the consumer
+tuning; a positive value overrides it. For the off-thread drain, the consumer
 establishes the durable boundary
 (`_initial_lsn`), releases its connection slot, and waits — holding no slot — for a
 worker to stage the table and publish its manifest, then serves the staged pages
