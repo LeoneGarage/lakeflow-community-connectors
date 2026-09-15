@@ -497,7 +497,9 @@ Regenerate the deployable file with `bash src/databricks/labs/community_connecto
 
 Delivery is at least once. A failure after rows are returned but before Lakeflow commits its checkpoint can replay them. `TRUNCATE` cannot be represented by keyed Lakeflow deletes and fails explicitly. Snapshot-only tables are fully reread and fail when they exceed `snapshot.max.rows`.
 
-The connector adds `_informix_change_lsn`, `_informix_commit_lsn`, `_informix_tx_id`, and `_informix_op` to rows. Native LSN fields are decoded across their complete unsigned 64-bit wire domain. The two LSN columns are fixed-width, zero-padded 20-digit decimal strings so Spark string ordering is identical to numeric LSN ordering. Native signed int32 transaction-ID bit patterns are normalized to `0..4294967295`, ensuring one stable identifier after the high bit is set. `_informix_change_lsn` is the incremental cursor; operations are `r` (snapshot), `c` (insert), `u` (update), and `d` (delete). Targets created with an older connector that emitted unpadded LSN strings require a full refresh before using this version.
+The connector adds `_informix_change_lsn`, `_informix_commit_lsn`, `_informix_tx_id`, `_informix_op`, and `_informix_commit_time` to rows. Native LSN fields are decoded across their complete unsigned 64-bit wire domain. The two LSN columns are fixed-width, zero-padded 20-digit decimal strings so Spark string ordering is identical to numeric LSN ordering. Native signed int32 transaction-ID bit patterns are normalized to `0..4294967295`, ensuring one stable identifier after the high bit is set. `_informix_change_lsn` is the incremental cursor; operations are `r` (snapshot), `c` (insert), `u` (update), and `d` (delete). Targets created with an older connector that emitted unpadded LSN strings require a full refresh before using this version.
+
+`_informix_commit_time` (`TimestampType`, UTC) is the **source** commit time — the Informix transaction commit time for CDC rows (`c`/`u`/`d`, from the CDC BEGIN/COMMIT record), and the snapshot boundary time for `r` rows (the source's `DBINFO('utc_current')` captured when the snapshot boundary is pinned; for a file-sourced `.unl` snapshot it comes from the extract's `_manifest.json` `boundary_time`, else `NULL`). It is **epoch-seconds granularity** and it is `≤` every subsequent CDC commit time, so the column is non-decreasing across the snapshot→CDC handoff. It is **informational** — keep `sequence_by` on `_informix_change_lsn`, which orders sub-second changes to one key that a second-granularity time cannot. It is an **additive** column: adding it to an existing target is a schema-evolution `ADD COLUMN` — the connector's schema fingerprint excludes it, so checkpoints resume with no full refresh — but rows ingested **before** the upgrade keep `NULL` (they are never re-read). To give the backlog a non-NULL value without re-snapshotting, coalesce at read time in a downstream view — `COALESCE(_informix_commit_time, TIMESTAMP '<cutover>')`, where `<cutover>` is the source time at which you upgraded (every backlog row's true commit is `≤` it, every new row `≥` it, so the column stays monotonic). A full refresh instead re-stamps every row as an `r` row with the new snapshot's boundary time. Avoid a sentinel like `1970-01-01`; `NULL` is the honest "unknown".
 
 ### Checkpoints and log retention
 
@@ -857,6 +859,12 @@ extract corresponds to. It is resolved per table, **first hit wins**:
 3. else the connector **self-pins** its own registration LSN (the fallback; correct
    only if the extract reflects the table at ingest time).
 
+The manifest may also carry an optional `"boundary_time": "<epoch-seconds>"` — the source
+UTC time the extract reflects. When present it becomes the `_informix_commit_time` of the
+served `r` rows (a file-sourced snapshot has no live boundary to query); when absent those
+rows carry `NULL`. Capture it in the **same transaction** as the boundary LSN (the recipe
+below does) so it matches the extract's as-of point.
+
 A supplied boundary is authoritative (the CDC stream and delete-channel bootstrap both
 start at it) and is validated against the source's retained/current log range — a
 boundary **below the minimum retained LSN fails closed** (the logical log recycled past
@@ -881,7 +889,8 @@ The LSN encoding must match the connector's: `(uniqid << 32) + (used << 12)`, re
 from the current logical log in `sysmaster:syslogs`.
 
 Run this **on a host with `dbaccess`**. Per table it writes, under `OUTDIR/<table>/`,
-the `<table>.unl` extract and a `_manifest.json` holding `{"boundary_lsn": "<X>"}`:
+the `<table>.unl` extract and a `_manifest.json` holding `{"boundary_lsn": "<X>",
+"boundary_time": "<epoch-seconds>"}`:
 
 ```bash
 #!/usr/bin/env bash
@@ -898,19 +907,19 @@ for tbl in "${TABLES[@]}"; do
   dir="$OUTDIR/$tbl"; mkdir -p "$dir"
   lsn_file="$dir/.lsn.unl"; unl_file="$dir/$tbl.unl"
 
-  # One session, one transaction: LSN capture then table UNLOAD.
+  # One session, one transaction: capture the LSN + source UTC time, then UNLOAD.
   dbaccess - <<SQL
 DATABASE $DB;
 SET ISOLATION TO REPEATABLE READ;
 BEGIN WORK;
 UNLOAD TO '$lsn_file' DELIMITER '|'
-  SELECT uniqid, used FROM sysmaster:syslogs WHERE is_current = 1;
+  SELECT uniqid, used, DBINFO('utc_current') FROM sysmaster:syslogs WHERE is_current = 1;
 UNLOAD TO '$unl_file' DELIMITER '|'
   SELECT * FROM $tbl;
 COMMIT WORK;
 SQL
 
-  IFS='|' read -r uniqid used _ < "$lsn_file"          # ".lsn.unl" is "uniqid|used|"
+  IFS='|' read -r uniqid used utc _ < "$lsn_file"       # ".lsn.unl" is "uniqid|used|utc|"
   boundary_lsn=$(( uniqid * 4294967296 + used * 4096 )) # (uniqid<<32)+(used<<12)
   rm -f "$lsn_file"
 
@@ -921,7 +930,9 @@ SQL
     MINGW*|MSYS*|CYGWIN*|Windows_NT) perl -i -pe 's/\r\n/\n/g' "$unl_file" ;;
   esac
 
-  printf '{"boundary_lsn": "%s"}\n' "$boundary_lsn" > "$dir/_manifest.json"
+  # boundary_time becomes the served r rows' _informix_commit_time (source UTC seconds).
+  printf '{"boundary_lsn": "%s", "boundary_time": "%s"}\n' "$boundary_lsn" "$utc" \
+    > "$dir/_manifest.json"
   echo "extracted $tbl: $(wc -l < "$unl_file") rows, boundary_lsn=$boundary_lsn -> $dir"
 done
 ```
@@ -993,12 +1004,12 @@ KEY="${5:?integer split-key expression, e.g. a numeric PK or rowid}"
 dir="$OUTDIR/$TBL"; mkdir -p "$dir"
 lsn_file="$dir/.lsn.unl"
 
-# Build one transaction: capture the LSN, then one UNLOAD per MOD bucket.
+# Build one transaction: capture the LSN + source UTC time, then one UNLOAD per MOD bucket.
 sql="DATABASE $DB;
 SET ISOLATION TO REPEATABLE READ;
 BEGIN WORK;
 UNLOAD TO '$lsn_file' DELIMITER '|'
-  SELECT uniqid, used FROM sysmaster:syslogs WHERE is_current = 1;"
+  SELECT uniqid, used, DBINFO('utc_current') FROM sysmaster:syslogs WHERE is_current = 1;"
 for ((k = 0; k < FILES; k++)); do
   sql="$sql
 UNLOAD TO '$dir/$TBL.p$k.unl' DELIMITER '|'
@@ -1008,10 +1019,11 @@ sql="$sql
 COMMIT WORK;"
 printf '%s\n' "$sql" | dbaccess -
 
-IFS='|' read -r uniqid used _ < "$lsn_file"
+IFS='|' read -r uniqid used utc _ < "$lsn_file"
 boundary_lsn=$(( uniqid * 4294967296 + used * 4096 ))   # (uniqid<<32)+(used<<12)
 rm -f "$lsn_file"
-printf '{"boundary_lsn": "%s"}\n' "$boundary_lsn" > "$dir/_manifest.json"
+printf '{"boundary_lsn": "%s", "boundary_time": "%s"}\n' "$boundary_lsn" "$utc" \
+  > "$dir/_manifest.json"
 
 # On Windows shells, normalize each part's CRLF -> LF (see the per-OS note above).
 case "$(uname -s 2>/dev/null)" in

@@ -197,6 +197,7 @@ class FakeBridge:
         self.rows = [{"id": 1, "value": "a"}, {"id": 2, "value": "b"}]
         self.changes = []
         self.now, self.minimum = 90, 1
+        self.utc_now = 1_700_000_000  # source UTC epoch seconds for snapshot commit-time
         self.snapshot_calls = []
         self.snapshot_max_bytes = []
         self.snapshot_max_rows = []
@@ -232,6 +233,10 @@ class FakeBridge:
 
     def minimum_lsn(self):
         return self.minimum
+
+    def current_utc_time(self):
+        # Fixed source UTC epoch seconds (2023-11-14T22:13:20Z) for snapshot commit-time.
+        return self.utc_now
 
     def prepare_initial_capture(self, identities):
         self.prepared_identities = list(identities)
@@ -904,6 +909,54 @@ class LakeflowContractTests(unittest.TestCase):
         rows, _ = connector.read_table("app.orders", checkpoint, {})
         changed = next(row for row in rows if row["id"] == 99)
         self.assertEqual(changed["agt_no"], Decimal("114250.000000000000000000"))
+
+    def test_cdc_row_carries_commit_time_from_commit_record(self):
+        # The COMMIT record's source timestamp (epoch seconds) is stamped onto every row
+        # of the transaction as _informix_commit_time (a UTC datetime).
+        bridge = FakeBridge()
+        connector = self.connector(bridge)
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 101, "timestamp": 1_700_000_500},
+            {"op": "INSERT", "tx_id": 7, "lsn": 102, "row": {"id": 99, "value": "x"}},
+            {"op": "COMMIT", "tx_id": 7, "lsn": 103, "timestamp": 1_700_000_500},
+        ]
+        rows, _ = connector.read_table("app.orders", checkpoint, {})
+        changed = next(row for row in rows if row["id"] == 99)
+        self.assertEqual(changed["_informix_op"], "c")
+        self.assertEqual(
+            changed[informix_module.COMMIT_TIME],
+            informix_module._commit_time_value(1_700_000_500),
+        )
+
+    def test_cdc_row_commit_time_is_null_when_commit_record_has_no_timestamp(self):
+        bridge = FakeBridge()
+        connector = self.connector(bridge)
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 101},
+            {"op": "INSERT", "tx_id": 7, "lsn": 102, "row": {"id": 99, "value": "x"}},
+            {"op": "COMMIT", "tx_id": 7, "lsn": 103},
+        ]
+        rows, _ = connector.read_table("app.orders", checkpoint, {})
+        changed = next(row for row in rows if row["id"] == 99)
+        self.assertIsNone(changed[informix_module.COMMIT_TIME])
+
+    def test_snapshot_row_carries_source_utc_commit_time(self):
+        # Snapshot ("r") rows are stamped with the source-server UTC time captured at the
+        # snapshot boundary (FakeBridge.current_utc_time), so they carry an as-of time
+        # rather than NULL.
+        bridge = FakeBridge()
+        connector = self.connector(bridge)
+        rows, _ = connector.read_table("app.orders", {}, {})
+        rows = list(rows)
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual(row[informix_module.OP], "r")
+            self.assertEqual(
+                row[informix_module.COMMIT_TIME],
+                informix_module._commit_time_value(bridge.utc_now),
+            )
 
     def test_shaped_snapshot_memory_is_included_in_byte_limit(self):
         bridge = FakeBridge()
@@ -3345,8 +3398,14 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(connector.list_tables(), ["app.orders"])
         schema = connector.get_table_schema("app.orders", {})
         self.assertEqual(
-            [field.name for field in schema.fields][-4:],
-            [CURSOR, "_informix_commit_lsn", "_informix_tx_id", "_informix_op"],
+            [field.name for field in schema.fields][-5:],
+            [
+                CURSOR,
+                "_informix_commit_lsn",
+                "_informix_tx_id",
+                "_informix_op",
+                "_informix_commit_time",
+            ],
         )
         self.assertEqual(
             connector.read_table_metadata("app.orders", {}),
@@ -13093,6 +13152,64 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
             with open(path, "wb") as handle:
                 handle.write(gzip.compress(content.encode()))
         return directory.name
+
+    def _write_manifest(self, source: str, **fields) -> None:
+        with open(os.path.join(source, "_manifest.json"), "w") as handle:
+            json.dump(fields, handle)
+
+    def test_unl_row_commit_time_from_manifest_boundary_time(self):
+        # A file-source snapshot has no live boundary to query, so `r` rows take their
+        # commit time from the extract's _manifest.json boundary_time (epoch seconds).
+        source = self._source("1|alpha|\n2|beta|\n")
+        self._write_manifest(source, boundary_time=1_700_000_000)
+        options = {"snapshot.source": source}
+        rows, _ = self.connector(FakeBridge()).read_table("app.orders", {}, options)
+        rows = list(rows)
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual(
+                row[informix_module.COMMIT_TIME],
+                informix_module._commit_time_value(1_700_000_000),
+            )
+
+    def test_unl_row_commit_time_null_without_manifest_boundary_time(self):
+        # No manifest boundary_time -> NULL commit time (no fabricated value).
+        source = self._source("1|alpha|\n2|beta|\n")
+        rows, _ = self.connector(FakeBridge()).read_table(
+            "app.orders", {}, {"snapshot.source": source}
+        )
+        self.assertTrue(all(row[informix_module.COMMIT_TIME] is None for row in rows))
+
+    def test_unl_manifest_boundary_time_rides_partitioned_descriptors(self):
+        # The manifest boundary_time reaches the executor path via the unl_split descriptor,
+        # so the partitioned fan-out stamps the same commit time as the serial serve.
+        source = self._source("1|a|\n2|b|\n3|c|\n")
+        self._write_manifest(source, boundary_lsn="42", boundary_time=1_700_000_000)
+        options = {"snapshot.source": source}
+        connector = self.connector(FakeBridge())
+        offset = connector.latest_offset("app.orders", options, {})
+        partitions = connector.get_partitions("app.orders", options, {}, offset)
+        self.assertTrue(all(p.get("commit_time") == 1_700_000_000 for p in partitions))
+        fanned = [
+            row
+            for partition in partitions
+            for row in connector.read_partition("app.orders", partition, options)
+        ]
+        self.assertTrue(fanned)
+        for row in fanned:
+            self.assertEqual(
+                row[informix_module.COMMIT_TIME],
+                informix_module._commit_time_value(1_700_000_000),
+            )
+
+    def test_unl_manifest_rejects_a_non_integer_boundary_time(self):
+        source = self._source("1|a|\n")
+        self._write_manifest(source, boundary_time="not-a-number")
+        with self.assertRaisesRegex(InformixError, "boundary_time"):
+            rows, _ = self.connector(FakeBridge()).read_table(
+                "app.orders", {}, {"snapshot.source": source}
+            )
+            list(rows)
 
     def test_unl_source_serves_shaped_rows_and_transitions_to_stream(self):
         source = self._source("1|alpha|\n2|beta|\n")
