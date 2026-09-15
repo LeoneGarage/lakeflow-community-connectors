@@ -391,7 +391,12 @@ Include filtering runs before exclusion filtering. Identifiers are limited to a 
 
 ### CDC type support
 
-A table supports CDC only when it has a primary key and every column has a supported CDC encoding.
+A table is captured via CDC when **every column has a supported CDC encoding**. A primary key is *not* required to read changes — it is required only to *merge* them into a keyed destination:
+
+- **With a primary key** → keyed CDC with deletes (`cdc_with_deletes`): inserts, updates, and deletes are applied to the destination by key.
+- **Without a primary key** → an append-only CDC stream (`ingestion_type="append"`, cursor `_informix_change_lsn`): changes are still read from the logical log, but with no key to identify a row they are appended rather than merged (no delete application).
+
+A table that has **any** column without a CDC encoding is not captured via CDC: it falls back to a snapshot-only read, or is rejected outright if the type cannot be represented at all (see the type table below).
 
 | CDC status | Informix types |
 |---|---|
