@@ -75,6 +75,7 @@ INTERNAL_COLUMNS = {
     "_informix_commit_lsn",
     "_informix_tx_id",
     "_informix_op",
+    "_informix_commit_time",
 }
 _PROGRESS_LOCK = threading.Lock()
 
@@ -383,6 +384,35 @@ def destination_rows(
             return rows
 
 
+def iter_unload_records(text: str) -> list[str]:
+    """Split an UNLOAD dump into records, ending only on an *unescaped* newline.
+
+    Informix UNLOAD escapes a newline embedded in a CHAR/VARCHAR value as ``\\`` +
+    newline, so naive ``splitlines`` would break one record into fragments with the
+    wrong field count. This tracks backslash-escape state and keeps an escaped newline
+    inside the record; ``parse_unload_line`` then decodes it back to a literal newline.
+    """
+
+    records: list[str] = []
+    record: list[str] = []
+    escaped = False
+    for character in text:
+        if escaped:
+            record.append(character)
+            escaped = False
+        elif character == "\\":
+            record.append(character)
+            escaped = True
+        elif character == "\n":
+            records.append("".join(record))
+            record = []
+        else:
+            record.append(character)
+    if record:
+        records.append("".join(record))
+    return records
+
+
 def parse_unload_line(line: str) -> list[str]:
     values: list[str] = []
     value: list[str] = []
@@ -471,7 +501,7 @@ def compare_table(
     destination_pipe: pathlib.Path,
 ) -> dict[str, Any]:
     source = []
-    for number, line in enumerate(source_file.read_text().splitlines(True), 1):
+    for number, line in enumerate(iter_unload_records(source_file.read_text()), 1):
         values = parse_unload_line(line)
         if len(values) != len(columns):
             raise RuntimeError(
