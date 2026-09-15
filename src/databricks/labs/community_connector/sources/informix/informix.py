@@ -32,7 +32,7 @@ import time
 import zlib
 from collections import deque
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from typing import Any, Callable, Iterable, Iterator, Protocol, Sequence
 
@@ -111,7 +111,13 @@ CURSOR = "_informix_change_lsn"
 COMMIT_LSN = "_informix_commit_lsn"
 TX_ID = "_informix_tx_id"
 OP = "_informix_op"
-_INTERNAL_COLUMNS = (CURSOR, COMMIT_LSN, TX_ID, OP)
+# Source commit time (TimestampType, UTC): the Informix transaction commit time for
+# CDC rows (c/u/d), the snapshot boundary time for snapshot rows (r), and NULL when the
+# source did not supply one (e.g. a file-source extract without a manifest boundary_time).
+# Appended last and excluded from the schema fingerprint, so adding it to an existing
+# target is an additive column: pre-existing rows keep NULL, new rows are populated.
+COMMIT_TIME = "_informix_commit_time"
+_INTERNAL_COLUMNS = (CURSOR, COMMIT_LSN, TX_ID, OP, COMMIT_TIME)
 _LSN_DECIMAL_WIDTH = 20
 _OFFSET_VERSION = 10
 # Informix undelimited identifiers: the first character is a "letter" or
@@ -1288,6 +1294,8 @@ class InformixBridge(Protocol):
     def current_lsn(self) -> int: ...
 
     def minimum_lsn(self) -> int: ...
+
+    def current_utc_time(self) -> int | None: ...
 
     def prepare_initial_capture(self, identities: Sequence[str]) -> int: ...
 
@@ -2519,6 +2527,24 @@ class PurePythonInformixBridge:
         self._ensure_connected()
         row = self.transport.execute("SELECT MIN(uniqid) AS uniqid FROM sysmaster:syslogs")[0]
         return int(_field(row, "uniqid", 0)) << 32
+
+    @_serialized_sqli_operation
+    def current_utc_time(self) -> int | None:
+        """Source-server current time as UTC epoch seconds, matching the CDC commit-time
+        units, for stamping snapshot rows' ``_informix_commit_time``.
+
+        Best-effort: a source that does not support ``DBINFO('utc_current')`` yields NULL
+        commit-time on snapshot rows rather than failing the read.
+        """
+
+        self._ensure_connected()
+        try:
+            row = self.transport.execute(
+                "SELECT DBINFO('utc_current') AS utc FROM sysmaster:sysdual"
+            )[0]
+            return int(_field(row, "utc", 0))
+        except Exception:
+            return None
 
     @_serialized_sqli_operation
     def prepare_initial_capture(self, identities: Sequence[str]) -> int:
@@ -4266,6 +4292,9 @@ class CommittedTransaction:
     commit_lsn: int
     restart_lsn: int
     records: tuple[dict[str, Any], ...]
+    # UTC epoch seconds from the COMMIT record (kind 2); None if the record carried none.
+    # Stamped onto every row of the transaction as ``_informix_commit_time``.
+    commit_time: int | None = None
 
 
 class TransactionBuffer:
@@ -4311,7 +4340,10 @@ class TransactionBuffer:
         end = tx.advance(record)
         del self.open[tx_id]
         restart = min((item.begin_lsn for item in self.open.values()), default=end)
-        return CommittedTransaction(tx_id, tx.begin_lsn, end, restart, tuple(tx.records))
+        commit_time = record.get("timestamp")
+        return CommittedTransaction(
+            tx_id, tx.begin_lsn, end, restart, tuple(tx.records), commit_time
+        )
 
 
 @dataclass(frozen=True)
@@ -5391,6 +5423,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     StructField(COMMIT_LSN, StringType(), False),
                     StructField(TX_ID, LongType(), True),
                     StructField(OP, StringType(), False),
+                    StructField(COMMIT_TIME, TimestampType(), True),
                 )
             )
             return StructType(fields)
@@ -8780,7 +8813,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             for row in bounded
         ]
         stamp = chunk_lsn if chunk_lsn is not None else 0
-        shaped = [_shape_snapshot(row, stamp, table, options) for row in cleaned]
+        commit_time = self._source_utc_time()
+        shaped = [
+            _shape_snapshot(row, stamp, table, options, commit_time=commit_time) for row in cleaned
+        ]
         result = dict(incremental)
         result["chunk_lsn"] = str(stamp)
         if last_cursor is not None:
@@ -9020,6 +9056,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             shaped_bytes = 0
             previous_upper_pk: list[Any] | None = None
             max_bytes = self._table_int_option(options, "snapshot.max.bytes", 0, minimum=0)
+            # Capture the source's UTC time once, at drain start, and bake it into every
+            # staged page's `r` rows as their commit time -- so the whole snapshot shares one
+            # as-of instant and the served (immutable) pages carry it without re-deriving.
+            commit_time = self._source_utc_time()
 
             def stage_page(
                 snapshot_lsn: int,
@@ -9037,7 +9077,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                         )
                 try:
                     shaped = [
-                        _shape_snapshot(row, snapshot_lsn, table, options) for row in page_rows
+                        _shape_snapshot(row, snapshot_lsn, table, options, commit_time=commit_time)
+                        for row in page_rows
                     ]
                 except Exception as error:
                     if isinstance(error, InformixError):
@@ -9183,6 +9224,24 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         value = str(value).strip() if value is not None else ""
         return value or None
 
+    def _source_utc_time(self) -> int | None:
+        """Best-effort source-server UTC epoch seconds for a snapshot row's commit time.
+
+        Captured at the snapshot's boundary/LSN capture so ``r`` rows carry the snapshot's
+        as-of time (``<=`` every later CDC commit time, keeping the column monotonic across
+        the snapshot->CDC handoff). Returns None -- a NULL commit time -- if the bridge does
+        not implement it or the source cannot answer, so a snapshot never fails over a time.
+        """
+
+        getter = getattr(self._bridge, "current_utc_time", None)
+        if getter is None:
+            return None
+        try:
+            value = getter()
+        except Exception:
+            return None
+        return int(value) if value is not None else None
+
     def _unl_field_format(self, table_options: dict[str, str]) -> tuple[str, str]:
         """The ``(delimiter, escape)`` for a `.unl`/HPL DELIMITED serve.
 
@@ -9308,6 +9367,34 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             return _strict_lsn(manifest["boundary_lsn"], f"{_SNAPSHOT_MANIFEST_NAME} boundary_lsn")
         except ValueError as error:
             raise InformixError(str(error)) from error
+
+    def _resolve_unl_commit_time(self, source: str) -> int | None:
+        """The `.unl` extract's snapshot commit time (UTC epoch seconds) for its ``r`` rows.
+
+        Read from the optional ``_manifest.json`` ``boundary_time`` the extract records
+        beside ``boundary_lsn`` -- the wall-clock instant the extract reflects. A file-source
+        snapshot has no live boundary to query, so absent a manifest time these rows carry
+        NULL rather than a fabricated time (which would break the monotonic-handoff
+        guarantee that snapshot commit time is ``<=`` every later CDC commit time). Fails
+        closed on a present-but-invalid value.
+        """
+
+        manifest = self._read_unl_manifest(source)
+        if manifest is None or manifest.get("boundary_time") is None:
+            return None
+        try:
+            value = int(manifest["boundary_time"])
+        except (TypeError, ValueError) as error:
+            raise InformixError(
+                f"snapshot.source '{source}' has a non-integer "
+                f"{_SNAPSHOT_MANIFEST_NAME} boundary_time"
+            ) from error
+        if value < 0:
+            raise InformixError(
+                f"snapshot.source '{source}' has a negative "
+                f"{_SNAPSHOT_MANIFEST_NAME} boundary_time"
+            )
+        return value
 
     def _read_unl_manifest(self, source: str) -> dict | None:
         """Read ``<source>/_manifest.json`` (small file, whole), or None if absent.
@@ -9506,6 +9593,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         files = self._list_unl_files(source, table.exposed_name)
         encoding = _client_encoding(self.options)
         delimiter, escape = self._unl_field_format(options)
+        commit_time = self._resolve_unl_commit_time(source)
         for path in files:
             size = os.path.getsize(path)
             read_chunk = self._unl_read_chunk(path)
@@ -9515,7 +9603,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 records = _iter_unl_records(read_chunk, 0, size)
             for raw in records:
                 yield _shape_unl_record(
-                    raw, table, snapshot_lsn, options, encoding, delimiter=delimiter, escape=escape
+                    raw,
+                    table,
+                    snapshot_lsn,
+                    options,
+                    encoding,
+                    delimiter=delimiter,
+                    escape=escape,
+                    commit_time=commit_time,
                 )
 
     def _read_unl_split(
@@ -9548,6 +9643,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         delimiter = str(partition.get("delimiter") or _UNL_DEFAULT_DELIMITER)
         escape = partition.get("escape", _UNL_DEFAULT_ESCAPE)
         escape = "" if escape is None else str(escape)
+        # Manifest boundary_time (UTC epoch seconds) rides the descriptor so every split's
+        # `r` rows share the extract's one commit time; None -> NULL commit time.
+        raw_commit_time = partition.get("commit_time")
+        commit_time = None if raw_commit_time is None else int(raw_commit_time)
         read_chunk = _unl_split_read_chunk(partition)
         start = int(partition["start_byte"])
         end = int(partition["end_byte"])
@@ -9565,6 +9664,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 exposed_name=exposed_name,
                 delimiter=delimiter,
                 escape=escape,
+                commit_time=commit_time,
             )
 
     def _unl_all_splits(
@@ -9636,6 +9736,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         host = files_api._host if files_api is not None else None
         encoding = _client_encoding(self.options)
         delimiter, escape = self._unl_field_format(table_options)
+        commit_time = self._resolve_unl_commit_time(
+            self._table_snapshot_source(table_options) or ""
+        )
         descriptors: list[dict] = []
         for path, start_byte, end_byte, is_gzip in all_splits[start_split:end_split]:
             descriptor = {
@@ -9650,6 +9753,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 "encoding": encoding,
                 "delimiter": delimiter,
                 "escape": escape,
+                "commit_time": commit_time,
             }
             if token and host:
                 descriptor["token"] = token
@@ -9785,7 +9889,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 f"Snapshot-only table {table.exposed_name} exceeds snapshot.max.rows={limit}"
             )
         lsn = self._bridge.current_lsn()
-        return iter(_shape_snapshot(row, lsn, table, options) for row in rows), None
+        commit_time = self._source_utc_time()
+        return (
+            iter(
+                _shape_snapshot(row, lsn, table, options, commit_time=commit_time) for row in rows
+            ),
+            None,
+        )
 
     def _read_changes_with_reconnect(
         self, captures, restart, timeout_seconds, max_records, *, table: Table
@@ -12221,6 +12331,7 @@ def _shape_change(row, record, tx, op):
             COMMIT_LSN: _sortable_lsn(tx.commit_lsn),
             TX_ID: tx.tx_id,
             OP: op,
+            COMMIT_TIME: _commit_time_value(tx.commit_time),
         }
     )
     return result
@@ -12240,6 +12351,7 @@ def _shape_delete(row, table, record, tx):
             COMMIT_LSN: _sortable_lsn(tx.commit_lsn),
             TX_ID: tx.tx_id,
             OP: "d",
+            COMMIT_TIME: _commit_time_value(tx.commit_time),
         }
     )
     return result
@@ -12621,6 +12733,7 @@ def _shape_unl_record(
     exposed_name: str | None = None,
     delimiter: str = _UNL_DEFAULT_DELIMITER,
     escape: str = _UNL_DEFAULT_ESCAPE,
+    commit_time: int | None = None,
 ) -> dict[str, Any]:
     """Parse, type-convert, and shape one UNLOAD / HPL DELIMITED record -- shared by both
     serve paths.
@@ -12646,7 +12759,21 @@ def _shape_unl_record(
         column.name: _unload_value(fields[index], column.type_name)
         for index, column in enumerate(columns)
     }
-    return _shape_snapshot(row, snapshot_lsn, table, options)
+    return _shape_snapshot(row, snapshot_lsn, table, options, commit_time=commit_time)
+
+
+def _commit_time_value(epoch_seconds: int | None) -> datetime | None:
+    """A UTC ``datetime`` for the ``_informix_commit_time`` column, or None.
+
+    The source supplies commit time as epoch seconds (Informix CDC BEGIN/COMMIT records
+    and ``DBINFO('utc_current')``); TimestampType wants a ``datetime``. None stays None so
+    a row with no source time (e.g. a file-source extract without a manifest boundary_time)
+    lands as NULL.
+    """
+
+    if epoch_seconds is None:
+        return None
+    return datetime.fromtimestamp(int(epoch_seconds), tz=timezone.utc)
 
 
 def _shape_snapshot(
@@ -12654,13 +12781,21 @@ def _shape_snapshot(
     lsn: int,
     table: Table | None = None,
     options: dict[str, str] | None = None,
+    *,
+    commit_time: int | None = None,
 ) -> dict[str, Any]:
     converted = (
         _coerce_variable_decimal_values(row, table, options or {}) if table is not None else row
     )
     result = _framework_row(converted)
     result.update(
-        {CURSOR: _sortable_lsn(lsn), COMMIT_LSN: _sortable_lsn(lsn), TX_ID: None, OP: "r"}
+        {
+            CURSOR: _sortable_lsn(lsn),
+            COMMIT_LSN: _sortable_lsn(lsn),
+            TX_ID: None,
+            OP: "r",
+            COMMIT_TIME: _commit_time_value(commit_time),
+        }
     )
     return result
 
