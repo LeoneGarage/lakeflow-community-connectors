@@ -947,6 +947,181 @@ def _sleep_with_backoff(deadline: float, delay: float) -> float:
     return min(delay * 1.5, 2.0)
 
 
+# The framework stream readers the Informix wrapper below instruments: the simple
+# reader (readBetweenOffsets replay) and the partitioned proxy, which is the default
+# for CDC-capable tables and replays through get_partitions(start, end) instead.
+_WRAPPED_STREAM_READER_NAMES = frozenset(
+    {"LakeflowStreamReader", "LakeflowPartitionedStreamReader"}
+)
+
+
+def _replay_between_offsets(start, end, read, options, connector_options):
+    """Replay ``[start, end)`` by reading to ``end`` and stopping there.
+
+    Shared by the simple reader's ``readBetweenOffsets`` and the partitioned reader's
+    ``get_partitions`` recompute, so both replay paths honour one contract: the read
+    is bounded at ``end.commit_lsn`` (and, mid-incremental-copy, at
+    ``end.incremental.last_pk``), and an under-read fails closed rather than letting
+    Spark commit an ``end`` the rows do not reach.
+
+    The unbounded alternative (``read(start)`` with the reached offset discarded) is
+    not reproducible: it ends at whichever transaction boundary the row budget falls
+    on, so the same start LSN over the same log can end in different places --
+    measured directly, budget 10 ended at LSN 107 and budget 2 at 104 on identical
+    data. Spark commits its own ``end`` regardless, so a fresh read that stops earlier
+    than the original silently drops everything in between; that is how six tables
+    lost 151 rows.
+
+    ``read(start)`` performs one read and returns ``(records, reached_offset)``; the
+    bounds are injected into ``options`` (the dict that read consults, restored on
+    exit) because read_table has no ``end`` parameter and thirty connectors
+    implement it. ``connector_options`` supplies the connection-wait default.
+    """
+
+    positional_keys = {
+        "commit_lsn",
+        "change_lsn",
+        "begin_lsn",
+        "tx_id",
+        "incremental",
+    }
+    # Spark may persist bootstrap coordination progress as a range of its own.
+    # Such a range advances no Informix position and contains no records to
+    # replay. Treat it as empty, while continuing to fail closed if either side
+    # identifies a positional CDC range.
+    advisory_only_end = (
+        isinstance(end, dict) and bool(end) and set(end) <= _OFFSET_ADVISORY_FIELDS
+    )
+    if advisory_only_end and not positional_keys.intersection(start or {}):
+        return iter(())
+
+    stop = (end or {}).get("commit_lsn")
+    if stop is None:
+        raise InformixError("Informix cannot replay an offset range whose end has no commit_lsn")
+    # The first incremental range starts at {} and still emits a chunk. Bound it
+    # whenever either side identifies an in-progress copy; a start-side block with
+    # no end-side block is the final range and is represented by JSON null below.
+    replaying_chunk = isinstance((start or {}).get("incremental"), dict) or isinstance(
+        (end or {}).get("incremental"), dict
+    )
+    # ``null`` is meaningful: the copy finished inside this range, so the replay
+    # must drain to max_pk instead of stopping at a cursor.
+    stop_pk = json.dumps(((end or {}).get("incremental") or {}).get("last_pk"))
+    previous = options.get(_REPLAY_STOP_LSN_OPTION)
+    previous_pk = options.get(_REPLAY_STOP_PK_OPTION)
+    previous_wait_budget = options.get(_REPLAY_CONNECTION_WAIT_BUDGET_OPTION)
+    options[_REPLAY_STOP_LSN_OPTION] = str(stop)
+    if replaying_chunk:
+        options[_REPLAY_STOP_PK_OPTION] = stop_pk
+    try:
+        initial_range = not positional_keys.intersection(start or {})
+        replay_start = start
+        record_parts = []
+        configured_wait = float(
+            options.get(
+                "connection.wait.timeout.seconds",
+                connector_options.get(
+                    "connection.wait.timeout.seconds",
+                    str(_DEFAULT_CONNECTION_WAIT_TIMEOUT_SECONDS),
+                ),
+            )
+        )
+        replay_wait_deadline = time.monotonic() + configured_wait
+        # Spark cannot checkpoint an advisory yield while replaying: it has already
+        # fixed this range's end. Advance bootstrap coordination counters inside
+        # this call until the reader obtains a real source position. This is
+        # especially important for the delete flow's deferred schema node fallback
+        # after a restart.
+        while True:
+            remaining_wait = replay_wait_deadline - time.monotonic()
+            if remaining_wait <= 0:
+                raise InformixError(
+                    "Informix replay did not produce a positional end LSN "
+                    "before its connection wait deadline"
+                )
+            options[_REPLAY_CONNECTION_WAIT_BUDGET_OPTION] = repr(remaining_wait)
+            records, reached = read(replay_start)
+            record_parts.append(records)
+            if isinstance(reached, dict) and reached.get("commit_lsn") is not None:
+                break
+            advisory_yield = (
+                initial_range
+                and isinstance(reached, dict)
+                and bool(reached)
+                and set(reached) <= _OFFSET_ADVISORY_FIELDS
+            )
+            if not advisory_yield:
+                raise InformixError("Informix replay did not produce a positional end LSN")
+            if reached == replay_start:
+                # At the maximum schema fallback count, an unchanged advisory
+                # offset means the owning upsert flow has not published its
+                # current channel start yet. The read has released its connection
+                # slot, so wait briefly and try again without extending the shared
+                # deadline.
+                remaining_wait = replay_wait_deadline - time.monotonic()
+                if remaining_wait <= 0:
+                    raise InformixError(
+                        "Informix replay did not produce a positional end LSN "
+                        "before its connection wait deadline"
+                    )
+                time.sleep(min(random.uniform(0.05, 0.2), remaining_wait))
+            replay_start = reached
+        records = itertools.chain.from_iterable(record_parts)
+        try:
+            reached_lsn = int(reached["commit_lsn"])
+            stop_lsn = int(stop)
+        except (KeyError, TypeError, ValueError) as error:
+            raise InformixError("Informix replay returned an invalid end LSN") from error
+        # The first full-refresh range normally starts at {}, but the framework
+        # may add retry bookkeeping before replaying it (for example
+        # ``schema_node_fallback_retry_count``). Such metadata does not turn the
+        # range into a checkpointed CDC range. Re-executing an initial range
+        # legitimately establishes a newer snapshot/CDC boundary than the one
+        # latestOffset planned before cancellation; its snapshot rows represent
+        # that newer state and replaying them is safe. A checkpointed range,
+        # however, must land on its exact transaction boundary. In both cases an
+        # under-read is always destructive.
+        wrong_lsn = reached_lsn < stop_lsn or (not initial_range and reached_lsn != stop_lsn)
+        if wrong_lsn:
+            raise InformixError(
+                "Informix replay did not reach its committed end LSN "
+                f"{stop_lsn}; reached {reached_lsn}"
+            )
+        expected_incremental = (end or {}).get("incremental")
+        reached_incremental = reached.get("incremental")
+        if isinstance(expected_incremental, dict):
+            expected_pk = expected_incremental.get("last_pk")
+            if (
+                not isinstance(reached_incremental, dict)
+                or reached_incremental.get("last_pk") != expected_pk
+            ):
+                raise InformixError(
+                    "Informix replay did not reach its committed incremental "
+                    f"snapshot cursor {expected_pk!r}"
+                )
+        elif replaying_chunk and isinstance(reached_incremental, dict):
+            raise InformixError(
+                "Informix replay did not finish the incremental snapshot range "
+                "that Spark has committed"
+            )
+        return records
+    finally:
+        # Scoped strictly to this replay: a normal read that inherited the bound
+        # would stop short forever.
+        if previous is None:
+            options.pop(_REPLAY_STOP_LSN_OPTION, None)
+        else:
+            options[_REPLAY_STOP_LSN_OPTION] = previous
+        if previous_pk is None:
+            options.pop(_REPLAY_STOP_PK_OPTION, None)
+        else:
+            options[_REPLAY_STOP_PK_OPTION] = previous_pk
+        if previous_wait_budget is None:
+            options.pop(_REPLAY_CONNECTION_WAIT_BUDGET_OPTION, None)
+        else:
+            options[_REPLAY_CONNECTION_WAIT_BUDGET_OPTION] = previous_wait_budget
+
+
 def _informix_available_now_base(base: type, spark_session: Any | None = None) -> type:
     """Wrap the generated reader base without changing the shared adapter source."""
 
@@ -976,7 +1151,11 @@ def _informix_available_now_base(base: type, spark_session: Any | None = None) -
 
         def __init_subclass__(cls, **kwargs):
             super().__init_subclass__(**kwargs)
-            if cls.__name__ != "LakeflowStreamReader":
+            # Both framework stream readers are instrumented. Matching only the
+            # simple reader left the partitioned proxy -- the default for
+            # CDC-capable tables -- without the registration-scope setter and the
+            # AvailableNow preparation hook.
+            if cls.__name__ not in _WRAPPED_STREAM_READER_NAMES:
                 return
 
             original_init = cls.__init__
@@ -1004,193 +1183,30 @@ def _informix_available_now_base(base: type, spark_session: Any | None = None) -
                     prepare()
 
             def read_between_offsets(reader, start, end):
-                """Replay ``[start, end)`` by reading to ``end`` and stopping there.
+                """Replay ``[start, end)`` bounded at ``end`` (see _replay_between_offsets).
 
                 The shared implementation is ``return self.read(start)[0]``: an
                 unbounded read whose returned offset is discarded. Spark commits its
                 own ``end`` regardless, so if the fresh read stops earlier than the
-                original did, everything in between is dropped silently -- how six
-                tables lost 151 rows.
-
-                An unbounded read is not reproducible. It ends at whichever
-                transaction boundary the row budget falls on, so the same start LSN
-                over the same log can end in different places: measured directly,
-                budget 10 ended at LSN 107 and budget 2 at 104 on identical data.
-                Comparing the reached offset against ``end`` can only detect that
-                after the fact, and failing there converts dropped rows into a retry
-                loop, since the next attempt is no more reproducible than the last.
-
-                Passing the bound down is what makes the replay deterministic:
-                ``_read_stream`` already stops cleanly at an arbitrary LSN for the
-                AvailableNow trigger boundary, and this reuses that path. The bound
+                original did, everything in between is dropped silently. The bound
                 travels through the reader's options, which the framework copies into
-                table_options, because read_table has no ``end`` parameter and thirty
-                connectors implement it.
-
-                A microbatch taken during the incremental copy emits a snapshot
-                chunk alongside the CDC rows, and the LSN bound does not constrain
-                it -- a chunk is bounded by its keyset cursor. ``end`` carries that
-                second bound as incremental.last_pk, so it is passed down the same
-                channel; see _REPLAY_STOP_PK_OPTION.
+                table_options on every read.
                 """
 
-                positional_keys = {
-                    "commit_lsn",
-                    "change_lsn",
-                    "begin_lsn",
-                    "tx_id",
-                    "incremental",
-                }
-                # Spark may persist bootstrap coordination progress as a range of
-                # its own. Such a range advances no Informix position and contains
-                # no records to replay. Treat it as empty, while continuing to fail
-                # closed if either side identifies a positional CDC range.
-                advisory_only_end = (
-                    isinstance(end, dict) and bool(end) and set(end) <= _OFFSET_ADVISORY_FIELDS
+                return _replay_between_offsets(
+                    start,
+                    end,
+                    reader.read,
+                    reader.options,
+                    getattr(reader.lakeflow_connect, "options", {}),
                 )
-                if advisory_only_end and not positional_keys.intersection(start or {}):
-                    return iter(())
-
-                stop = (end or {}).get("commit_lsn")
-                if stop is None:
-                    raise InformixError(
-                        "Informix cannot replay an offset range whose end has no commit_lsn"
-                    )
-                # The first incremental range starts at {} and still emits a chunk.
-                # Bound it whenever either side identifies an in-progress copy; a
-                # start-side block with no end-side block is the final range and is
-                # represented by JSON null below.
-                replaying_chunk = isinstance((start or {}).get("incremental"), dict) or isinstance(
-                    (end or {}).get("incremental"), dict
-                )
-                # ``null`` is meaningful: the copy finished inside this range, so the
-                # replay must drain to max_pk instead of stopping at a cursor.
-                stop_pk = json.dumps(((end or {}).get("incremental") or {}).get("last_pk"))
-                previous = reader.options.get(_REPLAY_STOP_LSN_OPTION)
-                previous_pk = reader.options.get(_REPLAY_STOP_PK_OPTION)
-                previous_wait_budget = reader.options.get(_REPLAY_CONNECTION_WAIT_BUDGET_OPTION)
-                reader.options[_REPLAY_STOP_LSN_OPTION] = str(stop)
-                if replaying_chunk:
-                    reader.options[_REPLAY_STOP_PK_OPTION] = stop_pk
-                try:
-                    initial_range = not positional_keys.intersection(start or {})
-                    replay_start = start
-                    record_parts = []
-                    connector_options = getattr(reader.lakeflow_connect, "options", {})
-                    configured_wait = float(
-                        reader.options.get(
-                            "connection.wait.timeout.seconds",
-                            connector_options.get(
-                                "connection.wait.timeout.seconds",
-                                str(_DEFAULT_CONNECTION_WAIT_TIMEOUT_SECONDS),
-                            ),
-                        )
-                    )
-                    replay_wait_deadline = time.monotonic() + configured_wait
-                    # Spark cannot checkpoint an advisory yield while executing
-                    # readBetweenOffsets(): it has already fixed this range's end.
-                    # Advance bootstrap coordination counters inside this call
-                    # until the reader obtains a real source position. This is
-                    # especially important for the delete flow's deferred schema
-                    # node fallback after a restart.
-                    while True:
-                        remaining_wait = replay_wait_deadline - time.monotonic()
-                        if remaining_wait <= 0:
-                            raise InformixError(
-                                "Informix replay did not produce a positional end LSN "
-                                "before its connection wait deadline"
-                            )
-                        reader.options[_REPLAY_CONNECTION_WAIT_BUDGET_OPTION] = repr(remaining_wait)
-                        records, reached = reader.read(replay_start)
-                        record_parts.append(records)
-                        if isinstance(reached, dict) and reached.get("commit_lsn") is not None:
-                            break
-                        advisory_yield = (
-                            initial_range
-                            and isinstance(reached, dict)
-                            and bool(reached)
-                            and set(reached) <= _OFFSET_ADVISORY_FIELDS
-                        )
-                        if not advisory_yield:
-                            raise InformixError(
-                                "Informix replay did not produce a positional end LSN"
-                            )
-                        if reached == replay_start:
-                            # At the maximum schema fallback count, an unchanged
-                            # advisory offset means the owning upsert flow has not
-                            # published its current channel start yet. The read has
-                            # released its connection slot, so wait briefly and try
-                            # again without extending the shared deadline.
-                            remaining_wait = replay_wait_deadline - time.monotonic()
-                            if remaining_wait <= 0:
-                                raise InformixError(
-                                    "Informix replay did not produce a positional end LSN "
-                                    "before its connection wait deadline"
-                                )
-                            time.sleep(min(random.uniform(0.05, 0.2), remaining_wait))
-                        replay_start = reached
-                    records = itertools.chain.from_iterable(record_parts)
-                    try:
-                        reached_lsn = int(reached["commit_lsn"])
-                        stop_lsn = int(stop)
-                    except (KeyError, TypeError, ValueError) as error:
-                        raise InformixError(
-                            "Informix replay returned an invalid end LSN"
-                        ) from error
-                    # The first full-refresh range normally starts at {}, but the
-                    # framework may add retry bookkeeping before replaying it (for
-                    # example ``schema_node_fallback_retry_count``). Such metadata
-                    # does not turn the range into a checkpointed CDC range.
-                    # Re-executing an initial range
-                    # legitimately establishes a newer snapshot/CDC boundary than
-                    # the one latestOffset planned before cancellation; its snapshot
-                    # rows represent that newer state and replaying them is safe. A
-                    # checkpointed range, however, must land on its exact transaction
-                    # boundary. In both cases an under-read is always destructive.
-                    wrong_lsn = reached_lsn < stop_lsn or (
-                        not initial_range and reached_lsn != stop_lsn
-                    )
-                    if wrong_lsn:
-                        raise InformixError(
-                            "Informix replay did not reach its committed end LSN "
-                            f"{stop_lsn}; reached {reached_lsn}"
-                        )
-                    expected_incremental = (end or {}).get("incremental")
-                    reached_incremental = reached.get("incremental")
-                    if isinstance(expected_incremental, dict):
-                        expected_pk = expected_incremental.get("last_pk")
-                        if (
-                            not isinstance(reached_incremental, dict)
-                            or reached_incremental.get("last_pk") != expected_pk
-                        ):
-                            raise InformixError(
-                                "Informix replay did not reach its committed incremental "
-                                f"snapshot cursor {expected_pk!r}"
-                            )
-                    elif replaying_chunk and isinstance(reached_incremental, dict):
-                        raise InformixError(
-                            "Informix replay did not finish the incremental snapshot range "
-                            "that Spark has committed"
-                        )
-                    return records
-                finally:
-                    # Scoped strictly to this replay: a normal read that inherited
-                    # the bound would stop short forever.
-                    if previous is None:
-                        reader.options.pop(_REPLAY_STOP_LSN_OPTION, None)
-                    else:
-                        reader.options[_REPLAY_STOP_LSN_OPTION] = previous
-                    if previous_pk is None:
-                        reader.options.pop(_REPLAY_STOP_PK_OPTION, None)
-                    else:
-                        reader.options[_REPLAY_STOP_PK_OPTION] = previous_pk
-                    if previous_wait_budget is None:
-                        reader.options.pop(_REPLAY_CONNECTION_WAIT_BUDGET_OPTION, None)
-                    else:
-                        reader.options[_REPLAY_CONNECTION_WAIT_BUDGET_OPTION] = previous_wait_budget
 
             cls.prepareForTriggerAvailableNow = prepare_for_trigger
-            cls.readBetweenOffsets = read_between_offsets
+            if cls.__name__ == "LakeflowStreamReader":
+                # Only the simple reader replays through readBetweenOffsets; the
+                # partitioned proxy replays through get_partitions(start, end), which
+                # bounds its recompute with the same _replay_between_offsets contract.
+                cls.readBetweenOffsets = read_between_offsets
             cls.__init__ = initialize
 
     return InformixAvailableNowBase
@@ -2517,10 +2533,35 @@ class PurePythonInformixBridge:
     @_serialized_sqli_operation
     def current_lsn(self) -> int:
         self._ensure_connected()
+        uniqid, used = self._current_log_position()
+        return _log_lsn(uniqid, used)
+
+    @_serialized_sqli_operation
+    def boundary_lsn(self) -> int:
+        """A capture boundary that is never ahead of the log's true write position.
+
+        ``syslogs.used`` is a page count, so :meth:`current_lsn` names the end of the
+        page currently being written -- up to one page ahead of the last record on
+        disk. A transaction committing in the rest of that page *after* the sample
+        would carry an LSN at or below such a boundary and be discarded by ``_recover``
+        as already captured, while the snapshot read that follows the sample may or
+        may not have seen it: a stale or missing row with nothing left to correct it.
+        Anchoring the boundary at the *start* of the current page keeps it at or below
+        every commit that follows the sample. The cost is at most one page of log
+        re-delivered, which keyed targets dedup by key and LSN. Positions used as a
+        stop bound (the AvailableNow high-water mark, log-file comparisons) keep
+        :meth:`current_lsn`, where overshooting is harmless.
+        """
+
+        self._ensure_connected()
+        uniqid, used = self._current_log_position()
+        return _log_lsn(uniqid, used, page_start=True)
+
+    def _current_log_position(self) -> tuple[int, int]:
         row = self.transport.execute(
             "SELECT uniqid, used FROM sysmaster:syslogs WHERE is_current = 1"
         )[0]
-        return (int(_field(row, "uniqid", 0)) << 32) + (int(_field(row, "used", 1)) << 12)
+        return int(_field(row, "uniqid", 0)), int(_field(row, "used", 1))
 
     @_serialized_sqli_operation
     def minimum_lsn(self) -> int:
@@ -2548,7 +2589,11 @@ class PurePythonInformixBridge:
 
     @_serialized_sqli_operation
     def prepare_initial_capture(self, identities: Sequence[str]) -> int:
-        """Enable full-row logging for every table, then capture one shared LSN."""
+        """Enable full-row logging for every table, then capture one shared boundary.
+
+        The boundary is :meth:`boundary_lsn` -- never ahead of the true log position --
+        because the snapshot that follows is sequenced against it.
+        """
 
         self._ensure_connected()
 
@@ -2570,7 +2615,7 @@ class PurePythonInformixBridge:
                 "Initial CDC preparation was partially applied; full-row logging remains "
                 f"enabled for {enabled!r}. Correct the failure and rerun preparation."
             ) from error
-        return self.current_lsn()
+        return self.boundary_lsn()
 
     @_serialized_sqli_operation
     def validate_initial_lsn(self, capture: dict[str, Any], start_lsn: int) -> None:
@@ -2998,7 +3043,10 @@ class PurePythonInformixBridge:
 
         self._ensure_connected()
         with self._repeatable_read_transaction():
-            chunk_lsn = self.current_lsn()
+            # boundary_lsn, not current_lsn: the stamp must not exceed the true log
+            # position, or a change committing right after the sample (but before
+            # this SELECT) sequences below a row that predates it.
+            chunk_lsn = self.boundary_lsn()
             rows = self.snapshot_page(
                 identity,
                 columns,
@@ -3193,7 +3241,8 @@ class PurePythonInformixBridge:
 
         self._ensure_connected()
         with self._repeatable_read_transaction(isolation):
-            snapshot_lsn = self.current_lsn()
+            # boundary_lsn, not current_lsn: see snapshot_chunk.
+            snapshot_lsn = self.boundary_lsn()
             rows: list[dict[str, Any]] = []
             retained_bytes = _deep_size(rows) if max_bytes else 0
             total_rows = 0
@@ -4409,23 +4458,39 @@ class _SharedCdcShard:
     def subscribe(self, identity, table, capture, checkpoint_commit_lsn, floor_lsn):
         with self.condition:
             existing = self.subscribers.get(identity)
-            self.subscribers[identity] = {
+            entry = {
                 "table": table,
                 "capture": capture,
                 "checkpoint": checkpoint_commit_lsn,
                 "floor": floor_lsn,
                 "last_seen": time.monotonic(),
+                # The lowest LSN a daemon read that captured this table was activated
+                # at, or None until one has run. The table is *covered* -- its buffer
+                # is authoritative from its floor on -- only once that read start is
+                # at or below its floor (see _covered). Preserved across re-subscribes;
+                # a TTL eviction drops the entry and so resets it.
+                "covered_from": None if existing is None else existing.get("covered_from"),
             }
+            self.subscribers[identity] = entry
             self.buffers.setdefault(identity, deque())
             # Lower the shared read cursor to admit a newly subscribed or lagging
             # table's history. It only moves backward here; the daemon advances it
-            # forward as it reads. Activating too low is merely wasteful (re-read then
+            # forward as it reads, but never past the floor of a table it has not yet
+            # covered (see ingest). Activating too low is merely wasteful (re-read then
             # discarded per cursor / _recover); too high would skip a laggard's changes.
             if self.shared_restart is None:
                 self.shared_restart = floor_lsn
-            elif existing is None:
+            elif not self._covered(entry):
                 self.shared_restart = min(self.shared_restart, floor_lsn)
             self.condition.notify_all()
+
+    @staticmethod
+    def _covered(entry) -> bool:
+        """Whether a daemon read that captured this subscriber started at or below
+        its floor, so its buffer holds every transaction above that floor."""
+
+        covered_from = entry.get("covered_from")
+        return covered_from is not None and covered_from <= entry["floor"]
 
     def snapshot(self, identity, checkpoint_commit_lsn):
         """Return a coherent view for one table, or None to fall back to a direct
@@ -4433,6 +4498,13 @@ class _SharedCdcShard:
 
         with self.condition:
             if not self.ready or identity not in self.schema:
+                return None
+            entry = self.subscribers.get(identity)
+            if entry is None or not self._covered(entry):
+                # No daemon read that captured this table has started at or below its
+                # floor yet, so its buffer may have a gap right after its checkpoint. A
+                # view is taken as authoritative and would skip that gap silently;
+                # keep the consumer on direct reads until a covering read is ingested.
                 return None
             table = self.schema.get(identity)
             if table is None or self.min_lsn is None or self.current_lsn is None:
@@ -4472,9 +4544,12 @@ class _SharedCdcShard:
                     store.pop(identity, None)
         return dict(self.subscribers)
 
-    def ingest(self, raw, schema_map, min_lsn, current_lsn):
+    def ingest(self, raw, schema_map, min_lsn, current_lsn, read_start):
         """Assemble one read's records into transactions, fan them out per table, and
-        publish the coherent snapshot. Returns whether the shard is caught up."""
+        publish the coherent snapshot. Returns whether the shard is caught up.
+
+        ``schema_map`` names the tables the read captured and ``read_start`` the LSN
+        it was activated at; together they record which subscribers it covered."""
 
         buffer = TransactionBuffer()
         committed = []
@@ -4494,13 +4569,36 @@ class _SharedCdcShard:
                     if any(_record_matches(record, sub["table"]) for record in tx.records):
                         self.buffers.setdefault(identity, deque()).append(tx)
                         self.cursors[identity] = tx.commit_lsn
+            # A subscriber is covered once a read that captured it was activated at or
+            # below its floor: from then on its buffer holds everything above the floor.
+            for identity in schema_map:
+                entry = self.subscribers.get(identity)
+                if entry is None:
+                    continue
+                previous = entry.get("covered_from")
+                entry["covered_from"] = (
+                    read_start if previous is None else min(previous, read_start)
+                )
             # Resume the next read from the oldest open BEGIN so open transactions are
             # recaptured; per-table cursors above dedup the resulting re-delivery.
             global_open = min((item.begin_lsn for item in buffer.open.values()), default=None)
             if global_open is not None:
-                self.shared_restart = global_open
+                advanced = global_open
             elif committed:
-                self.shared_restart = committed[-1].commit_lsn
+                advanced = committed[-1].commit_lsn
+            else:
+                advanced = self.shared_restart
+            # Never advance past the floor of a table this read did not cover. A
+            # subscriber that joined (or re-joined after TTL eviction) while the read
+            # was in flight lowered shared_restart to its floor; overwriting that here
+            # left its log between the floor and this read's end unread forever, and
+            # its first view then skipped that range silently.
+            pending = [
+                entry["floor"] for entry in self.subscribers.values() if not self._covered(entry)
+            ]
+            candidates = [value for value in (advanced, *pending) if value is not None]
+            if candidates:
+                self.shared_restart = min(candidates)
             open_begins: dict[str, int | None] = {}
             for identity, sub in self.subscribers.items():
                 begins = [
@@ -4635,7 +4733,7 @@ def _run_shared_cdc_shard(shard: _SharedCdcShard) -> None:
                     shard.max_records,
                     table=identities[0][1],
                 )
-                caught_up = shard.ingest(raw, schema_map, min_lsn, current_lsn)
+                caught_up = shard.ingest(raw, schema_map, min_lsn, current_lsn, restart)
             except Exception:  # noqa: BLE001 - surfaced by degrading to direct reads
                 logger.warning(
                     "Shared CDC shard read failed; consumers fall back to direct reads "
@@ -6070,14 +6168,40 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             ]
         encoded = self._partition_embedded_rows.pop(self._partition_offset_key(start_offset), None)
         if encoded is None:
-            # F2: a cache miss (e.g. Spark replaying an uncommitted batch after a
-            # restart) recomputes the read. Safe only because partitioned mode requires
-            # the shared CDC session (enforced in __init__), whose peek-don't-pop reads
-            # return the same rows for a committed start -- so the recompute matches the
-            # offset the batch will commit, with no duplicates or loss.
-            rows, _ = self._embedded_read(table_name, start_offset or {}, table_options)
+            # F2: a cache miss (Spark re-planning an uncommitted batch after a driver
+            # restart) recomputes the read. The recompute must land on exactly the
+            # ``end`` Spark already logged: it commits that offset regardless of what
+            # the fresh read reaches, so an under-read -- a direct poll bounded by
+            # cdc.max.records while the shared daemon is not ready yet, or a daemon
+            # buffer that does not yet cover this table -- would silently drop every
+            # row between the two. Bound the read at ``end`` and fail closed on a
+            # shortfall, the same contract the simple reader's readBetweenOffsets
+            # enforces, rather than trusting the recompute to reproduce the batch.
+            rows = self._replay_embedded_range(
+                table_name, start_offset or {}, end_offset or {}, table_options
+            )
             encoded = self._encode_embedded_rows(rows)
         return [{"kind": "embedded", "rows": encoded}]
+
+    def _replay_embedded_range(
+        self, table_name: str, start: dict, end: dict, table_options: dict[str, str]
+    ) -> Iterator[dict]:
+        """Recompute an embedded microbatch bounded by its committed ``end`` offset.
+
+        The replay bounds are injected into a private copy of the table options, so
+        the read stops at ``end.commit_lsn`` (and, mid-incremental-copy, at
+        ``end.incremental.last_pk``) and the reached offset is verified before any
+        row is returned; the copy keeps the bound from leaking into later reads.
+        """
+
+        options = dict(table_options)
+        return _replay_between_offsets(
+            start,
+            end,
+            lambda replay_start: self._embedded_read(table_name, replay_start, options),
+            options,
+            self.options,
+        )
 
     def read_partition(
         self, table_name: str, partition: dict, table_options: dict[str, str]
@@ -9593,14 +9717,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         files = self._list_unl_files(source, table.exposed_name)
         encoding = _client_encoding(self.options)
         delimiter, escape = self._unl_field_format(options)
+        escape_byte = _unl_escape_byte(escape, encoding)
         commit_time = self._resolve_unl_commit_time(source)
         for path in files:
             size = os.path.getsize(path)
             read_chunk = self._unl_read_chunk(path)
             if _unl_file_is_gzip(read_chunk):
-                records = _iter_gzip_unl_records(read_chunk, size)
+                records = _iter_gzip_unl_records(read_chunk, size, escape=escape_byte)
             else:
-                records = _iter_unl_records(read_chunk, 0, size)
+                records = _iter_unl_records(read_chunk, 0, size, escape=escape_byte)
             for raw in records:
                 yield _shape_unl_record(
                     raw,
@@ -9650,10 +9775,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         read_chunk = _unl_split_read_chunk(partition)
         start = int(partition["start_byte"])
         end = int(partition["end_byte"])
+        escape_byte = _unl_escape_byte(escape, encoding)
         if partition.get("gzip"):
-            records = _iter_gzip_unl_records(read_chunk, end)
+            records = _iter_gzip_unl_records(read_chunk, end, escape=escape_byte)
         else:
-            records = _iter_unl_records(read_chunk, start, end)
+            records = _iter_unl_records(read_chunk, start, end, escape=escape_byte)
         for raw in records:
             yield _shape_unl_record(
                 raw,
@@ -9685,6 +9811,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             table_options, _UNL_SPLIT_BYTES_OPTION, _UNL_SPLIT_TARGET_BYTES, minimum=1
         )
         source = self._table_snapshot_source(table_options)
+        # The split planner must skip escaped newlines exactly as the record readers
+        # do, so it takes the same escape byte (in the extract's encoding).
+        _delimiter, escape = self._unl_field_format(table_options)
+        escape_byte = _unl_escape_byte(escape, _client_encoding(self.options))
         splits: list[tuple[str, int, int, bool]] = []
         for path in self._list_unl_files(source, table.exposed_name):
             size = os.path.getsize(path)
@@ -9694,7 +9824,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 splits.append((path, 0, size, True))
                 continue
             for start_byte, end_byte in _unl_byte_splits(
-                read_chunk, size, target_bytes=target_bytes
+                read_chunk, size, target_bytes=target_bytes, escape=escape_byte
             ):
                 splits.append((path, start_byte, end_byte, False))
         return splits
@@ -12538,26 +12668,102 @@ def _unload_value(text: str, type_name: str) -> Any:
     return text
 
 
+_UNL_DEFAULT_ESCAPE_BYTE = b"\\"
+
+
+def _unl_escape_byte(escape: str, encoding: str) -> bytes:
+    """Encode the record escape character for the byte-level record splitter.
+
+    The splitter scans raw bytes for record terminators, so the escape must be a
+    single byte in the extract's encoding (backslash, or an HPL job's ASCII choice).
+    An empty escape (escaping disabled) yields ``b""``: every physical newline then
+    terminates a record.
+    """
+
+    if not escape:
+        return b""
+    encoded = escape.encode(encoding)
+    if len(encoded) != 1:
+        raise InformixError(
+            f"Option '{_UNL_ESCAPE_OPTION}' must encode to a single byte in {encoding!r}; "
+            f"got {escape!r}"
+        )
+    return encoded
+
+
+def _unl_escape_run(data: bytes, index: int, marker: int) -> int:
+    """Count the consecutive ``marker`` bytes immediately before ``data[index]``."""
+
+    run = 0
+    position = index - 1
+    while position >= 0 and data[position] == marker:
+        run += 1
+        position -= 1
+    return run
+
+
+def _unl_find_record_end(data: bytes, start: int, escape: bytes) -> int:
+    """Index of the first *unescaped* ``\\n`` in ``data`` at or after ``start``, else -1.
+
+    UNLOAD writes a newline embedded in a CHAR/VARCHAR value as the escape followed
+    by a literal newline, and a literal escape as the escape doubled, so a newline
+    preceded by an odd run of escape bytes is data while an even run (including
+    none) terminates the record. ``data`` must begin at a record start: the byte
+    before any record is an unescaped newline (or the file start), so a run can never
+    extend before it.
+    """
+
+    if not escape:
+        return data.find(b"\n", start)
+    marker = escape[0]
+    while True:
+        index = data.find(b"\n", start)
+        if index == -1 or _unl_escape_run(data, index, marker) % 2 == 0:
+            return index
+        start = index + 1
+
+
+def _unl_split_records(buffer: bytes, escape: bytes) -> tuple[list[bytes], bytes]:
+    """Split ``buffer`` (which starts at a record start) into its complete records and
+    the trailing partial record still waiting for its terminator."""
+
+    if not escape or escape not in buffer:
+        # No escape byte anywhere: every newline terminates a record (C-speed split).
+        parts = buffer.split(b"\n")
+        return parts[:-1], parts[-1]
+    records: list[bytes] = []
+    cursor = 0
+    while True:
+        index = _unl_find_record_end(buffer, cursor, escape)
+        if index == -1:
+            return records, buffer[cursor:]
+        records.append(buffer[cursor:index])
+        cursor = index + 1
+
+
 def _unl_byte_splits(
     read_chunk: Callable[[int, int], bytes],
     size: int,
     *,
     target_bytes: int = _UNL_SPLIT_TARGET_BYTES,
     chunk_bytes: int = _UNL_SCAN_CHUNK_BYTES,
+    escape: bytes = _UNL_DEFAULT_ESCAPE_BYTE,
 ) -> list[tuple[int, int]]:
     """Index one `.unl` file into ``[start, end)`` byte splits of ~``target_bytes`` each.
 
     Cheap to plan and constant-memory: for each split, seek to ``start + target_bytes``
-    and read forward via ``read_chunk`` only until the next physical ``\\n``, cutting the
-    split just after it (the next split resumes there). This reads a small window near
-    each cut point rather than the whole file -- the reason byte splitting is preferred
-    over a row cap, which cannot know row counts without reading every byte.
+    and read forward via ``read_chunk`` only until the next record terminator, cutting
+    the split just after it (the next split resumes there). This reads a small window
+    near each cut point rather than the whole file -- the reason byte splitting is
+    preferred over a row cap, which cannot know row counts without reading every byte.
 
-    ``_iter_unl_records`` splits the same range on physical ``\\n``, so ending a split
-    right after a newline keeps records from spanning a boundary -- the same contract the
-    row splitter had. One physical ``\\n`` is one UNLOAD record (embedded newlines are
-    escaped). A trailing unterminated record is included in the final split; a split
-    whose target lands past the last newline runs to EOF. An empty file yields no splits.
+    A record terminator is an *unescaped* physical ``\\n``: UNLOAD escapes a newline
+    embedded in a value as ``escape`` + newline, so a newline behind an odd run of
+    escape bytes is data (see _unl_find_record_end). ``_iter_unl_records`` splits the
+    same range on the same rule, so ending a split right after a terminator keeps
+    records from spanning a boundary. A trailing unterminated record is included in the
+    final split; a split whose target lands past the last terminator runs to EOF. An
+    empty file yields no splits.
     """
 
     target_bytes = max(1, target_bytes)
@@ -12568,7 +12774,7 @@ def _unl_byte_splits(
         if target >= size:
             splits.append((split_start, size))
             break
-        boundary = _unl_next_record_boundary(read_chunk, target, size, chunk_bytes)
+        boundary = _unl_next_record_boundary(read_chunk, target, size, chunk_bytes, escape)
         if boundary >= size:
             splits.append((split_start, size))
             break
@@ -12582,24 +12788,61 @@ def _unl_next_record_boundary(
     target: int,
     size: int,
     chunk_bytes: int,
+    escape: bytes = _UNL_DEFAULT_ESCAPE_BYTE,
 ) -> int:
-    """Return the offset just after the first physical ``\\n`` at or after ``target``.
+    """Return the offset just after the first unescaped ``\\n`` at or after ``target``.
 
     Reads forward from ``target`` in ``chunk_bytes`` windows (never the whole file) and
-    returns ``size`` when no newline remains before EOF, so the caller runs the final
-    split to the end of the file.
+    returns ``size`` when no terminator remains before EOF, so the caller runs the
+    final split to the end of the file. A candidate newline's escape run may begin
+    before the window -- before ``target`` itself when the newline is its first byte
+    -- so a run that reaches the window start is extended by reading backwards.
     """
 
+    marker = escape[0] if escape else None
     offset = target
     while offset < size:
         chunk = read_chunk(offset, min(chunk_bytes, size - offset))
         if not chunk:
             break
-        index = chunk.find(b"\n")
-        if index != -1:
+        search = 0
+        while True:
+            index = chunk.find(b"\n", search)
+            if index == -1:
+                break
+            if marker is not None:
+                run = _unl_escape_run(chunk, index, marker)
+                if run == index:
+                    run += _unl_escape_run_before(read_chunk, offset, marker)
+                if run % 2:
+                    search = index + 1
+                    continue
             return offset + index + 1
         offset += len(chunk)
     return size
+
+
+def _unl_escape_run_before(
+    read_chunk: Callable[[int, int], bytes], position: int, marker: int
+) -> int:
+    """Count the consecutive ``marker`` bytes ending right before ``position``, reading
+    backwards in small windows (a run is normally zero or one byte long)."""
+
+    run = 0
+    end = position
+    window = 64
+    while end > 0:
+        start = max(0, end - window)
+        data = read_chunk(start, end - start)
+        if not data:
+            break
+        trailing = _unl_escape_run(data, len(data), marker)
+        run += trailing
+        if trailing < len(data):
+            break
+        end = start
+        window = min(window * 2, _UNL_SCAN_CHUNK_BYTES)
+    return run
 
 
 def _iter_unl_records(
@@ -12608,11 +12851,13 @@ def _iter_unl_records(
     end: int,
     *,
     chunk_bytes: int = _UNL_SCAN_CHUNK_BYTES,
+    escape: bytes = _UNL_DEFAULT_ESCAPE_BYTE,
 ) -> Iterator[bytes]:
     """Yield the raw record bytes (no trailing newline) whose bytes lie in ``[start, end)``.
 
     Splits produced by :func:`_unl_byte_splits` begin at a record start and end right
-    after a record's newline, so this reads the range and splits on physical ``\\n``.
+    after a record terminator, so this reads the range and splits it on unescaped
+    ``\\n`` (see _unl_find_record_end); an escaped newline stays inside its record.
     Streaming/constant-memory. A final unterminated record (end of file) is yielded.
     """
 
@@ -12624,9 +12869,8 @@ def _iter_unl_records(
             break
         offset += len(chunk)
         buffer += chunk
-        parts = buffer.split(b"\n")
-        buffer = parts.pop()
-        yield from parts
+        records, buffer = _unl_split_records(buffer, escape)
+        yield from records
     if buffer:
         yield buffer
 
@@ -12646,16 +12890,18 @@ def _iter_gzip_unl_records(
     size: int,
     *,
     chunk_bytes: int = _UNL_SCAN_CHUNK_BYTES,
+    escape: bytes = _UNL_DEFAULT_ESCAPE_BYTE,
 ) -> Iterator[bytes]:
     """Yield raw record bytes from a gzip-compressed `.unl` file (whole file, streaming).
 
     Gzip is not seekable, so a compressed file is one non-splittable unit: read the
     compressed bytes ``[0, size)`` in ``chunk_bytes`` windows, decompress incrementally,
-    split the decompressed stream on physical ``\\n``, and yield records. Constant memory
-    -- only one compressed window, the current decompressed run, and the trailing partial
-    line are held. Concatenated gzip members (``cat a.gz b.gz``) are handled by starting a
-    fresh decompressor from each member's trailing ``unused_data``. A final unterminated
-    record is yielded. An empty extract (gzip of no rows) yields nothing.
+    split the decompressed stream on unescaped ``\\n`` (see _unl_find_record_end), and
+    yield records. Constant memory -- only one compressed window, the current
+    decompressed run, and the trailing partial record are held. Concatenated gzip
+    members (``cat a.gz b.gz``) are handled by starting a fresh decompressor from each
+    member's trailing ``unused_data``. A final unterminated record is yielded. An empty
+    extract (gzip of no rows) yields nothing.
     """
 
     decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
@@ -12673,13 +12919,11 @@ def _iter_gzip_unl_records(
             # Member finished; its leftover bytes begin the next concatenated member.
             compressed = decompressor.unused_data
             decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
-        parts = tail.split(b"\n")
-        tail = parts.pop()
-        yield from parts
+        records, tail = _unl_split_records(tail, escape)
+        yield from records
     tail += decompressor.flush()
-    parts = tail.split(b"\n")
-    tail = parts.pop()
-    yield from parts
+    records, tail = _unl_split_records(tail, escape)
+    yield from records
     if tail:
         yield tail
 
@@ -12883,6 +13127,19 @@ def _validate_shaped_rows(
                     f"{context} row {row_index} value for column '{column.name}' "
                     f"cannot materialize as {type(spark_type).__name__}"
                 )
+
+
+def _log_lsn(uniqid: int, used_pages: int, *, page_start: bool = False) -> int:
+    """Compose an LSN from a ``sysmaster:syslogs`` row: the log file's ``uniqid`` in the
+    high word and the byte offset of ``used_pages`` 4 KiB pages in the low word.
+
+    ``page_start`` anchors the offset at the start of the last used page instead of
+    its end -- the conservative capture boundary (see ``boundary_lsn``); a log with no
+    used page yet anchors at its beginning either way.
+    """
+
+    pages = max(int(used_pages) - 1, 0) if page_start else int(used_pages)
+    return (int(uniqid) << 32) + (pages << 12)
 
 
 def _sortable_lsn(value: int) -> str:

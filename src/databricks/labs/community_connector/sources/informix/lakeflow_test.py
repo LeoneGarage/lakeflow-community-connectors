@@ -3000,7 +3000,8 @@ class LakeflowContractTests(unittest.TestCase):
 
         lsn, rows = bridge.consistent_snapshot("demo.app.orders", ["id"], ["id"], 10, 100, 1 << 20)
 
-        self.assertEqual(lsn, (2 << 32) + (3 << 12))
+        # Conservative boundary: start of the current log page (see boundary_lsn).
+        self.assertEqual(lsn, (2 << 32) + (2 << 12))
         self.assertEqual(rows, [{"id": 1}])
         self.assertEqual(
             [sql for sql in bridge.transport.sql if sql.startswith("COMMAND:")][:2],
@@ -3042,7 +3043,10 @@ class LakeflowContractTests(unittest.TestCase):
 
         lsn, rows = bridge.snapshot_chunk("demo.app.orders", ["id"], ["id"], None, 10)
 
-        self.assertEqual(lsn, (2 << 32) + (3 << 12))
+        # The stamp is the conservative boundary: the start of the current log page
+        # (used=3 -> two full pages), never the page end that may exceed the true
+        # write position (see boundary_lsn).
+        self.assertEqual(lsn, (2 << 32) + (2 << 12))
         self.assertEqual(rows, [{"id": 1}])
         lsn_index = next(i for i, sql in enumerate(bridge.transport.sql) if "syslogs" in sql)
         select_index = next(i for i, sql in enumerate(bridge.transport.sql) if "FIRST_ROWS" in sql)
@@ -5035,6 +5039,71 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(partitions, [{"kind": "embedded", "rows": [{"id": 3}]}])
         self.assertEqual(read_table.call_count, 2)  # once in latest_offset, once on miss
+
+    def test_partitioned_cache_miss_replay_is_bounded_by_the_committed_end(self):
+        # Regression: on a driver restart Spark re-plans the uncommitted batch through
+        # partitions(start, end) with the cache empty. The recompute ignored ``end``,
+        # so a fresh read that stopped short (a direct poll capped by cdc.max.records
+        # while the shared daemon was not ready) served a prefix while Spark committed
+        # the original ``end`` -- dropping every row in between. The recompute must now
+        # carry the replay bound the simple reader's readBetweenOffsets uses.
+        connector = self._partitioned_connector()
+        start = {"phase": "stream", "commit_lsn": "5"}
+        end = {"phase": "stream", "commit_lsn": "9"}
+        seen = []
+
+        def read_table(name, start_offset, opts):
+            seen.append(dict(opts))
+            return iter([{"id": 1}, {"id": 2}, {"id": 3}]), dict(end)
+
+        with mock.patch.object(connector, "read_table", side_effect=read_table):
+            connector.latest_offset("app.orders", {}, start)
+            connector._partition_embedded_rows.clear()  # fresh driver process
+            partitions = connector.get_partitions("app.orders", {}, start, end)
+
+        self.assertEqual(
+            partitions, [{"kind": "embedded", "rows": [{"id": 1}, {"id": 2}, {"id": 3}]}]
+        )
+        self.assertNotIn(informix_module._REPLAY_STOP_LSN_OPTION, seen[0])  # normal read
+        self.assertEqual(seen[1][informix_module._REPLAY_STOP_LSN_OPTION], "9")  # bounded replay
+        self.assertIn(informix_module._REPLAY_CONNECTION_WAIT_BUDGET_OPTION, seen[1])
+
+    def test_partitioned_cache_miss_replay_fails_closed_on_a_short_read(self):
+        # A recompute that reaches a lower LSN than the committed end must raise rather
+        # than serve a prefix: Spark would commit ``end`` and the rest would be lost.
+        connector = self._partitioned_connector()
+        start = {"phase": "stream", "commit_lsn": "5"}
+        end = {"phase": "stream", "commit_lsn": "9"}
+        reached = iter([dict(end), {"phase": "stream", "commit_lsn": "6"}])
+
+        with mock.patch.object(
+            connector,
+            "read_table",
+            side_effect=lambda *a, **k: (iter([{"id": 1}]), next(reached)),
+        ):
+            connector.latest_offset("app.orders", {}, start)
+            connector._partition_embedded_rows.clear()
+            with self.assertRaisesRegex(InformixError, "did not reach its committed end LSN"):
+                connector.get_partitions("app.orders", {}, start, end)
+
+    def test_partitioned_cache_miss_replay_routes_the_delete_flow(self):
+        connector = self._partitioned_connector(**{"isDeleteFlow": "true"})
+        start = {"phase": "stream", "commit_lsn": "5"}
+        end = {"phase": "stream", "commit_lsn": "6"}
+        seen = []
+
+        def read_table_deletes(name, start_offset, opts):
+            seen.append(dict(opts))
+            return iter([{"id": 1}]), dict(end)
+
+        with (
+            mock.patch.object(connector, "read_table_deletes", side_effect=read_table_deletes),
+            mock.patch.object(connector, "read_table") as upserts,
+        ):
+            partitions = connector.get_partitions("app.orders", {}, start, end)
+        self.assertEqual(partitions, [{"kind": "embedded", "rows": [{"id": 1}]}])
+        self.assertEqual(seen[0][informix_module._REPLAY_STOP_LSN_OPTION], "6")
+        upserts.assert_not_called()
 
     def test_partitioned_batch_get_partitions_falls_back(self):
         # The 2-arg (batch) form must raise so LakeflowBatchReader falls back to a
@@ -7627,6 +7696,37 @@ class LakeflowContractTests(unittest.TestCase):
             self.assertIn(f"scope={first_scope}", message)
             self.assertIn("table=members", message)
             self.assertIn("role=delete", message)
+
+    def test_generated_available_now_base_wraps_the_partitioned_reader(self):
+        # The partitioned proxy is the default stream reader for CDC-capable tables.
+        # It must get the same registration-scope setter and AvailableNow hook as the
+        # simple reader; its replay goes through get_partitions, so it needs (and
+        # gets) no readBetweenOffsets.
+        class TriggerBase:
+            pass
+
+        Wrapped = _informix_available_now_base(TriggerBase)
+
+        class LakeflowPartitionedStreamReader(Wrapped):
+            def __init__(self):
+                self.lakeflow_connect = mock.Mock()
+                self.options = {"tableName": "members"}
+
+            def prepareForTriggerAvailableNow(self):
+                raise AssertionError("shared no-op was not replaced")
+
+        reader = LakeflowPartitionedStreamReader()
+        reader.prepareForTriggerAvailableNow()
+        reader.lakeflow_connect.prepare_for_trigger_available_now.assert_called_once_with()
+        scope = reader.lakeflow_connect.set_registration_scope.call_args.args[0]
+        self.assertRegex(scope, r"^[0-9a-f]{32}$")
+        self.assertFalse(hasattr(reader, "readBetweenOffsets"))
+
+        class SomethingElse(Wrapped):
+            def __init__(self):
+                self.lakeflow_connect = mock.Mock()
+
+        SomethingElse().lakeflow_connect.set_registration_scope.assert_not_called()
 
     def _replay_reader(self, connector, **options):
         """A real LakeflowStreamReader over ``connector``, with the installed patch."""
@@ -10832,7 +10932,7 @@ class SharedCdcShardTests(unittest.TestCase):
 
     def test_multiplexes_two_tables_to_their_own_buffers(self):
         shard = self._shard_with_two_tables()
-        caught_up = shard.ingest(self._two_table_stream(), self._schema_map(), 1, 106)
+        caught_up = shard.ingest(self._two_table_stream(), self._schema_map(), 1, 106, 0)
         self.assertTrue(caught_up)
         view_a = shard.snapshot(self.id_a, 0)
         view_b = shard.snapshot(self.id_b, 0)
@@ -10844,14 +10944,14 @@ class SharedCdcShardTests(unittest.TestCase):
     def test_per_table_cursor_blocks_reread_duplicates(self):
         shard = self._shard_with_two_tables()
         stream = self._two_table_stream()
-        shard.ingest(stream, self._schema_map(), 1, 106)
-        shard.ingest(stream, self._schema_map(), 1, 106)  # daemon re-reads from the floor
+        shard.ingest(stream, self._schema_map(), 1, 106, 0)
+        shard.ingest(stream, self._schema_map(), 1, 106, 0)  # daemon re-reads from the floor
         self.assertEqual(len(shard.buffers[self.id_a]), 1)
         self.assertEqual(len(shard.buffers[self.id_b]), 1)
 
     def test_snapshot_peeks_without_removing_until_checkpoint_advances(self):
         shard = self._shard_with_two_tables()
-        shard.ingest(self._two_table_stream(), self._schema_map(), 1, 106)
+        shard.ingest(self._two_table_stream(), self._schema_map(), 1, 106, 0)
         self.assertEqual([tx.tx_id for tx in shard.snapshot(self.id_a, 0).committed], [1])
         # A second poll at the same checkpoint still sees the un-consumed transaction.
         self.assertEqual([tx.tx_id for tx in shard.snapshot(self.id_a, 0).committed], [1])
@@ -10862,11 +10962,11 @@ class SharedCdcShardTests(unittest.TestCase):
         shard = _SharedCdcShard()
         shard.subscribe(self.id_a, self.table_a, _capture_descriptor(self.table_a), 0, 0)
         stream = self._two_table_stream()
-        shard.ingest(stream, {self.id_a: self.table_a}, 1, 106)
+        shard.ingest(stream, {self.id_a: self.table_a}, 1, 106, 0)
         # B subscribes late; the daemon re-reads the log and B must get its history
         # while A is not re-delivered.
         shard.subscribe(self.id_b, self.table_b, _capture_descriptor(self.table_b), 0, 0)
-        shard.ingest(stream, self._schema_map(), 1, 106)
+        shard.ingest(stream, self._schema_map(), 1, 106, 0)
         self.assertEqual([tx.tx_id for tx in shard.buffers[self.id_b]], [2])
         self.assertEqual(len(shard.buffers[self.id_a]), 1)
 
@@ -10882,7 +10982,7 @@ class SharedCdcShardTests(unittest.TestCase):
                 "row": {"id": 2, "value": "b"},
             },
         ]  # opened, not committed
-        caught_up = shard.ingest(stream, self._schema_map(), 1, 201)
+        caught_up = shard.ingest(stream, self._schema_map(), 1, 201, 0)
         self.assertFalse(caught_up)
         self.assertEqual(shard.snapshot(self.id_a, 0).open_begin, 200)
         self.assertIsNone(shard.snapshot(self.id_b, 0).open_begin)
@@ -10898,6 +10998,77 @@ class SharedCdcShardTests(unittest.TestCase):
     def test_snapshot_is_none_until_daemon_publishes(self):
         shard = self._shard_with_two_tables()
         self.assertIsNone(shard.snapshot(self.id_a, 0))
+
+    def _tx(self, tx_id, begin, table, commit):
+        return [
+            {"op": "BEGIN", "tx_id": tx_id, "lsn": begin},
+            {
+                "op": "INSERT",
+                "tx_id": tx_id,
+                "lsn": begin + 1,
+                "table": table.identity,
+                "row": {"id": tx_id, "value": "x"},
+            },
+            {"op": "COMMIT", "tx_id": tx_id, "lsn": commit},
+        ]
+
+    def test_ingest_keeps_the_floor_of_a_subscriber_that_joined_mid_read(self):
+        # Regression: A is subscribed at floor 800 and the daemon activates a read at
+        # 800 capturing only A. While that read is in flight B subscribes with floor
+        # 600 (its checkpoint), which lowers shared_restart to 600. ingest() used to
+        # overwrite shared_restart with the read's own end (900), so the daemon's next
+        # activation skipped B's log in (600, 900) forever -- and B's first view then
+        # advanced its checkpoint straight past that gap.
+        shard = _SharedCdcShard()
+        shard.subscribe(self.id_a, self.table_a, _capture_descriptor(self.table_a), 0, 800)
+        read_start = shard.shared_restart  # what the in-flight read was activated at
+        shard.subscribe(self.id_b, self.table_b, _capture_descriptor(self.table_b), 600, 600)
+        self.assertEqual(shard.shared_restart, 600)
+
+        raw = self._tx(1, 810, self.table_a, 850) + self._tx(2, 860, self.table_a, 900)
+        raw.append({"op": "TIMEOUT", "lsn": 901})
+        shard.ingest(raw, {self.id_a: self.table_a}, 1, 901, read_start)
+
+        # The floor B lowered survives the read that did not cover B.
+        self.assertEqual(shard.shared_restart, 600)
+        # A was covered by a read activated at its floor: its view is authoritative.
+        self.assertEqual([tx.tx_id for tx in shard.snapshot(self.id_a, 0).committed], [1, 2])
+        # B is not covered yet, so no view: the consumer stays on direct reads instead
+        # of trusting a buffer that never saw (600, 900).
+        self.assertIsNone(shard.snapshot(self.id_b, 600))
+
+        # The next daemon read activates at the clamped floor and captures both tables;
+        # B's history is delivered and only then does B get a view.
+        raw = self._tx(3, 610, self.table_b, 700) + self._tx(1, 810, self.table_a, 850)
+        raw += self._tx(2, 860, self.table_a, 900) + [{"op": "TIMEOUT", "lsn": 901}]
+        shard.ingest(raw, self._schema_map(), 1, 901, shard.shared_restart)
+        self.assertEqual([tx.tx_id for tx in shard.snapshot(self.id_b, 600).committed], [3])
+        # A's already-delivered transactions were not re-delivered.
+        self.assertEqual([tx.tx_id for tx in shard.snapshot(self.id_a, 0).committed], [1, 2])
+        self.assertEqual(shard.shared_restart, 900)
+
+    def test_snapshot_is_none_until_a_read_activated_at_or_below_the_floor_covers_it(self):
+        shard = _SharedCdcShard()
+        shard.subscribe(self.id_a, self.table_a, _capture_descriptor(self.table_a), 500, 500)
+        # A read that captured A but was activated above A's floor does not cover it.
+        shard.ingest([{"op": "TIMEOUT", "lsn": 700}], {self.id_a: self.table_a}, 1, 700, 650)
+        self.assertIsNone(shard.snapshot(self.id_a, 500))
+        self.assertEqual(shard.shared_restart, 500)  # clamped back to the uncovered floor
+        shard.ingest([{"op": "TIMEOUT", "lsn": 701}], {self.id_a: self.table_a}, 1, 701, 500)
+        self.assertIsNotNone(shard.snapshot(self.id_a, 500))
+
+    def test_a_ttl_evicted_subscriber_must_be_covered_again(self):
+        shard = _SharedCdcShard()
+        shard.subscriber_ttl = 0.0
+        shard.subscribe(self.id_a, self.table_a, _capture_descriptor(self.table_a), 0, 0)
+        shard.ingest([{"op": "TIMEOUT", "lsn": 10}], {self.id_a: self.table_a}, 1, 10, 0)
+        self.assertIsNotNone(shard.snapshot(self.id_a, 0))
+        with shard.condition:
+            shard.live_subscribers()  # TTL 0 -> evicted, coverage forgotten
+        shard.subscribe(self.id_a, self.table_a, _capture_descriptor(self.table_a), 0, 0)
+        shard.ingest([{"op": "TIMEOUT", "lsn": 11}], {self.id_a: self.table_a}, 1, 11, 5)
+        self.assertIsNone(shard.snapshot(self.id_a, 0))  # read at 5 did not cover floor 0
+        self.assertEqual(shard.shared_restart, 0)
 
 
 class SharedCdcOptionTests(unittest.TestCase):
@@ -11072,6 +11243,7 @@ class SharedCdcConsumerSeamTests(unittest.TestCase):
             {identity: table},
             1,
             103,
+            0,
         )
 
         with mock.patch.object(informix_module, "_shared_cdc_shard", lambda *a, **k: shard):
@@ -11091,7 +11263,7 @@ class SharedCdcConsumerSeamTests(unittest.TestCase):
 
         shard = _SharedCdcShard()
         shard.subscribe(identity, table, _capture_descriptor(table), 0, 0)
-        shard.ingest([{"op": "TIMEOUT", "lsn": 103}], {identity: table}, 1, 103)
+        shard.ingest([{"op": "TIMEOUT", "lsn": 103}], {identity: table}, 1, 103, 0)
 
         checkpoint = _stream_offset()
         checkpoint["schema_fingerprint"] = "0" * 64  # simulate an in-flight transition
@@ -11137,6 +11309,7 @@ class SharedCdcConsumerSeamTests(unittest.TestCase):
             {identity: override},  # daemon publishes schema WITH the override applied
             1,
             104,
+            0,
         )
 
         checkpoint = _stream_offset()
@@ -13096,6 +13269,90 @@ class UnloadHelperTests(unittest.TestCase):
             records.extend(list(informix_module._iter_unl_records(reader, start, end)))
         self.assertEqual(records, [b"a|", b"b|"])
 
+    # UNLOAD writes an embedded newline as backslash + newline and a literal backslash
+    # as a doubled backslash. Record 2 below holds both, plus a value ending in an
+    # escaped backslash right before its terminator (an even run: still a terminator).
+    _ESCAPED = b"1|plain|\n2|line one\\\nline two|back\\\\slash|\n3|end\\\\|\n4|x|\n"
+    _ESCAPED_RECORDS = [
+        b"1|plain|",
+        b"2|line one\\\nline two|back\\\\slash|",
+        b"3|end\\\\|",
+        b"4|x|",
+    ]
+
+    def test_iter_unl_records_keeps_an_escaped_newline_inside_the_record(self):
+        # Regression: the reader split on every physical newline, so a record whose
+        # value holds an escaped newline came out as two fragments with the wrong
+        # field count (and the serve failed closed on it).
+        for chunk_bytes in (1, 2, 3, 4, 7, 64):
+            records = list(
+                informix_module._iter_unl_records(
+                    self._reader(self._ESCAPED), 0, len(self._ESCAPED), chunk_bytes=chunk_bytes
+                )
+            )
+            self.assertEqual(records, self._ESCAPED_RECORDS, chunk_bytes)
+        # The record parser then decodes the escaped newline back into the value.
+        fields = informix_module._parse_unload_fields(self._ESCAPED_RECORDS[1].decode())
+        self.assertEqual(fields, ["2", "line one\nline two", "back\\slash"])
+
+    def test_unl_byte_splits_never_cut_at_an_escaped_newline(self):
+        # Every cut point must land after an *unescaped* newline, including when the
+        # target lands exactly on the escaped newline (or its escape byte), so the
+        # boundary finder has to look before the target to classify it.
+        data = self._ESCAPED
+        reader = self._reader(data)
+        for target in range(1, len(data) + 1):
+            for chunk_bytes in (1, 3, 64):
+                splits = informix_module._unl_byte_splits(
+                    reader, len(data), target_bytes=target, chunk_bytes=chunk_bytes
+                )
+                self.assertEqual(splits[0][0], 0)
+                self.assertEqual(splits[-1][1], len(data))
+                records = []
+                for start, end in splits:
+                    if end < len(data):
+                        self.assertEqual(data[end - 1 : end], b"\n")
+                        self.assertNotEqual(data[end - 2 : end], b"\\\n")
+                    records.extend(
+                        informix_module._iter_unl_records(
+                            reader, start, end, chunk_bytes=chunk_bytes
+                        )
+                    )
+                self.assertEqual(records, self._ESCAPED_RECORDS, (target, chunk_bytes))
+
+    def test_unl_escape_disabled_treats_every_newline_as_a_terminator(self):
+        data = b"a\\\nb|\nc|\n"
+        reader = self._reader(data)
+        plain = list(informix_module._iter_unl_records(reader, 0, len(data), escape=b""))
+        self.assertEqual(plain, [b"a\\", b"b|", b"c|"])
+        splits = informix_module._unl_byte_splits(
+            reader, len(data), target_bytes=1, chunk_bytes=2, escape=b""
+        )
+        self.assertEqual(len(splits), 3)
+        # An HPL job's own escape character is honoured the same way.
+        data = b"a~\nb|\nc|\n"
+        reader = self._reader(data)
+        self.assertEqual(
+            list(informix_module._iter_unl_records(reader, 0, len(data), escape=b"~")),
+            [b"a~\nb|", b"c|"],
+        )
+
+    def test_iter_gzip_unl_records_honours_escaped_newlines(self):
+        compressed = gzip.compress(self._ESCAPED)
+        for chunk_bytes in (1, 4, 64):
+            records = list(
+                informix_module._iter_gzip_unl_records(
+                    self._reader(compressed), len(compressed), chunk_bytes=chunk_bytes
+                )
+            )
+            self.assertEqual(records, self._ESCAPED_RECORDS, chunk_bytes)
+
+    def test_unl_escape_byte_requires_a_single_byte_in_the_extract_encoding(self):
+        self.assertEqual(informix_module._unl_escape_byte("\\", "utf-8"), b"\\")
+        self.assertEqual(informix_module._unl_escape_byte("", "utf-8"), b"")
+        with self.assertRaisesRegex(InformixError, "single byte"):
+            informix_module._unl_escape_byte("\u00e9", "utf-8")
+
     def test_unl_file_is_gzip_detects_magic_bytes(self):
         is_gzip = informix_module._unl_file_is_gzip
         self.assertTrue(is_gzip(self._reader(gzip.compress(b"1|a|\n"))))
@@ -13672,6 +13929,56 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
         second = connector.latest_offset("app.orders", options, {})
         self.assertEqual(first["commit_lsn"], "50")
         self.assertEqual(first, second)
+
+
+class BoundaryLsnTests(unittest.TestCase):
+    """The capture boundary never runs ahead of the log's true write position."""
+
+    def _bridge(self, uniqid, used):
+        class Transport:
+            def execute(self, sql, parameters=()):
+                if "syslogs" in sql:
+                    return [{"uniqid": uniqid, "used": used}]
+                return [{"status": 0}]
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.config = {"database": "demo"}
+        bridge.transport = Transport()
+        return bridge
+
+    def test_log_lsn_page_start_anchors_one_page_below_the_page_end(self):
+        self.assertEqual(informix_module._log_lsn(7, 3), (7 << 32) + (3 << 12))
+        self.assertEqual(informix_module._log_lsn(7, 3, page_start=True), (7 << 32) + (2 << 12))
+        # A log with no used page yet anchors at its start either way.
+        self.assertEqual(informix_module._log_lsn(7, 0, page_start=True), 7 << 32)
+        self.assertEqual(informix_module._log_lsn(7, 0), 7 << 32)
+
+    def test_boundary_lsn_is_never_ahead_of_current_lsn(self):
+        bridge = self._bridge(7, 3)
+        self.assertEqual(bridge.current_lsn(), (7 << 32) + (3 << 12))
+        self.assertEqual(bridge.boundary_lsn(), (7 << 32) + (2 << 12))
+        self.assertLess(bridge.boundary_lsn(), bridge.current_lsn())
+
+    def test_capture_boundaries_use_the_conservative_position(self):
+        # Every position a snapshot is sequenced against -- the shared initial
+        # boundary, a consistent snapshot's LSN, and each incremental chunk's stamp --
+        # is the conservative one; only stop bounds keep current_lsn.
+        bridge = self._bridge(7, 3)
+        conservative = (7 << 32) + (2 << 12)
+        self.assertEqual(bridge.prepare_initial_capture(["demo:app.orders"]), conservative)
+        with (
+            mock.patch.object(bridge, "_repeatable_read_transaction") as tx,
+            mock.patch.object(bridge, "snapshot_page", return_value=[]),
+        ):
+            tx.return_value.__enter__ = lambda *a: None
+            tx.return_value.__exit__ = lambda *a: False
+            chunk_lsn, _rows = bridge.snapshot_chunk("demo.app.orders", ["id"], ["id"], None, 10)
+            snapshot_lsn, _rows = bridge.consistent_snapshot(
+                "demo.app.orders", ["id"], ["id"], 10, 0, 0
+            )
+        self.assertEqual(chunk_lsn, conservative)
+        self.assertEqual(snapshot_lsn, conservative)
 
 
 if __name__ == "__main__":
