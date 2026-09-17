@@ -464,22 +464,27 @@ class _FakeCursor:
     def _insert_record(self, args: dict, text: str) -> None:
         key = (args["namespace"], args["record_key"])
         immutable = "DO NOTHING" in text
-        minimum_lsn = "EXCLUDED.record->>'start_lsn'" in text
+        # The two LSN publishers differ only in the comparison direction of their
+        # ON CONFLICT ... WHERE (and the minimum one also matches on scope), so tell them
+        # apart by that operator rather than by the shared start_lsn reference.
+        minimum_lsn = "::numeric > (EXCLUDED.record->>'start_lsn')" in text
+        maximum_lsn = "::numeric < (EXCLUDED.record->>'start_lsn')" in text
         with self._database.lock:
             if key in self._database.records and immutable:
                 return  # ON CONFLICT DO NOTHING: no row returned
-            if key in self._database.records and minimum_lsn:
+            if key in self._database.records and (minimum_lsn or maximum_lsn):
                 existing = json.loads(self._database.records[key])
                 candidate = json.loads(args["record"])
-                compatible = all(
-                    existing.get(field) == candidate.get(field)
-                    for field in (
-                        "format_version",
-                        "scope",
-                        "table",
-                    )
-                )
-                if not compatible or int(existing["start_lsn"]) <= int(candidate["start_lsn"]):
+                fields = ("format_version", "table")
+                if minimum_lsn:
+                    fields = ("format_version", "scope", "table")
+                compatible = all(existing.get(field) == candidate.get(field) for field in fields)
+                if not compatible:
+                    return
+                current, proposed = int(existing["start_lsn"]), int(candidate["start_lsn"])
+                if minimum_lsn and current <= proposed:
+                    return
+                if maximum_lsn and current >= proposed:
                     return
             self._database.records[key] = args["record"]
             self._result = [(args["record"],)]
@@ -1061,6 +1066,95 @@ class LakebaseStateRecordTests(unittest.TestCase):
         )
 
         self.assertEqual(winner, self._channel_record(90, schema_id="other"))
+
+    @staticmethod
+    def _floor_record(
+        lsn: int, *, table: str = "demo:app.orders", schema_id: str = "schema"
+    ) -> dict:
+        return {
+            "fingerprint": f"fingerprint-{schema_id}",
+            "format_version": 1,
+            "record_type": "delete-floor",
+            "schema_id": schema_id,
+            "start_lsn": str(lsn),
+            "table": table,
+        }
+
+    def test_maximum_lsn_record_can_only_move_forwards(self):
+        publish = lakebase_state.publish_maximum_lsn_state_record
+        for lsn, expected in ((90, "90"), (120, "120"), (100, "120"), (120, "120")):
+            winner = publish(
+                self.connection,
+                "ns",
+                "maximum",
+                self._floor_record(lsn),
+                record_type="delete-floor",
+            )
+            self.assertEqual(winner["start_lsn"], expected, lsn)
+
+    def test_maximum_lsn_record_compares_numerically(self):
+        # LSNs are stored as strings; "1000" must beat "999" (lexicographically it would not).
+        publish = lakebase_state.publish_maximum_lsn_state_record
+        publish(
+            self.connection, "ns", "numeric", self._floor_record(999), record_type="delete-floor"
+        )
+        winner = publish(
+            self.connection, "ns", "numeric", self._floor_record(1000), record_type="delete-floor"
+        )
+        self.assertEqual(winner["start_lsn"], "1000")
+
+    def test_concurrent_maximum_lsn_publishers_converge_on_highest(self):
+        values = [150, 90, 120, 80, 110] * 5
+
+        def publish(lsn: int) -> None:
+            lakebase_state.publish_maximum_lsn_state_record(
+                self.connection,
+                "ns",
+                "contended-maximum",
+                self._floor_record(lsn),
+                record_type="delete-floor",
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=25) as pool:
+            list(pool.map(publish, values))
+
+        self.assertEqual(
+            lakebase_state.read_state_record(self.connection, "ns", "contended-maximum")[
+                "start_lsn"
+            ],
+            "150",
+        )
+
+    def test_maximum_lsn_record_refuses_a_different_table(self):
+        publish = lakebase_state.publish_maximum_lsn_state_record
+        publish(
+            self.connection, "ns", "table-max", self._floor_record(90), record_type="delete-floor"
+        )
+        winner = publish(
+            self.connection,
+            "ns",
+            "table-max",
+            self._floor_record(200, table="demo:app.other"),
+            record_type="delete-floor",
+        )
+        # Incompatible identity: the higher LSN is refused and the elected record returned.
+        self.assertEqual(winner, self._floor_record(90))
+
+    def test_maximum_lsn_record_adopts_the_schema_of_the_higher_boundary(self):
+        # A resnapshot under a new schema generation must replace the floor wholesale:
+        # the schema generation rides inside the record, not in the key.
+        publish = lakebase_state.publish_maximum_lsn_state_record
+        publish(
+            self.connection, "ns", "schema-max", self._floor_record(90), record_type="delete-floor"
+        )
+        winner = publish(
+            self.connection,
+            "ns",
+            "schema-max",
+            self._floor_record(120, schema_id="successor"),
+            record_type="delete-floor",
+        )
+        self.assertEqual(winner, self._floor_record(120, schema_id="successor"))
 
     def test_vanished_record_raises_rather_than_returning_an_unelected_value(self):
         # Returning the caller's own value here would let two readers disagree

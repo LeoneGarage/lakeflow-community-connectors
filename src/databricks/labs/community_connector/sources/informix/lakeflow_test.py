@@ -5572,73 +5572,6 @@ class LakeflowContractTests(unittest.TestCase):
         )
         self.assertIsNotNone(schema_node)
 
-    def _publish_schema_node(self, connector, table, *, start_lsn):
-        """Publish a schema-node record the way an owning upsert reader does.
-
-        Keyed on the *derived* node id, which is what the delete channel's
-        bootstrap looks up -- distinct from the synthetic schema_id a test
-        checkpoint carries.
-        """
-
-        schema_id = informix_module._schema_node_id(table)
-        connector._publish_immutable_head(
-            connector._immutable_namespace(table, "schema-nodes", schema_id),
-            {
-                "created_at": time.time(),
-                "schema": {
-                    "id": schema_id,
-                    "fingerprint": informix_module._schema_fingerprint(table),
-                    "start_lsn": str(start_lsn),
-                    "table": informix_module._schema_state(table, start_lsn)["table"],
-                },
-            },
-            record_type="schema-node",
-        )
-        return schema_id
-
-    def test_a_future_schema_node_boundary_recovers_from_the_current_lsn(self):
-        # Observed in production: the source's logical log was reinitialized, so
-        # every stored schema-node boundary sat AHEAD of the server's current LSN
-        # (uniqid 6 and 12 against a log reset to 0-4). Declining left 16 delete
-        # channels permanently dead while all of them reported RUNNING, and the
-        # record cannot be repaired -- the node id derives from identity and
-        # fingerprint alone, so a full refresh recomputes the same id and the
-        # write-once head keeps the stale value forever.
-        #
-        # Recover from the server's CURRENT position. Safe precisely here: the
-        # boundary belongs to a previous log incarnation, so nothing in the current
-        # log has been consumed by this channel and starting anywhere in it cannot
-        # skip a readable delete.
-        #
-        # Deliberately not minimum_lsn, which this originally used: that is byte 0 of
-        # the oldest surviving log -- the next one Informix recycles -- so resuming
-        # there decodes whatever table has since reused the space. Observed in
-        # production as a UnicodeDecodeError on 0xf0 inside a foreign row.
-        bridge = FakeBridge()
-        connector = self.connector(bridge)
-        table = Table.parse(_table(), "demo")
-        self._publish_schema_node(connector, table, start_lsn=90)
-
-        # Reinitialize the log underneath it: current LSN drops far below the
-        # recorded boundary, which is exactly what a source restart produced.
-        bridge.now = 5
-        bridge.minimum = 1
-
-        with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
-            boundary, schema_id = connector._schema_node_delete_boundary(table)
-
-        self.assertEqual(boundary, 5, "the delete channel must recover at current_lsn")
-        self.assertNotEqual(
-            boundary, bridge.minimum, "byte 0 of the oldest retained log is not a safe restart"
-        )
-        self.assertEqual(schema_id, informix_module._schema_node_id(table))
-        message = "\n".join(logs.output)
-        self.assertIn("logical log was reinitialized", message)
-        # The operator must learn that pre-reset deletes are gone for good, since
-        # recovering the channel does not recover that window.
-        self.assertIn("cannot be replicated", message)
-        self.assertIn(table.exposed_name, message)
-
     def test_a_checkpoint_from_a_reinitialized_log_fails_instead_of_stalling(self):
         # Observed in production: the source reinitialized its logical log, so a
         # resuming reader's checkpoint named a log file the server no longer has.
@@ -5690,42 +5623,6 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(list(rows), [])
         self.assertEqual(end["commit_lsn"], str(restart), "a benign race was rejected")
-
-    def test_a_stale_schema_node_boundary_still_declines(self):
-        # The retention case must NOT adopt minimum_lsn. Its boundary was once
-        # valid, so deletes committed between it and minimum were readable and
-        # advancing would silently skip them. Only the log-reset case is safe to
-        # recover, so the two branches must stay distinct.
-        bridge = FakeBridge()
-        connector = self.connector(bridge)
-        table = Table.parse(_table(), "demo")
-        self._publish_schema_node(connector, table, start_lsn=10)
-
-        # The boundary has aged out: minimum advanced past it, current is beyond.
-        bridge.minimum = 50
-        bridge.now = 200
-
-        with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
-            boundary, schema_id = connector._schema_node_delete_boundary(table)
-
-        self.assertIsNone(boundary, "an aged-out boundary must not be advanced")
-        self.assertIsNone(schema_id)
-        self.assertIn("precedes the minimum retained", "\n".join(logs.output))
-
-    def test_a_usable_schema_node_boundary_warns_about_nothing(self):
-        # The warning must fire only for the unrecoverable case; a healthy
-        # bootstrap must stay silent so the signal keeps its meaning.
-        bridge = FakeBridge()
-        connector = self.connector(bridge)
-        table = Table.parse(_table(), "demo")
-        self._publish_schema_node(connector, table, start_lsn=90)
-
-        with mock.patch.object(logging.getLogger(informix_module.__name__), "warning") as warned:
-            boundary, schema_id = connector._schema_node_delete_boundary(table)
-
-        self.assertIsNotNone(boundary, "a usable boundary was declined")
-        self.assertIsNotNone(schema_id)
-        warned.assert_not_called()
 
     def test_snapshot_mode_recovery_rejects_new_or_changed_schema(self):
         bridge = FakeBridge()
@@ -6350,6 +6247,125 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(offset["commit_lsn"], "90")
         self.assertEqual(snapshot_bridge.prepared_identities, ["demo:app.orders"])
         self.assertEqual(delete_bridge.prepared_identities, [])
+
+    def test_delete_bootstrap_anchors_at_snapshot_floor_across_restart(self):
+        # A restart (new update scope, same pipeline) publishes a fresh upsert
+        # channel-start at the reader's *resume* position, which is ahead of the
+        # snapshot boundary. A delete flow bootstrapping there would skip before-image
+        # deletes -- e.g. a mutated-primary-key row's old-key delete -- committed between
+        # the snapshot and the resume, orphaning the pre-update rows. The durable
+        # per-pipeline snapshot floor must pull the bootstrap back to the snapshot
+        # boundary the current destination rows were captured at.
+        pid = "11111111-1111-1111-1111-111111111111"
+        scope_snapshot = f"{pid}_@_22222222-2222-2222-2222-222222222222"
+        scope_restart = f"{pid}_@_33333333-3333-3333-3333-333333333333"
+
+        snapshot_connector = self.connector()
+        snapshot_connector.set_registration_scope(scope_snapshot)
+        list(snapshot_connector.read_table("app.orders", {}, {})[0])  # snapshot at now=90
+        table = snapshot_connector._table("app.orders", {})
+        schema_id = snapshot_connector._snapshot_schema_ids[(scope_snapshot, table.identity)]
+        fingerprint = _schema_fingerprint(table)
+
+        # A later update of the same pipeline resumes the upsert reader at 120 -- above
+        # the 90 snapshot -- and publishes that as the new scope's channel-start.
+        restart_connector = self.connector()
+        restart_connector.set_registration_scope(scope_restart)
+        restart_connector._publish_upsert_channel_start(
+            restart_connector._table("app.orders", {}), 120, schema_id, fingerprint, scope_restart
+        )
+
+        _, offset = restart_connector.read_table_deletes("app.orders", {}, {})
+        # Anchored at the snapshot floor (90), NOT the drifted upsert resume (120): the
+        # deletes committed in (90, 120] stay within the delete channel's read range.
+        self.assertEqual(offset["commit_lsn"], "90")
+
+    _FLOOR_PIPELINE = "11111111-1111-1111-1111-111111111111"
+
+    def _drifted_upsert(self, *, pipeline=_FLOOR_PIPELINE, restart_bridge=None):
+        """Snapshot at LSN 90 in one update scope, then a later update of ``pipeline``
+        that resumed its upsert reader at 120 and published that as its channel-start.
+        Returns the restart-scope connector plus the snapshot's schema id/fingerprint."""
+
+        scope_snapshot = f"{self._FLOOR_PIPELINE}_@_22222222-2222-2222-2222-222222222222"
+        scope_restart = f"{pipeline}_@_33333333-3333-3333-3333-333333333333"
+        snapshot_connector = self.connector()
+        snapshot_connector.set_registration_scope(scope_snapshot)
+        list(snapshot_connector.read_table("app.orders", {}, {})[0])  # snapshot at now=90
+        table = snapshot_connector._table("app.orders", {})
+        schema_id = snapshot_connector._snapshot_schema_ids[(scope_snapshot, table.identity)]
+        fingerprint = _schema_fingerprint(table)
+        restart_connector = self.connector(restart_bridge)
+        restart_connector.set_registration_scope(scope_restart)
+        restart_connector._publish_upsert_channel_start(
+            restart_connector._table("app.orders", {}), 120, schema_id, fingerprint, scope_restart
+        )
+        return restart_connector, schema_id, fingerprint
+
+    def test_delete_bootstrap_reports_when_the_floor_pulls_it_back(self):
+        # The re-read can span days of log and lowers the delete shard's shared restart,
+        # so the event log must show both positions.
+        restart_connector, _, _ = self._drifted_upsert()
+        with self.assertLogs(informix_module.__name__, level="INFO") as logs:
+            _, offset = restart_connector.read_table_deletes("app.orders", {}, {})
+        self.assertEqual(offset["commit_lsn"], "90")
+        message = "\n".join(logs.output)
+        self.assertIn("snapshot floor 90", message)
+        self.assertIn("resume position 120", message)
+
+    def test_delete_bootstrap_warns_when_the_floor_has_aged_below_retention(self):
+        # The floor (90) has fallen out of the retained log (minimum 100): the deletes
+        # between it and the resume position are unrecoverable, so the bootstrap uses
+        # the resume position and says so instead of skipping them silently.
+        bridge = FakeBridge()
+        bridge.minimum, bridge.now = 100, 200
+        restart_connector, _, _ = self._drifted_upsert(restart_bridge=bridge)
+        with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
+            _, offset = restart_connector.read_table_deletes("app.orders", {}, {})
+        self.assertEqual(offset["commit_lsn"], "120")
+        message = "\n".join(logs.output)
+        self.assertIn("floor 90", message)
+        self.assertIn("precedes the minimum retained LSN 100", message)
+        self.assertIn("resume position 120", message)
+
+    def test_delete_bootstrap_ignores_another_pipelines_floor(self):
+        # Concurrent full refreshes of one table land on different destinations at
+        # different snapshot LSNs; a floor is per pipeline and never crosses over.
+        other = "99999999-9999-9999-9999-999999999999"
+        restart_connector, _, _ = self._drifted_upsert(pipeline=other)
+        _, offset = restart_connector.read_table_deletes("app.orders", {}, {})
+        self.assertEqual(offset["commit_lsn"], "120")
+
+    def test_delete_bootstrap_warns_when_the_floor_belongs_to_an_earlier_schema(self):
+        # A floor captured under a superseded schema generation cannot seed a bootstrap
+        # offset that names the current layout; the resume position is used and the
+        # skipped range is reported rather than silently dropped.
+        restart_connector, schema_id, _ = self._drifted_upsert()
+        table = restart_connector._table("app.orders", {})
+        stale_generation = "f" * 32
+        restart_connector._publish_delete_snapshot_floor(
+            table, stale_generation, 95, restart_connector._pipeline_scope()
+        )
+        with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
+            _, offset = restart_connector.read_table_deletes("app.orders", {}, {})
+        self.assertEqual(offset["commit_lsn"], "120")
+        message = "\n".join(logs.output)
+        self.assertIn(f"generation {stale_generation}", message)
+        self.assertIn(f"now runs generation {schema_id}", message)
+
+    def test_delete_snapshot_floor_only_moves_forward(self):
+        # A later resnapshot advances the floor; an older or replayed publish cannot
+        # lower it, so a stale writer can never pull a bootstrap below the rows the
+        # destination actually holds.
+        connector = self.connector()
+        table = connector._table("app.orders", {})
+        schema_id, scope = "a" * 32, connector._pipeline_scope()
+        fingerprint = _schema_fingerprint(table)
+        for lsn, expected in ((90, 90), (120, 120), (100, 120)):
+            connector._publish_delete_snapshot_floor(table, schema_id, lsn, scope)
+            self.assertEqual(
+                connector._read_delete_snapshot_floor(table, schema_id, fingerprint), expected, lsn
+            )
 
     def test_delete_reader_keeps_connection_maintenance_cleanup_enabled(self):
         connector = self.connector(FakeBridge())

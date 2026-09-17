@@ -23,17 +23,23 @@ first use, so no shared directory has to be prepared; the only Volume needed is
 `snapshot.staging.location`, for snapshot page payloads.
 
 A delete reader that has no offset of its own is bootstrapping, which is exactly the
-state a **full refresh** produces. It prefers the record published by *this* update and
-waits several reads for it, only then falling back to the scope-independent
-`schema-nodes` record. That fallback is necessary — an upsert reader that resumes a
-checkpoint publishes no scoped record, so without it the delete channel would stall from
-the second update onward — but `schema-nodes` is keyed by table identity and schema
-fingerprint alone, so it survives every update and its `start_lsn` can belong to a
-**previous logical-log incarnation**. If the source's logical log is reinitialized (a
-server rebuild, `oninit -iy`), a stale boundary naming a higher `uniqid` than the server
-has reached is detected and the channel restarts from the server's current LSN. Deletes
-committed before the reinitialization are no longer in the log and cannot be
-replicated — run a full refresh if the destination must match the source exactly.
+state a **full refresh** produces. It waits for the record *this* update's upsert reader
+publishes: the boundary of a fresh snapshot, or — for an upsert reader that *resumed* a
+checkpoint — its resume position, which it republishes in every update so the wait is
+bounded. A resume position can sit well past the snapshot the destination rows were
+captured at, and bootstrapping there would skip every delete committed in between
+(including the old-key delete of a primary-key change). The upsert reader therefore
+also records a durable, per-pipeline **delete floor** — the snapshot boundary, keyed by
+table and pipeline id so it survives update-scope cleanup, and moved forward only by a
+later resnapshot — and a bootstrapping delete reader anchors at the lower of the two,
+re-reading a range no delete checkpoint has consumed (idempotent for the target). A
+floor that has aged out of the retained logical log, or that was captured under an
+earlier schema generation, is reported in the event log and the resume position is used
+instead; the deletes between the two can then no longer be replicated — run a full
+refresh if the destination must match the source exactly. If the source's logical log
+is reinitialized (a server rebuild, `oninit -iy`), a boundary naming a higher `uniqid`
+than the server has reached makes the delete channel wait for a new snapshot generation
+rather than start from an unrelated position.
 
 ## Setup
 
@@ -1088,7 +1094,7 @@ This changes Lakeflow Auto CDC ordering and deduplication to `updated_at`; it do
 
 Connection capacity slots, backlog hints, the capacity limit, and every immutable
 per-table state record (schema nodes, initialization, schemas, trigger scopes,
-snapshot manifests) live in a Lakebase Autoscaling Postgres endpoint. Snapshot
+snapshot manifests, delete floors) live in a Lakebase Autoscaling Postgres endpoint. Snapshot
 page *payloads* remain on the Volume named by `snapshot.staging.location`, because
 they are large gzip blobs that suit object storage; nothing else uses a Volume.
 

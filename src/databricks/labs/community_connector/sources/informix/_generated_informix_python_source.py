@@ -3170,6 +3170,25 @@ def register_lakeflow_source(spark):
     """
 
 
+    # Scope-independent counterpart of the minimum publisher: converge one key on the
+    # *highest* start_lsn, and match on table alone (no scope) because the record is
+    # shared across every update scope for the table. Used for the delete-bootstrap
+    # snapshot floor, which must move forward only when a resnapshot repopulates the
+    # destination as-of a later boundary.
+    _PUBLISH_MAXIMUM_LSN_RECORD = """
+    INSERT INTO state_records (namespace, record_key, record, record_type)
+    VALUES (%(namespace)s, %(record_key)s, %(record)s::jsonb, %(record_type)s)
+    ON CONFLICT (namespace, record_key) DO UPDATE
+    SET record = EXCLUDED.record
+    WHERE state_records.record_type = EXCLUDED.record_type
+      AND state_records.record->>'format_version' = EXCLUDED.record->>'format_version'
+      AND state_records.record->>'table' = EXCLUDED.record->>'table'
+      AND (state_records.record->>'start_lsn')::numeric
+          < (EXCLUDED.record->>'start_lsn')::numeric
+    RETURNING record
+    """
+
+
     # Resolved once and cached, but in a dict mutated in place -- never a bare module
     # global rebound via ``global``. The single-file merged deployment nests this whole
     # module inside a function, turning module globals into that function's locals, so a
@@ -3284,6 +3303,44 @@ def register_lakeflow_source(spark):
         if row is None:
             raise LakebaseStateError(
                 f"state record {namespace}/{record_key} vanished during minimum-LSN publication"
+            )
+        return _as_dict(row[0])
+
+
+    def publish_maximum_lsn_state_record(
+        connection: Any,
+        namespace: str,
+        record_key: str,
+        record: dict[str, Any],
+        *,
+        record_type: str,
+    ) -> dict[str, Any]:
+        """Atomically publish the highest compatible ``start_lsn`` for one key.
+
+        The scope-independent counterpart of :func:`publish_minimum_lsn_state_record`,
+        used for the delete-bootstrap snapshot floor: the floor must advance only when a
+        resnapshot repopulates the destination as-of a later boundary, and stay put
+        otherwise. PostgreSQL serializes the conflict update so concurrent publishers
+        converge on the maximum.
+        """
+
+        payload = json.dumps(record, sort_keys=True)
+        parameters = {
+            "namespace": namespace,
+            "record_key": record_key,
+            "record": payload,
+            "record_type": record_type,
+        }
+        with connection.cursor() as cursor:
+            cursor.execute(_PUBLISH_MAXIMUM_LSN_RECORD, parameters)
+            row = cursor.fetchone()
+            if row is None:
+                cursor.execute(_SELECT_RECORD, parameters)
+                row = cursor.fetchone()
+        connection.commit()
+        if row is None:
+            raise LakebaseStateError(
+                f"state record {namespace}/{record_key} vanished during maximum-LSN publication"
             )
         return _as_dict(row[0])
 
@@ -5948,20 +6005,13 @@ def register_lakeflow_source(spark):
     # served in between are immutable as-of snapshot_lsn, so serving a few extra before
     # an abort is harmless.
     _SNAPSHOT_SCHEMA_REFRESH_INTERVAL_SECONDS = 60
-    # Bootstrap reads a delete reader spends waiting for *this* update's scoped
-    # initialization record before it will consider the scope-independent schema node.
-    #
-    # The scoped record is authoritative: it was published by this update against the
-    # current logical log. The schema node is keyed by table identity and schema
-    # fingerprint alone, so it survives every update and its start_lsn may belong to a
-    # previous log incarnation -- a stale uniqid-22 boundary against a reinitialized log
-    # that had only reached uniqid 10 is what sent a delete reader to byte 0 of the oldest
-    # retained log, where it decoded another table's row as its own.
-    #
-    # Sized to cover the window in which the owning upsert reader publishes: it enables
-    # full-row logging, captures one LSN, and publishes before taking its snapshot, so a
-    # handful of microbatch intervals is ample. Too low reintroduces the race; too high
-    # delays recovery of the resumed-upsert case the fallback exists for.
+    # Bootstrap deferrals a delete reader records before its advisory offset stops
+    # changing (see _schema_node_fallback_offset). The upsert reader publishes this
+    # update's channel-start before taking its snapshot -- it enables full-row logging,
+    # captures one LSN, and publishes -- and a resumed upsert reader republishes its
+    # resume position on its first stream read, so a handful of microbatch intervals
+    # covers the window in which the delete reader would otherwise find nothing. The
+    # counter is persisted in offsets under its historical name.
     _SCHEMA_NODE_FALLBACK_RETRIES = 5
     _HEAD_LEASE_SECONDS = 120.0
     _DEFAULT_MAX_CONCURRENT_CONNECTIONS = 16
@@ -12653,44 +12703,18 @@ def register_lakeflow_source(spark):
             return _option_bool(self.options, _TABLE_MIGRATION_OPTION, False)
 
         @staticmethod
-        def _schema_node_fallback_exhausted(start_offset: dict[str, Any]) -> bool:
-            """Report whether the scope-independent schema-node fallback may be used yet.
-
-            A delete reader with no offset at all is bootstrapping, which is exactly the
-            state a **full refresh** produces: Lakeflow discards the checkpoint, so the
-            first read of every flow arrives with ``start_offset`` empty. In that state the
-            owning upsert reader is concurrently publishing this update's scoped
-            ``initialization`` record, and the delete reader will normally find it within a
-            few retries.
-
-            The schema-node fallback exists for a different situation -- an upsert reader
-            that *resumed* a checkpoint publishes no scoped record at all, so from the
-            second update onward the delete channel would stall forever without it. But
-            ``schema-nodes`` is keyed by table identity and schema fingerprint alone, so it
-            is never scope-cleaned and its ``start_lsn`` can belong to a **previous log
-            incarnation**: observed in production as a boundary at uniqid 22 while the
-            source's reinitialized log had only reached uniqid 10. Taking that stale
-            boundary during a refresh is how the delete channel ended up resuming at byte 0
-            of the oldest retained log and decoding another table's row as its own.
-
-            So the fallback is deferred rather than removed: prefer this update's fresh
-            record for a bounded number of retries, and only consult the schema node once
-            waiting has demonstrably not produced one. The scoped record is authoritative
-            because it was published by this update against the current log; the schema node
-            is a last resort whose age cannot be verified.
-            """
-
-            return _schema_node_fallback_retry_count(start_offset) >= _SCHEMA_NODE_FALLBACK_RETRIES
-
-        @staticmethod
         def _schema_node_fallback_offset(start_offset: dict[str, Any]) -> dict[str, Any]:
-            """Carry the bootstrap retry count so the fallback eventually becomes eligible.
+            """Carry the bootstrap deferral count on an advisory (non-positional) offset.
 
-            Advisory and non-positional, like the other retry counters: it rides an offset
-            that has no position at all (bootstrap returns an empty offset), so it cannot
-            move a checkpoint. Without it every retry would look like the first and the
-            fallback would never be reached, permanently stalling the resumed-upsert case
-            this defers rather than removes.
+            A delete reader with no offset waits for the upsert reader to publish this
+            update's channel-start and yields an empty advisory batch meanwhile. The count
+            saturates at ``_SCHEMA_NODE_FALLBACK_RETRIES``: past it the returned offset
+            stops changing, which is how a replay (``_replay_between_offsets``) recognises
+            "still waiting for the upsert publication" and waits in place rather than
+            treating the unchanged offset as a failed replay. It rides an offset that has no
+            position at all, so it can never move a checkpoint. The field name is historical
+            -- it once gated a scope-independent schema-node fallback that never became part
+            of the bootstrap -- and is kept for checkpoint compatibility.
             """
 
             count = _schema_node_fallback_retry_count(start_offset)
@@ -12781,31 +12805,74 @@ def register_lakeflow_source(spark):
                         f"Informix upsert/delete bootstrap schema mismatch for "
                         f"'{table.exposed_name}'"
                     )
+                # The upsert channel-start records the upsert reader's *resume* position
+                # for the current scope, which the restart/replay cycles push forward past
+                # the snapshot boundary. Bootstrapping a delete flow there skips before-image
+                # deletes for rows the snapshot already wrote -- notably a mutated-primary-key
+                # row's old-key delete, which orphans the pre-update version permanently.
+                # Anchor instead at the durable snapshot floor for this pipeline when one is
+                # recorded: it is the LSN the current destination rows were captured at, is
+                # never above the upsert resume LSN, and -- because apply_as_deletes is
+                # idempotent (ordered by sequence_by) -- a lower start only ever re-reads, it
+                # cannot remove a newer row or apply a delete twice. This is a bootstrap-only
+                # cost; once the delete flow checkpoints, it resumes from its own cursor.
                 minimum = self._bridge.minimum_lsn()
-                if high_water < minimum:
+                floor = self._read_delete_snapshot_floor(table, schema_id, fingerprint)
+                bootstrap_lsn = high_water
+                if floor is not None and floor < minimum:
+                    # The floor has aged below the retained log, so the upsert channel-start
+                    # is the only boundary left. Deletes committed between the two are gone
+                    # from the source and cannot be replicated: say so, loudly, rather than
+                    # bootstrapping ahead of them in silence.
                     logging.getLogger(__name__).warning(
-                        "Informix upsert start boundary %s for '%s' precedes the minimum "
-                        "retained LSN %s; the delete channel is waiting for a resnapshot",
+                        "Informix delete snapshot floor %s for '%s' precedes the minimum retained "
+                        "LSN %s; bootstrapping the delete channel at the upsert resume position "
+                        "%s instead, so deletes committed between the floor and it can no longer "
+                        "be replicated. Run a full refresh if the destination must match the "
+                        "source exactly",
+                        floor,
+                        table.exposed_name,
+                        minimum,
                         high_water,
+                    )
+                elif floor is not None and floor < high_water:
+                    # The range between them was never consumed by a delete checkpoint, so it
+                    # is re-read from the floor. Visible in the event log because it can be
+                    # long (days of log after a stalled bootstrap) and lowers the delete
+                    # shard's shared restart under the sharded daemon.
+                    bootstrap_lsn = floor
+                    logging.getLogger(__name__).info(
+                        "Informix delete channel for '%s' bootstraps at the snapshot floor %s "
+                        "rather than the upsert resume position %s: no delete checkpoint has "
+                        "consumed that range yet, so it is re-read (idempotent for the target)",
+                        table.exposed_name,
+                        floor,
+                        high_water,
+                    )
+                if bootstrap_lsn < minimum:
+                    logging.getLogger(__name__).warning(
+                        "Informix delete bootstrap boundary %s for '%s' precedes the minimum "
+                        "retained LSN %s; the delete channel is waiting for a resnapshot",
+                        bootstrap_lsn,
                         table.exposed_name,
                         minimum,
                     )
                     return iter(()), self._schema_node_fallback_offset(bootstrap_offset)
                 current = self._bridge.current_lsn()
-                if (high_water >> 32) > (current >> 32):
+                if (bootstrap_lsn >> 32) > (current >> 32):
                     logging.getLogger(__name__).warning(
-                        "Informix upsert start boundary %s for '%s' is ahead of the "
+                        "Informix delete bootstrap boundary %s for '%s' is ahead of the "
                         "source's current logical log %s; the delete channel is waiting "
                         "for a new snapshot generation",
-                        high_water,
+                        bootstrap_lsn,
                         table.exposed_name,
                         current,
                     )
                     return iter(()), self._schema_node_fallback_offset(bootstrap_offset)
                 return iter(()), _offset(
-                    high_water,
-                    high_water,
-                    high_water,
+                    bootstrap_lsn,
+                    bootstrap_lsn,
+                    bootstrap_lsn,
                     None,
                     "stream",
                     table,
@@ -16622,6 +16689,97 @@ def register_lakeflow_source(spark):
                 fingerprint,
             )
 
+        @staticmethod
+        def _pipeline_id(scope: str) -> str:
+            """The stable pipeline identity within an update scope.
+
+            A scope is ``<pipeline_id>_@_<update_id>``; the pipeline id is constant across
+            a pipeline's restarts (only the update id changes) yet distinct between
+            pipelines, which is exactly the key the delete-floor needs: it must persist
+            across the restarts that push the upsert resume position forward, without one
+            pipeline's snapshot boundary ever lowering another's (concurrent full refreshes
+            of the same table land on different destinations at different snapshot LSNs).
+            """
+
+            return scope.partition("_@_")[0]
+
+        def _publish_delete_snapshot_floor(
+            self, table: Table, schema_id: str, snapshot_lsn: int, pipeline_scope: str
+        ) -> None:
+            """Record the snapshot boundary a delete flow should bootstrap from.
+
+            Keyed by table and pipeline id, so it outlives update-scope GC and survives
+            restarts while staying isolated per pipeline. The schema generation the snapshot
+            was taken under rides inside the record rather than in the key, so a bootstrap
+            after a schema change can tell that its floor belongs to a superseded layout
+            (and say so) instead of simply not finding one. Forward-moving: a resnapshot
+            repopulates the destination as-of a later ``snapshot_lsn`` and must advance the
+            floor -- under a new schema generation too -- while ordinary polls leave it
+            untouched. The delete channel is idempotent, so a floor that lags a resnapshot in
+            flight only causes a harmless re-read, never a lost or double delete.
+            """
+
+            self._state_op_with_reconnect(
+                lambda: publish_maximum_lsn_state_record(
+                    self._lakebase_connection(),
+                    self._lakebase_state_namespace(),
+                    self._immutable_namespace(table, "delete-floor", self._pipeline_id(pipeline_scope)),
+                    {
+                        "created_at": time.time(),
+                        "fingerprint": _schema_fingerprint(table),
+                        "format_version": _IMMUTABLE_STATE_VERSION,
+                        "record_type": "delete-floor",
+                        "schema_id": schema_id,
+                        "start_lsn": str(snapshot_lsn),
+                        "table": table.native_identity,
+                    },
+                    record_type="delete-floor",
+                ),
+                operation="delete-floor publish",
+            )
+
+        def _read_delete_snapshot_floor(
+            self, table: Table, schema_id: str, fingerprint: str
+        ) -> int | None:
+            """Return the snapshot-boundary floor for a bootstrapping delete flow.
+
+            ``None`` when no compatible floor exists, so the caller keeps its prior behaviour
+            of anchoring at the upsert channel-start: either this pipeline has not published
+            one (no snapshot since the record was introduced), or the floor was captured
+            under an earlier schema generation -- the source was altered after the snapshot
+            and the delete flow never checkpointed. The latter is reported: the bootstrap
+            then starts at the upsert resume position, and the deletes committed between the
+            snapshot and it are not replayed. A bootstrap offset must name the layout it
+            starts under, and carrying a superseded generation across the transition is the
+            upsert channel's job on a checkpoint it owns, not something to improvise here.
+            """
+
+            record = self._read_immutable_head(
+                self._immutable_namespace(
+                    table, "delete-floor", self._pipeline_id(self._pipeline_scope())
+                )
+            )
+            if record is None:
+                return None
+            self._validate_immutable_record_header(record, "delete-floor", table.exposed_name)
+            if record.get("table") != table.native_identity:
+                return None
+            floor = self._immutable_lsn(record, "start_lsn", table.exposed_name)
+            if record.get("schema_id") != schema_id or record.get("fingerprint") != fingerprint:
+                logging.getLogger(__name__).warning(
+                    "Informix delete snapshot floor %s for '%s' was captured under schema "
+                    "generation %s, but the upsert channel now runs generation %s; the delete "
+                    "channel bootstraps at the upsert resume position instead, so deletes "
+                    "committed between that snapshot and the resume position are not replayed. "
+                    "Run a full refresh if the destination must match the source exactly",
+                    floor,
+                    table.exposed_name,
+                    record.get("schema_id"),
+                    schema_id,
+                )
+                return None
+            return floor
+
         def _upsert_channel_start_exists(self, table_name: str, table_options: dict[str, str]) -> bool:
             """Check current-scope delete coordination without opening Informix."""
 
@@ -16889,110 +17047,14 @@ def register_lakeflow_source(spark):
                 _schema_fingerprint(table),
                 pipeline_scope,
             )
-
-        def _schema_node_delete_boundary(self, table: Table) -> tuple[int | None, str | None]:
-            """Return a scope-independent bootstrap boundary for a delete reader.
-
-            ``schema-nodes`` is keyed by schema id alone, so unlike the
-            update-scoped ``initialization`` and ``snapshots`` namespaces it is
-            never removed by ``_cleanup_previous_update_scopes``. The node for the
-            table's current layout is committed before any checkpoint that
-            references it, which makes its ``start_lsn`` a durable position the
-            upsert reader has already validated.
-
-            Returns ``(None, None)`` whenever a usable node is absent so the caller
-            keeps its existing "wait for the upsert reader" behaviour. This runs
-            only on the bootstrap path, never on a checkpointed microbatch.
-            """
-
-            schema_id = _schema_node_id(table)
-            record = self._read_immutable_head(
-                self._immutable_namespace(table, "schema-nodes", schema_id)
-            )
-            if record is None:
-                return None, None
-            self._validate_immutable_record_header(record, "schema-node", table.exposed_name)
-            schema = record.get("schema")
-            if (
-                not isinstance(schema, dict)
-                or schema.get("id") != schema_id
-                or schema.get("fingerprint") != _schema_fingerprint(table)
-                or _table_from_schema_state(schema, table.database).native_identity
-                != table.native_identity
-            ):
-                return None, None
-            boundary = self._immutable_lsn(schema, "start_lsn", table.exposed_name)
-            minimum = self._bridge.minimum_lsn()
-            if boundary < minimum:
-                # The recorded position has aged out of the logical log. Starting
-                # there would fail the retention check in _read_stream, and silently
-                # advancing to `minimum` could skip deletes committed in between, so
-                # decline and let the operator resnapshot.
-                logging.getLogger(__name__).warning(
-                    "Informix schema-node boundary %s for '%s' precedes the minimum retained "
-                    "LSN %s; the delete channel cannot bootstrap from it",
-                    boundary,
-                    table.exposed_name,
-                    minimum,
-                )
-                return None, None
-            current = self._bridge.current_lsn()
-            if boundary > current:
-                # A boundary ahead of the server's current position means the logical
-                # log was reinitialized (observed in production: the log reset to
-                # uniqid 0-4 while stored boundaries sat at uniqid 6 and 12). The
-                # position will not be reached again, so this cannot be waited out.
-                #
-                # Warn rather than decline silently. The retention branch above
-                # already warns for the symmetric case, and without this the delete
-                # channel stalls permanently with no operator-visible signal: the
-                # caller returns an empty offset for Lakeflow to retry, so the flow
-                # reports RUNNING forever while replicating no deletes.
-                #
-                # This record can never be repaired in place: the node id derives from
-                # the table identity and schema fingerprint alone, so a full refresh
-                # recomputes the same id, finds the write-once head already present,
-                # and leaves this start_lsn untouched. Declining would therefore stall
-                # the delete channel until an operator noticed.
-                #
-                # Bootstrap from the server's *current* position, which is safe here in a
-                # way it is NOT safe for the retention branch above. That
-                # branch declines because its boundary was once valid and deletes
-                # committed between it and ``minimum`` were readable, so advancing
-                # would silently skip them. Here the boundary belongs to a previous log
-                # incarnation: nothing in the *current* log has ever been consumed by
-                # this channel, so starting anywhere in it cannot skip a readable delete.
-                #
-                # Deliberately NOT the oldest retained position. minimum_lsn is
-                # MIN(uniqid) << 32 -- byte 0 of the oldest surviving log, which is the
-                # next log Informix recycles. Resuming there decodes whatever table's
-                # rows have since reused that space: observed in production as a
-                # UnicodeDecodeError on 0xf0 partway through a foreign row. current_lsn
-                # has the same "nothing consumed yet" property with none of that
-                # fragility. Re-reading is harmless because the delete channel
-                # is idempotent -- ``apply_as_deletes`` keyed on the primary key and
-                # ordered by ``sequence_by`` drops a delete whose sequence precedes the
-                # row currently holding that key, so a replayed delete can neither
-                # remove a newer row nor apply twice.
-                #
-                # Deletes that existed only in the pre-reset log are unrecoverable by
-                # any reader, so warn: this recovers the channel, it does not recover
-                # that window.
-                logging.getLogger(__name__).warning(
-                    "Informix schema-node boundary %s for '%s' is ahead of the current LSN %s, "
-                    "so the source's logical log was reinitialized. Bootstrapping the delete "
-                    "channel from the current LSN instead (not the oldest retained LSN %s, "
-                    "which is byte 0 of the log Informix recycles next); deletes committed "
-                    "before the reinitialization are no longer in the log and cannot be "
-                    "replicated, so run a full refresh if the destination must match the "
-                    "source exactly.",
-                    boundary,
-                    table.exposed_name,
-                    current,
-                    minimum,
-                )
-                return current, schema_id
-            return boundary, schema_id
+            # Durable floor for a delete flow's bootstrap. The per-scope upsert channel-start
+            # above is GC'd with its update scope and records the upsert *resume* position,
+            # which drifts forward across restarts; this floor is keyed by schema id and
+            # pipeline id so it survives scope cleanup and restarts while staying isolated
+            # per pipeline, and is forward-moving so a later resnapshot advances it. It is the
+            # LSN the current destination rows were captured at -- the correct lower bound for
+            # replaying deletes (see the bootstrap path in _read_table_deletes_attempt).
+            self._publish_delete_snapshot_floor(table, schema_id, snapshot_lsn, pipeline_scope)
 
         def _find_immutable_schema_record(
             self, table: Table, schema_id: str, scope: str
