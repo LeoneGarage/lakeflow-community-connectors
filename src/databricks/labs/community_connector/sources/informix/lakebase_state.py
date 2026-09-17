@@ -2068,6 +2068,25 @@ RETURNING record
 """
 
 
+# Scope-independent counterpart of the minimum publisher: converge one key on the
+# *highest* start_lsn, and match on table alone (no scope) because the record is
+# shared across every update scope for the table. Used for the delete-bootstrap
+# snapshot floor, which must move forward only when a resnapshot repopulates the
+# destination as-of a later boundary.
+_PUBLISH_MAXIMUM_LSN_RECORD = """
+INSERT INTO state_records (namespace, record_key, record, record_type)
+VALUES (%(namespace)s, %(record_key)s, %(record)s::jsonb, %(record_type)s)
+ON CONFLICT (namespace, record_key) DO UPDATE
+SET record = EXCLUDED.record
+WHERE state_records.record_type = EXCLUDED.record_type
+  AND state_records.record->>'format_version' = EXCLUDED.record->>'format_version'
+  AND state_records.record->>'table' = EXCLUDED.record->>'table'
+  AND (state_records.record->>'start_lsn')::numeric
+      < (EXCLUDED.record->>'start_lsn')::numeric
+RETURNING record
+"""
+
+
 # Resolved once and cached, but in a dict mutated in place -- never a bare module
 # global rebound via ``global``. The single-file merged deployment nests this whole
 # module inside a function, turning module globals into that function's locals, so a
@@ -2182,6 +2201,44 @@ def publish_minimum_lsn_state_record(
     if row is None:
         raise LakebaseStateError(
             f"state record {namespace}/{record_key} vanished during minimum-LSN publication"
+        )
+    return _as_dict(row[0])
+
+
+def publish_maximum_lsn_state_record(
+    connection: Any,
+    namespace: str,
+    record_key: str,
+    record: dict[str, Any],
+    *,
+    record_type: str,
+) -> dict[str, Any]:
+    """Atomically publish the highest compatible ``start_lsn`` for one key.
+
+    The scope-independent counterpart of :func:`publish_minimum_lsn_state_record`,
+    used for the delete-bootstrap snapshot floor: the floor must advance only when a
+    resnapshot repopulates the destination as-of a later boundary, and stay put
+    otherwise. PostgreSQL serializes the conflict update so concurrent publishers
+    converge on the maximum.
+    """
+
+    payload = json.dumps(record, sort_keys=True)
+    parameters = {
+        "namespace": namespace,
+        "record_key": record_key,
+        "record": payload,
+        "record_type": record_type,
+    }
+    with connection.cursor() as cursor:
+        cursor.execute(_PUBLISH_MAXIMUM_LSN_RECORD, parameters)
+        row = cursor.fetchone()
+        if row is None:
+            cursor.execute(_SELECT_RECORD, parameters)
+            row = cursor.fetchone()
+    connection.commit()
+    if row is None:
+        raise LakebaseStateError(
+            f"state record {namespace}/{record_key} vanished during maximum-LSN publication"
         )
     return _as_dict(row[0])
 
