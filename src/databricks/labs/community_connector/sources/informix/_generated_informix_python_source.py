@@ -6475,9 +6475,7 @@ def register_lakeflow_source(spark):
         # Such a range advances no Informix position and contains no records to
         # replay. Treat it as empty, while continuing to fail closed if either side
         # identifies a positional CDC range.
-        advisory_only_end = (
-            isinstance(end, dict) and bool(end) and set(end) <= _OFFSET_ADVISORY_FIELDS
-        )
+        advisory_only_end = isinstance(end, dict) and bool(end) and set(end) <= _OFFSET_ADVISORY_FIELDS
         if advisory_only_end and not positional_keys.intersection(start or {}):
             return iter(())
 
@@ -15976,7 +15974,17 @@ def register_lakeflow_source(spark):
             stop_lsn: int | None = None
             trigger_high_water: int | None = None
             trigger_generation: str | None = None
-            if self._trigger_available_now:
+            # A replay reproduces a committed [start, end) range bounded by its end offset
+            # (``replay_stop`` below). It must NOT consult the shared trigger boundary: that
+            # boundary is published per update scope by the upsert (owner) reader, so after a
+            # driver restart a replay -- planned in a fresh scope -- finds no boundary for the
+            # replayed generation, and the delete (non-owner) reader's _shared_trigger_boundary
+            # raises TriggerBoundaryUnavailable, which is fatal inside get_partitions
+            # (planPartitions has no latestOffset retry). The replay's own committed end LSN is
+            # the correct stop and is applied below, so skip the live handshake while replaying.
+            # A normal (non-replay) read has no replay stop and takes the boundary as before.
+            replay_stop = self._replay_stop_lsn(options)
+            if self._trigger_available_now and replay_stop is None:
                 stop_lsn, trigger_generation = self._shared_trigger_boundary(
                     table,
                     checkpoint,
@@ -16000,7 +16008,7 @@ def register_lakeflow_source(spark):
             # its source rather than detecting it afterwards, which is all a comparison
             # could do -- and failing there just turns lost rows into a retry loop,
             # because the next attempt is no more reproducible than the last.
-            replay_stop = self._replay_stop_lsn(options)
+            # (``replay_stop`` was resolved above, before the trigger-boundary block.)
             if replay_stop is not None:
                 stop_lsn = replay_stop if stop_lsn is None else min(stop_lsn, replay_stop)
                 # The committed range may hold more rows than a normal batch admits, and
