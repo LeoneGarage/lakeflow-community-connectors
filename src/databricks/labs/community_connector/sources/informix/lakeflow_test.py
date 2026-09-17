@@ -7865,6 +7865,33 @@ class LakeflowContractTests(unittest.TestCase):
         ):
             connector.read_table_deletes("app.orders", checkpoint, options)
 
+    def test_a_delete_replay_under_available_now_bypasses_the_trigger_boundary(self):
+        """Regression surfaced by stop/restart cycling on tw070.
+
+        A delete-flow replay after a driver restart must NOT consult the shared trigger
+        boundary. That boundary is published per update scope by the upsert (owner)
+        reader; a replay planned in a fresh scope finds none for the replayed generation,
+        so _shared_trigger_boundary(owner=False) raises TriggerBoundaryUnavailable --
+        fatal inside get_partitions (planPartitions has no latestOffset retry). The
+        replay is bounded by its own committed end LSN, so it must complete without the
+        live handshake. Patch the boundary to raise and assert the replay never calls it.
+        """
+
+        connector = self.connector(FakeBridge())
+        connector.prepare_for_trigger_available_now()
+        checkpoint = _stream_offset()
+        # Replaying [checkpoint, checkpoint): the committed end equals the start, so the
+        # bounded range is empty. The replay must still succeed and read no rows.
+        options = {informix_module._REPLAY_STOP_LSN_OPTION: checkpoint["commit_lsn"]}
+        with mock.patch.object(
+            connector,
+            "_shared_trigger_boundary",
+            side_effect=TriggerBoundaryUnavailable("boundary not published in this scope"),
+        ) as boundary:
+            rows, _ = connector.read_table_deletes("app.orders", checkpoint, options)
+            self.assertEqual(list(rows), [])
+        boundary.assert_not_called()
+
     def test_a_caught_up_contended_replay_does_not_fail(self):
         """The regression that took production down twice.
 
