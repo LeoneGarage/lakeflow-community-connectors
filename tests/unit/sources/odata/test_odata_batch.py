@@ -474,7 +474,7 @@ def test_batch_too_many_parts_shrinks_and_records_size():
 
 @responses.activate
 def test_batch_too_many_parts_still_shrinks_with_retry_extra_errors_400():
-    """PR #280 review: ``retry_extra_errors="400"`` must NOT swallow the $batch
+    """``retry_extra_errors="400"`` must NOT swallow the $batch
     envelope's "too many parts" 400. That 400 is the adaptive-shrink trigger —
     if the extra-retry rule applied to the POST, the oversized payload would be
     re-sent to exhaustion and hard-fail instead of shrinking. The rule only
@@ -499,7 +499,7 @@ def test_batch_too_many_parts_still_shrinks_with_retry_extra_errors_400():
 
 @responses.activate
 def test_batch_probe_403_with_retry_extra_errors_records_no_verdict():
-    """PR #280 review: with ``retry_extra_errors="403"`` the $batch capability
+    """With ``retry_extra_errors="403"`` the $batch capability
     probe must still see a 403 as a transient auth failure (PermissionError,
     swallowed → no verdict), not as a returned 403 response it would read as a
     definitive ``batch_ok=False`` and cache — pinning every worker to the slow

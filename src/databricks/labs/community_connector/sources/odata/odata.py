@@ -520,7 +520,7 @@ def _parse_retry_extra_errors(raw: str | None) -> list[tuple[int, str | None]]:
       body. A bare int in the array is a code with no signature. Rules are
       OR-ed. Example (the two Hexagon 400 shapes, matched narrowly)::
 
-        [{"code": 400, "signature": "context url"},
+        [{"code": 400, "signature": "context uri"},
          {"code": 400, "signature": "specified argument was out of the range"}]
 
     Empty/unset → ``[]`` (no extra retries; 400/403 stay terminal). Codes
@@ -3338,8 +3338,20 @@ class ODataLakeflowConnect(
             params.append(f"$orderby={order_by}")
         return "&".join(params)
 
-    def _fetch_pages(self, url: str, edm_types: dict[str, str] | None = None) -> Iterator[dict]:
+    def _fetch_pages(
+        self,
+        url: str,
+        edm_types: dict[str, str] | None = None,
+        *,
+        extra_retry: bool = True,
+    ) -> Iterator[dict]:
         """Walk a collection's pages, yielding raw JSON dicts (no coercion).
+
+        ``extra_retry`` (default on) lets operator-configured
+        ``retry_extra_errors`` apply to these page reads. A capability probe
+        that reads a 4xx as its verdict (e.g. "the server rejects this filter
+        shape") must pass ``extra_retry=False`` so that 4xx still surfaces as
+        an ``HTTPError`` instead of being retried into a ``RuntimeError``.
 
         Thin row-flattening wrapper over :meth:`_fetch_pages_with_links`,
         which handles the pagination strategy (nextlink / keyset / skip /
@@ -3349,7 +3361,7 @@ class ODataLakeflowConnect(
         ``edm_types`` (the collection's declared property types, when the
         caller has them) types the keyset-seek boundary literals.
         """
-        for page_rows, _ in self._fetch_pages_with_links(url, edm_types):
+        for page_rows, _ in self._fetch_pages_with_links(url, edm_types, extra_retry=extra_retry):
             yield from page_rows
 
     def _parse_pagination(self, table_options: dict[str, str] | None) -> str:
@@ -3419,7 +3431,11 @@ class ODataLakeflowConnect(
         return False
 
     def _fetch_pages_with_links(
-        self, url: str, edm_types: dict[str, str] | None = None
+        self,
+        url: str,
+        edm_types: dict[str, str] | None = None,
+        *,
+        extra_retry: bool = True,
     ) -> Iterator[tuple[list[dict], str | None]]:
         """Page-aware fetch: yields ``(page_rows, next_url)`` per response,
         where ``next_url`` resumes the next page (``None`` at the end).
@@ -3443,7 +3459,9 @@ class ODataLakeflowConnect(
         """
         mode = getattr(self, "_pagination", "nextlink")
         if mode != "nextlink":
-            yield from self._client_paginate_pages(url, mode, edm_types)
+            yield from self._client_paginate_pages(
+                url, mode, edm_types, extra_retry=extra_retry
+            )
             return
         session = self._get_session()
         next_url: str | None = url
@@ -3458,7 +3476,7 @@ class ODataLakeflowConnect(
         while next_url:
             if self._page_url_cycled(cycle, next_url, "nextlink"):
                 return
-            resp, payload = self._fetch_page_payload(session, next_url)
+            resp, payload = self._fetch_page_payload(session, next_url, extra_retry=extra_retry)
             raw_items = payload.get("value") or []  # `or`: tolerate a spec-invalid null
             page_rows = [
                 {k: v for k, v in item.items() if not k.startswith("@odata.")} for item in raw_items
@@ -3550,7 +3568,12 @@ class ODataLakeflowConnect(
         return ok
 
     def _client_paginate_pages(
-        self, url: str, mode: str, edm_types: dict[str, str] | None = None
+        self,
+        url: str,
+        mode: str,
+        edm_types: dict[str, str] | None = None,
+        *,
+        extra_retry: bool = True,
     ) -> Iterator[tuple[list[dict], str | None]]:
         """Client-driven pagination for servers that don't (always) emit
         ``@odata.nextLink``. Yields ``(page_rows, next_url)`` like
@@ -3623,7 +3646,7 @@ class ODataLakeflowConnect(
         while cur_url is not None:
             if self._page_url_cycled(cycle, cur_url, mode):
                 return
-            resp, payload = self._fetch_page_payload(session, cur_url)
+            resp, payload = self._fetch_page_payload(session, cur_url, extra_retry=extra_retry)
             raw_items = payload.get("value") or []  # `or`: tolerate a spec-invalid null
             page_rows = [
                 {k: v for k, v in item.items() if not k.startswith("@odata.")} for item in raw_items
@@ -3781,7 +3804,7 @@ class ODataLakeflowConnect(
         return urljoin(request_url, raw_next)
 
     def _fetch_page_payload(
-        self, session: requests.Session, url: str
+        self, session: requests.Session, url: str, *, extra_retry: bool = True
     ) -> tuple[requests.Response, dict]:
         """GET one page + decode JSON, retrying on truncated/malformed
         response bodies.
@@ -3804,9 +3827,11 @@ class ODataLakeflowConnect(
         url = _pg_strip_query(url, "__pgbase")
         attempts = self.max_retries + 1
         for attempt in range(attempts):
-            # The one caller that opts into ``retry_extra_errors``: plain
-            # page reads, where retrying a spurious 4xx is safe.
-            resp = self._http_get(session, url, extra_retry=True)
+            # The page-read path is where ``retry_extra_errors`` applies;
+            # ``extra_retry`` is threaded down from ``_fetch_pages`` /
+            # ``_fetch_one_expand_page`` so a capability probe that reads a
+            # 4xx as its verdict can switch it off.
+            resp = self._http_get(session, url, extra_retry=extra_retry)
             _raise_for_status_with_body(resp, url)
             try:
                 return resp, _decode_json_with_body(resp, url)

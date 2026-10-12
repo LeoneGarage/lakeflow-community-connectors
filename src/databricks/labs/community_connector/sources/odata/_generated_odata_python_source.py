@@ -3422,7 +3422,12 @@ def register_lakeflow_source(spark):
                     next_url += f"&$orderby={lp_order}"
                 while next_url:
                     try:
-                        lp_rows, next_url = self._fetch_one_expand_page(next_url, lp_types)
+                        # Probe fetches skip ``retry_extra_errors`` (as do the
+                        # reference and probe-shape fetches below): a 4xx here is
+                        # capability evidence, not a page to retry.
+                        lp_rows, next_url = self._fetch_one_expand_page(
+                            next_url, lp_types, extra_retry=False
+                        )
                     except Exception as exc:  # enumeration fetch failed — no verdict
                         raise _CursorProbePreflightUnavailable(str(exc)) from exc
                     for lp_row in lp_rows:
@@ -3470,7 +3475,8 @@ def register_lakeflow_source(spark):
             # Trusted reference: direct-navigation ordering on the leaf collection.
             try:
                 direct_rows, _ = self._fetch_one_expand_page(
-                    f"{leaf_base}?$orderby={cursor_field} desc&$top=2&$select={cursor_field}"
+                    f"{leaf_base}?$orderby={cursor_field} desc&$top=2&$select={cursor_field}",
+                    extra_retry=False,
                 )
             except Exception as exc:  # reference fetch failed — no verdict either way
                 raise _CursorProbePreflightUnavailable(str(exc)) from exc
@@ -3494,7 +3500,11 @@ def register_lakeflow_source(spark):
                 f"&$expand={leaf_nav}($orderby={cursor_field} desc;$top=1;$select={cursor_field})"
             )
             try:
-                exp_rows, _ = self._fetch_one_expand_page(expand_url)
+                # ``extra_retry=False``: the 400 below IS the verdict. Under a
+                # bare ``retry_extra_errors="400"`` it would otherwise be retried
+                # into a RuntimeError, land in the no-verdict branch, and re-probe
+                # (with a full backoff) every batch.
+                exp_rows, _ = self._fetch_one_expand_page(expand_url, extra_retry=False)
             except requests.HTTPError:  # server REJECTED the nested-$expand probe shape
                 # e.g. Hexagon Smart API 400s on inner $orderby/$top/$select rather
                 # than accepting it (or silently mis-ordering). An immediate
@@ -5304,7 +5314,11 @@ def register_lakeflow_source(spark):
             return None
 
         def _fetch_one_expand_page(
-            self, url: str, edm_types: dict[str, str] | None = None
+            self,
+            url: str,
+            edm_types: dict[str, str] | None = None,
+            *,
+            extra_retry: bool = True,
         ) -> tuple[list[dict], str | None]:
             """One HTTP GET; returns ``(page_rows, next_url)``. Thin wrapper
             over :meth:`_fetch_pages_with_links` that consumes a single
@@ -5336,7 +5350,9 @@ def register_lakeflow_source(spark):
             — and a repeated row is deduped at the destination by ``apply_changes``'
             MERGE on the primary key (a harmless duplicate, vs. the data loss a
             short-page stop causes)."""
-            for page_rows, page_next_url in self._fetch_pages_with_links(url, edm_types):
+            for page_rows, page_next_url in self._fetch_pages_with_links(
+                url, edm_types, extra_retry=extra_retry
+            ):
                 return page_rows, (None if page_next_url == url else page_next_url)
             return [], None
 
@@ -7690,7 +7706,10 @@ def register_lakeflow_source(spark):
 
             def _first_value(extra_filter, use_order_by=order_by):
                 url = self._build_url(top_set, opts, extra_filter=extra_filter, order_by=use_order_by)
-                for row in self._fetch_pages(url):
+                # ``extra_retry=False``: ``_probe_max`` falls back on a 400 (a
+                # backend rejecting ``ne null``); ``retry_extra_errors`` must not
+                # turn that 400 into a RuntimeError the fallback can't catch.
+                for row in self._fetch_pages(url, extra_retry=False):
                     value = row.get(cursor_field)
                     if value is not None:
                         return value
@@ -7830,7 +7849,9 @@ def register_lakeflow_source(spark):
                 extra_filter=extra,
             )
             try:
-                return next(iter(self._fetch_pages(url)), None) is not None
+                # A probe: skip ``retry_extra_errors`` so a rejected ``eq null``
+                # fails open at once instead of after a full backoff each batch.
+                return next(iter(self._fetch_pages(url, extra_retry=False)), None) is not None
             except (requests.RequestException, RuntimeError):
                 return False
 
@@ -8430,7 +8451,7 @@ def register_lakeflow_source(spark):
           body. A bare int in the array is a code with no signature. Rules are
           OR-ed. Example (the two Hexagon 400 shapes, matched narrowly)::
 
-            [{"code": 400, "signature": "context url"},
+            [{"code": 400, "signature": "context uri"},
              {"code": 400, "signature": "specified argument was out of the range"}]
 
         Empty/unset → ``[]`` (no extra retries; 400/403 stay terminal). Codes
@@ -11248,8 +11269,20 @@ def register_lakeflow_source(spark):
                 params.append(f"$orderby={order_by}")
             return "&".join(params)
 
-        def _fetch_pages(self, url: str, edm_types: dict[str, str] | None = None) -> Iterator[dict]:
+        def _fetch_pages(
+            self,
+            url: str,
+            edm_types: dict[str, str] | None = None,
+            *,
+            extra_retry: bool = True,
+        ) -> Iterator[dict]:
             """Walk a collection's pages, yielding raw JSON dicts (no coercion).
+
+            ``extra_retry`` (default on) lets operator-configured
+            ``retry_extra_errors`` apply to these page reads. A capability probe
+            that reads a 4xx as its verdict (e.g. "the server rejects this filter
+            shape") must pass ``extra_retry=False`` so that 4xx still surfaces as
+            an ``HTTPError`` instead of being retried into a ``RuntimeError``.
 
             Thin row-flattening wrapper over :meth:`_fetch_pages_with_links`,
             which handles the pagination strategy (nextlink / keyset / skip /
@@ -11259,7 +11292,7 @@ def register_lakeflow_source(spark):
             ``edm_types`` (the collection's declared property types, when the
             caller has them) types the keyset-seek boundary literals.
             """
-            for page_rows, _ in self._fetch_pages_with_links(url, edm_types):
+            for page_rows, _ in self._fetch_pages_with_links(url, edm_types, extra_retry=extra_retry):
                 yield from page_rows
 
         def _parse_pagination(self, table_options: dict[str, str] | None) -> str:
@@ -11329,7 +11362,11 @@ def register_lakeflow_source(spark):
             return False
 
         def _fetch_pages_with_links(
-            self, url: str, edm_types: dict[str, str] | None = None
+            self,
+            url: str,
+            edm_types: dict[str, str] | None = None,
+            *,
+            extra_retry: bool = True,
         ) -> Iterator[tuple[list[dict], str | None]]:
             """Page-aware fetch: yields ``(page_rows, next_url)`` per response,
             where ``next_url`` resumes the next page (``None`` at the end).
@@ -11353,7 +11390,9 @@ def register_lakeflow_source(spark):
             """
             mode = getattr(self, "_pagination", "nextlink")
             if mode != "nextlink":
-                yield from self._client_paginate_pages(url, mode, edm_types)
+                yield from self._client_paginate_pages(
+                    url, mode, edm_types, extra_retry=extra_retry
+                )
                 return
             session = self._get_session()
             next_url: str | None = url
@@ -11368,7 +11407,7 @@ def register_lakeflow_source(spark):
             while next_url:
                 if self._page_url_cycled(cycle, next_url, "nextlink"):
                     return
-                resp, payload = self._fetch_page_payload(session, next_url)
+                resp, payload = self._fetch_page_payload(session, next_url, extra_retry=extra_retry)
                 raw_items = payload.get("value") or []  # `or`: tolerate a spec-invalid null
                 page_rows = [
                     {k: v for k, v in item.items() if not k.startswith("@odata.")} for item in raw_items
@@ -11460,7 +11499,12 @@ def register_lakeflow_source(spark):
             return ok
 
         def _client_paginate_pages(
-            self, url: str, mode: str, edm_types: dict[str, str] | None = None
+            self,
+            url: str,
+            mode: str,
+            edm_types: dict[str, str] | None = None,
+            *,
+            extra_retry: bool = True,
         ) -> Iterator[tuple[list[dict], str | None]]:
             """Client-driven pagination for servers that don't (always) emit
             ``@odata.nextLink``. Yields ``(page_rows, next_url)`` like
@@ -11533,7 +11577,7 @@ def register_lakeflow_source(spark):
             while cur_url is not None:
                 if self._page_url_cycled(cycle, cur_url, mode):
                     return
-                resp, payload = self._fetch_page_payload(session, cur_url)
+                resp, payload = self._fetch_page_payload(session, cur_url, extra_retry=extra_retry)
                 raw_items = payload.get("value") or []  # `or`: tolerate a spec-invalid null
                 page_rows = [
                     {k: v for k, v in item.items() if not k.startswith("@odata.")} for item in raw_items
@@ -11691,7 +11735,7 @@ def register_lakeflow_source(spark):
             return urljoin(request_url, raw_next)
 
         def _fetch_page_payload(
-            self, session: requests.Session, url: str
+            self, session: requests.Session, url: str, *, extra_retry: bool = True
         ) -> tuple[requests.Response, dict]:
             """GET one page + decode JSON, retrying on truncated/malformed
             response bodies.
@@ -11714,9 +11758,11 @@ def register_lakeflow_source(spark):
             url = _pg_strip_query(url, "__pgbase")
             attempts = self.max_retries + 1
             for attempt in range(attempts):
-                # The one caller that opts into ``retry_extra_errors``: plain
-                # page reads, where retrying a spurious 4xx is safe.
-                resp = self._http_get(session, url, extra_retry=True)
+                # The page-read path is where ``retry_extra_errors`` applies;
+                # ``extra_retry`` is threaded down from ``_fetch_pages`` /
+                # ``_fetch_one_expand_page`` so a capability probe that reads a
+                # 4xx as its verdict can switch it off.
+                resp = self._http_get(session, url, extra_retry=extra_retry)
                 _raise_for_status_with_body(resp, url)
                 try:
                     return resp, _decode_json_with_body(resp, url)

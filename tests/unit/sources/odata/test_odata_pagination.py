@@ -1374,6 +1374,25 @@ def test_retry_extra_errors_json_signature_matches(monkeypatch):
 
 
 @responses.activate
+def test_retry_extra_errors_second_400_rule_matches_after_first_misses(monkeypatch):
+    """The documented Hexagon config has TWO 400 rules. A body matching only
+    the second rule must still be retried — the rule loop must keep going
+    after the first signature misses, not return False on the first miss."""
+    _mock_metadata()
+    sleeps = _patch_sleep(monkeypatch)
+    responses.add(responses.GET, f"{SERVICE_URL}Customers", json=_ARG_OUT_OF_RANGE_400, status=400)
+    responses.add(responses.GET, f"{SERVICE_URL}Customers", json={"value": [{"Id": 4}]}, status=200)
+    rules = (
+        '[{"code": 400, "signature": "context uri"},'
+        ' {"code": 400, "signature": "specified argument was out of the range"}]'
+    )
+    c = _make({"token": "t", "retry_extra_errors": rules})
+    rows, _ = c.read_table("Customers", None, {})
+    assert [r["Id"] for r in rows] == [4]
+    assert sleeps == [1.0]
+
+
+@responses.activate
 def test_retry_extra_errors_json_signature_no_match_is_terminal(monkeypatch):
     """A signature rule does NOT retry a 400 whose body lacks the signature —
     a genuine client 400 stays terminal even with the option set."""
