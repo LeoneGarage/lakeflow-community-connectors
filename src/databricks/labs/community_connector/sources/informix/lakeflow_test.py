@@ -7510,6 +7510,95 @@ class LakeflowContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no delete channel"):
             connector.read_table_deletes("app.orders", {}, dict(self.APPEND))
 
+    # One committed transaction: an insert followed by a delete of the same row. On the
+    # append path the delete has no key to pair with, so it can only survive as a row.
+    _APPEND_DELETE_CHANGES = [
+        {"op": "BEGIN", "tx_id": 1, "lsn": 100},
+        {"op": "INSERT", "tx_id": 1, "lsn": 101, "row": {"id": 1, "value": "a"}},
+        {"op": "DELETE", "tx_id": 1, "lsn": 102, "row": {"id": 1, "value": "a"}},
+        {"op": "COMMIT", "tx_id": 1, "lsn": 110},
+    ]
+
+    def _append_stream(self, table_options, changes=None, **connection_options):
+        """Bootstrap a keyless append flow at its cdc_only boundary, then stream one
+        batch of ``changes`` through its upsert channel."""
+        connector, bridge = self._keyless_connector(**connection_options)
+        _, offset = connector.read_table("app.orders", {}, table_options)
+        bridge.changes = list(self._APPEND_DELETE_CHANGES if changes is None else changes)
+        rows, _ = connector.read_table("app.orders", offset, table_options)
+        return list(rows)
+
+    @staticmethod
+    def _ops(rows):
+        return [(row["id"], row["value"], row["_informix_op"]) for row in rows]
+
+    def test_an_append_delete_lands_as_a_full_before_image_tombstone(self):
+        rows = self._append_stream({})
+
+        self.assertEqual(self._ops(rows), [(1, "a", "c"), (1, "a", "d")])
+        inserted, tombstone = rows
+        # The tombstone is a complete change-log record -- every source column plus the
+        # same metadata columns as the insert -- not a key-only delete.
+        self.assertEqual(set(tombstone), set(inserted))
+        self.assertEqual(tombstone[CURSOR], _sortable_lsn(102))
+        self.assertEqual(
+            tombstone[informix_module.COMMIT_LSN], inserted[informix_module.COMMIT_LSN]
+        )
+        self.assertEqual(tombstone[informix_module.TX_ID], 1)
+        self.assertIn(informix_module.COMMIT_TIME, tombstone)
+
+    def test_append_delete_tombstones_can_be_switched_off_per_table(self):
+        rows = self._append_stream({"append.delete.tombstones": "false"})
+
+        self.assertEqual(self._ops(rows), [(1, "a", "c")])
+
+    def test_append_delete_tombstones_can_be_switched_off_connection_wide(self):
+        rows = self._append_stream({}, **{"append.delete.tombstones": "false"})
+
+        self.assertEqual(self._ops(rows), [(1, "a", "c")])
+
+    def test_a_table_tombstone_option_overrides_the_connection_setting(self):
+        rows = self._append_stream(
+            {"append.delete.tombstones": "true"}, **{"append.delete.tombstones": "false"}
+        )
+
+        self.assertEqual(self._ops(rows), [(1, "a", "c"), (1, "a", "d")])
+
+    def test_a_keyed_cdc_upsert_channel_never_emits_a_tombstone(self):
+        # The pipeline applies a keyed table's deletes only through the delete flow; a
+        # 'd' row on its upsert view would be merged as an upsert, so the option must
+        # not leak onto the normal CDC path.
+        for option in ({}, {"append.delete.tombstones": "true"}):
+            with self.subTest(option=option):
+                bridge = FakeBridge()  # default app.orders has a primary key
+                bridge.now = 200
+                bridge.changes = list(self._APPEND_DELETE_CHANGES)
+                connector = self.connector(bridge)
+
+                changes, _ = connector.read_table("app.orders", _stream_offset(), option)
+                deletes, _ = connector.read_table_deletes("app.orders", _stream_offset(), option)
+
+                self.assertEqual(self._ops(changes), [(1, "a", "c")])
+                self.assertEqual([(row["id"], row["_informix_op"]) for row in deletes], [(1, "d")])
+
+    def test_an_append_delete_without_a_before_image_fails_clearly(self):
+        changes = [
+            {"op": "BEGIN", "tx_id": 1, "lsn": 100},
+            {"op": "DELETE", "tx_id": 1, "lsn": 101},
+            {"op": "COMMIT", "tx_id": 1, "lsn": 110},
+        ]
+
+        with self.assertRaisesRegex(InformixError, "no before image"):
+            self._append_stream({}, changes=changes)
+
+    def test_a_malformed_tombstone_option_is_rejected(self):
+        connector, _ = self._keyless_connector()
+
+        with self.assertRaisesRegex(ValueError, "append.delete.tombstones"):
+            connector.read_table_metadata("app.orders", {"append.delete.tombstones": "maybe"})
+        with self.assertRaisesRegex(ValueError, "append.delete.tombstones"):
+            self._keyless_connector(**{"append.delete.tombstones": "maybe"})
+
     def test_an_unsupported_append_snapshot_mode_is_rejected(self):
         connector, _ = self._keyless_connector()
         options = dict(self.APPEND, **{"snapshot.mode": "incremental"})

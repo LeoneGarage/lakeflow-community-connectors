@@ -5784,7 +5784,9 @@ def register_lakeflow_source(spark):
     # is orthogonal to snapshot.mode, which the table keeps unchanged throughout.
     _TABLE_MIGRATION_OPTION = "table.migration"
     # Handoff-token channels. Only the upsert channel's offset is parked: append ingestion
-    # has no separate delete channel, and deletes after the boundary surface as append rows.
+    # has no separate delete channel. A DELETE after the boundary reaches the upsert channel,
+    # where it lands as a full-before-image ``d`` tombstone row by default (see
+    # ``append.delete.tombstones``) or is dropped when tombstones are switched off.
     _HANDOFF_CHANNEL_UPSERT = 0
     _HANDOFF_CHANNEL_DELETE = 1
     _DEFAULT_SNAPSHOT_MODE = "incremental"
@@ -5793,10 +5795,14 @@ def register_lakeflow_source(spark):
     # cannot merge -- in practice one without a primary key.
     #
     # Deliberately a connector option rather than something inferred from a missing key.
-    # Append-only is only *correct* for a genuinely insert-only table: an UPDATE at the
-    # source appends a second row and a DELETE appends nothing, leaving the deleted row
-    # present. Nothing in the schema distinguishes an append-only log from a mutable table
-    # that merely lacks a key, so inferring it would silently corrupt the latter.
+    # Append output is a *change log*, not current state: an UPDATE at the source appends
+    # its after-image as a second row (``_informix_op='u'``) and a DELETE appends a
+    # tombstone row carrying the full before-image (``_informix_op='d'``, see
+    # ``append.delete.tombstones`` below). On a keyless table that tombstone is a
+    # change-log record, not an applied delete -- there is no key to pair it with -- so a
+    # consumer that wants current state filters on ``_informix_op``. Nothing in the schema
+    # distinguishes an append-only log from a mutable table that merely lacks a key, so
+    # inferring append from a missing key would silently turn the latter's merge into a log.
     #
     # It cannot be read from ``scd_type`` either, even though the pipeline layer already
     # maps ``scd_type=APPEND_ONLY`` onto an append flow: ``get_table_configuration``
@@ -5811,6 +5817,18 @@ def register_lakeflow_source(spark):
     # append destination. ``true`` forces append for every capturable table; ``false``
     # forces the normal CDC/snapshot path even for a keyless table.
     _APPEND_INGESTION_OPTION = "append.only.ingestion"
+    # Delete tombstones on the append path, on by default. Every CDC session enables
+    # full-row logging before capture, so a DELETE record always carries its full
+    # before-image; the append path emits it as a ``d`` row with the usual cursor /
+    # commit LSN / tx id / commit time columns, keeping the change log lossless (an UPDATE
+    # already lands as a ``u`` row). It costs nothing on a genuinely insert-only table,
+    # which never deletes. Set ``false`` (per table or connection-wide; the table option
+    # wins) only for an archive-style table where retention purges would otherwise append
+    # one tombstone per purged row. It has no effect on a table that is not on the append
+    # path: the keyed upsert channel still skips DELETEs, because the pipeline applies
+    # deletes only through the separate delete flow and would merge a ``d`` row on the
+    # upsert view as an upsert.
+    _APPEND_DELETE_TOMBSTONES_OPTION = "append.delete.tombstones"
     # Sharded daemon-reader CDC, on by default. Set ``cdc.shared.session=false`` to opt out,
     # in which case every CDC-capable table runs its own Informix CDC session per poll -- one
     # connection slot and a full opensess/startcapture/activatesess/endcapture cycle each
@@ -10756,6 +10774,8 @@ def register_lakeflow_source(spark):
             _null_byte_mode(options)
             if _APPEND_INGESTION_OPTION in options:
                 _append_only_value(options[_APPEND_INGESTION_OPTION])
+            if _APPEND_DELETE_TOMBSTONES_OPTION in options:
+                _option_bool(options, _APPEND_DELETE_TOMBSTONES_OPTION, True)
             if int(options.get("cdc.max.records", str(_DEFAULT_CDC_MAX_RECORDS))) > 256:
                 raise ValueError("Option 'cdc.max.records' must be <= 256")
             if int(options.get("cdc.read.bytes", "32000")) > 32767:
@@ -11076,6 +11096,9 @@ def register_lakeflow_source(spark):
                 try:
                     table = self._registration_table(table_name, table_options)
                     _ensure_materializable(table, table_options)
+                    # Only consulted on the append path, but validated for every table so a
+                    # malformed value fails at registration rather than on a later read.
+                    self._append_delete_tombstones(table_options)
                     if self._append_only_table(table, table_options):
                         # Report a cursor even though no primary key is exposed: the
                         # cursor is what makes the framework treat this as an
@@ -12548,6 +12571,19 @@ def register_lakeflow_source(spark):
                 if _APPEND_INGESTION_OPTION in source:
                     return _append_only_value(source[_APPEND_INGESTION_OPTION])
             return "auto"
+
+        def _append_delete_tombstones(self, table_options: dict[str, str]) -> bool:
+            """Resolve ``append.delete.tombstones``; default ``True``.
+
+            ``table_options`` override the connection options, exactly like
+            ``append.only.ingestion``. Only consulted for a table on the append path: it
+            decides whether a source DELETE lands on the upsert channel as a ``d`` row
+            carrying the full before-image, or is dropped.
+            """
+
+            if _APPEND_DELETE_TOMBSTONES_OPTION in table_options:
+                return _option_bool(table_options, _APPEND_DELETE_TOMBSTONES_OPTION, True)
+            return _option_bool(self.options, _APPEND_DELETE_TOMBSTONES_OPTION, True)
 
         def _append_only_table(self, table: Table, table_options: dict[str, str]) -> bool:
             """Report whether this read should use the append-only path.
@@ -16120,6 +16156,17 @@ def register_lakeflow_source(spark):
             # It is the one proof a reader has that work remains for *this* table, so
             # it is what the backlog rank is built from.
             row_budget_reached = False
+            # Delete handling on the upsert channel follows the destination. A keyed table's
+            # upsert view merges every row it receives, so its DELETEs are skipped here and
+            # applied only through the separate delete channel (``deletes=True``). An append
+            # destination lands rows as-is and never reads _informix_op, so a DELETE on the
+            # append path is emitted as a full-before-image ``d`` tombstone unless the
+            # operator switched tombstones off for this table.
+            tombstones = (
+                not deletes
+                and self._append_only_table(table, options)
+                and self._append_delete_tombstones(options)
+            )
             for tx in recovered:
                 if transition_lsn is not None and tx.commit_lsn > transition_lsn:
                     if tx.begin_lsn < transition_lsn:
@@ -16133,7 +16180,7 @@ def register_lakeflow_source(spark):
                 if stop_lsn is not None and tx.commit_lsn > stop_lsn:
                     crossed_trigger_boundary = True
                     break
-                projected = _project_transaction(tx, table, deletes)
+                projected = _project_transaction(tx, table, deletes, tombstones=tombstones)
                 projected = [_coerce_variable_decimal_values(row, table, options) for row in projected]
                 # Never split a transaction.  A single large transaction is
                 # accepted; subsequent complete transactions wait for next poll.
@@ -17968,8 +18015,22 @@ def register_lakeflow_source(spark):
 
 
     def _project_transaction(
-        tx: CommittedTransaction, table: Table, deletes: bool
+        tx: CommittedTransaction, table: Table, deletes: bool, tombstones: bool = False
     ) -> list[dict[str, Any]]:
+        """Project one committed transaction onto one output channel.
+
+        ``deletes`` selects the delete channel: key-only ``d`` rows for DELETEs and for the
+        old key of a key-changing UPDATE. Otherwise this is the upsert channel, which emits
+        INSERT/UPDATE after-images as ``c``/``u``. On the keyed CDC path the upsert channel
+        deliberately skips DELETEs -- the pipeline applies deletes only through the
+        separate delete flow, and a ``d`` row on the upsert view would be merged as an
+        upsert. ``tombstones`` (the append path with ``append.delete.tombstones`` on) adds
+        each DELETE's full before-image as a ``d`` row instead: the append destination
+        lands rows as-is and never reads ``_informix_op``, so the delete stays in the
+        change log rather than vanishing. A key-changing UPDATE on the append path still
+        lands only its after-image as ``u``. TRUNCATE is unrepresentable on either channel.
+        """
+
         output = []
         for record in tx.records:
             if not _record_matches(record, table):
@@ -17988,6 +18049,8 @@ def register_lakeflow_source(spark):
                     output.append(_shape_delete(before, table, record, tx))
             elif op in {"INSERT", "UPDATE"}:
                 output.append(_shape_change(after, record, tx, "u" if op == "UPDATE" else "c"))
+            elif op == "DELETE" and tombstones:
+                output.append(_shape_tombstone(before, table, record, tx))
         return output
 
 
@@ -18021,6 +18084,22 @@ def register_lakeflow_source(spark):
             }
         )
         return result
+
+
+    def _shape_tombstone(row, table, record, tx):
+        """A DELETE's full before-image as an append-path ``d`` row.
+
+        Not :func:`_shape_delete`, which nulls every non-key column and needs a primary
+        key: an append destination has no key to merge on, so the tombstone carries the
+        whole deleted row and is told apart from a live row only by ``_informix_op``.
+        """
+
+        if row is None:
+            raise InformixError(
+                f"CDC delete on append-only table {table.exposed_name} has no before image; "
+                "full-row logging is required to emit a delete tombstone"
+            )
+        return _shape_change(row, record, tx, "d")
 
 
     def _shape_delete(row, table, record, tx):
