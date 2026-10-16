@@ -645,17 +645,41 @@ connection:
         forces append for every capture-capable table, including keyed ones;
         `false` forces the normal CDC/snapshot path, opting a keyless table into
         bounded snapshot-only ingestion.
-        Only correct for a genuinely insert-only table: an UPDATE at the source
-        appends a second row, and a DELETE appends nothing and leaves the deleted
-        row present. Nothing in the schema distinguishes an append-only log from a
-        mutable table that merely lacks a key, so use `false` for mutable keyless
-        tables.
+        Append output is a change log, not current state: an UPDATE at the source
+        appends its after-image as a `u` row, and a DELETE appends a `d` tombstone
+        row carrying the full before-image (see `append.delete.tombstones`). On a
+        keyless table a tombstone is a change-log record, not an applied delete --
+        there is no key to pair it with -- so consumers wanting current state
+        filter on `_informix_op`. Nothing in the schema distinguishes an
+        append-only log from a mutable table that merely lacks a key, so use
+        `false` for a mutable keyless table that needs merge semantics.
         Set `scd_type: APPEND_ONLY` on the same table so the destination appends
         rather than attempting a keyed merge; the connector cannot read scd_type
         itself because the spec parser strips it before options reach the connector.
         A table whose columns Informix cannot capture ignores this and stays
         snapshot-only. There is no delete channel: requesting one for an
         append-only table fails rather than returning empty forever.
+
+    - name: append.delete.tombstones
+      type: string
+      required: false
+      description: >
+        Per-table boolean, also accepted at connection scope (the table option
+        wins); default true. Applies only to a table on the append path
+        (`append.only.ingestion`) and has no effect elsewhere. When true, a source
+        DELETE lands on the upsert channel as a `d` tombstone row carrying the full
+        before-image plus the usual `_informix_change_lsn`, `_informix_commit_lsn`,
+        `_informix_tx_id` and `_informix_commit_time` columns, so the change log is
+        lossless (an UPDATE already lands as a `u` row). Every CDC session enables
+        full-row logging, so the before-image is always available. On a keyless
+        table a tombstone is a change-log record, not an applied delete -- there is
+        no key to pair it with -- so consumers wanting current state filter on
+        `_informix_op`. A genuinely insert-only table never deletes, so the default
+        costs it nothing. Set false for an archive-style table where retention
+        purges would otherwise append one tombstone per purged row; the DELETE is
+        then dropped. A keyed table on the normal CDC path ignores this option:
+        its deletes are applied only through the separate delete flow. Accepts
+        `true`/`false`.
 
     - name: primary.keys
       type: string
@@ -1163,4 +1187,4 @@ connection:
 
 # Exact per-table overrides consumed by the connector. `qualified_source_table` maps a
 # pipeline table to a dynamically discovered exposed name (`owner.table`).
-external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
+external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
