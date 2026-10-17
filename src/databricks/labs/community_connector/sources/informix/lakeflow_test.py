@@ -7581,6 +7581,26 @@ class LakeflowContractTests(unittest.TestCase):
                 self.assertEqual(self._ops(changes), [(1, "a", "c")])
                 self.assertEqual([(row["id"], row["_informix_op"]) for row in deletes], [(1, "d")])
 
+    def test_a_keyed_table_forced_to_append_emits_a_tombstone_on_delete(self):
+        # The gate is the append path, not the key: a keyed table opted into append
+        # (append.only.ingestion=true alongside scd_type APPEND_ONLY) streams through the
+        # same upsert channel, so its DELETE lands as a full-before-image 'd' row too --
+        # key columns included, so a consumer can pair the tombstone with the row it
+        # removes.
+        bridge = FakeBridge()  # default app.orders has a primary key
+        connector = self.connector(bridge, **{"snapshot.mode": "cdc_only"})
+        table_options = dict(self.APPEND)
+
+        _, offset = connector.read_table("app.orders", {}, table_options)
+        bridge.changes = list(self._APPEND_DELETE_CHANGES)
+        rows, _ = connector.read_table("app.orders", offset, table_options)
+        rows = list(rows)
+
+        self.assertEqual(self._ops(rows), [(1, "a", "c"), (1, "a", "d")])
+        inserted, tombstone = rows
+        self.assertEqual(set(tombstone), set(inserted))
+        self.assertEqual(tombstone["id"], 1, "the key column survives on the tombstone")
+
     def test_an_append_delete_without_a_before_image_fails_clearly(self):
         changes = [
             {"op": "BEGIN", "tx_id": 1, "lsn": 100},
