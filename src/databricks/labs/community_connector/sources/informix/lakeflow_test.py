@@ -7581,25 +7581,92 @@ class LakeflowContractTests(unittest.TestCase):
                 self.assertEqual(self._ops(changes), [(1, "a", "c")])
                 self.assertEqual([(row["id"], row["_informix_op"]) for row in deletes], [(1, "d")])
 
+    def _keyed_append_stream(self, changes, table_options=None):
+        """Bootstrap a keyed table forced to append at its cdc_only boundary, then stream
+        one batch of ``changes`` through its upsert channel."""
+        bridge = FakeBridge()  # default app.orders has a primary key
+        connector = self.connector(bridge, **{"snapshot.mode": "cdc_only"})
+        options = {**self.APPEND, **(table_options or {})}
+        _, offset = connector.read_table("app.orders", {}, options)
+        bridge.changes = list(changes)
+        rows, _ = connector.read_table("app.orders", offset, options)
+        return list(rows)
+
+    # One committed transaction: insert id 1, then update it to id 2. The before- and
+    # after-images are separate log records at their own positions, as Informix logs them.
+    _KEY_CHANGE = [
+        {"op": "BEGIN", "tx_id": 1, "lsn": 100},
+        {"op": "INSERT", "tx_id": 1, "lsn": 101, "row": {"id": 1, "value": "a"}},
+        {"op": "BEFORE_UPDATE", "tx_id": 1, "lsn": 102, "row": {"id": 1, "value": "a"}},
+        {"op": "AFTER_UPDATE", "tx_id": 1, "lsn": 103, "row": {"id": 2, "value": "b"}},
+        {"op": "COMMIT", "tx_id": 1, "lsn": 110},
+    ]
+
     def test_a_keyed_table_forced_to_append_emits_a_tombstone_on_delete(self):
         # The gate is the append path, not the key: a keyed table opted into append
         # (append.only.ingestion=true alongside scd_type APPEND_ONLY) streams through the
         # same upsert channel, so its DELETE lands as a full-before-image 'd' row too --
         # key columns included, so a consumer can pair the tombstone with the row it
         # removes.
-        bridge = FakeBridge()  # default app.orders has a primary key
-        connector = self.connector(bridge, **{"snapshot.mode": "cdc_only"})
-        table_options = dict(self.APPEND)
-
-        _, offset = connector.read_table("app.orders", {}, table_options)
-        bridge.changes = list(self._APPEND_DELETE_CHANGES)
-        rows, _ = connector.read_table("app.orders", offset, table_options)
-        rows = list(rows)
+        rows = self._keyed_append_stream(self._APPEND_DELETE_CHANGES)
 
         self.assertEqual(self._ops(rows), [(1, "a", "c"), (1, "a", "d")])
         inserted, tombstone = rows
         self.assertEqual(set(tombstone), set(inserted))
         self.assertEqual(tombstone["id"], 1, "the key column survives on the tombstone")
+
+    def test_a_key_change_on_a_keyed_append_table_tombstones_the_old_key(self):
+        # Updating id 1 to id 2 removes id 1 at the source. Without a tombstone a
+        # consumer taking the latest row per key would keep id 1 alive forever.
+        rows = self._keyed_append_stream(self._KEY_CHANGE)
+
+        self.assertEqual(self._ops(rows), [(1, "a", "c"), (1, "a", "d"), (2, "b", "u")])
+        _, tombstone, updated = rows
+        self.assertEqual(set(tombstone), set(updated), "the tombstone is a full row")
+        # The tombstone is sequenced at the before-image's own log position, strictly
+        # below the after-image's, so ordering by the cursor is unambiguous.
+        self.assertEqual(
+            [row[CURSOR] for row in rows],
+            [_sortable_lsn(101), _sortable_lsn(102), _sortable_lsn(103)],
+        )
+        self.assertLess(tombstone[CURSOR], updated[CURSOR])
+        for column in (informix_module.COMMIT_LSN, informix_module.TX_ID):
+            self.assertEqual(tombstone[column], updated[column])
+
+    def test_a_non_key_update_on_a_keyed_append_table_emits_no_tombstone(self):
+        changes = [dict(record) for record in self._KEY_CHANGE]
+        changes[3]["row"] = {"id": 1, "value": "b"}
+
+        rows = self._keyed_append_stream(changes)
+
+        self.assertEqual(self._ops(rows), [(1, "a", "c"), (1, "b", "u")])
+
+    def test_key_change_tombstones_follow_the_tombstone_option(self):
+        rows = self._keyed_append_stream(self._KEY_CHANGE, {"append.delete.tombstones": "false"})
+
+        self.assertEqual(self._ops(rows), [(1, "a", "c"), (2, "b", "u")])
+
+    def test_a_keyless_append_update_never_emits_a_tombstone(self):
+        # With no key there is nothing to change: an update is only its after-image.
+        rows = self._append_stream({}, changes=self._KEY_CHANGE)
+
+        self.assertEqual(self._ops(rows), [(1, "a", "c"), (2, "b", "u")])
+
+    def test_a_keyed_cdc_upsert_channel_never_tombstones_a_key_change(self):
+        # On the normal CDC path the old key is removed by the delete channel; a 'd' row
+        # on the upsert view would be merged as an upsert.
+        for option in ({}, {"append.delete.tombstones": "true"}):
+            with self.subTest(option=option):
+                bridge = FakeBridge()  # default app.orders has a primary key
+                bridge.now = 200
+                bridge.changes = list(self._KEY_CHANGE)
+                connector = self.connector(bridge)
+
+                changes, _ = connector.read_table("app.orders", _stream_offset(), option)
+                deletes, _ = connector.read_table_deletes("app.orders", _stream_offset(), option)
+
+                self.assertEqual(self._ops(changes), [(1, "a", "c"), (2, "b", "u")])
+                self.assertEqual([(row["id"], row["_informix_op"]) for row in deletes], [(1, "d")])
 
     def test_an_append_delete_without_a_before_image_fails_clearly(self):
         changes = [

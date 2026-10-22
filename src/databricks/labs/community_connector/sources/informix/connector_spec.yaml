@@ -670,8 +670,12 @@ connection:
         DELETE lands on the upsert channel as a `d` tombstone row carrying the full
         before-image plus the usual `_informix_change_lsn`, `_informix_commit_lsn`,
         `_informix_tx_id` and `_informix_commit_time` columns, so the change log is
-        lossless (an UPDATE already lands as a `u` row). Every CDC session enables
-        full-row logging, so the before-image is always available. On a keyless
+        lossless (an UPDATE already lands as a `u` row). On a keyed table forced to
+        append, a key-changing UPDATE also removes the old key, so it lands the old
+        row's before-image as a `d` tombstone ahead of the new key's `u` row, with
+        the before-image's own, strictly lower, `_informix_change_lsn`. Every CDC
+        session enables full-row logging, so the before-image is always available.
+        On a keyless
         table a tombstone is a change-log record, not an applied delete -- there is
         no key to pair it with -- so consumers wanting current state filter on
         `_informix_op`. A genuinely insert-only table never deletes, so the default

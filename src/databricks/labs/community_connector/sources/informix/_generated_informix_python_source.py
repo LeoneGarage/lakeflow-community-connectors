@@ -5786,7 +5786,8 @@ def register_lakeflow_source(spark):
     # Handoff-token channels. Only the upsert channel's offset is parked: append ingestion
     # has no separate delete channel. A DELETE after the boundary reaches the upsert channel,
     # where it lands as a full-before-image ``d`` tombstone row by default (see
-    # ``append.delete.tombstones``) or is dropped when tombstones are switched off.
+    # ``append.delete.tombstones``) or is dropped when tombstones are switched off. The
+    # old key of a key-changing UPDATE on a keyed append table is handled the same way.
     _HANDOFF_CHANNEL_UPSERT = 0
     _HANDOFF_CHANNEL_DELETE = 1
     _DEFAULT_SNAPSHOT_MODE = "incremental"
@@ -5821,7 +5822,10 @@ def register_lakeflow_source(spark):
     # full-row logging before capture, so a DELETE record always carries its full
     # before-image; the append path emits it as a ``d`` row with the usual cursor /
     # commit LSN / tx id / commit time columns, keeping the change log lossless (an UPDATE
-    # already lands as a ``u`` row). It costs nothing on a genuinely insert-only table,
+    # already lands as a ``u`` row). On a keyed table forced to append, a key-changing
+    # UPDATE removes the old key as well, so it also lands its before-image as a ``d`` row,
+    # ahead of the new key's ``u`` row and sequenced at the before-image's own log position.
+    # It costs nothing on a genuinely insert-only table,
     # which never deletes. Set ``false`` (per table or connection-wide; the table option
     # wins) only for an archive-style table where retention purges would otherwise append
     # one tombstone per purged row. It has no effect on a table that is not on the append
@@ -9873,6 +9877,11 @@ def register_lakeflow_source(spark):
                 merged["op"] = "UPDATE"
                 merged["before"] = self.pending_before.get("before", self.pending_before.get("row"))
                 merged["after"] = record.get("after", record.get("row"))
+                # The merged record is sequenced at the after-image. Keep the before-image's
+                # own, strictly earlier, log position too: the append path's old-key
+                # tombstone for a key-changing UPDATE is sequenced there, so it never ties
+                # with the new key's after-image on the cursor.
+                merged["before_lsn"] = _lsn(self.pending_before)
                 self.pending_before = None
                 self.records.append(merged)
                 return
@@ -16161,7 +16170,9 @@ def register_lakeflow_source(spark):
             # applied only through the separate delete channel (``deletes=True``). An append
             # destination lands rows as-is and never reads _informix_op, so a DELETE on the
             # append path is emitted as a full-before-image ``d`` tombstone unless the
-            # operator switched tombstones off for this table.
+            # operator switched tombstones off for this table. So is the old key of a
+            # key-changing UPDATE on a keyed table forced to append. A transaction is never
+            # split across batches, so such a tombstone always ships with its ``u`` row.
             tombstones = (
                 not deletes
                 and self._append_only_table(table, options)
@@ -17923,6 +17934,22 @@ def register_lakeflow_source(spark):
             raise InformixError(f"CDC record has an invalid LSN: {record!r}") from error
 
 
+    def _before_lsn(record: dict[str, Any]) -> int:
+        """The log position of an assembled UPDATE's before-image.
+
+        Set when the transaction assembler pairs BEFORE_UPDATE with AFTER_UPDATE; the
+        merged record's own ``lsn`` is the after-image's position.
+        """
+
+        value = record.get("before_lsn")
+        if value is None:
+            raise InformixError(f"CDC update has no before-image LSN: {record!r}")
+        try:
+            return _strict_lsn(value, "CDC before-image LSN")
+        except ValueError as error:
+            raise InformixError(f"CDC update has an invalid before-image LSN: {record!r}") from error
+
+
     def _tx_id(record: dict[str, Any]) -> int:
         value = record.get("tx_id", record.get("transaction_id"))
         if value is None:
@@ -18027,8 +18054,12 @@ def register_lakeflow_source(spark):
         upsert. ``tombstones`` (the append path with ``append.delete.tombstones`` on) adds
         each DELETE's full before-image as a ``d`` row instead: the append destination
         lands rows as-is and never reads ``_informix_op``, so the delete stays in the
-        change log rather than vanishing. A key-changing UPDATE on the append path still
-        lands only its after-image as ``u``. TRUNCATE is unrepresentable on either channel.
+        change log rather than vanishing. On a keyed table forced onto the append path, a
+        key-changing UPDATE is a delete of the old key too: with ``tombstones`` on it lands
+        the before-image as a ``d`` row ahead of the new key's ``u`` row, sequenced at the
+        before-image's own log position so the two never tie on the cursor. A keyless table
+        has no key to change, so its UPDATEs land only their after-image. TRUNCATE is
+        unrepresentable on either channel.
         """
 
         output = []
@@ -18048,6 +18079,13 @@ def register_lakeflow_source(spark):
                 elif op == "UPDATE" and _key(before, table) != _key(after, table):
                     output.append(_shape_delete(before, table, record, tx))
             elif op in {"INSERT", "UPDATE"}:
+                if (
+                    op == "UPDATE"
+                    and tombstones
+                    and table.primary_keys
+                    and _key(before, table) != _key(after, table)
+                ):
+                    output.append(_shape_tombstone(before, table, record, tx, lsn=_before_lsn(record)))
                 output.append(_shape_change(after, record, tx, "u" if op == "UPDATE" else "c"))
             elif op == "DELETE" and tombstones:
                 output.append(_shape_tombstone(before, table, record, tx))
@@ -18070,13 +18108,15 @@ def register_lakeflow_source(spark):
         return tuple(row.get(pk) for pk in table.primary_keys)
 
 
-    def _shape_change(row, record, tx, op):
+    def _shape_change(row, record, tx, op, *, lsn: int | None = None):
+        """Shape one full-row change. ``lsn`` overrides the record's own cursor position."""
+
         if row is None:
             raise InformixError("CDC upsert has no after image")
         result = _framework_row(row)
         result.update(
             {
-                CURSOR: _sortable_lsn(_lsn(record)),
+                CURSOR: _sortable_lsn(_lsn(record) if lsn is None else lsn),
                 COMMIT_LSN: _sortable_lsn(tx.commit_lsn),
                 TX_ID: tx.tx_id,
                 OP: op,
@@ -18086,12 +18126,14 @@ def register_lakeflow_source(spark):
         return result
 
 
-    def _shape_tombstone(row, table, record, tx):
-        """A DELETE's full before-image as an append-path ``d`` row.
+    def _shape_tombstone(row, table, record, tx, *, lsn: int | None = None):
+        """A full before-image as an append-path ``d`` row.
 
-        Not :func:`_shape_delete`, which nulls every non-key column and needs a primary
-        key: an append destination has no key to merge on, so the tombstone carries the
-        whole deleted row and is told apart from a live row only by ``_informix_op``.
+        Used for a DELETE and for the old key of a key-changing UPDATE; the latter passes
+        ``lsn``, the before-image's own position. Not :func:`_shape_delete`, which nulls
+        every non-key column and needs a primary key: an append destination does not
+        merge, so the tombstone carries the whole removed row and is told apart from a
+        live row only by ``_informix_op``.
         """
 
         if row is None:
@@ -18099,7 +18141,7 @@ def register_lakeflow_source(spark):
                 f"CDC delete on append-only table {table.exposed_name} has no before image; "
                 "full-row logging is required to emit a delete tombstone"
             )
-        return _shape_change(row, record, tx, "d")
+        return _shape_change(row, record, tx, "d", lsn=lsn)
 
 
     def _shape_delete(row, table, record, tx):
