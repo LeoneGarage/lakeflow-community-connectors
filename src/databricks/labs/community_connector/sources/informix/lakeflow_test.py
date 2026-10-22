@@ -14064,6 +14064,321 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
         ]
         self.assertEqual(fanned, serial)
 
+    # --- gzip record windows (snapshot.gzip.records.per.batch) -----------------------
+
+    _FIVE_RECORDS = "1|a|\n2|b|\n3|c|\n4|d|\n5|e|\n"
+
+    def _serve(self, connector, options, start=None, max_batches=20):
+        """Drive the partitioned file serve batch by batch until the stream phase.
+
+        Returns every served row, each batch's (partition kinds, end offset), and the
+        final offset."""
+        start = start or {}
+        rows, batches = [], []
+        for _ in range(max_batches):
+            end = connector.latest_offset("app.orders", options, start)
+            partitions = connector.get_partitions("app.orders", options, start, end)
+            batches.append(([p["kind"] for p in partitions], end))
+            for partition in partitions:
+                rows.extend(connector.read_partition("app.orders", partition, options))
+            start = end
+            if end["phase"] == "stream":
+                return rows, batches, end
+        self.fail("file serve did not reach the stream phase")
+
+    @staticmethod
+    def _position(offset):
+        snapshot = offset.get("snapshot") or {}
+        return offset["phase"], snapshot.get("page_index"), snapshot.get("record_index", 0)
+
+    def test_gzip_record_windows_serve_the_file_across_batches(self):
+        source = self._gzip_source(self._FIVE_RECORDS)
+        options = {"snapshot.source": source, "snapshot.gzip.records.per.batch": "2"}
+        serial = list(self.connector(FakeBridge()).read_table("app.orders", {}, options)[0])
+
+        rows, batches, _ = self._serve(self.connector(FakeBridge()), options)
+
+        self.assertEqual(rows, serial)
+        self.assertEqual([kinds for kinds, _ in batches], [["embedded"]] * 3)
+        self.assertEqual(
+            [self._position(end) for _, end in batches],
+            [("snapshot", 0, 2), ("snapshot", 0, 4), ("stream", None, 0)],
+        )
+
+    def test_gzip_record_windows_keep_one_decompressor_across_batches(self):
+        source = self._gzip_source(self._FIVE_RECORDS)
+        options = {"snapshot.source": source, "snapshot.gzip.records.per.batch": "2"}
+        connector = self.connector(FakeBridge())
+        with mock.patch.object(
+            connector, "_open_unl_gzip_records", wraps=connector._open_unl_gzip_records
+        ) as opened:
+            self._serve(connector, options)
+
+        self.assertEqual(opened.call_count, 1, "normal progress is one pass over the file")
+
+    def test_a_restart_resumes_mid_file_from_the_recorded_record(self):
+        # A fresh connector stands in for a restarted driver: it has no open
+        # decompressor, so it reopens the file and skips the records already served.
+        source = self._gzip_source(self._FIVE_RECORDS)
+        options = {"snapshot.source": source, "snapshot.gzip.records.per.batch": "2"}
+        serial = list(self.connector(FakeBridge()).read_table("app.orders", {}, options)[0])
+        first = self.connector(FakeBridge())
+        end = first.latest_offset("app.orders", options, {})
+        partitions = first.get_partitions("app.orders", options, {}, end)
+        served = [row for p in partitions for row in first.read_partition("app.orders", p, options)]
+
+        restarted = self.connector(FakeBridge())
+        rest, _, _ = self._serve(restarted, options, start=end)
+
+        self.assertEqual([row["id"] for row in served], [1, 2])
+        self.assertEqual(served + rest, serial, "no record re-ingested or lost")
+
+    def test_a_lost_window_replays_exactly_its_logged_records(self):
+        # Re-planning an uncommitted batch on a fresh driver: get_partitions without the
+        # latest_offset that cached its rows must replay exactly [start, end).
+        source = self._gzip_source(self._FIVE_RECORDS)
+        options = {"snapshot.source": source, "snapshot.gzip.records.per.batch": "2"}
+        planner = self.connector(FakeBridge())
+        start = planner.latest_offset("app.orders", options, {})
+        end = planner.latest_offset("app.orders", options, start)
+        last = planner.latest_offset("app.orders", options, end)
+
+        for window_start, window_end, ids in ((start, end, [3, 4]), (end, last, [5])):
+            with self.subTest(ids=ids):
+                replayer = self.connector(FakeBridge())
+                partitions = replayer.get_partitions(
+                    "app.orders", options, window_start, window_end
+                )
+                rows = [
+                    row
+                    for p in partitions
+                    for row in replayer.read_partition("app.orders", p, options)
+                ]
+                self.assertEqual([row["id"] for row in rows], ids)
+
+    def test_a_repeated_latest_offset_does_not_advance_the_window(self):
+        source = self._gzip_source(self._FIVE_RECORDS)
+        options = {"snapshot.source": source, "snapshot.gzip.records.per.batch": "2"}
+        connector = self.connector(FakeBridge())
+
+        first = connector.latest_offset("app.orders", options, {})
+        again = connector.latest_offset("app.orders", options, {})
+        partitions = connector.get_partitions("app.orders", options, {}, again)
+        rows = [
+            row for p in partitions for row in connector.read_partition("app.orders", p, options)
+        ]
+
+        self.assertEqual(first, again)
+        self.assertEqual([row["id"] for row in rows], [1, 2])
+
+    def test_executor_windows_stop_before_a_gzip_file_served_in_record_windows(self):
+        # Plain files still fan out to executors; a gzip file gets its own driver windows.
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        with open(os.path.join(directory.name, "a.unl"), "w") as handle:
+            handle.write("1|a|\n2|b|\n")
+        with open(os.path.join(directory.name, "b.unl.gz"), "wb") as handle:
+            handle.write(gzip.compress(b"3|c|\n4|d|\n5|e|\n"))
+        with open(os.path.join(directory.name, "c.unl"), "w") as handle:
+            handle.write("6|f|\n")
+        options = {
+            "snapshot.source": directory.name,
+            "snapshot.gzip.records.per.batch": "2",
+            "snapshot.split.bytes": "1",
+        }
+        serial = list(self.connector(FakeBridge()).read_table("app.orders", {}, options)[0])
+
+        rows, batches, _ = self._serve(self.connector(FakeBridge()), options)
+
+        self.assertEqual(rows, serial)
+        self.assertEqual(
+            [kinds for kinds, _ in batches],
+            [["unl_split", "unl_split"], ["embedded"], ["embedded"], ["unl_split"]],
+        )
+
+    def test_clearing_the_option_mid_file_finishes_it_without_re_reading(self):
+        source = self._gzip_source(self._FIVE_RECORDS)
+        windowed = {"snapshot.source": source, "snapshot.gzip.records.per.batch": "2"}
+        connector = self.connector(FakeBridge())
+        end = connector.latest_offset("app.orders", windowed, {})
+        connector.get_partitions("app.orders", windowed, {}, end)
+
+        plain = {"snapshot.source": source}
+        rows, batches, _ = self._serve(self.connector(FakeBridge()), plain, start=end)
+
+        self.assertEqual([row["id"] for row in rows], [3, 4, 5])
+        self.assertEqual([kinds for kinds, _ in batches], [["embedded"]])
+
+    def test_a_shrunken_gzip_file_fails_closed_on_resume(self):
+        source = self._gzip_source(self._FIVE_RECORDS)
+        options = {"snapshot.source": source, "snapshot.gzip.records.per.batch": "2"}
+        connector = self.connector(FakeBridge())
+        offset = connector.latest_offset("app.orders", options, {})
+        offset = connector.latest_offset("app.orders", options, offset)  # record_index 4
+        with open(os.path.join(source, "part-000.unl.gz"), "wb") as handle:
+            handle.write(gzip.compress(b"1|a|\n2|b|\n"))
+
+        with self.assertRaisesRegex(InformixError, "part-000.unl.gz changed size"):
+            self.connector(FakeBridge()).latest_offset("app.orders", options, offset)
+
+    def test_a_gzip_skip_past_the_end_of_the_file_fails_closed(self):
+        # Backstop beneath the manifest: the reopen-and-skip never serves past a file
+        # that holds fewer records than the checkpoint has served.
+        source = self._gzip_source(self._FIVE_RECORDS)
+        options = {"snapshot.source": source}
+        connector = self.connector(FakeBridge())
+        table = connector._table("app.orders", options)
+        split = connector._unl_all_splits(table, options)[0]
+
+        with self.assertRaisesRegex(InformixError, "fewer than the 10"):
+            connector._read_unl_gzip_window(table, options, 90, split, 10, 2)
+
+    # --- extract manifest: a file changed after the snapshot started ------------------
+
+    _THREE_RECORDS = "1|a|\n2|b|\n3|c|\n"
+
+    def _first_batch(self, options):
+        """Serve one single-split batch of a three-record plain file; return its end."""
+        connector = self.connector(
+            FakeBridge(), **{"stream.partitioned.snapshot.pages.per.batch": "1"}
+        )
+        end = connector.latest_offset("app.orders", options, {})
+        connector.get_partitions("app.orders", options, {}, end)
+        self.assertEqual(end["phase"], "snapshot")
+        return end
+
+    def _resume(self, options, offset):
+        return self.connector(
+            FakeBridge(), **{"stream.partitioned.snapshot.pages.per.batch": "1"}
+        ).latest_offset("app.orders", options, offset)
+
+    @staticmethod
+    def _rewrite_keeping_mtime(path, content):
+        info = os.stat(path)
+        with open(path, "w") as handle:
+            handle.write(content)
+        os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+
+    def test_a_same_size_content_change_is_caught_on_resume(self):
+        source = self._source(self._THREE_RECORDS)
+        options = {"snapshot.source": source, "snapshot.split.bytes": "1"}
+        end = self._first_batch(options)
+        self._rewrite_keeping_mtime(os.path.join(source, "part-000.unl"), "1|a|\n2|z|\n3|c|\n")
+
+        with self.assertRaisesRegex(InformixError, "part-000.unl has different content"):
+            self._resume(options, end)
+
+    def test_a_touched_file_is_caught_on_resume(self):
+        source = self._source(self._THREE_RECORDS)
+        options = {"snapshot.source": source, "snapshot.split.bytes": "1"}
+        end = self._first_batch(options)
+        path = os.path.join(source, "part-000.unl")
+        info = os.stat(path)
+        os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns + 3600 * 10**9))
+
+        with self.assertRaisesRegex(InformixError, "different modification time"):
+            self._resume(options, end)
+
+    def test_an_mtime_shift_within_tolerance_is_accepted(self):
+        # A Volume reports an unsettled mtime for a few seconds after a write, so a small
+        # shift with unchanged content must not fail the resume.
+        source = self._source(self._THREE_RECORDS)
+        options = {"snapshot.source": source, "snapshot.split.bytes": "1"}
+        end = self._first_batch(options)
+        path = os.path.join(source, "part-000.unl")
+        info = os.stat(path)
+        os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns + 2 * 10**9))
+
+        resumed = self._resume(options, end)
+
+        self.assertEqual(resumed["snapshot"]["page_index"], 2)
+
+    # Added and removed files are separate tests: each needs its own pinned manifest, and
+    # cases within one test share the pipeline scope the manifest is keyed by.
+    def test_an_added_file_is_caught_on_resume(self):
+        source = self._source(self._THREE_RECORDS)
+        options = {"snapshot.source": source, "snapshot.split.bytes": "1"}
+        end = self._first_batch(options)
+        with open(os.path.join(source, "part-001.unl"), "w") as handle:
+            handle.write("4|d|\n")
+
+        with self.assertRaisesRegex(InformixError, "added part-001.unl"):
+            self._resume(options, end)
+
+    def test_a_removed_file_is_caught_on_resume(self):
+        source = self._source(self._THREE_RECORDS, "4|d|\n")
+        options = {"snapshot.source": source, "snapshot.split.bytes": "1"}
+        end = self._first_batch(options)
+        os.remove(os.path.join(source, "part-001.unl"))
+
+        with self.assertRaisesRegex(InformixError, "removed part-001.unl"):
+            self._resume(options, end)
+
+    def test_a_replaced_file_is_caught_on_a_replanned_batch(self):
+        # A batch re-planned after a restart reaches get_partitions without its
+        # latest_offset, so the check must run there too.
+        source = self._gzip_source(self._FIVE_RECORDS)
+        options = {"snapshot.source": source, "snapshot.gzip.records.per.batch": "2"}
+        planner = self.connector(FakeBridge())
+        start = planner.latest_offset("app.orders", options, {})
+        end = planner.latest_offset("app.orders", options, start)
+        with open(os.path.join(source, "part-000.unl.gz"), "wb") as handle:
+            handle.write(gzip.compress(b"9|x|\n8|y|\n7|z|\n6|w|\n5|v|\n"))
+
+        with self.assertRaisesRegex(InformixError, "changed after its snapshot started"):
+            self.connector(FakeBridge()).get_partitions("app.orders", options, start, end)
+
+    def test_a_snapshot_without_a_manifest_pins_one_on_its_next_read(self):
+        # A snapshot that began before manifests existed is pinned on its next read, which
+        # then guards the rest of its serve.
+        source = self._source(self._THREE_RECORDS)
+        options = {"snapshot.source": source}
+        connector = self.connector(FakeBridge())
+        table = connector._table("app.orders", options)
+        legacy_schema_id = "f" * 32
+
+        connector._verify_unl_extract(table, options, "legacy-scope", legacy_schema_id, 90, set())
+        self._rewrite_keeping_mtime(os.path.join(source, "part-000.unl"), "1|a|\n2|z|\n3|c|\n")
+        path = os.path.join(source, "part-000.unl")
+
+        with self.assertRaisesRegex(InformixError, "different content"):
+            self.connector(FakeBridge())._verify_unl_extract(
+                table, options, "legacy-scope", legacy_schema_id, 90, {path}
+            )
+
+    def test_the_fingerprint_samples_the_head_and_tail_of_a_large_file(self):
+        # With a 4-byte sample, a 15-byte file is fingerprinted by its first and last 4
+        # bytes: a same-size edit there is caught, one confined to the middle is not.
+        source = self._source(self._THREE_RECORDS)
+        options = {"snapshot.source": source}
+        path = os.path.join(source, "part-000.unl")
+        with mock.patch.object(informix_module, "_UNL_FINGERPRINT_SAMPLE_BYTES", 4):
+            connector = self.connector(FakeBridge())
+            table = connector._table("app.orders", options)
+            connector._verify_unl_extract(table, options, "sample-scope", "e" * 32, 90, set())
+
+            self._rewrite_keeping_mtime(path, "1|a|\n2|z|\n3|c|\n")
+            self.connector(FakeBridge())._verify_unl_extract(
+                table, options, "sample-scope", "e" * 32, 90, {path}
+            )
+
+            self._rewrite_keeping_mtime(path, "9|a|\n2|z|\n3|c|\n")
+            with self.assertRaisesRegex(InformixError, "different content"):
+                self.connector(FakeBridge())._verify_unl_extract(
+                    table, options, "sample-scope", "e" * 32, 90, {path}
+                )
+
+    def test_an_invalid_record_index_is_rejected(self):
+        source = self._gzip_source(self._FIVE_RECORDS)
+        options = {"snapshot.source": source, "snapshot.gzip.records.per.batch": "2"}
+        offset = self.connector(FakeBridge()).latest_offset("app.orders", options, {})
+        for bad in (-1, True, "2"):
+            with self.subTest(record_index=bad):
+                broken = json.loads(json.dumps(offset))
+                broken["snapshot"]["record_index"] = bad
+                with self.assertRaisesRegex(ValueError, "record_index"):
+                    informix_module._validated_offset(broken)
+
     def test_unl_hpl_custom_delimiter_serves_shaped_rows(self):
         # An HPL DELIMITED extract: tab-delimited, no trailing delimiter. With the
         # matching snapshot.unl.delimiter it shapes to the same rows as an UNLOAD extract

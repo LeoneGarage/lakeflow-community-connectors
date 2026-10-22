@@ -102,9 +102,10 @@ rather than start from an unrelated position.
 | `decimal.variable.type` | No | `decimal(38,18)` | Per-table option. Target Spark type for variable-scale `DECIMAL(p)`/`NUMERIC(p)` columns: `string`, `double`, `integer` (truncated), or `decimal(p,s)`. Explicit `DECIMAL(p,s)` remains fixed-scale. See [Variable-scale decimals](#variable-scale-decimals). |
 | `decimal.variable.column.type` | No | none | Per-table option. Comma-separated `column:type` overrides of `decimal.variable.type` for specific columns, e.g. `agt_no:decimal(9,0),bnk_acct_no:string`. |
 | `snapshot.mode` | No | `incremental` | Per-table snapshot policy: `incremental`, `initial`, `initial_only`, `cdc_only`, `auto_snapshot`, or `recovery`. See [Snapshot modes](#snapshot-modes). |
-| `snapshot.source` | No | none | Per-table (also connection-scope) UC Volume directory of Informix UNLOAD (`.unl` or gzip `.unl.gz`) extract files. With `snapshot.mode=initial`, the initial snapshot is served from those files instead of a live scan, then transitions to CDC at the boundary. Files must be newline-terminated delimited text — UNLOAD (`\|` delimiter, backslash escaping, empty field = NULL) or **HPL DELIMITED** output (set `snapshot.unl.delimiter`/`snapshot.unl.escape` when its job uses a different pair; HPL fixed-position/COBOL/binary formats are not supported). Parallel executor reads use ranged GETs over the Files REST API, splitting each plain file into ~`snapshot.split.bytes` (default 50 MiB) pieces at record boundaries. A gzip file (detected by magic bytes, not name) is not seekable, so it is one non-splittable unit — for compressed extracts, parallelism and mid-snapshot resume come from using **multiple `.unl.gz` files**. The operator must ensure the extract reflects the table at ingest time (quiesce, or extract-then-ingest); the connector does not verify alignment. Producing the `.unl` files via UNLOAD/HPL is out of scope. See [File-sourced initial snapshot](#file-sourced-initial-snapshot). |
+| `snapshot.source` | No | none | Per-table (also connection-scope) UC Volume directory of Informix UNLOAD (`.unl` or gzip `.unl.gz`) extract files. With `snapshot.mode=initial`, the initial snapshot is served from those files instead of a live scan, then transitions to CDC at the boundary. Files must be newline-terminated delimited text — UNLOAD (`\|` delimiter, backslash escaping, empty field = NULL) or **HPL DELIMITED** output (set `snapshot.unl.delimiter`/`snapshot.unl.escape` when its job uses a different pair; HPL fixed-position/COBOL/binary formats are not supported). Parallel executor reads use ranged GETs over the Files REST API, splitting each plain file into ~`snapshot.split.bytes` (default 50 MiB) pieces at record boundaries. A gzip file (detected by magic bytes, not name) is not seekable, so it is one non-splittable unit — for compressed extracts, parallelism comes from using **multiple `.unl.gz` files**, and mid-snapshot resume from multiple files or `snapshot.gzip.records.per.batch`. The operator must ensure the extract reflects the table at ingest time (quiesce, or extract-then-ingest); the connector does not verify alignment. Once the snapshot starts, the connector pins each file's name, size, modification time and a sampled content fingerprint, and fails with a full-refresh error if a later read finds any file added, removed or changed. Producing the `.unl` files via UNLOAD/HPL is out of scope. See [File-sourced initial snapshot](#file-sourced-initial-snapshot). |
 | `snapshot.boundary.lsn` | No | self-pin | Per-table (also connection-scope) operator-supplied CDC boundary LSN for a `snapshot.source` extract — the LSN the extract was captured at, so the CDC stream resumes at exactly that position. **Resolution per table, first hit wins:** this option; else a `_manifest.json` file in the `snapshot.source` directory containing `{"boundary_lsn": "<X>"}` (other keys ignored); else the connector self-pins its own registration LSN. A supplied boundary is validated against the source's retained/current log range and **fails closed** if below the minimum retained LSN (the logical log recycled past it → gap) or above current. Non-negative integer. |
 | `snapshot.split.bytes` | No | `52428800` | Per-table (also connection-scope) target byte size for each parallel `.unl` split — each executor reads roughly this many bytes, snapped up to the next record boundary. Splitting by bytes rather than rows lets the connector plan splits with a few small reads instead of scanning the whole file. Positive integer; default 50 MiB. Only meaningful with `snapshot.source`. |
+| `snapshot.gzip.records.per.batch` | No | `0` | Per-table (also connection-scope) number of records of a gzip `.unl.gz` file to serve per microbatch, so a gzip file resumes mid-file after a failure instead of being re-read whole. `0` (default) keeps today's behaviour: each gzip file is one split, read whole on an executor in one microbatch. With a positive value, each gzip file is served on the driver that many records per microbatch, and the checkpoint records how many of its records are done. The driver keeps the file's decompressor open between microbatches, so normal progress is still one pass over the file; after a restart it reopens the file and skips the records already ingested, which re-decompresses that prefix but never re-ingests it. Each microbatch's rows pass through the driver, and a gzip file is no longer read in parallel with other splits, so this suits a few large gzip files rather than many small ones; keep the value moderate, for example tens of thousands to a few hundred thousand records. Plain `.unl` files still fan out to executors. Clearing the option while a file is part-served finishes that file in one microbatch. A file replaced while part-served fails the read with a full-refresh error rather than resuming into different content. Applies to the partitioned reader (the default). Only meaningful with `snapshot.source`. |
 | `snapshot.unl.delimiter` | No | `\|` | Per-table (also connection-scope) field delimiter for a `snapshot.source` extract; a single character. Default `\|` (Informix UNLOAD). Set it when the extract is **HPL DELIMITED** output whose ipload job uses a non-pipe delimiter — HPL does not honor `DBDELIMITER`, so the delimiter is whatever the job set. Record terminator is always newline. Must differ from `snapshot.unl.escape`. Only meaningful with `snapshot.source`. |
 | `snapshot.unl.escape` | No | `\` | Per-table (also connection-scope) escape character for a `snapshot.source` extract; a single character. Default `\` (UNLOAD backslash escaping: `\n`/`\r`/`\t` → control chars, `\<other>` → literal). Set it to match an HPL job's escape character, or to the **empty string** to disable escape processing for an HPL job that writes no escapes. Must differ from `snapshot.unl.delimiter`. Only meaningful with `snapshot.source`. |
 | `table.migration` | No | `false` | Per-table (also connection-scope) boolean. When `true`, the table runs a two-run checkpoint handoff instead of its normal read, so it can move to a new Lakeflow flow — an SCD Type 1 → append-only switch, or a destination relocation — **without re-snapshotting**. Orthogonal to `snapshot.mode`, which the table keeps unchanged. Migration never streams: every read records a checkpoint, emits no rows, and stops. Clearing it (Restore) resumes normal reads from the recorded offset. See [Migrating a table without a re-snapshot](#migrating-a-table-without-a-re-snapshot). Accepts `true`/`false`. |
@@ -147,7 +148,7 @@ rather than start from an unrelated position.
 Because per-table options are supported, configure the Unity Catalog connection with this exact `externalOptionsAllowList`:
 
 ```text
-qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration
+qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration
 ```
 
 Create the connection from the Lakeflow Community Connector flow on the **Add Data** page, with the Databricks CLI, or with the Databricks SDK for Python. The Unity Catalog connection type must be `COMMUNITY`, and `sourceName` must be `informix`.
@@ -180,7 +181,7 @@ databricks connections create --json "$(jq -n \
       encrypt: "true",
       "snapshot.staging.location": "/Volumes/main/informix_cdc/staging",
       "lakebase.password": $lakebase_password,
-      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
+      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
     }
   }')"
 
@@ -218,7 +219,7 @@ databricks connections update informix_sales --json "$(jq -n \
       "ssl.ca.file": "/Volumes/catalog/schema/artifacts/informix-ca.pem",
       "snapshot.staging.location": "/Volumes/main/informix_cdc/staging",
       "lakebase.password": $lakebase_password,
-      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
+      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
     }
   }')" \
   --profile "$DATABRICKS_PROFILE"
@@ -265,7 +266,7 @@ connection = w.connections.create(
         "lakebase.password": os.environ["LAKEBASE_PASSWORD"],
         "externalOptionsAllowList": (
             "qualified_source_table,decimal.variable.type,decimal.variable.column.type,"
-            "snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,"
+            "snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,"
             "append.only.ingestion,append.delete.tombstones,"
             "max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
         ),
@@ -306,7 +307,7 @@ connection = w.connections.update(
         "lakebase.password": os.environ["LAKEBASE_PASSWORD"],
         "externalOptionsAllowList": (
             "qualified_source_table,decimal.variable.type,decimal.variable.column.type,"
-            "snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,"
+            "snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,"
             "append.only.ingestion,append.delete.tombstones,"
             "max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
         ),
@@ -856,12 +857,28 @@ newline-terminated DELIMITED output.
 
 **Gzip.** A file is decompressed transparently when it is gzip-compressed — detected by its
 `1f 8b` magic bytes, so `.unl.gz` (or even a mislabelled `.unl` that is actually gzip) works.
-Because a gzip stream is not seekable, a compressed file is **one non-splittable split**: it
-is streamed and decompressed whole on a single executor, and a restart re-reads it from the
-start. So parallelism and mid-snapshot resume for compressed extracts come from producing
-**multiple `.unl.gz` files** (e.g. `UNLOAD` to N files, gzip each), not from splitting within
-a file. `snapshot.split.bytes` has no effect on a gzip file. Plain and gzip files may be
-mixed in one directory. Concatenated gzip members (`cat a.gz b.gz`) are handled.
+Because a gzip stream is not seekable, a compressed file is **one non-splittable split**: by
+default it is streamed and decompressed whole on a single executor, and a restart re-reads it
+from the start. Parallelism for compressed extracts therefore comes from producing **multiple
+`.unl.gz` files** (e.g. `UNLOAD` to N files, gzip each), not from splitting within a file.
+For mid-file resume, set `snapshot.gzip.records.per.batch`: each gzip file is then served on
+the driver that many records per microbatch, and a restart resumes after the last committed
+record instead of re-reading the file. `snapshot.split.bytes` has no effect on a gzip file.
+Plain and gzip files may be mixed in one directory. Concatenated gzip members
+(`cat a.gz b.gz`) are handled.
+
+**Extract validation.** A file snapshot resumes by position in a split plan rebuilt from the
+directory on every read, so the extract must not change until the snapshot finishes. When
+the snapshot starts, the connector pins a manifest of the extract: each file's name, size,
+modification time, and a fingerprint hashing its size with its first and last megabyte.
+Every later read checks every file's name, size and modification time against it, and
+re-checks the fingerprint of each file that read serves. Any file added, removed or changed
+fails the read with a full-refresh error instead of silently skipping or repeating rows.
+Modification times are compared within a few seconds, because a Volume reports an unsettled
+time just after a write. The fingerprint samples rather than hashes whole files, so an edit
+confined to the middle of a file that also keeps its size and modification time is not
+detected. To recover, run a full refresh to ingest the current extract, or restore the
+original files with their modification times.
 
 **Boundary LSN.** For CDC to resume correctly the connector needs the log position the
 extract corresponds to. It is resolved per table, **first hit wins**:
@@ -990,7 +1007,8 @@ Notes:
 - One plain `.unl` per table is the best default — the connector byte-splits it across
   executors with no whole-file scan. Only reach for `gzip` when transfer size matters,
   and then produce **multiple** `.unl.gz` files (`UNLOAD` ranges to N files, gzip each),
-  because a gzip file is one non-splittable split.
+  because a gzip file is one non-splittable split. For one large `.unl.gz` that must resume
+  mid-file, set `snapshot.gzip.records.per.batch` instead.
 - If you set `snapshot.boundary.lsn` on the table it overrides the manifest, so the
   `_manifest.json` is only needed when you would rather not carry the LSN in the spec.
 

@@ -5966,6 +5966,37 @@ def register_lakeflow_source(spark):
     _UNL_SPLIT_TARGET_BYTES = 50 << 20
     # Per-table (connection-fallback) override of the split target byte size.
     _UNL_SPLIT_BYTES_OPTION = "snapshot.split.bytes"
+    # Resumable gzip extracts. A `.unl.gz` file cannot be split by byte range -- compressed
+    # data cannot be decoded from the middle -- so by default it is one split, read whole on an
+    # executor in one microbatch, and a failure re-reads the whole file. With
+    # ``snapshot.gzip.records.per.batch`` = N > 0, each gzip file is instead served on the
+    # driver N records per microbatch, and the offset records how many of the file's records
+    # are done (``snapshot.record_index``). The driver keeps the file's decompressor open
+    # between microbatches, so normal progress is still one pass over the file; after a
+    # restart it reopens the file and skips the recorded records once -- re-decompressing that
+    # prefix, but never re-ingesting it. Each microbatch's rows pass through the driver and its
+    # partition descriptor, and a gzip file is no longer read in parallel with other splits, so
+    # this suits large gzip files rather than many small ones. Plain files are unaffected.
+    # Clearing the option while a file is part-served finishes that file in one microbatch
+    # rather than re-reading its served prefix. Applies to the partitioned reader; the serial
+    # reader serves the whole extract in one microbatch either way.
+    _UNL_GZIP_RECORDS_OPTION = "snapshot.gzip.records.per.batch"
+    # Extract identity. A file snapshot resumes by position -- split index, and record index
+    # inside a gzip file served in record windows -- into a split plan rebuilt from the
+    # directory on every read, so a file replaced, added or removed after the snapshot started
+    # would make a resume silently skip or repeat rows. When the boundary is pinned, the
+    # connector also pins a manifest of the extract: every file's name, size and modification
+    # time, and a fingerprint hashing the size with the first and last
+    # _UNL_FINGERPRINT_SAMPLE_BYTES of the file. Every later read compares the directory with
+    # it -- names and sizes exactly, modification times within _UNL_MTIME_TOLERANCE_SECONDS,
+    # because a Volume reports an unsettled mtime for a few seconds after a write -- and
+    # re-checks the fingerprint of each file that read will serve, failing closed with a
+    # full-refresh error on any difference. Fingerprints are cached per (path, size, exact
+    # mtime) within a driver process, so a gzip file served over many microbatches is sampled
+    # once per run. The fingerprint samples rather than hashes whole files, so an edit confined
+    # to the middle of a file that also keeps its size and modification time escapes it.
+    _UNL_FINGERPRINT_SAMPLE_BYTES = 1 << 20
+    _UNL_MTIME_TOLERANCE_SECONDS = 5.0
     # Fixed buffer for the streaming range reads and the boundary-snap scan: constant
     # memory regardless of `.unl` size (never load a whole file).
     _UNL_SCAN_CHUNK_BYTES = 4 << 20
@@ -10967,6 +10998,16 @@ def register_lakeflow_source(spark):
             # Values are codec-encoded (JSON-safe) rows -- the exact descriptor payload
             # get_partitions emits and read_partition decodes; see _encode_embedded_rows.
             self._partition_embedded_rows: dict[str, list[Any]] = {}
+            # Driver-only gzip record-window state (see _UNL_GZIP_RECORDS_OPTION): the open
+            # record iterator for the gzip file being served, as [key, next_record_index,
+            # iterator], and the last window read, so a repeated latest_offset for the same
+            # start returns the same rows instead of advancing the iterator again. Never
+            # pickled; losing either only costs a reopen-and-skip.
+            self._unl_gzip_reader: list[Any] | None = None
+            self._unl_gzip_window_memo: tuple[Any, Any] | None = None
+            # Extract-file fingerprints already sampled by this process, keyed by
+            # (path, size, mtime_ns): any change to a file's size or exact mtime re-samples it.
+            self._unl_fingerprint_cache: dict[tuple[str, int, int], str] = {}
             # Tables whose stale-stage retention sweep has already been submitted by this
             # reader instance, so the age-based safety net runs at most once per table per
             # instance (off the serve path) instead of every microbatch.
@@ -10987,6 +11028,8 @@ def register_lakeflow_source(spark):
                 self._snapshot_cleanup_watermark.clear()
                 self._snapshot_schema_refreshed_at.clear()
                 self._partition_embedded_rows.clear()
+                self._unl_gzip_reader = None
+                self._unl_gzip_window_memo = None
                 self._retention_swept.clear()
                 self._trigger_available_now = False
             self._registration_scope = scope
@@ -11069,6 +11112,10 @@ def register_lakeflow_source(spark):
             # Driver-only; never ship materialized embedded rows to a worker. The worker
             # gets its rows from the partition descriptor, not from this cache.
             state["_partition_embedded_rows"] = {}
+            # An open gzip record iterator is a live generator, and a window memo holds rows;
+            # neither belongs on a worker.
+            state["_unl_gzip_reader"] = None
+            state["_unl_gzip_window_memo"] = None
             return state
 
         def __setstate__(self, state: dict[str, Any]) -> None:
@@ -11658,8 +11705,16 @@ def register_lakeflow_source(spark):
             if self._unl_snapshot_serve(table_options, effective_start):
                 # File source: serve the extract as a window of splits per microbatch. Leaving
                 # the embedded cache untouched steers the following get_partitions to the
-                # unl_split fan-out instead of the driver-side embedded path.
-                return self._unl_snapshot_offset(table, table_options, effective_start)
+                # unl_split fan-out instead of the driver-side embedded path. A gzip record
+                # window is the exception: its rows were read here on the driver, so they are
+                # cached for get_partitions exactly as an embedded read's are.
+                end, window_rows = self._unl_snapshot_offset(table, table_options, effective_start)
+                if window_rows is not None:
+                    self._partition_embedded_rows.clear()
+                    self._partition_embedded_rows[self._partition_offset_key(start_offset)] = (
+                        self._encode_embedded_rows(window_rows)
+                    )
+                return end
             batch = self._snapshot_page_batch(table, effective_start, table_options)
             if batch is not None:
                 return self._snapshot_page_batch_offset(table, effective_start, batch)
@@ -11766,17 +11821,53 @@ def register_lakeflow_source(spark):
                 # boundary was pinned by latest_offset; take snapshot_lsn from end_offset and
                 # the resume point from the start offset's split index (0 on the first read).
                 snapshot_lsn = int((end_offset or {})["commit_lsn"])
-                start_split = (
-                    int(_validated_offset(effective_start)["snapshot"]["page_index"])
-                    if effective_start
-                    else 0
+                start_split, start_record = _unl_position(effective_start)
+                splits = self._unl_all_splits(table, table_options)
+                end_split, end_record = _unl_position(end_offset or {}, terminal=len(splits))
+                driver_window = self._unl_gzip_driver_window(
+                    table_options, splits, start_split, start_record
                 )
+                # A batch re-planned after a restart reaches here without its latest_offset, so
+                # the extract is checked against its pinned manifest here as well.
+                end_checkpoint = _validated_offset(end_offset or {})
+                window_paths = (
+                    {splits[start_split][0]}
+                    if driver_window
+                    else {split[0] for split in splits[start_split:end_split]}
+                )
+                self._verify_unl_extract(
+                    table,
+                    table_options,
+                    self._pipeline_scope(end_checkpoint),
+                    str(end_checkpoint["schema_id"]),
+                    snapshot_lsn,
+                    window_paths,
+                )
+                if driver_window:
+                    encoded = self._partition_embedded_rows.pop(
+                        self._partition_offset_key(start_offset), None
+                    )
+                    if encoded is None:
+                        # Re-planning an uncommitted batch (e.g. after a driver restart):
+                        # replay exactly the records between start and the logged end.
+                        rows = self._replay_unl_gzip_window(
+                            table,
+                            table_options,
+                            snapshot_lsn,
+                            splits[start_split],
+                            start_record,
+                            stop_record=end_record if end_split == start_split else None,
+                        )
+                        encoded = self._encode_embedded_rows(rows)
+                    return [{"kind": "embedded", "rows": encoded}]
+                # The window is whatever latest_offset logged: up to pages-per-batch splits,
+                # ending early before a gzip split that is served in record windows.
                 return self._unl_split_descriptors(
                     table,
                     table_options,
                     snapshot_lsn,
                     start_split=start_split,
-                    window=self._partitioned_pages_per_batch(),
+                    window=end_split - start_split,
                 )
             batch = self._snapshot_page_batch(table, effective_start, table_options)
             if batch is not None:
@@ -15305,6 +15396,7 @@ def register_lakeflow_source(spark):
                 self._publish_snapshot_boundary(
                     table, schema_id, high_water, high_water, pipeline_scope
                 )
+                self._pin_unl_extract(table, options, pipeline_scope, schema_id, high_water)
                 return table, schema_id, high_water
             minimum = self._bridge.minimum_lsn()
             current = self._bridge.current_lsn()
@@ -15318,25 +15410,198 @@ def register_lakeflow_source(spark):
             table = self._refresh_table_schema(table, _schema_fingerprint(table))
             schema_id = self._publish_unl_initialization(table, pipeline_scope, boundary)
             self._publish_snapshot_boundary(table, schema_id, boundary, boundary, pipeline_scope)
+            self._pin_unl_extract(table, options, pipeline_scope, schema_id, boundary)
             return table, schema_id, boundary
+
+        def _unl_extract_namespace(self, table: Table, pipeline_scope: str, schema_id: str) -> str:
+            return self._immutable_namespace(table, "unl-extract", pipeline_scope, schema_id)
+
+        def _unl_extract_files(self, table: Table, table_options: dict[str, str]) -> list[dict]:
+            """The extract's files as they are now: name, path, size and modification time."""
+
+            source = self._table_snapshot_source(table_options)
+            entries = []
+            for path in self._list_unl_files(source, table.exposed_name):
+                info = os.stat(path)
+                entries.append(
+                    {
+                        "name": os.path.basename(path),
+                        "path": path,
+                        "size": int(info.st_size),
+                        "mtime": float(info.st_mtime),
+                        "mtime_ns": int(info.st_mtime_ns),
+                    }
+                )
+            return entries
+
+        def _unl_fingerprint(self, entry: dict) -> str:
+            """SHA-256 of a file's size with its first and last sample bytes; cached per version."""
+
+            key = (entry["path"], entry["size"], entry["mtime_ns"])
+            cached = self._unl_fingerprint_cache.get(key)
+            if cached is not None:
+                return cached
+            size = entry["size"]
+            sample = _UNL_FINGERPRINT_SAMPLE_BYTES
+            digest = hashlib.sha256(f"{size}\0".encode())
+            if size:
+                read_chunk = self._unl_read_chunk(entry["path"])
+                if size <= 2 * sample:
+                    digest.update(read_chunk(0, size))
+                else:
+                    digest.update(read_chunk(0, sample))
+                    digest.update(read_chunk(size - sample, sample))
+            value = digest.hexdigest()
+            self._unl_fingerprint_cache[key] = value
+            return value
+
+        def _pin_unl_extract(
+            self,
+            table: Table,
+            table_options: dict[str, str],
+            pipeline_scope: str,
+            schema_id: str,
+            snapshot_lsn: int,
+        ) -> None:
+            """Pin the extract's manifest with the snapshot boundary; idempotent.
+
+            The record is elected, so a retried first read compares the directory with the
+            manifest the snapshot actually started from rather than re-pinning it.
+            """
+
+            entries = self._unl_extract_files(table, table_options)
+            winner = self._publish_immutable_head(
+                self._unl_extract_namespace(table, pipeline_scope, schema_id),
+                {
+                    "created_at": time.time(),
+                    "scope": pipeline_scope,
+                    "schema_id": schema_id,
+                    "snapshot_lsn": str(snapshot_lsn),
+                    "files": [
+                        {
+                            "name": entry["name"],
+                            "size": entry["size"],
+                            "mtime": entry["mtime"],
+                            "fingerprint": self._unl_fingerprint(entry),
+                        }
+                        for entry in entries
+                    ],
+                },
+                record_type="unl-extract",
+            )
+            self._validate_immutable_record_header(winner, "unl-extract", table.exposed_name)
+            self._compare_unl_extract(table, winner, entries, fingerprint_paths=None)
+
+        def _verify_unl_extract(
+            self,
+            table: Table,
+            table_options: dict[str, str],
+            pipeline_scope: str,
+            schema_id: str,
+            snapshot_lsn: int,
+            read_paths: Iterable[str],
+        ) -> None:
+            """Fail closed when the extract no longer matches the manifest its snapshot pinned.
+
+            Checks every file's name, size and modification time, and the fingerprint of each
+            file in ``read_paths`` -- the ones this read will serve. A snapshot that began
+            before manifests existed pins one now, which guards the rest of its serve.
+            """
+
+            record = self._read_immutable_head(
+                self._unl_extract_namespace(table, pipeline_scope, schema_id)
+            )
+            if record is None:
+                logging.getLogger(__name__).info(
+                    "Informix file snapshot for '%s' has no pinned extract manifest; pinning the "
+                    "extract as it is now",
+                    table.exposed_name,
+                )
+                self._pin_unl_extract(table, table_options, pipeline_scope, schema_id, snapshot_lsn)
+                return
+            self._validate_immutable_record_header(record, "unl-extract", table.exposed_name)
+            entries = self._unl_extract_files(table, table_options)
+            self._compare_unl_extract(table, record, entries, fingerprint_paths=set(read_paths))
+
+        def _compare_unl_extract(
+            self,
+            table: Table,
+            record: dict,
+            entries: list[dict],
+            *,
+            fingerprint_paths: set[str] | None,
+        ) -> None:
+            """Raise if ``entries`` differ from the pinned manifest ``record``.
+
+            ``fingerprint_paths`` limits the content check to those files; None checks all.
+            """
+
+            pinned = record.get("files")
+            if not isinstance(pinned, list) or not all(isinstance(item, dict) for item in pinned):
+                raise InformixError(
+                    f"Invalid pinned extract manifest for '{table.exposed_name}'; run a full refresh"
+                )
+            pinned_names = [str(item.get("name")) for item in pinned]
+            current_names = [entry["name"] for entry in entries]
+            problem = None
+            if pinned_names != current_names:
+                added = sorted(set(current_names) - set(pinned_names))
+                removed = sorted(set(pinned_names) - set(current_names))
+                problem = "; ".join(
+                    part
+                    for part in (
+                        f"added {', '.join(added)}" if added else "",
+                        f"removed {', '.join(removed)}" if removed else "",
+                    )
+                    if part
+                )
+            else:
+                for item, entry in zip(pinned, entries):
+                    name = entry["name"]
+                    if int(item.get("size", -1)) != entry["size"]:
+                        problem = (
+                            f"{name} changed size from {item.get('size')} to {entry['size']} bytes"
+                        )
+                    elif (
+                        abs(float(item.get("mtime", 0.0)) - entry["mtime"])
+                        > _UNL_MTIME_TOLERANCE_SECONDS
+                    ):
+                        problem = f"{name} has a different modification time"
+                    elif (
+                        fingerprint_paths is None or entry["path"] in fingerprint_paths
+                    ) and self._unl_fingerprint(entry) != item.get("fingerprint"):
+                        problem = f"{name} has different content"
+                    if problem:
+                        break
+            if problem:
+                raise InformixError(
+                    f"The {_SNAPSHOT_SOURCE_OPTION} extract for '{table.exposed_name}' changed after "
+                    f"its snapshot started ({problem}), so resuming would skip or repeat rows. Run "
+                    "a full refresh to ingest the current extract, or restore the original files "
+                    "with their modification times."
+                )
 
         def _unl_snapshot_offset(
             self, table: Table, table_options: dict[str, str], effective_start: dict
-        ) -> dict:
-            """End offset for one windowed ``.unl`` snapshot microbatch.
+        ) -> tuple[dict, list[dict[str, Any]] | None]:
+            """End offset for one windowed ``.unl`` snapshot microbatch, plus any driver rows.
 
             On the first read (empty start) the boundary is pinned durably and idempotently
             (see :meth:`_pin_unl_boundary`) and the serve begins at split 0; on a continuation
             the boundary/schema come from the checkpoint and the serve resumes at the recorded
-            split index. Each read advances by ``stream.partitioned.snapshot.pages.per.batch``
-            splits: a non-terminal microbatch returns a snapshot-phase offset carrying the next
-            split index (so the serve is resumable mid-snapshot), and the microbatch that
-            reaches the last split transitions to the stream phase at the boundary -- where the
-            CDC stream resumes and ``_recover`` discards everything at or below it. The schema
-            fingerprint is carried forward from the checkpoint on a continuation (the extract is
-            frozen as of the boundary; drift is still caught at the snapshot->CDC transition by
-            ``_read_stream``), matching the staged-page serve. An empty extract transitions to
-            the stream phase immediately.
+            split index (and, inside a gzip file served in record windows, its record index).
+            An executor window advances by up to ``stream.partitioned.snapshot.pages.per.batch``
+            splits, stopping early before a gzip split that ``snapshot.gzip.records.per.batch``
+            serves in record windows. Such a window is read here on the driver -- its rows are
+            returned so latest_offset can cache them -- and advances by up to that many records,
+            moving to the next split once the file is exhausted. A non-terminal microbatch
+            returns a snapshot-phase offset (so the serve is resumable mid-snapshot), and the
+            microbatch that finishes the last split transitions to the stream phase at the
+            boundary -- where the CDC stream resumes and ``_recover`` discards everything at or
+            below it. The schema fingerprint is carried forward from the checkpoint on a
+            continuation (the extract is frozen as of the boundary; drift is still caught at the
+            snapshot->CDC transition by ``_read_stream``), matching the staged-page serve. An
+            empty extract transitions to the stream phase immediately.
             """
 
             if not effective_start:
@@ -15344,17 +15609,49 @@ def register_lakeflow_source(spark):
                 table, schema_id, snapshot_lsn = self._pin_unl_boundary(
                     table, table_options, pipeline_scope
                 )
-                start_split = 0
+                start_split, start_record = 0, 0
                 expected_fingerprint = None
             else:
                 checkpoint = _validated_offset(effective_start)
                 pipeline_scope = self._pipeline_scope(checkpoint)
                 schema_id = str(checkpoint["schema_id"])
                 snapshot_lsn = int(checkpoint["snapshot_lsn"])
-                start_split = int(checkpoint["snapshot"]["page_index"])
+                start_split, start_record = _unl_position(checkpoint)
                 expected_fingerprint = checkpoint.get("schema_fingerprint")
-            total = len(self._unl_all_splits(table, table_options))
-            end_split = min(start_split + self._partitioned_pages_per_batch(), total)
+            splits = self._unl_all_splits(table, table_options)
+            total = len(splits)
+            window_rows: list[dict[str, Any]] | None = None
+            driver_window = self._unl_gzip_driver_window(
+                table_options, splits, start_split, start_record
+            )
+            if effective_start:
+                # The first read just pinned the manifest; a continuation checks the extract
+                # still matches it before serving anything more.
+                self._verify_unl_extract(
+                    table,
+                    table_options,
+                    pipeline_scope,
+                    schema_id,
+                    snapshot_lsn,
+                    self._unl_window_paths(table_options, splits, start_split, driver_window),
+                )
+            if driver_window:
+                limit = self._table_int_option(table_options, _UNL_GZIP_RECORDS_OPTION, 0, minimum=0)
+                window_rows, exhausted = self._read_unl_gzip_window(
+                    table,
+                    table_options,
+                    snapshot_lsn,
+                    splits[start_split],
+                    start_record,
+                    limit or None,
+                )
+                if exhausted:
+                    end_split, end_record = start_split + 1, 0
+                else:
+                    end_split, end_record = start_split, start_record + len(window_rows)
+            else:
+                end_split = self._unl_executor_window_end(table_options, splits, start_split)
+                end_record = 0
             if end_split >= total:
                 # Last window (or empty extract): the snapshot is complete -> transition to the
                 # stream phase at the boundary, an ordinary stream offset from here on.
@@ -15370,7 +15667,7 @@ def register_lakeflow_source(spark):
                 )
                 if expected_fingerprint is not None:
                     end["schema_fingerprint"] = expected_fingerprint
-                return end
+                return end, window_rows
             end = _offset(
                 snapshot_lsn,
                 snapshot_lsn,
@@ -15383,15 +15680,192 @@ def register_lakeflow_source(spark):
             )
             if expected_fingerprint is not None:
                 end["schema_fingerprint"] = expected_fingerprint
-            end.update(
-                {
-                    "snapshot_lsn": str(snapshot_lsn),
-                    # No PK cursor for byte splits: page_index is the split index; last_pk is
-                    # an unused placeholder that satisfies the snapshot-offset schema.
-                    "snapshot": {"last_pk": [], "page_index": end_split},
-                }
+            # No PK cursor for byte splits: page_index is the split index; last_pk is an unused
+            # placeholder that satisfies the snapshot-offset schema. record_index, present only
+            # inside a gzip file served in record windows, counts that file's records done.
+            snapshot: dict[str, Any] = {"last_pk": [], "page_index": end_split}
+            if end_record:
+                snapshot["record_index"] = end_record
+            end.update({"snapshot_lsn": str(snapshot_lsn), "snapshot": snapshot})
+            return end, window_rows
+
+        def _unl_executor_window_end(
+            self,
+            table_options: dict[str, str],
+            splits: list[tuple[str, int, int, bool]],
+            start_split: int,
+        ) -> int:
+            """End split of an executor window: up to pages-per-batch splits, stopping before a
+            gzip split that ``snapshot.gzip.records.per.batch`` serves on the driver."""
+
+            end_split = min(start_split + self._partitioned_pages_per_batch(), len(splits))
+            if self._table_int_option(table_options, _UNL_GZIP_RECORDS_OPTION, 0, minimum=0):
+                end_split = next(
+                    (index for index in range(start_split + 1, end_split) if splits[index][3]),
+                    end_split,
+                )
+            return end_split
+
+        def _unl_window_paths(
+            self,
+            table_options: dict[str, str],
+            splits: list[tuple[str, int, int, bool]],
+            start_split: int,
+            driver_window: bool,
+        ) -> set[str]:
+            """The files the window starting at ``start_split`` will read."""
+
+            if start_split >= len(splits):
+                return set()
+            if driver_window:
+                return {splits[start_split][0]}
+            end_split = self._unl_executor_window_end(table_options, splits, start_split)
+            return {split[0] for split in splits[start_split:end_split]}
+
+        def _unl_gzip_driver_window(
+            self,
+            table_options: dict[str, str],
+            splits: list[tuple[str, int, int, bool]],
+            start_split: int,
+            start_record: int,
+        ) -> bool:
+            """Whether the window starting at ``start_split`` is a driver-read gzip record window.
+
+            True for a gzip split when ``snapshot.gzip.records.per.batch`` is set, and also for
+            one already part-served (``start_record`` > 0) after the option was cleared, so that
+            file finishes from its recorded position instead of being re-read whole.
+            """
+
+            if start_split >= len(splits) or not splits[start_split][3]:
+                if start_record:
+                    raise InformixError(
+                        "File snapshot offset records a record index for a split that is not a "
+                        "gzip file; the extract changed under a running snapshot -- run a full "
+                        "refresh"
+                    )
+                return False
+            if start_record:
+                return True
+            return bool(self._table_int_option(table_options, _UNL_GZIP_RECORDS_OPTION, 0, minimum=0))
+
+        def _read_unl_gzip_window(
+            self,
+            table: Table,
+            table_options: dict[str, str],
+            snapshot_lsn: int,
+            split: tuple[str, int, int, bool],
+            start_record: int,
+            limit: int | None,
+        ) -> tuple[list[dict[str, Any]], bool]:
+            """Read up to ``limit`` records (None: the rest) of a gzip split from ``start_record``.
+
+            Returns the shaped rows and whether the file is now exhausted -- a short window, or
+            an empty one when the previous window ended exactly at the last record. The open
+            record iterator is kept between microbatches, so consecutive windows decompress the
+            file once; a window that does not continue it (a restart, or a different file)
+            reopens the file and skips ``start_record`` records. A repeated request for the
+            window just read returns the same rows without touching the iterator.
+            """
+
+            path, _start_byte, size, _is_gzip = split
+            key = (path, size, snapshot_lsn)
+            memo_key = (key, start_record, limit)
+            memo = self._unl_gzip_window_memo
+            if memo is not None and memo[0] == memo_key:
+                return memo[1]
+            reader = self._unl_gzip_reader
+            if reader is None or reader[0] != key or reader[1] != start_record:
+                self._unl_gzip_reader = None
+                records = self._open_unl_gzip_records(path, size, table_options)
+                skipped = sum(1 for _ in itertools.islice(records, start_record))
+                if skipped != start_record:
+                    raise InformixError(
+                        f"gzip snapshot file {path} for '{table.exposed_name}' holds {skipped} "
+                        f"records, fewer than the {start_record} the checkpoint has served; the "
+                        "extract changed under a running snapshot -- run a full refresh"
+                    )
+                reader = [key, start_record, records]
+            try:
+                raw_records = list(itertools.islice(reader[2], limit) if limit else reader[2])
+            except BaseException:
+                self._unl_gzip_reader = None
+                raise
+            exhausted = limit is None or len(raw_records) < limit
+            rows = self._shape_unl_records(table, table_options, snapshot_lsn, raw_records)
+            reader[1] = start_record + len(raw_records)
+            self._unl_gzip_reader = None if exhausted else reader
+            result = (rows, exhausted)
+            self._unl_gzip_window_memo = (memo_key, result)
+            return result
+
+        def _replay_unl_gzip_window(
+            self,
+            table: Table,
+            table_options: dict[str, str],
+            snapshot_lsn: int,
+            split: tuple[str, int, int, bool],
+            start_record: int,
+            *,
+            stop_record: int | None,
+        ) -> list[dict[str, Any]]:
+            """Recompute a logged gzip record window: records ``[start_record, stop_record)``.
+
+            ``stop_record`` None means the window ran to the end of the file. The logged end is
+            what Spark commits, so a shortfall (the file holds fewer records than the window
+            claimed) fails closed rather than silently dropping rows.
+            """
+
+            limit = None if stop_record is None else stop_record - start_record
+            if limit is not None and limit <= 0:
+                return []
+            rows, _exhausted = self._read_unl_gzip_window(
+                table, table_options, snapshot_lsn, split, start_record, limit
             )
-            return end
+            if limit is not None and len(rows) != limit:
+                raise InformixError(
+                    f"gzip snapshot file {split[0]} for '{table.exposed_name}' ended after "
+                    f"{start_record + len(rows)} records, short of the {stop_record} the logged "
+                    "microbatch covers; the extract changed under a running snapshot -- run a "
+                    "full refresh"
+                )
+            return rows
+
+        def _open_unl_gzip_records(
+            self, path: str, size: int, table_options: dict[str, str]
+        ) -> Iterator[bytes]:
+            """A fresh raw-record iterator over a whole gzip `.unl.gz` file, from its start."""
+
+            _delimiter, escape = self._unl_field_format(table_options)
+            escape_byte = _unl_escape_byte(escape, _client_encoding(self.options))
+            return _iter_gzip_unl_records(self._unl_read_chunk(path), size, escape=escape_byte)
+
+        def _shape_unl_records(
+            self,
+            table: Table,
+            table_options: dict[str, str],
+            snapshot_lsn: int,
+            raw_records: list[bytes],
+        ) -> list[dict[str, Any]]:
+            """Shape raw `.unl` records exactly as the serial and executor serves do."""
+
+            encoding = _client_encoding(self.options)
+            delimiter, escape = self._unl_field_format(table_options)
+            commit_time = self._resolve_unl_commit_time(
+                self._table_snapshot_source(table_options) or ""
+            )
+            return [
+                _shape_unl_record(
+                    raw,
+                    table,
+                    snapshot_lsn,
+                    table_options,
+                    encoding,
+                    delimiter=delimiter,
+                    escape=escape,
+                    commit_time=commit_time,
+                )
+                for raw in raw_records
+            ]
 
         def _serve_unl_snapshot(
             self, table: Table, options: dict[str, str], snapshot_lsn: int
@@ -19336,6 +19810,25 @@ def register_lakeflow_source(spark):
             )
 
 
+    def _unl_position(offset: dict[str, Any], *, terminal: int | None = None) -> tuple[int, int]:
+        """``(split index, record index)`` a file-snapshot offset points at.
+
+        An empty offset is the start of the extract. A stream-phase offset is past its end:
+        ``terminal`` (the split count) when given -- the end of a window that finished the
+        extract -- and an error otherwise.
+        """
+
+        if not offset:
+            return 0, 0
+        checkpoint = _validated_offset(offset)
+        if checkpoint.get("phase") != "snapshot":
+            if terminal is None:
+                raise InformixError("A file snapshot window cannot start at a stream-phase offset")
+            return terminal, 0
+        snapshot = checkpoint["snapshot"]
+        return int(snapshot["page_index"]), int(snapshot.get("record_index", 0))
+
+
     def _validated_offset(offset: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(offset, dict):
             raise ValueError("Informix offset must be a dictionary")
@@ -19438,6 +19931,9 @@ def register_lakeflow_source(spark):
             page_index = snapshot.get("page_index")
             if isinstance(page_index, bool) or not isinstance(page_index, int) or page_index < 0:
                 raise ValueError("Informix snapshot offset has an invalid snapshot.page_index")
+            record_index = snapshot.get("record_index", 0)
+            if isinstance(record_index, bool) or not isinstance(record_index, int) or record_index < 0:
+                raise ValueError("Informix snapshot offset has an invalid snapshot.record_index")
         incremental = result.get("incremental")
         if incremental is not None:
             if phase != "stream":

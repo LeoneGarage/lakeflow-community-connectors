@@ -493,9 +493,15 @@ connection:
         pieces at record boundaries. A gzip file (detected by its `1f 8b` magic bytes, not
         its name) is not seekable, so it is one non-splittable unit -- parallelism and
         mid-snapshot resume for compressed extracts come from using multiple `.unl.gz`
-        files, not from splitting within one. The operator is responsible for the extract
+        files or `snapshot.gzip.records.per.batch`, not from splitting within one. The operator is responsible for the extract
         reflecting the table at ingest time (quiesce, or extract-then-ingest); the
-        connector does not verify alignment. Reads via UNLOAD/HPL host-side tools are
+        connector does not verify alignment. Once the snapshot starts, the connector
+        pins each file's name, size, modification time and a fingerprint of its size
+        and first and last megabyte; a later read that finds any file added, removed or
+        changed fails with a full-refresh error rather than resuming into different
+        content. Modification times are compared within a few seconds, and an edit
+        confined to the middle of a file that keeps its size and modification time is
+        not detected. Reads via UNLOAD/HPL host-side tools are
         Phase A and out of the connector's scope.
 
     - name: snapshot.split.bytes
@@ -508,6 +514,23 @@ connection:
         large extract fans out into byte-balanced pieces. Splitting by bytes rather than
         rows lets the connector plan splits with a few small reads instead of scanning
         the whole file. Only meaningful with `snapshot.source`.
+
+    - name: snapshot.gzip.records.per.batch
+      type: string
+      required: false
+      description: >
+        Per-table number of records of a gzip `.unl.gz` file to serve per microbatch,
+        also accepted at connection scope; a non-negative integer, default 0. At 0 each
+        gzip file is one split, read whole on an executor in one microbatch, so a
+        failure re-reads the whole file. A positive value serves each gzip file on the
+        driver that many records per microbatch and records in the checkpoint how many
+        are done, so a failure resumes after the last committed record. The driver keeps
+        the decompressor open between microbatches, so normal progress is one pass; a
+        restart reopens the file and skips the records already ingested. Rows pass
+        through the driver and a gzip file is no longer read in parallel with other
+        splits, so it suits a few large gzip files rather than many small ones. Plain
+        files are unaffected. Applies to the partitioned reader. Only meaningful with
+        `snapshot.source`.
 
     - name: snapshot.unl.delimiter
       type: string
@@ -1226,4 +1249,4 @@ connection:
 
 # Exact per-table overrides consumed by the connector. `qualified_source_table` maps a
 # pipeline table to a dynamically discovered exposed name (`owner.table`).
-external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
+external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
