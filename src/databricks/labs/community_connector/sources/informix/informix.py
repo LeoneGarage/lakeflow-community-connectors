@@ -371,6 +371,28 @@ _SNAPSHOT_RESERVATION_OPTION = "snapshot.connection.reservation"
 # README warning). REPEATABLE READ restores the exactly-once, table-locking behaviour.
 _SNAPSHOT_ISOLATION_OPTION = "snapshot.isolation"
 _DEFAULT_SNAPSHOT_ISOLATION = "committed_read_last_committed"
+# How a keyed table's one-pass consistent snapshot reads the source. ``keyset`` (default)
+# pages in key order: each page is its own query, ordered by the key and bounded below by
+# the previous page's last key. With an index on the key columns that is a cheap index
+# walk; without one, every page can scan and sort the table, so the cost grows with pages
+# times table size -- the usual case for a primary.keys override, the wildcard especially.
+# ``cursor`` reads the table through one forward-only cursor with no ORDER BY, exactly as a
+# keyless table is read, while the key still drives the destination merge and the delete
+# channel. Skipping key comparisons also sidesteps keyset paging's trouble with NULL keys.
+#
+# Rows committed during a non-locking scan can reach both the snapshot and the CDC stream;
+# for a keyed table that is harmless, because the sink merges by key and CDC replays every
+# change after the snapshot LSN. snapshot.isolation=repeatable_read still gives an
+# exactly-once scan that locks the table.
+#
+# With snapshot.mode=incremental or auto_snapshot there are no key ranges to chunk by, so
+# a fresh snapshot falls back to the one-pass consistent snapshot, the same fallback a
+# DATETIME key that cannot be chunked takes. A chunked copy already in flight finishes as
+# it started. A keyless table always reads through the cursor, whatever this says.
+_SNAPSHOT_SCAN_OPTION = "snapshot.scan"
+_SNAPSHOT_SCAN_KEYSET = "keyset"
+_SNAPSHOT_SCAN_CURSOR = "cursor"
+_SNAPSHOT_SCANS = frozenset({_SNAPSHOT_SCAN_KEYSET, _SNAPSHOT_SCAN_CURSOR})
 
 # Where snapshot page payloads are written. ``fuse`` uses the UC Volume FUSE mount
 # (today's behaviour). ``rest`` writes them through the Files REST API, which never
@@ -3671,6 +3693,22 @@ def _append_only_value(raw: str) -> str:
 
 
 _PRIMARY_KEYS_OPTION = "primary.keys"
+# ``primary.keys: "*"`` keys a table on every column, in catalog column order, so the whole
+# row is its identity. Meant for a keyless table whose rows are unique as a whole, such as
+# a junction or lookup table. It is shorthand for listing every column, except that the key
+# follows the schema: an added column joins the key, which a running flow treats like any
+# key change. The schema-transition check fails it closed and asks for a full refresh,
+# rather than streaming on under a key that no longer covers the whole row.
+#
+# Nullable columns join the key like any other. On the keyed CDC path a delete carries a
+# NULL key value through, and the pipeline's AUTO CDC delete flow matches it (see
+# _shape_delete), so updates and deletes of a row holding NULL apply normally -- under a
+# wildcard every update changes the key and deletes the old row. What a NULL can still
+# break is keyset snapshot paging, which compares key values in SQL and in Python;
+# snapshot.scan=cursor avoids it, and the per-page sort an all-column key usually costs.
+# On the append path with snapshot.mode=cdc_only, its default, nothing pages by key, so a
+# NULL there is harmless.
+_PRIMARY_KEYS_WILDCARD = "*"
 # When a table has no primary-key constraint, promote a UNIQUE index to stand in as the
 # primary key, so a physically key-less table becomes keyed (resumable keyset snapshots and
 # CDC dedup) instead of falling back to the one-shot key-less drain. Default on. An explicit
@@ -4207,6 +4245,10 @@ class Table:
     # catalog's (empty, for a physically keyless table). Not part of the schema
     # fingerprint -- only the resulting primary_keys are.
     key_override: bool = False
+    # True when that override is the ``primary.keys: "*"`` wildcard. A schema refresh then
+    # re-expands the key to the refreshed columns instead of preserving the old list, so an
+    # added column changes the key and the flow fails closed. Not fingerprinted either.
+    key_wildcard: bool = False
     # Per-column key index direction, parallel to primary_keys: True == DESC.
     # Empty means all-ascending (the common case) -- paging then uses the default
     # lexicographic order untouched. A mixed/descending key carries the full
@@ -4726,13 +4768,9 @@ def _run_shared_cdc_shard(shard: _SharedCdcShard) -> None:
                         # _refresh_table_schema does. Without this an overridden table's
                         # fingerprint never matches its checkpoint, so it would always
                         # fall back to a direct read and never benefit from sharding --
-                        # and its PK-change detection would use the wrong keys.
-                        fresh = replace(
-                            fresh,
-                            primary_keys=table.primary_keys,
-                            key_override=True,
-                            key_descending=table.key_descending,
-                        )
+                        # and its PK-change detection would use the wrong keys. A
+                        # wildcard key is re-expanded to the fresh columns instead.
+                        fresh = _carry_key_override(fresh, table)
                     elif table.key_from_nullable_index:
                         # Same for a nullable-index promotion (a table-level option
                         # the catalog re-derivation cannot see): keep the promoted key.
@@ -7084,6 +7122,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         names a mixed-direction index's columns still pages in that index's own
         order rather than forcing an all-ascending sort. When no index matches,
         paging stays ascending.
+
+        ``"*"`` (or ``["*"]``) keys the table on every column in catalog order, nullable
+        ones included; see ``_PRIMARY_KEYS_WILDCARD``.
         """
 
         raw = table_options.get(_PRIMARY_KEYS_OPTION)
@@ -7092,6 +7133,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         keys = _parse_key_columns(raw)
         if not keys:
             raise ValueError(f"Option '{_PRIMARY_KEYS_OPTION}' is set but lists no columns")
+        wildcard = _PRIMARY_KEYS_WILDCARD in keys
+        if wildcard:
+            if keys != [_PRIMARY_KEYS_WILDCARD]:
+                raise ValueError(
+                    f"Option '{_PRIMARY_KEYS_OPTION}' must be '{_PRIMARY_KEYS_WILDCARD}' alone "
+                    "to key on every column, or a list of column names"
+                )
+            keys = [column.name for column in table.columns]
         if len(keys) != len(set(keys)):
             raise ValueError(f"Option '{_PRIMARY_KEYS_OPTION}' lists a duplicate column")
         column_names = {column.name for column in table.columns}
@@ -7105,14 +7154,17 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # The override restates the current key; keep its directions (already
             # reflecting the key index) rather than looking them up again. It is now
             # owned by the override, not a nullable-index promotion.
-            if table.key_override:
+            if table.key_override and table.key_wildcard == wildcard:
                 return table
-            return replace(table, key_override=True, key_from_nullable_index=False)
+            return replace(
+                table, key_override=True, key_wildcard=wildcard, key_from_nullable_index=False
+            )
         directions = self._override_key_directions(table.identity, tuple(keys))
         return replace(
             table,
             primary_keys=tuple(keys),
             key_override=True,
+            key_wildcard=wildcard,
             key_descending=tuple(directions or ()),
             key_from_nullable_index=False,
         )
@@ -8660,6 +8712,19 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 f"Table '{table.exposed_name}' is not CDC-capable; incremental "
                 "snapshot requires a primary key and CDC-supported columns"
             )
+        # snapshot.scan=cursor reads without key order, so there are no key ranges to
+        # chunk by: take the blocking consistent snapshot, which honours the cursor scan.
+        if self._snapshot_cursor_scan(options):
+            logging.getLogger(__name__).info(
+                "Informix incremental snapshot for '%s' using the blocking consistent "
+                "snapshot because %s=%s reads without key order",
+                table.exposed_name,
+                _SNAPSHOT_SCAN_OPTION,
+                _SNAPSHOT_SCAN_CURSOR,
+            )
+            return self._read_snapshot(
+                table, None, options, pipeline_scope_override=pipeline_scope_override
+            )
         # DATETIME primary keys cannot use native keyset (WHERE pk > ?)
         # pagination reliably. When every DATETIME key column has an
         # order-preserving string cast we chunk by that string instead;
@@ -9091,13 +9156,17 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 f"Table '{table.exposed_name}' is no longer CDC-capable after metadata refresh; "
                 "run a full refresh after restoring its primary key and supported schema"
             )
-        if table.primary_keys:
+        # The key columns the drain pages by: none for a keyless table or a cursor scan,
+        # which then reads through one unordered forward-only cursor.
+        scan_keys = () if self._snapshot_cursor_scan(options) else table.primary_keys
+        if scan_keys:
             page_size = self._table_int_option(
                 options, "snapshot.page.size", _DEFAULT_SNAPSHOT_PAGE_SIZE, minimum=1
             )
         else:
             # A keyless initial snapshot pages positionally and stages larger pages by
-            # default; its own knob so it never changes keyed keyset chunk sizing.
+            # default; its own knob so it never changes keyed keyset chunk sizing. A
+            # cursor scan of a keyed table pages the same way, so it shares the knob.
             page_size = self._table_int_option(
                 options,
                 "keyless.snapshot.page.size",
@@ -9300,12 +9369,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 snapshot_lsn, rows = consistent_snapshot(
                     table.identity,
                     [c.name for c in table.columns],
-                    table.primary_keys,
+                    scan_keys,
                     page_size,
                     max_rows,
                     self._table_int_option(options, "snapshot.max.bytes", 0, minimum=0),
                     datetime_primary_key=any(
-                        column.name in table.primary_keys and column.type_name == "DATETIME"
+                        column.name in scan_keys and column.type_name == "DATETIME"
                         for column in table.columns
                     ),
                     page_consumer=page_consumer,
@@ -10248,6 +10317,24 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _shared_cdc_enabled(self) -> bool:
         return _option_bool(self.options, _SHARED_CDC_SESSION_OPTION, True)
 
+    def _snapshot_cursor_scan(self, options: dict[str, str]) -> bool:
+        """Whether ``snapshot.scan=cursor`` asks for an unordered one-pass snapshot.
+
+        The table option wins over connection scope; the default is ``keyset``. See
+        ``_SNAPSHOT_SCAN_OPTION``.
+        """
+
+        raw = options.get(
+            _SNAPSHOT_SCAN_OPTION, self.options.get(_SNAPSHOT_SCAN_OPTION, _SNAPSHOT_SCAN_KEYSET)
+        )
+        value = str(raw).strip().lower()
+        if value not in _SNAPSHOT_SCANS:
+            raise ValueError(
+                f"Option '{_SNAPSHOT_SCAN_OPTION}' must be one of: "
+                f"{_SNAPSHOT_SCAN_KEYSET}, {_SNAPSHOT_SCAN_CURSOR}"
+            )
+        return value == _SNAPSHOT_SCAN_CURSOR
+
     def _snapshot_isolation(self, options: dict[str, str]) -> str:
         """Resolve the ``snapshot.isolation`` table option to its SQL clause.
 
@@ -11023,13 +11110,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # when the caller was already overridden, so a genuine catalog key change
             # on a normal table is still detected as drift. The override's adopted
             # key-index directions are preserved too, so a mixed-direction override
-            # keeps paging in its index order across the refresh.
-            refreshed = replace(
-                refreshed,
-                primary_keys=table.primary_keys,
-                key_override=True,
-                key_descending=table.key_descending,
-            )
+            # keeps paging in its index order across the refresh. A wildcard key is
+            # every column, so it is re-expanded instead: an added column changes the
+            # key and the schema-transition check fails the flow closed.
+            refreshed = _carry_key_override(refreshed, table)
         elif table.key_from_nullable_index:
             # Preserve a nullable-index promotion across the refresh: the catalog
             # re-derives the table as key-less (no all-NOT-NULL index), so without
@@ -12603,13 +12687,40 @@ def _shape_tombstone(row, table, record, tx, *, lsn: int | None = None):
 
 
 def _shape_delete(row, table, record, tx):
+    """Shape a delete-channel row: the key values, with every other column NULL.
+
+    A NULL key value passes through when its column is declared nullable. Such a key can
+    only come from a ``primary.keys`` override (the wildcard included) or a nullable-index
+    promotion, and the pipeline's AUTO CDC delete flow matches NULL key values, for SCD1
+    and SCD2 alike.
+
+    A NOT NULL key column -- every real catalog primary key -- can never legitimately
+    hold NULL, so a NULL there still fails closed as a corrupt or incomplete before-image.
+    So does a key column missing from the image entirely: the CDC decoder sets every
+    captured column, using None for a SQL NULL, so an absent column is never a NULL.
+    """
+
     if row is None:
         raise InformixError("CDC delete has no before image; full-row logging is required")
     result = {column.name: None for column in table.columns}
+    nullable: set[str] | None = None
     for pk in table.primary_keys:
-        if row.get(pk) is None:
-            raise InformixError(f"CDC delete has no primary-key value for {pk}")
-        result[pk] = _framework_value(row[pk])
+        if pk not in row:
+            raise InformixError(
+                f"CDC delete on '{table.exposed_name}' has no value for key column {pk}; "
+                "the before image is incomplete"
+            )
+        value = row[pk]
+        if value is None:
+            if nullable is None:
+                nullable = {column.name for column in table.columns if column.nullable}
+            if pk not in nullable:
+                raise InformixError(
+                    f"CDC delete on '{table.exposed_name}' has NULL in NOT NULL key column "
+                    f"{pk}; the before image is corrupt or incomplete, or "
+                    f"'{_NULL_BYTE_OPTION}=null' turned a string holding a NUL byte into NULL"
+                )
+        result[pk] = _framework_value(value)
     result.update(
         {
             CURSOR: _sortable_lsn(_lsn(record)),
@@ -13601,6 +13712,29 @@ def _table_from_schema_state(state: dict[str, object], default_database: str) ->
     if _schema_fingerprint(table) != state.get("fingerprint"):
         raise InformixError("Informix shared CDC schema fingerprint does not match metadata")
     return table
+
+
+def _carry_key_override(fresh: Table, overridden: Table) -> Table:
+    """Carry a ``primary.keys`` override from ``overridden`` onto a re-read ``fresh`` table.
+
+    An explicit key list is preserved as-is, with its adopted key-index directions. A
+    wildcard key is re-expanded to ``fresh``'s columns, keeping the directions only when
+    the column set is unchanged.
+    """
+
+    keys = overridden.primary_keys
+    descending = overridden.key_descending
+    if overridden.key_wildcard:
+        keys = tuple(column.name for column in fresh.columns)
+        if keys != overridden.primary_keys:
+            descending = ()
+    return replace(
+        fresh,
+        primary_keys=keys,
+        key_override=True,
+        key_wildcard=overridden.key_wildcard,
+        key_descending=descending,
+    )
 
 
 def _ensure_additive_schema_change(previous: Table, current: Table) -> None:

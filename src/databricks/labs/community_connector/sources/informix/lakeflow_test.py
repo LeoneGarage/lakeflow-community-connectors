@@ -204,6 +204,9 @@ class FakeBridge:
         self.snapshot_page_sizes = []
         self.snapshot_filters = []
         self.snapshot_isolations = []
+        # The key columns each consistent_snapshot call was asked to page by; () is the
+        # unordered cursor scan a keyless table, or snapshot.scan=cursor, takes.
+        self.snapshot_primary_keys = []
         self.prepared_identities = []
         self.validated_initial = []
         self.change_reads = []
@@ -307,7 +310,8 @@ class FakeBridge:
         snapshot_filter=None,
         isolation="REPEATABLE READ",
     ):
-        del identity, columns, primary_keys, datetime_primary_key
+        del identity, columns, datetime_primary_key
+        self.snapshot_primary_keys.append(tuple(primary_keys))
         self.snapshot_max_bytes.append(max_bytes)
         self.snapshot_max_rows.append(max_rows)
         self.snapshot_page_sizes.append(page_size)
@@ -7192,6 +7196,131 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(refreshed.primary_keys, ("id",))
         self.assertTrue(refreshed.key_override)
 
+    WILDCARD = {"primary.keys": "*"}
+
+    def test_primary_keys_wildcard_keys_every_column_in_column_order(self):
+        # `value` is nullable and joins the key anyway: like an explicit list, the
+        # wildcard trusts the operator that key columns never actually hold NULL.
+        for raw in ("*", " * ", '["*"]'):
+            with self.subTest(raw=raw):
+                connector, _ = self._keyless_connector()
+
+                metadata = connector.read_table_metadata("app.orders", {"primary.keys": raw})
+
+                self.assertEqual(metadata["ingestion_type"], "cdc_with_deletes")
+                self.assertEqual(metadata["primary_keys"], ["id", "value"])
+                table = connector._table("app.orders", {"primary.keys": raw})
+                self.assertTrue(table.key_override and table.key_wildcard)
+
+    def test_primary_keys_wildcard_must_stand_alone(self):
+        connector, _ = self._keyless_connector()
+
+        for raw in ("*,id", '["*", "id"]', "*,*"):
+            with self.subTest(raw=raw), self.assertRaisesRegex(ValueError, "alone"):
+                connector.read_table_metadata("app.orders", {"primary.keys": raw})
+
+    def _project_deletes(self, connector, table_options, *records):
+        """Project ``records`` onto app.orders' delete channel as one transaction."""
+        table = connector._table("app.orders", dict(table_options))
+        tx = informix_module.CommittedTransaction(1, 100, 110, 110, tuple(records))
+        return informix_module._project_transaction(tx, table, deletes=True)
+
+    def test_a_delete_carries_null_for_a_nullable_key_column(self):
+        # The pipeline's AUTO CDC delete flow matches NULL key values, so a NULL in a
+        # nullable key column is passed through rather than failing the flow. Under a
+        # wildcard every update changes the key, so the update's old row is deleted the
+        # same way.
+        update = {
+            "op": "UPDATE",
+            "lsn": 103,
+            "before_lsn": 102,
+            "before": {"id": 1, "value": None},
+            "after": {"id": 1, "value": "b"},
+        }
+        delete = {"op": "DELETE", "lsn": 104, "row": {"id": 1, "value": None}}
+        for options in (dict(self.WILDCARD), {"primary.keys": "id,value"}):
+            with self.subTest(options=options):
+                connector, _ = self._keyless_connector()  # `value` is nullable
+
+                rows = self._project_deletes(connector, options, update, delete)
+
+                self.assertEqual(
+                    [(row["id"], row["value"], row["_informix_op"]) for row in rows],
+                    [(1, None, "d"), (1, None, "d")],
+                )
+
+    def test_a_null_in_a_not_null_key_column_still_fails_as_a_broken_record(self):
+        # A NOT NULL key column -- every real catalog primary key -- never legitimately
+        # holds NULL, so a NULL there is a corrupt or incomplete before image. So is a key
+        # column missing from the image, since the decoder sets every captured column.
+        cases = (
+            ({"id": None, "value": "a"}, "NULL in NOT NULL key column id"),
+            ({"value": "a"}, "no value for key column id"),
+        )
+        for options in ({}, dict(self.WILDCARD)):
+            for row, message in cases:
+                with self.subTest(options=options, row=row):
+                    if options:
+                        connector, _ = self._keyless_connector()  # `id` is NOT NULL
+                    else:
+                        connector = self.connector(FakeBridge())  # catalog key `id`
+                    delete = {"op": "DELETE", "lsn": 101, "row": row}
+
+                    with self.assertRaisesRegex(InformixError, message):
+                        self._project_deletes(connector, options, delete)
+
+    def test_a_schema_refresh_re_expands_a_wildcard_key(self):
+        # An explicit list survives a refresh unchanged (see the test above); a wildcard
+        # is every column, so it must pick up the added one.
+        connector, bridge = self._keyless_connector()
+        table = connector._table("app.orders", dict(self.WILDCARD))
+        self.assertEqual(table.primary_keys, ("id", "value"))
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+
+        refreshed = connector._refresh_table_schema(table, None)
+
+        self.assertEqual(refreshed.primary_keys, ("id", "value", "added"))
+        self.assertTrue(refreshed.key_override and refreshed.key_wildcard)
+
+    def _read_after_adding_a_column(self, options, *, restart):
+        """Checkpoint app.orders, append a nullable column at the source, then read on
+        from that checkpoint with the same connector or a restarted one."""
+        bridge = FakeBridge()
+        bridge.tables = [_table(primary_keys=())]
+        connector = self.connector(bridge)
+        _, checkpoint = connector.read_table("app.orders", {}, options)
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+        reader = self.connector(bridge) if restart else connector
+        rows, end = reader.read_table("app.orders", checkpoint, options)
+        return list(rows), checkpoint, end
+
+    # A running flow cannot change its key in place, so a wildcard key that grows with
+    # the schema must stop the flow with a full-refresh error -- on the same connector
+    # and after a restart -- instead of streaming on under a key that misses the new
+    # column.
+    def test_an_added_column_fails_a_running_wildcard_keyed_flow_closed(self):
+        with self.assertRaisesRegex(InformixError, "primary keys; run a full refresh"):
+            self._read_after_adding_a_column(dict(self.WILDCARD), restart=False)
+
+    def test_an_added_column_fails_a_restarted_wildcard_keyed_flow_closed(self):
+        with self.assertRaisesRegex(InformixError, "primary keys; run a full refresh"):
+            self._read_after_adding_a_column(dict(self.WILDCARD), restart=True)
+
+    def test_an_added_column_transitions_an_explicitly_keyed_flow(self):
+        # The contrast: an explicit key list is not tied to the column set.
+        rows, checkpoint, transitioned = self._read_after_adding_a_column(
+            {"primary.keys": "id,value"}, restart=True
+        )
+
+        self.assertEqual(rows, [])
+        self.assertNotEqual(transitioned["schema_fingerprint"], checkpoint["schema_fingerprint"])
+
     def test_a_table_with_uncapturable_columns_is_never_append(self):
         bridge = FakeBridge()
         bridge.tables = [_table(cdc=False, primary_keys=())]
@@ -7640,6 +7769,16 @@ class LakeflowContractTests(unittest.TestCase):
         rows = self._keyed_append_stream(changes)
 
         self.assertEqual(self._ops(rows), [(1, "a", "c"), (1, "b", "u")])
+
+    def test_a_wildcard_keyed_append_table_tombstones_every_update(self):
+        # Every column is the key, so even an update to a non-id column changes the key:
+        # the old row lands as a 'd' tombstone ahead of the new row's 'u'.
+        changes = [dict(record) for record in self._KEY_CHANGE]
+        changes[3]["row"] = {"id": 1, "value": "b"}
+
+        rows = self._append_stream({**self.WILDCARD, **self.APPEND}, changes=changes)
+
+        self.assertEqual(self._ops(rows), [(1, "a", "c"), (1, "a", "d"), (1, "b", "u")])
 
     def test_key_change_tombstones_follow_the_tombstone_option(self):
         rows = self._keyed_append_stream(self._KEY_CHANGE, {"append.delete.tombstones": "false"})
@@ -12455,6 +12594,107 @@ class SnapshotIsolationOptionTests(unittest.TestCase):
         with self.assertRaises(informix_module.InformixError):
             with bridge._repeatable_read_transaction("DROP TABLE users"):
                 pass
+
+
+class SnapshotScanOptionTests(unittest.TestCase):
+    """snapshot.scan=cursor reads a keyed table's one-pass snapshot through the unordered
+    keyless cursor instead of key-ordered keyset pages, while the key still drives the
+    destination merge and the delete channel."""
+
+    def setUp(self):
+        self._shared_state = tempfile.TemporaryDirectory()
+        self._lakebase = _OfflineLakebase().install(self)
+
+    def tearDown(self):
+        self._shared_state.cleanup()
+
+    def _connector(self, bridge=None, **options):
+        connector = InformixLakeflowConnect(
+            {
+                "database": "demo",
+                "snapshot.staging.location": self._shared_state.name,
+                "lakebase.password": "test-state-password",
+                "snapshot.mode": "initial",
+                "snapshot.shared.session": "false",
+                "cdc.shared.session": "false",
+                "stream.partitioned": "false",
+                **options,
+            }
+        )
+        # Unique scope per connector so staged snapshot state never leaks between cases.
+        connector.set_registration_scope(hashlib.sha256(os.urandom(16)).hexdigest()[:32])
+        connector._bridge_instance = bridge or FakeBridge()
+        return connector
+
+    @staticmethod
+    def _keyless_bridge():
+        bridge = FakeBridge()
+        bridge.tables = [_table(primary_keys=())]
+        return bridge
+
+    def test_keyset_is_the_default(self):
+        connector = self._connector()
+
+        connector.read_table("app.orders", {}, {})
+
+        self.assertEqual(connector._bridge_instance.snapshot_primary_keys, [("id",)])
+
+    def test_cursor_drains_a_catalog_keyed_table_without_key_order(self):
+        connector = self._connector()
+
+        rows, _ = connector.read_table("app.orders", {}, {"snapshot.scan": "cursor"})
+
+        bridge = connector._bridge_instance
+        self.assertEqual(bridge.snapshot_primary_keys, [()])
+        self.assertEqual(
+            bridge.snapshot_page_sizes, [informix_module._DEFAULT_KEYLESS_SNAPSHOT_PAGE_SIZE]
+        )
+        self.assertEqual(sorted(row["id"] for row in rows), [1, 2])
+
+    def test_cursor_keeps_an_overridden_key_for_the_merge(self):
+        # The point of the option: a primary.keys override on a keyless table snapshots
+        # without a per-page sort, yet still reports and merges on its key.
+        for options in ({"primary.keys": "id"}, {"primary.keys": "*"}):
+            with self.subTest(options=options):
+                connector = self._connector(self._keyless_bridge())
+                table_options = {**options, "snapshot.scan": "cursor"}
+
+                metadata = connector.read_table_metadata("app.orders", table_options)
+                connector.read_table("app.orders", {}, table_options)
+
+                self.assertEqual(metadata["ingestion_type"], "cdc_with_deletes")
+                self.assertTrue(metadata["primary_keys"])
+                self.assertEqual(connector._bridge_instance.snapshot_primary_keys, [()])
+
+    def test_connection_scope_applies_and_the_table_option_wins(self):
+        connector = self._connector(**{"snapshot.scan": "cursor"})
+        connector.read_table("app.orders", {}, {})
+        self.assertEqual(connector._bridge_instance.snapshot_primary_keys, [()])
+
+        connector = self._connector(**{"snapshot.scan": "cursor"})
+        connector.read_table("app.orders", {}, {"snapshot.scan": "keyset"})
+        self.assertEqual(connector._bridge_instance.snapshot_primary_keys, [("id",)])
+
+    def test_incremental_mode_falls_back_to_the_cursor_consistent_snapshot(self):
+        # A cursor scan has no key ranges to chunk by, so a fresh incremental snapshot
+        # takes the one-pass consistent snapshot, as an unchunkable DATETIME key does.
+        connector = self._connector()
+
+        _, offset = connector.read_table(
+            "app.orders", {}, {"snapshot.mode": "incremental", "snapshot.scan": "cursor"}
+        )
+
+        self.assertEqual(connector._bridge_instance.snapshot_primary_keys, [()])
+        self.assertNotIn("incremental", offset)
+
+        # Without the option the same mode chunks by key and never calls the drain.
+        connector = self._connector()
+        connector.read_table("app.orders", {}, {"snapshot.mode": "incremental"})
+        self.assertEqual(connector._bridge_instance.snapshot_primary_keys, [])
+
+    def test_a_malformed_scan_value_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "snapshot.scan"):
+            self._connector()._snapshot_cursor_scan({"snapshot.scan": "sorted"})
 
 
 class FairSlotQueueWiringTests(unittest.TestCase):

@@ -632,6 +632,24 @@ connection:
         `repeatable_read` to restore the exactly-once, table-locking behavior.
         Tokens are case- and whitespace-insensitive; unknown values are rejected.
 
+    - name: snapshot.scan
+      type: string
+      required: false
+      description: >
+        Per-table (also connection-scope) read strategy for a keyed table's
+        one-pass snapshot; default `keyset`. `keyset` pages in key order, one query
+        per page ordered by the key columns -- cheap with an index on those
+        columns, but without one every page can scan and sort the table, the usual
+        case for a primary.keys override and especially the "*" wildcard. `cursor`
+        reads the table through one forward-only cursor with no sorting, as a
+        keyless table is read, while the key still drives the destination merge
+        and delete handling; it also avoids keyset paging's trouble with NULL key
+        values, and pages are sized by keyless.snapshot.page.size. With
+        snapshot.mode=incremental or auto_snapshot a cursor scan has no key ranges
+        to chunk by, so a new snapshot uses the one-pass snapshot instead; a chunked
+        copy already in progress finishes as it started. A keyless table always
+        reads through the cursor. Accepts `keyset`/`cursor`.
+
     - name: append.only.ingestion
       type: string
       required: false
@@ -697,7 +715,20 @@ connection:
         destination merge key too (no separate `primary_keys` needed). The columns
         must exist in the table. You MUST guarantee they are unique per row: a
         non-unique override corrupts upserts, delete identification, and snapshot
-        pagination. Leave unset to use the catalog's primary key (or none).
+        pagination. A key column declared nullable may hold NULL: a delete carries
+        the NULL through and the pipeline's delete flow matches NULL key values, so
+        updates and deletes of that row apply normally. A NULL in a NOT NULL key
+        column still fails the pipeline as a broken log record, and a NULL key value
+        can still make a keyset snapshot skip rows or fail (snapshot.scan=cursor
+        avoids that). Leave unset to use the catalog's primary key (or none).
+        Set "*" (or ["*"]) to key on every column, in catalog column order, so the
+        whole row is its identity -- for a keyless table whose rows are unique as a
+        whole. Nullable columns join the wildcard key too, so the NULL behaviour
+        above applies to every nullable column; on an append-only table with
+        snapshot.mode=cdc_only, its default, NULLs are harmless. The wildcard
+        follows the schema:
+        an added column joins the key, which a running flow treats like any key
+        change, so it stops and asks for a full refresh.
 
     - name: snapshot.max.bytes
       type: string
@@ -1191,4 +1222,4 @@ connection:
 
 # Exact per-table overrides consumed by the connector. `qualified_source_table` maps a
 # pipeline table to a dynamically discovered exposed name (`owner.table`).
-external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
+external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
