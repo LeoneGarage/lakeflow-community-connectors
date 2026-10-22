@@ -1074,8 +1074,12 @@ connection:
         all-NOT-NULL UNIQUE index, setting this true lets a UNIQUE index that
         includes nullable column(s) stand in as the key, so the table takes the
         resumable keyed path instead of the one-shot key-less drain. The operator
-        thereby asserts those columns are unique and non-null for every row; a real
-        NULL there would mis-order or drop rows in keyset pagination and CDC dedup.
+        thereby asserts those columns are unique for every row. A row that does hold
+        NULL in one of them is still updated and deleted correctly: as for a
+        primary.keys override, a delete carries the NULL through and the pipeline's
+        delete flow matches NULL key values. What a NULL can still break is keyset
+        snapshot paging, which compares key values and may skip the row or fail;
+        snapshot.scan=cursor avoids that.
         Only has effect when primary.key.from.unique.index is enabled (the default)
         and no non-null key exists; an all-NOT-NULL index and an explicit
         primary.keys option both still win. Accepts true/false.

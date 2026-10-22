@@ -3634,6 +3634,22 @@ def _option_bool(options: dict[str, str], name: str, default: bool) -> bool:
     raise ValueError(f"Option '{name}' must be one of: 1, true, yes, 0, false, no")
 
 
+def _snapshot_scan_value(raw: object) -> str:
+    """Normalise and validate a ``snapshot.scan`` value; see ``_SNAPSHOT_SCAN_OPTION``.
+
+    Shared by construction (connection scope), registration (table scope) and the
+    snapshot read itself, so a malformed value fails before any read.
+    """
+
+    value = str(raw).strip().lower()
+    if value not in _SNAPSHOT_SCANS:
+        raise ValueError(
+            f"Option '{_SNAPSHOT_SCAN_OPTION}' must be one of: "
+            f"{_SNAPSHOT_SCAN_KEYSET}, {_SNAPSHOT_SCAN_CURSOR}"
+        )
+    return value
+
+
 def _validate_nonneg_float_option(options: dict[str, str], name: str) -> None:
     """Raise if ``name`` is present and not a number >= 0. Absent means the default."""
 
@@ -3717,8 +3733,11 @@ _PRIMARY_KEYS_WILDCARD = "*"
 _PROMOTE_UNIQUE_INDEX_OPTION = "primary.key.from.unique.index"
 # Per-table opt-in: when a table has no primary key and no all-NOT-NULL unique index, allow a
 # UNIQUE index that includes nullable column(s) to stand in as the key. The operator asserts
-# those columns are effectively unique and non-null for every row; a real NULL there would
-# mis-order or drop rows in keyset pagination and CDC dedup. Default false (stay key-less).
+# those columns are effectively unique for every row. A row that does hold NULL in one of
+# them is still updated and deleted correctly: as for a ``primary.keys`` override, a delete
+# carries the NULL through and the pipeline's delete flow matches it (see _shape_delete).
+# What a NULL can still break is keyset snapshot paging, which compares key values and can
+# skip the row or fail; snapshot.scan=cursor avoids that. Default false (stay key-less).
 _ALLOW_NULLABLE_INDEX_OPTION = "allow.nullable.index"
 
 
@@ -5281,6 +5300,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             _append_only_value(options[_APPEND_INGESTION_OPTION])
         if _APPEND_DELETE_TOMBSTONES_OPTION in options:
             _option_bool(options, _APPEND_DELETE_TOMBSTONES_OPTION, True)
+        if _SNAPSHOT_SCAN_OPTION in options:
+            _snapshot_scan_value(options[_SNAPSHOT_SCAN_OPTION])
         if int(options.get("cdc.max.records", str(_DEFAULT_CDC_MAX_RECORDS))) > 256:
             raise ValueError("Option 'cdc.max.records' must be <= 256")
         if int(options.get("cdc.read.bytes", "32000")) > 32767:
@@ -5601,9 +5622,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             try:
                 table = self._registration_table(table_name, table_options)
                 _ensure_materializable(table, table_options)
-                # Only consulted on the append path, but validated for every table so a
-                # malformed value fails at registration rather than on a later read.
+                # Only consulted on the append path (tombstones) or at snapshot time
+                # (scan), but validated for every table so a malformed value fails at
+                # registration rather than on a later read.
                 self._append_delete_tombstones(table_options)
+                self._snapshot_cursor_scan(table_options)
                 if self._append_only_table(table, table_options):
                     # Report a cursor even though no primary key is exposed: the
                     # cursor is what makes the framework treat this as an
@@ -7922,15 +7945,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         self._staging_files_api = files_api
         return files_api
 
-    def _should_pipeline_staging(self, table: Table) -> bool:
+    def _should_pipeline_staging(self, scan_keys: tuple[str, ...]) -> bool:
         """Whether to overlap this drain's page fetch with the page upload.
 
-        Only for a keyless positional drain over the REST transport: keyed drains
-        are out of scope, and pipelining FUSE writes would raise the mount's write
+        Only for a positional drain over the REST transport -- ``scan_keys`` empty: a
+        keyless table, or a keyed one on ``snapshot.scan=cursor``. Keyset drains are
+        out of scope, and pipelining FUSE writes would raise the mount's write
         frequency -- the exact condition the REST transport exists to avoid.
         """
 
-        if table.primary_keys:
+        if scan_keys:
             return False
         if not _option_bool(self.options, _SNAPSHOT_STAGING_PIPELINE_OPTION, True):
             return False
@@ -9358,11 +9382,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 if self._drain_progress is not None:
                     self._drain_progress()
 
-            # A keyless REST drain overlaps the next page fetch with the previous
-            # page's shape+upload through a bounded background uploader; the counters
-            # stage_page owns are then read only after the pipeline is joined below.
+            # A positional REST drain (keyless, or keyed under snapshot.scan=cursor)
+            # overlaps the next page fetch with the previous page's shape+upload through
+            # a bounded background uploader; the counters stage_page owns are then read
+            # only after the pipeline is joined below.
             pipeline = (
-                _AsyncStagePipeline(stage_page) if self._should_pipeline_staging(table) else None
+                _AsyncStagePipeline(stage_page)
+                if self._should_pipeline_staging(scan_keys)
+                else None
             )
             page_consumer = pipeline.submit if pipeline is not None else stage_page
             try:
@@ -10327,13 +10354,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         raw = options.get(
             _SNAPSHOT_SCAN_OPTION, self.options.get(_SNAPSHOT_SCAN_OPTION, _SNAPSHOT_SCAN_KEYSET)
         )
-        value = str(raw).strip().lower()
-        if value not in _SNAPSHOT_SCANS:
-            raise ValueError(
-                f"Option '{_SNAPSHOT_SCAN_OPTION}' must be one of: "
-                f"{_SNAPSHOT_SCAN_KEYSET}, {_SNAPSHOT_SCAN_CURSOR}"
-            )
-        return value == _SNAPSHOT_SCAN_CURSOR
+        return _snapshot_scan_value(raw) == _SNAPSHOT_SCAN_CURSOR
 
     def _snapshot_isolation(self, options: dict[str, str]) -> str:
         """Resolve the ``snapshot.isolation`` table option to its SQL clause.

@@ -7505,8 +7505,10 @@ class LakeflowContractTests(unittest.TestCase):
                 connector.read_table("app.orders", {}, options)
 
     def test_pipelining_engages_only_for_keyless_rest_drains(self):
-        keyless = types.SimpleNamespace(primary_keys=())
-        keyed = types.SimpleNamespace(primary_keys=("id",))
+        # The gate is the drain's scan keys, not the table's key: () is a positional
+        # drain (a keyless table, or a keyed one on snapshot.scan=cursor).
+        keyless = ()
+        keyed = ("id",)
 
         def _fake_provider(*_a, **_k):
             provider = mock.Mock()
@@ -7533,7 +7535,7 @@ class LakeflowContractTests(unittest.TestCase):
             self.assertTrue(
                 rest._should_pipeline_staging(keyless), "keyless REST drain should pipeline"
             )
-            self.assertFalse(rest._should_pipeline_staging(keyed), "keyed drains are out of scope")
+            self.assertFalse(rest._should_pipeline_staging(keyed), "keyset drains are out of scope")
 
             off, _ = self._keyless_connector(
                 **dict(rest_opts, **{"snapshot.staging.pipeline": "false"})
@@ -12692,9 +12694,64 @@ class SnapshotScanOptionTests(unittest.TestCase):
         connector.read_table("app.orders", {}, {"snapshot.mode": "incremental"})
         self.assertEqual(connector._bridge_instance.snapshot_primary_keys, [])
 
-    def test_a_malformed_scan_value_is_rejected(self):
+    def test_a_cursor_scan_pipelines_its_rest_staging_like_a_keyless_drain(self):
+        # The drain, not the key, decides the overlap: a keyed table read through the
+        # cursor stages its pages through the same background uploader a keyless table
+        # uses on the REST transport, while its keyset drain stays synchronous.
+        built: list = []
+        real_pipeline = informix_module._AsyncStagePipeline
+
+        class _RecordingPipeline(real_pipeline):
+            def __init__(self, *args, **kwargs):
+                built.append(self)
+                super().__init__(*args, **kwargs)
+
+        class _FakeFilesApi:
+            def __init__(self, host, provider):
+                pass
+
+            def put(self, path, data):
+                os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+                with open(path, "wb") as handle:
+                    handle.write(data)
+
+        def _fake_provider(*_a, **_k):
+            provider = mock.Mock()
+            provider.bearer.return_value = "tok"
+            return provider
+
+        rest = {
+            "snapshot.staging.transport": "rest",
+            "lakebase.workspace.host": "https://ws",
+            "lakebase.workspace.token": "boot",
+        }
+        with (
+            mock.patch.object(informix_module, "_AsyncStagePipeline", _RecordingPipeline),
+            mock.patch.object(informix_module, "WorkspaceFilesApi", _FakeFilesApi),
+            mock.patch.object(informix_module, "StagingCredentialProvider", _fake_provider),
+        ):
+            for scan, pipelines in (("cursor", 1), ("keyset", 0)):
+                with self.subTest(scan=scan):
+                    del built[:]
+                    bridge = FakeBridge()
+                    bridge.rows = [{"id": i, "value": str(i)} for i in range(10)]
+                    connector = self._connector(bridge, **rest)
+
+                    connector.read_table(
+                        "app.orders",
+                        {},
+                        {"snapshot.scan": scan, "keyless.snapshot.page.size": "3"},
+                    )
+
+                    self.assertEqual(len(built), pipelines)
+
+    def test_a_malformed_scan_value_is_rejected_at_registration_and_construction(self):
+        # Like append.delete.tombstones: a typo fails when the table is registered or
+        # the connector is built, not on the first snapshot read.
         with self.assertRaisesRegex(ValueError, "snapshot.scan"):
-            self._connector()._snapshot_cursor_scan({"snapshot.scan": "sorted"})
+            self._connector().read_table_metadata("app.orders", {"snapshot.scan": "sorted"})
+        with self.assertRaisesRegex(ValueError, "snapshot.scan"):
+            self._connector(**{"snapshot.scan": "sorted"})
 
 
 class FairSlotQueueWiringTests(unittest.TestCase):
