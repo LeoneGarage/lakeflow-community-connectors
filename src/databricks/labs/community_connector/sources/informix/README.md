@@ -26,6 +26,7 @@ The pure-Python protocol implementation has completed authentication, query, dis
   - [The default change log](#the-default-change-log)
   - [Keyed on a set of columns](#keyed-on-a-set-of-columns)
   - [Keyed on the whole row](#keyed-on-the-whole-row)
+    - [Why not a row hash](#why-not-a-row-hash)
   - [Soft deletes](#soft-deletes)
   - [A change log with a key](#a-change-log-with-a-key)
   - [Snapshot-only ingestion](#snapshot-only-ingestion)
@@ -749,6 +750,42 @@ junction and lookup tables whose rows are unique only as a whole.
   [Additive schema evolution without full refresh](#additive-schema-evolution-without-full-refresh).
 - Paging a snapshot by every column sorts the table once per page, so set
   `snapshot.scan: cursor`.
+
+#### Why not a row hash
+
+Another way to key a keyless table is a synthetic column holding a hash of the
+whole row. The connector keys on the columns themselves instead, because here a
+hash costs more than it saves:
+
+- **It can't make the snapshot cheaper.** The hash exists only in the
+  connector's output, so Informix can't index it or order by it. The per-page
+  sort a whole-row key causes is avoided with `snapshot.scan: cursor` instead.
+- **It makes merges read more of the target.** A merge skips a target file only
+  when that file's key values can't include any incoming key. Hash values are
+  random, so every file spans nearly the whole range and almost nothing is
+  skipped. Clustering the target on the hash helps, but each changed row still
+  lands in its own file. Real columns keep some locality, for example recent IDs
+  that tend to change together.
+- **It can silently merge distinct rows.** Two different rows with the same hash
+  become one. Making that negligible needs a hash of at least 128 bits.
+- **It depends on the exact bytes of every value.** The target compares typed
+  values, so representation differences it ignores, such as a decimal's trailing
+  zeros, can still give two hashes of the same row. If a snapshot row and a later
+  change ever render a value differently, the change no longer finds its row.
+  With real columns that kind of mismatch can be inspected column by column; with
+  a hash it can't.
+- **It turns a column addition into a full refresh.** Adding a column changes
+  every row's hash, so changes to existing rows no longer find them. With real
+  columns, rows from before the change match by their NULL in the new column, so
+  the key grows without a full refresh.
+- **It costs CPU on every row.** The connector would hash each row in Python,
+  including every change row.
+
+A hash does give a compact, single-column key, which can speed up merges on very
+wide rows. Its other advantage, a key that is never NULL, doesn't matter here,
+because updates and deletes of rows with NULL key values apply normally. If merge
+time on a wide table turns out to be dominated by the key, an explicit
+`primary.keys` list of a few columns that are unique together is the better fix.
 
 ### Soft deletes
 
