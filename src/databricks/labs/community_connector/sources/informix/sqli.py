@@ -35,7 +35,7 @@ from databricks.labs.community_connector.sources.informix.cdc_protocol import (
 
 
 def add_informix_exception_note(error: BaseException, note: str) -> None:
-    """Attach secondary diagnostics on every supported Python version."""
+    # Docstring: Attach secondary diagnostics on every supported Python version.
 
     add_note = getattr(error, "add_note", None)
     if add_note is not None:
@@ -99,24 +99,29 @@ class SqliProtocolError(RuntimeError):
     pass
 
 
-@dataclass(frozen=True)
+# These dataclasses turn off the generated __repr__ and __eq__: nothing prints them or
+# compares them by value, a repr would expose the password fields below, and the
+# merged deployment pickles every generated method.
+@dataclass(frozen=True, eq=False, repr=False)
 class InformixDatetimeLiteral:
-    """A canonical partial DATETIME value paired with its native qualifier."""
+    # Docstring: A canonical partial DATETIME value paired with its native qualifier.
 
     value: str
     qualifier: int
 
 
 class SqliTransportError(SqliProtocolError):
-    """A connection-specific SQLI failure that is safe to retry on another address."""
+    # Docstring: A connection-specific SQLI failure that is safe to retry on another address.
+    pass
 
 
 class SqliSessionRejected(SqliProtocolError):
-    """Informix rejected the SQLI session before authentication diagnostics."""
+    # Docstring: Informix rejected the SQLI session before authentication diagnostics.
+    pass
 
 
 def informix_locale_encoding(locale: str | None) -> str:
-    """Return the verified Python codec for an Informix locale codeset."""
+    # Docstring: Return the verified Python codec for an Informix locale codeset.
 
     codeset = (locale or "en_US.utf8").rsplit(".", 1)[-1].lower()
     aliases = {
@@ -136,15 +141,14 @@ def informix_locale_encoding(locale: str | None) -> str:
 
 
 def _decode_text(raw: bytes, encoding: str) -> str:
-    """Decode a result string, turning a codeset mismatch into an actionable error.
-
-    Informix converts result data from the database codeset to the client codeset
-    on the wire, so ``encoding`` is the CLIENT_LOCALE codec. A strict decode failure
-    almost always means CLIENT_LOCALE does not match what the server actually sent
-    (for example CLIENT_LOCALE left at en_US.utf8 while the server transmits Latin-1
-    for an en_US.819 database). Surface that as a clear diagnostic instead of a bare
-    UnicodeDecodeError so the fix -- align CLIENT_LOCALE with the source -- is obvious.
-    """
+    # Docstring: Decode a result string, turning a codeset mismatch into an actionable error.
+    #
+    # Informix converts result data from the database codeset to the client codeset
+    # on the wire, so ``encoding`` is the CLIENT_LOCALE codec. A strict decode failure
+    # almost always means CLIENT_LOCALE does not match what the server actually sent
+    # (for example CLIENT_LOCALE left at en_US.utf8 while the server transmits Latin-1
+    # for an en_US.819 database). Surface that as a clear diagnostic instead of a bare
+    # UnicodeDecodeError so the fix -- align CLIENT_LOCALE with the source -- is obvious.
 
     try:
         return raw.decode(encoding)
@@ -171,7 +175,7 @@ class SqliDescriptorNotImplemented(SqliProtocolError):
 
 
 class _DeadlineReader:
-    """Apply one absolute login deadline to every underlying stream read."""
+    # Docstring: Apply one absolute login deadline to every underlying stream read.
 
     def __init__(
         self, stream: BinaryIO, connection: socket.socket, deadline: float, maximum: float
@@ -212,7 +216,7 @@ class ConnectionState(Enum):
     CLOSED = auto()
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False, repr=False)
 class AscAccept:
     version: str
     cap_1: int
@@ -221,7 +225,7 @@ class AscAccept:
     warnings: int
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False, repr=False)
 class ResultColumn:
     name: str
     position: int
@@ -232,7 +236,7 @@ class ResultColumn:
     extended_name: str = ""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False, repr=False)
 class ResultDescription:
     statement_type: int
     statement_id: int
@@ -261,12 +265,12 @@ class CdcTransport(Protocol):
 
 
 class AuthenticationProvider(Protocol):
-    """Noninteractive, secret-backed PAM response provider."""
+    # Docstring: Noninteractive, secret-backed PAM response provider.
 
     def respond(self, style: int, challenge: str) -> str | bytes: ...
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False, repr=False)
 class PasswordAuthenticationProvider:
     password: str
     echo_response: str | None = None
@@ -280,7 +284,7 @@ class PasswordAuthenticationProvider:
         raise SqliUnsupportedAuthentication(f"no noninteractive PAM response for style {style}")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False, repr=False)
 class TypedBind:
     native_type: int
     value: int | str | None
@@ -424,11 +428,10 @@ def read_session_packet(stream: BinaryIO, maximum: int = 0xFFFF) -> tuple[int, i
 
 
 def decode_asc_response(packet: bytes) -> bytes:
-    """Validate accept/reject/redirect session state and ASC binary markers.
-
-    Returns the undecoded capability body for an accepted connection. Its full
-    field layout is intentionally left to the forthcoming DecodeAscBinary port.
-    """
+    # Docstring: Validate accept/reject/redirect session state and ASC binary markers.
+    #
+    # Returns the undecoded capability body for an accepted connection. Its full
+    # field layout is intentionally left to the forthcoming DecodeAscBinary port.
 
     sl_type, protocol, payload = read_session_packet(io.BytesIO(packet))
     if protocol != SQLI_PROTOCOL:
@@ -551,10 +554,9 @@ def encode_normal_auth_prefix(
     database: str,
     encoding: str = "utf-8",
 ) -> bytes:
-    """Encode the fixed ASC normal-password portion before the recovered ASC tail.
-
-    Password bytes are plaintext; callers must place this packet inside TLS.
-    """
+    # Docstring: Encode the fixed ASC normal-password portion before the recovered ASC tail.
+    #
+    # Password bytes are plaintext; callers must place this packet inside TLS.
 
     out = io.BytesIO()
     out.write(struct.pack(">hhi", SQ_ASSOC, SQ_ASCBINARY, 61))
@@ -702,7 +704,7 @@ def _effective_result_kind(column: ResultColumn) -> int:
 def encode_variable_fetch(
     description: ResultDescription, buffer_size: int = 32767, encoding: str = "utf-8"
 ) -> bytes:
-    """Encode the two-phase variable-row RET_TYPE + NFETCH request."""
+    # Docstring: Encode the two-phase variable-row RET_TYPE + NFETCH request.
 
     if not 1 <= buffer_size <= 32767:
         raise ValueError("fetch buffer_size must be in [1, 32767]")
@@ -855,7 +857,7 @@ def read_int32(stream: BinaryIO) -> int:
 
 
 def _retained_size(value: object, seen: set[int] | None = None) -> int:
-    """Estimate retained decoded-result memory without double counting objects."""
+    # Docstring: Estimate retained decoded-result memory without double counting objects.
 
     if seen is None:
         seen = set()
@@ -874,7 +876,7 @@ def _retained_size(value: object, seen: set[int] | None = None) -> int:
 
 
 def _connector_sql(sql: str, parameters: tuple) -> str:
-    """Bind only connector-owned scalar values using strict SQL literals."""
+    # Docstring: Bind only connector-owned scalar values using strict SQL literals.
 
     result: list[str] = []
     parameter_index = 0
@@ -1017,31 +1019,30 @@ def _partial_datetime_sql(value: str, qualifier: int) -> str:
 
 
 def datetime_order_preserving_cast(column: str, qualifier: int) -> str | None:
-    """Return a fixed-width SQL text expression for chunking a DATETIME column.
-
-    Incremental snapshot chunks a table with ``WHERE key > <value>`` ordered by
-    that key. Informix DATETIME keyset literals do not round-trip for every
-    qualifier, so instead of comparing the DATETIME natively this renders the
-    value as its canonical zero-padded text and the connector compares strings.
-
-    Keyset pagination is complete as long as the SAME expression drives
-    ``ORDER BY``, the ``WHERE`` bound, and the stored cursor, and the string
-    order is a deterministic total order that agrees between Informix and
-    Python. It does not need to be chronological. Within one column every value
-    shares the declared qualifier, so casting the column IN ITS OWN qualifier
-    range yields a fixed-width, zero-padded string (``YYYY-MM-DD HH:MM:SS.fffff``
-    truncated to the qualifier's fields). Fixed width makes byte order stable
-    across collations, so a DATETIME key column of any contiguous qualifier can
-    be chunked — including HOUR-anchored TIME-of-day and DATE-only ranges, and
-    such a column combined lexicographically with non-DATETIME key columns.
-
-    ``qualifier`` uses the connector's decoded layout: start field in bits
-    8..11 and end field in bits 0..3, with field codes 0=YEAR, 2=MONTH, 4=DAY,
-    6=HOUR, 8=MINUTE, 10=SECOND, 11..15=FRACTION(1..5).
-
-    Returns ``None`` for a malformed qualifier so the caller can fall back
-    rather than risk skipped or duplicated chunk rows.
-    """
+    # Docstring: Return a fixed-width SQL text expression for chunking a DATETIME column.
+    #
+    # Incremental snapshot chunks a table with ``WHERE key > <value>`` ordered by
+    # that key. Informix DATETIME keyset literals do not round-trip for every
+    # qualifier, so instead of comparing the DATETIME natively this renders the
+    # value as its canonical zero-padded text and the connector compares strings.
+    #
+    # Keyset pagination is complete as long as the SAME expression drives
+    # ``ORDER BY``, the ``WHERE`` bound, and the stored cursor, and the string
+    # order is a deterministic total order that agrees between Informix and
+    # Python. It does not need to be chronological. Within one column every value
+    # shares the declared qualifier, so casting the column IN ITS OWN qualifier
+    # range yields a fixed-width, zero-padded string (``YYYY-MM-DD HH:MM:SS.fffff``
+    # truncated to the qualifier's fields). Fixed width makes byte order stable
+    # across collations, so a DATETIME key column of any contiguous qualifier can
+    # be chunked — including HOUR-anchored TIME-of-day and DATE-only ranges, and
+    # such a column combined lexicographically with non-DATETIME key columns.
+    #
+    # ``qualifier`` uses the connector's decoded layout: start field in bits
+    # 8..11 and end field in bits 0..3, with field codes 0=YEAR, 2=MONTH, 4=DAY,
+    # 6=HOUR, 8=MINUTE, 10=SECOND, 11..15=FRACTION(1..5).
+    #
+    # Returns ``None`` for a malformed qualifier so the caller can fall back
+    # rather than risk skipped or duplicated chunk rows.
 
     start, end = (qualifier >> 8) & 0xF, qualifier & 0xF
     field_starts = {0, 2, 4, 6, 8, 10}
@@ -1276,7 +1277,7 @@ def _fixed_result_size(column: ResultColumn, remaining: bytes) -> int:
     raise SqliDescriptorNotImplemented(f"ordinary Informix result type {kind} is unsupported")
 
 
-@dataclass
+@dataclass(eq=False, repr=False)
 class InformixSqliClient:
     hostname: str
     port: int
@@ -1586,7 +1587,7 @@ class InformixSqliClient:
         return self._input, self._output
 
     def set_socket_timeout(self, timeout: float) -> None:
-        """Update the timeout used by the live SQLI socket."""
+        # Docstring: Update the timeout used by the live SQLI socket.
 
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("socket timeout must be finite and positive")
@@ -1785,7 +1786,7 @@ class InformixSqliClient:
         page_size: int,
         page_consumer: Callable[[list[dict[str, object]]], None],
     ) -> None:
-        """Stream one SELECT through one forward-only cursor in bounded pages."""
+        # Docstring: Stream one SELECT through one forward-only cursor in bounded pages.
 
         if page_size < 1:
             raise ValueError("page_size must be positive")
@@ -1860,7 +1861,7 @@ class InformixSqliClient:
                 raise
 
     def execute_command(self, sql: str) -> None:
-        """Execute a connector-owned non-row SQL statement through SQ_COMMAND."""
+        # Docstring: Execute a connector-owned non-row SQL statement through SQ_COMMAND.
 
         _, output_stream = self._require_open()
         with self._lock:

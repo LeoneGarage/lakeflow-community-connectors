@@ -141,13 +141,12 @@ _BARE_IDENTIFIER = re.compile(r"^[^\W\d][\w$]*$", re.UNICODE)
 
 
 def _sql_identifier(identifier: str) -> str:
-    """Render a (already validated) identifier for interpolation into SQL.
-
-    Bare when it is a valid undelimited identifier; otherwise delimited with
-    double quotes, doubling any embedded quote. The identifier must already have
-    passed ``_IDENTIFIER`` validation, so the delimited branch only ever escapes
-    admitted characters such as "+" and ".".
-    """
+    # Docstring: Render a (already validated) identifier for interpolation into SQL.
+    #
+    # Bare when it is a valid undelimited identifier; otherwise delimited with
+    # double quotes, doubling any embedded quote. The identifier must already have
+    # passed ``_IDENTIFIER`` validation, so the delimited branch only ever escapes
+    # admitted characters such as "+" and ".".
 
     if _BARE_IDENTIFIER.fullmatch(identifier):
         return identifier
@@ -155,21 +154,19 @@ def _sql_identifier(identifier: str) -> str:
 
 
 def _join_identity(*components: str) -> str:
-    """Join identity components with ``.``, delimiting any component that is not a
-    valid undelimited identifier so the result round-trips through
-    ``_split_identity`` even when a component itself contains ``.``.
-    """
+    # Docstring: Join identity components with ``.``, delimiting any component that is not a
+    # valid undelimited identifier so the result round-trips through
+    # ``_split_identity`` even when a component itself contains ``.``.
 
     return ".".join(_sql_identifier(component) for component in components)
 
 
 def _split_identity(identity: str) -> list[str]:
-    """Split a ``.``-joined identity into its components -- the inverse of
-    ``_join_identity``.
-
-    A double-quoted component is taken whole (so it may contain ``.``) with its
-    doubled quotes unescaped; bare components split on ``.`` as before.
-    """
+    # Docstring: Split a ``.``-joined identity into its components -- the inverse of
+    # ``_join_identity``.
+    #
+    # A double-quoted component is taken whole (so it may contain ``.``) with its
+    # doubled quotes unescaped; bare components split on ``.`` as before.
 
     parts: list[str] = []
     index, length = 0, len(identity)
@@ -970,7 +967,7 @@ _INFORMIX_REGISTRATION_CONTEXT: dict[str, Any] = {"scope": None}
 
 
 class _StateValidationCoordinator:
-    """Process-local exact leases whose synchronization state is never serialized."""
+    # Docstring: Process-local exact leases whose synchronization state is never serialized.
 
     def __init__(self) -> None:
         self.condition = threading.Condition()
@@ -992,7 +989,7 @@ _STATE_VALIDATION_COORDINATOR = _StateValidationCoordinator()
 
 
 class _ConnectionMaintenanceCoordinator:
-    """Throttle best-effort connection artifact cleanup per worker process."""
+    # Docstring: Throttle best-effort connection artifact cleanup per worker process.
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -1008,7 +1005,7 @@ class _ConnectionMaintenanceCoordinator:
 
 
 def _sleep_with_backoff(deadline: float, delay: float) -> float:
-    """Sleep with jitter without crossing the caller's absolute deadline."""
+    # Docstring: Sleep with jitter without crossing the caller's absolute deadline.
 
     remaining = deadline - time.monotonic()
     if remaining > 0:
@@ -1025,27 +1022,26 @@ _WRAPPED_STREAM_READER_NAMES = frozenset(
 
 
 def _replay_between_offsets(start, end, read, options, connector_options):
-    """Replay ``[start, end)`` by reading to ``end`` and stopping there.
-
-    Shared by the simple reader's ``readBetweenOffsets`` and the partitioned reader's
-    ``get_partitions`` recompute, so both replay paths honour one contract: the read
-    is bounded at ``end.commit_lsn`` (and, mid-incremental-copy, at
-    ``end.incremental.last_pk``), and an under-read fails closed rather than letting
-    Spark commit an ``end`` the rows do not reach.
-
-    The unbounded alternative (``read(start)`` with the reached offset discarded) is
-    not reproducible: it ends at whichever transaction boundary the row budget falls
-    on, so the same start LSN over the same log can end in different places --
-    measured directly, budget 10 ended at LSN 107 and budget 2 at 104 on identical
-    data. Spark commits its own ``end`` regardless, so a fresh read that stops earlier
-    than the original silently drops everything in between; that is how six tables
-    lost 151 rows.
-
-    ``read(start)`` performs one read and returns ``(records, reached_offset)``; the
-    bounds are injected into ``options`` (the dict that read consults, restored on
-    exit) because read_table has no ``end`` parameter and thirty connectors
-    implement it. ``connector_options`` supplies the connection-wait default.
-    """
+    # Docstring: Replay ``[start, end)`` by reading to ``end`` and stopping there.
+    #
+    # Shared by the simple reader's ``readBetweenOffsets`` and the partitioned reader's
+    # ``get_partitions`` recompute, so both replay paths honour one contract: the read
+    # is bounded at ``end.commit_lsn`` (and, mid-incremental-copy, at
+    # ``end.incremental.last_pk``), and an under-read fails closed rather than letting
+    # Spark commit an ``end`` the rows do not reach.
+    #
+    # The unbounded alternative (``read(start)`` with the reached offset discarded) is
+    # not reproducible: it ends at whichever transaction boundary the row budget falls
+    # on, so the same start LSN over the same log can end in different places --
+    # measured directly, budget 10 ended at LSN 107 and budget 2 at 104 on identical
+    # data. Spark commits its own ``end`` regardless, so a fresh read that stops earlier
+    # than the original silently drops everything in between; that is how six tables
+    # lost 151 rows.
+    #
+    # ``read(start)`` performs one read and returns ``(records, reached_offset)``; the
+    # bounds are injected into ``options`` (the dict that read consults, restored on
+    # exit) because read_table has no ``end`` parameter and thirty connectors
+    # implement it. ``connector_options`` supplies the connection-wait default.
 
     positional_keys = {
         "commit_lsn",
@@ -1190,7 +1186,7 @@ def _replay_between_offsets(start, end, read, options, connector_options):
 
 
 def _informix_available_now_base(base: type, spark_session: Any | None = None) -> type:
-    """Wrap the generated reader base without changing the shared adapter source."""
+    # Docstring: Wrap the generated reader base without changing the shared adapter source.
 
     original_base = getattr(base, "_informix_original_base", base)
     pipeline_id: str | None = None
@@ -1250,15 +1246,15 @@ def _informix_available_now_base(base: type, spark_session: Any | None = None) -
                     prepare()
 
             def read_between_offsets(reader, start, end):
-                """Replay ``[start, end)`` bounded at ``end`` (see _replay_between_offsets).
-
-                The shared implementation is ``return self.read(start)[0]``: an
-                unbounded read whose returned offset is discarded. Spark commits its
-                own ``end`` regardless, so if the fresh read stops earlier than the
-                original did, everything in between is dropped silently. The bound
-                travels through the reader's options, which the framework copies into
-                table_options on every read.
-                """
+                # Docstring: Replay ``[start, end)`` bounded at ``end`` (see
+                # _replay_between_offsets).
+                #
+                # The shared implementation is ``return self.read(start)[0]``: an
+                # unbounded read whose returned offset is discarded. Spark commits its
+                # own ``end`` regardless, so if the fresh read stops earlier than the
+                # original did, everything in between is dropped silently. The bound
+                # travels through the reader's options, which the framework copies into
+                # table_options on every read.
 
                 return _replay_between_offsets(
                     start,
@@ -1306,47 +1302,52 @@ else:
 
 
 class InformixError(RuntimeError):
-    """Base error raised by this connector."""
+    # Docstring: Base error raised by this connector.
+    pass
 
 
 class ConnectionCapacityUnavailable(InformixError):
-    """No connector-managed Informix connection slot is currently available."""
+    # Docstring: No connector-managed Informix connection slot is currently available.
+    pass
 
 
 class SharedStateAccessUnavailable(InformixError):
-    """A transient permissions failure prevented access to shared state."""
+    # Docstring: A transient permissions failure prevented access to shared state.
+    pass
 
 
 class TriggerBoundaryUnavailable(InformixError):
-    """The owning upsert reader has not published this update's boundary yet."""
+    # Docstring: The owning upsert reader has not published this update's boundary yet.
+    pass
 
 
 class SchemaTransitionUnavailable(InformixError):
-    """The owning upsert reader has not published this schema transition yet."""
+    # Docstring: The owning upsert reader has not published this schema transition yet.
+    pass
 
 
 class LogRetentionError(InformixError):
-    """The requested restart LSN is no longer retained by Informix."""
+    # Docstring: The requested restart LSN is no longer retained by Informix.
+    pass
 
 
 def _stale_capture_label_error(frame: bytes, error: Exception, start_lsn: int) -> InformixError:
-    """Explain an undecodable CDC frame in terms the operator can act on.
-
-    Informix can emit log records that predate this capture's registration while
-    still tagging them with the session's capture label. ``decode_frame`` trusts
-    the label to select column descriptors, so such a record is decoded with the
-    wrong layout and fails -- observed in production as a bare
-    ``UnicodeDecodeError`` on a byte belonging to a foreign row's binary field,
-    with nothing to tie it to the log position that caused it.
-
-    Fail closed rather than skipping the frame. A frame that cannot be decoded
-    under its declared layout cannot be classified: it may be a foreign record
-    (safe to drop) or a real change this reader must not lose, and nothing in the
-    frame distinguishes the two. Silently skipping would risk dropping
-    replicated changes, and continuing would risk ingesting a foreign row as if
-    it were data. Naming the log file lets the operator confirm the checkpoint
-    sits in reused log territory, which is the actual remedy.
-    """
+    # Docstring: Explain an undecodable CDC frame in terms the operator can act on.
+    #
+    # Informix can emit log records that predate this capture's registration while
+    # still tagging them with the session's capture label. ``decode_frame`` trusts
+    # the label to select column descriptors, so such a record is decoded with the
+    # wrong layout and fails -- observed in production as a bare
+    # ``UnicodeDecodeError`` on a byte belonging to a foreign row's binary field,
+    # with nothing to tie it to the log position that caused it.
+    #
+    # Fail closed rather than skipping the frame. A frame that cannot be decoded
+    # under its declared layout cannot be classified: it may be a foreign record
+    # (safe to drop) or a real change this reader must not lose, and nothing in the
+    # frame distinguishes the two. Silently skipping would risk dropping
+    # replicated changes, and continuing would risk ingesting a foreign row as if
+    # it were data. Naming the log file lets the operator confirm the checkpoint
+    # sits in reused log territory, which is the actual remedy.
 
     log_file = frame_log_file(frame)
     location = f"logical log {log_file}" if log_file is not None else "an unidentified logical log"
@@ -1362,11 +1363,12 @@ def _stale_capture_label_error(frame: bytes, error: Exception, start_lsn: int) -
 
 
 class UnsupportedChangeError(InformixError):
-    """A source operation cannot be represented by the Lakeflow interface."""
+    # Docstring: A source operation cannot be represented by the Lakeflow interface.
+    pass
 
 
 class InformixBridge(Protocol):
-    """Injectable boundary around pure-Python SQLI metadata, snapshots, and CDC."""
+    # Docstring: Injectable boundary around pure-Python SQLI metadata, snapshots, and CDC.
 
     def list_tables(self) -> list[dict[str, Any]]: ...
 
@@ -1443,12 +1445,12 @@ class InformixBridge(Protocol):
     ) -> list[dict[str, Any]]: ...
 
     def release_connection(self) -> None:
-        """Close a finite poll's source connection and release its capacity lease."""
+        # Docstring: Close a finite poll's source connection and release its capacity lease.
         ...
 
 
 def _serialized_sqli_operation(method: Callable[..., Any]) -> Callable[..., Any]:
-    """Keep lease-loss shutdown from closing a transport during an operation."""
+    # Docstring: Keep lease-loss shutdown from closing a transport during an operation.
 
     def serialized(self: "PurePythonInformixBridge", *args: Any, **kwargs: Any) -> Any:
         lock = getattr(self, "_operation_lock", None)
@@ -1478,12 +1480,11 @@ def _serialized_sqli_operation(method: Callable[..., Any]) -> Callable[..., Any]
 
 
 def _resolve_daemon_reservation(options: dict[str, str], slot_count: int) -> int:
-    """Effective CDC-daemon slot reservation (the ``0`` = auto case resolved).
-
-    Resolution only -- range validation stays in ``_daemon_connection_reservation`` and
-    the constructor. Extracted so ``_resolve_snapshot_reader_threads`` can key its default
-    off the same value without duplicating the auto formula.
-    """
+    # Docstring: Effective CDC-daemon slot reservation (the ``0`` = auto case resolved).
+    #
+    # Resolution only -- range validation stays in ``_daemon_connection_reservation`` and
+    # the constructor. Extracted so ``_resolve_snapshot_reader_threads`` can key its default
+    # off the same value without duplicating the auto formula.
 
     reservation = int(
         options.get(_DAEMON_RESERVATION_OPTION, str(_DEFAULT_DAEMON_CONNECTION_RESERVATION))
@@ -1494,20 +1495,19 @@ def _resolve_daemon_reservation(options: dict[str, str], slot_count: int) -> int
 
 
 def _resolve_snapshot_reader_threads(options: dict[str, str]) -> int:
-    """Number of snapshot-drain workers the pool spawns for these options.
-
-    Shared by the connector (worker count) and the bridge (reservation band) so the two
-    never drift. An explicit ``snapshot.reader.threads`` wins; otherwise the count is one
-    below the CDC-daemon reservation. Keeping it strictly below the reservation guarantees
-    the snapshot-drain floor (``daemon.connection.reservation - threads``) never collapses
-    to 0, so a low slot always stays reachable by consumer bootstrap reads even while the
-    drains hold their slots for whole scans -- otherwise the drains grab the lowest slots
-    and, holding them for the entire (uncapped) backfill, starve consumer/CDC reads on a
-    small pool. Keyless drains serialize through this pool, so a flat single worker made
-    every keyless table's initial scan queue behind the last, stalling the later tables on
-    multi-table pipelines; one-below-reservation parallelizes them once the pool is large
-    enough to spare a drain band and still keep a consumer floor.
-    """
+    # Docstring: Number of snapshot-drain workers the pool spawns for these options.
+    #
+    # Shared by the connector (worker count) and the bridge (reservation band) so the two
+    # never drift. An explicit ``snapshot.reader.threads`` wins; otherwise the count is one
+    # below the CDC-daemon reservation. Keeping it strictly below the reservation guarantees
+    # the snapshot-drain floor (``daemon.connection.reservation - threads``) never collapses
+    # to 0, so a low slot always stays reachable by consumer bootstrap reads even while the
+    # drains hold their slots for whole scans -- otherwise the drains grab the lowest slots
+    # and, holding them for the entire (uncapped) backfill, starve consumer/CDC reads on a
+    # small pool. Keyless drains serialize through this pool, so a flat single worker made
+    # every keyless table's initial scan queue behind the last, stalling the later tables on
+    # multi-table pipelines; one-below-reservation parallelizes them once the pool is large
+    # enough to spare a drain band and still keep a consumer floor.
 
     explicit = options.get(_SNAPSHOT_READER_THREADS_OPTION)
     if explicit is not None:
@@ -1519,11 +1519,10 @@ def _resolve_snapshot_reader_threads(options: dict[str, str]) -> int:
 
 
 class PurePythonInformixBridge:
-    """Pure-Python SQLI/CDC bridge validated against disposable Informix 15.
-
-    Tests can inject ``transport.factory=module:callable`` without changing
-    Lakeflow or CDC decoding code.
-    """
+    # Docstring: Pure-Python SQLI/CDC bridge validated against disposable Informix 15.
+    #
+    # Tests can inject ``transport.factory=module:callable`` without changing
+    # Lakeflow or CDC decoding code.
 
     def __init__(self, options: dict[str, str]) -> None:
         self.options = options
@@ -1586,13 +1585,12 @@ class PurePythonInformixBridge:
         self._startup_jitter_applied = False
 
     def _apply_startup_jitter(self) -> None:
-        """Sleep a one-time jittered delay before this reader's first connection.
-
-        Spreads a pipeline's startup connection/CDC-session opens over a window so dozens of
-        flows do not hit syscdcv1 simultaneously. One-shot per reader instance: the flag is
-        set before sleeping, so a failed connect that retries does not re-delay, and every
-        connection after the first is immediate.
-        """
+        # Docstring: Sleep a one-time jittered delay before this reader's first connection.
+        #
+        # Spreads a pipeline's startup connection/CDC-session opens over a window so dozens of
+        # flows do not hit syscdcv1 simultaneously. One-shot per reader instance: the flag is
+        # set before sleeping, so a failed connect that retries does not re-delay, and every
+        # connection after the first is immediate.
 
         if getattr(self, "_startup_jitter_applied", True):
             return
@@ -1632,17 +1630,16 @@ class PurePythonInformixBridge:
 
     @staticmethod
     def _connection_identity_from(source: dict[str, Any]) -> str:
-        """Identify the Informix endpoint whose capacity is being shared.
-
-        Deliberately excludes the database name: capacity is a property of the
-        server process, so every database on one server draws from one pool.
-
-        Takes the mapping so a holder (which has a parsed ``config``) and a waiter
-        (which has only ``options``) derive the *same* identity. They must: the
-        holder publishes the backlog hint and the waiter reads it, so a divergence
-        here would leave every hint silently unreadable rather than failing
-        loudly.
-        """
+        # Docstring: Identify the Informix endpoint whose capacity is being shared.
+        #
+        # Deliberately excludes the database name: capacity is a property of the
+        # server process, so every database on one server draws from one pool.
+        #
+        # Takes the mapping so a holder (which has a parsed ``config``) and a waiter
+        # (which has only ``options``) derive the *same* identity. They must: the
+        # holder publishes the backlog hint and the waiter reads it, so a divergence
+        # here would leave every hint silently unreadable rather than failing
+        # loudly.
 
         return "\0".join(
             (
@@ -1656,7 +1653,7 @@ class PurePythonInformixBridge:
         return self._connection_identity_from(getattr(self, "config", None) or self.options)
 
     def _lakebase(self) -> Any:
-        """Return this process's Lakebase state handle, provisioning on first use."""
+        # Docstring: Return this process's Lakebase state handle, provisioning on first use.
 
         existing = getattr(self, "_lakebase_state", None)
         if existing is not None:
@@ -1667,12 +1664,11 @@ class PurePythonInformixBridge:
         return state
 
     def _lakebase_connection(self) -> Any:
-        """Return a per-bridge Postgres connection, reconnecting if it has died.
-
-        One connection per bridge rather than a pool: a bridge serves a single
-        table's reads sequentially, and the endpoint permits 450 connections
-        (measured), which is ample for a pipeline's flows.
-        """
+        # Docstring: Return a per-bridge Postgres connection, reconnecting if it has died.
+        #
+        # One connection per bridge rather than a pool: a bridge serves a single
+        # table's reads sequentially, and the endpoint permits 450 connections
+        # (measured), which is ample for a pipeline's flows.
 
         connection = getattr(self, "_lakebase_conn", None)
         if connection is not None:
@@ -1686,19 +1682,18 @@ class PurePythonInformixBridge:
         return connection
 
     def _lakebase_namespace(self) -> str:
-        """Namespace every row by the Informix endpoint sharing the capacity."""
+        # Docstring: Namespace every row by the Informix endpoint sharing the capacity.
 
         return hashlib.sha256(self._connection_identity().encode()).hexdigest()[:24]
 
     @staticmethod
     def _revocation_name(path: str) -> str:
-        """Return the revocation marker name for one artifact.
-
-        Nested fence stages share basenames across slots (every slot has a
-        ``fencing`` child), so the marker must include the slot to stay unique;
-        deriving it from the basename alone would let one slot's revocation
-        appear to revoke every other slot's same-stage fence.
-        """
+        # Docstring: Return the revocation marker name for one artifact.
+        #
+        # Nested fence stages share basenames across slots (every slot has a
+        # ``fencing`` child), so the marker must include the slot to stay unique;
+        # deriving it from the basename alone would let one slot's revocation
+        # appear to revoke every other slot's same-stage fence.
 
         base = os.path.basename(path)
         if base in _CONNECTION_FENCE_STAGES:
@@ -1710,17 +1705,16 @@ class PurePythonInformixBridge:
         return self.options.get("connection.backlog.hint.enabled", "true") != "false"
 
     def _publish_connection_backlog_hint(self) -> None:
-        """Record the endpoint's current log position for waiters to read.
-
-        Called by a reader that still holds a slot, which is the only participant
-        able to ask the server anything. One monotonic upsert: ``GREATEST`` makes
-        concurrent publications converge, so every holder may publish and the
-        value can never regress -- no per-quantum election is needed.
-
-        Advisory. Every failure is swallowed, because a missing hint only degrades
-        waiters to the unprioritised behaviour they had before hints existed and
-        must never fail a read that otherwise succeeded.
-        """
+        # Docstring: Record the endpoint's current log position for waiters to read.
+        #
+        # Called by a reader that still holds a slot, which is the only participant
+        # able to ask the server anything. One monotonic upsert: ``GREATEST`` makes
+        # concurrent publications converge, so every holder may publish and the
+        # value can never regress -- no per-quantum election is needed.
+        #
+        # Advisory. Every failure is swallowed, because a missing hint only degrades
+        # waiters to the unprioritised behaviour they had before hints existed and
+        # must never fail a read that otherwise succeeded.
 
         if not self._connection_hints_enabled():
             return
@@ -1738,16 +1732,15 @@ class PurePythonInformixBridge:
 
     @classmethod
     def _read_connection_backlog_hint_at(cls, options: dict[str, str]) -> int | None:
-        """Return the published endpoint log position from Postgres, or None.
-
-        Called by a *waiter*, which holds no slot and has no bridge, so it cannot
-        reuse a bridge's connection. The handle is cached per process and keyed by
-        endpoint identity; a waiter reads once per sweep, so one shared connection
-        per process is enough.
-
-        Advisory, so every failure yields None and the caller falls back to
-        unprioritised waiting rather than failing.
-        """
+        # Docstring: Return the published endpoint log position from Postgres, or None.
+        #
+        # Called by a *waiter*, which holds no slot and has no bridge, so it cannot
+        # reuse a bridge's connection. The handle is cached per process and keyed by
+        # endpoint identity; a waiter reads once per sweep, so one shared connection
+        # per process is enough.
+        #
+        # Advisory, so every failure yields None and the caller falls back to
+        # unprioritised waiting rather than failing.
 
         identity = cls._connection_identity_from(options)
         namespace = hashlib.sha256(identity.encode()).hexdigest()[:24]
@@ -1843,17 +1836,16 @@ class PurePythonInformixBridge:
         return _resolve_daemon_reservation(self.options, slot_count)
 
     def _snapshot_daemon_connection_reservation(self, slot_count: int) -> int:
-        """Floor for the snapshot-drain daemon: one band below the CDC daemon.
-
-        The CDC daemon is deferrable and floored at ``daemon.connection.reservation``;
-        a drain is bootstrap work that must make progress, so it sits ``snapshot.reader
-        .threads`` slots lower, giving it that many slots the CDC daemon cannot claim.
-        The band below it (``daemon.connection.reservation - snapshot.reader.threads``
-        slots) stays reachable only by consumer bootstrap reads at floor 0. When the
-        pool cannot spare a private drain band the floor collapses to 0, where the drain
-        still reaches the CDC-free low slots (consumer reads release per microbatch, so
-        those slots churn) -- it simply loses its dedicated headroom.
-        """
+        # Docstring: Floor for the snapshot-drain daemon: one band below the CDC daemon.
+        #
+        # The CDC daemon is deferrable and floored at ``daemon.connection.reservation``;
+        # a drain is bootstrap work that must make progress, so it sits ``snapshot.reader
+        # .threads`` slots lower, giving it that many slots the CDC daemon cannot claim.
+        # The band below it (``daemon.connection.reservation - snapshot.reader.threads``
+        # slots) stays reachable only by consumer bootstrap reads at floor 0. When the
+        # pool cannot spare a private drain band the floor collapses to 0, where the drain
+        # still reaches the CDC-free low slots (consumer reads release per microbatch, so
+        # those slots churn) -- it simply loses its dedicated headroom.
 
         daemon_reservation = self._daemon_connection_reservation(slot_count)
         # Reserve a band exactly as wide as the number of drain workers the pool will
@@ -1866,17 +1858,16 @@ class PurePythonInformixBridge:
         return max(0, daemon_reservation - threads)
 
     def _connection_sweep_rank_scale(self) -> float:
-        """Shrink the gap between acquisition sweeps for a further-behind reader.
-
-        The connector publishes the rank alongside the attempt budget, so this
-        needs no offset access of its own. Returns 1.0 when no rank is present,
-        which leaves the cadence byte-identical to the pre-rank behaviour.
-
-        Linear between 1.0 (unranked) and ``_SLOT_SWEEP_RANK_FLOOR`` (top rank).
-        Bounded deliberately: a freed slot goes to whoever sweeps next, so halving
-        the gap is enough to bias that race, while an unbounded shrink would
-        reintroduce exactly the metadata storm the wide interval exists to prevent.
-        """
+        # Docstring: Shrink the gap between acquisition sweeps for a further-behind reader.
+        #
+        # The connector publishes the rank alongside the attempt budget, so this
+        # needs no offset access of its own. Returns 1.0 when no rank is present,
+        # which leaves the cadence byte-identical to the pre-rank behaviour.
+        #
+        # Linear between 1.0 (unranked) and ``_SLOT_SWEEP_RANK_FLOOR`` (top rank).
+        # Bounded deliberately: a freed slot goes to whoever sweeps next, so halving
+        # the gap is enough to bias that race, while an unbounded shrink would
+        # reintroduce exactly the metadata storm the wide interval exists to prevent.
 
         raw = self.options.get(_CONNECTION_ATTEMPT_RANK_OPTION)
         if not raw:
@@ -1892,13 +1883,12 @@ class PurePythonInformixBridge:
         return 1.0 - (1.0 - _SLOT_SWEEP_RANK_FLOOR) * fraction
 
     def _connection_waiter_class(self) -> int:
-        """The requester class this reader enqueues under for the round-robin policy.
-
-        Derived from the private slot markers already on the reader's options, checked
-        daemon-first so a daemon reader is never misclassified as a plain consumer. The
-        class only interleaves the queue; it does not change which slots a reader may
-        claim (that is the reservation ``floor``).
-        """
+        # Docstring: The requester class this reader enqueues under for the round-robin policy.
+        #
+        # Derived from the private slot markers already on the reader's options, checked
+        # daemon-first so a daemon reader is never misclassified as a plain consumer. The
+        # class only interleaves the queue; it does not change which slots a reader may
+        # claim (that is the reservation ``floor``).
 
         if self.options.get(_SNAPSHOT_DAEMON_SLOT_MARKER_OPTION) == "true":
             return _SLOT_CLASS_SNAPSHOT_DAEMON
@@ -1909,13 +1899,12 @@ class PurePythonInformixBridge:
         return _SLOT_CLASS_CONSUMER
 
     def _acquire_connection_slot(self, budget_seconds: float | None = None) -> None:
-        """Claim a capacity slot from Postgres.
-
-        Structurally the same wait loop as the Volume path -- the same timeout,
-        the same rank-scaled cadence, the same reservation floor -- but each pass
-        is a single atomic statement instead of a per-slot ``mkdir`` sweep, so
-        there is no fence to check afterwards and no partial claim to unwind.
-        """
+        # Docstring: Claim a capacity slot from Postgres.
+        #
+        # Structurally the same wait loop as the Volume path -- the same timeout,
+        # the same rank-scaled cadence, the same reservation floor -- but each pass
+        # is a single atomic statement instead of a per-slot ``mkdir`` sweep, so
+        # there is no fence to check afterwards and no partial claim to unwind.
 
         namespace = self._lakebase_namespace()
         slot_count = int(
@@ -2088,11 +2077,10 @@ class PurePythonInformixBridge:
         stop: threading.Event,
         on_lease_lost: Callable[[], None] | None = None,
     ) -> None:
-        """Renew a Postgres lease until released, poisoning it if renewal fails.
-
-        Uses its own connection: the bridge's connection is busy serving reads,
-        and psycopg connections are not safe to share across threads.
-        """
+        # Docstring: Renew a Postgres lease until released, poisoning it if renewal fails.
+        #
+        # Uses its own connection: the bridge's connection is busy serving reads,
+        # and psycopg connections are not safe to share across threads.
 
         def report_lease_lost() -> None:
             # Mirrors the Volume heartbeat: a lease whose owner is already
@@ -2150,7 +2138,7 @@ class PurePythonInformixBridge:
                     pass
 
     def _release_connection_slot(self) -> None:
-        """Free a Postgres lease, tolerating a lease already reclaimed."""
+        # Docstring: Free a Postgres lease, tolerating a lease already reclaimed.
 
         slot = getattr(self, "_lakebase_slot", None)
         # Stop the heartbeat before releasing, and clear the handles first so a
@@ -2187,14 +2175,13 @@ class PurePythonInformixBridge:
             )
 
     def _poison_connection_slot_lease(self) -> None:
-        """Abandon a lease that can no longer be renewed, closing the transport.
-
-        Called from the heartbeat when renewal is rejected or fails persistently.
-        The reader has provably lost its capacity slot, so continuing to use the
-        SQLI connection would exceed the configured concurrency: another reader
-        already owns the slot. Nothing here is Volume-specific -- it is about the
-        Informix transport and the operation in flight on it.
-        """
+        # Docstring: Abandon a lease that can no longer be renewed, closing the transport.
+        #
+        # Called from the heartbeat when renewal is rejected or fails persistently.
+        # The reader has provably lost its capacity slot, so continuing to use the
+        # SQLI connection would exceed the configured concurrency: another reader
+        # already owns the slot. Nothing here is Volume-specific -- it is about the
+        # Informix transport and the operation in flight on it.
 
         lease_lost = getattr(self, "_connection_lease_lost", None)
         if lease_lost is not None:
@@ -2265,7 +2252,7 @@ class PurePythonInformixBridge:
             os.close(descriptor)
 
     def release_connection(self) -> None:
-        """Release a finite worker poll's SQLI session without discarding metadata."""
+        # Docstring: Release a finite worker poll's SQLI session without discarding metadata.
 
         operation_lock = getattr(self, "_operation_lock", None)
         context = operation_lock if operation_lock is not None else contextlib.nullcontext()
@@ -2290,15 +2277,14 @@ class PurePythonInformixBridge:
                     self._release_connection_slot()
 
     def reset_transport(self) -> None:
-        """Drop a dead SQLI transport but keep the connection slot held.
-
-        Used to recover from a mid-read connection drop: close the (already
-        broken) transport and mark the bridge disconnected so the next
-        ``_ensure_connected`` reconnects, *without* releasing and re-acquiring
-        the connection slot. Releasing the slot here would reintroduce capacity
-        contention on what is a transient network blip, and the caller is
-        retrying the same read in place under the slot it already owns.
-        """
+        # Docstring: Drop a dead SQLI transport but keep the connection slot held.
+        #
+        # Used to recover from a mid-read connection drop: close the (already
+        # broken) transport and mark the bridge disconnected so the next
+        # ``_ensure_connected`` reconnects, *without* releasing and re-acquiring
+        # the connection slot. Releasing the slot here would reintroduce capacity
+        # contention on what is a transient network blip, and the caller is
+        # retrying the same read in place under the slot it already owns.
 
         operation_lock = getattr(self, "_operation_lock", None)
         context = operation_lock if operation_lock is not None else contextlib.nullcontext()
@@ -2380,7 +2366,7 @@ class PurePythonInformixBridge:
         return self._describe_table(parts[1], parts[2])
 
     def _assert_capture_layout(self, capture: dict[str, Any], encoding: str) -> None:
-        """Fail before decoding rows when catalog metadata changed mid-session."""
+        # Docstring: Fail before decoding rows when catalog metadata changed mid-session.
 
         native = str(capture["identity"])
         try:
@@ -2547,12 +2533,11 @@ class PurePythonInformixBridge:
 
     @_serialized_sqli_operation
     def column_defaults(self, identity, columns):
-        """Return which of ``columns`` have a non-NULL default in the catalog.
-
-        ``sysdefaults`` holds one row per column with an explicit default; type ``N`` is
-        ``DEFAULT NULL``, which leaves existing rows NULL like no default at all, so it is
-        not reported.
-        """
+        # Docstring: Return which of ``columns`` have a non-NULL default in the catalog.
+        #
+        # ``sysdefaults`` holds one row per column with an explicit default; type ``N`` is
+        # ``DEFAULT NULL``, which leaves existing rows NULL like no default at all, so it is
+        # not reported.
 
         self._ensure_connected()
         database, owner, name = _split_identity(identity)
@@ -2578,16 +2563,15 @@ class PurePythonInformixBridge:
         )
 
     def key_index_directions(self, identity, columns):
-        """Return the per-column DESC flags of an index whose key columns exactly
-        match ``columns`` in order, or ``None`` if no index matches.
-
-        A ``primary.keys`` override names columns, not an index, so on its own it
-        pages all-ascending -- which sorts when the real key index is
-        mixed-direction. This finds any index (unique, duplicate, or the PK's)
-        whose ordered key columns equal the override and reports its directions,
-        so the override can page in that index's own order. A negative catalog
-        part number is a descending column. ``None`` leaves paging ascending.
-        """
+        # Docstring: Return the per-column DESC flags of an index whose key columns exactly
+        # match ``columns`` in order, or ``None`` if no index matches.
+        #
+        # A ``primary.keys`` override names columns, not an index, so on its own it
+        # pages all-ascending -- which sorts when the real key index is
+        # mixed-direction. This finds any index (unique, duplicate, or the PK's)
+        # whose ordered key columns equal the override and reports its directions,
+        # so the override can page in that index's own order. A negative catalog
+        # part number is a descending column. ``None`` leaves paging ascending.
 
         self._ensure_connected()
         database, owner, name = _split_identity(identity)
@@ -2638,20 +2622,19 @@ class PurePythonInformixBridge:
 
     @_serialized_sqli_operation
     def boundary_lsn(self) -> int:
-        """A capture boundary that is never ahead of the log's true write position.
-
-        ``syslogs.used`` is a page count, so :meth:`current_lsn` names the end of the
-        page currently being written -- up to one page ahead of the last record on
-        disk. A transaction committing in the rest of that page *after* the sample
-        would carry an LSN at or below such a boundary and be discarded by ``_recover``
-        as already captured, while the snapshot read that follows the sample may or
-        may not have seen it: a stale or missing row with nothing left to correct it.
-        Anchoring the boundary at the *start* of the current page keeps it at or below
-        every commit that follows the sample. The cost is at most one page of log
-        re-delivered, which keyed targets dedup by key and LSN. Positions used as a
-        stop bound (the AvailableNow high-water mark, log-file comparisons) keep
-        :meth:`current_lsn`, where overshooting is harmless.
-        """
+        # Docstring: A capture boundary that is never ahead of the log's true write position.
+        #
+        # ``syslogs.used`` is a page count, so :meth:`current_lsn` names the end of the
+        # page currently being written -- up to one page ahead of the last record on
+        # disk. A transaction committing in the rest of that page *after* the sample
+        # would carry an LSN at or below such a boundary and be discarded by ``_recover``
+        # as already captured, while the snapshot read that follows the sample may or
+        # may not have seen it: a stale or missing row with nothing left to correct it.
+        # Anchoring the boundary at the *start* of the current page keeps it at or below
+        # every commit that follows the sample. The cost is at most one page of log
+        # re-delivered, which keyed targets dedup by key and LSN. Positions used as a
+        # stop bound (the AvailableNow high-water mark, log-file comparisons) keep
+        # :meth:`current_lsn`, where overshooting is harmless.
 
         self._ensure_connected()
         uniqid, used = self._current_log_position()
@@ -2671,12 +2654,11 @@ class PurePythonInformixBridge:
 
     @_serialized_sqli_operation
     def current_utc_time(self) -> int | None:
-        """Source-server current time as UTC epoch seconds, matching the CDC commit-time
-        units, for stamping snapshot rows' ``_informix_commit_time``.
-
-        Best-effort: a source that does not support ``DBINFO('utc_current')`` yields NULL
-        commit-time on snapshot rows rather than failing the read.
-        """
+        # Docstring: Source-server current time as UTC epoch seconds, matching the CDC commit-time
+        # units, for stamping snapshot rows' ``_informix_commit_time``.
+        #
+        # Best-effort: a source that does not support ``DBINFO('utc_current')`` yields NULL
+        # commit-time on snapshot rows rather than failing the read.
 
         self._ensure_connected()
         try:
@@ -2689,11 +2671,10 @@ class PurePythonInformixBridge:
 
     @_serialized_sqli_operation
     def prepare_initial_capture(self, identities: Sequence[str]) -> int:
-        """Enable full-row logging for every table, then capture one shared boundary.
-
-        The boundary is :meth:`boundary_lsn` -- never ahead of the true log position --
-        because the snapshot that follows is sequenced against it.
-        """
+        # Docstring: Enable full-row logging for every table, then capture one shared boundary.
+        #
+        # The boundary is :meth:`boundary_lsn` -- never ahead of the true log position --
+        # because the snapshot that follows is sequenced against it.
 
         self._ensure_connected()
 
@@ -2719,17 +2700,16 @@ class PurePythonInformixBridge:
 
     @_serialized_sqli_operation
     def validate_initial_lsn(self, capture: dict[str, Any], start_lsn: int) -> None:
-        """Validate CDC registration/activation without reading LODATA records.
-
-        Retries on a socket-read *timeout*, which under a startup storm (many flows
-        opening CDC sessions against syscdcv1 at once) is transient contention rather
-        than a real validation failure. Each attempt reconnects a fresh transport;
-        bounded attempts with short backoff ride out the storm, and exhausting them
-        re-raises so a genuinely-unreachable source still fails honestly. A non-timeout
-        failure (a nonzero cdc_* return, a negative session id) is a real error and is
-        never retried. Idempotent: each attempt opens its own CDC session, and the
-        server reclaims an abandoned one on its own.
-        """
+        # Docstring: Validate CDC registration/activation without reading LODATA records.
+        #
+        # Retries on a socket-read *timeout*, which under a startup storm (many flows
+        # opening CDC sessions against syscdcv1 at once) is transient contention rather
+        # than a real validation failure. Each attempt reconnects a fresh transport;
+        # bounded attempts with short backoff ride out the storm, and exhausting them
+        # re-raises so a genuinely-unreachable source still fails honestly. A non-timeout
+        # failure (a nonzero cdc_* return, a negative session id) is a real error and is
+        # never retried. Idempotent: each attempt opens its own CDC session, and the
+        # server reclaims an abandoned one on its own.
 
         attempt = 0
         while True:
@@ -2758,7 +2738,7 @@ class PurePythonInformixBridge:
                 attempt += 1
 
     def _validate_initial_lsn_once(self, capture: dict[str, Any], start_lsn: int) -> None:
-        """One attempt of :meth:`validate_initial_lsn` (which owns the retry policy)."""
+        # Docstring: One attempt of :meth:`validate_initial_lsn` (which owns the retry policy).
 
         self._ensure_connected()
 
@@ -2831,19 +2811,18 @@ class PurePythonInformixBridge:
         set_socket_timeout,
         previous_socket_timeout,
     ) -> None:
-        """Best-effort teardown for :meth:`_validate_initial_lsn_once`.
-
-        The purpose of the validation -- proving the CDC boundary registers and
-        activates -- is already met once activation succeeds (``primary_error`` is
-        None). cdc_endcapture/cdc_closesess are best-effort: the server reclaims an
-        abandoned CDC session on its own, and the validation returns no value derived
-        from them. A teardown that merely *times out* under heavy syscdcv1 load must not
-        fail an otherwise-successful validation -- doing so was observed wedging a flow
-        (e.g. tw101) purely on a slow teardown. Poison the transport so the next use
-        reconnects rather than resuming a half-torn-down session, and treat it as
-        non-fatal. A non-timeout cleanup failure, or any failure alongside a real primary
-        error, is still surfaced.
-        """
+        # Docstring: Best-effort teardown for :meth:`_validate_initial_lsn_once`.
+        #
+        # The purpose of the validation -- proving the CDC boundary registers and
+        # activates -- is already met once activation succeeds (``primary_error`` is
+        # None). cdc_endcapture/cdc_closesess are best-effort: the server reclaims an
+        # abandoned CDC session on its own, and the validation returns no value derived
+        # from them. A teardown that merely *times out* under heavy syscdcv1 load must not
+        # fail an otherwise-successful validation -- doing so was observed wedging a flow
+        # (e.g. tw101) purely on a slow teardown. Poison the transport so the next use
+        # reconnects rather than resuming a half-torn-down session, and treat it as
+        # non-fatal. A non-timeout cleanup failure, or any failure alongside a real primary
+        # error, is still surfaced.
 
         cleanup_errors = []
         cleanup_timed_out = False
@@ -3048,18 +3027,17 @@ class PurePythonInformixBridge:
 
     @contextlib.contextmanager
     def _repeatable_read_transaction(self, isolation: str = "REPEATABLE READ"):
-        """Run a snapshot transaction at ``isolation`` with the snapshot socket timeout.
-
-        Yields ``execute_command``. Commits on success and rolls back on any
-        error, preserving the primary error if rollback also fails. Isolates
-        the ANSI/non-ANSI transaction handling shared by the blocking
-        consistent snapshot and per-chunk incremental snapshot reads.
-
-        ``isolation`` is the SQL clause after ``SET ISOLATION TO`` and must be one
-        of the fixed clauses in ``_SNAPSHOT_ISOLATION_SQL`` -- it is interpolated
-        into a statement, so it is guarded here against anything else even though
-        the connector already maps it from a validated token.
-        """
+        # Docstring: Run a snapshot transaction at ``isolation`` with the snapshot socket timeout.
+        #
+        # Yields ``execute_command``. Commits on success and rolls back on any
+        # error, preserving the primary error if rollback also fails. Isolates
+        # the ANSI/non-ANSI transaction handling shared by the blocking
+        # consistent snapshot and per-chunk incremental snapshot reads.
+        #
+        # ``isolation`` is the SQL clause after ``SET ISOLATION TO`` and must be one
+        # of the fixed clauses in ``_SNAPSHOT_ISOLATION_SQL`` -- it is interpolated
+        # into a statement, so it is guarded here against anything else even though
+        # the connector already maps it from a validated token.
 
         if isolation not in _SNAPSHOT_ISOLATION_SQL.values():
             raise InformixError(f"Unsupported snapshot isolation {isolation!r}")
@@ -3129,17 +3107,16 @@ class PurePythonInformixBridge:
         snapshot_filter=None,
         key_descending=None,
     ):
-        """Read one PK-ordered chunk in its own repeatable-read transaction.
-
-        Returns ``(chunk_lsn, rows)`` where ``chunk_lsn`` is the source LSN
-        captured immediately before the chunk SELECT. The chunk is read at
-        REPEATABLE READ so its values are consistent as-of ``chunk_lsn``; the
-        transaction spans a single page, so no long-lived read view is held.
-        ``chunk_exprs`` optionally maps primary-key columns to order-preserving
-        SQL text expressions for keyset comparison (e.g. DATETIME-as-string).
-        ``key_descending`` optionally carries the per-column key index direction
-        so a mixed-direction key pages in the index's own order.
-        """
+        # Docstring: Read one PK-ordered chunk in its own repeatable-read transaction.
+        #
+        # Returns ``(chunk_lsn, rows)`` where ``chunk_lsn`` is the source LSN
+        # captured immediately before the chunk SELECT. The chunk is read at
+        # REPEATABLE READ so its values are consistent as-of ``chunk_lsn``; the
+        # transaction spans a single page, so no long-lived read view is held.
+        # ``chunk_exprs`` optionally maps primary-key columns to order-preserving
+        # SQL text expressions for keyset comparison (e.g. DATETIME-as-string).
+        # ``key_descending`` optionally carries the per-column key index direction
+        # so a mixed-direction key pages in the index's own order.
 
         self._ensure_connected()
         with self._repeatable_read_transaction():
@@ -3164,23 +3141,22 @@ class PurePythonInformixBridge:
     def max_primary_key(
         self, identity, primary_keys, chunk_exprs=None, snapshot_filter=None, key_descending=None
     ):
-        """Return the largest primary-key tuple, or ``None`` for an empty table.
-
-        "Largest" is the last tuple in the key's paging order. For a plain-column
-        key that order follows the index's per-column direction (see
-        ``key_descending``); for an all-ascending key it is ordinary descending.
-
-        When ``chunk_exprs`` maps a key to an order-preserving SQL expression,
-        that key is ordered and returned as its rendered string form so the
-        upper bound matches the values chunk pages compare against.
-
-        A plain-column key resolves the maximum tuple one column at a time (see
-        ``_max_key_stepwise``) so every read is index-servable regardless of the
-        key index's per-column direction. A chunked (DATETIME) key keeps the
-        single composite read: its equality prefix would have to match an
-        order-preserving cast expression that no index serves, so a stepwise scan
-        would not avoid a sort there.
-        """
+        # Docstring: Return the largest primary-key tuple, or ``None`` for an empty table.
+        #
+        # "Largest" is the last tuple in the key's paging order. For a plain-column
+        # key that order follows the index's per-column direction (see
+        # ``key_descending``); for an all-ascending key it is ordinary descending.
+        #
+        # When ``chunk_exprs`` maps a key to an order-preserving SQL expression,
+        # that key is ordered and returned as its rendered string form so the
+        # upper bound matches the values chunk pages compare against.
+        #
+        # A plain-column key resolves the maximum tuple one column at a time (see
+        # ``_max_key_stepwise``) so every read is index-servable regardless of the
+        # key index's per-column direction. A chunked (DATETIME) key keeps the
+        # single composite read: its equality prefix would have to match an
+        # order-preserving cast expression that no index serves, so a stepwise scan
+        # would not avoid a sort there.
 
         self._ensure_connected()
         database, owner, name = _split_identity(identity)
@@ -3224,26 +3200,25 @@ class PurePythonInformixBridge:
         snapshot_filter: str | None,
         descending: list[bool],
     ) -> list[Any] | None:
-        """Resolve the maximum key tuple one column at a time.
-
-        Each step reads ``FIRST 1`` of one key column under an equality filter
-        that pins the already-resolved higher-order columns, ordered to return
-        that column's *last* value in the key's paging order: for an ASC column
-        that is its max (``ORDER BY col DESC``), for a DESC column its min
-        (``ORDER BY col ASC``) -- so the tuple is the last row a forward index
-        scan in the key's own order would reach. A single-column order within an
-        equality prefix is served by a directional sub-range scan of the key
-        index -- no whole-table sort -- and it holds for any mix of ASC/DESC
-        column directions, where a composite ``ORDER BY`` matches neither scan
-        direction and forces a sort. Prior columns are pinned with ``?``
-        parameters, exactly as the snapshot keyset does, so no key value is
-        rendered back into SQL text.
-
-        All steps run inside one REPEATABLE READ view so the columns resolve
-        against a single point in time -- identical to what the equivalent
-        one-statement composite read would return -- and that view also carries
-        the snapshot read-timeout budget instead of the bare transport default.
-        """
+        # Docstring: Resolve the maximum key tuple one column at a time.
+        #
+        # Each step reads ``FIRST 1`` of one key column under an equality filter
+        # that pins the already-resolved higher-order columns, ordered to return
+        # that column's *last* value in the key's paging order: for an ASC column
+        # that is its max (``ORDER BY col DESC``), for a DESC column its min
+        # (``ORDER BY col ASC``) -- so the tuple is the last row a forward index
+        # scan in the key's own order would reach. A single-column order within an
+        # equality prefix is served by a directional sub-range scan of the key
+        # index -- no whole-table sort -- and it holds for any mix of ASC/DESC
+        # column directions, where a composite ``ORDER BY`` matches neither scan
+        # direction and forces a sort. Prior columns are pinned with ``?``
+        # parameters, exactly as the snapshot keyset does, so no key value is
+        # rendered back into SQL text.
+        #
+        # All steps run inside one REPEATABLE READ view so the columns resolve
+        # against a single point in time -- identical to what the equivalent
+        # one-statement composite read would return -- and that view also carries
+        # the snapshot read-timeout budget instead of the bare transport default.
 
         with self._repeatable_read_transaction():
             resolved: list[Any] = []
@@ -3273,12 +3248,11 @@ class PurePythonInformixBridge:
             return resolved
 
     def _execute_with_snapshot_read_timeout(self, sql: str, params: tuple) -> list:
-        """Run one read with the snapshot read-timeout budget, then restore it.
-
-        The incremental-snapshot key bound can run a full scan + top-sort on a
-        large table, so it must not be constrained by the bare ~30s transport
-        default or a slow seed times out and crash-loops the stream on restart.
-        """
+        # Docstring: Run one read with the snapshot read-timeout budget, then restore it.
+        #
+        # The incremental-snapshot key bound can run a full scan + top-sort on a
+        # large table, so it must not be constrained by the bare ~30s transport
+        # default or a slow seed times out and crash-loops the stream on restart.
 
         set_socket_timeout = getattr(self.transport, "set_socket_timeout", None)
         previous_socket_timeout = getattr(self.transport, "socket_timeout", None)
@@ -3320,15 +3294,14 @@ class PurePythonInformixBridge:
         snapshot_filter=None,
         isolation="REPEATABLE READ",
     ):
-        """Read one bounded point-in-time snapshot at ``isolation``.
-
-        ``isolation`` defaults to REPEATABLE READ, which freezes the scanned rows
-        so the snapshot is exactly the committed state as-of ``snapshot_lsn``. A
-        non-locking level (e.g. COMMITTED READ LAST COMMITTED) avoids locking the
-        table but no longer freezes it, so rows committed during the scan may be
-        captured here and replayed by CDC -- harmless for a keyed table (the sink
-        de-duplicates), a duplicate-row risk for a key-less one.
-        """
+        # Docstring: Read one bounded point-in-time snapshot at ``isolation``.
+        #
+        # ``isolation`` defaults to REPEATABLE READ, which freezes the scanned rows
+        # so the snapshot is exactly the committed state as-of ``snapshot_lsn``. A
+        # non-locking level (e.g. COMMITTED READ LAST COMMITTED) avoids locking the
+        # table but no longer freezes it, so rows committed during the scan may be
+        # captured here and replayed by CDC -- harmless for a keyed table (the sink
+        # de-duplicates), a duplicate-row risk for a key-less one.
 
         self._ensure_connected()
 
@@ -3643,7 +3616,7 @@ _bridge_factory: Callable[[dict[str, str]], InformixBridge] = PurePythonInformix
 
 
 def set_bridge_factory(factory: Callable[[dict[str, str]], InformixBridge]) -> None:
-    """Set the process-wide bridge factory (primarily for deterministic tests)."""
+    # Docstring: Set the process-wide bridge factory (primarily for deterministic tests).
 
     global _bridge_factory
     _bridge_factory = factory
@@ -3699,11 +3672,10 @@ def _option_bool(options: dict[str, str], name: str, default: bool) -> bool:
 
 
 def _snapshot_scan_value(raw: object) -> str:
-    """Normalise and validate a ``snapshot.scan`` value; see ``_SNAPSHOT_SCAN_OPTION``.
-
-    Shared by construction (connection scope), registration (table scope) and the
-    snapshot read itself, so a malformed value fails before any read.
-    """
+    # Docstring: Normalise and validate a ``snapshot.scan`` value; see ``_SNAPSHOT_SCAN_OPTION``.
+    #
+    # Shared by construction (connection scope), registration (table scope) and the
+    # snapshot read itself, so a malformed value fails before any read.
 
     value = str(raw).strip().lower()
     if value not in _SNAPSHOT_SCANS:
@@ -3715,7 +3687,7 @@ def _snapshot_scan_value(raw: object) -> str:
 
 
 def _validate_nonneg_float_option(options: dict[str, str], name: str) -> None:
-    """Raise if ``name`` is present and not a number >= 0. Absent means the default."""
+    # Docstring: Raise if ``name`` is present and not a number >= 0. Absent means the default.
 
     if name not in options:
         return
@@ -3737,7 +3709,8 @@ _DEFAULT_NULL_BYTE_MODE = "null"
 
 
 def _null_byte_mode(options: dict[str, str]) -> str:
-    """Resolve the ``string.null.byte`` option to ``null`` (default), ``empty``, or ``keep``."""
+    # Docstring: Resolve the ``string.null.byte`` option to ``null`` (default), ``empty``, or
+    # ``keep``.
 
     raw = options.get(_NULL_BYTE_OPTION)
     if raw is None:
@@ -3753,12 +3726,11 @@ def _null_byte_mode(options: dict[str, str]) -> str:
 
 
 def _append_only_value(raw: str) -> str:
-    """Normalize the tri-state ``append.only.ingestion`` option.
-
-    ``true``/``false`` force append (or not) for every capturable table; ``auto``
-    (also the default when the option is unset) applies append only to keyless
-    tables and leaves keyed tables on their normal CDC/snapshot path.
-    """
+    # Docstring: Normalize the tri-state ``append.only.ingestion`` option.
+    #
+    # ``true``/``false`` force append (or not) for every capturable table; ``auto``
+    # (also the default when the option is unset) applies append only to keyless
+    # tables and leaves keyed tables on their normal CDC/snapshot path.
 
     normalized = (raw or "").strip().lower()
     if normalized in {"1", "true", "yes"}:
@@ -3811,15 +3783,14 @@ _ALLOW_NULLABLE_INDEX_OPTION = "allow.nullable.index"
 
 
 class _DescendingKey:
-    """Order one key-column value descending inside a tuple comparison.
-
-    Index-native paging over a mixed-direction key compares tuples in the
-    index's order, not Python's all-ascending default. Wrapping the values of
-    the DESC columns flips just those positions; ASC columns stay bare. A
-    wrapper is only ever compared against another wrapper at the same tuple
-    position (same column, same type), so comparing the underlying values is
-    well-defined.
-    """
+    # Docstring: Order one key-column value descending inside a tuple comparison.
+    #
+    # Index-native paging over a mixed-direction key compares tuples in the
+    # index's order, not Python's all-ascending default. Wrapping the values of
+    # the DESC columns flips just those positions; ASC columns stay bare. A
+    # wrapper is only ever compared against another wrapper at the same tuple
+    # position (same column, same type), so comparing the underlying values is
+    # well-defined.
 
     __slots__ = ("value",)
 
@@ -3849,13 +3820,12 @@ class _DescendingKey:
 
 
 def _order_key(values: Sequence[Any], descending: Sequence[bool]) -> tuple:
-    """Map a key tuple to a comparison key honoring per-column direction.
-
-    Empty or all-ascending ``descending`` returns the tuple unchanged, so the
-    common (all-ascending lexicographic) case keeps Python's native order and is
-    unaffected. Otherwise DESC columns are wrapped so tuple comparison reproduces
-    the index's own scan order.
-    """
+    # Docstring: Map a key tuple to a comparison key honoring per-column direction.
+    #
+    # Empty or all-ascending ``descending`` returns the tuple unchanged, so the
+    # common (all-ascending lexicographic) case keeps Python's native order and is
+    # unaffected. Otherwise DESC columns are wrapped so tuple comparison reproduces
+    # the index's own scan order.
 
     if not descending or not any(descending):
         return tuple(values)
@@ -3870,25 +3840,24 @@ def _select_unique_index_key(
     nullable_by_name: dict[str, bool],
     allow_nullable: bool = False,
 ) -> list[tuple[str, bool]]:
-    """Choose a UNIQUE index to stand in for an absent primary key.
-
-    ``indexes`` is ``(idxname, [part1..part16])`` per unique index; the parts are
-    ``syscolumns`` column numbers in key order, terminated by a ``0`` (a negative number
-    is a descending column -- still part of the key, so its magnitude names the column).
-
-    By default only indexes whose every column is NOT NULL are eligible: a primary key must
-    be non-null for keyset pagination (``WHERE key > ?``) and CDC dedup to be sound, exactly
-    as a real primary key is, and a NULL key value would silently drop or mis-order rows.
-    ``allow_nullable`` relaxes that -- the operator asserts the columns are effectively
-    unique and non-null -- so an index with a nullable column can stand in. An index
-    referencing a column not present in the projection is skipped either way.
-
-    Among the eligible indexes, choose the one with the fewest columns; break ties by index
-    name in ascending lexical order (deterministic and independent of catalog row order).
-    Returns the ordered key as ``(column, descending)`` pairs -- ``descending`` records the
-    per-column index direction so paging can match the index's own order -- or ``[]`` when
-    no unique index qualifies (the table stays key-less).
-    """
+    # Docstring: Choose a UNIQUE index to stand in for an absent primary key.
+    #
+    # ``indexes`` is ``(idxname, [part1..part16])`` per unique index; the parts are
+    # ``syscolumns`` column numbers in key order, terminated by a ``0`` (a negative number
+    # is a descending column -- still part of the key, so its magnitude names the column).
+    #
+    # By default only indexes whose every column is NOT NULL are eligible: a primary key must
+    # be non-null for keyset pagination (``WHERE key > ?``) and CDC dedup to be sound, exactly
+    # as a real primary key is, and a NULL key value would silently drop or mis-order rows.
+    # ``allow_nullable`` relaxes that -- the operator asserts the columns are effectively
+    # unique and non-null -- so an index with a nullable column can stand in. An index
+    # referencing a column not present in the projection is skipped either way.
+    #
+    # Among the eligible indexes, choose the one with the fewest columns; break ties by index
+    # name in ascending lexical order (deterministic and independent of catalog row order).
+    # Returns the ordered key as ``(column, descending)`` pairs -- ``descending`` records the
+    # per-column index direction so paging can match the index's own order -- or ``[]`` when
+    # no unique index qualifies (the table stays key-less).
 
     candidates: list[tuple[int, str, list[tuple[str, bool]]]] = []
     for idxname, parts in indexes:
@@ -3914,7 +3883,7 @@ def _select_unique_index_key(
 
 
 def _parse_key_columns(raw: str) -> list[str]:
-    """Parse the primary.keys option -- a comma-separated list or a JSON array."""
+    # Docstring: Parse the primary.keys option -- a comma-separated list or a JSON array.
 
     text = (raw or "").strip()
     if not text:
@@ -3933,7 +3902,7 @@ def _parse_key_columns(raw: str) -> list[str]:
 
 
 def _snapshot_filter(options: dict[str, str]) -> str | None:
-    """Return a validated connector-owned snapshot WHERE predicate."""
+    # Docstring: Return a validated connector-owned snapshot WHERE predicate.
 
     value = options.get("snapshot.filter")
     if value is None:
@@ -3971,21 +3940,20 @@ def _validated_volume_location(location: str, option_name: str, options: dict[st
 
 
 def _newest_created_entry_mtime(path: str, recursive: bool = False) -> float:
-    """Return the newest storage-assigned timestamp without trusting directory updates.
-
-    Considers only the creation timestamps of the *files* found beneath ``path``.
-    Every artifact this inspects is created with O_EXCL and never rewritten, so a
-    file's mtime is its creation time.
-
-    Directory mtimes are excluded because their meaning is filesystem-specific:
-    a local POSIX filesystem advances them when entries are *removed*, while a
-    Volume settles them to a creation-like whole second but briefly surfaces a
-    transient post-mutation value first. Either way, cleaning an artifact's
-    contents could make the artifact look newly created to a caller sampling at
-    the wrong moment, keeping a stale lease alive. The scanned directory's own
-    timestamp is used only when it contains no files at all, where it bounds the
-    age rather than extending it.
-    """
+    # Docstring: Return the newest storage-assigned timestamp without trusting directory updates.
+    #
+    # Considers only the creation timestamps of the *files* found beneath ``path``.
+    # Every artifact this inspects is created with O_EXCL and never rewritten, so a
+    # file's mtime is its creation time.
+    #
+    # Directory mtimes are excluded because their meaning is filesystem-specific:
+    # a local POSIX filesystem advances them when entries are *removed*, while a
+    # Volume settles them to a creation-like whole second but briefly surfaces a
+    # transient post-mutation value first. Either way, cleaning an artifact's
+    # contents could make the artifact look newly created to a caller sampling at
+    # the wrong moment, keeping a stale lease alive. The scanned directory's own
+    # timestamp is used only when it contains no files at all, where it bounds the
+    # age rather than extending it.
 
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     root = os.open(path, flags)
@@ -4014,12 +3982,11 @@ def _newest_created_entry_mtime(path: str, recursive: bool = False) -> float:
 
 
 def _staging_subdirectories(path: str) -> list[str]:
-    """Immediate subdirectory paths of ``path``; empty if it is absent or unreadable.
-
-    Best-effort helper for the retention sweep: a missing path (nothing staged) is not
-    an error, and a scan failure must never fail a read -- the sweep is a background
-    safety net.
-    """
+    # Docstring: Immediate subdirectory paths of ``path``; empty if it is absent or unreadable.
+    #
+    # Best-effort helper for the retention sweep: a missing path (nothing staged) is not
+    # an error, and a scan failure must never fail a read -- the sweep is a background
+    # safety net.
 
     try:
         with os.scandir(path) as entries:
@@ -4063,12 +4030,11 @@ def _remove_candidate_tree_at(parent_descriptor: int, name: str) -> None:
 
 
 def _namespace_storage_now(namespace_descriptor: int) -> float | None:
-    """Return a storage-assigned wall clock for lease decisions, or None.
-
-    Writes and removes a short-lived probe file, reading its storage-assigned
-    mtime so lease comparisons use the filesystem's clock rather than a possibly
-    skewed worker clock. Returns None when the probe cannot be written.
-    """
+    # Docstring: Return a storage-assigned wall clock for lease decisions, or None.
+    #
+    # Writes and removes a short-lived probe file, reading its storage-assigned
+    # mtime so lease comparisons use the filesystem's clock rather than a possibly
+    # skewed worker clock. Returns None when the probe cannot be written.
 
     probe = f".now-{secrets.token_hex(8)}"
     try:
@@ -4109,20 +4075,19 @@ def _fsync_directory_path(path: str) -> None:
 
 
 def _dropped_mount_error(error: BaseException) -> OSError | None:
-    """Return the ENOTCONN in ``error``'s cause chain, if a dropped mount caused it.
-
-    Snapshot page staging is the only remaining Volume user, but it still touches
-    the mount from several calls -- open, makedirs, rename, listdir -- and only
-    ``os.open`` goes through the retry helper. When the mount drops, whichever
-    call runs first raises ENOTCONN, so no single site can be the place this is
-    handled; production saw it surface from two different sites in consecutive
-    updates.
-
-    Classifying at the read boundary instead covers every site at once. The
-    caller converts this into the same empty-batch checkpoint retry it already
-    uses for a transiently inaccessible Volume, which is exactly what a remount
-    needs: the mount returns within seconds and the next read proceeds.
-    """
+    # Docstring: Return the ENOTCONN in ``error``'s cause chain, if a dropped mount caused it.
+    #
+    # Snapshot page staging is the only remaining Volume user, but it still touches
+    # the mount from several calls -- open, makedirs, rename, listdir -- and only
+    # ``os.open`` goes through the retry helper. When the mount drops, whichever
+    # call runs first raises ENOTCONN, so no single site can be the place this is
+    # handled; production saw it surface from two different sites in consecutive
+    # updates.
+    #
+    # Classifying at the read boundary instead covers every site at once. The
+    # caller converts this into the same empty-batch checkpoint retry it already
+    # uses for a transiently inaccessible Volume, which is exactly what a remount
+    # needs: the mount returns within seconds and the next read proceeds.
 
     seen: set[int] = set()
     cursor: BaseException | None = error
@@ -4135,7 +4100,7 @@ def _dropped_mount_error(error: BaseException) -> OSError | None:
 
 
 def _open_state_entry_with_retry(path: str, flags: int, *, dir_fd: int | None = None) -> int:
-    """Open one state entry, retrying transient Volume permission and mount failures."""
+    # Docstring: Open one state entry, retrying transient Volume permission and mount failures.
 
     last_error: OSError | None = None
     for attempt in range(_SHARED_STATE_OPEN_ATTEMPTS):
@@ -4179,7 +4144,7 @@ def _open_state_entry_with_retry(path: str, flags: int, *, dir_fd: int | None = 
 
 
 def _open_state_directory(root: str, path: str) -> int:
-    """Open a directory beneath root without following a replaceable symlink."""
+    # Docstring: Open a directory beneath root without following a replaceable symlink.
 
     if os.path.commonpath((root, path)) != root:
         raise InformixError(f"Informix shared-state path escapes '{root}': '{path}'")
@@ -4297,7 +4262,10 @@ def _redirect_allowlist(value: str) -> frozenset[tuple[str, int]]:
     return frozenset(result)
 
 
-@dataclass(frozen=True)
+# These dataclasses generate only the methods the connector uses: none is printed,
+# and only Column is compared by value (the schema-change check compares column
+# tuples). The merged deployment pickles every generated method, so the rest are off.
+@dataclass(frozen=True, repr=False)
 class Column:
     name: str
     type_name: str
@@ -4320,7 +4288,7 @@ class Column:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False, repr=False)
 class Table:
     database: str
     owner: str
@@ -4429,7 +4397,7 @@ class Table:
         )
 
 
-@dataclass
+@dataclass(eq=False, repr=False)
 class Transaction:
     tx_id: int
     begin_lsn: int
@@ -4484,7 +4452,7 @@ class Transaction:
             self.pending_before = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False, repr=False)
 class CommittedTransaction:
     tx_id: int
     begin_lsn: int
@@ -4497,7 +4465,7 @@ class CommittedTransaction:
 
 
 class TransactionBuffer:
-    """Buffering for interleaved Informix transactions."""
+    # Docstring: Buffering for interleaved Informix transactions.
 
     def __init__(self) -> None:
         self.open: dict[int, Transaction] = {}
@@ -4545,10 +4513,10 @@ class TransactionBuffer:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False, repr=False)
 class _SharedCdcSnapshot:
-    """A coherent (schema, log position, transactions) view a consumer poll reads
-    from a shard in place of touching Informix itself."""
+    # Docstring: A coherent (schema, log position, transactions) view a consumer poll reads
+    # from a shard in place of touching Informix itself.
 
     table: "Table"
     fingerprint: str
@@ -4560,14 +4528,13 @@ class _SharedCdcSnapshot:
 
 
 class _SharedCdcShard:
-    """One shard of the sharded daemon-reader CDC pool.
-
-    A single daemon thread owns the Informix I/O for this shard's tables -- it reads
-    the shared CDC session, fetches schema, and samples the log bounds -- and publishes
-    the result here. Consumer streaming polls read the fanned-out transactions and the
-    schema/log position from memory rather than connecting themselves. All mutable
-    state is guarded by ``condition``.
-    """
+    # Docstring: One shard of the sharded daemon-reader CDC pool.
+    #
+    # A single daemon thread owns the Informix I/O for this shard's tables -- it reads
+    # the shared CDC session, fetches schema, and samples the log bounds -- and publishes
+    # the result here. Consumer streaming polls read the fanned-out transactions and the
+    # schema/log position from memory rather than connecting themselves. All mutable
+    # state is guarded by ``condition``.
 
     def __init__(self) -> None:
         self.condition = threading.Condition()
@@ -4636,15 +4603,15 @@ class _SharedCdcShard:
 
     @staticmethod
     def _covered(entry) -> bool:
-        """Whether a daemon read that captured this subscriber started at or below
-        its floor, so its buffer holds every transaction above that floor."""
+        # Docstring: Whether a daemon read that captured this subscriber started at or below
+        # its floor, so its buffer holds every transaction above that floor.
 
         covered_from = entry.get("covered_from")
         return covered_from is not None and covered_from <= entry["floor"]
 
     def snapshot(self, identity, checkpoint_commit_lsn):
-        """Return a coherent view for one table, or None to fall back to a direct
-        read (daemon not ready yet, or this table is unknown to the daemon)."""
+        # Docstring: Return a coherent view for one table, or None to fall back to a direct
+        # read (daemon not ready yet, or this table is unknown to the daemon).
 
         with self.condition:
             if not self.ready or identity not in self.schema:
@@ -4683,8 +4650,8 @@ class _SharedCdcShard:
     # ---- daemon side --------------------------------------------------------
 
     def live_subscribers(self):
-        """Drop subscribers past the TTL (a stopped flow must not pin the shard) and
-        return the current set. Caller holds the lock."""
+        # Docstring: Drop subscribers past the TTL (a stopped flow must not pin the shard) and
+        # return the current set. Caller holds the lock.
 
         now = time.monotonic()
         for identity in list(self.subscribers):
@@ -4695,11 +4662,11 @@ class _SharedCdcShard:
         return dict(self.subscribers)
 
     def ingest(self, raw, schema_map, min_lsn, current_lsn, read_start):
-        """Assemble one read's records into transactions, fan them out per table, and
-        publish the coherent snapshot. Returns whether the shard is caught up.
-
-        ``schema_map`` names the tables the read captured and ``read_start`` the LSN
-        it was activated at; together they record which subscribers it covered."""
+        # Docstring: Assemble one read's records into transactions, fan them out per table, and
+        # publish the coherent snapshot. Returns whether the shard is caught up.
+        #
+        # ``schema_map`` names the tables the read captured and ``read_start`` the LSN
+        # it was activated at; together they record which subscribers it covered.
 
         buffer = TransactionBuffer()
         committed = []
@@ -4822,9 +4789,9 @@ def _close_shared_cdc_reader(reader) -> None:
 
 
 def _run_shared_cdc_shard(shard: _SharedCdcShard) -> None:
-    """Daemon loop for one shard: read the shared CDC session, fetch schema + log
-    bounds, and publish. Holds one connection slot only across consecutive productive
-    reads; releases it before any idle wait so consumer bootstrap can use the slot."""
+    # Docstring: Daemon loop for one shard: read the shared CDC session, fetch schema + log
+    # bounds, and publish. Holds one connection slot only across consecutive productive
+    # reads; releases it before any idle wait so consumer bootstrap can use the slot.
 
     logger = logging.getLogger(__name__)
     reader = None
@@ -4901,34 +4868,33 @@ def _run_shared_cdc_shard(shard: _SharedCdcShard) -> None:
 
 
 class _SnapshotDrainPool:
-    """Bounded pool that drains ``initial``-mode snapshots off the microbatch thread.
-
-    A fixed number of driver-resident daemon workers (``snapshot.reader.threads``) pull
-    drain jobs off a shared queue; each builds a private reader, runs the ordinary inline
-    snapshot drain (which stages the pages and publishes the manifest durably), then
-    closes the reader to release its connection slot. Because at most K workers drain at
-    once, at most K slots are ever held by snapshots -- the fairness guarantee that keeps
-    streaming readers from being starved. A consumer subscribes a job and waits, holding
-    no slot, for its result. All state is guarded by ``condition``.
-
-    The consumer's ``wait`` is a *liveness watchdog*, not a total-duration deadline: the
-    drain reports progress (via ``report_progress``) each time it stages a page, and the
-    wait trips only after progress has gone quiet for a whole idle window. Liveness is
-    scoped by state so a job is neither failed early nor kept alive on someone else's work:
-
-    - A **running** job (a worker has picked it up) is measured from *its own* progress --
-      a staged page, or, while its worker is still acquiring a connection slot, a turnover
-      ping from the slot wait -- so a hung fetch on its worker trips even while other
-      workers advance, but a worker legitimately queued behind a busy pool does not.
-    - A **queued** job (waiting for a free worker) is measured from *pool-wide* progress,
-      so it waits its turn behind a large, healthy drain instead of failing while queued,
-      and only trips when the whole pool goes quiet.
-
-    Because progress is tied to *actual staged pages* (plus a pickup), a hung fetch cannot
-    masquerade as liveness. At most K workers drain at once, so at most K slots are ever
-    held by snapshots -- the fairness guarantee that keeps streaming readers from being
-    starved. A consumer subscribes a job and waits, holding no slot, for its result.
-    """
+    # Docstring: Bounded pool that drains ``initial``-mode snapshots off the microbatch thread.
+    #
+    # A fixed number of driver-resident daemon workers (``snapshot.reader.threads``) pull
+    # drain jobs off a shared queue; each builds a private reader, runs the ordinary inline
+    # snapshot drain (which stages the pages and publishes the manifest durably), then
+    # closes the reader to release its connection slot. Because at most K workers drain at
+    # once, at most K slots are ever held by snapshots -- the fairness guarantee that keeps
+    # streaming readers from being starved. A consumer subscribes a job and waits, holding
+    # no slot, for its result. All state is guarded by ``condition``.
+    #
+    # The consumer's ``wait`` is a *liveness watchdog*, not a total-duration deadline: the
+    # drain reports progress (via ``report_progress``) each time it stages a page, and the
+    # wait trips only after progress has gone quiet for a whole idle window. Liveness is
+    # scoped by state so a job is neither failed early nor kept alive on someone else's work:
+    #
+    # - A **running** job (a worker has picked it up) is measured from *its own* progress --
+    #   a staged page, or, while its worker is still acquiring a connection slot, a turnover
+    #   ping from the slot wait -- so a hung fetch on its worker trips even while other
+    #   workers advance, but a worker legitimately queued behind a busy pool does not.
+    # - A **queued** job (waiting for a free worker) is measured from *pool-wide* progress,
+    #   so it waits its turn behind a large, healthy drain instead of failing while queued,
+    #   and only trips when the whole pool goes quiet.
+    #
+    # Because progress is tied to *actual staged pages* (plus a pickup), a hung fetch cannot
+    # masquerade as liveness. At most K workers drain at once, so at most K slots are ever
+    # held by snapshots -- the fairness guarantee that keeps streaming readers from being
+    # starved. A consumer subscribes a job and waits, holding no slot, for its result.
 
     def __init__(self) -> None:
         self.condition = threading.Condition()
@@ -4980,7 +4946,7 @@ class _SnapshotDrainPool:
                 self.condition.notify_all()
 
     def mark_running(self, job_key) -> None:
-        """Record that a worker has picked this job up (it is no longer merely queued)."""
+        # Docstring: Record that a worker has picked this job up (it is no longer merely queued).
 
         with self.condition:
             self.running.add(job_key)
@@ -4993,12 +4959,11 @@ class _SnapshotDrainPool:
             self.condition.notify_all()
 
     def report_progress(self, job_key) -> None:
-        """Record forward progress on a job so waiters' idle windows reset.
-
-        A staged page advances both this job's own clock (for its running waiter) and the
-        pool-wide clock (for every queued waiter), so a queued job stays alive as long as
-        any worker is draining.
-        """
+        # Docstring: Record forward progress on a job so waiters' idle windows reset.
+        #
+        # A staged page advances both this job's own clock (for its running waiter) and the
+        # pool-wide clock (for every queued waiter), so a queued job stays alive as long as
+        # any worker is draining.
 
         with self.condition:
             now = time.monotonic()
@@ -5008,15 +4973,14 @@ class _SnapshotDrainPool:
             self.condition.notify_all()
 
     def wait(self, job_key, idle_timeout):
-        """Block until the job finishes, fails, or goes quiet for ``idle_timeout``.
-
-        Returns True on success, re-raises the worker's exception on failure, and returns
-        False only when the drain is *stalled*. "Stalled" means different things by state:
-        a **running** job must make its own progress (a hung fetch on its worker times
-        out even while other workers advance); a **queued** job only needs the pool to be
-        making progress (it waits its turn behind a big, healthy drain rather than failing
-        while it is still queued). Either way it fails once the whole pool goes quiet.
-        """
+        # Docstring: Block until the job finishes, fails, or goes quiet for ``idle_timeout``.
+        #
+        # Returns True on success, re-raises the worker's exception on failure, and returns
+        # False only when the drain is *stalled*. "Stalled" means different things by state:
+        # a **running** job must make its own progress (a hung fetch on its worker times
+        # out even while other workers advance); a **queued** job only needs the pool to be
+        # making progress (it waits its turn behind a big, healthy drain rather than failing
+        # while it is still queued). Either way it fails once the whole pool goes quiet.
 
         with self.condition:
             while job_key in self.pending:
@@ -5081,11 +5045,11 @@ def _close_snapshot_drain_reader(reader) -> None:
 
 
 def _run_snapshot_drain_worker(pool: _SnapshotDrainPool) -> None:
-    """Daemon loop: pull one drain job, run the inline snapshot drain under a private
-    reader (staging pages and publishing the manifest durably), then close the reader to
-    release its slot. A failure is recorded on the job so the waiting consumer re-raises
-    and its next microbatch re-subscribes -- the same recover-by-restart the inline drain
-    already relies on."""
+    # Docstring: Daemon loop: pull one drain job, run the inline snapshot drain under a private
+    # reader (staging pages and publishing the manifest durably), then close the reader to
+    # release its slot. A failure is recorded on the job so the waiting consumer re-raises
+    # and its next microbatch re-subscribes -- the same recover-by-restart the inline drain
+    # already relies on.
 
     logger = logging.getLogger(__name__)
     while True:
@@ -5136,21 +5100,20 @@ def _run_snapshot_drain_worker(pool: _SnapshotDrainPool) -> None:
 
 
 class _AsyncStagePipeline:
-    """Overlap a drain's next page fetch with the previous page's shape+upload.
-
-    Wraps the ``page_consumer`` the consistent-snapshot loop calls. ``submit``
-    hands a page to a single background worker and returns, so the loop can fetch
-    the next page while the worker shapes, compresses, and uploads the previous one.
-    A single worker preserves page order; a depth-1 queue bounds resident pages to
-    roughly three (one being fetched, one queued, one uploading) and applies
-    backpressure by blocking ``submit`` when the worker falls behind.
-
-    The wrapped stage callable owns nonlocal counters (page/row counts); it runs
-    only on the worker thread, and ``close`` joins that thread before the caller
-    reads them. A stage error is captured and re-raised at the next ``submit`` (so
-    the fetch loop stops early) and again at ``close``; ``shutdown`` joins without
-    raising, for the path where a primary error is already propagating.
-    """
+    # Docstring: Overlap a drain's next page fetch with the previous page's shape+upload.
+    #
+    # Wraps the ``page_consumer`` the consistent-snapshot loop calls. ``submit``
+    # hands a page to a single background worker and returns, so the loop can fetch
+    # the next page while the worker shapes, compresses, and uploads the previous one.
+    # A single worker preserves page order; a depth-1 queue bounds resident pages to
+    # roughly three (one being fetched, one queued, one uploading) and applies
+    # backpressure by blocking ``submit`` when the worker falls behind.
+    #
+    # The wrapped stage callable owns nonlocal counters (page/row counts); it runs
+    # only on the worker thread, and ``close`` joins that thread before the caller
+    # reads them. A stage error is captured and re-raised at the next ``submit`` (so
+    # the fetch loop stops early) and again at ``close``; ``shutdown`` joins without
+    # raising, for the path where a primary error is already propagating.
 
     def __init__(self, stage: Callable[[int, int, list], None], *, queue_size: int = 1) -> None:
         self._stage = stage
@@ -5184,7 +5147,7 @@ class _AsyncStagePipeline:
                 self._error = error
 
     def close(self) -> None:
-        """Finish all queued pages, join the worker, then re-raise any stage error."""
+        # Docstring: Finish all queued pages, join the worker, then re-raise any stage error.
 
         if self._started:
             self._queue.put(None)
@@ -5193,7 +5156,7 @@ class _AsyncStagePipeline:
             raise self._error
 
     def shutdown(self) -> None:
-        """Join the worker without raising -- for use while another error propagates."""
+        # Docstring: Join the worker without raising -- for use while another error propagates.
 
         if self._started:
             self._queue.put(None)
@@ -5201,11 +5164,10 @@ class _AsyncStagePipeline:
 
 
 class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
-    """Pure-Python connector live-validated on disposable Informix 15.
-
-    Normal auth, queries, discovery, snapshots, transactional CDC, and
-    serverless Lakeflow pipeline execution have been exercised.
-    """
+    # Docstring: Pure-Python connector live-validated on disposable Informix 15.
+    #
+    # Normal auth, queries, discovery, snapshots, transactional CDC, and
+    # serverless Lakeflow pipeline execution have been exercised.
 
     def __init__(self, options: dict[str, str]) -> None:
         super().__init__(options)
@@ -5511,7 +5473,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         self._retention_swept: set[str] = set()
 
     def set_registration_scope(self, scope: str) -> None:
-        """Install the scope shared by every reader serialized from one registration."""
+        # Docstring: Install the scope shared by every reader serialized from one registration.
 
         if not isinstance(scope, str) or _PIPELINE_SCOPE.fullmatch(scope) is None:
             raise ValueError("Informix registration scope has an invalid identity")
@@ -5540,13 +5502,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return scope
 
     def prepare_for_trigger_available_now(self) -> None:
-        """Freeze stream high-water marks when Spark selects AvailableNow."""
+        # Docstring: Freeze stream high-water marks when Spark selects AvailableNow.
 
         self._trigger_available_now = True
         self._trigger_boundaries.clear()
 
     def close(self) -> None:
-        """Close the live SQLI transport, if one was opened."""
+        # Docstring: Close the live SQLI transport, if one was opened.
 
         # Stop the background page-cleanup pool without blocking on in-flight
         # deletes -- cleanup is best-effort, so a few pages may be left for the
@@ -5592,14 +5554,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             add_informix_exception_note(exc_value, f"Informix cleanup also failed: {close_error}")
 
     def __getstate__(self) -> dict[str, Any]:
-        """Exclude live SQLI state when Spark serializes the data source.
-
-        Schema and metadata discovery run before Spark ships the reader to a
-        Python worker, so ``_bridge_instance`` can contain a socket, buffered
-        streams, and a thread lock.  None of those objects is transferable or
-        valid in another process.  The worker reconstructs a fresh bridge from
-        the immutable connection options on its first source operation.
-        """
+        # Docstring: Exclude live SQLI state when Spark serializes the data source.
+        #
+        # Schema and metadata discovery run before Spark ships the reader to a
+        # Python worker, so ``_bridge_instance`` can contain a socket, buffered
+        # streams, and a thread lock.  None of those objects is transferable or
+        # valid in another process.  The worker reconstructs a fresh bridge from
+        # the immutable connection options on its first source operation.
 
         self.close()
         state = self.__dict__.copy()
@@ -5748,15 +5709,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             return result
 
     def _registration_table(self, table_name: str, table_options: dict[str, str]) -> Table:
-        """Resolve one configured table with a targeted catalog lookup.
-
-        The framework asks for one specific table at a time (the pipeline spec's
-        exact ``owner.name``), so query just that table rather than scanning and
-        parsing the whole catalog. This keeps an unrelated unsupported table from
-        breaking registration for tables that are configured, and avoids reading
-        a large catalog wholesale. Resolved tables are cached per table in the
-        cross-instance coordinator so repeated registrations reuse them.
-        """
+        # Docstring: Resolve one configured table with a targeted catalog lookup.
+        #
+        # The framework asks for one specific table at a time (the pipeline spec's
+        # exact ``owner.name``), so query just that table rather than scanning and
+        # parsing the whole catalog. This keeps an unrelated unsupported table from
+        # breaking registration for tables that are configured, and avoids reading
+        # a large catalog wholesale. Resolved tables are cached per table in the
+        # cross-instance coordinator so repeated registrations reuse them.
 
         exposed = table_options.get("qualified_source_table", table_name)
         key = self._registration_table_cache_key()
@@ -5777,11 +5737,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             return self._apply_key_options(table, table_options)
 
     def _resolve_registration_table(self, exposed: str) -> Table:
-        """Resolve a single configured table by exposed ``owner.name`` via a
-        targeted catalog query, applying the same eligibility and selection
-        filters ``_table_map`` would. Only this one table is read and parsed, so
-        an unrelated unsupported table elsewhere in the catalog cannot fail it.
-        """
+        # Docstring: Resolve a single configured table by exposed ``owner.name`` via a
+        # targeted catalog query, applying the same eligibility and selection
+        # filters ``_table_map`` would. Only this one table is read and parsed, so
+        # an unrelated unsupported table elsewhere in the catalog cannot fail it.
 
         parts = _split_identity(exposed)
         if len(parts) != 2 or not all(_IDENTIFIER.fullmatch(part) for part in parts):
@@ -6099,15 +6058,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             yield _decode_snapshot_stage_value(row)
 
     def is_partitioned(self, table_name: str) -> bool:
-        """Gate the partitioned reader (default on).
-
-        True only for tables with a bounded staged-snapshot -> stream lifecycle:
-        keyed CDC tables and append-only tables. Their snapshot serves immutable
-        staged pages that fan out across executors, and every microbatch is bounded
-        so the embedded fallback never ships an unbounded batch. Snapshot-only
-        (non-CDC, non-append) tables drain unbounded and stay on the simple reader.
-        Cheap and exception-safe: any doubt returns False -> simpleStreamReader.
-        """
+        # Docstring: Gate the partitioned reader (default on).
+        #
+        # True only for tables with a bounded staged-snapshot -> stream lifecycle:
+        # keyed CDC tables and append-only tables. Their snapshot serves immutable
+        # staged pages that fan out across executors, and every microbatch is bounded
+        # so the embedded fallback never ships an unbounded batch. Snapshot-only
+        # (non-CDC, non-append) tables drain unbounded and stay on the simple reader.
+        # Cheap and exception-safe: any doubt returns False -> simpleStreamReader.
 
         if not self._partitioned_stream_enabled():
             return False
@@ -6122,18 +6080,17 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _snapshot_page_batch(
         self, table: Table, effective_start: dict, table_options: dict[str, str]
     ) -> tuple[str, str, int, int, int, int] | None:
-        """Resolve a staged-snapshot page-serve microbatch, else None.
-
-        Returns ``(stage_scope, schema_id, snapshot_lsn, start_page, end_page,
-        page_count)`` for a snapshot-phase checkpoint whose staged manifest exists,
-        where ``stage_scope`` is the scope the pages are stored under (the capturing
-        flow's, for a handoff relocation; otherwise the offset's own scope),
-        mirroring the resume resolution in :meth:`_read_snapshot`. Deterministic
-        given the start offset + immutable manifest + pages-per-batch, so
-        ``latest_offset`` and ``get_partitions`` agree without sharing state. None
-        means "not a page-serve" -> the embedded path. Never a page-serve for the
-        delete channel (deletes stage no pages).
-        """
+        # Docstring: Resolve a staged-snapshot page-serve microbatch, else None.
+        #
+        # Returns ``(stage_scope, schema_id, snapshot_lsn, start_page, end_page,
+        # page_count)`` for a snapshot-phase checkpoint whose staged manifest exists,
+        # where ``stage_scope`` is the scope the pages are stored under (the capturing
+        # flow's, for a handoff relocation; otherwise the offset's own scope),
+        # mirroring the resume resolution in :meth:`_read_snapshot`. Deterministic
+        # given the start offset + immutable manifest + pages-per-batch, so
+        # ``latest_offset`` and ``get_partitions`` agree without sharing state. None
+        # means "not a page-serve" -> the embedded path. Never a page-serve for the
+        # delete channel (deletes stage no pages).
 
         if self._is_delete_flow():
             return None
@@ -6234,18 +6191,17 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         effective_start: dict,
         batch: tuple[str, str, int, int, int, int],
     ) -> dict:
-        """Build the end offset for a page-serve microbatch spanning [start,end) pages.
-
-        Mirrors :meth:`_staged_snapshot_result`'s offset construction: a
-        snapshot-phase offset that advances ``page_index`` to ``end_page`` and
-        carries the boundary page's ``upper_pk`` as ``last_pk``, or the stream-phase
-        transition offset once the last page is served. The schema fingerprint is
-        carried forward from the checkpoint rather than recomputed from a live
-        catalog read -- staged pages are frozen as-of ``snapshot_lsn`` so a
-        mid-snapshot schema change cannot invalidate them, and drift is still caught
-        at the snapshot->CDC transition by ``_read_stream``. In the (overwhelming)
-        no-drift case this is byte-identical to what the simple reader commits.
-        """
+        # Docstring: Build the end offset for a page-serve microbatch spanning [start,end) pages.
+        #
+        # Mirrors :meth:`_staged_snapshot_result`'s offset construction: a
+        # snapshot-phase offset that advances ``page_index`` to ``end_page`` and
+        # carries the boundary page's ``upper_pk`` as ``last_pk``, or the stream-phase
+        # transition offset once the last page is served. The schema fingerprint is
+        # carried forward from the checkpoint rather than recomputed from a live
+        # catalog read -- staged pages are frozen as-of ``snapshot_lsn`` so a
+        # mid-snapshot schema change cannot invalidate them, and drift is still caught
+        # at the snapshot->CDC transition by ``_read_stream``. In the (overwhelming)
+        # no-drift case this is byte-identical to what the simple reader commits.
 
         stage_scope, schema_id, snapshot_lsn, start_page, end_page, page_count = batch
         expected_fingerprint = effective_start.get("schema_fingerprint")
@@ -6401,13 +6357,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _replay_embedded_range(
         self, table_name: str, start: dict, end: dict, table_options: dict[str, str]
     ) -> Iterator[dict]:
-        """Recompute an embedded microbatch bounded by its committed ``end`` offset.
-
-        The replay bounds are injected into a private copy of the table options, so
-        the read stops at ``end.commit_lsn`` (and, mid-incremental-copy, at
-        ``end.incremental.last_pk``) and the reached offset is verified before any
-        row is returned; the copy keeps the bound from leaking into later reads.
-        """
+        # Docstring: Recompute an embedded microbatch bounded by its committed ``end`` offset.
+        #
+        # The replay bounds are injected into a private copy of the table options, so
+        # the read stops at ``end.commit_lsn`` (and, mid-incremental-copy, at
+        # ``end.incremental.last_pk``) and the reached offset is verified before any
+        # row is returned; the copy keeps the bound from leaking into later reads.
 
         options = dict(table_options)
         return _replay_between_offsets(
@@ -6612,27 +6567,26 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return result
 
     def _dropped_mount_retry_offset(self, start_offset: dict, error: OSError) -> dict:
-        """Yield an empty batch for a dropped Volume mount, bounded by a fail-loud cap.
-
-        Kept separate from ``_shared_state_retry_offset`` because the two count
-        different things at different cadences: that one bounds a fast in-process
-        retry loop, this one bounds consecutive *microbatches*. Sharing a counter
-        would either let a dropped mount stall for ~100 minutes (see
-        ``_DROPPED_MOUNT_MAX_RETRIES``) or cut the in-process retries far too short.
-
-        Yielding is still the right first response -- a remount settles in seconds
-        and the checkpoint is untouched -- but it must not be the *only* response.
-        A mount that never returns otherwise leaves every flow yielding empty
-        batches with the pipeline reporting RUNNING and committing zero-row Delta
-        versions on schedule, which is indistinguishable from an idle source. This
-        was observed in production taking all 60 flows offline for 13 minutes with
-        no ERROR or WARN anywhere in the event log; only the offset's retry count
-        revealed it. Failing at the cap turns that into a visible flow failure.
-
-        ``_reset_retry_counts`` drops the key on the next read that reaches the
-        Volume, so the count only ever measures a current run of consecutive
-        failures and a mount that flaps does not accumulate toward the cap.
-        """
+        # Docstring: Yield an empty batch for a dropped Volume mount, bounded by a fail-loud cap.
+        #
+        # Kept separate from ``_shared_state_retry_offset`` because the two count
+        # different things at different cadences: that one bounds a fast in-process
+        # retry loop, this one bounds consecutive *microbatches*. Sharing a counter
+        # would either let a dropped mount stall for ~100 minutes (see
+        # ``_DROPPED_MOUNT_MAX_RETRIES``) or cut the in-process retries far too short.
+        #
+        # Yielding is still the right first response -- a remount settles in seconds
+        # and the checkpoint is untouched -- but it must not be the *only* response.
+        # A mount that never returns otherwise leaves every flow yielding empty
+        # batches with the pipeline reporting RUNNING and committing zero-row Delta
+        # versions on schedule, which is indistinguishable from an idle source. This
+        # was observed in production taking all 60 flows offline for 13 minutes with
+        # no ERROR or WARN anywhere in the event log; only the offset's retry count
+        # revealed it. Failing at the cap turns that into a visible flow failure.
+        #
+        # ``_reset_retry_counts`` drops the key on the next read that reaches the
+        # Volume, so the count only ever measures a current run of consecutive
+        # failures and a mount that flaps does not accumulate toward the cap.
 
         result = dict(start_offset)
         retry_count = _dropped_mount_retry_count(result)
@@ -6652,13 +6606,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return result
 
     def _dropped_mount_max_retries(self) -> int:
-        """Consecutive dropped-mount yields tolerated before the flow fails.
-
-        Configurable because the right bound depends on the microbatch interval:
-        the cap counts reads, not seconds, so a pipeline with a long trigger
-        interval covers the same wall-clock outage in fewer retries. Defaults to
-        ``_DROPPED_MOUNT_MAX_RETRIES``.
-        """
+        # Docstring: Consecutive dropped-mount yields tolerated before the flow fails.
+        #
+        # Configurable because the right bound depends on the microbatch interval:
+        # the cap counts reads, not seconds, so a pipeline with a long trigger
+        # interval covers the same wall-clock outage in fewer retries. Defaults to
+        # ``_DROPPED_MOUNT_MAX_RETRIES``.
 
         value = int(
             self.options.get(
@@ -6671,17 +6624,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return value
 
     def _capacity_retry_max_delay(self) -> float:
-        """Maximum jittered delay before a continuous reader retries after a miss.
-
-        A positive value is the inter-read backoff and also caps each acquisition
-        attempt (a short, miss-scaled budget). ``0`` changes both for a continuous
-        flow: the acquisition attempt blocks the full ``connection.wait.timeout.seconds``
-        (maximum chance to claim a slot) and there is no inter-read delay before
-        the next attempt. A continuous flow still yields rather than fails on
-        exhaustion, bounded by ``capacity.retry.max.retries``. For a triggered
-        flow the value is irrelevant: it always blocks fully and raises on
-        exhaustion.
-        """
+        # Docstring: Maximum jittered delay before a continuous reader retries after a miss.
+        #
+        # A positive value is the inter-read backoff and also caps each acquisition
+        # attempt (a short, miss-scaled budget). ``0`` changes both for a continuous
+        # flow: the acquisition attempt blocks the full ``connection.wait.timeout.seconds``
+        # (maximum chance to claim a slot) and there is no inter-read delay before
+        # the next attempt. A continuous flow still yields rather than fails on
+        # exhaustion, bounded by ``capacity.retry.max.retries``. For a triggered
+        # flow the value is irrelevant: it always blocks fully and raises on
+        # exhaustion.
 
         value = float(
             self.options.get(
@@ -6695,33 +6647,31 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
 
     @staticmethod
     def _offset_is_incremental_reader(start_offset: dict) -> bool:
-        """Report whether this read is an in-progress incremental snapshot.
-
-        The incremental strategy interleaves primary-key snapshot chunks with the
-        live CDC stream, so its offset carries ``phase == "stream"`` *and* an
-        ``incremental`` block while the copy is still in flight; the block is
-        dropped once the snapshot completes and the reader becomes pure CDC. This
-        window is the incremental *reader* phase, distinct from steady-state
-        stream even though both report ``phase == "stream"``.
-        """
+        # Docstring: Report whether this read is an in-progress incremental snapshot.
+        #
+        # The incremental strategy interleaves primary-key snapshot chunks with the
+        # live CDC stream, so its offset carries ``phase == "stream"`` *and* an
+        # ``incremental`` block while the copy is still in flight; the block is
+        # dropped once the snapshot completes and the reader becomes pure CDC. This
+        # window is the incremental *reader* phase, distinct from steady-state
+        # stream even though both report ``phase == "stream"``.
 
         return bool(start_offset) and "incremental" in start_offset
 
     def _offset_is_stream_phase(self, start_offset: dict) -> bool:
-        """Report whether this read is steady-state CDC for capacity purposes.
-
-        A first read has no checkpoint and begins with a snapshot; the blocking
-        ``snapshot`` phase carries ``phase != "stream"``. Only ``phase ==
-        "stream"`` is CDC. The incremental *reader* phase also reports ``phase ==
-        "stream"`` but is a bulk copy interleaved with CDC (see
-        :meth:`_offset_is_incremental_reader`); whether it counts as stream for
-        capacity is governed by ``snapshot.incremental.blocking`` -- when that is
-        true (the default) it is treated as non-stream so it blocks for a slot
-        like the consistent snapshot, and when false it is treated as stream and
-        uses the continuous yield budget. The capacity retry offset preserves both
-        ``phase`` and the ``incremental`` block across misses, so this stays
-        correct while a starved reader retries.
-        """
+        # Docstring: Report whether this read is steady-state CDC for capacity purposes.
+        #
+        # A first read has no checkpoint and begins with a snapshot; the blocking
+        # ``snapshot`` phase carries ``phase != "stream"``. Only ``phase ==
+        # "stream"`` is CDC. The incremental *reader* phase also reports ``phase ==
+        # "stream"`` but is a bulk copy interleaved with CDC (see
+        # :meth:`_offset_is_incremental_reader`); whether it counts as stream for
+        # capacity is governed by ``snapshot.incremental.blocking`` -- when that is
+        # true (the default) it is treated as non-stream so it blocks for a slot
+        # like the consistent snapshot, and when false it is treated as stream and
+        # uses the continuous yield budget. The capacity retry offset preserves both
+        # ``phase`` and the ``incremental`` block across misses, so this stays
+        # correct while a starved reader retries.
 
         if not start_offset or start_offset.get("phase") != "stream":
             return False
@@ -6730,35 +6680,33 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return True
 
     def _incremental_snapshot_blocking(self) -> bool:
-        """Whether the incremental snapshot reader phase blocks for a slot.
-
-        When true (the default), an in-progress incremental snapshot read blocks
-        the full ``connection.wait.timeout.seconds`` to patiently claim a slot,
-        like the consistent snapshot -- bulk copying is latency-tolerant and
-        benefits from pressing for a slot rather than yielding empty. When false,
-        it uses the continuous miss-scaled yield budget and ``capacity.retry.max.delay.seconds``
-        inter-read backoff instead, freeing the worker between attempts at the
-        cost of a slower copy under contention. A triggered flow always blocks
-        regardless of this option.
-        """
+        # Docstring: Whether the incremental snapshot reader phase blocks for a slot.
+        #
+        # When true (the default), an in-progress incremental snapshot read blocks
+        # the full ``connection.wait.timeout.seconds`` to patiently claim a slot,
+        # like the consistent snapshot -- bulk copying is latency-tolerant and
+        # benefits from pressing for a slot rather than yielding empty. When false,
+        # it uses the continuous miss-scaled yield budget and ``capacity.retry.max.delay.seconds``
+        # inter-read backoff instead, freeing the worker between attempts at the
+        # cost of a slower copy under contention. A triggered flow always blocks
+        # regardless of this option.
 
         return _option_bool(self.options, "snapshot.incremental.blocking", True)
 
     def _effective_capacity_retry_delay(self, start_offset: dict) -> float:
-        """Per-read capacity retry delay, treating non-stream reads as ``0``.
-
-        Snapshot reads (and, by default, the incremental snapshot reader phase)
-        are bulk, latency-tolerant work, so they should patiently wait out
-        contention for a slot: forcing the delay to ``0`` there makes each attempt
-        block the full ``connection.wait.timeout.seconds`` with no inter-read
-        backoff. Only the steady-state ``stream`` phase uses the configured
-        ``capacity.retry.max.delay.seconds``, where prompt yield-and-retry is the
-        right backpressure. Whether the incremental reader phase counts as stream
-        here is governed by ``snapshot.incremental.blocking`` (see
-        :meth:`_offset_is_stream_phase`). The phase override only applies to a
-        positive configured delay; a configured ``0`` already means "block fully
-        in every phase", so there is nothing to override.
-        """
+        # Docstring: Per-read capacity retry delay, treating non-stream reads as ``0``.
+        #
+        # Snapshot reads (and, by default, the incremental snapshot reader phase)
+        # are bulk, latency-tolerant work, so they should patiently wait out
+        # contention for a slot: forcing the delay to ``0`` there makes each attempt
+        # block the full ``connection.wait.timeout.seconds`` with no inter-read
+        # backoff. Only the steady-state ``stream`` phase uses the configured
+        # ``capacity.retry.max.delay.seconds``, where prompt yield-and-retry is the
+        # right backpressure. Whether the incremental reader phase counts as stream
+        # here is governed by ``snapshot.incremental.blocking`` (see
+        # :meth:`_offset_is_stream_phase`). The phase override only applies to a
+        # positive configured delay; a configured ``0`` already means "block fully
+        # in every phase", so there is nothing to override.
 
         configured = self._capacity_retry_max_delay()
         if configured and not self._offset_is_stream_phase(start_offset):
@@ -6766,15 +6714,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return configured
 
     def _retried_result(self, result: tuple[Iterator[dict], dict], start_offset: dict):
-        """Return a retried read's result without disturbing its retry bookkeeping.
-
-        A nested attempt may itself have given up and yielded, in which case its
-        offset carries the advisory counter that bounds the retry. Passing that
-        through ``_reset_retry_counts`` -- which exists to clear the counters after a
-        read that actually reached the source -- strips it, so the count oscillates
-        instead of climbing and the fail-loud caps can never be reached. Observed
-        directly while building this: successive reads reported 1, absent, 1, absent.
-        """
+        # Docstring: Return a retried read's result without disturbing its retry bookkeeping.
+        #
+        # A nested attempt may itself have given up and yielded, in which case its
+        # offset carries the advisory counter that bounds the retry. Passing that
+        # through ``_reset_retry_counts`` -- which exists to clear the counters after a
+        # read that actually reached the source -- strips it, so the count oscillates
+        # instead of climbing and the fail-loud caps can never be reached. Observed
+        # directly while building this: successive reads reported 1, absent, 1, absent.
 
         _, end_offset = result
         if _OFFSET_ADVISORY_FIELDS & set(end_offset):
@@ -6784,25 +6731,24 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _retry_transient_volume_read(
         self, attempt: Callable[[], Any], options: dict[str, str], attempt_index: int
     ):
-        """Re-run a read whose shared-state access failed transiently.
-
-        Called from the handlers that would otherwise answer a dropped mount by
-        yielding an empty batch with an unchanged position. For a normal read that
-        is correct and cheap -- the framework calls again and nothing is lost. During
-        a replay it is silently destructive: the caller has already committed the
-        range's end offset and reads an empty batch as proof the range held nothing,
-        so the rows vanish. Six tables lost 151 rows this way.
-
-        Retrying in place removes the dilemma whenever the mount returns, which in
-        production it did within seconds. If it never returns the two cases genuinely
-        differ, so they diverge: a normal read yields (this returns None and the
-        caller falls back), while a replay raises, because failing a batch Spark will
-        retry beats under-delivering one it will not.
-
-        Performs one further attempt per call. The caller re-enters through the read
-        path, which calls back here on a repeat failure, so ``attempt_index`` bounds
-        the chain; returning None at the bound hands the decision back.
-        """
+        # Docstring: Re-run a read whose shared-state access failed transiently.
+        #
+        # Called from the handlers that would otherwise answer a dropped mount by
+        # yielding an empty batch with an unchanged position. For a normal read that
+        # is correct and cheap -- the framework calls again and nothing is lost. During
+        # a replay it is silently destructive: the caller has already committed the
+        # range's end offset and reads an empty batch as proof the range held nothing,
+        # so the rows vanish. Six tables lost 151 rows this way.
+        #
+        # Retrying in place removes the dilemma whenever the mount returns, which in
+        # production it did within seconds. If it never returns the two cases genuinely
+        # differ, so they diverge: a normal read yields (this returns None and the
+        # caller falls back), while a replay raises, because failing a batch Spark will
+        # retry beats under-delivering one it will not.
+        #
+        # Performs one further attempt per call. The caller re-enters through the read
+        # path, which calls back here on a repeat failure, so ``attempt_index`` bounds
+        # the chain; returning None at the bound hands the decision back.
 
         if attempt_index + 1 >= _TRANSIENT_VOLUME_IN_PROCESS_ATTEMPTS:
             logging.getLogger(__name__).warning(
@@ -6822,12 +6768,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
 
     @staticmethod
     def _replay_stop_lsn(options: dict[str, str]) -> int | None:
-        """The LSN a replayed read must stop at, or None for an ordinary read.
-
-        Validated rather than trusted: the value reaches the read through the
-        options dict, and a malformed one would silently become an unbounded read --
-        exactly the behaviour being fixed.
-        """
+        # Docstring: The LSN a replayed read must stop at, or None for an ordinary read.
+        #
+        # Validated rather than trusted: the value reaches the read through the
+        # options dict, and a malformed one would silently become an unbounded read --
+        # exactly the behaviour being fixed.
 
         raw = options.get(_REPLAY_STOP_LSN_OPTION)
         if raw is None:
@@ -6862,14 +6807,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return budget
 
     def _capacity_retry_max_retries(self) -> int:
-        """Consecutive capacity misses a continuous flow tolerates before failing.
-
-        A continuous reader that never gets a slot yields empty batches, which is
-        indistinguishable from an idle source. This bound makes a permanently
-        undersized endpoint fail loudly instead of replicating nothing forever;
-        acquiring a slot resets the count, so it only ever measures a current run
-        of misses. Defaults to ``_CAPACITY_RETRY_MAX_RETRIES``.
-        """
+        # Docstring: Consecutive capacity misses a continuous flow tolerates before failing.
+        #
+        # A continuous reader that never gets a slot yields empty batches, which is
+        # indistinguishable from an idle source. This bound makes a permanently
+        # undersized endpoint fail loudly instead of replicating nothing forever;
+        # acquiring a slot resets the count, so it only ever measures a current run
+        # of misses. Defaults to ``_CAPACITY_RETRY_MAX_RETRIES``.
 
         value = int(
             self.options.get(
@@ -6888,49 +6832,48 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         replaying: bool = False,
         replay_wait_budget: float | None = None,
     ) -> float | None:
-        """Seconds this read may spend acquiring a slot, or None to block fully.
-
-        The bounded budget is a continuous-mode concept: a continuous flow is a
-        permanent standing consumer, so instead of pinning a worker for the whole
-        ``connection.wait.timeout.seconds`` it spends a short budget, yields an
-        empty batch, and is called again. A triggered flow is the opposite -- it
-        drains and terminates, so it must block for the full wait to actually get
-        a slot, and only fail if that genuinely exhausts. It therefore never uses
-        the yield budget, regardless of ``capacity.retry.max.delay.seconds``
-        (which governs only the continuous yield/backoff and is irrelevant to a
-        triggered read). Returning a short budget to a triggered flow makes it
-        give up in under a second under contention and fail the update, which is
-        the bug this guard prevents.
-
-        A replay also blocks for the full wait. Spark has already committed the
-        range's end and cannot accept an empty capacity-yield in its place, so a
-        short attempt only creates retry churn and increases the chance of repeated
-        failure under the same contention that caused the first miss.
-
-        A continuous flow blocks fully whenever its *effective* delay is ``0``
-        (see :meth:`_effective_capacity_retry_delay`): either the configured
-        ``capacity.retry.max.delay.seconds`` is ``0``, or this read is a
-        non-stream (snapshot/incremental) read, which is treated as ``0`` so bulk
-        copying patiently waits out contention for a slot. Blocking fully gives
-        the read the maximum chance to claim a slot before giving up; it still
-        yields rather than fails when the wait exhausts (only a triggered flow
-        raises), bounded by ``capacity.retry.max.retries`` consecutive misses.
-        The guard is an ``or`` (triggered is *always* full-block, plus any read
-        whose effective delay is zero); the earlier bug used ``and`` and so let a
-        triggered flow with a positive delay fall through to the short budget.
-
-        Otherwise (a continuous stream read with a positive delay) the budget
-        scales with ``capacity_pressure`` -- an acquisition-pressure signal that
-        rises on a miss and *decays* rather than resets on a served read -- so a
-        reader that has been contended presses harder than one that just arrived,
-        and a reader that is intermittently served keeps some of that earned
-        patience instead of dropping straight back to the least-patient budget on
-        every success. (This is deliberately distinct from ``capacity_retry_count``,
-        which counts strictly consecutive misses and resets on success because it
-        is the failure guard.) It is jittered so equally-aged readers do not
-        converge on one give-up instant and re-storm the Volume together on the
-        next round.
-        """
+        # Docstring: Seconds this read may spend acquiring a slot, or None to block fully.
+        #
+        # The bounded budget is a continuous-mode concept: a continuous flow is a
+        # permanent standing consumer, so instead of pinning a worker for the whole
+        # ``connection.wait.timeout.seconds`` it spends a short budget, yields an
+        # empty batch, and is called again. A triggered flow is the opposite -- it
+        # drains and terminates, so it must block for the full wait to actually get
+        # a slot, and only fail if that genuinely exhausts. It therefore never uses
+        # the yield budget, regardless of ``capacity.retry.max.delay.seconds``
+        # (which governs only the continuous yield/backoff and is irrelevant to a
+        # triggered read). Returning a short budget to a triggered flow makes it
+        # give up in under a second under contention and fail the update, which is
+        # the bug this guard prevents.
+        #
+        # A replay also blocks for the full wait. Spark has already committed the
+        # range's end and cannot accept an empty capacity-yield in its place, so a
+        # short attempt only creates retry churn and increases the chance of repeated
+        # failure under the same contention that caused the first miss.
+        #
+        # A continuous flow blocks fully whenever its *effective* delay is ``0``
+        # (see :meth:`_effective_capacity_retry_delay`): either the configured
+        # ``capacity.retry.max.delay.seconds`` is ``0``, or this read is a
+        # non-stream (snapshot/incremental) read, which is treated as ``0`` so bulk
+        # copying patiently waits out contention for a slot. Blocking fully gives
+        # the read the maximum chance to claim a slot before giving up; it still
+        # yields rather than fails when the wait exhausts (only a triggered flow
+        # raises), bounded by ``capacity.retry.max.retries`` consecutive misses.
+        # The guard is an ``or`` (triggered is *always* full-block, plus any read
+        # whose effective delay is zero); the earlier bug used ``and`` and so let a
+        # triggered flow with a positive delay fall through to the short budget.
+        #
+        # Otherwise (a continuous stream read with a positive delay) the budget
+        # scales with ``capacity_pressure`` -- an acquisition-pressure signal that
+        # rises on a miss and *decays* rather than resets on a served read -- so a
+        # reader that has been contended presses harder than one that just arrived,
+        # and a reader that is intermittently served keeps some of that earned
+        # patience instead of dropping straight back to the least-patient budget on
+        # every success. (This is deliberately distinct from ``capacity_retry_count``,
+        # which counts strictly consecutive misses and resets on success because it
+        # is the failure guard.) It is jittered so equally-aged readers do not
+        # converge on one give-up instant and re-storm the Volume together on the
+        # next round.
 
         if replaying:
             return replay_wait_budget
@@ -6961,15 +6904,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         replay_wait_budget: float | None = None,
         reserve_snapshot_slot: bool = False,
     ):
-        """Publish this read's acquisition budget and rank, then restore both.
-
-        The rank is published even when there is no budget. A blocking reader --
-        a triggered flow, or the latency-tolerant snapshot/incremental copy -- has
-        no budget by design, and it is exactly the reader that carries a proven
-        backlog while bulk-copying, so gating the rank on the budget left those
-        readers unprioritised (observed in production: ranks only ever appeared on
-        steady-state CDC offsets, streaks only on blocking copy offsets).
-        """
+        # Docstring: Publish this read's acquisition budget and rank, then restore both.
+        #
+        # The rank is published even when there is no budget. A blocking reader --
+        # a triggered flow, or the latency-tolerant snapshot/incremental copy -- has
+        # no budget by design, and it is exactly the reader that carries a proven
+        # backlog while bulk-copying, so gating the rank on the budget left those
+        # readers unprioritised (observed in production: ranks only ever appeared on
+        # steady-state CDC offsets, streaks only on blocking copy offsets).
 
         budget = self._capacity_attempt_budget(
             start_offset,
@@ -7012,19 +6954,18 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 self.options[_SNAPSHOT_DRAIN_MARKER_OPTION] = previous_drain
 
     def _capacity_retry_offset(self, start_offset: dict) -> dict:
-        """Yield an empty continuous batch when no connection slot is free.
-
-        The returned offset must differ from ``start_offset``: the framework calls
-        a reader repeatedly until the offset stops changing, so returning it
-        unchanged would signal exhaustion and stop the stream. Bumping the retry
-        count keeps the stream live, and ``_reset_retry_counts`` clears the key on
-        the next read that actually acquires a slot, so a reader that gets served
-        starts again from zero and the count only ever measures a current run of
-        consecutive misses.
-
-        Only the terminal case is logged: individual retries are the expected
-        steady state, and logging each would bury the driver log.
-        """
+        # Docstring: Yield an empty continuous batch when no connection slot is free.
+        #
+        # The returned offset must differ from ``start_offset``: the framework calls
+        # a reader repeatedly until the offset stops changing, so returning it
+        # unchanged would signal exhaustion and stop the stream. Bumping the retry
+        # count keeps the stream live, and ``_reset_retry_counts`` clears the key on
+        # the next read that actually acquires a slot, so a reader that gets served
+        # starts again from zero and the count only ever measures a current run of
+        # consecutive misses.
+        #
+        # Only the terminal case is logged: individual retries are the expected
+        # steady state, and logging each would bury the driver log.
 
         result = dict(start_offset)
         retry_count = _capacity_retry_count(result)
@@ -7071,20 +7012,19 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return result
 
     def _estimated_backlog(self, start_offset: dict) -> int | None:
-        """Estimate how far this flow trails the source, without a connection.
-
-        A waiting reader cannot call ``current_lsn()`` -- that needs the very slot
-        it is waiting for -- so it subtracts its own checkpoint (which survives a
-        capacity yield inside the offset) from the log position a slot *holder*
-        published. Returns None whenever no trustworthy hint exists, so callers
-        keep their unprioritised behaviour rather than ranking on a guess.
-
-        The published position is the server's global log position, so this
-        over-states the backlog of a quiet table: the log advances because *other*
-        tables are written. It measures staleness rather than true per-table lag,
-        which is why callers should compare it on a log scale rather than treat
-        the difference as a row count.
-        """
+        # Docstring: Estimate how far this flow trails the source, without a connection.
+        #
+        # A waiting reader cannot call ``current_lsn()`` -- that needs the very slot
+        # it is waiting for -- so it subtracts its own checkpoint (which survives a
+        # capacity yield inside the offset) from the log position a slot *holder*
+        # published. Returns None whenever no trustworthy hint exists, so callers
+        # keep their unprioritised behaviour rather than ranking on a guess.
+        #
+        # The published position is the server's global log position, so this
+        # over-states the backlog of a quiet table: the log advances because *other*
+        # tables are written. It measures staleness rather than true per-table lag,
+        # which is why callers should compare it on a log scale rather than treat
+        # the difference as a row count.
 
         try:
             checkpoint = start_offset.get("commit_lsn")
@@ -7117,18 +7057,17 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
 
     @staticmethod
     def _schema_transition_retry_offset(start_offset: dict) -> dict:
-        """Yield an empty batch while the upsert reader publishes the transition.
-
-        The offset must differ from ``start_offset`` or the framework reads the
-        unchanged offset as exhaustion and stops the stream, so bump a counter the
-        way the sibling coordination retries do. Unlike the capacity retry this
-        carries no failure cap: the wait is on the paired upsert reader for the
-        *same* table, which either publishes (this reader proceeds) or fails its
-        own flow with a real error. Capping here would convert a slow schema
-        transition into a delete-channel failure while the upsert side is still
-        healthy, and the whole point of yielding is that the slot is free for that
-        publication to happen.
-        """
+        # Docstring: Yield an empty batch while the upsert reader publishes the transition.
+        #
+        # The offset must differ from ``start_offset`` or the framework reads the
+        # unchanged offset as exhaustion and stops the stream, so bump a counter the
+        # way the sibling coordination retries do. Unlike the capacity retry this
+        # carries no failure cap: the wait is on the paired upsert reader for the
+        # *same* table, which either publishes (this reader proceeds) or fails its
+        # own flow with a real error. Capping here would convert a slow schema
+        # transition into a delete-channel failure while the upsert side is still
+        # healthy, and the whole point of yielding is that the slot is free for that
+        # publication to happen.
 
         result = dict(start_offset)
         retry_count = _schema_transition_retry_count(result)
@@ -7219,11 +7158,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return rows, end_offset
 
     def _append_only_mode(self, table_options: dict[str, str]) -> str:
-        """Resolve ``append.only.ingestion`` to ``'true'``, ``'false'``, or ``'auto'``.
-
-        ``table_options`` override the connection options; when the option is set
-        nowhere the mode defaults to ``'auto'``.
-        """
+        # Docstring: Resolve ``append.only.ingestion`` to ``'true'``, ``'false'``, or ``'auto'``.
+        #
+        # ``table_options`` override the connection options; when the option is set
+        # nowhere the mode defaults to ``'auto'``.
 
         for source in (table_options, self.options):
             if _APPEND_INGESTION_OPTION in source:
@@ -7231,27 +7169,25 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return "auto"
 
     def _append_delete_tombstones(self, table_options: dict[str, str]) -> bool:
-        """Resolve ``append.delete.tombstones``; default ``True``.
-
-        ``table_options`` override the connection options, exactly like
-        ``append.only.ingestion``. Only consulted for a table on the append path: it
-        decides whether a source DELETE lands on the upsert channel as a ``d`` row
-        carrying the full before-image, or is dropped.
-        """
+        # Docstring: Resolve ``append.delete.tombstones``; default ``True``.
+        #
+        # ``table_options`` override the connection options, exactly like
+        # ``append.only.ingestion``. Only consulted for a table on the append path: it
+        # decides whether a source DELETE lands on the upsert channel as a ``d`` row
+        # carrying the full before-image, or is dropped.
 
         if _APPEND_DELETE_TOMBSTONES_OPTION in table_options:
             return _option_bool(table_options, _APPEND_DELETE_TOMBSTONES_OPTION, True)
         return _option_bool(self.options, _APPEND_DELETE_TOMBSTONES_OPTION, True)
 
     def _append_only_table(self, table: Table, table_options: dict[str, str]) -> bool:
-        """Report whether this read should use the append-only path.
-
-        ``true`` forces append for any capturable table (a caller may want append
-        semantics even for an insert-only keyed table); ``false`` forces the normal
-        CDC/snapshot path; ``auto`` (the default) appends only keyless tables and
-        leaves keyed tables on CDC. A table whose columns cannot be captured always
-        falls back to snapshot, since append cannot represent rows it cannot read.
-        """
+        # Docstring: Report whether this read should use the append-only path.
+        #
+        # ``true`` forces append for any capturable table (a caller may want append
+        # semantics even for an insert-only keyed table); ``false`` forces the normal
+        # CDC/snapshot path; ``auto`` (the default) appends only keyless tables and
+        # leaves keyed tables on CDC. A table whose columns cannot be captured always
+        # falls back to snapshot, since append cannot represent rows it cannot read.
 
         if not _cdc_streamable(table):
             return False
@@ -7261,24 +7197,23 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return mode == "true"
 
     def _apply_primary_key_override(self, table: Table, table_options: dict[str, str]) -> Table:
-        """Override a table's primary key with the connector ``primary.keys`` option.
-
-        When set (per table), treat the table as keyed on those columns -- even a
-        physically keyless one -- so it is read as cdc_with_deletes with
-        keyset-paginated snapshots and reported with those keys (which the pipeline
-        also uses as the destination merge key). The caller MUST guarantee the
-        columns are unique for the row: a non-unique override corrupts upserts,
-        delete identification, and snapshot pagination.
-
-        The override adopts the per-column direction of an index whose key columns
-        exactly match it (see ``_override_key_directions``), so an override that
-        names a mixed-direction index's columns still pages in that index's own
-        order rather than forcing an all-ascending sort. When no index matches,
-        paging stays ascending.
-
-        ``"*"`` (or ``["*"]``) keys the table on every column in catalog order, nullable
-        ones included; see ``_PRIMARY_KEYS_WILDCARD``.
-        """
+        # Docstring: Override a table's primary key with the connector ``primary.keys`` option.
+        #
+        # When set (per table), treat the table as keyed on those columns -- even a
+        # physically keyless one -- so it is read as cdc_with_deletes with
+        # keyset-paginated snapshots and reported with those keys (which the pipeline
+        # also uses as the destination merge key). The caller MUST guarantee the
+        # columns are unique for the row: a non-unique override corrupts upserts,
+        # delete identification, and snapshot pagination.
+        #
+        # The override adopts the per-column direction of an index whose key columns
+        # exactly match it (see ``_override_key_directions``), so an override that
+        # names a mixed-direction index's columns still pages in that index's own
+        # order rather than forcing an all-ascending sort. When no index matches,
+        # paging stays ascending.
+        #
+        # ``"*"`` (or ``["*"]``) keys the table on every column in catalog order, nullable
+        # ones included; see ``_PRIMARY_KEYS_WILDCARD``.
 
         raw = table_options.get(_PRIMARY_KEYS_OPTION)
         if raw is None:
@@ -7323,11 +7258,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         )
 
     def _override_key_directions(self, identity: str, keys: tuple[str, ...]) -> list[bool] | None:
-        """Memoized key-index direction lookup for a ``primary.keys`` override.
-
-        The override is applied on every ``_table`` call (cache hits included), so
-        the catalog lookup must run at most once per table+key, not per microbatch.
-        """
+        # Docstring: Memoized key-index direction lookup for a ``primary.keys`` override.
+        #
+        # The override is applied on every ``_table`` call (cache hits included), so
+        # the catalog lookup must run at most once per table+key, not per microbatch.
 
         cache = self._override_direction_cache
         cache_key = (identity, keys)
@@ -7338,15 +7272,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return list(cached) if cached else None
 
     def _apply_nullable_index_promotion(self, table: Table, table_options: dict[str, str]) -> Table:
-        """Promote a nullable-column UNIQUE index to the key when the table opts in.
-
-        Applies only when the table is otherwise key-less (no primary key and no
-        all-NOT-NULL unique index qualified) and the per-table ``allow.nullable.index``
-        option is set. The operator thereby asserts the index's columns are unique and
-        non-null for every row. ``key_from_nullable_index`` marks the result so a schema
-        refresh preserves the promotion (the catalog re-derives it as key-less). An
-        explicit ``primary.keys`` override still wins -- it is applied afterward.
-        """
+        # Docstring: Promote a nullable-column UNIQUE index to the key when the table opts in.
+        #
+        # Applies only when the table is otherwise key-less (no primary key and no
+        # all-NOT-NULL unique index qualified) and the per-table ``allow.nullable.index``
+        # option is set. The operator thereby asserts the index's columns are unique and
+        # non-null for every row. ``key_from_nullable_index`` marks the result so a schema
+        # refresh preserves the promotion (the catalog re-derives it as key-less). An
+        # explicit ``primary.keys`` override still wins -- it is applied afterward.
 
         if table.primary_keys or not table.nullable_index_key:
             return table
@@ -7360,10 +7293,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         )
 
     def _apply_key_options(self, table: Table, table_options: dict[str, str]) -> Table:
-        """Apply the per-table key options in precedence order: an explicit
-        ``primary.keys`` override wins over a nullable-index promotion, which wins
-        over the catalog-derived key. Promotion runs first so the override, applied
-        last, still takes precedence."""
+        # Docstring: Apply the per-table key options in precedence order: an explicit
+        # ``primary.keys`` override wins over a nullable-index promotion, which wins
+        # over the catalog-derived key. Promotion runs first so the override, applied
+        # last, still takes precedence.
 
         return self._apply_primary_key_override(
             self._apply_nullable_index_promotion(table, table_options), table_options
@@ -7398,13 +7331,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return mode
 
     def _table_migration(self, table_options: dict[str, str]) -> bool:
-        """Whether this table is being migrated (``table.migration=true``).
-
-        Per-table first, falling back to the connection default; orthogonal to
-        snapshot.mode, which is left unchanged while migrating. When true the read runs
-        the record-and-stop handoff (see :meth:`_read_handoff`) instead of its normal
-        snapshot/stream behaviour.
-        """
+        # Docstring: Whether this table is being migrated (``table.migration=true``).
+        #
+        # Per-table first, falling back to the connection default; orthogonal to
+        # snapshot.mode, which is left unchanged while migrating. When true the read runs
+        # the record-and-stop handoff (see :meth:`_read_handoff`) instead of its normal
+        # snapshot/stream behaviour.
 
         if _TABLE_MIGRATION_OPTION in table_options:
             return _option_bool(table_options, _TABLE_MIGRATION_OPTION, False)
@@ -7412,18 +7344,17 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
 
     @staticmethod
     def _schema_node_fallback_offset(start_offset: dict[str, Any]) -> dict[str, Any]:
-        """Carry the bootstrap deferral count on an advisory (non-positional) offset.
-
-        A delete reader with no offset waits for the upsert reader to publish this
-        update's channel-start and yields an empty advisory batch meanwhile. The count
-        saturates at ``_SCHEMA_NODE_FALLBACK_RETRIES``: past it the returned offset
-        stops changing, which is how a replay (``_replay_between_offsets``) recognises
-        "still waiting for the upsert publication" and waits in place rather than
-        treating the unchanged offset as a failed replay. It rides an offset that has no
-        position at all, so it can never move a checkpoint. The field name is historical
-        -- it once gated a scope-independent schema-node fallback that never became part
-        of the bootstrap -- and is kept for checkpoint compatibility.
-        """
+        # Docstring: Carry the bootstrap deferral count on an advisory (non-positional) offset.
+        #
+        # A delete reader with no offset waits for the upsert reader to publish this
+        # update's channel-start and yields an empty advisory batch meanwhile. The count
+        # saturates at ``_SCHEMA_NODE_FALLBACK_RETRIES``: past it the returned offset
+        # stops changing, which is how a replay (``_replay_between_offsets``) recognises
+        # "still waiting for the upsert publication" and waits in place rather than
+        # treating the unchanged offset as a failed replay. It rides an offset that has no
+        # position at all, so it can never move a checkpoint. The field name is historical
+        # -- it once gated a scope-independent schema-node fallback that never became part
+        # of the bootstrap -- and is kept for checkpoint compatibility.
 
         count = _schema_node_fallback_retry_count(start_offset)
         if count >= _SCHEMA_NODE_FALLBACK_RETRIES:
@@ -7634,17 +7565,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             )
 
     def _reset_lakebase_connection(self) -> None:
-        """Drop the cached Lakebase state connection so the next use reopens fresh.
-
-        A psycopg connection left open across a long, idle wait -- worse, left
-        idle inside the implicit read transaction that a bare SELECT starts --
-        is reaped by Lakebase's ``idle_in_transaction_session_timeout``, and
-        ``.closed`` stays False until the next query fails, so
-        ``_lakebase_connection`` cannot tell it is dead and hands it back. The
-        snapshot-drain consumer blocks for the whole drain without touching
-        state, so it closes the connection here and lets the post-wait manifest
-        read reopen a guaranteed-live one.
-        """
+        # Docstring: Drop the cached Lakebase state connection so the next use reopens fresh.
+        #
+        # A psycopg connection left open across a long, idle wait -- worse, left
+        # idle inside the implicit read transaction that a bare SELECT starts --
+        # is reaped by Lakebase's ``idle_in_transaction_session_timeout``, and
+        # ``.closed`` stays False until the next query fails, so
+        # ``_lakebase_connection`` cannot tell it is dead and hands it back. The
+        # snapshot-drain consumer blocks for the whole drain without touching
+        # state, so it closes the connection here and lets the post-wait manifest
+        # read reopen a guaranteed-live one.
 
         connection = getattr(self, "_lakebase_conn", None)
         self._lakebase_conn = None
@@ -7657,7 +7587,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _write_handoff_token(
         self, table: Table, offset: dict, channel: int = _HANDOFF_CHANNEL_UPSERT
     ) -> None:
-        """Park a stream-phase offset so a later flow can resume from it."""
+        # Docstring: Park a stream-phase offset so a later flow can resume from it.
 
         _, table_key = self._table_state_keys(table)
         namespace = self._lakebase_state_namespace()
@@ -7678,7 +7608,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _read_handoff_token(
         self, table: Table, channel: int = _HANDOFF_CHANNEL_UPSERT
     ) -> dict[str, str] | None:
-        """Return the parked handoff token for this table, or None when absent."""
+        # Docstring: Return the parked handoff token for this table, or None when absent.
 
         _, table_key = self._table_state_keys(table)
         namespace = self._lakebase_state_namespace()
@@ -7688,7 +7618,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         )
 
     def _delete_handoff_token(self, table: Table, channel: int = _HANDOFF_CHANNEL_UPSERT) -> None:
-        """Drop a consumed handoff token. Best-effort and idempotent."""
+        # Docstring: Drop a consumed handoff token. Best-effort and idempotent.
 
         _, table_key = self._table_state_keys(table)
         namespace = self._lakebase_state_namespace()
@@ -7700,24 +7630,23 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _append_migration_record_and_stop(
         self, table: Table, effective_start: dict
     ) -> tuple[Iterator[dict], dict]:
-        """Record-and-stop for an append flow at stream phase under table.migration.
-
-        Migration never streams, so emit no rows and return the same offset. Capture and
-        the committed cutover seed are told apart by ``handoff_seeded`` exactly as on the
-        keyed path in :meth:`_read_handoff`:
-
-        * **Capture** (no marker) -- this append flow is the *source* of a relocation (an
-          already-append table moving destination), so park its current stream offset for
-          the new flow to seed from. Append has no delete channel, so only the upsert
-          offset is parked.
-        * **Cutover, seed committed** (marker present) -- drop the now-consumed token(s).
-          Crash-safe: a crash before the seed committed re-seeds from the still-present
-          token, and a later full refresh under table.migration then finds no token and
-          fails closed rather than silently re-seeding. The delete-channel token is dropped
-          too: an SCD1->append switch parked one while the table was still keyed, and an
-          append flow has no delete reader to consume it. The marker is kept on the
-          outgoing offset so a later steady-state read stays a stop.
-        """
+        # Docstring: Record-and-stop for an append flow at stream phase under table.migration.
+        #
+        # Migration never streams, so emit no rows and return the same offset. Capture and
+        # the committed cutover seed are told apart by ``handoff_seeded`` exactly as on the
+        # keyed path in :meth:`_read_handoff`:
+        #
+        # * **Capture** (no marker) -- this append flow is the *source* of a relocation (an
+        #   already-append table moving destination), so park its current stream offset for
+        #   the new flow to seed from. Append has no delete channel, so only the upsert
+        #   offset is parked.
+        # * **Cutover, seed committed** (marker present) -- drop the now-consumed token(s).
+        #   Crash-safe: a crash before the seed committed re-seeds from the still-present
+        #   token, and a later full refresh under table.migration then finds no token and
+        #   fails closed rather than silently re-seeding. The delete-channel token is dropped
+        #   too: an SCD1->append switch parked one while the table was still keyed, and an
+        #   append flow has no delete reader to consume it. The marker is kept on the
+        #   outgoing offset so a later steady-state read stays a stop.
 
         if effective_start.get("handoff_seeded"):
             self._delete_handoff_token(table)
@@ -7727,18 +7656,17 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return iter(()), dict(effective_start)
 
     def _drop_orphaned_handoff_tokens(self, table: Table, channels: list[int]) -> None:
-        """Best-effort, one-shot drop of a handoff token left behind after Restore.
-
-        The committed seed drops the token from inside ``_read_handoff`` /
-        ``_read_handoff_deletes`` -- but only while ``table.migration`` is still set.
-        If a cutover run committed the seed without a later same-mode read to consume it
-        (and Restore then cleared table.migration, so reads no longer enter those methods),
-        the
-        token would linger: it has no TTL, and a *future* cutover of the same table could
-        adopt it. So when a post-Restore read still carries the ``handoff_seeded`` marker,
-        drop the token here. This is one-shot -- the marker is not carried onto this read's
-        output offset -- and best-effort: a lingering token never justifies failing a read.
-        """
+        # Docstring: Best-effort, one-shot drop of a handoff token left behind after Restore.
+        #
+        # The committed seed drops the token from inside ``_read_handoff`` /
+        # ``_read_handoff_deletes`` -- but only while ``table.migration`` is still set.
+        # If a cutover run committed the seed without a later same-mode read to consume it
+        # (and Restore then cleared table.migration, so reads no longer enter those methods),
+        # the
+        # token would linger: it has no TTL, and a *future* cutover of the same table could
+        # adopt it. So when a post-Restore read still carries the ``handoff_seeded`` marker,
+        # drop the token here. This is one-shot -- the marker is not carried onto this read's
+        # output offset -- and best-effort: a lingering token never justifies failing a read.
 
         for channel in channels:
             try:
@@ -7753,13 +7681,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 )
 
     def _handoff_seed_from_token(self, table: Table, token: dict[str, str]) -> dict:
-        """Build the seed offset from a parked token, failing closed on schema drift.
-
-        The parked ``schema_fp`` is the source schema at capture time. If the source
-        schema changed before cutover the parked LSN position no longer aligns with the
-        current layout, so resuming would misread the stream -- fail closed and tell the
-        operator to re-capture or start fresh instead of silently corrupting the seam.
-        """
+        # Docstring: Build the seed offset from a parked token, failing closed on schema drift.
+        #
+        # The parked ``schema_fp`` is the source schema at capture time. If the source
+        # schema changed before cutover the parked LSN position no longer aligns with the
+        # current layout, so resuming would misread the stream -- fail closed and tell the
+        # operator to re-capture or start fresh instead of silently corrupting the seam.
 
         current = self._refresh_table_schema(table, None)
         parked_fp = token.get("schema_fp")
@@ -7792,41 +7719,40 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return seeded
 
     def _read_handoff(self, table: Table, effective_start: dict) -> tuple[Iterator[dict], dict]:
-        """Both sides of ``table.migration`` for a **keyed** (merge) CDC flow.
-
-        A keyed table keeps its ``scd_type`` across a destination relocation, so both
-        the capture (old flow) and the cutover (new flow) reach here -- unlike the
-        SCD1->append switch, whose cutover changes ingestion type and lands in
-        :meth:`_read_append_only`. Migration **never streams and never snapshots**: every
-        read records a checkpoint, emits no rows, and stops, or fails closed. Streaming
-        (and finishing an in-flight snapshot) resumes only once the operator clears
-        ``table.migration`` (the "Restore" step), after which the flow reads
-        normally from the checkpoint recorded here. The states:
-
-        * **Capture** (old flow) -- a stream-phase offset (steady-state CDC, or an
-          in-flight incremental copy whose ``incremental`` block fully describes a
-          resumable position), or a blocking ``initial`` snapshot parked mid-serve
-          (``phase=="snapshot"``, whose staged pages are portable *by reference* -- a new
-          flow reads them under the capturing scope via ``stage_scope``). Park it and
-          stop: an empty batch at the same offset is the AvailableNow "caught up, stop"
-          signal, so the parked offset equals the flow's committed position exactly.
-        * **Cutover seed** (new flow) -- an empty checkpoint with a parked token. Adopt
-          the parked offset as this flow's checkpoint, emit no rows, and stop. The token
-          is kept (not dropped) so a crash before the seed commits re-seeds rather than
-          failing closed; a ``handoff_seeded`` marker on the seed lets the next read drop
-          it (see :meth:`_handoff_seed_from_token`).
-        * **Seed committed** (new flow) -- the marker is present, so the seed committed.
-          Drop the now-consumed token and stop, still emitting no rows. The marker is
-          **kept on the outgoing offset** so a later steady-state read is not mistaken for
-          a fresh capture and re-parked; the flow idles here until Restore clears
-          table.migration.
-        * **Fail closed** -- an empty checkpoint with no parked token means the flow has
-          not reached a hand-off-able position (steady-state streaming, an in-flight
-          incremental copy, or a mid-serve blocking snapshot). There is nothing to record,
-          so raise rather than silently snapshotting: the operator must run the flow
-          without table.migration until it is streaming (or mid initial snapshot), then
-          set it.
-        """
+        # Docstring: Both sides of ``table.migration`` for a **keyed** (merge) CDC flow.
+        #
+        # A keyed table keeps its ``scd_type`` across a destination relocation, so both
+        # the capture (old flow) and the cutover (new flow) reach here -- unlike the
+        # SCD1->append switch, whose cutover changes ingestion type and lands in
+        # :meth:`_read_append_only`. Migration **never streams and never snapshots**: every
+        # read records a checkpoint, emits no rows, and stops, or fails closed. Streaming
+        # (and finishing an in-flight snapshot) resumes only once the operator clears
+        # ``table.migration`` (the "Restore" step), after which the flow reads
+        # normally from the checkpoint recorded here. The states:
+        #
+        # * **Capture** (old flow) -- a stream-phase offset (steady-state CDC, or an
+        #   in-flight incremental copy whose ``incremental`` block fully describes a
+        #   resumable position), or a blocking ``initial`` snapshot parked mid-serve
+        #   (``phase=="snapshot"``, whose staged pages are portable *by reference* -- a new
+        #   flow reads them under the capturing scope via ``stage_scope``). Park it and
+        #   stop: an empty batch at the same offset is the AvailableNow "caught up, stop"
+        #   signal, so the parked offset equals the flow's committed position exactly.
+        # * **Cutover seed** (new flow) -- an empty checkpoint with a parked token. Adopt
+        #   the parked offset as this flow's checkpoint, emit no rows, and stop. The token
+        #   is kept (not dropped) so a crash before the seed commits re-seeds rather than
+        #   failing closed; a ``handoff_seeded`` marker on the seed lets the next read drop
+        #   it (see :meth:`_handoff_seed_from_token`).
+        # * **Seed committed** (new flow) -- the marker is present, so the seed committed.
+        #   Drop the now-consumed token and stop, still emitting no rows. The marker is
+        #   **kept on the outgoing offset** so a later steady-state read is not mistaken for
+        #   a fresh capture and re-parked; the flow idles here until Restore clears
+        #   table.migration.
+        # * **Fail closed** -- an empty checkpoint with no parked token means the flow has
+        #   not reached a hand-off-able position (steady-state streaming, an in-flight
+        #   incremental copy, or a mid-serve blocking snapshot). There is nothing to record,
+        #   so raise rather than silently snapshotting: the operator must run the flow
+        #   without table.migration until it is streaming (or mid initial snapshot), then
+        #   set it.
 
         if not _cdc_capable(table):
             raise ValueError(
@@ -7868,20 +7794,19 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         options: dict[str, str],
         bootstrap_offset: dict,
     ) -> tuple[Iterator[dict], dict]:
-        """Delete-channel side of ``table.migration``.
-
-        Mirrors :meth:`_read_handoff` on the independently checkpointed delete reader,
-        so a keyed relocation that keeps its ``scd_type`` records the delete position
-        across the seam too -- so that, after Restore, the delete reader resumes at
-        *exactly* where the old flow's delete reader stopped, rather than restarting from
-        the upsert boundary (which could skip deletes that lay between the two readers'
-        independent positions). Like :meth:`_read_handoff`, it never streams: it records a
-        checkpoint, emits no rows, and stops. The delete token uses a separate channel
-        from the upsert token.
-
-        The SCD1->append switch has no delete flow at all, so this is only reached for
-        a table that keeps a delete channel; a snapshot-only or append table freezes.
-        """
+        # Docstring: Delete-channel side of ``table.migration``.
+        #
+        # Mirrors :meth:`_read_handoff` on the independently checkpointed delete reader,
+        # so a keyed relocation that keeps its ``scd_type`` records the delete position
+        # across the seam too -- so that, after Restore, the delete reader resumes at
+        # *exactly* where the old flow's delete reader stopped, rather than restarting from
+        # the upsert boundary (which could skip deletes that lay between the two readers'
+        # independent positions). Like :meth:`_read_handoff`, it never streams: it records a
+        # checkpoint, emits no rows, and stops. The delete token uses a separate channel
+        # from the upsert token.
+        #
+        # The SCD1->append switch has no delete flow at all, so this is only reached for
+        # a table that keeps a delete channel; a snapshot-only or append table freezes.
 
         table = self._table(table_name, options)
         if self._append_only_table(table, options) or not _cdc_capable(table):
@@ -7912,7 +7837,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return iter(()), dict(effective_start)
 
     def _read_cdc_only(self, table: Table, options: dict[str, str]) -> tuple[Iterator[dict], dict]:
-        """Establish a schema-safe CDC boundary without reading existing rows."""
+        # Docstring: Establish a schema-safe CDC boundary without reading existing rows.
 
         pipeline_scope = self._pipeline_scope()
         table = self._refresh_table_schema(table, None)
@@ -7938,24 +7863,22 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         )
 
     def _table_state_keys(self, table: Table) -> tuple[str, str]:
-        """Return the (connection, table) key pair that identifies a table's state.
-
-        The single source of truth for both. ``_shared_table_state_root`` joins
-        these under the shared state location; snapshot staging joins the same two
-        under the staging location. Deriving them here rather than recovering them
-        by relpath is what lets staging stand alone once the shared state location
-        is gone.
-        """
+        # Docstring: Return the (connection, table) key pair that identifies a table's state.
+        #
+        # The single source of truth for both. ``_shared_table_state_root`` joins
+        # these under the shared state location; snapshot staging joins the same two
+        # under the staging location. Deriving them here rather than recovering them
+        # by relpath is what lets staging stand alone once the shared state location
+        # is gone.
 
         return self._table_state_keys_for(table.native_identity)
 
     def _table_state_keys_for(self, native_identity: str) -> tuple[str, str]:
-        """Identity-string form of :meth:`_table_state_keys`.
-
-        Depends only on ``native_identity`` and the connection options (both
-        available on a Spark executor), so the staged-page read path can run there
-        without a ``Table`` -- i.e. without a live Informix catalog lookup.
-        """
+        # Docstring: Identity-string form of :meth:`_table_state_keys`.
+        #
+        # Depends only on ``native_identity`` and the connection options (both
+        # available on a Spark executor), so the staged-page read path can run there
+        # without a ``Table`` -- i.e. without a live Informix catalog lookup.
 
         namespace = "\0".join(
             (
@@ -7994,13 +7917,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _snapshot_manifest_namespace(
         self, table: Table, pipeline_scope: str, schema_id: str
     ) -> str:
-        """Record key for a staged snapshot's manifest.
-
-        The manifest is metadata -- page count, row count, snapshot LSN -- so it
-        lives with the rest of the state rather than beside the page payloads it
-        describes. Keying it by identity instead of by staging path means moving
-        or repointing the staging Volume does not orphan it.
-        """
+        # Docstring: Record key for a staged snapshot's manifest.
+        #
+        # The manifest is metadata -- page count, row count, snapshot LSN -- so it
+        # lives with the rest of the state rather than beside the page payloads it
+        # describes. Keying it by identity instead of by staging path means moving
+        # or repointing the staging Volume does not orphan it.
 
         connection_key, table_key = self._table_state_keys(table)
         return "/".join(
@@ -8034,15 +7956,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         self._cleaned_snapshot_stages.add(path)
 
     def _staging_transport(self) -> WorkspaceFilesApi | None:
-        """Resolve the snapshot-page staging transport once, caching the choice.
-
-        Returns a :class:`WorkspaceFilesApi` to stage pages over the Files REST API,
-        or ``None`` to use the FUSE mount. ``fuse`` forces FUSE; ``rest`` forces REST
-        and raises if a token cannot be minted; ``auto`` (default) uses REST when a
-        staging token can be minted and falls back to FUSE when the workspace forbids
-        token creation. The first mint is forced here so a "creation disabled"
-        workspace falls back at resolution time rather than mid-drain.
-        """
+        # Docstring: Resolve the snapshot-page staging transport once, caching the choice.
+        #
+        # Returns a :class:`WorkspaceFilesApi` to stage pages over the Files REST API,
+        # or ``None`` to use the FUSE mount. ``fuse`` forces FUSE; ``rest`` forces REST
+        # and raises if a token cannot be minted; ``auto`` (default) uses REST when a
+        # staging token can be minted and falls back to FUSE when the workspace forbids
+        # token creation. The first mint is forced here so a "creation disabled"
+        # workspace falls back at resolution time rather than mid-drain.
 
         if self._staging_transport_resolved:
             return self._staging_files_api
@@ -8076,13 +7997,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return files_api
 
     def _should_pipeline_staging(self, scan_keys: tuple[str, ...]) -> bool:
-        """Whether to overlap this drain's page fetch with the page upload.
-
-        Only for a positional drain over the REST transport -- ``scan_keys`` empty: a
-        keyless table, or a keyed one on ``snapshot.scan=cursor``. Keyset drains are
-        out of scope, and pipelining FUSE writes would raise the mount's write
-        frequency -- the exact condition the REST transport exists to avoid.
-        """
+        # Docstring: Whether to overlap this drain's page fetch with the page upload.
+        #
+        # Only for a positional drain over the REST transport -- ``scan_keys`` empty: a
+        # keyless table, or a keyed one on ``snapshot.scan=cursor``. Keyset drains are
+        # out of scope, and pipelining FUSE writes would raise the mount's write
+        # frequency -- the exact condition the REST transport exists to avoid.
 
         if scan_keys:
             return False
@@ -8093,13 +8013,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _build_staging_credential_provider(
         self, *, required: bool
     ) -> StagingCredentialProvider | None:
-        """Build the Files-API credential provider, or ``None`` to fall back to FUSE.
-
-        In ``auto`` mode with neither explicit workspace credentials nor a Databricks
-        runtime there is no ambient identity to mint from, so it returns ``None``
-        without probing the SDK -- which also keeps offline tests on FUSE. ``rest``
-        mode (``required``) always attempts resolution and lets a failure propagate.
-        """
+        # Docstring: Build the Files-API credential provider, or ``None`` to fall back to FUSE.
+        #
+        # In ``auto`` mode with neither explicit workspace credentials nor a Databricks
+        # runtime there is no ambient identity to mint from, so it returns ``None``
+        # without probing the SDK -- which also keeps offline tests on FUSE. ``rest``
+        # mode (``required``) always attempts resolution and lets a failure propagate.
 
         explicit = bool(
             self.options.get("lakebase.workspace.token")
@@ -8242,12 +8161,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         snapshot_lsn: int,
         page_index: int,
     ) -> bytes:
-        """Open, size-guard, and decompress one staged page into its raw JSON bytes.
-
-        Both the whole-record reader (used by the staging conflict check) and the
-        streaming serve reader go through this, so the file-open/decompress/ceiling
-        logic lives in one place.
-        """
+        # Docstring: Open, size-guard, and decompress one staged page into its raw JSON bytes.
+        #
+        # Both the whole-record reader (used by the staging conflict check) and the
+        # streaming serve reader go through this, so the file-open/decompress/ceiling
+        # logic lives in one place.
 
         return self._read_staged_page_payload_for(
             table.native_identity,
@@ -8267,12 +8185,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         snapshot_lsn: int,
         page_index: int,
     ) -> bytes:
-        """Identity-string form of :meth:`_read_staged_page_payload`.
-
-        Uses only the page's identity strings + the staging location, so it runs on
-        a Spark executor (the partitioned reader's ``read_partition``) with no live
-        Informix ``Table`` and therefore no catalog connection.
-        """
+        # Docstring: Identity-string form of :meth:`_read_staged_page_payload`.
+        #
+        # Uses only the page's identity strings + the staging location, so it runs on
+        # a Spark executor (the partitioned reader's ``read_partition``) with no live
+        # Informix ``Table`` and therefore no catalog connection.
 
         path = os.path.join(
             self._snapshot_stage_namespace_for(native_identity, pipeline_scope, schema_id),
@@ -8361,30 +8278,29 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         snapshot_lsn: int,
         page_index: int,
     ) -> tuple[dict[str, Any], Iterator[dict[str, Any]]]:
-        """Read a staged page without ever materializing its whole row graph.
-
-        The blocker for wide pages is that ``json.loads`` builds the entire page's
-        Python object graph (multiple GB) before a row is served, OOM-ing the
-        worker. Here the page is parsed structurally instead: the small header
-        fields are decoded, the huge ``rows`` array is *located* (not parsed), and
-        the rows are streamed one at a time by the returned generator, so peak
-        memory is the ~256 MB page text plus a single row rather than the whole
-        graph.
-
-        Integrity is still verified over the exact same bytes the writer hashed.
-        The writer stores ``sha256(json.dumps(body))`` and the page is
-        ``json.dumps({**body, "sha256": digest})`` with identical ``json.dumps``
-        settings, so the page bytes with the ``"sha256":"..."`` field excised are
-        byte-for-byte that canonical body -- hashed here via a ``memoryview`` (no
-        copy). ``json.dumps`` defaults to ``ensure_ascii=True``, so the page is
-        ASCII and character offsets equal byte offsets, letting the text scan and
-        the byte hash share indices.
-
-        Returns ``(header, rows)`` where ``header`` holds every field except
-        ``rows`` (already validated for version/identity/scope/schema/page and
-        integrity) and ``rows`` is a single-use generator of decoded rows that also
-        enforces the row count.
-        """
+        # Docstring: Read a staged page without ever materializing its whole row graph.
+        #
+        # The blocker for wide pages is that ``json.loads`` builds the entire page's
+        # Python object graph (multiple GB) before a row is served, OOM-ing the
+        # worker. Here the page is parsed structurally instead: the small header
+        # fields are decoded, the huge ``rows`` array is *located* (not parsed), and
+        # the rows are streamed one at a time by the returned generator, so peak
+        # memory is the ~256 MB page text plus a single row rather than the whole
+        # graph.
+        #
+        # Integrity is still verified over the exact same bytes the writer hashed.
+        # The writer stores ``sha256(json.dumps(body))`` and the page is
+        # ``json.dumps({**body, "sha256": digest})`` with identical ``json.dumps``
+        # settings, so the page bytes with the ``"sha256":"..."`` field excised are
+        # byte-for-byte that canonical body -- hashed here via a ``memoryview`` (no
+        # copy). ``json.dumps`` defaults to ``ensure_ascii=True``, so the page is
+        # ASCII and character offsets equal byte offsets, letting the text scan and
+        # the byte hash share indices.
+        #
+        # Returns ``(header, rows)`` where ``header`` holds every field except
+        # ``rows`` (already validated for version/identity/scope/schema/page and
+        # integrity) and ``rows`` is a single-use generator of decoded rows that also
+        # enforces the row count.
 
         return self._stream_staged_page_for(
             table.native_identity,
@@ -8404,13 +8320,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         snapshot_lsn: int,
         page_index: int,
     ) -> tuple[dict[str, Any], Iterator[dict[str, Any]]]:
-        """Identity-string form of :meth:`_stream_staged_page`.
-
-        Takes the page's identity strings instead of a ``Table`` so it runs on a
-        Spark executor (the partitioned reader's ``read_partition``) without a live
-        Informix catalog lookup. Integrity, structural scan, and row-count checks
-        are identical.
-        """
+        # Docstring: Identity-string form of :meth:`_stream_staged_page`.
+        #
+        # Takes the page's identity strings instead of a ``Table`` so it runs on a
+        # Spark executor (the partitioned reader's ``read_partition``) without a live
+        # Informix catalog lookup. Integrity, structural scan, and row-count checks
+        # are identical.
 
         payload = self._read_staged_page_payload_for(
             native_identity, exposed_name, pipeline_scope, schema_id, snapshot_lsn, page_index
@@ -8490,11 +8405,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return header, stream_rows()
 
     def _snapshot_cleanup_executor(self) -> concurrent.futures.ThreadPoolExecutor:
-        """Lazily start the background pool that deletes consumed staged pages.
-
-        Created on first use rather than in ``__init__`` and never pickled (see
-        ``close``/``__getstate__``): it is a driver-only, non-serializable object.
-        """
+        # Docstring: Lazily start the background pool that deletes consumed staged pages.
+        #
+        # Created on first use rather than in ``__init__`` and never pickled (see
+        # ``close``/``__getstate__``): it is a driver-only, non-serializable object.
 
         executor = self._snapshot_cleanup_executor_instance
         if executor is None:
@@ -8507,7 +8421,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
 
     @staticmethod
     def _delete_snapshot_page(path: str) -> None:
-        """Remove one consumed staged page. Best-effort: a leak only wastes space."""
+        # Docstring: Remove one consumed staged page. Best-effort: a leak only wastes space.
 
         try:
             PurePythonInformixBridge._remove_connection_slot_tree(path)
@@ -8528,19 +8442,18 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         snapshot_lsn: int,
         before_page_index: int,
     ) -> None:
-        """Schedule deletion of pages the reader has advanced past.
-
-        Incremental and off the serve path. A per-stream high-water mark makes
-        this schedule only the pages consumed since the last call, so it is O(1)
-        amortized per microbatch instead of the old O(page_index) rescan that
-        re-walked every earlier page each time -- at thousands of pages that
-        quadratic pile of FUSE lookups, not decode, dominated serve time. The
-        deletes run on a background pool so the microbatch never blocks on the
-        Volume. The mark lives on the reader instance, so a fresh stream (or a
-        restart) starts at zero and schedules every earlier page once; that
-        catch-up is still asynchronous. Deletion stays best-effort: a leaked page
-        only wastes space and is reclaimed by the retention sweep.
-        """
+        # Docstring: Schedule deletion of pages the reader has advanced past.
+        #
+        # Incremental and off the serve path. A per-stream high-water mark makes
+        # this schedule only the pages consumed since the last call, so it is O(1)
+        # amortized per microbatch instead of the old O(page_index) rescan that
+        # re-walked every earlier page each time -- at thousands of pages that
+        # quadratic pile of FUSE lookups, not decode, dominated serve time. The
+        # deletes run on a background pool so the microbatch never blocks on the
+        # Volume. The mark lives on the reader instance, so a fresh stream (or a
+        # restart) starts at zero and schedules every earlier page once; that
+        # catch-up is still asynchronous. Deletion stays best-effort: a leaked page
+        # only wastes space and is reclaimed by the retention sweep.
 
         key = (pipeline_scope, schema_id, snapshot_lsn)
         already_scheduled = self._snapshot_cleanup_watermark.get(key, 0)
@@ -8558,16 +8471,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             executor.submit(self._delete_snapshot_page, path)
 
     def _maybe_sweep_stale_snapshot_stages(self, table: Table) -> None:
-        """Submit a one-shot background sweep of this table's stale staged snapshot runs.
-
-        The consumed-page and completed-stage cleanups reclaim staging in the normal
-        lifecycle, but a crash, an abandoned resnapshot, or a superseded schema/scope can
-        leave a whole ``runs/<snapshot_lsn>`` subtree behind. This is the age-based safety
-        net that ``snapshot.staging.retention.days`` promises. It runs off the serve path
-        (on the same background pool as page deletion) and at most once per table per
-        reader instance -- so it never blocks a microbatch and never rescans -- and it is
-        keyed on file mtime, so an active run (recent page writes) is never swept.
-        """
+        # Docstring: Submit a one-shot background sweep of this table's stale staged snapshot runs.
+        #
+        # The consumed-page and completed-stage cleanups reclaim staging in the normal
+        # lifecycle, but a crash, an abandoned resnapshot, or a superseded schema/scope can
+        # leave a whole ``runs/<snapshot_lsn>`` subtree behind. This is the age-based safety
+        # net that ``snapshot.staging.retention.days`` promises. It runs off the serve path
+        # (on the same background pool as page deletion) and at most once per table per
+        # reader instance -- so it never blocks a microbatch and never rescans -- and it is
+        # keyed on file mtime, so an active run (recent page writes) is never swept.
 
         location = self._snapshot_staging_location
         retention = self._snapshot_staging_retention_seconds
@@ -8585,13 +8497,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
 
     @staticmethod
     def _sweep_stale_snapshot_stages(root: str, retention_seconds: float) -> None:
-        """Delete ``runs/<snapshot_lsn>`` subtrees under a table's staging root whose
-        newest page is older than the retention window.
-
-        Best-effort and idempotent, and safe to run concurrently with serving: an active
-        run's pages carry a recent mtime so it is never selected, and a path that is
-        missing or removed by a racing cleanup is skipped. Runs on a background thread.
-        """
+        # Docstring: Delete ``runs/<snapshot_lsn>`` subtrees under a table's staging root whose
+        # newest page is older than the retention window.
+        #
+        # Best-effort and idempotent, and safe to run concurrently with serving: an active
+        # run's pages carry a recent mtime so it is never selected, and a path that is
+        # missing or removed by a racing cleanup is skipped. Runs on a background thread.
 
         cutoff = time.time() - retention_seconds
         for scope in _staging_subdirectories(root):
@@ -8762,18 +8673,17 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _incremental_datetime_chunk_exprs(
         self, table: Table, options: dict[str, str]
     ) -> tuple[dict[str, str], bool]:
-        """Return ``(chunk_exprs, viable)`` for incremental chunking.
-
-        ``chunk_exprs`` maps each DATETIME primary-key column to a fixed-width
-        SQL text expression so keyset pagination can compare strings instead of
-        DATETIME literals. Any contiguous DATETIME qualifier is supported,
-        including HOUR-anchored TIME-of-day and DATE-only ranges, and a DATETIME
-        key column combined with non-DATETIME key columns in a composite key.
-        ``viable`` is False when the table has a DATETIME key that cannot be
-        string-chunked (option off or a malformed qualifier), signalling the
-        caller to fall back to the blocking snapshot rather than risk skipped
-        rows.
-        """
+        # Docstring: Return ``(chunk_exprs, viable)`` for incremental chunking.
+        #
+        # ``chunk_exprs`` maps each DATETIME primary-key column to a fixed-width
+        # SQL text expression so keyset pagination can compare strings instead of
+        # DATETIME literals. Any contiguous DATETIME qualifier is supported,
+        # including HOUR-anchored TIME-of-day and DATE-only ranges, and a DATETIME
+        # key column combined with non-DATETIME key columns in a composite key.
+        # ``viable`` is False when the table has a DATETIME key that cannot be
+        # string-chunked (option off or a malformed qualifier), signalling the
+        # caller to fall back to the blocking snapshot rather than risk skipped
+        # rows.
 
         datetime_keys = [
             column
@@ -8805,17 +8715,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         *,
         pipeline_scope_override: str | None = None,
     ) -> tuple[Iterator[dict], dict]:
-        """Interleave a PK-chunked snapshot with the live CDC stream.
-
-        Unlike the blocking consistent snapshot, CDC begins immediately at the
-        captured boundary and the table is copied in primary-key chunks, one
-        per microbatch, interleaved with change events. Each chunk is read in
-        its own short repeatable-read transaction and its READ rows are stamped
-        with the LSN captured just before that chunk's SELECT. Correctness for
-        keyed (apply_changes) targets follows from LSN sequencing: any
-        concurrent or later change to a chunked key commits at a higher LSN and
-        supersedes the READ row, so no in-memory deduplication window is needed.
-        """
+        # Docstring: Interleave a PK-chunked snapshot with the live CDC stream.
+        #
+        # Unlike the blocking consistent snapshot, CDC begins immediately at the
+        # captured boundary and the table is copied in primary-key chunks, one
+        # per microbatch, interleaved with change events. Each chunk is read in
+        # its own short repeatable-read transaction and its READ rows are stamped
+        # with the LSN captured just before that chunk's SELECT. Correctness for
+        # keyed (apply_changes) targets follows from LSN sequencing: any
+        # concurrent or later change to a chunked key commits at a higher LSN and
+        # supersedes the READ row, so no in-memory deduplication window is needed.
 
         checkpoint = _validated_offset(start) if start else None
         # A truncated destination discards the offset, and with it the whole
@@ -8922,27 +8831,26 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         chunk_exprs: dict[str, str],
         snapshot_filter: str | None,
     ) -> tuple[Table, str, dict]:
-        """Capture a fresh, self-describing incremental snapshot block.
-
-        The correctness of an incremental copy rests on one ordering: ``max_pk``
-        is read at or after the CDC start LSN. A row above ``max_pk`` is then
-        necessarily inserted later, commits above the start LSN, and so is
-        carried by the change stream that begins there. Reverse the order and
-        rows inserted in between fall above the key bound *and* below the stream
-        start -- owned by neither, and lost silently.
-
-        Production hit exactly that (tw214): a cancelled update published
-        max_pk=W0056332 at 22:41:58, the restart published a fresh, higher
-        initial_lsn at 22:46:29, and the copy ran with the OLD key bound against
-        the NEW stream start. Four rows inserted in between were never emitted.
-        The bound cannot have been captured fresh -- rows above it already
-        existed when the copy began.
-
-        ``max_pk`` rides in the Spark checkpoint while the LSN is published
-        durably per scope, so nothing tied the pair together. Stamping the block
-        with the scope that captured it makes the pair checkable wherever it is
-        later resumed; see ``_incremental_bound_is_foreign``.
-        """
+        # Docstring: Capture a fresh, self-describing incremental snapshot block.
+        #
+        # The correctness of an incremental copy rests on one ordering: ``max_pk``
+        # is read at or after the CDC start LSN. A row above ``max_pk`` is then
+        # necessarily inserted later, commits above the start LSN, and so is
+        # carried by the change stream that begins there. Reverse the order and
+        # rows inserted in between fall above the key bound *and* below the stream
+        # start -- owned by neither, and lost silently.
+        #
+        # Production hit exactly that (tw214): a cancelled update published
+        # max_pk=W0056332 at 22:41:58, the restart published a fresh, higher
+        # initial_lsn at 22:46:29, and the copy ran with the OLD key bound against
+        # the NEW stream start. Four rows inserted in between were never emitted.
+        # The bound cannot have been captured fresh -- rows above it already
+        # existed when the copy began.
+        #
+        # ``max_pk`` rides in the Spark checkpoint while the LSN is published
+        # durably per scope, so nothing tied the pair together. Stamping the block
+        # with the scope that captured it makes the pair checkable wherever it is
+        # later resumed; see ``_incremental_bound_is_foreign``.
 
         high_water = self._initial_lsn(table, scope=pipeline_scope)
         schema_id = self._snapshot_schema_ids[(pipeline_scope, table.identity)]
@@ -8984,29 +8892,28 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _rebound_incremental_block(
         self, table: Table, incremental: dict, chunk_exprs: dict[str, str]
     ) -> dict:
-        """Recapture ``max_pk`` when the block was bounded by another update.
-
-        The snapshot bound is only sound if it was read at or after the CDC start
-        LSN this update is streaming from: a row above ``max_pk`` then necessarily
-        commits above that LSN, so the change stream carries it. A bound inherited
-        from an earlier update inverts that -- it was read before this update's
-        boundary, so rows inserted in between sit above the key bound and below
-        the stream start, owned by neither side.
-
-        Production hit exactly that (tw214). A cancelled update bounded the copy
-        at W0056332 at 22:41:58; the restart published a fresh, higher boundary at
-        22:46:29 and copied with the OLD bound. Four rows inserted in between were
-        never emitted. The bound provably could not have been captured fresh --
-        rows above it already existed when that copy began.
-
-        Only the bound is recaptured. ``last_pk`` is kept: it names rows this
-        destination still holds, because the framework only discards the offset
-        when it truncates the table, and a discarded offset takes the whole
-        ``incremental`` block with it (start is None, which re-seeds from
-        scratch). Resetting the cursor here would re-read a prefix that is still
-        present -- measured as a 5x throughput drop across restarts -- and protect
-        nothing.
-        """
+        # Docstring: Recapture ``max_pk`` when the block was bounded by another update.
+        #
+        # The snapshot bound is only sound if it was read at or after the CDC start
+        # LSN this update is streaming from: a row above ``max_pk`` then necessarily
+        # commits above that LSN, so the change stream carries it. A bound inherited
+        # from an earlier update inverts that -- it was read before this update's
+        # boundary, so rows inserted in between sit above the key bound and below
+        # the stream start, owned by neither side.
+        #
+        # Production hit exactly that (tw214). A cancelled update bounded the copy
+        # at W0056332 at 22:41:58; the restart published a fresh, higher boundary at
+        # 22:46:29 and copied with the OLD bound. Four rows inserted in between were
+        # never emitted. The bound provably could not have been captured fresh --
+        # rows above it already existed when that copy began.
+        #
+        # Only the bound is recaptured. ``last_pk`` is kept: it names rows this
+        # destination still holds, because the framework only discards the offset
+        # when it truncates the table, and a discarded offset takes the whole
+        # ``incremental`` block with it (start is None, which re-seeds from
+        # scratch). Resetting the cursor here would re-read a prefix that is still
+        # present -- measured as a 5x throughput drop across restarts -- and protect
+        # nothing.
 
         max_pk = self._snapshot_read_with_reconnect(
             lambda: self._bridge.max_primary_key(
@@ -9028,7 +8935,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return rebound
 
     def _incremental_bound_is_foreign(self, incremental: dict) -> bool:
-        """True when this block's bound was captured by a different update."""
+        # Docstring: True when this block's bound was captured by a different update.
 
         # The reader's own registration, read directly rather than through
         # _pipeline_scope: that helper falls back to the checkpoint's own
@@ -9234,16 +9141,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _replay_stop_pk(
         options: dict[str, str], primary_keys: tuple[str, ...]
     ) -> object | tuple | None:
-        """The chunk cursor a replayed read must stop at, or None if unbounded.
-
-        JSON ``null`` returns a sentinel rather than None: both use max_pk as the
-        numerical bound, but the replay must keep fetching pages until it reaches
-        that bound while an ordinary read intentionally fetches only one page.
-
-        Validated rather than trusted, for the same reason as the LSN bound: a
-        malformed value would silently widen the replay back to the behaviour
-        being fixed.
-        """
+        # Docstring: The chunk cursor a replayed read must stop at, or None if unbounded.
+        #
+        # JSON ``null`` returns a sentinel rather than None: both use max_pk as the
+        # numerical bound, but the replay must keep fetching pages until it reaches
+        # that bound while an ordinary read intentionally fetches only one page.
+        #
+        # Validated rather than trusted, for the same reason as the LSN bound: a
+        # malformed value would silently widen the replay back to the behaviour
+        # being fixed.
 
         raw = options.get(_REPLAY_STOP_PK_OPTION)
         if raw is None:
@@ -9608,7 +9514,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
 
     @staticmethod
     def _validate_unl_source_options(options: dict[str, str]) -> None:
-        """Eagerly validate the connection-level `.unl` source options (per-table too)."""
+        # Docstring: Eagerly validate the connection-level `.unl` source options (per-table too).
 
         if _SNAPSHOT_SOURCE_OPTION in options and not str(options[_SNAPSHOT_SOURCE_OPTION]).strip():
             raise ValueError(f"Option '{_SNAPSHOT_SOURCE_OPTION}' must be a non-empty path")
@@ -9620,7 +9526,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 )
 
     def _table_snapshot_source(self, table_options: dict[str, str]) -> str | None:
-        """The table's ``snapshot.source`` Volume path (table option, then connection)."""
+        # Docstring: The table's ``snapshot.source`` Volume path (table option, then connection).
 
         value = table_options.get(_SNAPSHOT_SOURCE_OPTION) or self.options.get(
             _SNAPSHOT_SOURCE_OPTION
@@ -9629,13 +9535,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return value or None
 
     def _source_utc_time(self) -> int | None:
-        """Best-effort source-server UTC epoch seconds for a snapshot row's commit time.
-
-        Captured at the snapshot's boundary/LSN capture so ``r`` rows carry the snapshot's
-        as-of time (``<=`` every later CDC commit time, keeping the column monotonic across
-        the snapshot->CDC handoff). Returns None -- a NULL commit time -- if the bridge does
-        not implement it or the source cannot answer, so a snapshot never fails over a time.
-        """
+        # Docstring: Best-effort source-server UTC epoch seconds for a snapshot row's commit time.
+        #
+        # Captured at the snapshot's boundary/LSN capture so ``r`` rows carry the snapshot's
+        # as-of time (``<=`` every later CDC commit time, keeping the column monotonic across
+        # the snapshot->CDC handoff). Returns None -- a NULL commit time -- if the bridge does
+        # not implement it or the source cannot answer, so a snapshot never fails over a time.
 
         getter = getattr(self._bridge, "current_utc_time", None)
         if getter is None:
@@ -9647,13 +9552,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return int(value) if value is not None else None
 
     def _unl_field_format(self, table_options: dict[str, str]) -> tuple[str, str]:
-        """The ``(delimiter, escape)`` for a `.unl`/HPL DELIMITED serve.
-
-        Resolved table option, then connection, then the UNLOAD defaults (``|``/backslash),
-        so a plain UNLOAD extract needs no options and an HPL extract sets only what differs.
-        Both are validated to a single character (empty escape allowed = escaping disabled),
-        and the two must differ.
-        """
+        # Docstring: The ``(delimiter, escape)`` for a `.unl`/HPL DELIMITED serve.
+        #
+        # Resolved table option, then connection, then the UNLOAD defaults (``|``/backslash),
+        # so a plain UNLOAD extract needs no options and an HPL extract sets only what differs.
+        # Both are validated to a single character (empty escape allowed = escaping disabled),
+        # and the two must differ.
 
         delimiter = _unl_char(
             table_options.get(
@@ -9678,18 +9582,17 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return delimiter, escape
 
     def _unl_snapshot_serve(self, table_options: dict[str, str], effective_start: dict) -> bool:
-        """Whether this read belongs to a file-source initial snapshot's split serve.
-
-        The single gate the partitioned ``latest_offset``/``get_partitions`` branches
-        share: a non-delete flow, ``snapshot.source`` set, and ``snapshot.mode=initial``
-        (the only mode that routes to the file serve, keyed or keyless-append). It fires
-        on the first read (no committed offset) and on every continuation microbatch (a
-        snapshot-phase offset), so the serve fans out ``stream.partitioned.snapshot.pages.
-        per.batch`` splits at a time until the boundary offset transitions to the stream
-        phase; after that ``effective_start`` is a stream offset and every later read
-        takes the ordinary CDC path. A ``.unl`` table never stages pages, so a
-        snapshot-phase offset here is always a ``.unl`` split window (never a staged page).
-        """
+        # Docstring: Whether this read belongs to a file-source initial snapshot's split serve.
+        #
+        # The single gate the partitioned ``latest_offset``/``get_partitions`` branches
+        # share: a non-delete flow, ``snapshot.source`` set, and ``snapshot.mode=initial``
+        # (the only mode that routes to the file serve, keyed or keyless-append). It fires
+        # on the first read (no committed offset) and on every continuation microbatch (a
+        # snapshot-phase offset), so the serve fans out ``stream.partitioned.snapshot.pages.
+        # per.batch`` splits at a time until the boundary offset transitions to the stream
+        # phase; after that ``effective_start`` is a stream offset and every later read
+        # takes the ordinary CDC path. A ``.unl`` table never stages pages, so a
+        # snapshot-phase offset here is always a ``.unl`` split window (never a staged page).
 
         if self._is_delete_flow():
             return False
@@ -9700,12 +9603,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return not effective_start or effective_start.get("phase") == "snapshot"
 
     def _list_unl_files(self, source: str, exposed_name: str) -> list[str]:
-        """Sorted `.unl`/`.unl.gz` files under ``source`` (listing/stat only -- no content read).
-
-        Both plain and gzip-compressed extracts are listed; whether a given file is gzip is
-        decided per file by its magic bytes at read time (see :func:`_unl_file_is_gzip`), not
-        by its name, so a mislabelled file is still handled correctly.
-        """
+        # Docstring: Sorted `.unl`/`.unl.gz` files under ``source`` (listing/stat only -- no content
+        # read).
+        #
+        # Both plain and gzip-compressed extracts are listed; whether a given file is gzip is
+        # decided per file by its magic bytes at read time (see :func:`_unl_file_is_gzip`), not
+        # by its name, so a mislabelled file is still handled correctly.
 
         try:
             names = sorted(
@@ -9727,14 +9630,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return files
 
     def _unl_read_chunk(self, path: str) -> Callable[[int, int], bytes]:
-        """A ``(offset, length) -> bytes`` range reader for one `.unl` file.
-
-        Prefers the Files REST API (ranged GET, 206) when a staging token can be
-        minted -- the whole point, since serverless FUSE caches an entire file to
-        local disk on first access, fatal for a large `.unl`. Falls back to a local
-        seek/read when REST is unavailable (offline tests, or a workspace that forbids
-        token minting), mirroring ``snapshot.staging.transport=auto`` for writes.
-        """
+        # Docstring: A ``(offset, length) -> bytes`` range reader for one `.unl` file.
+        #
+        # Prefers the Files REST API (ranged GET, 206) when a staging token can be
+        # minted -- the whole point, since serverless FUSE caches an entire file to
+        # local disk on first access, fatal for a large `.unl`. Falls back to a local
+        # seek/read when REST is unavailable (offline tests, or a workspace that forbids
+        # token minting), mirroring ``snapshot.staging.transport=auto`` for writes.
 
         files_api = self._staging_transport()
         if files_api is not None:
@@ -9748,13 +9650,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return local
 
     def _resolve_unl_boundary_lsn(self, table_options: dict[str, str], source: str) -> int | None:
-        """Resolve the operator-supplied boundary LSN, or None to self-pin.
-
-        Order (first hit wins): the ``snapshot.boundary.lsn`` table option (table
-        options first, connection fallback -- same shape as :meth:`_table_snapshot_source`),
-        then ``_manifest.json`` in the source directory (``{"boundary_lsn": "<X>"}``).
-        Fails closed on a non-integer value in either place.
-        """
+        # Docstring: Resolve the operator-supplied boundary LSN, or None to self-pin.
+        #
+        # Order (first hit wins): the ``snapshot.boundary.lsn`` table option (table
+        # options first, connection fallback -- same shape as :meth:`_table_snapshot_source`),
+        # then ``_manifest.json`` in the source directory (``{"boundary_lsn": "<X>"}``).
+        # Fails closed on a non-integer value in either place.
 
         raw = table_options.get(_SNAPSHOT_BOUNDARY_LSN_OPTION) or self.options.get(
             _SNAPSHOT_BOUNDARY_LSN_OPTION
@@ -9773,15 +9674,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             raise InformixError(str(error)) from error
 
     def _resolve_unl_commit_time(self, source: str) -> int | None:
-        """The `.unl` extract's snapshot commit time (UTC epoch seconds) for its ``r`` rows.
-
-        Read from the optional ``_manifest.json`` ``boundary_time`` the extract records
-        beside ``boundary_lsn`` -- the wall-clock instant the extract reflects. A file-source
-        snapshot has no live boundary to query, so absent a manifest time these rows carry
-        NULL rather than a fabricated time (which would break the monotonic-handoff
-        guarantee that snapshot commit time is ``<=`` every later CDC commit time). Fails
-        closed on a present-but-invalid value.
-        """
+        # Docstring: The `.unl` extract's snapshot commit time (UTC epoch seconds) for its ``r``
+        # rows.
+        #
+        # Read from the optional ``_manifest.json`` ``boundary_time`` the extract records
+        # beside ``boundary_lsn`` -- the wall-clock instant the extract reflects. A file-source
+        # snapshot has no live boundary to query, so absent a manifest time these rows carry
+        # NULL rather than a fabricated time (which would break the monotonic-handoff
+        # guarantee that snapshot commit time is ``<=`` every later CDC commit time). Fails
+        # closed on a present-but-invalid value.
 
         manifest = self._read_unl_manifest(source)
         if manifest is None or manifest.get("boundary_time") is None:
@@ -9801,12 +9702,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return value
 
     def _read_unl_manifest(self, source: str) -> dict | None:
-        """Read ``<source>/_manifest.json`` (small file, whole), or None if absent.
-
-        Uses the Files REST API when a staging token is available (a 404 means absent),
-        else a local read (a missing file means absent). A present-but-malformed
-        manifest fails closed.
-        """
+        # Docstring: Read ``<source>/_manifest.json`` (small file, whole), or None if absent.
+        #
+        # Uses the Files REST API when a staging token is available (a 404 means absent),
+        # else a local read (a missing file means absent). A present-but-malformed
+        # manifest fails closed.
 
         path = os.path.join(source, _SNAPSHOT_MANIFEST_NAME)
         files_api = self._staging_transport()
@@ -9831,16 +9731,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return parsed if isinstance(parsed, dict) else None
 
     def _publish_unl_initialization(self, table: Table, scope: str, boundary: int) -> str:
-        """Publish the durable initialization record at an operator-supplied ``boundary``.
-
-        A variant of the owner path in :meth:`_shared_table_lsn` that pins ``initial_lsn``
-        to the operator's LSN (X) rather than the connector's freshly-captured
-        registration LSN -- X is authoritative, so the schema node's ``start_lsn`` and
-        the init record's ``initial_lsn`` are both X. Full-row logging is still enabled
-        (idempotent) and the boundary validated at X. Election makes it idempotent: a
-        re-call with the same X adopts the same winner; a table already initialized at a
-        different LSN loses the election and fails closed (run a full refresh).
-        """
+        # Docstring: Publish the durable initialization record at an operator-supplied ``boundary``.
+        #
+        # A variant of the owner path in :meth:`_shared_table_lsn` that pins ``initial_lsn``
+        # to the operator's LSN (X) rather than the connector's freshly-captured
+        # registration LSN -- X is authoritative, so the schema node's ``start_lsn`` and
+        # the init record's ``initial_lsn`` are both X. Full-row logging is still enabled
+        # (idempotent) and the boundary validated at X. Election makes it idempotent: a
+        # re-call with the same X adopts the same winner; a table already initialized at a
+        # different LSN loses the election and fails closed (run a full refresh).
 
         capture = _capture_descriptor(table, _client_encoding(self.options))
         self._bridge.prepare_initial_capture([table.native_identity])
@@ -9872,18 +9771,17 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _pin_unl_boundary(
         self, table: Table, options: dict[str, str], pipeline_scope: str
     ) -> tuple[Table, str, int]:
-        """Pin and durably publish the file-source snapshot boundary; idempotent.
-
-        With an operator-supplied boundary (``snapshot.boundary.lsn`` or ``_manifest.json``,
-        see :meth:`_resolve_unl_boundary_lsn`) the LSN X is authoritative: guard
-        ``minimum_lsn() <= X <= current_lsn()`` (below min = the logical log recycled past
-        X -> gap; above current = bogus), then publish the initialization + snapshot
-        boundary at ``initial_lsn == snapshot_lsn == X`` so the CDC stream and the
-        delete-channel bootstrap both start at X. Otherwise self-pin via ``_initial_lsn``
-        (the connector's registration LSN, cached -> stable across re-calls). Either way
-        the durable records are elected/immutable, so a speculative ``latest_offset``
-        re-call is idempotent.
-        """
+        # Docstring: Pin and durably publish the file-source snapshot boundary; idempotent.
+        #
+        # With an operator-supplied boundary (``snapshot.boundary.lsn`` or ``_manifest.json``,
+        # see :meth:`_resolve_unl_boundary_lsn`) the LSN X is authoritative: guard
+        # ``minimum_lsn() <= X <= current_lsn()`` (below min = the logical log recycled past
+        # X -> gap; above current = bogus), then publish the initialization + snapshot
+        # boundary at ``initial_lsn == snapshot_lsn == X`` so the CDC stream and the
+        # delete-channel bootstrap both start at X. Otherwise self-pin via ``_initial_lsn``
+        # (the connector's registration LSN, cached -> stable across re-calls). Either way
+        # the durable records are elected/immutable, so a speculative ``latest_offset``
+        # re-call is idempotent.
 
         boundary = self._resolve_unl_boundary_lsn(options, self._table_snapshot_source(options))
         if boundary is None:
@@ -9914,7 +9812,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return self._immutable_namespace(table, "unl-extract", pipeline_scope, schema_id)
 
     def _unl_extract_files(self, table: Table, table_options: dict[str, str]) -> list[dict]:
-        """The extract's files as they are now: name, path, size and modification time."""
+        # Docstring: The extract's files as they are now: name, path, size and modification time.
 
         source = self._table_snapshot_source(table_options)
         entries = []
@@ -9932,7 +9830,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return entries
 
     def _unl_fingerprint(self, entry: dict) -> str:
-        """SHA-256 of a file's size with its first and last sample bytes; cached per version."""
+        # Docstring: SHA-256 of a file's size with its first and last sample bytes; cached per
+        # version.
 
         key = (entry["path"], entry["size"], entry["mtime_ns"])
         cached = self._unl_fingerprint_cache.get(key)
@@ -9960,11 +9859,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         schema_id: str,
         snapshot_lsn: int,
     ) -> None:
-        """Pin the extract's manifest with the snapshot boundary; idempotent.
-
-        The record is elected, so a retried first read compares the directory with the
-        manifest the snapshot actually started from rather than re-pinning it.
-        """
+        # Docstring: Pin the extract's manifest with the snapshot boundary; idempotent.
+        #
+        # The record is elected, so a retried first read compares the directory with the
+        # manifest the snapshot actually started from rather than re-pinning it.
 
         entries = self._unl_extract_files(table, table_options)
         winner = self._publish_immutable_head(
@@ -9998,12 +9896,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         snapshot_lsn: int,
         read_paths: Iterable[str],
     ) -> None:
-        """Fail closed when the extract no longer matches the manifest its snapshot pinned.
-
-        Checks every file's name, size and modification time, and the fingerprint of each
-        file in ``read_paths`` -- the ones this read will serve. A snapshot that began
-        before manifests existed pins one now, which guards the rest of its serve.
-        """
+        # Docstring: Fail closed when the extract no longer matches the manifest its snapshot
+        # pinned.
+        #
+        # Checks every file's name, size and modification time, and the fingerprint of each
+        # file in ``read_paths`` -- the ones this read will serve. A snapshot that began
+        # before manifests existed pins one now, which guards the rest of its serve.
 
         record = self._read_immutable_head(
             self._unl_extract_namespace(table, pipeline_scope, schema_id)
@@ -10028,10 +9926,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         *,
         fingerprint_paths: set[str] | None,
     ) -> None:
-        """Raise if ``entries`` differ from the pinned manifest ``record``.
-
-        ``fingerprint_paths`` limits the content check to those files; None checks all.
-        """
+        # Docstring: Raise if ``entries`` differ from the pinned manifest ``record``.
+        #
+        # ``fingerprint_paths`` limits the content check to those files; None checks all.
 
         pinned = record.get("files")
         if not isinstance(pinned, list) or not all(isinstance(item, dict) for item in pinned):
@@ -10081,25 +9978,24 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _unl_snapshot_offset(
         self, table: Table, table_options: dict[str, str], effective_start: dict
     ) -> tuple[dict, list[dict[str, Any]] | None]:
-        """End offset for one windowed ``.unl`` snapshot microbatch, plus any driver rows.
-
-        On the first read (empty start) the boundary is pinned durably and idempotently
-        (see :meth:`_pin_unl_boundary`) and the serve begins at split 0; on a continuation
-        the boundary/schema come from the checkpoint and the serve resumes at the recorded
-        split index (and, inside a gzip file served in record windows, its record index).
-        An executor window advances by up to ``stream.partitioned.snapshot.pages.per.batch``
-        splits, stopping early before a gzip split that ``snapshot.gzip.records.per.batch``
-        serves in record windows. Such a window is read here on the driver -- its rows are
-        returned so latest_offset can cache them -- and advances by up to that many records,
-        moving to the next split once the file is exhausted. A non-terminal microbatch
-        returns a snapshot-phase offset (so the serve is resumable mid-snapshot), and the
-        microbatch that finishes the last split transitions to the stream phase at the
-        boundary -- where the CDC stream resumes and ``_recover`` discards everything at or
-        below it. The schema fingerprint is carried forward from the checkpoint on a
-        continuation (the extract is frozen as of the boundary; drift is still caught at the
-        snapshot->CDC transition by ``_read_stream``), matching the staged-page serve. An
-        empty extract transitions to the stream phase immediately.
-        """
+        # Docstring: End offset for one windowed ``.unl`` snapshot microbatch, plus any driver rows.
+        #
+        # On the first read (empty start) the boundary is pinned durably and idempotently
+        # (see :meth:`_pin_unl_boundary`) and the serve begins at split 0; on a continuation
+        # the boundary/schema come from the checkpoint and the serve resumes at the recorded
+        # split index (and, inside a gzip file served in record windows, its record index).
+        # An executor window advances by up to ``stream.partitioned.snapshot.pages.per.batch``
+        # splits, stopping early before a gzip split that ``snapshot.gzip.records.per.batch``
+        # serves in record windows. Such a window is read here on the driver -- its rows are
+        # returned so latest_offset can cache them -- and advances by up to that many records,
+        # moving to the next split once the file is exhausted. A non-terminal microbatch
+        # returns a snapshot-phase offset (so the serve is resumable mid-snapshot), and the
+        # microbatch that finishes the last split transitions to the stream phase at the
+        # boundary -- where the CDC stream resumes and ``_recover`` discards everything at or
+        # below it. The schema fingerprint is carried forward from the checkpoint on a
+        # continuation (the extract is frozen as of the boundary; drift is still caught at the
+        # snapshot->CDC transition by ``_read_stream``), matching the staged-page serve. An
+        # empty extract transitions to the stream phase immediately.
 
         if not effective_start:
             pipeline_scope = self._pipeline_scope()
@@ -10192,8 +10088,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         splits: list[tuple[str, int, int, bool]],
         start_split: int,
     ) -> int:
-        """End split of an executor window: up to pages-per-batch splits, stopping before a
-        gzip split that ``snapshot.gzip.records.per.batch`` serves on the driver."""
+        # Docstring: End split of an executor window: up to pages-per-batch splits, stopping before
+        # a
+        # gzip split that ``snapshot.gzip.records.per.batch`` serves on the driver.
 
         end_split = min(start_split + self._partitioned_pages_per_batch(), len(splits))
         if self._table_int_option(table_options, _UNL_GZIP_RECORDS_OPTION, 0, minimum=0):
@@ -10210,7 +10107,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         start_split: int,
         driver_window: bool,
     ) -> set[str]:
-        """The files the window starting at ``start_split`` will read."""
+        # Docstring: The files the window starting at ``start_split`` will read.
 
         if start_split >= len(splits):
             return set()
@@ -10226,12 +10123,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         start_split: int,
         start_record: int,
     ) -> bool:
-        """Whether the window starting at ``start_split`` is a driver-read gzip record window.
-
-        True for a gzip split when ``snapshot.gzip.records.per.batch`` is set, and also for
-        one already part-served (``start_record`` > 0) after the option was cleared, so that
-        file finishes from its recorded position instead of being re-read whole.
-        """
+        # Docstring: Whether the window starting at ``start_split`` is a driver-read gzip record
+        # window.
+        #
+        # True for a gzip split when ``snapshot.gzip.records.per.batch`` is set, and also for
+        # one already part-served (``start_record`` > 0) after the option was cleared, so that
+        # file finishes from its recorded position instead of being re-read whole.
 
         if start_split >= len(splits) or not splits[start_split][3]:
             if start_record:
@@ -10254,15 +10151,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         start_record: int,
         limit: int | None,
     ) -> tuple[list[dict[str, Any]], bool]:
-        """Read up to ``limit`` records (None: the rest) of a gzip split from ``start_record``.
-
-        Returns the shaped rows and whether the file is now exhausted -- a short window, or
-        an empty one when the previous window ended exactly at the last record. The open
-        record iterator is kept between microbatches, so consecutive windows decompress the
-        file once; a window that does not continue it (a restart, or a different file)
-        reopens the file and skips ``start_record`` records. A repeated request for the
-        window just read returns the same rows without touching the iterator.
-        """
+        # Docstring: Read up to ``limit`` records (None: the rest) of a gzip split from
+        # ``start_record``.
+        #
+        # Returns the shaped rows and whether the file is now exhausted -- a short window, or
+        # an empty one when the previous window ended exactly at the last record. The open
+        # record iterator is kept between microbatches, so consecutive windows decompress the
+        # file once; a window that does not continue it (a restart, or a different file)
+        # reopens the file and skips ``start_record`` records. A repeated request for the
+        # window just read returns the same rows without touching the iterator.
 
         path, _start_byte, size, _is_gzip = split
         key = (path, size, snapshot_lsn)
@@ -10305,12 +10202,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         *,
         stop_record: int | None,
     ) -> list[dict[str, Any]]:
-        """Recompute a logged gzip record window: records ``[start_record, stop_record)``.
-
-        ``stop_record`` None means the window ran to the end of the file. The logged end is
-        what Spark commits, so a shortfall (the file holds fewer records than the window
-        claimed) fails closed rather than silently dropping rows.
-        """
+        # Docstring: Recompute a logged gzip record window: records ``[start_record, stop_record)``.
+        #
+        # ``stop_record`` None means the window ran to the end of the file. The logged end is
+        # what Spark commits, so a shortfall (the file holds fewer records than the window
+        # claimed) fails closed rather than silently dropping rows.
 
         limit = None if stop_record is None else stop_record - start_record
         if limit is not None and limit <= 0:
@@ -10330,7 +10226,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _open_unl_gzip_records(
         self, path: str, size: int, table_options: dict[str, str]
     ) -> Iterator[bytes]:
-        """A fresh raw-record iterator over a whole gzip `.unl.gz` file, from its start."""
+        # Docstring: A fresh raw-record iterator over a whole gzip `.unl.gz` file, from its start.
 
         _delimiter, escape = self._unl_field_format(table_options)
         escape_byte = _unl_escape_byte(escape, _client_encoding(self.options))
@@ -10343,7 +10239,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         snapshot_lsn: int,
         raw_records: list[bytes],
     ) -> list[dict[str, Any]]:
-        """Shape raw `.unl` records exactly as the serial and executor serves do."""
+        # Docstring: Shape raw `.unl` records exactly as the serial and executor serves do.
 
         encoding = _client_encoding(self.options)
         delimiter, escape = self._unl_field_format(table_options)
@@ -10367,14 +10263,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _serve_unl_snapshot(
         self, table: Table, options: dict[str, str], snapshot_lsn: int
     ) -> Iterator[dict[str, Any]]:
-        """Lazily yield shaped rows read from the table's `.unl` files (serial driver path).
-
-        The partitioned executor path (``read_partition`` ``unl_split``) shapes each
-        record through the same :func:`_shape_unl_record`, so both produce identical
-        rows. Streams each file record by record (constant memory); the serial path
-        reads the whole file, the executor path reads one byte split. A gzip file (magic
-        bytes ``1f 8b``) is decompressed as a single non-splittable stream.
-        """
+        # Docstring: Lazily yield shaped rows read from the table's `.unl` files (serial driver
+        # path).
+        #
+        # The partitioned executor path (``read_partition`` ``unl_split``) shapes each
+        # record through the same :func:`_shape_unl_record`, so both produce identical
+        # rows. Streams each file record by record (constant memory); the serial path
+        # reads the whole file, the executor path reads one byte split. A gzip file (magic
+        # bytes ``1f 8b``) is decompressed as a single non-splittable stream.
 
         source = self._table_snapshot_source(options)
         files = self._list_unl_files(source, table.exposed_name)
@@ -10404,15 +10300,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _read_unl_split(
         self, partition: dict, table_options: dict[str, str]
     ) -> Iterator[dict[str, Any]]:
-        """Executor side: shape the rows of one `.unl` byte split, without a live Table.
-
-        The descriptor carries the column metadata, so a Table is rebuilt from it
-        purely for shaping (variable-scale DECIMAL coercion needs the column list); no
-        catalog connection and no Informix session run here. The range is read via a
-        Files-API ranged GET when the descriptor carries a token/host, else a local
-        seek -- the same fallback shape as the driver's ``_unl_read_chunk``. A gzip split
-        (``gzip=True``) spans the whole file and is decompressed as one stream.
-        """
+        # Docstring: Executor side: shape the rows of one `.unl` byte split, without a live Table.
+        #
+        # The descriptor carries the column metadata, so a Table is rebuilt from it
+        # purely for shaping (variable-scale DECIMAL coercion needs the column list); no
+        # catalog connection and no Informix session run here. The range is read via a
+        # Files-API ranged GET when the descriptor carries a token/host, else a local
+        # seek -- the same fallback shape as the driver's ``_unl_read_chunk``. A gzip split
+        # (``gzip=True``) spans the whole file and is decompressed as one stream.
 
         columns = tuple(Column.parse(raw) for raw in partition["columns"])
         table = Table(
@@ -10459,16 +10354,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _unl_all_splits(
         self, table: Table, table_options: dict[str, str]
     ) -> list[tuple[str, int, int, bool]]:
-        """The full ordered ``(path, start_byte, end_byte, gzip)`` split plan for the extract.
-
-        Files are listed sorted; a plain file is split into ~``snapshot.split.bytes`` byte
-        pieces (per-table, connection fallback, then :data:`_UNL_SPLIT_TARGET_BYTES`), while
-        a gzip file (magic bytes ``1f 8b``) is non-splittable and yields a single whole-file
-        split flagged ``gzip=True``. The plan is deterministic given the immutable extract
-        and target size, so ``latest_offset`` and ``get_partitions`` -- separate calls --
-        agree on the same global split ordering without sharing state, and a windowed serve
-        tiles ``[0, total)`` across microbatches with no gap, overlap, or duplication.
-        """
+        # Docstring: The full ordered ``(path, start_byte, end_byte, gzip)`` split plan for the
+        # extract.
+        #
+        # Files are listed sorted; a plain file is split into ~``snapshot.split.bytes`` byte
+        # pieces (per-table, connection fallback, then :data:`_UNL_SPLIT_TARGET_BYTES`), while
+        # a gzip file (magic bytes ``1f 8b``) is non-splittable and yields a single whole-file
+        # split flagged ``gzip=True``. The plan is deterministic given the immutable extract
+        # and target size, so ``latest_offset`` and ``get_partitions`` -- separate calls --
+        # agree on the same global split ordering without sharing state, and a windowed serve
+        # tiles ``[0, total)`` across microbatches with no gap, overlap, or duplication.
 
         target_bytes = self._table_int_option(
             table_options, _UNL_SPLIT_BYTES_OPTION, _UNL_SPLIT_TARGET_BYTES, minimum=1
@@ -10501,15 +10396,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         start_split: int,
         window: int,
     ) -> list[dict]:
-        """``unl_split`` partition descriptors for the split window ``[start_split, +window)``.
-
-        The window (``stream.partitioned.snapshot.pages.per.batch`` splits) is sliced from
-        the deterministic :meth:`_unl_all_splits` plan, so this microbatch serves only its
-        slice and the offset advances by ``window`` splits per read. Mints a per-batch
-        staging token when REST is available so executors read via ranged GET; omitting it
-        makes executors fall back to a local seek. The token rides only this batch's
-        transient descriptors, never the checkpoint offset.
-        """
+        # Docstring: ``unl_split`` partition descriptors for the split window ``[start_split,
+        # +window)``.
+        #
+        # The window (``stream.partitioned.snapshot.pages.per.batch`` splits) is sliced from
+        # the deterministic :meth:`_unl_all_splits` plan, so this microbatch serves only its
+        # slice and the offset advances by ``window`` splits per read. Mints a per-batch
+        # staging token when REST is available so executors read via ranged GET; omitting it
+        # makes executors fall back to a local seek. The token rides only this batch's
+        # transient descriptors, never the checkpoint offset.
 
         all_splits = self._unl_all_splits(table, table_options)
         end_split = min(start_split + window, len(all_splits))
@@ -10555,40 +10450,39 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return descriptors
 
     def _read_append_only(self, table: Table, start: dict | None, options: dict[str, str]):
-        """Begin an append-only flow, then hand off to the ordinary CDC stream.
-
-        Only the *first* read reaches here. It establishes a stream-phase offset and
-        every later read is routed straight to :meth:`_read_stream`, which needs no
-        changes: it derives its restart position from ``begin_lsn``/``commit_lsn``
-        and never consults ``table.primary_keys``.
-
-        Two startup behaviours, selected by ``snapshot.mode``:
-
-        ``cdc_only`` (also the append-only default when snapshot.mode is unset)
-            Start at the server's current log position and emit nothing now. Rows
-            that predate the flow are not captured. No size ceiling, no memory
-            spike, and no failure mode -- which is why it is the default. An
-            append-only table is usually one that is actively being appended to, so
-            the interesting rows are the arriving ones.
-
-        ``initial``
-            Read the table once under REPEATABLE READ and continue from that
-            snapshot's LSN, so history is captured and the handoff is gapless: the
-            snapshot is consistent as-of one LSN and the stream resumes from exactly
-            that LSN. Because a key-less table has no stable monotonic cursor, this
-            uses one forward-only cursor and one REPEATABLE READ transaction. Fetched
-            rows are written to immutable staged pages and become visible only after
-            the completed snapshot manifest is published.
-
-        When ``table.migration=true`` (checked before either mode), the flow instead
-        records the checkpoint a prior flow parked in Lakebase (see :meth:`_read_handoff`),
-        emits no rows, and stops -- skipping the snapshot entirely. Used to switch a table
-        SCD1->append-only, or relocate its destination, without a re-snapshot. The table
-        keeps its real ``snapshot.mode``; migration never streams, and clearing
-        table.migration (Restore) resumes streaming from the recorded offset, with
-        _recover's strict ``commit_lsn > C`` filter keeping the seam gapless and
-        duplicate-free.
-        """
+        # Docstring: Begin an append-only flow, then hand off to the ordinary CDC stream.
+        #
+        # Only the *first* read reaches here. It establishes a stream-phase offset and
+        # every later read is routed straight to :meth:`_read_stream`, which needs no
+        # changes: it derives its restart position from ``begin_lsn``/``commit_lsn``
+        # and never consults ``table.primary_keys``.
+        #
+        # Two startup behaviours, selected by ``snapshot.mode``:
+        #
+        # ``cdc_only`` (also the append-only default when snapshot.mode is unset)
+        #     Start at the server's current log position and emit nothing now. Rows
+        #     that predate the flow are not captured. No size ceiling, no memory
+        #     spike, and no failure mode -- which is why it is the default. An
+        #     append-only table is usually one that is actively being appended to, so
+        #     the interesting rows are the arriving ones.
+        #
+        # ``initial``
+        #     Read the table once under REPEATABLE READ and continue from that
+        #     snapshot's LSN, so history is captured and the handoff is gapless: the
+        #     snapshot is consistent as-of one LSN and the stream resumes from exactly
+        #     that LSN. Because a key-less table has no stable monotonic cursor, this
+        #     uses one forward-only cursor and one REPEATABLE READ transaction. Fetched
+        #     rows are written to immutable staged pages and become visible only after
+        #     the completed snapshot manifest is published.
+        #
+        # When ``table.migration=true`` (checked before either mode), the flow instead
+        # records the checkpoint a prior flow parked in Lakebase (see :meth:`_read_handoff`),
+        # emits no rows, and stops -- skipping the snapshot entirely. Used to switch a table
+        # SCD1->append-only, or relocate its destination, without a re-snapshot. The table
+        # keeps its real ``snapshot.mode``; migration never streams, and clearing
+        # table.migration (Restore) resumes streaming from the recorded offset, with
+        # _recover's strict ``commit_lsn > C`` filter keeping the seam gapless and
+        # duplicate-free.
 
         _ensure_materializable(table, options)
         table = self._refresh_table_schema(table, None)
@@ -10693,26 +10587,25 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _read_changes_with_reconnect(
         self, captures, restart, timeout_seconds, max_records, *, table: Table
     ):
-        """Run one bounded CDC poll, retrying in place on a mid-read drop.
-
-        A connection dropped during ``read_changes`` raises ``SqliProtocolError``
-        (e.g. ``SQ_LODATA server/ISAM error -1`` when the socket dies mid-poll).
-        The read has not advanced any offset, so it is safe to reset the dead
-        transport and reissue the identical poll under the connection slot the
-        reader already holds. Bounded attempts with short backoff absorb a
-        transient blip; exhausting them re-raises so a genuinely-down source
-        still fails honestly.
-
-        This retries synchronously inside the single ``latestOffset`` call rather
-        than yielding an empty batch, so it is correct for a triggered
-        (AvailableNow) flow too: an empty batch below the frozen high-water mark
-        would let AvailableNow complete the batch and skip the un-read changes,
-        whereas retrying in place either returns the real records or raises.
-
-        A lost connection-capacity lease (``ConnectionCapacityUnavailable``) is
-        not a transport drop and is never retried here; it propagates to the
-        capacity-aware handler.
-        """
+        # Docstring: Run one bounded CDC poll, retrying in place on a mid-read drop.
+        #
+        # A connection dropped during ``read_changes`` raises ``SqliProtocolError``
+        # (e.g. ``SQ_LODATA server/ISAM error -1`` when the socket dies mid-poll).
+        # The read has not advanced any offset, so it is safe to reset the dead
+        # transport and reissue the identical poll under the connection slot the
+        # reader already holds. Bounded attempts with short backoff absorb a
+        # transient blip; exhausting them re-raises so a genuinely-down source
+        # still fails honestly.
+        #
+        # This retries synchronously inside the single ``latestOffset`` call rather
+        # than yielding an empty batch, so it is correct for a triggered
+        # (AvailableNow) flow too: an empty batch below the frozen high-water mark
+        # would let AvailableNow complete the batch and skip the un-read changes,
+        # whereas retrying in place either returns the real records or raises.
+        #
+        # A lost connection-capacity lease (``ConnectionCapacityUnavailable``) is
+        # not a transport drop and is never retried here; it propagates to the
+        # capacity-aware handler.
 
         attempt = 0
         while True:
@@ -10748,23 +10641,22 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 attempt += 1
 
     def _snapshot_read_with_reconnect(self, thunk, *, table: Table, operation: str):
-        """Run one snapshot page or key-bound read, retrying in place on a drop.
-
-        A connection dropped mid-read raises ``SqliTransportError`` ("truncated
-        SQLI stream ..."), a subclass of ``SqliProtocolError``; the enclosing
-        repeatable-read transaction's rollback then fails because the session is
-        already gone. The read has advanced no offset -- the incremental cursor is
-        committed only after the read returns, and each read (``max_primary_key``,
-        ``snapshot_chunk``, the keyless one-shot ``snapshot_page``) opens its own
-        repeatable-read transaction -- so the dead transport can be reset and the
-        identical read reissued under the connection slot already held. Bounded
-        attempts with short backoff absorb a transient blip; exhausting them
-        re-raises so a genuinely-down source still fails honestly. This is the
-        snapshot counterpart of ``_read_changes_with_reconnect``.
-
-        A deliberate lease-loss shutdown (``ConnectionCapacityUnavailable`` or a
-        set ``_connection_lease_lost``) is never retried; it propagates.
-        """
+        # Docstring: Run one snapshot page or key-bound read, retrying in place on a drop.
+        #
+        # A connection dropped mid-read raises ``SqliTransportError`` ("truncated
+        # SQLI stream ..."), a subclass of ``SqliProtocolError``; the enclosing
+        # repeatable-read transaction's rollback then fails because the session is
+        # already gone. The read has advanced no offset -- the incremental cursor is
+        # committed only after the read returns, and each read (``max_primary_key``,
+        # ``snapshot_chunk``, the keyless one-shot ``snapshot_page``) opens its own
+        # repeatable-read transaction -- so the dead transport can be reset and the
+        # identical read reissued under the connection slot already held. Bounded
+        # attempts with short backoff absorb a transient blip; exhausting them
+        # re-raises so a genuinely-down source still fails honestly. This is the
+        # snapshot counterpart of ``_read_changes_with_reconnect``.
+        #
+        # A deliberate lease-loss shutdown (``ConnectionCapacityUnavailable`` or a
+        # set ``_connection_lease_lost``) is never retried; it propagates.
 
         attempt = 0
         while True:
@@ -10801,25 +10693,24 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 attempt += 1
 
     def _state_op_with_reconnect(self, thunk, *, operation: str):
-        """Run one Lakebase state read/write, retrying in place on a dropped connection.
-
-        A state connection reaped while idle (typically across a long wait for
-        connection capacity) is handed back by ``_lakebase_connection`` because
-        psycopg leaves ``.closed`` False until a query fails; the next
-        ``cursor.execute`` then raises ``OperationalError``/``InterfaceError``.
-        The operation committed nothing (the failure precedes ``commit``) and is
-        idempotent, so the dead handle is dropped and the identical operation
-        reissued on a fresh connection. ``thunk`` must re-fetch
-        ``self._lakebase_connection()`` each call so the retry uses the reopened
-        handle. Bounded attempts with short backoff absorb a transient reap;
-        exhausting them re-raises. Postgres counterpart of
-        ``_snapshot_read_with_reconnect``.
-
-        Only a genuinely-dead connection is retried: after the error the cached
-        handle must report closed. A failure on a still-live connection (e.g. a
-        serialization conflict, also an ``OperationalError`` subclass) is not a
-        drop and propagates unchanged.
-        """
+        # Docstring: Run one Lakebase state read/write, retrying in place on a dropped connection.
+        #
+        # A state connection reaped while idle (typically across a long wait for
+        # connection capacity) is handed back by ``_lakebase_connection`` because
+        # psycopg leaves ``.closed`` False until a query fails; the next
+        # ``cursor.execute`` then raises ``OperationalError``/``InterfaceError``.
+        # The operation committed nothing (the failure precedes ``commit``) and is
+        # idempotent, so the dead handle is dropped and the identical operation
+        # reissued on a fresh connection. ``thunk`` must re-fetch
+        # ``self._lakebase_connection()`` each call so the retry uses the reopened
+        # handle. Bounded attempts with short backoff absorb a transient reap;
+        # exhausting them re-raises. Postgres counterpart of
+        # ``_snapshot_read_with_reconnect``.
+        #
+        # Only a genuinely-dead connection is retried: after the error the cached
+        # handle must report closed. A failure on a still-live connection (e.g. a
+        # serialization conflict, also an ``OperationalError`` subclass) is not a
+        # drop and propagates unchanged.
 
         connection_lost = connection_lost_error_types()
         if not connection_lost:
@@ -10858,11 +10749,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return _option_bool(self.options, _SHARED_CDC_SESSION_OPTION, True)
 
     def _snapshot_cursor_scan(self, options: dict[str, str]) -> bool:
-        """Whether ``snapshot.scan=cursor`` asks for an unordered one-pass snapshot.
-
-        The table option wins over connection scope; the default is ``keyset``. See
-        ``_SNAPSHOT_SCAN_OPTION``.
-        """
+        # Docstring: Whether ``snapshot.scan=cursor`` asks for an unordered one-pass snapshot.
+        #
+        # The table option wins over connection scope; the default is ``keyset``. See
+        # ``_SNAPSHOT_SCAN_OPTION``.
 
         raw = options.get(
             _SNAPSHOT_SCAN_OPTION, self.options.get(_SNAPSHOT_SCAN_OPTION, _SNAPSHOT_SCAN_KEYSET)
@@ -10870,12 +10760,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return _snapshot_scan_value(raw) == _SNAPSHOT_SCAN_CURSOR
 
     def _snapshot_isolation(self, options: dict[str, str]) -> str:
-        """Resolve the ``snapshot.isolation`` table option to its SQL clause.
-
-        Defaults to COMMITTED READ LAST COMMITTED (non-locking; see the README
-        duplicate warning). Tokens are whitespace/hyphen-insensitive; an unknown
-        value fails loudly rather than silently falling back.
-        """
+        # Docstring: Resolve the ``snapshot.isolation`` table option to its SQL clause.
+        #
+        # Defaults to COMMITTED READ LAST COMMITTED (non-locking; see the README
+        # duplicate warning). Tokens are whitespace/hyphen-insensitive; an unknown
+        # value fails loudly rather than silently falling back.
 
         token = (
             str(options.get(_SNAPSHOT_ISOLATION_OPTION, _DEFAULT_SNAPSHOT_ISOLATION))
@@ -10932,9 +10821,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         schema_id: str,
         allow_keyless: bool,
     ) -> dict[str, Any]:
-        """Enqueue this table's drain on the bounded pool and wait -- holding no slot
-        or state connection -- for the daemon to stage it and publish the manifest,
-        then return that manifest."""
+        # Docstring: Enqueue this table's drain on the bounded pool and wait -- holding no slot
+        # or state connection -- for the daemon to stage it and publish the manifest,
+        # then return that manifest.
 
         namespace = self._lakebase_state_namespace()
         pool = _snapshot_drain_pool(
@@ -11026,8 +10915,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return lambda: cls(reader_options)
 
     def _shared_cdc_snapshot(self, table, checkpoint, options, deletes, pipeline_scope):
-        """Subscribe this table to its shard and return the daemon's coherent view, or
-        None to fall back to a direct read (daemon not ready, or a schema transition)."""
+        # Docstring: Subscribe this table to its shard and return the daemon's coherent view, or
+        # None to fall back to a direct read (daemon not ready, or a schema transition).
 
         channel = "delete" if deletes else "upsert"
         threads = self._shared_cdc_thread_count()
@@ -11652,11 +11541,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             delay = _sleep_with_backoff(deadline, delay)
 
     def _ensure_added_key_columns_have_no_default(self, previous: Table, current: Table) -> None:
-        """Fail closed when a column joining a wildcard key was added with a default.
-
-        Existing rows would carry the default in their before-images at the source while
-        the target holds NULL for them, so their updates and deletes would never match.
-        """
+        # Docstring: Fail closed when a column joining a wildcard key was added with a default.
+        #
+        # Existing rows would carry the default in their before-images at the source while
+        # the target holds NULL for them, so their updates and deletes would never match.
 
         added = [column.name for column in current.columns[len(previous.columns) :]]
         lookup = getattr(self._bridge, "column_defaults", None)
@@ -11733,7 +11621,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         wait: bool = True,
         scope: str | None = None,
     ) -> int | None:
-        """Return one durable per-table boundary shared by upsert and delete readers."""
+        # Docstring: Return one durable per-table boundary shared by upsert and delete readers.
 
         scope = scope or self._pipeline_scope()
         cache_key = (scope, table.identity)
@@ -11766,14 +11654,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         fingerprint: str,
         scope: str,
     ) -> None:
-        """Publish the upsert reader's effective start for an unseeded delete flow.
-
-        Lakeflow checkpoints the upsert and delete flows independently.  The
-        incoming upsert offset is the only authoritative evidence of where a
-        resumed update starts; source ``current_lsn`` and global schema history
-        can both be later. A later poll can discover an older open transaction,
-        so publishers atomically lower the shared boundary and never raise it.
-        """
+        # Docstring: Publish the upsert reader's effective start for an unseeded delete flow.
+        #
+        # Lakeflow checkpoints the upsert and delete flows independently.  The
+        # incoming upsert offset is the only authoritative evidence of where a
+        # resumed update starts; source ``current_lsn`` and global schema history
+        # can both be later. A later poll can discover an older open transaction,
+        # so publishers atomically lower the shared boundary and never raise it.
 
         namespace = self._immutable_namespace(table, "channel-starts", scope, "upsert")
         winner = self._state_op_with_reconnect(
@@ -11821,7 +11708,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         fingerprint: str,
         predecessor_id: Any,
     ) -> bool:
-        """Return whether a schema node safely replaces one at the same position."""
+        # Docstring: Return whether a schema node safely replaces one at the same position.
 
         if not isinstance(predecessor_id, str):
             return False
@@ -11864,33 +11751,31 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
 
     @staticmethod
     def _pipeline_id(scope: str) -> str:
-        """The stable pipeline identity within an update scope.
-
-        A scope is ``<pipeline_id>_@_<update_id>``; the pipeline id is constant across
-        a pipeline's restarts (only the update id changes) yet distinct between
-        pipelines, which is exactly the key the delete-floor needs: it must persist
-        across the restarts that push the upsert resume position forward, without one
-        pipeline's snapshot boundary ever lowering another's (concurrent full refreshes
-        of the same table land on different destinations at different snapshot LSNs).
-        """
+        # Docstring: The stable pipeline identity within an update scope.
+        #
+        # A scope is ``<pipeline_id>_@_<update_id>``; the pipeline id is constant across
+        # a pipeline's restarts (only the update id changes) yet distinct between
+        # pipelines, which is exactly the key the delete-floor needs: it must persist
+        # across the restarts that push the upsert resume position forward, without one
+        # pipeline's snapshot boundary ever lowering another's (concurrent full refreshes
+        # of the same table land on different destinations at different snapshot LSNs).
 
         return scope.partition("_@_")[0]
 
     def _publish_delete_snapshot_floor(
         self, table: Table, schema_id: str, snapshot_lsn: int, pipeline_scope: str
     ) -> None:
-        """Record the snapshot boundary a delete flow should bootstrap from.
-
-        Keyed by table and pipeline id, so it outlives update-scope GC and survives
-        restarts while staying isolated per pipeline. The schema generation the snapshot
-        was taken under rides inside the record rather than in the key, so a bootstrap
-        after a schema change can tell that its floor belongs to a superseded layout
-        (and say so) instead of simply not finding one. Forward-moving: a resnapshot
-        repopulates the destination as-of a later ``snapshot_lsn`` and must advance the
-        floor -- under a new schema generation too -- while ordinary polls leave it
-        untouched. The delete channel is idempotent, so a floor that lags a resnapshot in
-        flight only causes a harmless re-read, never a lost or double delete.
-        """
+        # Docstring: Record the snapshot boundary a delete flow should bootstrap from.
+        #
+        # Keyed by table and pipeline id, so it outlives update-scope GC and survives
+        # restarts while staying isolated per pipeline. The schema generation the snapshot
+        # was taken under rides inside the record rather than in the key, so a bootstrap
+        # after a schema change can tell that its floor belongs to a superseded layout
+        # (and say so) instead of simply not finding one. Forward-moving: a resnapshot
+        # repopulates the destination as-of a later ``snapshot_lsn`` and must advance the
+        # floor -- under a new schema generation too -- while ordinary polls leave it
+        # untouched. The delete channel is idempotent, so a floor that lags a resnapshot in
+        # flight only causes a harmless re-read, never a lost or double delete.
 
         self._state_op_with_reconnect(
             lambda: publish_maximum_lsn_state_record(
@@ -11914,18 +11799,17 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _read_delete_snapshot_floor(
         self, table: Table, schema_id: str, fingerprint: str
     ) -> int | None:
-        """Return the snapshot-boundary floor for a bootstrapping delete flow.
-
-        ``None`` when no compatible floor exists, so the caller keeps its prior behaviour
-        of anchoring at the upsert channel-start: either this pipeline has not published
-        one (no snapshot since the record was introduced), or the floor was captured
-        under an earlier schema generation -- the source was altered after the snapshot
-        and the delete flow never checkpointed. The latter is reported: the bootstrap
-        then starts at the upsert resume position, and the deletes committed between the
-        snapshot and it are not replayed. A bootstrap offset must name the layout it
-        starts under, and carrying a superseded generation across the transition is the
-        upsert channel's job on a checkpoint it owns, not something to improvise here.
-        """
+        # Docstring: Return the snapshot-boundary floor for a bootstrapping delete flow.
+        #
+        # ``None`` when no compatible floor exists, so the caller keeps its prior behaviour
+        # of anchoring at the upsert channel-start: either this pipeline has not published
+        # one (no snapshot since the record was introduced), or the floor was captured
+        # under an earlier schema generation -- the source was altered after the snapshot
+        # and the delete flow never checkpointed. The latter is reported: the bootstrap
+        # then starts at the upsert resume position, and the deletes committed between the
+        # snapshot and it are not replayed. A bootstrap offset must name the layout it
+        # starts under, and carrying a superseded generation across the transition is the
+        # upsert channel's job on a checkpoint it owns, not something to improvise here.
 
         record = self._read_immutable_head(
             self._immutable_namespace(
@@ -11954,7 +11838,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return floor
 
     def _upsert_channel_start_exists(self, table_name: str, table_options: dict[str, str]) -> bool:
-        """Check current-scope delete coordination without opening Informix."""
+        # Docstring: Check current-scope delete coordination without opening Informix.
 
         exposed = table_options.get("qualified_source_table", table_name)
         # Preserve eager configuration/schema failures. Registration commonly
@@ -11990,7 +11874,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         )
 
     def _native_table_state_identity(self, exposed: str) -> tuple[str, str, str] | None:
-        """Derive native and Lakebase table identities without opening Informix."""
+        # Docstring: Derive native and Lakebase table identities without opening Informix.
 
         parts = _split_identity(exposed)
         if len(parts) == 2:
@@ -12015,15 +11899,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         effective_start: dict[str, Any],
         table_options: dict[str, str],
     ) -> None:
-        """Publish an authoritative resume checkpoint before waiting for a slot.
-
-        A canceled microbatch leaves its positional end in Spark's checkpoint but
-        no commit marker. The next update must replay that range, and replay may
-        wait for capacity for minutes. Publishing only after acquiring capacity
-        leaves the paired delete reader unable to initialize for that entire wait.
-        The incoming positional checkpoint already fixes the safe resume boundary,
-        schema id, and fingerprint, so publishing it requires Lakebase only.
-        """
+        # Docstring: Publish an authoritative resume checkpoint before waiting for a slot.
+        #
+        # A canceled microbatch leaves its positional end in Spark's checkpoint but
+        # no commit marker. The next update must replay that range, and replay may
+        # wait for capacity for minutes. Publishing only after acquiring capacity
+        # leaves the paired delete reader unable to initialize for that entire wait.
+        # The incoming positional checkpoint already fixes the safe resume boundary,
+        # schema id, and fingerprint, so publishing it requires Lakebase only.
 
         if (
             effective_start.get("phase") != "stream"
@@ -12251,12 +12134,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return None
 
     def _lakebase_connection(self) -> Any:
-        """Return this connector's Postgres connection, provisioning on first use.
-
-        The connector and its bridge each keep their own connection: the bridge's
-        serves slot operations while a read is in flight, and sharing one across
-        both would serialise state reads behind slot maintenance.
-        """
+        # Docstring: Return this connector's Postgres connection, provisioning on first use.
+        #
+        # The connector and its bridge each keep their own connection: the bridge's
+        # serves slot operations while a read is in flight, and sharing one across
+        # both would serialise state reads behind slot maintenance.
 
         connection = getattr(self, "_lakebase_conn", None)
         if connection is not None:
@@ -12282,14 +12164,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return connection
 
     def _immutable_namespace(self, table: Table, *parts: str) -> str:
-        """Build the record key identifying one piece of per-table state.
-
-        Keys are ``<connection>/<table>/<part>/...`` where both leading
-        components are hashes of the Informix identity, so a key is reproducible
-        by any worker without coordination. A component that is not already
-        restricted to a safe character set is hashed, which keeps a scope or
-        schema id containing a separator from forging a different key.
-        """
+        # Docstring: Build the record key identifying one piece of per-table state.
+        #
+        # Keys are ``<connection>/<table>/<part>/...`` where both leading
+        # components are hashes of the Informix identity, so a key is reproducible
+        # by any worker without coordination. A component that is not already
+        # restricted to a safe character set is hashed, which keeps a scope or
+        # schema id containing a separator from forging a different key.
 
         connection_key, table_key = self._table_state_keys(table)
         safe = [connection_key, table_key]
@@ -12301,7 +12182,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return "/".join(safe)
 
     def _touch_table_state(self, table: Table) -> None:
-        """Mark a pipeline/table active and opportunistically run daily state GC."""
+        # Docstring: Mark a pipeline/table active and opportunistically run daily state GC.
 
         scope = self._pipeline_scope()
         if "_@_" not in scope:
@@ -12385,7 +12266,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _cleanup_previous_update_scopes(
         self, table: Table, checkpoint: dict[str, Any] | None = None
     ) -> None:
-        """Clean obsolete scopes without deleting state referenced by Spark."""
+        # Docstring: Clean obsolete scopes without deleting state referenced by Spark.
 
         if checkpoint and checkpoint.get("stage_scope"):
             # A handoff relocation is still serving staged pages that live under the
@@ -12430,12 +12311,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             )
 
     def _lakebase_state_namespace(self) -> str:
-        """Namespace state records by the Informix *database*, not the endpoint.
-
-        Slots are per server process because capacity is a property of that
-        process, but a table's state belongs to one database on it, so two
-        databases on one server never share a record.
-        """
+        # Docstring: Namespace state records by the Informix *database*, not the endpoint.
+        #
+        # Slots are per server process because capacity is a property of that
+        # process, but a table's state belongs to one database on it, so two
+        # databases on one server never share a record.
 
         identity = "\0".join(
             (
@@ -12449,7 +12329,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return hashlib.sha256(identity.encode()).hexdigest()[:24]
 
     def _read_immutable_head(self, namespace: str) -> dict[str, object] | None:
-        """Return the elected record for a key, or None when unwritten."""
+        # Docstring: Return the elected record for a key, or None when unwritten.
 
         return self._state_op_with_reconnect(
             lambda: read_state_record(
@@ -12465,13 +12345,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         *,
         record_type: str = "generic",
     ) -> dict[str, object]:
-        """Elect exactly one immutable record for a key and return the winner.
-
-        ``INSERT ... ON CONFLICT DO NOTHING RETURNING`` is the election. The
-        return value is always the *elected* record, which may be another
-        writer's: a record is shared truth for its key, so a loser must adopt the
-        winner rather than assume its own value took effect.
-        """
+        # Docstring: Elect exactly one immutable record for a key and return the winner.
+        #
+        # ``INSERT ... ON CONFLICT DO NOTHING RETURNING`` is the election. The
+        # return value is always the *elected* record, which may be another
+        # writer's: a record is shared truth for its key, so a loser must adopt the
+        # winner rather than assume its own value took effect.
 
         return self._state_op_with_reconnect(
             lambda: publish_state_record(
@@ -12738,13 +12617,12 @@ def _expect_zero(rows: list[Any], operation: str) -> None:
 
 
 def _is_timeout_error(error: BaseException | None) -> bool:
-    """Report whether ``error`` (or anything it wraps) is a socket read timeout.
-
-    A SQLI socket read timeout surfaces as a bare ``TimeoutError`` (``socket.timeout``
-    is an alias of it on Python 3.10+); it may also travel as the ``__cause__`` of a
-    wrapping connector error, so walk the cause chain rather than checking the top
-    exception alone.
-    """
+    # Docstring: Report whether ``error`` (or anything it wraps) is a socket read timeout.
+    #
+    # A SQLI socket read timeout surfaces as a bare ``TimeoutError`` (``socket.timeout``
+    # is an alias of it on Python 3.10+); it may also travel as the ``__cause__`` of a
+    # wrapping connector error, so walk the cause chain rather than checking the top
+    # exception alone.
 
     seen: set[int] = set()
     while error is not None and id(error) not in seen:
@@ -12803,36 +12681,34 @@ def _eligible(table: Table) -> bool:
 
 
 def _cdc_streamable(table: Table) -> bool:
-    """Report whether Informix can capture this table's changes at all.
-
-    Split from :func:`_cdc_capable` because the two questions are different and
-    conflating them made every key-less table snapshot-only. ``cdc_startcapture``
-    takes ``(session, table, columns, full_row_logging)`` -- no key -- so the
-    logical log records inserts, updates, and deletes for any table with full-row
-    logging enabled. A primary key is needed to *merge* a change into the
-    destination, not to read it.
-
-    Missing/placeholder values are unsafe in Lakeflow table rows, especially for
-    binary and complex types, so a table containing uncaptured columns is still
-    excluded here rather than silently nulling those values.
-    """
+    # Docstring: Report whether Informix can capture this table's changes at all.
+    #
+    # Split from :func:`_cdc_capable` because the two questions are different and
+    # conflating them made every key-less table snapshot-only. ``cdc_startcapture``
+    # takes ``(session, table, columns, full_row_logging)`` -- no key -- so the
+    # logical log records inserts, updates, and deletes for any table with full-row
+    # logging enabled. A primary key is needed to *merge* a change into the
+    # destination, not to read it.
+    #
+    # Missing/placeholder values are unsafe in Lakeflow table rows, especially for
+    # binary and complex types, so a table containing uncaptured columns is still
+    # excluded here rather than silently nulling those values.
 
     return all(column.cdc_supported for column in table.columns)
 
 
 def _cdc_capable(table: Table) -> bool:
-    """Report whether this table can be merged into a keyed destination.
-
-    Requires a primary key on top of :func:`_cdc_streamable`: both the upsert
-    channel's ``apply_changes`` target and the delete channel's row identification
-    need one, as does snapshot keyset pagination.
-    """
+    # Docstring: Report whether this table can be merged into a keyed destination.
+    #
+    # Requires a primary key on top of :func:`_cdc_streamable`: both the upsert
+    # channel's ``apply_changes`` target and the delete channel's row identification
+    # need one, as does snapshot keyset pagination.
 
     return bool(table.primary_keys) and _cdc_streamable(table)
 
 
 def _snapshot_unsupported_columns(table: Table) -> tuple[Column, ...]:
-    """Return types whose ordinary SQLI row representation is not implemented."""
+    # Docstring: Return types whose ordinary SQLI row representation is not implemented.
 
     unsupported = {
         "BYTE",
@@ -12870,13 +12746,12 @@ _DECIMAL_TYPE_RE = re.compile(r"^decimal\(\s*(\d+)\s*,\s*(\d+)\s*\)$")
 
 
 def _parse_variable_decimal_type(spec: str, *, option: str) -> tuple[str, int | None, int | None]:
-    """Normalize a variable-DECIMAL target-type spec.
-
-    Accepts ``string``, ``double``, ``integer`` or ``decimal(p,s)`` and returns a
-    ``(kind, precision, scale)`` tuple where ``kind`` is one of ``string``,
-    ``double``, ``integer`` or ``decimal``.  ``precision``/``scale`` are populated
-    only for ``decimal``.
-    """
+    # Docstring: Normalize a variable-DECIMAL target-type spec.
+    #
+    # Accepts ``string``, ``double``, ``integer`` or ``decimal(p,s)`` and returns a
+    # ``(kind, precision, scale)`` tuple where ``kind`` is one of ``string``,
+    # ``double``, ``integer`` or ``decimal``.  ``precision``/``scale`` are populated
+    # only for ``decimal``.
 
     normalized = spec.strip().lower()
     if normalized in {"string", "double", "integer"}:
@@ -12898,7 +12773,7 @@ def _parse_variable_decimal_type(spec: str, *, option: str) -> tuple[str, int | 
 def _variable_decimal_column_overrides(
     options: dict[str, str],
 ) -> dict[str, tuple[str, int | None, int | None]]:
-    """Parse ``decimal.variable.column.type`` into a per-column target map."""
+    # Docstring: Parse ``decimal.variable.column.type`` into a per-column target map.
 
     raw = options.get("decimal.variable.column.type", "").strip()
     if not raw:
@@ -12924,11 +12799,10 @@ def _variable_decimal_column_overrides(
 def _variable_decimal_target(
     column: Column, options: dict[str, str]
 ) -> tuple[str, int | None, int | None]:
-    """Resolve the target type for one variable-scale DECIMAL/NUMERIC column.
-
-    A per-column ``decimal.variable.column.type`` entry wins over the global
-    ``decimal.variable.type``; the default is ``decimal(38,18)``.
-    """
+    # Docstring: Resolve the target type for one variable-scale DECIMAL/NUMERIC column.
+    #
+    # A per-column ``decimal.variable.column.type`` entry wins over the global
+    # ``decimal.variable.type``; the default is ``decimal(38,18)``.
 
     overrides = _variable_decimal_column_overrides(options)
     if column.name in overrides:
@@ -12940,7 +12814,7 @@ def _variable_decimal_target(
 
 
 def _validate_variable_decimal_options(options: dict[str, str]) -> None:
-    """Eagerly validate the variable-DECIMAL options so bad specs fail fast."""
+    # Docstring: Eagerly validate the variable-DECIMAL options so bad specs fail fast.
 
     _parse_variable_decimal_type(
         options.get("decimal.variable.type", _VARIABLE_DECIMAL_DEFAULT),
@@ -13050,11 +12924,10 @@ def _lsn(record: dict[str, Any]) -> int:
 
 
 def _before_lsn(record: dict[str, Any]) -> int:
-    """The log position of an assembled UPDATE's before-image.
-
-    Set when the transaction assembler pairs BEFORE_UPDATE with AFTER_UPDATE; the
-    merged record's own ``lsn`` is the after-image's position.
-    """
+    # Docstring: The log position of an assembled UPDATE's before-image.
+    #
+    # Set when the transaction assembler pairs BEFORE_UPDATE with AFTER_UPDATE; the
+    # merged record's own ``lsn`` is the after-image's position.
 
     value = record.get("before_lsn")
     if value is None:
@@ -13159,23 +13032,22 @@ def _capture_descriptor(table: Table, encoding: str = "utf-8") -> dict[str, Any]
 def _project_transaction(
     tx: CommittedTransaction, table: Table, deletes: bool, tombstones: bool = False
 ) -> list[dict[str, Any]]:
-    """Project one committed transaction onto one output channel.
-
-    ``deletes`` selects the delete channel: key-only ``d`` rows for DELETEs and for the
-    old key of a key-changing UPDATE. Otherwise this is the upsert channel, which emits
-    INSERT/UPDATE after-images as ``c``/``u``. On the keyed CDC path the upsert channel
-    deliberately skips DELETEs -- the pipeline applies deletes only through the
-    separate delete flow, and a ``d`` row on the upsert view would be merged as an
-    upsert. ``tombstones`` (the append path with ``append.delete.tombstones`` on) adds
-    each DELETE's full before-image as a ``d`` row instead: the append destination
-    lands rows as-is and never reads ``_informix_op``, so the delete stays in the
-    change log rather than vanishing. On a keyed table forced onto the append path, a
-    key-changing UPDATE is a delete of the old key too: with ``tombstones`` on it lands
-    the before-image as a ``d`` row ahead of the new key's ``u`` row, sequenced at the
-    before-image's own log position so the two never tie on the cursor. A keyless table
-    has no key to change, so its UPDATEs land only their after-image. TRUNCATE is
-    unrepresentable on either channel.
-    """
+    # Docstring: Project one committed transaction onto one output channel.
+    #
+    # ``deletes`` selects the delete channel: key-only ``d`` rows for DELETEs and for the
+    # old key of a key-changing UPDATE. Otherwise this is the upsert channel, which emits
+    # INSERT/UPDATE after-images as ``c``/``u``. On the keyed CDC path the upsert channel
+    # deliberately skips DELETEs -- the pipeline applies deletes only through the
+    # separate delete flow, and a ``d`` row on the upsert view would be merged as an
+    # upsert. ``tombstones`` (the append path with ``append.delete.tombstones`` on) adds
+    # each DELETE's full before-image as a ``d`` row instead: the append destination
+    # lands rows as-is and never reads ``_informix_op``, so the delete stays in the
+    # change log rather than vanishing. On a keyed table forced onto the append path, a
+    # key-changing UPDATE is a delete of the old key too: with ``tombstones`` on it lands
+    # the before-image as a ``d`` row ahead of the new key's ``u`` row, sequenced at the
+    # before-image's own log position so the two never tie on the cursor. A keyless table
+    # has no key to change, so its UPDATEs land only their after-image. TRUNCATE is
+    # unrepresentable on either channel.
 
     output = []
     for record in tx.records:
@@ -13224,7 +13096,7 @@ def _key(row: dict[str, Any] | None, table: Table) -> tuple[Any, ...]:
 
 
 def _shape_change(row, record, tx, op, *, lsn: int | None = None):
-    """Shape one full-row change. ``lsn`` overrides the record's own cursor position."""
+    # Docstring: Shape one full-row change. ``lsn`` overrides the record's own cursor position.
 
     if row is None:
         raise InformixError("CDC upsert has no after image")
@@ -13242,14 +13114,13 @@ def _shape_change(row, record, tx, op, *, lsn: int | None = None):
 
 
 def _shape_tombstone(row, table, record, tx, *, lsn: int | None = None):
-    """A full before-image as an append-path ``d`` row.
-
-    Used for a DELETE and for the old key of a key-changing UPDATE; the latter passes
-    ``lsn``, the before-image's own position. Not :func:`_shape_delete`, which nulls
-    every non-key column and needs a primary key: an append destination does not
-    merge, so the tombstone carries the whole removed row and is told apart from a
-    live row only by ``_informix_op``.
-    """
+    # Docstring: A full before-image as an append-path ``d`` row.
+    #
+    # Used for a DELETE and for the old key of a key-changing UPDATE; the latter passes
+    # ``lsn``, the before-image's own position. Not :func:`_shape_delete`, which nulls
+    # every non-key column and needs a primary key: an append destination does not
+    # merge, so the tombstone carries the whole removed row and is told apart from a
+    # live row only by ``_informix_op``.
 
     if row is None:
         raise InformixError(
@@ -13260,18 +13131,17 @@ def _shape_tombstone(row, table, record, tx, *, lsn: int | None = None):
 
 
 def _shape_delete(row, table, record, tx):
-    """Shape a delete-channel row: the key values, with every other column NULL.
-
-    A NULL key value passes through when its column is declared nullable. Such a key can
-    only come from a ``primary.keys`` override (the wildcard included) or a nullable-index
-    promotion, and the pipeline's AUTO CDC delete flow matches NULL key values, for SCD1
-    and SCD2 alike.
-
-    A NOT NULL key column -- every real catalog primary key -- can never legitimately
-    hold NULL, so a NULL there still fails closed as a corrupt or incomplete before-image.
-    So does a key column missing from the image entirely: the CDC decoder sets every
-    captured column, using None for a SQL NULL, so an absent column is never a NULL.
-    """
+    # Docstring: Shape a delete-channel row: the key values, with every other column NULL.
+    #
+    # A NULL key value passes through when its column is declared nullable. Such a key can
+    # only come from a ``primary.keys`` override (the wildcard included) or a nullable-index
+    # promotion, and the pipeline's AUTO CDC delete flow matches NULL key values, for SCD1
+    # and SCD2 alike.
+    #
+    # A NOT NULL key column -- every real catalog primary key -- can never legitimately
+    # hold NULL, so a NULL there still fails closed as a corrupt or incomplete before-image.
+    # So does a key column missing from the image entirely: the CDC decoder sets every
+    # captured column, using None for a SQL NULL, so an absent column is never a NULL.
 
     if row is None:
         raise InformixError("CDC delete has no before image; full-row logging is required")
@@ -13311,7 +13181,7 @@ def _coerce_variable_decimal_value(
     column: Column,
     target: tuple[str, int | None, int | None],
 ) -> Any:
-    """Coerce one variable-scale DECIMAL value to its resolved target type."""
+    # Docstring: Coerce one variable-scale DECIMAL value to its resolved target type.
 
     kind, precision, scale = target
     if not isinstance(value, Decimal):
@@ -13370,14 +13240,13 @@ def _coerce_variable_decimal_values(
 
 
 def _unl_char(value: object, name: str, *, allow_empty: bool) -> str:
-    """Validate a `.unl`/HPL delimiter or escape option to a single character.
-
-    HPL and UNLOAD field delimiters and escape characters are each one character. A
-    multi-character value is a configuration error, caught eagerly rather than silently
-    truncated. An empty value is rejected for the delimiter and accepted for the escape
-    (``allow_empty``), where it disables escape processing for an HPL extract that writes
-    no escapes.
-    """
+    # Docstring: Validate a `.unl`/HPL delimiter or escape option to a single character.
+    #
+    # HPL and UNLOAD field delimiters and escape characters are each one character. A
+    # multi-character value is a configuration error, caught eagerly rather than silently
+    # truncated. An empty value is rejected for the delimiter and accepted for the escape
+    # (``allow_empty``), where it disables escape processing for an HPL extract that writes
+    # no escapes.
 
     text = "" if value is None else str(value)
     if text == "":
@@ -13390,11 +13259,10 @@ def _unl_char(value: object, name: str, *, allow_empty: bool) -> str:
 
 
 def _validate_unl_field_format(options: dict[str, str]) -> None:
-    """Eagerly validate the connection-scope `.unl`/HPL delimiter and escape options.
-
-    Table-scope overrides are validated the same way at resolve time by
-    ``_unl_field_format``; this catches a bad connection default at construction.
-    """
+    # Docstring: Eagerly validate the connection-scope `.unl`/HPL delimiter and escape options.
+    #
+    # Table-scope overrides are validated the same way at resolve time by
+    # ``_unl_field_format``; this catches a bad connection default at construction.
 
     delimiter = _unl_char(
         options.get(_UNL_DELIMITER_OPTION, _UNL_DEFAULT_DELIMITER),
@@ -13418,18 +13286,17 @@ def _parse_unload_fields(
     delimiter: str = _UNL_DEFAULT_DELIMITER,
     escape: str = _UNL_DEFAULT_ESCAPE,
 ) -> list[str]:
-    """Split one UNLOAD / HPL DELIMITED record into raw field strings.
-
-    Delimited with a single-character field ``delimiter`` (``|`` for UNLOAD) and, when
-    ``escape`` is non-empty (backslash for UNLOAD), backslash-style escaping: ``<esc>n``/
-    ``<esc>r``/``<esc>t`` decode to the control chars and ``<esc><other>`` to the literal
-    char. UNLOAD terminates each record with a trailing delimiter and HPL DELIMITED does
-    not; both are handled -- a line ending in the delimiter yields no spurious trailing
-    field (the final ``value`` is empty and dropped) and a line without one still yields
-    its last field. An empty field is the empty string here -- ``_unload_value`` maps it
-    to NULL (both writers render NULL as an empty field). An empty ``escape`` disables
-    escape processing (raw split on the delimiter), for an HPL job that writes no escapes.
-    """
+    # Docstring: Split one UNLOAD / HPL DELIMITED record into raw field strings.
+    #
+    # Delimited with a single-character field ``delimiter`` (``|`` for UNLOAD) and, when
+    # ``escape`` is non-empty (backslash for UNLOAD), backslash-style escaping: ``<esc>n``/
+    # ``<esc>r``/``<esc>t`` decode to the control chars and ``<esc><other>`` to the literal
+    # char. UNLOAD terminates each record with a trailing delimiter and HPL DELIMITED does
+    # not; both are handled -- a line ending in the delimiter yields no spurious trailing
+    # field (the final ``value`` is empty and dropped) and a line without one still yields
+    # its last field. An empty field is the empty string here -- ``_unload_value`` maps it
+    # to NULL (both writers render NULL as an empty field). An empty ``escape`` disables
+    # escape processing (raw split on the delimiter), for an HPL job that writes no escapes.
 
     values: list[str] = []
     value: list[str] = []
@@ -13451,14 +13318,13 @@ def _parse_unload_fields(
 
 
 def _unload_value(text: str, type_name: str) -> Any:
-    """Convert one UNLOAD field to the Python value the live snapshot would yield.
-
-    Keyed on the column's Informix ``type_name`` so ``_shape_snapshot`` (which
-    isoformats date/datetime and quantizes decimals) then produces a row
-    byte-identical to a live ``consistent_snapshot`` row. An empty field is NULL.
-    Exotic/binary types and locale-sensitive date formats are best-effort and must
-    be validated against the count/data-compare tool in live mode.
-    """
+    # Docstring: Convert one UNLOAD field to the Python value the live snapshot would yield.
+    #
+    # Keyed on the column's Informix ``type_name`` so ``_shape_snapshot`` (which
+    # isoformats date/datetime and quantizes decimals) then produces a row
+    # byte-identical to a live ``consistent_snapshot`` row. An empty field is NULL.
+    # Exotic/binary types and locale-sensitive date formats are best-effort and must
+    # be validated against the count/data-compare tool in live mode.
 
     if text == "":
         return None
@@ -13491,13 +13357,12 @@ _UNL_DEFAULT_ESCAPE_BYTE = b"\\"
 
 
 def _unl_escape_byte(escape: str, encoding: str) -> bytes:
-    """Encode the record escape character for the byte-level record splitter.
-
-    The splitter scans raw bytes for record terminators, so the escape must be a
-    single byte in the extract's encoding (backslash, or an HPL job's ASCII choice).
-    An empty escape (escaping disabled) yields ``b""``: every physical newline then
-    terminates a record.
-    """
+    # Docstring: Encode the record escape character for the byte-level record splitter.
+    #
+    # The splitter scans raw bytes for record terminators, so the escape must be a
+    # single byte in the extract's encoding (backslash, or an HPL job's ASCII choice).
+    # An empty escape (escaping disabled) yields ``b""``: every physical newline then
+    # terminates a record.
 
     if not escape:
         return b""
@@ -13511,7 +13376,7 @@ def _unl_escape_byte(escape: str, encoding: str) -> bytes:
 
 
 def _unl_escape_run(data: bytes, index: int, marker: int) -> int:
-    """Count the consecutive ``marker`` bytes immediately before ``data[index]``."""
+    # Docstring: Count the consecutive ``marker`` bytes immediately before ``data[index]``.
 
     run = 0
     position = index - 1
@@ -13522,15 +13387,14 @@ def _unl_escape_run(data: bytes, index: int, marker: int) -> int:
 
 
 def _unl_find_record_end(data: bytes, start: int, escape: bytes) -> int:
-    """Index of the first *unescaped* ``\\n`` in ``data`` at or after ``start``, else -1.
-
-    UNLOAD writes a newline embedded in a CHAR/VARCHAR value as the escape followed
-    by a literal newline, and a literal escape as the escape doubled, so a newline
-    preceded by an odd run of escape bytes is data while an even run (including
-    none) terminates the record. ``data`` must begin at a record start: the byte
-    before any record is an unescaped newline (or the file start), so a run can never
-    extend before it.
-    """
+    # Docstring: Index of the first *unescaped* ``\\n`` in ``data`` at or after ``start``, else -1.
+    #
+    # UNLOAD writes a newline embedded in a CHAR/VARCHAR value as the escape followed
+    # by a literal newline, and a literal escape as the escape doubled, so a newline
+    # preceded by an odd run of escape bytes is data while an even run (including
+    # none) terminates the record. ``data`` must begin at a record start: the byte
+    # before any record is an unescaped newline (or the file start), so a run can never
+    # extend before it.
 
     if not escape:
         return data.find(b"\n", start)
@@ -13543,8 +13407,8 @@ def _unl_find_record_end(data: bytes, start: int, escape: bytes) -> int:
 
 
 def _unl_split_records(buffer: bytes, escape: bytes) -> tuple[list[bytes], bytes]:
-    """Split ``buffer`` (which starts at a record start) into its complete records and
-    the trailing partial record still waiting for its terminator."""
+    # Docstring: Split ``buffer`` (which starts at a record start) into its complete records and
+    # the trailing partial record still waiting for its terminator.
 
     if not escape or escape not in buffer:
         # No escape byte anywhere: every newline terminates a record (C-speed split).
@@ -13568,22 +13432,21 @@ def _unl_byte_splits(
     chunk_bytes: int = _UNL_SCAN_CHUNK_BYTES,
     escape: bytes = _UNL_DEFAULT_ESCAPE_BYTE,
 ) -> list[tuple[int, int]]:
-    """Index one `.unl` file into ``[start, end)`` byte splits of ~``target_bytes`` each.
-
-    Cheap to plan and constant-memory: for each split, seek to ``start + target_bytes``
-    and read forward via ``read_chunk`` only until the next record terminator, cutting
-    the split just after it (the next split resumes there). This reads a small window
-    near each cut point rather than the whole file -- the reason byte splitting is
-    preferred over a row cap, which cannot know row counts without reading every byte.
-
-    A record terminator is an *unescaped* physical ``\\n``: UNLOAD escapes a newline
-    embedded in a value as ``escape`` + newline, so a newline behind an odd run of
-    escape bytes is data (see _unl_find_record_end). ``_iter_unl_records`` splits the
-    same range on the same rule, so ending a split right after a terminator keeps
-    records from spanning a boundary. A trailing unterminated record is included in the
-    final split; a split whose target lands past the last terminator runs to EOF. An
-    empty file yields no splits.
-    """
+    # Docstring: Index one `.unl` file into ``[start, end)`` byte splits of ~``target_bytes`` each.
+    #
+    # Cheap to plan and constant-memory: for each split, seek to ``start + target_bytes``
+    # and read forward via ``read_chunk`` only until the next record terminator, cutting
+    # the split just after it (the next split resumes there). This reads a small window
+    # near each cut point rather than the whole file -- the reason byte splitting is
+    # preferred over a row cap, which cannot know row counts without reading every byte.
+    #
+    # A record terminator is an *unescaped* physical ``\\n``: UNLOAD escapes a newline
+    # embedded in a value as ``escape`` + newline, so a newline behind an odd run of
+    # escape bytes is data (see _unl_find_record_end). ``_iter_unl_records`` splits the
+    # same range on the same rule, so ending a split right after a terminator keeps
+    # records from spanning a boundary. A trailing unterminated record is included in the
+    # final split; a split whose target lands past the last terminator runs to EOF. An
+    # empty file yields no splits.
 
     target_bytes = max(1, target_bytes)
     splits: list[tuple[int, int]] = []
@@ -13609,14 +13472,13 @@ def _unl_next_record_boundary(
     chunk_bytes: int,
     escape: bytes = _UNL_DEFAULT_ESCAPE_BYTE,
 ) -> int:
-    """Return the offset just after the first unescaped ``\\n`` at or after ``target``.
-
-    Reads forward from ``target`` in ``chunk_bytes`` windows (never the whole file) and
-    returns ``size`` when no terminator remains before EOF, so the caller runs the
-    final split to the end of the file. A candidate newline's escape run may begin
-    before the window -- before ``target`` itself when the newline is its first byte
-    -- so a run that reaches the window start is extended by reading backwards.
-    """
+    # Docstring: Return the offset just after the first unescaped ``\\n`` at or after ``target``.
+    #
+    # Reads forward from ``target`` in ``chunk_bytes`` windows (never the whole file) and
+    # returns ``size`` when no terminator remains before EOF, so the caller runs the
+    # final split to the end of the file. A candidate newline's escape run may begin
+    # before the window -- before ``target`` itself when the newline is its first byte
+    # -- so a run that reaches the window start is extended by reading backwards.
 
     marker = escape[0] if escape else None
     offset = target
@@ -13644,8 +13506,8 @@ def _unl_next_record_boundary(
 def _unl_escape_run_before(
     read_chunk: Callable[[int, int], bytes], position: int, marker: int
 ) -> int:
-    """Count the consecutive ``marker`` bytes ending right before ``position``, reading
-    backwards in small windows (a run is normally zero or one byte long)."""
+    # Docstring: Count the consecutive ``marker`` bytes ending right before ``position``, reading
+    # backwards in small windows (a run is normally zero or one byte long).
 
     run = 0
     end = position
@@ -13672,13 +13534,13 @@ def _iter_unl_records(
     chunk_bytes: int = _UNL_SCAN_CHUNK_BYTES,
     escape: bytes = _UNL_DEFAULT_ESCAPE_BYTE,
 ) -> Iterator[bytes]:
-    """Yield the raw record bytes (no trailing newline) whose bytes lie in ``[start, end)``.
-
-    Splits produced by :func:`_unl_byte_splits` begin at a record start and end right
-    after a record terminator, so this reads the range and splits it on unescaped
-    ``\\n`` (see _unl_find_record_end); an escaped newline stays inside its record.
-    Streaming/constant-memory. A final unterminated record (end of file) is yielded.
-    """
+    # Docstring: Yield the raw record bytes (no trailing newline) whose bytes lie in ``[start,
+    # end)``.
+    #
+    # Splits produced by :func:`_unl_byte_splits` begin at a record start and end right
+    # after a record terminator, so this reads the range and splits it on unescaped
+    # ``\\n`` (see _unl_find_record_end); an escaped newline stays inside its record.
+    # Streaming/constant-memory. A final unterminated record (end of file) is yielded.
 
     offset = start
     buffer = b""
@@ -13695,11 +13557,10 @@ def _iter_unl_records(
 
 
 def _unl_file_is_gzip(read_chunk: Callable[[int, int], bytes]) -> bool:
-    """Whether a `.unl` file is gzip-compressed, by its two magic bytes ``1f 8b``.
-
-    Authoritative over the file name, so a mislabelled extract is still handled
-    correctly. An empty file (no bytes) is not gzip.
-    """
+    # Docstring: Whether a `.unl` file is gzip-compressed, by its two magic bytes ``1f 8b``.
+    #
+    # Authoritative over the file name, so a mislabelled extract is still handled
+    # correctly. An empty file (no bytes) is not gzip.
 
     return read_chunk(0, 2) == b"\x1f\x8b"
 
@@ -13711,17 +13572,16 @@ def _iter_gzip_unl_records(
     chunk_bytes: int = _UNL_SCAN_CHUNK_BYTES,
     escape: bytes = _UNL_DEFAULT_ESCAPE_BYTE,
 ) -> Iterator[bytes]:
-    """Yield raw record bytes from a gzip-compressed `.unl` file (whole file, streaming).
-
-    Gzip is not seekable, so a compressed file is one non-splittable unit: read the
-    compressed bytes ``[0, size)`` in ``chunk_bytes`` windows, decompress incrementally,
-    split the decompressed stream on unescaped ``\\n`` (see _unl_find_record_end), and
-    yield records. Constant memory -- only one compressed window, the current
-    decompressed run, and the trailing partial record are held. Concatenated gzip
-    members (``cat a.gz b.gz``) are handled by starting a fresh decompressor from each
-    member's trailing ``unused_data``. A final unterminated record is yielded. An empty
-    extract (gzip of no rows) yields nothing.
-    """
+    # Docstring: Yield raw record bytes from a gzip-compressed `.unl` file (whole file, streaming).
+    #
+    # Gzip is not seekable, so a compressed file is one non-splittable unit: read the
+    # compressed bytes ``[0, size)`` in ``chunk_bytes`` windows, decompress incrementally,
+    # split the decompressed stream on unescaped ``\\n`` (see _unl_find_record_end), and
+    # yield records. Constant memory -- only one compressed window, the current
+    # decompressed run, and the trailing partial record are held. Concatenated gzip
+    # members (``cat a.gz b.gz``) are handled by starting a fresh decompressor from each
+    # member's trailing ``unused_data``. A final unterminated record is yielded. An empty
+    # extract (gzip of no rows) yields nothing.
 
     decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
     offset = 0
@@ -13748,12 +13608,11 @@ def _iter_gzip_unl_records(
 
 
 class _StaticStagingCredential:
-    """Fixed-bearer credential for a ``WorkspaceFilesApi`` rebuilt on an executor.
-
-    The driver mints and refreshes the real staging token; an executor receives just
-    the bearer for one batch in its partition descriptor, so it needs no minting or
-    refresh -- only ``bearer()``, which ``WorkspaceFilesApi`` calls per request.
-    """
+    # Docstring: Fixed-bearer credential for a ``WorkspaceFilesApi`` rebuilt on an executor.
+    #
+    # The driver mints and refreshes the real staging token; an executor receives just
+    # the bearer for one batch in its partition descriptor, so it needs no minting or
+    # refresh -- only ``bearer()``, which ``WorkspaceFilesApi`` calls per request.
 
     def __init__(self, token: str) -> None:
         self._token = token
@@ -13763,13 +13622,12 @@ class _StaticStagingCredential:
 
 
 def _unl_split_read_chunk(partition: dict) -> Callable[[int, int], bytes]:
-    """A ``(offset, length) -> bytes`` range reader for one ``unl_split`` descriptor.
-
-    Ranged GET over the Files REST API when the descriptor carries a token+host
-    (executors have no ambient workspace credential, so the driver passes one per
-    batch); otherwise a local seek/read -- the same fallback shape as the driver's
-    ``_unl_read_chunk``, used offline or when no token could be minted.
-    """
+    # Docstring: A ``(offset, length) -> bytes`` range reader for one ``unl_split`` descriptor.
+    #
+    # Ranged GET over the Files REST API when the descriptor carries a token+host
+    # (executors have no ambient workspace credential, so the driver passes one per
+    # batch); otherwise a local seek/read -- the same fallback shape as the driver's
+    # ``_unl_read_chunk``, used offline or when no token could be minted.
 
     token = partition.get("token")
     host = partition.get("host")
@@ -13798,15 +13656,14 @@ def _shape_unl_record(
     escape: str = _UNL_DEFAULT_ESCAPE,
     commit_time: int | None = None,
 ) -> dict[str, Any]:
-    """Parse, type-convert, and shape one UNLOAD / HPL DELIMITED record -- shared by both
-    serve paths.
-
-    Fails closed on a per-record column-count mismatch (the cheap misalignment guard
-    that stands in for the absent schema-fingerprint check). ``exposed_name`` names the
-    table in the error when the caller's ``table`` is a shaping-only stand-in.
-    ``delimiter``/``escape`` select the delimited dialect (UNLOAD's ``|``/backslash by
-    default, or an HPL job's configured pair).
-    """
+    # Docstring: Parse, type-convert, and shape one UNLOAD / HPL DELIMITED record -- shared by both
+    # serve paths.
+    #
+    # Fails closed on a per-record column-count mismatch (the cheap misalignment guard
+    # that stands in for the absent schema-fingerprint check). ``exposed_name`` names the
+    # table in the error when the caller's ``table`` is a shaping-only stand-in.
+    # ``delimiter``/``escape`` select the delimited dialect (UNLOAD's ``|``/backslash by
+    # default, or an HPL job's configured pair).
 
     fields = _parse_unload_fields(
         raw.decode(encoding, "strict"), delimiter=delimiter, escape=escape
@@ -13826,13 +13683,12 @@ def _shape_unl_record(
 
 
 def _commit_time_value(epoch_seconds: int | None) -> datetime | None:
-    """A UTC ``datetime`` for the ``_informix_commit_time`` column, or None.
-
-    The source supplies commit time as epoch seconds (Informix CDC BEGIN/COMMIT records
-    and ``DBINFO('utc_current')``); TimestampType wants a ``datetime``. None stays None so
-    a row with no source time (e.g. a file-source extract without a manifest boundary_time)
-    lands as NULL.
-    """
+    # Docstring: A UTC ``datetime`` for the ``_informix_commit_time`` column, or None.
+    #
+    # The source supplies commit time as epoch seconds (Informix CDC BEGIN/COMMIT records
+    # and ``DBINFO('utc_current')``); TimestampType wants a ``datetime``. None stays None so
+    # a row with no source time (e.g. a file-source extract without a manifest boundary_time)
+    # lands as NULL.
 
     if epoch_seconds is None:
         return None
@@ -13871,7 +13727,7 @@ def _validate_shaped_rows(
     context: str,
     primary_keys_only: bool = False,
 ) -> None:
-    """Reject values that the declared Spark schema cannot materialize."""
+    # Docstring: Reject values that the declared Spark schema cannot materialize.
 
     columns = (
         [column for column in table.columns if column.name in table.primary_keys]
@@ -13949,13 +13805,12 @@ def _validate_shaped_rows(
 
 
 def _log_lsn(uniqid: int, used_pages: int, *, page_start: bool = False) -> int:
-    """Compose an LSN from a ``sysmaster:syslogs`` row: the log file's ``uniqid`` in the
-    high word and the byte offset of ``used_pages`` 4 KiB pages in the low word.
-
-    ``page_start`` anchors the offset at the start of the last used page instead of
-    its end -- the conservative capture boundary (see ``boundary_lsn``); a log with no
-    used page yet anchors at its beginning either way.
-    """
+    # Docstring: Compose an LSN from a ``sysmaster:syslogs`` row: the log file's ``uniqid`` in the
+    # high word and the byte offset of ``used_pages`` 4 KiB pages in the low word.
+    #
+    # ``page_start`` anchors the offset at the start of the last used page instead of
+    # its end -- the conservative capture boundary (see ``boundary_lsn``); a log with no
+    # used page yet anchors at its beginning either way.
 
     pages = max(int(used_pages) - 1, 0) if page_start else int(used_pages)
     return (int(uniqid) << 32) + (pages << 12)
@@ -13981,7 +13836,7 @@ def _framework_value(value: Any) -> Any:
 
 
 def _deep_size(value: Any, seen: set[int] | None = None) -> int:
-    """Estimate retained Python container/value memory without double counting."""
+    # Docstring: Estimate retained Python container/value memory without double counting.
 
     if seen is None:
         seen = set()
@@ -14000,11 +13855,10 @@ def _deep_size(value: Any, seen: set[int] | None = None) -> int:
 
 
 def _skip_json_whitespace(text: str, index: int) -> int:
-    """Return the first index at or after ``index`` that is not JSON whitespace.
-
-    Staged pages are written with ``separators=(",",":")`` (no whitespace), but
-    tolerating it keeps the hand-rolled scan robust to a compliant re-serializer.
-    """
+    # Docstring: Return the first index at or after ``index`` that is not JSON whitespace.
+    #
+    # Staged pages are written with ``separators=(",",":")`` (no whitespace), but
+    # tolerating it keeps the hand-rolled scan robust to a compliant re-serializer.
 
     length = len(text)
     while index < length and text[index] in " \t\n\r":
@@ -14028,27 +13882,26 @@ _SNAPSHOT_STAGE_TRAILING_KEYS = (
 
 
 def _scan_staged_page(text: str) -> tuple[dict[str, Any], int, tuple[int, int]]:
-    """Locate a staged page's header fields without ever walking the ``rows`` array.
-
-    Returns ``(header, array_start, sha_span)``. ``header`` holds every field except
-    ``rows``; ``array_start`` is the index of the ``rows`` array's opening ``[`` (the
-    single serve pass streams from there and finds the closing ``]`` itself);
-    ``sha_span`` is the ``[start, end)`` of the ``"sha256":"...",`` field including its
-    trailing comma, so the caller can excise it to recover the exact canonical body
-    the digest covers.
-
-    The rows array is the one field with unbounded, arbitrary content, so it is never
-    scanned. Leading fields (those sorting before ``rows``) are forward-parsed with
-    ``raw_decode`` and are small; the parse stops at the ``rows`` key. Trailing fields
-    (sorting after ``rows``) are found from the tail with ``str.rfind`` on their
-    ``,"key":`` marker: each trailing field is structurally the *last* occurrence of
-    its key in the payload -- any same-named row column lives inside the earlier rows
-    array, and an unescaped ``,"key":`` only ever appears as a JSON key (a string
-    *value* containing that text is escaped as ``,\\"key\\":``) -- so the reverse find
-    lands on the real header field. Those fields occupy the payload's final few
-    hundred bytes, so the reverse finds are effectively free while the multi-hundred-MB
-    rows array is skipped entirely. Raises ``InformixError`` on any structural problem.
-    """
+    # Docstring: Locate a staged page's header fields without ever walking the ``rows`` array.
+    #
+    # Returns ``(header, array_start, sha_span)``. ``header`` holds every field except
+    # ``rows``; ``array_start`` is the index of the ``rows`` array's opening ``[`` (the
+    # single serve pass streams from there and finds the closing ``]`` itself);
+    # ``sha_span`` is the ``[start, end)`` of the ``"sha256":"...",`` field including its
+    # trailing comma, so the caller can excise it to recover the exact canonical body
+    # the digest covers.
+    #
+    # The rows array is the one field with unbounded, arbitrary content, so it is never
+    # scanned. Leading fields (those sorting before ``rows``) are forward-parsed with
+    # ``raw_decode`` and are small; the parse stops at the ``rows`` key. Trailing fields
+    # (sorting after ``rows``) are found from the tail with ``str.rfind`` on their
+    # ``,"key":`` marker: each trailing field is structurally the *last* occurrence of
+    # its key in the payload -- any same-named row column lives inside the earlier rows
+    # array, and an unescaped ``,"key":`` only ever appears as a JSON key (a string
+    # *value* containing that text is escaped as ``,\\"key\\":``) -- so the reverse find
+    # lands on the real header field. Those fields occupy the payload's final few
+    # hundred bytes, so the reverse finds are effectively free while the multi-hundred-MB
+    # rows array is skipped entirely. Raises ``InformixError`` on any structural problem.
 
     length = len(text)
     index = _skip_json_whitespace(text, 0)
@@ -14265,7 +14118,7 @@ def _schema_state(
 
 
 def _schema_node_id(table: Table) -> str:
-    """Return the stable identity of one physical-table schema layout."""
+    # Docstring: Return the stable identity of one physical-table schema layout.
 
     identity = "\0".join((table.native_identity, _schema_fingerprint(table)))
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
@@ -14288,12 +14141,12 @@ def _table_from_schema_state(state: dict[str, object], default_database: str) ->
 
 
 def _carry_key_override(fresh: Table, overridden: Table) -> Table:
-    """Carry a ``primary.keys`` override from ``overridden`` onto a re-read ``fresh`` table.
-
-    An explicit key list is preserved as-is, with its adopted key-index directions. A
-    wildcard key is re-expanded to ``fresh``'s columns, keeping the directions only when
-    the column set is unchanged.
-    """
+    # Docstring: Carry a ``primary.keys`` override from ``overridden`` onto a re-read ``fresh``
+    # table.
+    #
+    # An explicit key list is preserved as-is, with its adopted key-index directions. A
+    # wildcard key is re-expanded to ``fresh``'s columns, keeping the directions only when
+    # the column set is unchanged.
 
     keys = overridden.primary_keys
     descending = overridden.key_descending
@@ -14313,12 +14166,11 @@ def _carry_key_override(fresh: Table, overridden: Table) -> Table:
 def _ensure_additive_schema_change(
     previous: Table, current: Table, *, extend_wildcard_key: bool = False
 ) -> None:
-    """Fail closed unless ``current`` only appends nullable, CDC-supported columns.
-
-    The key must be unchanged, except that with ``extend_wildcard_key`` a whole-row key may
-    grow by exactly the appended columns: every previous column, in order, followed by
-    the additions.
-    """
+    # Docstring: Fail closed unless ``current`` only appends nullable, CDC-supported columns.
+    #
+    # The key must be unchanged, except that with ``extend_wildcard_key`` a whole-row key may
+    # grow by exactly the appended columns: every previous column, in order, followed by
+    # the additions.
 
     keys_match = previous.primary_keys == current.primary_keys
     if not keys_match and extend_wildcard_key:
@@ -14361,12 +14213,11 @@ def _ensure_additive_schema_change(
 
 
 def _unl_position(offset: dict[str, Any], *, terminal: int | None = None) -> tuple[int, int]:
-    """``(split index, record index)`` a file-snapshot offset points at.
-
-    An empty offset is the start of the extract. A stream-phase offset is past its end:
-    ``terminal`` (the split count) when given -- the end of a window that finished the
-    extract -- and an error otherwise.
-    """
+    # Docstring: ``(split index, record index)`` a file-snapshot offset points at.
+    #
+    # An empty offset is the start of the extract. A stream-phase offset is past its end:
+    # ``terminal`` (the split count) when given -- the end of a window that finished the
+    # extract -- and an error otherwise.
 
     if not offset:
         return 0, 0
@@ -14568,17 +14419,16 @@ def _capacity_retry_count(offset: dict[str, Any]) -> int:
 
 
 def _capacity_pressure(offset: dict[str, Any]) -> int:
-    """Decaying acquisition-pressure signal that feeds the yield budget.
-
-    Distinct from ``capacity_retry_count``: that counts *consecutive* misses and
-    resets to zero the instant a read gets a slot, because it is the failure
-    guard (a permanently starved flow fails at ``capacity.retry.max.retries``).
-    Pressure instead *decays* on success rather than resetting, so a flow that is
-    contended but occasionally served keeps some of the elevated budget it earned
-    while starved instead of dropping straight back to the least-patient value.
-    Optional and backward compatible: an offset written before this field existed
-    defaults to zero.
-    """
+    # Docstring: Decaying acquisition-pressure signal that feeds the yield budget.
+    #
+    # Distinct from ``capacity_retry_count``: that counts *consecutive* misses and
+    # resets to zero the instant a read gets a slot, because it is the failure
+    # guard (a permanently starved flow fails at ``capacity.retry.max.retries``).
+    # Pressure instead *decays* on success rather than resetting, so a flow that is
+    # contended but occasionally served keeps some of the elevated budget it earned
+    # while starved instead of dropping straight back to the least-patient value.
+    # Optional and backward compatible: an offset written before this field existed
+    # defaults to zero.
 
     value = offset.get("capacity_pressure", 0)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -14587,11 +14437,10 @@ def _capacity_pressure(offset: dict[str, Any]) -> int:
 
 
 def _backlog_streak(offset: dict[str, Any]) -> int:
-    """Validate the run of consecutive reads that filled their row budget.
-
-    Optional and backward compatible: an offset written before the streak existed,
-    or by a flow that has never truncated, simply has no key and reads as zero.
-    """
+    # Docstring: Validate the run of consecutive reads that filled their row budget.
+    #
+    # Optional and backward compatible: an offset written before the streak existed,
+    # or by a flow that has never truncated, simply has no key and reads as zero.
 
     value = offset.get("backlog_streak", 0)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -14600,19 +14449,18 @@ def _backlog_streak(offset: dict[str, Any]) -> int:
 
 
 def _with_backlog_streak(end: dict, start: dict, row_budget_reached: bool) -> dict:
-    """Record whether this read ended at its row budget rather than the log's end.
-
-    A read that filled its budget has *proved* more changes are waiting for this
-    table, which is the only first-hand backlog evidence a reader has: the
-    published hint is the server's global log position, so it measures staleness
-    and cannot tell a quiet table from a lagging one. Counting consecutive
-    truncations distinguishes a sustained backlog from one busy read, and draining
-    the log clears the streak outright so a caught-up flow never keeps priority it
-    no longer needs.
-
-    The count saturates so it cannot grow without bound in an offset that a
-    permanently backlogged flow persists on every batch.
-    """
+    # Docstring: Record whether this read ended at its row budget rather than the log's end.
+    #
+    # A read that filled its budget has *proved* more changes are waiting for this
+    # table, which is the only first-hand backlog evidence a reader has: the
+    # published hint is the server's global log position, so it measures staleness
+    # and cannot tell a quiet table from a lagging one. Counting consecutive
+    # truncations distinguishes a sustained backlog from one busy read, and draining
+    # the log clears the streak outright so a caught-up flow never keeps priority it
+    # no longer needs.
+    #
+    # The count saturates so it cannot grow without bound in an offset that a
+    # permanently backlogged flow persists on every batch.
 
     if not row_budget_reached:
         if "backlog_streak" not in end:
@@ -14626,31 +14474,30 @@ def _with_backlog_streak(end: dict, start: dict, row_budget_reached: bool) -> di
 
 
 def _backlog_rank(backlog: int, streak: int = 0) -> int:
-    """Bucket an estimated backlog onto a small, bounded, log-scaled rank.
-
-    Two signals combine, because each is blind where the other sees.
-
-    ``backlog`` is derived from a published *global* log position, so its
-    magnitude reflects whole-server write volume rather than this table's row
-    count; a log scale absorbs that bias so only order-of-magnitude differences
-    move the rank. It is comparable *across* readers, which is what ordering a
-    contended queue needs, but it over-states a quiet table's lag.
-
-    ``streak`` counts consecutive reads that ended at their row budget. That is
-    first-hand proof this table has work outstanding, so it discriminates a
-    genuinely backlogged flow from a merely stale one -- the discrimination the
-    global signal cannot supply (measured in production: every waiter ranked
-    identically because all checkpoints were recent). It is only a self
-    assessment, so it cannot order one reader against another on its own.
-
-    The streak takes the *high* band of the rank space and the estimate the low
-    one, rather than the two being combined by a maximum. A maximum cannot
-    separate readers whose estimates have already saturated, which is exactly the
-    observed failure: when every waiter's hint-derived estimate lands on the same
-    high rank, a proven backlog has to be able to outrank it. Banding guarantees
-    that any truncating flow outranks every non-truncating one, while the estimate
-    still orders readers within each band.
-    """
+    # Docstring: Bucket an estimated backlog onto a small, bounded, log-scaled rank.
+    #
+    # Two signals combine, because each is blind where the other sees.
+    #
+    # ``backlog`` is derived from a published *global* log position, so its
+    # magnitude reflects whole-server write volume rather than this table's row
+    # count; a log scale absorbs that bias so only order-of-magnitude differences
+    # move the rank. It is comparable *across* readers, which is what ordering a
+    # contended queue needs, but it over-states a quiet table's lag.
+    #
+    # ``streak`` counts consecutive reads that ended at their row budget. That is
+    # first-hand proof this table has work outstanding, so it discriminates a
+    # genuinely backlogged flow from a merely stale one -- the discrimination the
+    # global signal cannot supply (measured in production: every waiter ranked
+    # identically because all checkpoints were recent). It is only a self
+    # assessment, so it cannot order one reader against another on its own.
+    #
+    # The streak takes the *high* band of the rank space and the estimate the low
+    # one, rather than the two being combined by a maximum. A maximum cannot
+    # separate readers whose estimates have already saturated, which is exactly the
+    # observed failure: when every waiter's hint-derived estimate lands on the same
+    # high rank, a proven backlog has to be able to outrank it. Banding guarantees
+    # that any truncating flow outranks every non-truncating one, while the estimate
+    # still orders readers within each band.
 
     proven_floor = _CONNECTION_BACKLOG_RANK_LEVELS // 2
     estimated = 0 if backlog <= 0 else min(proven_floor - 1, backlog.bit_length() // 4)
@@ -14663,11 +14510,10 @@ def _backlog_rank(backlog: int, streak: int = 0) -> int:
 
 
 def _backlog_rank_value(offset: dict[str, Any]) -> int:
-    """Validate an optional persisted backlog rank.
-
-    Optional and backward compatible: an offset written before hints existed, or
-    by a reader that found no usable hint, simply has no rank and reads as zero.
-    """
+    # Docstring: Validate an optional persisted backlog rank.
+    #
+    # Optional and backward compatible: an offset written before hints existed, or
+    # by a reader that found no usable hint, simply has no rank and reads as zero.
 
     value = offset.get("backlog_rank", 0)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:

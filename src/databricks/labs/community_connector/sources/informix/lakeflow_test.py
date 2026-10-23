@@ -1042,6 +1042,31 @@ class LakeflowContractTests(unittest.TestCase):
 
         cloudpickle.loads(cloudpickle.dumps(source_class))
 
+    def test_generated_source_class_pickles_under_the_broadcast_threshold(self):
+        # Spark pickles the merged data source by value. Above 1 MiB PySpark ships
+        # the pickle as a broadcast file, which serverless pipelines fail to load
+        # (NoSuchFileException in the sandboxed Python worker). The connector keeps
+        # its docstrings as "# Docstring:" comments, which are not pickled, to stay
+        # under it; new docstrings or enough new code fail here instead of in a
+        # pipeline.
+        try:
+            from pyspark import cloudpickle
+        except ImportError:
+            try:
+                import cloudpickle
+            except ImportError:
+                self.skipTest("cloudpickle is not installed in the unit environment")
+        generated = importlib.import_module(
+            "databricks.labs.community_connector.sources.informix."
+            "_generated_informix_python_source"
+        )
+        registry = mock.Mock()
+        spark = types.SimpleNamespace(dataSource=registry)
+        generated.register_lakeflow_source(spark)
+        source_class = registry.register.call_args.args[0]
+
+        self.assertLess(len(cloudpickle.dumps(source_class)), 1 << 20)
+
     def test_generated_state_op_reconnect_resolves_connection_lost_types(self):
         # Regression: connection_lost_error_types cached via a `global` rebind
         # crashed with NameError in the single-file merged deployment, where the

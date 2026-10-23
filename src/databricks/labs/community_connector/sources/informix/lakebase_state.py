@@ -170,16 +170,16 @@ _FILES_API_ATTEMPTS = 4
 
 
 class LakebaseStateError(RuntimeError):
-    """Raised when Lakebase-backed state cannot be provisioned or reached."""
+    # Docstring: Raised when Lakebase-backed state cannot be provisioned or reached.
+    pass
 
 
 class WorkspaceHttpError(LakebaseStateError):
-    """A workspace control-plane call returned a non-retriable HTTP status.
-
-    Subclasses ``LakebaseStateError`` so existing ``except LakebaseStateError``
-    handlers are unaffected; it merely carries ``status_code`` so a caller can
-    branch on, for example, a 403 that means a feature is disabled.
-    """
+    # Docstring: A workspace control-plane call returned a non-retriable HTTP status.
+    #
+    # Subclasses ``LakebaseStateError`` so existing ``except LakebaseStateError``
+    # handlers are unaffected; it merely carries ``status_code`` so a caller can
+    # branch on, for example, a 403 that means a feature is disabled.
 
     def __init__(self, message: str, status_code: int) -> None:
         super().__init__(message)
@@ -187,25 +187,23 @@ class WorkspaceHttpError(LakebaseStateError):
 
 
 def project_id_for_connection(identity: str, prefix: str = "informix-state") -> str:
-    """Derive a stable, DNS-compliant project id from a connection identity.
-
-    The id must be reproducible: every worker in every update has to resolve the
-    same project without coordinating, and the project is the unit that ties
-    state to one Informix connection. Hashing the identity also avoids leaking a
-    hostname into a globally visible resource name.
-    """
+    # Docstring: Derive a stable, DNS-compliant project id from a connection identity.
+    #
+    # The id must be reproducible: every worker in every update has to resolve the
+    # same project without coordinating, and the project is the unit that ties
+    # state to one Informix connection. Hashing the identity also avoids leaking a
+    # hostname into a globally visible resource name.
 
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
     return f"{prefix}-{digest}"
 
 
 class _WorkspaceApi:
-    """Minimal REST client for the workspace control plane.
-
-    Deliberately stdlib-only. This module is imported inside Spark workers where
-    adding a dependency is a deployment problem, and the surface needed here is
-    four verbs against JSON endpoints.
-    """
+    # Docstring: Minimal REST client for the workspace control plane.
+    #
+    # Deliberately stdlib-only. This module is imported inside Spark workers where
+    # adding a dependency is a deployment problem, and the surface needed here is
+    # four verbs against JSON endpoints.
 
     def __init__(self, host: str, token: str) -> None:
         self._host = host.rstrip("/")
@@ -274,11 +272,10 @@ class _WorkspaceApi:
     def await_operation(
         self, envelope: dict[str, Any] | None, *, deadline: float | None = None
     ) -> dict[str, Any]:
-        """Resolve a long-running-operation envelope to its final response.
-
-        Provisioning calls may return either a finished resource or an operation
-        that has to be polled; both shapes arrive on the same code path.
-        """
+        # Docstring: Resolve a long-running-operation envelope to its final response.
+        #
+        # Provisioning calls may return either a finished resource or an operation
+        # that has to be polled; both shapes arrive on the same code path.
 
         if not envelope:
             return {}
@@ -329,12 +326,11 @@ _CAPTURED_WORKSPACE: dict[str, str] = {}
 
 
 def capture_workspace_credentials() -> dict[str, str]:
-    """Record the driver's ambient workspace credentials for later use.
-
-    Call once while the pipeline module executes on the driver. Failure is not
-    fatal here: an explicitly configured host/token still works, and raising
-    would break registration for deployments that never touch Lakebase.
-    """
+    # Docstring: Record the driver's ambient workspace credentials for later use.
+    #
+    # Call once while the pipeline module executes on the driver. Failure is not
+    # fatal here: an explicitly configured host/token still works, and raising
+    # would break registration for deployments that never touch Lakebase.
 
     if not os.environ.get("DATABRICKS_RUNTIME_VERSION"):
         # Only a Databricks runtime has an ambient identity worth capturing. This
@@ -360,12 +356,11 @@ def capture_workspace_credentials() -> dict[str, str]:
 
 
 def _workspace_credentials(options: dict[str, str]) -> tuple[str, str]:
-    """Resolve the workspace host and bearer token for control-plane calls.
-
-    Prefers explicit options, then the credential captured on the driver, then
-    the ambient identity. The captured value is what makes this work inside a
-    pipeline at all, because the calling process has no identity of its own.
-    """
+    # Docstring: Resolve the workspace host and bearer token for control-plane calls.
+    #
+    # Prefers explicit options, then the credential captured on the driver, then
+    # the ambient identity. The captured value is what makes this work inside a
+    # pipeline at all, because the calling process has no identity of its own.
 
     host = (
         options.get("lakebase.workspace.host")
@@ -407,14 +402,13 @@ def ensure_project(
     suspend_seconds: int = _DEFAULT_SUSPEND_SECONDS,
     deadline: float | None = None,
 ) -> dict[str, Any]:
-    """Create the project if absent and return the endpoint's connection facts.
-
-    ``default_endpoint_settings`` is supplied at creation because that is the
-    only point at which ``suspend_timeout_duration`` reaches the auto-created
-    ``primary`` endpoint (see module docstring). An existing project is left
-    exactly as it is: adjusting a live endpoint's capacity is an operator
-    decision, not something a reader should do behind the operator's back.
-    """
+    # Docstring: Create the project if absent and return the endpoint's connection facts.
+    #
+    # ``default_endpoint_settings`` is supplied at creation because that is the
+    # only point at which ``suspend_timeout_duration`` reaches the auto-created
+    # ``primary`` endpoint (see module docstring). An existing project is left
+    # exactly as it is: adjusting a live endpoint's capacity is an operator
+    # decision, not something a reader should do behind the operator's back.
 
     deadline_kwargs = {"deadline": deadline} if deadline is not None else {}
     existing = api.request(
@@ -498,12 +492,11 @@ def ensure_project(
 def _endpoint_facts(
     api: _WorkspaceApi, project_id: str, *, deadline: float | None = None
 ) -> dict[str, Any]:
-    """Read the read-write endpoint's host and resource name.
-
-    Waits for the endpoint to exist because project creation provisions it
-    asynchronously; an IDLE endpoint is ready to use, since connecting is what
-    wakes it.
-    """
+    # Docstring: Read the read-write endpoint's host and resource name.
+    #
+    # Waits for the endpoint to exist because project creation provisions it
+    # asynchronously; an IDLE endpoint is ready to use, since connecting is what
+    # wakes it.
 
     path = (
         f"/api/2.0/postgres/projects/{project_id}"
@@ -537,12 +530,11 @@ def _endpoint_facts(
 
 
 def generate_credential(api: _WorkspaceApi, endpoint: str) -> str:
-    """Mint a short-lived Postgres OAuth token for ``endpoint``.
-
-    Sends ``endpoint`` alone: the documented ``claims`` array is rejected by this
-    workspace's API (see module docstring), and the caller's own identity already
-    scopes the credential.
-    """
+    # Docstring: Mint a short-lived Postgres OAuth token for ``endpoint``.
+    #
+    # Sends ``endpoint`` alone: the documented ``claims`` array is rejected by this
+    # workspace's API (see module docstring), and the caller's own identity already
+    # scopes the credential.
 
     response = api.request("POST", "/api/2.0/postgres/credentials", {"endpoint": endpoint})
     token = (response or {}).get("token")
@@ -552,23 +544,22 @@ def generate_credential(api: _WorkspaceApi, endpoint: str) -> str:
 
 
 class StagingTokenUnavailable(RuntimeError):
-    """Personal access token creation is disabled or forbidden for this identity.
-
-    Raised so the connector can fall back to the FUSE staging transport instead
-    of failing the flow: the Files-API transport cannot authenticate without a
-    token, and many workspaces disable PAT creation by policy.
-    """
+    # Docstring: Personal access token creation is disabled or forbidden for this identity.
+    #
+    # Raised so the connector can fall back to the FUSE staging transport instead
+    # of failing the flow: the Files-API transport cannot authenticate without a
+    # token, and many workspaces disable PAT creation by policy.
+    pass
 
 
 def mint_staging_token(
     api: _WorkspaceApi, pipeline_id: str, lifetime_seconds: int
 ) -> tuple[str, str]:
-    """Mint a personal access token for Files-API staging, tagged per pipeline.
-
-    Returns ``(token_value, token_id)``. Raises :class:`StagingTokenUnavailable`
-    when the workspace forbids token creation (HTTP 403) or rejects it as
-    unsupported (HTTP 400), so the caller can fall back to FUSE rather than fail.
-    """
+    # Docstring: Mint a personal access token for Files-API staging, tagged per pipeline.
+    #
+    # Returns ``(token_value, token_id)``. Raises :class:`StagingTokenUnavailable`
+    # when the workspace forbids token creation (HTTP 403) or rejects it as
+    # unsupported (HTTP 400), so the caller can fall back to FUSE rather than fail.
 
     comment = f"{STAGING_TOKEN_COMMENT_PREFIX}{pipeline_id}"
     try:
@@ -595,12 +586,11 @@ def mint_staging_token(
 
 
 def revoke_stale_staging_tokens(api: _WorkspaceApi, pipeline_id: str, keep_token_id: str) -> None:
-    """Delete this pipeline's previously-minted staging tokens, keeping the current one.
-
-    Best-effort: listing or deleting may fail (e.g. the identity cannot manage
-    tokens it did not create), and an orphaned token expires on its own, so a
-    failure here is logged and swallowed rather than blocking startup.
-    """
+    # Docstring: Delete this pipeline's previously-minted staging tokens, keeping the current one.
+    #
+    # Best-effort: listing or deleting may fail (e.g. the identity cannot manage
+    # tokens it did not create), and an orphaned token expires on its own, so a
+    # failure here is logged and swallowed rather than blocking startup.
 
     comment = f"{STAGING_TOKEN_COMMENT_PREFIX}{pipeline_id}"
     try:
@@ -618,13 +608,12 @@ def revoke_stale_staging_tokens(api: _WorkspaceApi, pipeline_id: str, keep_token
 
 
 def store_staging_secret(api: _WorkspaceApi, scope: str, key: str, value: str) -> None:
-    """Persist the current staging token as a workspace secret (best-effort).
-
-    The secret is a durable record for rotation/audit and cross-restart recovery;
-    it is *not* the reader's bootstrap source (reading a secret would itself need a
-    token). Staging always uses the in-process token carried in _CAPTURED_WORKSPACE,
-    so a failure to write the secret does not stop staging.
-    """
+    # Docstring: Persist the current staging token as a workspace secret (best-effort).
+    #
+    # The secret is a durable record for rotation/audit and cross-restart recovery;
+    # it is *not* the reader's bootstrap source (reading a secret would itself need a
+    # token). Staging always uses the in-process token carried in _CAPTURED_WORKSPACE,
+    # so a failure to write the secret does not stop staging.
 
     try:
         api.request("POST", "/api/2.0/secrets/scopes/create", {"scope": scope})
@@ -646,21 +635,20 @@ def store_staging_secret(api: _WorkspaceApi, scope: str, key: str, value: str) -
 
 
 class StagingCredentialProvider:
-    """Supplies a Files-API bearer token, refreshing it before it can expire.
-
-    The first ``bearer()`` mints a token using ``bootstrap_token`` -- whatever
-    credential the reader could carry from the driver (the captured runtime
-    credential). Every later refresh, at half-life, uses the *current minted
-    token* to mint its successor, so no ambient identity is needed after startup
-    (the reader process has none). Each mint also refreshes the durable secret and
-    revokes this pipeline's older tokens. Refresh is lazy -- checked on each
-    ``bearer()`` call -- so there is no background thread to manage; page writes
-    call ``bearer()`` often enough to refresh well within the half-life.
-
-    A first-mint :class:`StagingTokenUnavailable` propagates so the caller falls
-    back to FUSE; a later *refresh* failure keeps the still-valid current token
-    rather than dropping a working credential.
-    """
+    # Docstring: Supplies a Files-API bearer token, refreshing it before it can expire.
+    #
+    # The first ``bearer()`` mints a token using ``bootstrap_token`` -- whatever
+    # credential the reader could carry from the driver (the captured runtime
+    # credential). Every later refresh, at half-life, uses the *current minted
+    # token* to mint its successor, so no ambient identity is needed after startup
+    # (the reader process has none). Each mint also refreshes the durable secret and
+    # revokes this pipeline's older tokens. Refresh is lazy -- checked on each
+    # ``bearer()`` call -- so there is no background thread to manage; page writes
+    # call ``bearer()`` often enough to refresh well within the half-life.
+    #
+    # A first-mint :class:`StagingTokenUnavailable` propagates so the caller falls
+    # back to FUSE; a later *refresh* failure keeps the still-valid current token
+    # rather than dropping a working credential.
 
     def __init__(
         self,
@@ -719,43 +707,41 @@ class StagingCredentialProvider:
 
 
 class WorkspaceFilesApi:
-    """Read/write UC Volume files over the Files REST API instead of the FUSE mount.
-
-    Only the verbs snapshot staging needs, stdlib-only for the same reason as
-    :class:`_WorkspaceApi`. The bearer token is fetched from the credential
-    provider on every attempt, so a token refreshed between attempts is picked up.
-    """
+    # Docstring: Read/write UC Volume files over the Files REST API instead of the FUSE mount.
+    #
+    # Only the verbs snapshot staging needs, stdlib-only for the same reason as
+    # :class:`_WorkspaceApi`. The bearer token is fetched from the credential
+    # provider on every attempt, so a token refreshed between attempts is picked up.
 
     def __init__(self, host: str, credential: StagingCredentialProvider) -> None:
         self._host = host.rstrip("/")
         self._credential = credential
 
     def put(self, volume_path: str, data: bytes) -> None:
-        """Upload ``data`` to ``volume_path`` (a /Volumes/... path), overwriting."""
+        # Docstring: Upload ``data`` to ``volume_path`` (a /Volumes/... path), overwriting.
 
         self._request("PUT", volume_path, data=data, overwrite=True)
 
     def get(self, volume_path: str) -> bytes:
-        """Download ``volume_path``; raises on any non-200."""
+        # Docstring: Download ``volume_path``; raises on any non-200.
 
         return self._request("GET", volume_path) or b""
 
     def get_range(self, volume_path: str, start: int, end: int) -> bytes:
-        """Download the half-open byte range ``[start, end)`` of ``volume_path``.
-
-        Issues a ranged GET (``Range: bytes=start-end-1``, inclusive per RFC 9110),
-        which the Files API answers with ``206 Partial Content``. Lets a reader pull
-        one split of a large file straight from object storage without materializing
-        the whole file (the serverless FUSE mount caches the whole file on first
-        access, so it is unsuitable for large files). ``end <= start`` yields ``b""``.
-        """
+        # Docstring: Download the half-open byte range ``[start, end)`` of ``volume_path``.
+        #
+        # Issues a ranged GET (``Range: bytes=start-end-1``, inclusive per RFC 9110),
+        # which the Files API answers with ``206 Partial Content``. Lets a reader pull
+        # one split of a large file straight from object storage without materializing
+        # the whole file (the serverless FUSE mount caches the whole file on first
+        # access, so it is unsuitable for large files). ``end <= start`` yields ``b""``.
 
         if end <= start:
             return b""
         return self._request("GET", volume_path, byte_range=(start, end - 1)) or b""
 
     def delete(self, volume_path: str) -> None:
-        """Delete ``volume_path`` if it exists; a 404 is tolerated."""
+        # Docstring: Delete ``volume_path`` if it exists; a 404 is tolerated.
 
         self._request("DELETE", volume_path, tolerate_missing=True)
 
@@ -813,12 +799,11 @@ class WorkspaceFilesApi:
 
 
 def _quoted_identifier(connection: Any, name: str) -> str:
-    """Return ``name`` safely quoted for use as a Postgres identifier.
-
-    A role name arrives from a connection option and lands in DDL, where it
-    cannot be a bind parameter. ``quote_ident`` is the server's own quoting, so
-    the escaping matches exactly what the server will parse.
-    """
+    # Docstring: Return ``name`` safely quoted for use as a Postgres identifier.
+    #
+    # A role name arrives from a connection option and lands in DDL, where it
+    # cannot be a bind parameter. ``quote_ident`` is the server's own quoting, so
+    # the escaping matches exactly what the server will parse.
 
     with connection.cursor() as cursor:
         cursor.execute("SELECT quote_ident(%s)", (name,))
@@ -829,22 +814,21 @@ def _quoted_identifier(connection: Any, name: str) -> str:
 
 
 def ensure_login_role(admin_connection: Any, database: str, user: str, password: str) -> str:
-    """Create the password login role, or reset its password if it exists.
-
-    Runs as the OAuth-authenticated workspace identity, which is the only caller
-    able to do this. Returns ``"created"`` or ``"reset"`` to say which happened.
-
-    Reset rather than drop-and-recreate, deliberately. Once the role owns the
-    state tables -- which it does from its first run onwards -- ``DROP ROLE``
-    fails with ``DependentObjectsStillExist``, and the forced route
-    (``REASSIGN OWNED``/``DROP OWNED``) fails with ``InsufficientPrivilege``
-    because this identity holds CREATEROLE rather than superuser. Dropping would
-    also be the wrong outcome: the role owns ``conn_slots``, ``backlog_hints``
-    and ``state_records``, so removing it would discard the shared CDC state and
-    force every table to resnapshot. ``ALTER ROLE ... PASSWORD`` achieves the
-    same end -- the previous password stops working immediately -- while leaving
-    the data and its ownership untouched (all verified against a live endpoint).
-    """
+    # Docstring: Create the password login role, or reset its password if it exists.
+    #
+    # Runs as the OAuth-authenticated workspace identity, which is the only caller
+    # able to do this. Returns ``"created"`` or ``"reset"`` to say which happened.
+    #
+    # Reset rather than drop-and-recreate, deliberately. Once the role owns the
+    # state tables -- which it does from its first run onwards -- ``DROP ROLE``
+    # fails with ``DependentObjectsStillExist``, and the forced route
+    # (``REASSIGN OWNED``/``DROP OWNED``) fails with ``InsufficientPrivilege``
+    # because this identity holds CREATEROLE rather than superuser. Dropping would
+    # also be the wrong outcome: the role owns ``conn_slots``, ``backlog_hints``
+    # and ``state_records``, so removing it would discard the shared CDC state and
+    # force every table to resnapshot. ``ALTER ROLE ... PASSWORD`` achieves the
+    # same end -- the previous password stops working immediately -- while leaving
+    # the data and its ownership untouched (all verified against a live endpoint).
 
     identifier = _quoted_identifier(admin_connection, user)
     database_identifier = _quoted_identifier(admin_connection, database)
@@ -1046,17 +1030,16 @@ _SCHEMA_STATEMENTS = (
 
 
 def ensure_schema(connection: Any) -> None:
-    """Create the state tables if they do not already exist.
-
-    Serialized on a transaction-scoped advisory lock: ``CREATE TABLE IF NOT EXISTS``
-    is *not* concurrency-safe on first creation -- when a Lakeflow pipeline starts one
-    Python worker per flow and they all create a brand-new table at once (the first run
-    after a table is added), the existence check passes for all of them and every worker
-    but one then fails inserting the catalog row with ``duplicate key ... pg_type_typname
-    _nsp_index``. The lock makes the losers wait, so they find the objects already present.
-    It needs no connector schema and is released by the commit below, so it is safe during
-    first provisioning; the key is distinct from the role-provisioning lock's.
-    """
+    # Docstring: Create the state tables if they do not already exist.
+    #
+    # Serialized on a transaction-scoped advisory lock: ``CREATE TABLE IF NOT EXISTS``
+    # is *not* concurrency-safe on first creation -- when a Lakeflow pipeline starts one
+    # Python worker per flow and they all create a brand-new table at once (the first run
+    # after a table is added), the existence check passes for all of them and every worker
+    # but one then fails inserting the catalog row with ``duplicate key ... pg_type_typname
+    # _nsp_index``. The lock makes the losers wait, so they find the objects already present.
+    # It needs no connector schema and is released by the commit below, so it is safe during
+    # first provisioning; the key is distinct from the role-provisioning lock's.
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -1069,13 +1052,12 @@ def ensure_schema(connection: Any) -> None:
 
 
 def seed_slots(connection: Any, namespace: str, slot_count: int) -> None:
-    """Ensure ``slot_count`` rows exist for ``namespace``.
-
-    Capacity is the row count, so seeding *is* configuring the semaphore. Rows
-    are only ever added: removing them while a holder is live would silently
-    revoke a lease, so a reduced limit is enforced by the acquire query's
-    ``slot_id`` bound instead.
-    """
+    # Docstring: Ensure ``slot_count`` rows exist for ``namespace``.
+    #
+    # Capacity is the row count, so seeding *is* configuring the semaphore. Rows
+    # are only ever added: removing them while a holder is live would silently
+    # revoke a lease, so a reduced limit is enforced by the acquire query's
+    # ``slot_id`` bound instead.
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -1091,12 +1073,11 @@ def seed_slots(connection: Any, namespace: str, slot_count: int) -> None:
 
 
 class LakebaseState:
-    """Connection factory and provisioning entry point for Lakebase state.
-
-    One instance per reader process. Provisioning runs at most once per project
-    per process behind a lock, so the 60-odd flows a pipeline starts converge on
-    a single set of control-plane calls instead of each issuing their own.
-    """
+    # Docstring: Connection factory and provisioning entry point for Lakebase state.
+    #
+    # One instance per reader process. Provisioning runs at most once per project
+    # per process behind a lock, so the 60-odd flows a pipeline starts converge on
+    # a single set of control-plane calls instead of each issuing their own.
 
     _provisioned: dict[str, dict[str, Any]] = {}
     # Held in a dict and built on first use rather than at class creation. Spark
@@ -1163,7 +1144,7 @@ class LakebaseState:
         return self._api
 
     def provision(self) -> dict[str, Any]:
-        """Idempotently ensure the project, endpoint, and schema all exist."""
+        # Docstring: Idempotently ensure the project, endpoint, and schema all exist.
 
         cached = LakebaseState._provisioned.get(self._project_id)
         if cached is not None:
@@ -1207,7 +1188,7 @@ class LakebaseState:
             lock.release()
 
     def _password_login_works(self, facts: dict[str, Any]) -> bool:
-        """Return whether the configured user_id/password can actually log in."""
+        # Docstring: Return whether the configured user_id/password can actually log in.
 
         try:
             connection = self._open(facts, self._user_id, self._password)
@@ -1222,7 +1203,7 @@ class LakebaseState:
         return True
 
     def _ensure_password_login(self, facts: dict[str, Any]) -> None:
-        """Validate the state role's login, provisioning it if it fails."""
+        # Docstring: Validate the state role's login, provisioning it if it fails.
 
         if not self._password:
             raise LakebaseStateError(
@@ -1257,12 +1238,11 @@ class LakebaseState:
         return self._token
 
     def connect(self) -> Any:
-        """Open a Postgres connection, waking a suspended endpoint if needed.
-
-        ``psycopg2`` is preinstalled on the Databricks runtime; ``psycopg`` (v3)
-        is accepted as an alternative so the module also works where only that
-        is present.
-        """
+        # Docstring: Open a Postgres connection, waking a suspended endpoint if needed.
+        #
+        # ``psycopg2`` is preinstalled on the Databricks runtime; ``psycopg`` (v3)
+        # is accepted as an alternative so the module also works where only that
+        # is present.
 
         facts = self._facts or self.provision()
         # Always the state role: its password needs no control-plane call and
@@ -1271,7 +1251,7 @@ class LakebaseState:
         return self._open(facts, self._user_id, self._password)
 
     def collect_unused_projects(self, retention_days: int, interval_hours: float) -> int:
-        """Delete inactive, auto-named connector projects once per scan interval."""
+        # Docstring: Delete inactive, auto-named connector projects once per scan interval.
 
         if self._options.get("lakebase.project.id", "").strip():
             return 0
@@ -1325,29 +1305,27 @@ class LakebaseState:
         return deleted
 
     def _admin_user(self) -> str:
-        """Return the role name used for provisioning.
-
-        ``_default_user`` already honours ``lakebase.admin_user`` first, so this
-        does not re-check it: two copies of the same precedence rule can disagree.
-        """
+        # Docstring: Return the role name used for provisioning.
+        #
+        # ``_default_user`` already honours ``lakebase.admin_user`` first, so this
+        # does not re-check it: two copies of the same precedence rule can disagree.
 
         return _default_user(self._options)
 
     def _connect_as_admin(self, facts: dict[str, Any]) -> Any:
-        """Connect as the provisioning identity.
-
-        Prefers ``lakebase.admin_password`` when set, because a password works
-        even where a control-plane credential cannot be minted. Otherwise mints a
-        short-lived OAuth credential for the workspace identity, which is what
-        makes the zero-configuration case work.
-        """
+        # Docstring: Connect as the provisioning identity.
+        #
+        # Prefers ``lakebase.admin_password`` when set, because a password works
+        # even where a control-plane credential cannot be minted. Otherwise mints a
+        # short-lived OAuth credential for the workspace identity, which is what
+        # makes the zero-configuration case work.
 
         if self._admin_password:
             return self._open(facts, self._admin_user(), self._admin_password)
         return self._open(facts, self._admin_user(), self._credential())
 
     def _open(self, facts: dict[str, Any], user: str, password: str) -> Any:
-        """Connect as ``user``, waking a suspended endpoint if needed."""
+        # Docstring: Connect as ``user``, waking a suspended endpoint if needed.
 
         parameters = {
             "host": facts["host"],
@@ -1546,11 +1524,10 @@ DELETE FROM slot_waiters WHERE namespace = %(namespace)s AND ticket_id = %(ticke
 
 
 class ConnectionSlot:
-    """A held connection-capacity lease.
-
-    ``epoch`` is the fencing token; it is required to renew or release, so a
-    lease that expired while this process was stalled cannot be resurrected.
-    """
+    # Docstring: A held connection-capacity lease.
+    #
+    # ``epoch`` is the fencing token; it is required to renew or release, so a
+    # lease that expired while this process was stalled cannot be resurrected.
 
     __slots__ = ("namespace", "slot_id", "epoch", "owner")
 
@@ -1579,26 +1556,25 @@ def acquire_slot(
     waiter_class: int = 0,
     num_classes: int = 1,
 ) -> ConnectionSlot | None:
-    """Claim one slot, or return ``None`` when every eligible slot is busy.
-
-    ``floor`` implements the upsert reservation: the delete channel passes the
-    reserved count so it can never claim a low slot, which is what makes the
-    reservation a guarantee rather than a preference. ``slot_count`` bounds the
-    ceiling, so lowering the configured limit takes effect immediately even
-    though surplus rows are deliberately left in place.
-
-    ``ticket_id`` opts into the fair queue: pass the id returned by
-    ``enqueue_waiter`` (with the same ``waiter_ttl`` used to heartbeat it) and the
-    claim yields any slot an earlier-ordered, still-heartbeating waiter is also
-    eligible for, so this caller waits its turn. Omit it (the default) for the raw
-    first-come race. ``policy`` selects how the queue orders waiters: ``"fifo"``
-    (default) serves strictly by arrival (``_ACQUIRE_SLOT_FAIR``); ``"round_robin"``
-    interleaves requester classes so ticket volume in one class cannot crowd out
-    another (``_ACQUIRE_SLOT_ROUND_ROBIN``). Both only matter when ``ticket_id`` is set.
-    ``waiter_class`` is this caller's class (matching the ticket) and ``num_classes`` the
-    rotation modulus; on a round-robin win the cursor is advanced to ``waiter_class`` in
-    the same transaction as the claim.
-    """
+    # Docstring: Claim one slot, or return ``None`` when every eligible slot is busy.
+    #
+    # ``floor`` implements the upsert reservation: the delete channel passes the
+    # reserved count so it can never claim a low slot, which is what makes the
+    # reservation a guarantee rather than a preference. ``slot_count`` bounds the
+    # ceiling, so lowering the configured limit takes effect immediately even
+    # though surplus rows are deliberately left in place.
+    #
+    # ``ticket_id`` opts into the fair queue: pass the id returned by
+    # ``enqueue_waiter`` (with the same ``waiter_ttl`` used to heartbeat it) and the
+    # claim yields any slot an earlier-ordered, still-heartbeating waiter is also
+    # eligible for, so this caller waits its turn. Omit it (the default) for the raw
+    # first-come race. ``policy`` selects how the queue orders waiters: ``"fifo"``
+    # (default) serves strictly by arrival (``_ACQUIRE_SLOT_FAIR``); ``"round_robin"``
+    # interleaves requester classes so ticket volume in one class cannot crowd out
+    # another (``_ACQUIRE_SLOT_ROUND_ROBIN``). Both only matter when ``ticket_id`` is set.
+    # ``waiter_class`` is this caller's class (matching the ticket) and ``num_classes`` the
+    # rotation modulus; on a round-robin win the cursor is advanced to ``waiter_class`` in
+    # the same transaction as the claim.
 
     parameters = {
         "owner": owner,
@@ -1643,14 +1619,13 @@ def enqueue_waiter(
     ceiling: int,
     waiter_class: int = 0,
 ) -> int:
-    """Register this caller as a slot waiter and return its queue ticket.
-
-    The ticket records the eligible band [floor, ceiling); acquisition consults it
-    so an earlier-ordered waiter in the same band is served first. ``waiter_class``
-    tags the ticket with its requester class for the round-robin policy (it is inert
-    under FIFO); it defaults to 0, the consumer class. Commit it before waiting so
-    other waiters' connections can see it.
-    """
+    # Docstring: Register this caller as a slot waiter and return its queue ticket.
+    #
+    # The ticket records the eligible band [floor, ceiling); acquisition consults it
+    # so an earlier-ordered waiter in the same band is served first. ``waiter_class``
+    # tags the ticket with its requester class for the round-robin policy (it is inert
+    # under FIFO); it defaults to 0, the consumer class. Commit it before waiting so
+    # other waiters' connections can see it.
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -1669,12 +1644,11 @@ def enqueue_waiter(
 
 
 def heartbeat_waiter(connection: Any, namespace: str, ticket_id: int, *, waiter_ttl: float) -> None:
-    """Renew this waiter's ticket and reap any whose owner stopped heartbeating.
-
-    Folding the reap into the heartbeat keeps the queue self-cleaning: a crashed or
-    timed-out waiter's ticket ages out and is dropped by the next live heartbeat, so
-    it never blocks the queue and no separate GC pass is needed.
-    """
+    # Docstring: Renew this waiter's ticket and reap any whose owner stopped heartbeating.
+    #
+    # Folding the reap into the heartbeat keeps the queue self-cleaning: a crashed or
+    # timed-out waiter's ticket ages out and is dropped by the next live heartbeat, so
+    # it never blocks the queue and no separate GC pass is needed.
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -1689,7 +1663,7 @@ def heartbeat_waiter(connection: Any, namespace: str, ticket_id: int, *, waiter_
 
 
 def dequeue_waiter(connection: Any, namespace: str, ticket_id: int) -> None:
-    """Remove this waiter's ticket -- on winning a slot or on giving up."""
+    # Docstring: Remove this waiter's ticket -- on winning a slot or on giving up.
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -1727,7 +1701,7 @@ def put_cdc_handoff(
     offset_json: str,
     schema_fp: str,
 ) -> None:
-    """Park (or overwrite) a table's checkpoint-handoff token. Idempotent re-capture."""
+    # Docstring: Park (or overwrite) a table's checkpoint-handoff token. Idempotent re-capture.
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -1746,7 +1720,7 @@ def put_cdc_handoff(
 def get_cdc_handoff(
     connection: Any, namespace: str, table_key: str, channel: int
 ) -> dict[str, str] | None:
-    """Return the parked ``{offset_json, schema_fp}`` token, or ``None`` when absent."""
+    # Docstring: Return the parked ``{offset_json, schema_fp}`` token, or ``None`` when absent.
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -1761,7 +1735,7 @@ def get_cdc_handoff(
 
 
 def delete_cdc_handoff(connection: Any, namespace: str, table_key: str, channel: int) -> None:
-    """Remove a consumed handoff token. Idempotent (a missing row is a no-op)."""
+    # Docstring: Remove a consumed handoff token. Idempotent (a missing row is a no-op).
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -1772,7 +1746,7 @@ def delete_cdc_handoff(connection: Any, namespace: str, table_key: str, channel:
 
 
 def heartbeat_slot(connection: Any, slot: ConnectionSlot) -> bool:
-    """Renew a lease. ``False`` means the lease was lost and must not be reused."""
+    # Docstring: Renew a lease. ``False`` means the lease was lost and must not be reused.
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -1790,7 +1764,7 @@ def heartbeat_slot(connection: Any, slot: ConnectionSlot) -> bool:
 
 
 def release_slot(connection: Any, slot: ConnectionSlot) -> bool:
-    """Free a lease. ``False`` means it had already been reclaimed."""
+    # Docstring: Free a lease. ``False`` means it had already been reclaimed.
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -1822,7 +1796,7 @@ SELECT COALESCE(SUM(epoch), 0) FROM conn_slots WHERE namespace = %(namespace)s
 
 
 def pool_progress_token(connection: Any, namespace: str) -> int:
-    """Return the pool's turnover token (see ``_POOL_PROGRESS_TOKEN``)."""
+    # Docstring: Return the pool's turnover token (see ``_POOL_PROGRESS_TOKEN``).
 
     with connection.cursor() as cursor:
         cursor.execute(_POOL_PROGRESS_TOKEN, {"namespace": namespace})
@@ -1855,7 +1829,7 @@ WHERE namespace = %(namespace)s
 
 
 def publish_backlog_hint(connection: Any, namespace: str, table_name: str, lsn: int) -> None:
-    """Record a table's log position, never regressing an existing value."""
+    # Docstring: Record a table's log position, never regressing an existing value.
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -1867,11 +1841,10 @@ def publish_backlog_hint(connection: Any, namespace: str, table_name: str, lsn: 
 def read_backlog_hints(
     connection: Any, namespace: str, *, max_age_seconds: float = 45.0
 ) -> dict[str, int]:
-    """Return every fresh hint for a namespace in one round trip.
-
-    Stale rows are filtered by age rather than deleted: a hint is advisory, and
-    leaving it costs one row per table instead of a reaper.
-    """
+    # Docstring: Return every fresh hint for a namespace in one round trip.
+    #
+    # Stale rows are filtered by age rather than deleted: a hint is advisory, and
+    # leaving it costs one row per table instead of a reaper.
 
     with connection.cursor() as cursor:
         cursor.execute(_READ_HINTS, {"namespace": namespace, "max_age": float(max_age_seconds)})
@@ -1901,7 +1874,7 @@ def publish_connection_limit(
     reserved_deletes: int,
     version: int,
 ) -> None:
-    """Publish the agreed capacity configuration for a namespace."""
+    # Docstring: Publish the agreed capacity configuration for a namespace.
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -1917,7 +1890,7 @@ def publish_connection_limit(
 
 
 def read_connection_limit(connection: Any, namespace: str) -> dict[str, int] | None:
-    """Return the published capacity configuration, or ``None`` if unset."""
+    # Docstring: Return the published capacity configuration, or ``None`` if unset.
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -2097,17 +2070,16 @@ _CONNECTION_LOST_ERROR_TYPES: dict[str, tuple[type[BaseException], ...]] = {}
 
 
 def connection_lost_error_types() -> tuple[type[BaseException], ...]:
-    """Return the driver exception types raised when a connection is severed.
-
-    A Lakebase (Postgres) connection left idle -- e.g. across a long wait for
-    connection capacity -- is reaped by the server, and the next query on it
-    fails with ``OperationalError`` ("SSL SYSCALL error: EOF detected", "server
-    closed the connection unexpectedly") or ``InterfaceError`` ("connection
-    already closed"). Callers catch these to reconnect and retry an idempotent
-    state operation. Resolved once against whichever driver is installed
-    (``psycopg2`` or ``psycopg`` v3); an empty tuple when neither is importable
-    so the caller simply never matches and propagates.
-    """
+    # Docstring: Return the driver exception types raised when a connection is severed.
+    #
+    # A Lakebase (Postgres) connection left idle -- e.g. across a long wait for
+    # connection capacity -- is reaped by the server, and the next query on it
+    # fails with ``OperationalError`` ("SSL SYSCALL error: EOF detected", "server
+    # closed the connection unexpectedly") or ``InterfaceError`` ("connection
+    # already closed"). Callers catch these to reconnect and retry an idempotent
+    # state operation. Resolved once against whichever driver is installed
+    # (``psycopg2`` or ``psycopg`` v3); an empty tuple when neither is importable
+    # so the caller simply never matches and propagates.
 
     cached = _CONNECTION_LOST_ERROR_TYPES.get("types")
     if cached is not None:
@@ -2135,12 +2107,11 @@ def publish_state_record(
     *,
     record_type: str = "generic",
 ) -> dict[str, Any]:
-    """Elect exactly one record for a key and return the elected value.
-
-    Always returns the *winning* record, which may be another writer's. Callers
-    depend on that: a record is the shared truth for a key, so a loser must adopt
-    the winner rather than assume its own value took effect.
-    """
+    # Docstring: Elect exactly one record for a key and return the elected value.
+    #
+    # Always returns the *winning* record, which may be another writer's. Callers
+    # depend on that: a record is the shared truth for a key, so a loser must adopt
+    # the winner rather than assume its own value took effect.
 
     payload = json.dumps(record, sort_keys=True)
     with connection.cursor() as cursor:
@@ -2174,15 +2145,14 @@ def publish_minimum_lsn_state_record(
     *,
     record_type: str,
 ) -> dict[str, Any]:
-    """Atomically publish the lowest compatible ``start_lsn`` for one key.
-
-    A later CDC poll can discover an older still-open transaction, moving its
-    effective restart position backwards. PostgreSQL serializes the conflict
-    update so concurrent upsert workers converge on the minimum. Incompatible
-    identity metadata prevents the update; schema metadata travels with the
-    winning minimum because schema transitions can legitimately occur later in
-    the same update.
-    """
+    # Docstring: Atomically publish the lowest compatible ``start_lsn`` for one key.
+    #
+    # A later CDC poll can discover an older still-open transaction, moving its
+    # effective restart position backwards. PostgreSQL serializes the conflict
+    # update so concurrent upsert workers converge on the minimum. Incompatible
+    # identity metadata prevents the update; schema metadata travels with the
+    # winning minimum because schema transitions can legitimately occur later in
+    # the same update.
 
     payload = json.dumps(record, sort_keys=True)
     parameters = {
@@ -2213,14 +2183,13 @@ def publish_maximum_lsn_state_record(
     *,
     record_type: str,
 ) -> dict[str, Any]:
-    """Atomically publish the highest compatible ``start_lsn`` for one key.
-
-    The scope-independent counterpart of :func:`publish_minimum_lsn_state_record`,
-    used for the delete-bootstrap snapshot floor: the floor must advance only when a
-    resnapshot repopulates the destination as-of a later boundary, and stay put
-    otherwise. PostgreSQL serializes the conflict update so concurrent publishers
-    converge on the maximum.
-    """
+    # Docstring: Atomically publish the highest compatible ``start_lsn`` for one key.
+    #
+    # The scope-independent counterpart of :func:`publish_minimum_lsn_state_record`,
+    # used for the delete-bootstrap snapshot floor: the floor must advance only when a
+    # resnapshot repopulates the destination as-of a later boundary, and stay put
+    # otherwise. PostgreSQL serializes the conflict update so concurrent publishers
+    # converge on the maximum.
 
     payload = json.dumps(record, sort_keys=True)
     parameters = {
@@ -2244,7 +2213,7 @@ def publish_maximum_lsn_state_record(
 
 
 def read_state_record(connection: Any, namespace: str, record_key: str) -> dict[str, Any] | None:
-    """Return an elected record, or ``None`` when the key is unwritten."""
+    # Docstring: Return an elected record, or ``None`` when the key is unwritten.
 
     with connection.cursor() as cursor:
         cursor.execute(_SELECT_RECORD, {"namespace": namespace, "record_key": record_key})
@@ -2267,7 +2236,7 @@ def delete_obsolete_scoped_state_records(
     current_scope: str,
     retained_scope: str | None = None,
 ) -> int:
-    """Delete old update scopes while preserving the scope in Spark's checkpoint."""
+    # Docstring: Delete old update scopes while preserving the scope in Spark's checkpoint.
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -2293,7 +2262,7 @@ def touch_table_activity(
     pipeline_id: str,
     touch_interval_seconds: float,
 ) -> bool:
-    """Refresh one table/pipeline activity record when its write interval elapsed."""
+    # Docstring: Refresh one table/pipeline activity record when its write interval elapsed.
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -2318,7 +2287,7 @@ def collect_stale_table_state(
     retention_days: int,
     gc_interval_hours: float,
 ) -> int:
-    """Run at most one database-scoped table-state collection per interval."""
+    # Docstring: Run at most one database-scoped table-state collection per interval.
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -2348,7 +2317,7 @@ def collect_stale_table_state(
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
-    """Normalise a jsonb column, which drivers return as dict or as text."""
+    # Docstring: Normalise a jsonb column, which drivers return as dict or as text.
 
     if isinstance(value, dict):
         return value
@@ -2359,14 +2328,13 @@ def _as_dict(value: Any) -> dict[str, Any]:
 
 
 def _default_user(options: dict[str, str]) -> str:
-    """Resolve the provisioning role name, which is the caller's own identity.
-
-    The last two resolutions exist because the process that needs this name has
-    no ambient identity: ``WorkspaceClient()`` cannot be constructed there, so
-    asking the SDK who we are is not an option. Instead the driver's captured
-    credential is used to *ask the control plane*, which works from anywhere,
-    with the SDK kept only for the non-pipeline case.
-    """
+    # Docstring: Resolve the provisioning role name, which is the caller's own identity.
+    #
+    # The last two resolutions exist because the process that needs this name has
+    # no ambient identity: ``WorkspaceClient()`` cannot be constructed there, so
+    # asking the SDK who we are is not an option. Instead the driver's captured
+    # credential is used to *ask the control plane*, which works from anywhere,
+    # with the SDK kept only for the non-pipeline case.
 
     explicit = options.get("lakebase.admin_user", "").strip()
     if explicit:
@@ -2388,11 +2356,10 @@ def _default_user(options: dict[str, str]) -> str:
 
 
 def _current_user_from_captured_credential(options: dict[str, str]) -> str:
-    """Return the calling identity's user name, or "" if it cannot be resolved.
-
-    A service principal has no ``userName``, so ``id`` is accepted as the
-    fallback: for one, that is the client id the Postgres role is named after.
-    """
+    # Docstring: Return the calling identity's user name, or "" if it cannot be resolved.
+    #
+    # A service principal has no ``userName``, so ``id`` is accepted as the
+    # fallback: for one, that is the client id the Postgres role is named after.
 
     try:
         host, token = _workspace_credentials(options)

@@ -35,7 +35,7 @@ CDC_ROUTINE_DATABASE = "syscdcv1"
 
 
 def cdc_routine(name: str) -> str:
-    """Return the cross-database name of an installed Informix CDC routine."""
+    # Docstring: Return the cross-database name of an installed Informix CDC routine.
 
     if not name.startswith("cdc_") or not name.replace("_", "").isalnum():
         raise CdcProtocolError(f"invalid CDC routine name {name!r}")
@@ -43,7 +43,7 @@ def cdc_routine(name: str) -> str:
 
 
 def metadata_column_names(payload: bytes, encoding: str = "utf-8") -> tuple[str, ...]:
-    """Extract CDC metadata column names while ignoring commas in type arguments."""
+    # Docstring: Extract CDC metadata column names while ignoring commas in type arguments.
 
     text = payload.rstrip(b"\0 \t\r\n").decode(encoding)
     fields: list[str] = []
@@ -76,7 +76,7 @@ class UnsupportedCdcType(CdcProtocolError):
 
 
 class OpenTransactionRecords:
-    """Count only data records still held by currently open transactions."""
+    # Docstring: Count only data records still held by currently open transactions.
 
     def __init__(self) -> None:
         self._sequences: dict[int, list[int]] = {}
@@ -114,7 +114,9 @@ def validate_snapshot_arity(after: Sequence[Any] | None, primary_keys: Sequence[
         raise CdcProtocolError("Snapshot primary-key offset has the wrong arity")
 
 
-@dataclass(frozen=True)
+# No generated __repr__ or __eq__: nothing prints descriptors or compares them by
+# value, and the merged deployment pickles every generated method.
+@dataclass(frozen=True, eq=False, repr=False)
 class ColumnDescriptor:
     name: str
     type_name: str
@@ -125,7 +127,7 @@ class ColumnDescriptor:
 
 
 class CdcFrameParser:
-    """Incremental bounded parser preserving partial frames between reads."""
+    # Docstring: Incremental bounded parser preserving partial frames between reads.
 
     def __init__(self, max_frame_bytes: int = 16 * 1024 * 1024) -> None:
         if max_frame_bytes < FIXED_HEADER:
@@ -213,13 +215,12 @@ def decode_frame(
 
 
 def frame_log_file(frame: bytes) -> int | None:
-    """Return the logical log file a data frame's LSN names, when discoverable.
-
-    Only operation frames carry an LSN, and a frame that failed to decode may be
-    malformed in other ways, so this reports ``None`` rather than raising when the
-    position cannot be read. Callers use it to attribute an undecodable record to
-    the log file it came from.
-    """
+    # Docstring: Return the logical log file a data frame's LSN names, when discoverable.
+    #
+    # Only operation frames carry an LSN, and a frame that failed to decode may be
+    # malformed in other ways, so this reports ``None`` rather than raising when the
+    # position cannot be read. Callers use it to attribute an undecodable record to
+    # the log file it came from.
 
     if len(frame) < FIXED_HEADER:
         return None
@@ -256,19 +257,18 @@ def decode_row(
 
 
 def apply_null_byte(value: Any, mode: str) -> Any:
-    """Sanitize a decoded string that contains an embedded NUL (``\\x00``).
-
-    ``mode`` selects the behaviour (shared by the CDC and snapshot decode paths):
-
-    - ``"keep"`` -- return the value unchanged; a NUL passes straight through.
-    - ``"null"`` -- a string containing any NUL becomes ``None``. A NUL is genuine
-      content here (the decoders already trim real padding), so it cannot be
-      represented as a clean string; ``None`` says so honestly and is detectable
-      downstream rather than silently altering the value.
-    - ``"empty"`` -- strip the NUL characters, preserving the rest of the string.
-
-    Non-string values, and NUL-free strings, are returned unchanged regardless of mode.
-    """
+    # Docstring: Sanitize a decoded string that contains an embedded NUL (``\\x00``).
+    #
+    # ``mode`` selects the behaviour (shared by the CDC and snapshot decode paths):
+    #
+    # - ``"keep"`` -- return the value unchanged; a NUL passes straight through.
+    # - ``"null"`` -- a string containing any NUL becomes ``None``. A NUL is genuine
+    #   content here (the decoders already trim real padding), so it cannot be
+    #   represented as a clean string; ``None`` says so honestly and is detectable
+    #   downstream rather than silently altering the value.
+    # - ``"empty"`` -- strip the NUL characters, preserving the rest of the string.
+    #
+    # Non-string values, and NUL-free strings, are returned unchanged regardless of mode.
 
     if mode == "keep" or not isinstance(value, str) or "\x00" not in value:
         return value
