@@ -607,10 +607,11 @@ included), nullability changes, non-nullable additions, unsupported types, prima
 changes, and dropping a `NOT NULL` or key column. Changing `include_columns`,
 `exclude_columns`, or `row_filter` on a running table also needs one.
 
-Appended columns have been validated against a live Informix server. Longer strings,
-`SMALLINT` to `INTEGER`, and dropped columns rely on Informix returning older log
-records in the current layout in the same way, so validate them against your server
-version before relying on them.
+All four have been validated against a live Informix server: after the change,
+Informix returns log records written before it in the current layout. Values logged
+under the old layout arrive with the column at its new width, a `SMALLINT` as an
+`INTEGER`, and a dropped column left out, so the connector decodes old and new records
+alike.
 
 A table keyed with `primary.keys: "*"` is the one exception to an unchanged key: its
 key is every column, so an appended column joins it. The key may grow that way without

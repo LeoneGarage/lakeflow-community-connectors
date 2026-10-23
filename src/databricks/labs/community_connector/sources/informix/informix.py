@@ -11648,7 +11648,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # checkpoint safely spans the DDL: records written before the ALTER
             # contain NULL for the appended field, while records written after
             # it contain the logged value.  Live Informix 15 validation covers
-            # both transactions in one replay session.
+            # both transactions in one replay session.  The same holds for the
+            # other changes _ensure_compatible_schema_change accepts: live
+            # Informix 14.10 returned records logged before a CHAR/VARCHAR
+            # widening, a SMALLINT -> INTEGER change, and a column drop in the
+            # current layout (the CHAR at its new width, the SMALLINT as INTEGER,
+            # the dropped column absent), so they decode with the new descriptor.
             #
             # Previously this method captured with the predecessor descriptor
             # only up to a restart-time ``current_lsn`` and then advanced the
