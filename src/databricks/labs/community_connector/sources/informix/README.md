@@ -4,6 +4,45 @@ This connector discovers Informix user tables, takes an initial snapshot, and th
 
 The pure-Python protocol implementation has completed authentication, query, discovery, snapshot, and end-to-end transactional INSERT/UPDATE/DELETE CDC validation against a disposable Informix 15 fixture. It has also completed a serverless Lakeflow Connect pipeline run over TLS, including multi-table discovery, snapshots, checkpointed CDC flow execution, deletes, and SCD Type 2 materialization. Validate it against your Informix version, topology, security policy, and workload before broader use.
 
+## Contents
+
+- [Prerequisites](#prerequisites)
+- [Setup](#setup)
+  - [Connection parameters](#connection-parameters)
+  - [Create a connection with the Databricks CLI](#create-a-connection-with-the-databricks-cli)
+  - [Update a connection with the Databricks CLI](#update-a-connection-with-the-databricks-cli)
+  - [Create a connection with the Python API](#create-a-connection-with-the-python-api)
+  - [Authentication, redirects, and TLS](#authentication-redirects-and-tls)
+- [Supported objects and naming](#supported-objects-and-naming)
+  - [CDC type support](#cdc-type-support)
+  - [Variable-scale decimals](#variable-scale-decimals)
+- [Snapshot, CDC, and deletes](#snapshot-cdc-and-deletes)
+  - [Snapshot isolation](#snapshot-isolation)
+  - [Checkpoints and log retention](#checkpoints-and-log-retention)
+  - [Additive schema evolution without full refresh](#additive-schema-evolution-without-full-refresh)
+- [Keyless tables](#keyless-tables)
+  - [Which tables count as keyless](#which-tables-count-as-keyless)
+  - [Choosing an approach](#choosing-an-approach)
+  - [The default change log](#the-default-change-log)
+  - [Keyed on a set of columns](#keyed-on-a-set-of-columns)
+  - [Keyed on the whole row](#keyed-on-the-whole-row)
+  - [Soft deletes](#soft-deletes)
+  - [A change log with a key](#a-change-log-with-a-key)
+  - [Snapshot-only ingestion](#snapshot-only-ingestion)
+  - [Loading existing rows](#loading-existing-rows)
+  - [Limits](#limits)
+  - [Option reference](#option-reference)
+- [Table configuration](#table-configuration)
+  - [Snapshot modes](#snapshot-modes)
+    - [Migrating a table without a re-snapshot](#migrating-a-table-without-a-re-snapshot)
+    - [Incremental snapshot and append-only targets](#incremental-snapshot-and-append-only-targets)
+    - [File-sourced initial snapshot](#file-sourced-initial-snapshot)
+    - [Reference recipe: extracting `.unl` files and their manifest](#reference-recipe-extracting-unl-files-and-their-manifest)
+  - [SCD Type 2 sequencing and validity columns](#scd-type-2-sequencing-and-validity-columns)
+  - [Lakebase-backed shared state](#lakebase-backed-shared-state)
+- [Operational guidance](#operational-guidance)
+- [References](#references)
+
 ## Prerequisites
 
 - An Informix SQLI endpoint reachable from serverless Lakeflow Connect compute. Configure firewalls, private connectivity, and DNS as appropriate. Protocol redirects are disabled by default and require the explicit controls described below.
