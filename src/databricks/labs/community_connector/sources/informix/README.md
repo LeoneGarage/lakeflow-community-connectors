@@ -731,14 +731,44 @@ deletes through a separate delete flow.
 
 ### Keyed on the whole row
 
-`primary.keys: "*"` makes every column, in table order, the key. It suits
-junction and lookup tables whose rows are unique only as a whole.
+`primary.keys: "*"` makes every column, in table order, the key. It gets a
+keyless table merged into current state, with inserts, updates and deletes all
+applied, when no set of columns can be vouched unique. Without a key the table
+lands as a change log in which an update records only its new values, so once
+rows are updated, current state can't be rebuilt from it.
+
+When rows are unique as a whole, the full row is an exact identity. Full-row
+logging supplies the values of every deleted row and the before-image of every
+update, so each change maps onto the target exactly:
 
 | Source operation | Effect on the target |
 |---|---|
 | `INSERT` | Row inserted |
 | `UPDATE` | Old row removed, new row inserted |
 | `DELETE` | Row removed |
+
+It fits tables where the row itself is the identity:
+
+- junction tables linking two others, such as `user_roles(user_id, role_id)`
+  declared without a primary key;
+- lookup or reference tables that were never given a key;
+- tag and membership tables, where a row is a fact that is either present or not.
+
+Forced to append, it instead gives a change log that records both sides of every
+update, so current state can be rebuilt from history; see
+[A change log with a key](#a-change-log-with-a-key). Under `SCD_TYPE_2`, deleted
+rows are kept with their validity closed; see [Soft deletes](#soft-deletes).
+
+Use something else when:
+
+- **the table has a natural key.** An explicit `primary.keys` list keeps a row's
+  identity across updates, which a whole-row key can't, because every update
+  becomes a different key. Under `SCD_TYPE_2` that loses the history of a single
+  row.
+- **the table holds exact duplicate rows.** They collapse to one, as described
+  below.
+- **rows are heavily updated or very wide.** Every update becomes a delete plus
+  an insert, which is more merge work than an in-place update.
 
 - Exact duplicate rows collapse to one row in the target, and deleting one copy
   at the source removes that row.
