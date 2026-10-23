@@ -749,9 +749,10 @@ connection:
         whole. Nullable columns join the wildcard key too, so the NULL behaviour
         above applies to every nullable column; on an append-only table with
         snapshot.mode=cdc_only, its default, NULLs are harmless. The wildcard
-        follows the schema:
-        an added column joins the key, which a running flow treats like any key
-        change, so it stops and asks for a full refresh.
+        follows the schema: an appended column joins the key. For a table already
+        streaming changes, a nullable column added without a default extends the
+        key without a full refresh; a column added with a default, or while an
+        incremental copy is still running, needs a full refresh.
 
     - name: snapshot.max.bytes
       type: string

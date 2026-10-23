@@ -6916,6 +6916,8 @@ def register_lakeflow_source(spark):
 
         def key_index_directions(self, identity: str, columns: Sequence[str]) -> list[bool] | None: ...
 
+        def column_defaults(self, identity: str, columns: Sequence[str]) -> list[str]: ...
+
         def current_lsn(self) -> int: ...
 
         def minimum_lsn(self) -> int: ...
@@ -8086,6 +8088,37 @@ def register_lakeflow_source(spark):
             }
 
         @_serialized_sqli_operation
+        def column_defaults(self, identity, columns):
+            """Return which of ``columns`` have a non-NULL default in the catalog.
+
+            ``sysdefaults`` holds one row per column with an explicit default; type ``N`` is
+            ``DEFAULT NULL``, which leaves existing rows NULL like no default at all, so it is
+            not reported.
+            """
+
+            self._ensure_connected()
+            database, owner, name = _split_identity(identity)
+            for identifier in (database, owner, name, *columns):
+                if not _IDENTIFIER.fullmatch(identifier):
+                    raise InformixError(f"Unsafe column-default identifier {identifier!r}")
+            rows = self.transport.execute(
+                "SELECT c.colname, d.type FROM systables t "
+                "JOIN syscolumns c ON t.tabid = c.tabid "
+                "JOIN sysdefaults d ON d.tabid = c.tabid AND d.colno = c.colno "
+                "WHERE t.tabtype = 'T' AND t.owner = ? AND t.tabname = ?",
+                (owner, name),
+                max_result_bytes=(int(self.options.get("metadata.max.bytes", str(64 << 20))) or None),
+            )
+            wanted = set(columns)
+            return sorted(
+                {
+                    str(_field(row, "colname", 0)).strip()
+                    for row in rows
+                    if str(_field(row, "colname", 0)).strip() in wanted
+                    and str(_field(row, "type", 1)).strip().upper() != "N"
+                }
+            )
+
         def key_index_directions(self, identity, columns):
             """Return the per-column DESC flags of an index whose key columns exactly
             match ``columns`` in order, or ``None`` if no index matches.
@@ -9285,9 +9318,14 @@ def register_lakeflow_source(spark):
     # ``primary.keys: "*"`` keys a table on every column, in catalog column order, so the whole
     # row is its identity. Meant for a keyless table whose rows are unique as a whole, such as
     # a junction or lookup table. It is shorthand for listing every column, except that the key
-    # follows the schema: an added column joins the key, which a running flow treats like any
-    # key change. The schema-transition check fails it closed and asks for a full refresh,
-    # rather than streaming on under a key that no longer covers the whole row.
+    # follows the schema: an added column joins the key. For a table already streaming changes,
+    # the schema-transition check accepts exactly that growth -- the old key followed by the
+    # appended nullable columns -- so no full refresh is needed. Rows written before the ALTER
+    # hold NULL in the new column at the source, and the target gives them NULL when it gains
+    # the column, so their updates and deletes still match by the longer key. The check fails
+    # closed instead when an added column has a default (existing rows would carry it at the
+    # source but NULL in the target) or while an incremental copy is still in progress (its
+    # stored chunk position is laid out by the old key).
     #
     # Nullable columns join the key like any other. On the keyed CDC path a delete carries a
     # NULL key value through, and the pipeline's AUTO CDC delete flow matches it (see
@@ -9839,7 +9877,8 @@ def register_lakeflow_source(spark):
         key_override: bool = False
         # True when that override is the ``primary.keys: "*"`` wildcard. A schema refresh then
         # re-expands the key to the refreshed columns instead of preserving the old list, so an
-        # added column changes the key and the flow fails closed. Not fingerprinted either.
+        # added column joins the key; the schema transition accepts that growth (see
+        # _PRIMARY_KEYS_WILDCARD). Not fingerprinted either.
         key_wildcard: bool = False
         # Per-column key index direction, parallel to primary_keys: True == DESC.
         # Empty means all-ascending (the common case) -- paging then uses the default
@@ -16640,6 +16679,10 @@ def register_lakeflow_source(spark):
                     checkpoint_schema_id,
                     int(checkpoint["commit_lsn"]),
                     owner=not deletes,
+                    # An incremental copy still in progress keeps its chunk position in the
+                    # offset, laid out by the old key, so a wildcard key may only grow once
+                    # the copy has finished and dropped that block.
+                    allow_key_extension=not isinstance(checkpoint.get("incremental"), dict),
                 )
                 # Informix capture registration is a projection, not a raw decoder
                 # tied to the catalog layout at ``start_lsn``.  For an appended
@@ -17029,7 +17072,10 @@ def register_lakeflow_source(spark):
             checkpoint_lsn: int,
             *,
             owner: bool,
+            allow_key_extension: bool = False,
         ) -> tuple[Table, Table, int, str]:
+            # A wildcard key may grow by the appended columns (see _PRIMARY_KEYS_WILDCARD).
+            extend_key = allow_key_extension and table.key_wildcard
             namespace = self._immutable_namespace(table, "schemas", checkpoint_schema_id)
             deadline = time.monotonic() + int(
                 self.options.get("cdc.shared.state.wait.seconds", str(_SHARED_STATE_WAIT_SECONDS))
@@ -17053,9 +17099,13 @@ def register_lakeflow_source(spark):
                         f"Immutable schema node identity mismatch for '{table.exposed_name}'"
                     )
                 previous_table = _table_from_schema_state(previous, table.database)
-                _ensure_additive_schema_change(previous_table, table)
+                _ensure_additive_schema_change(previous_table, table, extend_wildcard_key=extend_key)
                 transition_record = self._read_immutable_head(namespace)
                 if transition_record is None and owner:
+                    if previous_table.primary_keys != table.primary_keys:
+                        # The key grew: only safe when existing rows really hold NULL in the
+                        # new columns at the source, as they will in the target.
+                        self._ensure_added_key_columns_have_no_default(previous_table, table)
                     transition = self._bridge.current_lsn()
                     if transition < checkpoint_lsn:
                         raise InformixError(
@@ -17101,9 +17151,13 @@ def register_lakeflow_source(spark):
                         raise InformixError(
                             f"Invalid immutable schema identity for '{table.exposed_name}'"
                         )
-                    _ensure_additive_schema_change(previous_table, target_table)
+                    _ensure_additive_schema_change(
+                        previous_table, target_table, extend_wildcard_key=extend_key
+                    )
                     if _schema_fingerprint(target_table) != _schema_fingerprint(table):
-                        _ensure_additive_schema_change(target_table, table)
+                        _ensure_additive_schema_change(
+                            target_table, table, extend_wildcard_key=extend_key
+                        )
                     schema_winner = self._publish_immutable_head(
                         self._immutable_namespace(table, "schema-nodes", str(current["id"])),
                         transition_record,
@@ -17139,6 +17193,30 @@ def register_lakeflow_source(spark):
                     )
                 delay = _sleep_with_backoff(deadline, delay)
 
+        def _ensure_added_key_columns_have_no_default(self, previous: Table, current: Table) -> None:
+            """Fail closed when a column joining a wildcard key was added with a default.
+
+            Existing rows would carry the default in their before-images at the source while
+            the target holds NULL for them, so their updates and deletes would never match.
+            """
+
+            added = [column.name for column in current.columns[len(previous.columns) :]]
+            lookup = getattr(self._bridge, "column_defaults", None)
+            if not callable(lookup):
+                raise InformixError(
+                    f"Cannot check the columns added to '{current.exposed_name}' for defaults, so "
+                    f"its {_PRIMARY_KEYS_OPTION}='{_PRIMARY_KEYS_WILDCARD}' key cannot grow to "
+                    "include them; run a full refresh"
+                )
+            with_default = lookup(current.identity, added)
+            if with_default:
+                raise InformixError(
+                    f"Column(s) {', '.join(with_default)} were added to '{current.exposed_name}' "
+                    f"with a default and join its {_PRIMARY_KEYS_OPTION}='{_PRIMARY_KEYS_WILDCARD}' "
+                    "key. Existing rows carry that default at the source but NULL in the target, "
+                    "so their updates and deletes would not match; run a full refresh"
+                )
+
         def _refresh_table_schema(self, table: Table, expected_fingerprint: str | None) -> Table:
             refreshed = Table.parse(self._bridge.get_table(table.identity), table.database)
             if table.key_override:
@@ -17148,8 +17226,8 @@ def register_lakeflow_source(spark):
                 # on a normal table is still detected as drift. The override's adopted
                 # key-index directions are preserved too, so a mixed-direction override
                 # keeps paging in its index order across the refresh. A wildcard key is
-                # every column, so it is re-expanded instead: an added column changes the
-                # key and the schema-transition check fails the flow closed.
+                # every column, so it is re-expanded instead: an added column joins the key,
+                # which the schema transition accepts for a streaming table.
                 refreshed = _carry_key_override(refreshed, table)
             elif table.key_from_nullable_index:
                 # Preserve a nullable-index promotion across the refresh: the catalog
@@ -19774,19 +19852,33 @@ def register_lakeflow_source(spark):
         )
 
 
-    def _ensure_additive_schema_change(previous: Table, current: Table) -> None:
-        if (
+    def _ensure_additive_schema_change(
+        previous: Table, current: Table, *, extend_wildcard_key: bool = False
+    ) -> None:
+        """Fail closed unless ``current`` only appends nullable, CDC-supported columns.
+
+        The key must be unchanged, except that with ``extend_wildcard_key`` a whole-row key may
+        grow by exactly the appended columns: every previous column, in order, followed by
+        the additions.
+        """
+
+        keys_match = previous.primary_keys == current.primary_keys
+        if not keys_match and extend_wildcard_key:
+            additions = tuple(column.name for column in current.columns[len(previous.columns) :])
+            keys_match = bool(additions) and (
+                previous.primary_keys == tuple(column.name for column in previous.columns)
+                and current.primary_keys == previous.primary_keys + additions
+            )
+        if not keys_match or (
             previous.database,
             previous.owner,
             previous.name,
             previous.incarnation,
-            previous.primary_keys,
         ) != (
             current.database,
             current.owner,
             current.name,
             current.incarnation,
-            current.primary_keys,
         ):
             raise InformixError(
                 f"Informix schema change for '{current.exposed_name}' changed table identity or "

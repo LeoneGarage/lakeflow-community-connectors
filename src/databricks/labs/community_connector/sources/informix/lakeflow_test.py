@@ -207,6 +207,8 @@ class FakeBridge:
         # The key columns each consistent_snapshot call was asked to page by; () is the
         # unordered cursor scan a keyless table, or snapshot.scan=cursor, takes.
         self.snapshot_primary_keys = []
+        # Column names the fake catalog reports as having a non-NULL default.
+        self.column_default_names = set()
         self.prepared_identities = []
         self.validated_initial = []
         self.change_reads = []
@@ -224,6 +226,10 @@ class FakeBridge:
 
     def get_table(self, identity):
         return next(t for t in self.tables if identity.endswith(f".{t['owner']}.{t['name']}"))
+
+    def column_defaults(self, identity, columns):
+        del identity
+        return sorted(column for column in columns if column in self.column_default_names)
 
     def key_index_directions(self, identity, columns):
         # Directions of an index matching the override columns; configured per
@@ -3156,6 +3162,33 @@ class LakeflowContractTests(unittest.TestCase):
         )
         self.assertNotIn("ORDER BY", bridge.transport.sql[-2])
         self.assertEqual([page for _, _, page in consumed], [[{"id": 1}, {"id": 2}], [{"id": 3}]])
+
+    def test_column_defaults_reports_only_non_null_defaults(self):
+        # DEFAULT NULL (type N) leaves existing rows NULL, exactly like no default.
+        class CatalogTransport:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                del max_result_bytes
+                self.calls.append((sql, parameters))
+                return [
+                    {"colname": "added", "type": "L"},
+                    {"colname": "nulled", "type": "N"},
+                    {"colname": "unasked", "type": "C"},
+                ]
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {"database": "demo"}
+        bridge.config = {"database": "demo"}
+        bridge.transport = CatalogTransport()
+
+        found = bridge.column_defaults("demo.app.orders", ["added", "nulled"])
+
+        self.assertEqual(found, ["added"])
+        sql, parameters = bridge.transport.calls[-1]
+        self.assertIn("JOIN sysdefaults d ON d.tabid = c.tabid AND d.colno = c.colno", sql)
+        self.assertEqual(parameters, ("app", "orders"))
 
     def test_snapshot_stage_typed_values_round_trip(self):
         value = {
@@ -7284,11 +7317,18 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(refreshed.primary_keys, ("id", "value", "added"))
         self.assertTrue(refreshed.key_override and refreshed.key_wildcard)
 
-    def _read_after_adding_a_column(self, options, *, restart):
+    def _read_after_adding_a_column(self, options, *, restart, bridge=None):
         """Checkpoint app.orders, append a nullable column at the source, then read on
         from that checkpoint with the same connector or a restarted one."""
-        bridge = FakeBridge()
-        bridge.tables = [_table(primary_keys=())]
+        rows, checkpoint, end, _reader, _bridge = self._add_column_and_read(
+            options, restart=restart, bridge=bridge
+        )
+        return rows, checkpoint, end
+
+    def _add_column_and_read(self, options, *, restart, bridge=None):
+        bridge = bridge or FakeBridge()
+        if bridge.tables == FakeBridge().tables:
+            bridge.tables = [_table(primary_keys=())]
         connector = self.connector(bridge)
         _, checkpoint = connector.read_table("app.orders", {}, options)
         bridge.tables[0]["columns"].append(
@@ -7298,19 +7338,113 @@ class LakeflowContractTests(unittest.TestCase):
         bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
         reader = self.connector(bridge) if restart else connector
         rows, end = reader.read_table("app.orders", checkpoint, options)
-        return list(rows), checkpoint, end
+        return list(rows), checkpoint, end, reader, bridge
 
-    # A running flow cannot change its key in place, so a wildcard key that grows with
-    # the schema must stop the flow with a full-refresh error -- on the same connector
-    # and after a restart -- instead of streaming on under a key that misses the new
-    # column.
-    def test_an_added_column_fails_a_running_wildcard_keyed_flow_closed(self):
-        with self.assertRaisesRegex(InformixError, "primary keys; run a full refresh"):
-            self._read_after_adding_a_column(dict(self.WILDCARD), restart=False)
+    # A whole-row key grows by an appended nullable column without a full refresh: rows
+    # written before the ALTER hold NULL in it at the source and in the target, so their
+    # updates and deletes still match by the longer key.
+    def test_an_added_column_extends_a_running_wildcard_key(self):
+        rows, checkpoint, transitioned, reader, _ = self._add_column_and_read(
+            dict(self.WILDCARD), restart=False
+        )
 
-    def test_an_added_column_fails_a_restarted_wildcard_keyed_flow_closed(self):
+        self.assertEqual(rows, [])
+        self.assertNotEqual(transitioned["schema_fingerprint"], checkpoint["schema_fingerprint"])
+        metadata = reader.read_table_metadata("app.orders", dict(self.WILDCARD))
+        self.assertEqual(metadata["primary_keys"], ["id", "value", "added"])
+
+    def test_an_added_column_extends_a_restarted_wildcard_key_for_later_changes(self):
+        options = dict(self.WILDCARD)
+        _, _, transitioned, reader, bridge = self._add_column_and_read(options, restart=True)
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 121},
+            # A row written before the ALTER: NULL in the new column on both sides.
+            {"op": "DELETE", "tx_id": 7, "lsn": 122, "row": {"id": 1, "value": "a", "added": None}},
+            # Setting the new column changes the key: the old row goes, the new one lands.
+            {
+                "op": "BEFORE_UPDATE",
+                "tx_id": 7,
+                "lsn": 123,
+                "row": {"id": 2, "value": "b", "added": None},
+            },
+            {
+                "op": "AFTER_UPDATE",
+                "tx_id": 7,
+                "lsn": 124,
+                "row": {"id": 2, "value": "b", "added": 5},
+            },
+            {"op": "COMMIT", "tx_id": 7, "lsn": 125},
+        ]
+
+        upserts, _ = reader.read_table("app.orders", transitioned, options)
+        deletes, _ = reader.read_table_deletes("app.orders", transitioned, options)
+
+        self.assertEqual(
+            [(row["id"], row["value"], row["added"], row["_informix_op"]) for row in upserts],
+            [(2, "b", 5, "u")],
+        )
+        self.assertEqual(
+            [(row["id"], row["value"], row["added"], row["_informix_op"]) for row in deletes],
+            [(1, "a", None, "d"), (2, "b", None, "d")],
+        )
+
+    def test_a_column_added_with_a_default_still_needs_a_full_refresh(self):
+        # Existing rows would carry the default at the source but NULL in the target.
+        bridge = FakeBridge()
+        bridge.tables = [_table(primary_keys=())]
+        bridge.column_default_names = {"added"}
+
+        with self.assertRaisesRegex(InformixError, "with a default.*run a full refresh"):
+            self._read_after_adding_a_column(dict(self.WILDCARD), restart=True, bridge=bridge)
+
+    def test_a_wildcard_key_does_not_grow_during_an_incremental_copy(self):
+        # The copy's stored chunk position is laid out by the old key.
+        options = {**self.WILDCARD, "snapshot.mode": "incremental", "snapshot.page.size": "1"}
+        bridge = FakeBridge()
+        bridge.tables = [_table(primary_keys=())]
+        connector = self.connector(bridge)
+        _, checkpoint = connector.read_table("app.orders", {}, options)
+        self.assertIn("incremental", checkpoint, "the copy must still be in progress")
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+
         with self.assertRaisesRegex(InformixError, "primary keys; run a full refresh"):
-            self._read_after_adding_a_column(dict(self.WILDCARD), restart=True)
+            rows, _ = self.connector(bridge).read_table("app.orders", checkpoint, options)
+            list(rows)
+
+    def test_a_wildcard_key_may_grow_only_by_exactly_the_appended_columns(self):
+        def table(columns, keys):
+            raw = _table(primary_keys=keys)
+            raw["columns"] = [
+                {"name": name, "type_name": "INTEGER", "nullable": name != "id"} for name in columns
+            ]
+            return informix_module.Table.parse(raw, "demo")
+
+        previous = table(("id", "value"), ("id", "value"))
+        grown = table(("id", "value", "added"), ("id", "value", "added"))
+        ensure = informix_module._ensure_additive_schema_change
+
+        ensure(previous, grown, extend_wildcard_key=True)
+        with self.assertRaisesRegex(InformixError, "primary keys"):
+            ensure(previous, grown)  # growth needs the wildcard
+        for current in (
+            table(("id", "value", "added"), ("id", "added", "value")),  # reordered
+            table(("id", "value", "added"), ("id", "value")),  # unchanged is not growth
+            table(("id", "value", "added", "more"), ("id", "value", "added")),  # partial
+        ):
+            with self.subTest(keys=current.primary_keys, columns=len(current.columns)):
+                if current.primary_keys == previous.primary_keys:
+                    continue  # an unchanged key is an ordinary additive change
+                with self.assertRaisesRegex(InformixError, "primary keys"):
+                    ensure(previous, current, extend_wildcard_key=True)
+        explicit = table(("id", "value"), ("id",))
+        with self.assertRaisesRegex(InformixError, "primary keys"):
+            ensure(
+                explicit, table(("id", "value", "added"), ("id", "added")), extend_wildcard_key=True
+            )
 
     def test_an_added_column_transitions_an_explicitly_keyed_flow(self):
         # The contrast: an explicit key list is not tied to the column set.
