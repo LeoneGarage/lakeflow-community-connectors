@@ -403,7 +403,7 @@ Include filtering runs before exclusion filtering. Identifiers are limited to a 
 A table is captured via CDC when **every column has a supported CDC encoding**. A primary key is *not* required to read changes — it is required only to *merge* them into a keyed destination:
 
 - **With a primary key** → keyed CDC with deletes (`cdc_with_deletes`): inserts, updates, and deletes are applied to the destination by key.
-- **Without a primary key** → an append-only CDC stream (`ingestion_type="append"`, cursor `_informix_change_lsn`): changes are still read from the logical log, but with no key to identify a row they are appended rather than merged (no delete application; a delete appends a `d` tombstone row carrying the full before-image, see `append.delete.tombstones`).
+- **Without a primary key** → an append-only CDC stream (`ingestion_type="append"`, cursor `_informix_change_lsn`): changes are still read from the logical log, but with no key to identify a row they are appended rather than merged (no delete application; a delete appends a `d` tombstone row carrying the full before-image, see `append.delete.tombstones`). See [Keyless tables](#keyless-tables) for the ways to manage upserts and deletes on such a table.
 
 A table that has **any** column without a CDC encoding is not captured via CDC: it falls back to a snapshot-only read, or is rejected outright if the type cannot be represented at all (see the type table below).
 
@@ -608,6 +608,200 @@ history. Committed schema generations are retained because automatically
 deleting one could break a paused pipeline, so schema history grows with the
 number of additive steps a connection has taken. If a required historical schema
 node is removed, the affected pipeline fails closed and requires a full refresh.
+
+## Keyless tables
+
+A table without a primary key is still captured from the logical log; the
+connector just has no column to merge a change on. By default such a table lands
+as an append-only change log, one row per change, with `_informix_op` saying what
+happened. To get merged current state instead, give the table a key, either a set
+of columns that is unique per row or the whole row.
+
+In a change log, `_informix_op = 'd'` marks a deleted row, and ordering by
+`_informix_change_lsn` gives the order changes happened in. A merged target needs
+no filter: it holds current state.
+
+### Which tables count as keyless
+
+A table is keyed when any of these supplies a key, highest precedence first:
+
+1. the `primary.keys` table option;
+2. a `UNIQUE` index with nullable columns, when the table sets `allow.nullable.index: "true"`;
+3. the catalog primary key, or a `UNIQUE` index whose columns are all `NOT NULL`
+   (`primary.key.from.unique.index`, on by default).
+
+A table with none of these is keyless. A table with any column Informix cannot
+capture is snapshot-only, whatever its key.
+
+### Choosing an approach
+
+| Goal | Table configuration | The target holds | Watch out for |
+|---|---|---|---|
+| A change log (the default) | none | One row per change | Updates carry only new values, so current state can't be rebuilt |
+| Current state, unique columns | `primary.keys: "col_a,col_b"`, or a `UNIQUE` index | Merged rows | The key must be unique per row |
+| Current state, whole row | `primary.keys: "*"` and `snapshot.scan: cursor` | Merged rows | Duplicate rows collapse; a column added with a default needs a full refresh |
+| Current state with soft deletes | a key, as above, and `scd_type: SCD_TYPE_2` | Every version; deleted ones closed, not removed | Old versions accumulate |
+| A change log you can rebuild state from | `primary.keys: "*"`, `append.only.ingestion: "true"` and `scd_type: APPEND_ONLY` | One row per change; each update as `d` then `u` | Readers need the current-state query below |
+| A small table re-read each run | `append.only.ingestion: "false"`, and `primary_keys` in the pipeline spec | The whole table, merged by those keys | Each run re-reads every row, capped by `snapshot.max.rows` |
+
+### The default change log
+
+| Source operation | Lands as |
+|---|---|
+| Existing row, copied when `snapshot.mode: initial` | `r` with the row |
+| `INSERT` | `c` with the new row |
+| `UPDATE` | `u` with the new values only |
+| `DELETE` | `d` with the deleted row's values |
+| `TRUNCATE` | Stops the flow; a full refresh recovers |
+
+- Every row also carries `_informix_change_lsn`, `_informix_commit_lsn`,
+  `_informix_tx_id` and `_informix_commit_time`.
+- Set `append.delete.tombstones: "false"` to drop deletes instead of recording
+  them, for example on an archive table whose retention purges you don't want in
+  the log.
+- An update records only its new values, so the log can't say which earlier row
+  it replaced. For a table whose rows get updated, you can't rebuild current state
+  from this log; use one of the keyed approaches instead.
+- The flow starts at the current log position and copies no existing rows. Set
+  `snapshot.mode: initial` on the table to copy them first. Any other mode is
+  rejected for a change-log table, so if you set `snapshot.mode` at connection
+  scope, set it per table here as well.
+
+### Keyed on a set of columns
+
+Name the columns with `primary.keys`, or rely on a `UNIQUE` index. The table then
+behaves like any keyed table: the pipeline merges upserts by key and applies
+deletes through a separate delete flow.
+
+| Source operation | Effect on the target |
+|---|---|
+| `INSERT` | Row inserted |
+| `UPDATE` | Row updated in place |
+| `UPDATE` that changes the key | Old key removed, new key inserted |
+| `DELETE` | Row removed |
+
+- The key must be unique per row; a non-unique key silently merges distinct rows.
+- Choose the key before the first ingest. Changing it later needs a full refresh.
+  Adding a nullable column does not.
+- A key column declared nullable may hold NULL, and updates and deletes of such
+  rows still apply. A NULL key value can make a key-ordered snapshot skip rows or
+  fail, so set `snapshot.scan: cursor` for those tables.
+- The default snapshot copies the table in key-ordered chunks, which is cheap
+  with an index on the key columns. Without one, set `snapshot.scan: cursor`.
+
+### Keyed on the whole row
+
+`primary.keys: "*"` makes every column, in table order, the key. It suits
+junction and lookup tables whose rows are unique only as a whole.
+
+| Source operation | Effect on the target |
+|---|---|
+| `INSERT` | Row inserted |
+| `UPDATE` | Old row removed, new row inserted |
+| `DELETE` | Row removed |
+
+- Exact duplicate rows collapse to one row in the target, and deleting one copy
+  at the source removes that row.
+- A column appended to the table joins the key. If it's nullable and has no
+  default, and the table is already streaming changes, no full refresh is needed.
+  Rows from before the change hold NULL in the new column on both sides, so their
+  later updates and deletes still match. A column added with a default, or added
+  while an incremental copy is still running, needs a full refresh. See
+  [Additive schema evolution without full refresh](#additive-schema-evolution-without-full-refresh).
+- Paging a snapshot by every column sorts the table once per page, so set
+  `snapshot.scan: cursor`.
+
+### Soft deletes
+
+With `scd_type: SCD_TYPE_2` on a keyed table, a delete closes the row's current
+version instead of removing it: the row stays, with `__END_AT` set. Current rows
+are those where `__END_AT` is NULL. Under a whole-row key every update closes the
+old row and opens a new one, so each version appears as a separate key rather
+than as the history of one row.
+
+### A change log with a key
+
+`append.only.ingestion: "true"` keeps a keyed table on the change-log path. The
+key then only detects key changes.
+
+| Source operation | Lands as |
+|---|---|
+| `INSERT` | `c` with the new row |
+| `UPDATE` that keeps the key | `u` with the new values |
+| `UPDATE` that changes the key | `d` with the old row, then `u` with the new one |
+| `DELETE` | `d` with the deleted row's values |
+
+Under a whole-row key every update changes the key, so the log records both sides
+of every change. Current state is then every distinct row whose latest event is
+not a delete:
+
+```sql
+SELECT * FROM main.informix.orders_log
+QUALIFY row_number() OVER (
+  PARTITION BY col_a, col_b, col_c          -- every source column
+  ORDER BY _informix_change_lsn DESC
+) = 1 AND _informix_op <> 'd'
+```
+
+This query doesn't work on the default keyless log, where an update doesn't mark
+the old row as removed.
+
+Setting only `scd_type: APPEND_ONLY` on a keyed table is not the same. The target
+becomes an append table, but the connector stays on the keyed path, so deletes
+are silently dropped. Set `append.only.ingestion: "true"`.
+
+As with the default change log, only `snapshot.mode: initial` and `cdc_only` are
+allowed. An `initial` snapshot pages by key unless you set `snapshot.scan: cursor`.
+
+### Snapshot-only ingestion
+
+`append.only.ingestion: "false"` on a keyless table skips change capture. Each
+pipeline update reads the whole table in one query, held in one executor task,
+and the pipeline compares it with the previous copy. That comparison runs by the
+`primary_keys` set in the pipeline spec, so set them. The read fails if the table
+holds more than `snapshot.max.rows` rows; for this path an unset value means
+100,000. It suits small reference tables only.
+
+### Loading existing rows
+
+| Approach | Snapshot modes | Default |
+|---|---|---|
+| Change log, with or without a key | `initial`, `cdc_only` | `cdc_only`, no existing rows |
+| Keyed, on columns or the whole row | any | `incremental` |
+| Snapshot-only | not applicable | the whole table, every run |
+
+To load existing rows from Informix `UNLOAD` files instead of a live scan, set
+`snapshot.source` and `snapshot.mode: initial`, and supply the extract's log
+position in a `_manifest.json` or `snapshot.boundary.lsn`. See
+[File-sourced initial snapshot](#file-sourced-initial-snapshot).
+
+### Limits
+
+- `TRUNCATE` stops the flow on every path; a full refresh recovers.
+- Exact duplicate rows can't be told apart once the table is keyed; they collapse
+  to one row.
+- A NULL in a `NOT NULL` key column fails the read as a broken log record.
+- Changing a key needs a full refresh. The exception is a whole-row key growing
+  by a nullable column added without a default, once the table is streaming.
+- Changing the files under a running file snapshot fails the read with a
+  full-refresh error.
+- A table with a column Informix can't capture is always snapshot-only.
+
+### Option reference
+
+| Option | Default | Effect |
+|---|---|---|
+| `append.only.ingestion` | `auto` | `auto` appends keyless tables; `true` appends keyed ones too; `false` makes a keyless table snapshot-only |
+| `append.delete.tombstones` | `true` | Records deletes on a change log as `d` rows |
+| `primary.keys` | catalog key | An explicit key, or `"*"` for the whole row |
+| `primary.key.from.unique.index` | `true` | Promotes an all-`NOT NULL` `UNIQUE` index to the key |
+| `allow.nullable.index` | `false` | Also promotes a `UNIQUE` index with nullable columns |
+| `snapshot.mode` | `incremental`, or `cdc_only` for a change log | How existing rows are copied |
+| `snapshot.scan` | `keyset` | `cursor` reads a keyed table's snapshot without sorting |
+| `snapshot.max.rows` | `0` | Row cap; for snapshot-only tables `0` means 100,000 |
+| `snapshot.source` | none | Loads existing rows from `UNLOAD` files |
+
+Full definitions are in [Connection parameters](#connection-parameters).
 
 ## Table configuration
 
