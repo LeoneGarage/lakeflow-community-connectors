@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import errno
 import gzip
 import hashlib
@@ -6791,12 +6792,15 @@ class LakeflowContractTests(unittest.TestCase):
         bridge = FakeBridge()
         connector = self.connector(bridge)
         _, checkpoint = connector.read_table("app.orders", {}, {})
+        # The published successor adds an INTEGER column the live table has as VARCHAR:
+        # no widening reconciles the two. (A different added name would not conflict --
+        # dropping one nullable column and adding another is an evolution in itself.)
         conflicting_raw = json.loads(json.dumps(bridge.tables[0]))
         conflicting_raw["columns"].append(
-            {"name": "branch_a", "type_name": "INTEGER", "nullable": True}
+            {"name": "branch", "type_name": "INTEGER", "nullable": True}
         )
         bridge.tables[0]["columns"].append(
-            {"name": "branch_b", "type_name": "INTEGER", "nullable": True}
+            {"name": "branch", "type_name": "VARCHAR", "nullable": True, "length": 20}
         )
         bridge.now = 120
         current = Table.parse(bridge.tables[0], "demo")
@@ -6810,7 +6814,7 @@ class LakeflowContractTests(unittest.TestCase):
             record_type="schema-transition",
         )
 
-        with self.assertRaisesRegex(InformixError, "not an additive column change"):
+        with self.assertRaisesRegex(InformixError, "changed column branch other than by widening"):
             connector.read_table("app.orders", checkpoint, {})
 
     def test_schema_transition_uses_checkpoint_not_schema_node_observation_lsn(self):
@@ -6854,7 +6858,9 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(new_checkpoint["commit_lsn"], "150")
         self.assertEqual(bridge.prepared_identities, ["demo:app.orders"])
-        with self.assertRaisesRegex(InformixError, "not an additive.*full refresh"):
+        with self.assertRaisesRegex(
+            InformixError, "changed column value other than by widening.*full refresh"
+        ):
             self.connector(bridge).read_table("app.orders", old_checkpoint, {})
 
     def test_full_refresh_of_evolved_layout_reuses_its_schema_node(self):
@@ -6924,7 +6930,9 @@ class LakeflowContractTests(unittest.TestCase):
         _, checkpoint = connector.read_table("app.orders", {}, {})
         bridge.tables[0]["columns"][1]["type_name"] = "INTEGER"
 
-        with self.assertRaisesRegex(InformixError, "not an additive.*full refresh"):
+        with self.assertRaisesRegex(
+            InformixError, "changed column value other than by widening.*full refresh"
+        ):
             self.connector(bridge).read_table("app.orders", checkpoint, {})
 
     def test_stream_offset_rejects_previous_connector_format(self):
@@ -7450,7 +7458,7 @@ class LakeflowContractTests(unittest.TestCase):
 
         previous = table(("id", "value"), ("id", "value"))
         grown = table(("id", "value", "added"), ("id", "value", "added"))
-        ensure = informix_module._ensure_additive_schema_change
+        ensure = informix_module._ensure_compatible_schema_change
 
         ensure(previous, grown, extend_wildcard_key=True)
         with self.assertRaisesRegex(InformixError, "primary keys"):
@@ -14969,6 +14977,552 @@ class BoundaryLsnTests(unittest.TestCase):
             )
         self.assertEqual(chunk_lsn, conservative)
         self.assertEqual(snapshot_lsn, conservative)
+
+
+def _wide_table(primary_keys=("id",)):
+    raw = _table(primary_keys=primary_keys)
+    raw["columns"].append({"name": "extra", "type_name": "INTEGER", "nullable": True})
+    return raw
+
+
+def _project(row, columns):
+    return {name: row[name] for name in columns if name in row}
+
+
+class _ProjectingBridge(FakeBridge):
+    """A FakeBridge whose snapshots and CDC images carry only the requested columns, as
+    Informix's do, so a column selection shows in what the connector emits."""
+
+    def __init__(self):
+        super().__init__()
+        self.tables = [_wide_table()]
+        self.rows = [{"id": 1, "value": "a", "extra": 7}, {"id": 2, "value": "b", "extra": 8}]
+        self.snapshot_columns = []
+
+    def consistent_snapshot(self, identity, columns, *args, **kwargs):
+        self.snapshot_columns.append(tuple(columns))
+        consumer = kwargs.get("page_consumer")
+        if consumer is not None:
+            kwargs["page_consumer"] = lambda lsn, index, rows: consumer(
+                lsn, index, [_project(row, columns) for row in rows]
+            )
+        lsn, rows = super().consistent_snapshot(identity, columns, *args, **kwargs)
+        return lsn, [_project(row, columns) for row in rows]
+
+    def read_changes(self, tables, start_lsn, timeout_seconds, max_records):
+        records = super().read_changes(tables, start_lsn, timeout_seconds, max_records)
+        captured = tables[0]["columns"] if tables else []
+        return [
+            dict(record, row=_project(record["row"], captured))
+            if isinstance(record.get("row"), dict)
+            else record
+            for record in records
+        ]
+
+
+class _TableOptionTestCase(unittest.TestCase):
+    def setUp(self):
+        self._shared_state = tempfile.TemporaryDirectory()
+        self._lakebase = _OfflineLakebase().install(self)
+
+    def tearDown(self):
+        self._shared_state.cleanup()
+
+    def connector(self, bridge):
+        connector = InformixLakeflowConnect(
+            {
+                "database": "demo",
+                "snapshot.staging.location": self._shared_state.name,
+                "lakebase.password": "test-state-password",
+                "snapshot.mode": "initial",
+                "cdc.shared.session": "false",
+                "snapshot.shared.session": "false",
+                "stream.partitioned": "false",
+            }
+        )
+        connector.set_registration_scope(hashlib.sha256(b"test-pipeline").hexdigest()[:32])
+        connector._bridge_instance = bridge
+        return connector
+
+    def stream(self, bridge, options):
+        """Snapshot app.orders and return the connector with its stream checkpoint."""
+        connector = self.connector(bridge)
+        rows, checkpoint = connector.read_table("app.orders", {}, dict(options))
+        list(rows)
+        return connector, checkpoint
+
+    @staticmethod
+    def committed(*records, tx_id=7, lsn=121):
+        """``(op, row)`` records as one committed transaction, LSNs numbered from ``lsn``."""
+        out = [{"op": "BEGIN", "tx_id": tx_id, "lsn": lsn}]
+        for offset, (op, row) in enumerate(records, start=1):
+            out.append({"op": op, "tx_id": tx_id, "lsn": lsn + offset, "row": row})
+        out.append({"op": "COMMIT", "tx_id": tx_id, "lsn": lsn + len(records) + 1})
+        return out
+
+    def changes(self, connector, bridge, checkpoint, options, *records):
+        """Feed one transaction and return ``(upserts, deletes)`` as (id, op) pairs."""
+        bridge.now = 200
+        bridge.changes = self.committed(*records)
+        upserts, _ = connector.read_table("app.orders", checkpoint, dict(options))
+        deletes, _ = connector.read_table_deletes("app.orders", checkpoint, dict(options))
+        return (
+            [(row["id"], row["_informix_op"]) for row in upserts],
+            [(row["id"], row["_informix_op"]) for row in deletes],
+        )
+
+
+class ColumnSelectionTests(_TableOptionTestCase):
+    """include_columns / exclude_columns narrow what is read and landed: the reported
+    schema, the snapshot SELECT, and the CDC capture all see only the selected columns."""
+
+    INCLUDE = {"include_columns": "id,value"}
+
+    def test_include_columns_narrows_schema_snapshot_and_capture(self):
+        bridge = _ProjectingBridge()
+        connector, checkpoint = self.stream(bridge, self.INCLUDE)
+
+        schema = connector.get_table_schema("app.orders", dict(self.INCLUDE))
+        self.assertNotIn("extra", [field.name for field in schema.fields])
+        self.assertEqual(bridge.snapshot_columns, [("id", "value")])
+        bridge.now = 200
+        bridge.changes = self.committed(("INSERT", {"id": 3, "value": "c", "extra": 9}))
+        rows = list(connector.read_table("app.orders", checkpoint, dict(self.INCLUDE))[0])
+        self.assertEqual(bridge.change_reads[-1][0][0]["columns"], ["id", "value"])
+        self.assertEqual(
+            [(row["id"], row["value"], "extra" in row) for row in rows], [(3, "c", False)]
+        )
+
+    def test_exclude_columns_accepts_a_json_array_and_matches_include(self):
+        connector = self.connector(_ProjectingBridge())
+        excluded = connector.get_table_schema("app.orders", {"exclude_columns": '["extra"]'})
+        included = connector.get_table_schema("app.orders", dict(self.INCLUDE))
+        self.assertEqual(
+            [field.name for field in excluded.fields], [field.name for field in included.fields]
+        )
+
+    def test_excluding_an_uncapturable_column_makes_the_table_streamable(self):
+        bridge = FakeBridge()
+        bridge.tables = [_table(cdc=False)]
+        connector = self.connector(bridge)
+
+        self.assertEqual(
+            connector.read_table_metadata("app.orders", {})["ingestion_type"], "snapshot"
+        )
+        metadata = connector.read_table_metadata("app.orders", {"exclude_columns": "value"})
+        self.assertEqual(metadata["ingestion_type"], "cdc_with_deletes")
+
+    def test_the_key_must_stay_selected_unless_primary_keys_replaces_it(self):
+        connector = self.connector(_ProjectingBridge())
+        with self.assertRaisesRegex(InformixError, "Key column.*id.*must be selected"):
+            connector.read_table_metadata("app.orders", {"exclude_columns": "id"})
+        metadata = connector.read_table_metadata(
+            "app.orders", {"exclude_columns": "id", "primary.keys": "value"}
+        )
+        self.assertEqual(metadata["primary_keys"], ["value"])
+
+    def test_invalid_selections_fail(self):
+        connector = self.connector(_ProjectingBridge())
+        for options, message in (
+            ({"include_columns": "id,missing"}, "does not have: missing"),
+            ({"exclude_columns": "nope"}, "does not have: nope"),
+            ({"include_columns": "id", "exclude_columns": "extra"}, "not both"),
+            ({"include_columns": "id,id"}, "duplicate"),
+            ({"include_columns": " "}, "lists no columns"),
+            ({"exclude_columns": "id,value,extra"}, "no columns"),
+        ):
+            with self.subTest(options=options):
+                with self.assertRaisesRegex((InformixError, ValueError), message):
+                    connector.read_table_metadata("app.orders", options)
+
+    def test_a_wildcard_key_covers_only_the_selected_columns(self):
+        connector = self.connector(_ProjectingBridge())
+        metadata = connector.read_table_metadata(
+            "app.orders", {"exclude_columns": "extra", "primary.keys": "*"}
+        )
+        self.assertEqual(metadata["primary_keys"], ["id", "value"])
+
+    def test_changing_the_selection_on_a_running_stream_fails_closed(self):
+        bridge = _ProjectingBridge()
+        connector, checkpoint = self.stream(bridge, self.INCLUDE)
+        bridge.now = 200
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 200}]
+        widened = {"include_columns": "id,value,extra"}
+        with self.assertRaisesRegex(InformixError, "include_columns.*changed.*full refresh"):
+            connector.read_table("app.orders", checkpoint, widened)
+
+    def test_a_table_without_a_selection_keeps_its_fingerprint(self):
+        # The fingerprint every existing checkpoint was written with: no selection or
+        # row_filter part is appended when neither option is set.
+        table = Table.parse(_wide_table(), "demo")
+        legacy = repr(
+            (
+                table.database,
+                table.owner,
+                table.name,
+                table.incarnation,
+                table.primary_keys,
+                tuple(
+                    (
+                        c.name,
+                        c.type_name,
+                        c.nullable,
+                        c.length,
+                        c.precision,
+                        c.scale,
+                        c.cdc_supported,
+                    )
+                    for c in table.columns
+                ),
+            )
+        )
+        self.assertEqual(_schema_fingerprint(table), hashlib.sha256(legacy.encode()).hexdigest())
+
+    def test_selection_and_filter_survive_schema_history(self):
+        connector = self.connector(_ProjectingBridge())
+        table = connector._table(
+            "app.orders", {"include_columns": "id,value", "row_filter": "id > 1"}
+        )
+        restored = informix_module._table_from_schema_state(_schema_state(table, 100), "demo")
+        self.assertEqual(restored.column_selection, ("include", ("id", "value")))
+        self.assertEqual(restored.row_filter, "id > 1")
+        self.assertEqual(_schema_fingerprint(restored), _schema_fingerprint(table))
+
+    def test_a_unl_record_is_matched_by_catalog_position_then_narrowed(self):
+        connector = self.connector(_ProjectingBridge())
+        table = connector._table(
+            "app.orders", {"exclude_columns": "value", "row_filter": "extra >= 8"}
+        )
+        shape = informix_module._shape_unl_record
+        kept = shape(b"2|b|8|", table, 100, {}, "utf-8")
+        self.assertEqual((kept["id"], kept["extra"], "value" in kept), (2, 8, False))
+        self.assertIsNone(shape(b"1|a|7|", table, 100, {}, "utf-8"))
+        with self.assertRaisesRegex(InformixError, "has 2 fields but the table has 3 columns"):
+            shape(b"1|7|", table, 100, {}, "utf-8")
+
+    def test_an_executor_unl_split_rebuilds_the_selection_and_filter(self):
+        connector = self.connector(_ProjectingBridge())
+        path = os.path.join(self._shared_state.name, "orders.unl")
+        with open(path, "wb") as handle:
+            handle.write(b"1|a|7|\n2|b|8|\n")
+        partition = {
+            "kind": "unl_split",
+            "path": path,
+            "start_byte": 0,
+            "end_byte": os.path.getsize(path),
+            "gzip": False,
+            "columns": [
+                {"name": "id", "type_name": "INTEGER"},
+                {"name": "value", "type_name": "VARCHAR", "length": 20},
+                {"name": "extra", "type_name": "INTEGER"},
+            ],
+            "selected": ["id", "extra"],
+            "row_filter": "extra >= 8",
+            "snapshot_lsn": 100,
+            "exposed_name": "app.orders",
+        }
+        rows = list(connector._read_unl_split(partition, {}))
+        self.assertEqual(
+            [(row["id"], row["extra"], "value" in row) for row in rows], [(2, 8, False)]
+        )
+
+
+class SchemaEvolutionTests(_TableOptionTestCase):
+    """A running stream adopts widened strings, SMALLINT to INTEGER, and dropped nullable
+    columns without a full refresh; every other change still fails closed."""
+
+    @staticmethod
+    def table(columns, keys=("id",), selection=None):
+        raw = _table(primary_keys=keys)
+        raw["columns"] = [dict(column) for column in columns]
+        if selection is not None:
+            raw["column_selection"] = selection
+        return Table.parse(raw, "demo")
+
+    ID = {"name": "id", "type_name": "INTEGER", "nullable": False}
+
+    def column(self, name, type_name="VARCHAR", length=20, nullable=True):
+        return {"name": name, "type_name": type_name, "length": length, "nullable": nullable}
+
+    def test_compatible_changes_are_accepted(self):
+        ensure = informix_module._ensure_compatible_schema_change
+        base = self.table([self.ID, self.column("v"), self.column("w", "SMALLINT", 2)])
+        for name, current in (
+            (
+                "longer VARCHAR",
+                [self.ID, self.column("v", length=50), self.column("w", "SMALLINT", 2)],
+            ),
+            ("SMALLINT to INTEGER", [self.ID, self.column("v"), self.column("w", "INTEGER", 4)]),
+            ("drop nullable", [self.ID, self.column("v")]),
+            ("drop then append", [self.ID, self.column("w", "SMALLINT", 2), self.column("x")]),
+            (
+                "VARCHAR min length only",
+                [self.ID, self.column("v", length=20 + 5 * 256), self.column("w", "SMALLINT", 2)],
+            ),
+        ):
+            with self.subTest(name):
+                ensure(base, self.table(current))
+
+    def test_incompatible_changes_fail_closed(self):
+        ensure = informix_module._ensure_compatible_schema_change
+        base = self.table([self.ID, self.column("v"), self.column("n", nullable=False)])
+        for name, current, message in (
+            (
+                "shorter",
+                [self.ID, self.column("v", length=10), self.column("n", nullable=False)],
+                "other than by widening",
+            ),
+            (
+                "nullability",
+                [self.ID, self.column("v", nullable=False), self.column("n", nullable=False)],
+                "other than by widening",
+            ),
+            (
+                "type",
+                [self.ID, self.column("v", "INTEGER", 4), self.column("n", nullable=False)],
+                "other than by widening",
+            ),
+            ("drop NOT NULL", [self.ID, self.column("v")], "dropped NOT NULL column n"),
+            ("reorder", [self.ID, self.column("n", nullable=False), self.column("v")], "reordered"),
+            (
+                "insert before",
+                [self.ID, self.column("x"), self.column("v"), self.column("n", nullable=False)],
+                "reordered",
+            ),
+            (
+                "append NOT NULL",
+                [
+                    self.ID,
+                    self.column("v"),
+                    self.column("n", nullable=False),
+                    self.column("x", nullable=False),
+                ],
+                "non-nullable",
+            ),
+        ):
+            with self.subTest(name):
+                with self.assertRaisesRegex(InformixError, message):
+                    ensure(base, self.table(current))
+        with self.subTest("numeric widening waits for destination type widening"):
+            ints = self.table([self.ID, self.column("v", "INTEGER", 4)])
+            with self.assertRaisesRegex(InformixError, "other than by widening"):
+                ensure(ints, self.table([self.ID, self.column("v", "BIGINT", 8)]))
+
+    def test_a_selection_may_only_lose_names_of_columns_gone_from_the_source(self):
+        ensure = informix_module._ensure_compatible_schema_change
+        before = self.table(
+            [self.ID, self.column("v"), self.column("w")], selection=["include", ["id", "v", "w"]]
+        )
+        after_drop = self.table([self.ID, self.column("v")], selection=["include", ["id", "v"]])
+        ensure(before, after_drop)  # w was dropped at the source, then taken out of the list
+        still_there = self.table([self.ID, self.column("v")], selection=["include", ["id", "v"]])
+        still_there = dataclasses.replace(
+            still_there, catalog_columns=still_there.columns + (Column.parse(self.column("w")),)
+        )
+        with self.assertRaisesRegex(InformixError, "include_columns.*changed"):
+            ensure(before, still_there)
+
+    def test_a_widened_column_transitions_a_running_stream(self):
+        bridge = _ProjectingBridge()
+        connector, checkpoint = self.stream(bridge, {})
+        bridge.tables[0]["columns"][1]["length"] = 50
+        upserts, _ = self.changes(
+            connector, bridge, checkpoint, {}, ("INSERT", {"id": 3, "value": "x" * 40, "extra": 1})
+        )
+        self.assertEqual(upserts, [(3, "c")])
+
+    def test_a_dropped_column_transitions_a_running_stream(self):
+        bridge = _ProjectingBridge()
+        connector, checkpoint = self.stream(bridge, {})
+        del bridge.tables[0]["columns"][2]  # ALTER TABLE ... DROP (extra)
+        bridge.now = 200
+        bridge.changes = self.committed(("INSERT", {"id": 3, "value": "c"}))
+        rows = list(connector.read_table("app.orders", checkpoint, {})[0])
+        self.assertEqual([(row["id"], "extra" in row) for row in rows], [(3, False)])
+        self.assertEqual(bridge.change_reads[-1][0][0]["columns"], ["id", "value"])
+
+    def test_dropping_a_selected_column_asks_for_the_list_to_be_edited(self):
+        options = {"include_columns": "id,value,extra"}
+        bridge = _ProjectingBridge()
+        connector, checkpoint = self.stream(bridge, options)
+        del bridge.tables[0]["columns"][2]
+        bridge.now = 200
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 200}]
+        with self.assertRaisesRegex(InformixError, "does not have: extra"):
+            connector.read_table("app.orders", checkpoint, options)
+        rows, end = connector.read_table("app.orders", checkpoint, {"include_columns": "id,value"})
+        self.assertEqual(list(rows), [])
+        self.assertNotEqual(end["schema_fingerprint"], checkpoint["schema_fingerprint"])
+
+
+class RowFilterTests(_TableOptionTestCase):
+    """row_filter keeps only matching rows -- in snapshot SQL and in CDC, where an update
+    moving a row into the filter upserts it and one moving it out deletes it."""
+
+    FILTER = {"row_filter": "extra >= 8"}
+
+    def filtered_table(self, text, raw=None):
+        bridge = FakeBridge()
+        bridge.tables = [raw or _wide_table()]
+        return self.connector(bridge)._table("app.orders", {"row_filter": text})
+
+    def test_the_filter_is_stored_in_canonical_form(self):
+        table = self.filtered_table(
+            "extra>=8 and (value = 'it''s' or value is not null) AND NOT id != 1.50"
+        )
+        self.assertEqual(
+            table.row_filter,
+            "(extra >= 8) AND ((value = 'it''s') OR (value IS NOT NULL)) AND (NOT (id <> 1.5))",
+        )
+        self.assertEqual(self.filtered_table(table.row_filter).row_filter, table.row_filter)
+
+    def test_invalid_filters_fail(self):
+        float_table = _wide_table()
+        float_table["columns"][2]["type_name"] = "FLOAT"
+        nvarchar_table = _wide_table()
+        nvarchar_table["columns"][1]["type_name"] = "NVARCHAR"
+        for text, raw, message in (
+            ("extra = NULL", None, "IS NULL"),
+            ("extra >", None, "expected a value"),
+            ("missing = 1", None, "does not have or does not select"),
+            ("extra = 'x'", None, "with a string value"),
+            ("extra = 1 extra", None, "unexpected"),
+            ("extra ~ 1", None, "unexpected character"),
+            ("extra = 1.5", float_table, "cannot filter on FLOAT"),
+            ("value > 'a'", nvarchar_table, "only test NVARCHAR column value for equality"),
+            ("id = DATE '2024-02-30'", None, "valid calendar"),
+        ):
+            with self.subTest(text):
+                with self.assertRaisesRegex((InformixError, ValueError), message):
+                    self.filtered_table(text, raw)
+
+    def test_the_filter_renders_as_informix_sql(self):
+        raw = _wide_table()
+        raw["columns"] += [
+            {"name": "born", "type_name": "DATE"},
+            {
+                "name": "seen",
+                "type_name": "DATETIME",
+                "length": (0 << 8) | 13,
+            },  # YEAR TO FRACTION(3)
+            {"name": "flag", "type_name": "BOOLEAN"},
+        ]
+        table = self.filtered_table(
+            "value IN ('a', 'b''c') AND extra NOT BETWEEN -1 AND 2.50 AND born >= DATE '2024-01-31'"
+            " AND seen < TIMESTAMP '2024-01-31 10:00:00.123' AND flag = TRUE AND id IS NULL",
+            raw,
+        )
+        self.assertEqual(
+            informix_module._row_filter_sql(table),
+            "(value IN ('a', 'b''c')) AND (extra NOT BETWEEN -1 AND 2.5) AND "
+            "(born >= MDY(1, 31, 2024)) AND "
+            "(seen < DATETIME(2024-01-31 10:00:00.123) YEAR TO FRACTION(3)) AND "
+            "(flag = 't') AND (id IS NULL)",
+        )
+        with self.assertRaisesRegex(InformixError, "more precise than DATETIME column seen"):
+            self.filtered_table("seen = TIMESTAMP '2024-01-31 10:00:00.1234'", raw)
+
+    def test_python_evaluation_follows_sql_three_valued_logic(self):
+        table = self.filtered_table("value = 'a' OR extra > 5")
+        predicate = informix_module._row_filter_predicate(table)
+        matches = informix_module._row_filter_matches
+        self.assertTrue(matches(predicate, {"value": "a", "extra": None}))  # TRUE OR NULL
+        self.assertFalse(matches(predicate, {"value": "b", "extra": None}))  # FALSE OR NULL
+        negated = informix_module._row_filter_predicate(self.filtered_table("NOT extra IN (1, 2)"))
+        self.assertFalse(matches(negated, {"extra": None}))  # NOT NULL is NULL
+        self.assertTrue(matches(negated, {"extra": 3}))
+        padded = informix_module._row_filter_predicate(self.filtered_table("value = 'a'"))
+        self.assertTrue(matches(padded, {"value": "a  "}))  # trailing spaces ignored
+
+    def test_snapshots_apply_the_filter_with_snapshot_filter(self):
+        bridge = _ProjectingBridge()
+        options = {"row_filter": "extra >= 8", "snapshot.filter": "id > 0"}
+        self.stream(bridge, options)
+        self.assertIn("(id > 0) AND (extra >= 8)", bridge.snapshot_filters)
+
+    def test_cdc_membership_follows_the_images(self):
+        bridge = _ProjectingBridge()
+        connector, checkpoint = self.stream(bridge, self.FILTER)
+        cases = (
+            ("insert outside", [("INSERT", {"id": 3, "value": "c", "extra": 1})], [], []),
+            ("insert inside", [("INSERT", {"id": 3, "value": "c", "extra": 9})], [(3, "c")], []),
+            (
+                "update stays inside",
+                [
+                    ("BEFORE_UPDATE", {"id": 2, "value": "b", "extra": 8}),
+                    ("AFTER_UPDATE", {"id": 2, "value": "x", "extra": 9}),
+                ],
+                [(2, "u")],
+                [],
+            ),
+            (
+                "update moves in under a new key",
+                [
+                    ("BEFORE_UPDATE", {"id": 1, "value": "a", "extra": 7}),
+                    ("AFTER_UPDATE", {"id": 5, "value": "a", "extra": 9}),
+                ],
+                [(5, "u")],
+                [],
+            ),
+            (
+                "update moves out",
+                [
+                    ("BEFORE_UPDATE", {"id": 2, "value": "b", "extra": 8}),
+                    ("AFTER_UPDATE", {"id": 2, "value": "b", "extra": 1}),
+                ],
+                [],
+                [(2, "d")],
+            ),
+            (
+                "update stays outside",
+                [
+                    ("BEFORE_UPDATE", {"id": 1, "value": "a", "extra": 7}),
+                    ("AFTER_UPDATE", {"id": 1, "value": "z", "extra": 6}),
+                ],
+                [],
+                [],
+            ),
+            ("delete inside", [("DELETE", {"id": 2, "value": "b", "extra": 8})], [], [(2, "d")]),
+            ("delete outside", [("DELETE", {"id": 1, "value": "a", "extra": 7})], [], []),
+        )
+        for name, records, upserts, deletes in cases:
+            with self.subTest(name):
+                self.assertEqual(
+                    self.changes(connector, bridge, checkpoint, self.FILTER, *records),
+                    (upserts, deletes),
+                )
+
+    def test_append_path_tombstones_a_row_leaving_the_filter(self):
+        bridge = _ProjectingBridge()
+        bridge.tables = [_wide_table(primary_keys=())]
+        options = {"append.only.ingestion": "true", **self.FILTER}
+        connector, checkpoint = self.stream(bridge, options)
+        bridge.now = 200
+        bridge.changes = self.committed(
+            ("BEFORE_UPDATE", {"id": 2, "value": "b", "extra": 8}),
+            ("AFTER_UPDATE", {"id": 2, "value": "b", "extra": 1}),
+        )
+        rows = list(connector.read_table("app.orders", checkpoint, options)[0])
+        self.assertEqual(
+            [(row["id"], row["extra"], row["_informix_op"]) for row in rows], [(2, 8, "d")]
+        )
+
+    def test_changing_the_filter_on_a_running_stream_fails_closed(self):
+        bridge = _ProjectingBridge()
+        connector, checkpoint = self.stream(bridge, self.FILTER)
+        bridge.now = 200
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 200}]
+        list(
+            connector.read_table("app.orders", checkpoint, {"row_filter": "extra>=8"})[0]
+        )  # same filter
+        with self.assertRaisesRegex(InformixError, "row_filter.*changed.*full refresh"):
+            connector.read_table("app.orders", checkpoint, {"row_filter": "extra >= 9"})
+
+    def test_a_filter_column_must_be_selected(self):
+        with self.assertRaisesRegex(InformixError, "does not have or does not select"):
+            self.connector(_ProjectingBridge())._table(
+                "app.orders", {"exclude_columns": "extra", "row_filter": "extra > 1"}
+            )
 
 
 if __name__ == "__main__":

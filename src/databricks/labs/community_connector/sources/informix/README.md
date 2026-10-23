@@ -19,7 +19,7 @@ The pure-Python protocol implementation has completed authentication, query, dis
 - [Snapshot, CDC, and deletes](#snapshot-cdc-and-deletes)
   - [Snapshot isolation](#snapshot-isolation)
   - [Checkpoints and log retention](#checkpoints-and-log-retention)
-  - [Additive schema evolution without full refresh](#additive-schema-evolution-without-full-refresh)
+  - [Schema evolution without full refresh](#schema-evolution-without-full-refresh)
 - [Keyless tables](#keyless-tables)
   - [Which tables count as keyless](#which-tables-count-as-keyless)
   - [Choosing an approach](#choosing-an-approach)
@@ -34,6 +34,8 @@ The pure-Python protocol implementation has completed authentication, query, dis
   - [Limits](#limits)
   - [Option reference](#option-reference)
 - [Table configuration](#table-configuration)
+  - [Column selection](#column-selection)
+  - [Row filtering](#row-filtering)
   - [Snapshot modes](#snapshot-modes)
     - [Migrating a table without a re-snapshot](#migrating-a-table-without-a-re-snapshot)
     - [Incremental snapshot and append-only targets](#incremental-snapshot-and-append-only-targets)
@@ -151,7 +153,10 @@ rather than start from an unrelated position.
 | `table.migration` | No | `false` | Per-table (also connection-scope) boolean. When `true`, the table runs a two-run checkpoint handoff instead of its normal read, so it can move to a new Lakeflow flow — an SCD Type 1 → append-only switch, or a destination relocation — **without re-snapshotting**. Orthogonal to `snapshot.mode`, which the table keeps unchanged. Migration never streams: every read records a checkpoint, emits no rows, and stops. Clearing it (Restore) resumes normal reads from the recorded offset. See [Migrating a table without a re-snapshot](#migrating-a-table-without-a-re-snapshot). Accepts `true`/`false`. |
 | `snapshot.page.size` | No | `20000` | Rows per page for **keyed** tables — keyset-paged incremental chunks and the keyed blocking `initial` snapshot; minimum `1`. Pages are read under one repeatable-read transaction and delivered through checkpointed Lakeflow microbatches. A keyless `initial` snapshot uses `keyless.snapshot.page.size` instead. |
 | `keyless.snapshot.page.size` | No | `50000` | Rows per immutable staged Volume page for a **keyless** `initial` snapshot (an append-only keyless table with `snapshot.mode=initial`); minimum `1`. Such a table drains positionally (no seek cursor), so a larger page means fewer manifest entries and round trips for the same rows. A per-page byte ceiling still applies, and `snapshot.max.rows`/`snapshot.max.bytes` cap the whole drain. |
-| `snapshot.filter` | No | none | Per-table Informix SQL predicate appended to snapshot `SELECT` statements, without the `WHERE` keyword. It filters blocking, incremental, append-only initial, and snapshot-only copies. CDC events after the snapshot are not filtered. Semicolons, SQL comments, control characters, and predicates longer than 8,192 characters are rejected. |
+| `snapshot.filter` | No | none | Per-table Informix SQL predicate appended to snapshot `SELECT` statements, without the `WHERE` keyword. It filters blocking, incremental, append-only initial, and snapshot-only copies. CDC events after the snapshot are not filtered; use `row_filter` to filter them too. Semicolons, SQL comments, control characters, and predicates longer than 8,192 characters are rejected. |
+| `row_filter` | No | none | Per-table predicate, without `WHERE`, that keeps only matching rows in snapshots, file-sourced snapshots, and the change stream. An update that moves a row out of the filter deletes it. See [Row filtering](#row-filtering). |
+| `include_columns` | No | all columns | Per-table list of the columns to ingest (comma-separated or a JSON array). Columns added to the source later stay out. See [Column selection](#column-selection). |
+| `exclude_columns` | No | none | Per-table list of columns to leave out (comma-separated or a JSON array). Columns added to the source later come in. Can't be combined with `include_columns`. See [Column selection](#column-selection). |
 | `snapshot.isolation` | No | `committed_read_last_committed` | Per-table isolation level for the monolithic `snapshot.mode=initial` full-table snapshot. `committed_read_last_committed` (default) reads the last-committed image of a locked row instead of holding shared locks, so the snapshot does **not** lock the table against writers. `repeatable_read` restores the exactly-once, table-locking behavior. Tokens are case- and whitespace-insensitive; unknown values are rejected. **⚠️ Duplicate-row warning:** under `committed_read_last_committed` the table is no longer frozen at the snapshot LSN, so a row inserted **during** the scan can be captured by both the snapshot and the change stream. A keyed table de-duplicates these by primary key, but a **keyless (append-only) table has no key to de-duplicate on and may therefore emit duplicate rows**. Use `repeatable_read` for keyless tables that require exactly-once, or run the `initial` backfill during a quiet window. See [Snapshot isolation](#snapshot-isolation). |
 | `snapshot.scan` | No | `keyset` | Per-table (also connection-scope) read strategy for a **keyed** table's one-pass snapshot. `keyset` (default) pages in key order: each page is its own query ordered by the key columns, which an index on those columns serves cheaply. Without such an index every page can scan and sort the table, so the cost grows with pages times table size, which is the usual case for a `primary.keys` override and especially the `"*"` wildcard. `cursor` reads the table through one forward-only cursor with no sorting, as a keyless table is read, while the key still drives the destination merge and delete handling. It also avoids keyset paging's trouble with NULL key values. Pages are sized by `keyless.snapshot.page.size`. Rows committed during a non-locking scan can reach both the snapshot and the change stream, which the key de-duplicates; set `snapshot.isolation=repeatable_read` for an exactly-once scan that locks the table. With `snapshot.mode=incremental` or `auto_snapshot`, a cursor scan has no key ranges to chunk by, so a new snapshot uses the one-pass snapshot instead of the chunked one; a chunked copy already in progress finishes as it started. A keyless table always reads through the cursor. Accepts `keyset`/`cursor`. |
 | `stream.partitioned` | No | `true` | Whether the connector uses the **partitioned stream reader**. When enabled (default), the staged-snapshot page-serve phase **fans out**: a microbatch spans up to `stream.partitioned.snapshot.pages.per.batch` immutable staged pages, each read and decoded on a **separate Spark executor** instead of one page per microbatch on the driver — the parallel-read win for large snapshots. Every other phase (staging bootstrap, the live CDC/incremental stream, snapshot→CDC transitions, deletes) is a **single driver-computed partition** whose rows are byte-for-byte the current output, just wrapped — **CDC is never parallelized here** (the shard daemon remains the CDC lever; see `cdc.shared.session`). Applies only to tables with a bounded staged-snapshot→stream lifecycle (keyed CDC tables and append-only tables); snapshot-only tables always use the simple reader. Both readers persist the **same offset**, so this can be flipped on a **running** pipeline and it resumes the existing checkpoint in place with **no full refresh** (verified: serverless SDP resumes across the reader-class swap). **Requires `cdc.shared.session=true` (the default)**, because an embedded CDC microbatch that Spark re-plans after a driver restart is recomputed from its committed start offset **bounded at its committed end offset** — the recompute must reach exactly that `end` and fails closed on a shortfall, the same contract as the simple reader's `readBetweenOffsets` — and only the shared session's accumulating buffer lets a bounded replay of a range larger than one `cdc.max.records` poll converge (a direct per-table poll is capped per read and could never satisfy the bound). Because `stream.partitioned` is on by default, **if you set `cdc.shared.session=false` you must also set `stream.partitioned=false`**; otherwise the connector **fails fast at construction** with an explanatory error. There is no silent fallback. Set `false` to force the simple single-partition driver reader. Accepts `true`/`false`. |
@@ -164,7 +169,7 @@ rather than start from an unrelated position.
 | `snapshot.max.rows` | No | `0` | Optional total row bound for a staged CDC snapshot. `0` disables the bound. Snapshot-only tables remain limited to 100,000 rows when this option is `0`. |
 | `append.only.ingestion` | No | `auto` | Tri-state: `auto` (default), `true`, or `false`. `auto` appends only CDC-streamable tables **without** a primary key — the connector reports `ingestion_type=append` with a cursor and streams changes instead of repeatedly reading a bounded snapshot — and leaves keyed tables on their normal CDC path (so keyed tables follow the pipeline `scd_type`, default `SCD_TYPE_1`). For a keyless table `auto` is equivalent to `true`. `true` forces append for every capturable table, including keyed ones; `false` forces the normal CDC/snapshot path, opting a keyless table into bounded snapshot-only ingestion. Append output is a **change log**, not current state: an update appends its after-image as a `u` row, and a delete appends a `d` **tombstone** row carrying the full before-image (see `append.delete.tombstones`). On a keyless table a tombstone is a change-log record, not an applied delete — there is no key to pair it with — so consumers wanting current state filter on `_informix_op`; use `false` for a mutable keyless table that needs merge semantics. To append a **keyed** table also set `scd_type: APPEND_ONLY`; the connector cannot read that pipeline setting. Uncapturable types remain snapshot-only, and append-only tables have no delete channel. |
 | `append.delete.tombstones` | No | `true` | Per-table boolean, also accepted at connection scope (the table option wins). Applies only to a table on the append path (`append.only.ingestion`) and has no effect elsewhere. When `true`, a source `DELETE` lands on the upsert channel as a `d` tombstone row carrying the **full before-image** plus the usual `_informix_change_lsn`, `_informix_commit_lsn`, `_informix_tx_id` and `_informix_commit_time` columns, so the change log is lossless (an update already lands as a `u` row). On a keyed table forced to append, a key-changing update also removes the old key, so it lands the old row's before-image as a `d` tombstone ahead of the new key's `u` row. That tombstone's `_informix_change_lsn` is the before-image's own log position, strictly lower than the `u` row's, so ordering by the cursor applies them in the right order. Every CDC session enables full-row logging, so the before-image is always available. On a keyless table a tombstone is a change-log record, not an applied delete — there is no key to pair it with — so consumers wanting current state filter on `_informix_op`. A genuinely insert-only table never deletes, so the default costs it nothing. Set `false` for an archive-style table where retention purges would otherwise append one tombstone per purged row; the delete is then dropped. A keyed table on the normal CDC path ignores this option: its deletes are applied only through the separate delete flow. Accepts `true`/`false`. |
-| `primary.keys` | No | *(catalog key)* | Per-table override of the table's primary key — a comma-separated list (or JSON array) of column names. When set, the connector treats the table as **keyed** on those columns even if it is physically keyless: it reports `ingestion_type=cdc_with_deletes`, reads incrementally with keyset-paginated snapshots and delete identification, and reports the keys so the pipeline uses them as the destination merge key too (no separate `primary_keys` needed). The columns must exist in the table. **You must guarantee they are unique per row** — a non-unique override corrupts upserts, delete identification, and snapshot pagination. A key column declared nullable may hold NULL: a delete carries the NULL through, and the pipeline's delete flow matches NULL key values, so updates and deletes of that row apply normally. A NULL in a `NOT NULL` key column still fails the pipeline as a broken log record. A NULL key value can still make a snapshot skip rows or fail, because keyset snapshot paging compares key values; `snapshot.scan=cursor` avoids that. Leave unset to use the catalog's primary key, then a `UNIQUE` index if the connection has `primary.key.from.unique.index` enabled (the default), and otherwise none. Set `"*"` (or `["*"]`) to key on **every column**, in catalog column order, so the whole row is its identity. This suits a keyless table whose rows are unique as a whole, such as a junction or lookup table. Nullable columns join the wildcard key too, so the NULL behaviour above applies to every nullable column. On an append-only table with `snapshot.mode=cdc_only`, its default, nothing pages by key, so NULLs are harmless there. It also follows the schema: a column appended to the table joins the key. Once the table is streaming changes, a nullable column added without a default extends the key without a full refresh, as described in [Additive schema evolution without full refresh](#additive-schema-evolution-without-full-refresh). A column added with a default, or added while an incremental copy is still running, still needs a full refresh. Keyset snapshot paging sorts and compares on every column, so for a large table set `snapshot.scan=cursor`, or use an explicit key that matches an index. |
+| `primary.keys` | No | *(catalog key)* | Per-table override of the table's primary key — a comma-separated list (or JSON array) of column names. When set, the connector treats the table as **keyed** on those columns even if it is physically keyless: it reports `ingestion_type=cdc_with_deletes`, reads incrementally with keyset-paginated snapshots and delete identification, and reports the keys so the pipeline uses them as the destination merge key too (no separate `primary_keys` needed). The columns must exist in the table. **You must guarantee they are unique per row** — a non-unique override corrupts upserts, delete identification, and snapshot pagination. A key column declared nullable may hold NULL: a delete carries the NULL through, and the pipeline's delete flow matches NULL key values, so updates and deletes of that row apply normally. A NULL in a `NOT NULL` key column still fails the pipeline as a broken log record. A NULL key value can still make a snapshot skip rows or fail, because keyset snapshot paging compares key values; `snapshot.scan=cursor` avoids that. Leave unset to use the catalog's primary key, then a `UNIQUE` index if the connection has `primary.key.from.unique.index` enabled (the default), and otherwise none. Set `"*"` (or `["*"]`) to key on **every column**, in catalog column order, so the whole row is its identity. This suits a keyless table whose rows are unique as a whole, such as a junction or lookup table. Nullable columns join the wildcard key too, so the NULL behaviour above applies to every nullable column. On an append-only table with `snapshot.mode=cdc_only`, its default, nothing pages by key, so NULLs are harmless there. It also follows the schema: a column appended to the table joins the key. Once the table is streaming changes, a nullable column added without a default extends the key without a full refresh, as described in [Schema evolution without full refresh](#schema-evolution-without-full-refresh). A column added with a default, or added while an incremental copy is still running, still needs a full refresh. Keyset snapshot paging sorts and compares on every column, so for a large table set `snapshot.scan=cursor`, or use an explicit key that matches an index. |
 | `allow.nullable.index` | No | `false` | Per-table opt-in that lets a `UNIQUE` index containing **nullable** column(s) be promoted to the key when the table has **no primary key and no all-`NOT NULL` unique index**. Normally such an index is rejected because a key column is expected to be non-null; setting this `true` asserts the columns are **unique for every row**. A row that does hold NULL in one of them is still updated and deleted correctly: as for a `primary.keys` override, a delete carries the NULL through and the pipeline's delete flow matches NULL key values. What a NULL can still break is keyset snapshot paging, which compares key values and may skip the row or fail; `snapshot.scan=cursor` avoids that. Only takes effect when `primary.key.from.unique.index` is enabled (the default) and no non-null key exists; an all-`NOT NULL` unique index and an explicit `primary.keys` both still win. Promoting a table changes its keyed/key-less classification and schema fingerprint, so enable it before first ingest or run a full refresh. Accepts `true`/`false`. |
 | `snapshot.max.bytes` | No | `0` | Optional estimated decoded Python byte bound for the complete staged snapshot. The default `0` disables the limit and byte accounting. Each encoded staged page also has a fixed 256 MiB safety bound. |
 | `metadata.max.bytes` | No | `67108864` | Maximum estimated decoded Python bytes retained by an individual catalog query and by complete discovery. Set `0` to disable the limit and byte accounting. |
@@ -188,7 +193,7 @@ rather than start from an unrelated position.
 Because per-table options are supported, configure the Unity Catalog connection with this exact `externalOptionsAllowList`:
 
 ```text
-qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration
+qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration
 ```
 
 Create the connection from the Lakeflow Community Connector flow on the **Add Data** page, with the Databricks CLI, or with the Databricks SDK for Python. The Unity Catalog connection type must be `COMMUNITY`, and `sourceName` must be `informix`.
@@ -221,7 +226,7 @@ databricks connections create --json "$(jq -n \
       encrypt: "true",
       "snapshot.staging.location": "/Volumes/main/informix_cdc/staging",
       "lakebase.password": $lakebase_password,
-      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
+      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
     }
   }')"
 
@@ -259,7 +264,7 @@ databricks connections update informix_sales --json "$(jq -n \
       "ssl.ca.file": "/Volumes/catalog/schema/artifacts/informix-ca.pem",
       "snapshot.staging.location": "/Volumes/main/informix_cdc/staging",
       "lakebase.password": $lakebase_password,
-      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
+      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
     }
   }')" \
   --profile "$DATABRICKS_PROFILE"
@@ -306,7 +311,7 @@ connection = w.connections.create(
         "lakebase.password": os.environ["LAKEBASE_PASSWORD"],
         "externalOptionsAllowList": (
             "qualified_source_table,decimal.variable.type,decimal.variable.column.type,"
-            "snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,"
+            "snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,"
             "append.only.ingestion,append.delete.tombstones,"
             "max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
         ),
@@ -347,7 +352,7 @@ connection = w.connections.update(
         "lakebase.password": os.environ["LAKEBASE_PASSWORD"],
         "externalOptionsAllowList": (
             "qualified_source_table,decimal.variable.type,decimal.variable.column.type,"
-            "snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,"
+            "snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,"
             "append.only.ingestion,append.delete.tombstones,"
             "max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
         ),
@@ -579,14 +584,33 @@ generations different, then independently checkpoint the shared generation.
 
 An idle timeout returns no rows and leaves the checkpoint unchanged. Incomplete or open transactions do not advance it. If the restart LSN predates the minimum retained logical log in `sysmaster:syslogs`, continuation fails and the table must be resnapshotted. Every CDC session validates its initial METADATA frame against a fresh catalog layout before decoding later records; another METADATA frame in that session fails immediately and requires a full refresh.
 
-### Additive schema evolution without full refresh
+### Schema evolution without full refresh
 
-A normal pipeline restart can evolve an existing CDC table when nullable,
-CDC-supported columns are appended at the end of the Informix table. Existing
-columns must retain their names, order, types, nullability, widths, precision,
-and scale, and the primary key must remain unchanged. Drops, renames, reorders,
-type changes, non-nullable additions, unsupported types, and primary-key changes
-still require a full refresh.
+A normal pipeline restart adopts these Informix schema changes on a streaming table
+without a full refresh:
+
+- **Appended columns:** nullable, CDC-supported columns added after every existing one.
+- **Longer strings:** a `CHAR`, `VARCHAR`, `NVARCHAR`, or `LVARCHAR` column made longer,
+  with its type and nullability unchanged. It still arrives as a string, so the
+  destination column doesn't change.
+- **`SMALLINT` to `INTEGER`:** both arrive as integers, so the destination column doesn't
+  change.
+- **Dropped columns:** a nullable column that isn't part of the key. The connector stops
+  reading it and no longer reports it, and the destination keeps the column. With SCD
+  type 1, a row updated after the drop keeps the value it had; rows inserted after the
+  drop hold NULL. With SCD type 2, versions written after the drop hold NULL, and earlier
+  versions keep their values.
+
+Anything else still needs a full refresh: renames, reorders, a column added before
+existing ones, other type changes (numeric widening such as `INTEGER` to `BIGINT`
+included), nullability changes, non-nullable additions, unsupported types, primary-key
+changes, and dropping a `NOT NULL` or key column. Changing `include_columns`,
+`exclude_columns`, or `row_filter` on a running table also needs one.
+
+Appended columns have been validated against a live Informix server. Longer strings,
+`SMALLINT` to `INTEGER`, and dropped columns rely on Informix returning older log
+records in the current layout in the same way, so validate them against your server
+version before relying on them.
 
 A table keyed with `primary.keys: "*"` is the one exception to an unchanged key: its
 key is every column, so an appended column joins it. The key may grow that way without
@@ -602,7 +626,8 @@ Informix rejects `ALTER TABLE` while full-row logging is enabled. Stop every
 pipeline using this connection, then quiesce source writes before disabling
 logging and keep them quiesced until logging is re-enabled. Apply the additive
 DDL, immediately re-enable logging, and then writes may resume even before the
-pipeline restarts. Restart normally—do not request a full refresh. For example:
+pipeline restarts. Restart normally—do not request a full refresh. For example, to
+append a column:
 
 ```sql
 EXECUTE FUNCTION syscdcv1:cdc_set_fullrowlogging(
@@ -612,6 +637,15 @@ ALTER TABLE informix.members ADD new_nullable_column VARCHAR(64);
 EXECUTE FUNCTION syscdcv1:cdc_set_fullrowlogging(
   'testdb:informix.members', 1
 );
+```
+
+The other supported changes follow the same sequence with a different `ALTER TABLE`. A
+`MODIFY` restates the whole column definition, so keep `NOT NULL` on a column that has
+it; otherwise the column becomes nullable and the change needs a full refresh:
+
+```sql
+ALTER TABLE informix.members MODIFY (surname VARCHAR(120) NOT NULL);
+ALTER TABLE informix.members DROP (legacy_code);
 ```
 
 Shared state stores predecessor-linked schema generations, the Informix catalog
@@ -777,7 +811,7 @@ Use something else when:
   Rows from before the change hold NULL in the new column on both sides, so their
   later updates and deletes still match. A column added with a default, or added
   while an incremental copy is still running, needs a full refresh. See
-  [Additive schema evolution without full refresh](#additive-schema-evolution-without-full-refresh).
+  [Schema evolution without full refresh](#schema-evolution-without-full-refresh).
 - Paging a snapshot by every column sorts the table once per page, so set
   `snapshot.scan: cursor`.
 
@@ -935,7 +969,94 @@ Full definitions are in [Connection parameters](#connection-parameters).
 }
 ```
 
-Supported source-specific table options are `qualified_source_table`, `decimal.variable.type`, `decimal.variable.column.type`, `snapshot.mode`, `snapshot.source`, `snapshot.boundary.lsn`, `snapshot.split.bytes`, `snapshot.unl.delimiter`, `snapshot.unl.escape`, `snapshot.page.size`, `keyless.snapshot.page.size`, `snapshot.filter`, `snapshot.isolation`, `snapshot.max.rows`, `snapshot.max.bytes`, `max.records.per.batch`, `cdc.timeout`, and `cdc.max.records`. `qualified_source_table` maps the pipeline's logical table name to an Informix `owner.table` name. Standard destination, SCD, key, sequence, and clustering options remain available.
+Supported source-specific table options are `qualified_source_table`, `decimal.variable.type`, `decimal.variable.column.type`, `snapshot.mode`, `snapshot.source`, `snapshot.boundary.lsn`, `snapshot.split.bytes`, `snapshot.unl.delimiter`, `snapshot.unl.escape`, `snapshot.page.size`, `keyless.snapshot.page.size`, `snapshot.filter`, `row_filter`, `include_columns`, `exclude_columns`, `snapshot.isolation`, `snapshot.max.rows`, `snapshot.max.bytes`, `max.records.per.batch`, `cdc.timeout`, and `cdc.max.records`. `qualified_source_table` maps the pipeline's logical table name to an Informix `owner.table` name. Standard destination, SCD, key, sequence, and clustering options remain available.
+
+### Column selection
+
+`include_columns` lists the columns to ingest, and `exclude_columns` lists the ones to
+leave out. Both take a comma-separated list or a JSON array, use the names of Lakeflow
+Connect's managed-connector options, and can't be combined. A column left out is read
+nowhere: not by the snapshot `SELECT`, not by the CDC capture, and not into the
+destination.
+
+```json
+{
+  "source_table": "orders",
+  "table_configuration": {
+    "qualified_source_table": "informix.orders",
+    "include_columns": ["order_id", "status", "amount"]
+  }
+}
+```
+
+- **Columns added later:** with `include_columns` they stay out; with `exclude_columns`
+  they come in like any appended column.
+- **Keys and filters:** key columns must stay selected, and so must every column
+  `row_filter` uses. A `primary.keys` override may name other selected columns in place
+  of an excluded catalog key. `primary.keys: "*"` keys the table on the selected columns
+  only, so leaving out a column that made rows unique can produce duplicate keys.
+- **Names:** every name must be a column of the table, so a typo fails instead of letting
+  in a column you meant to keep out. After dropping a listed column at the source, take
+  it out of the list; that edit needs no full refresh.
+- **Uncapturable columns:** a table with a BYTE, TEXT, BLOB, CLOB, INTERVAL, or
+  collection column is otherwise snapshot-only. Excluding those columns lets it stream
+  its changes.
+- **Changing the selection:** on a running table this fails closed, because rows already
+  landed were read under the old selection. Run a full refresh to apply the new one.
+- **File-sourced snapshots:** an extract still holds every column. The connector matches
+  fields by catalog position and keeps the selected ones.
+
+### Row filtering
+
+`row_filter` keeps only the rows that match a predicate, written without `WHERE`:
+
+```json
+{
+  "source_table": "orders",
+  "table_configuration": {
+    "qualified_source_table": "informix.orders",
+    "row_filter": "status IN ('open', 'held') AND amount >= 100"
+  }
+}
+```
+
+Unlike `snapshot.filter`, which only filters snapshot queries, `row_filter` applies
+wherever a row can arrive: snapshot queries (combined with `snapshot.filter` by `AND`),
+file-sourced snapshots, and the change stream. For changes, the connector evaluates the
+filter on each row's before- and after-image:
+
+| Change | Result |
+|---|---|
+| Insert that matches | Inserted |
+| Update, before and after both match | Updated |
+| Update that moves a row into the filter | Upserted |
+| Update that moves a row out of the filter | Deleted (a `d` tombstone on the append path) |
+| Delete of a matching row | Deleted |
+| Change whose rows never match | Dropped |
+
+A keyed destination therefore holds exactly the matching rows. Lakeflow Connect's
+managed connectors keep rows that stop matching; this connector deletes them.
+
+The predicate is parsed by the connector, so it can be evaluated the same way in SQL and
+on change images. That limits it to:
+
+- **Operators:** `=`, `<>` (or `!=`), `<`, `<=`, `>`, `>=`, `[NOT] IN (...)`,
+  `[NOT] BETWEEN ... AND ...`, `IS [NOT] NULL`, `AND`, `OR`, `NOT`, and parentheses.
+- **Values:** numbers, `'quoted strings'` (double a quote to include one), `TRUE` and
+  `FALSE`, `DATE 'YYYY-MM-DD'`, and `TIMESTAMP 'YYYY-MM-DD HH:MM:SS[.ffffff]'`. A
+  `TIMESTAMP` can't be more precise than the column's `DATETIME` qualifier.
+- **Columns:** numeric (except `FLOAT` and `SMALLFLOAT`), `CHAR`, `VARCHAR`, `LVARCHAR`,
+  `NVARCHAR`, `BOOLEAN`, `DATE`, and `DATETIME YEAR TO DAY` or finer. Each value must
+  match its column's type.
+- **Strings:** compare by code point with trailing spaces ignored, which is Informix's
+  `CHAR` and `VARCHAR` order in ISO 8859-1 and UTF-8 databases. `NVARCHAR` collates by
+  locale, so it only takes `=`, `<>`, and `IN`.
+- **NULL:** follows SQL's three-valued logic; a row is kept only when the predicate is
+  true.
+
+Changing the filter on a running table fails closed until a full refresh, since rows
+already landed were selected under the old one. Formatting-only edits, such as spacing,
+keyword case, or `!=` for `<>`, don't count as changes.
 
 ### Snapshot modes
 

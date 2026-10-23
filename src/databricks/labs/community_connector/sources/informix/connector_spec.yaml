@@ -639,7 +639,52 @@ connection:
         without the WHERE keyword. Applies to blocking, incremental, append-only
         initial, and snapshot-only copies; subsequent CDC events are not filtered.
         Semicolons, SQL comments, control characters, and predicates longer than
-        8192 characters are rejected.
+        8192 characters are rejected. To filter the change stream as well, use
+        row_filter.
+
+    - name: include_columns
+      type: string
+      required: false
+      description: >
+        Per-table list of the columns to ingest, as a comma-separated list or a JSON
+        array; every other column is left out of the snapshot, the CDC capture, and
+        the destination. A column added to the source later stays out. Key columns
+        must be listed, and so must any column row_filter uses. Every name must be a
+        column of the table; after dropping a listed column at the source, take it
+        out of the list (no full refresh needed). Excluding a column CDC cannot
+        capture (BYTE, TEXT, BLOB, CLOB, INTERVAL, collections) lets the table stream
+        changes instead of being snapshot-only. Changing the selection on a running
+        table fails closed until a full refresh. Mutually exclusive with
+        exclude_columns.
+
+    - name: exclude_columns
+      type: string
+      required: false
+      description: >
+        Per-table list of columns to leave out, as a comma-separated list or a JSON
+        array; every other column is ingested, including ones added to the source
+        later. Otherwise behaves as include_columns: key columns and row_filter
+        columns cannot be excluded, every name must be a column of the table, and
+        changing the list on a running table fails closed until a full refresh.
+        Mutually exclusive with include_columns.
+
+    - name: row_filter
+      type: string
+      required: false
+      description: >
+        Per-table predicate, without the WHERE keyword, that keeps only matching rows
+        in snapshots, file-sourced snapshots, and the change stream. An UPDATE that
+        moves a row into the filter is upserted and one that moves it out is
+        deleted (a tombstone on the append path), so a keyed destination holds
+        exactly the matching rows. Supports comparisons (=, <>, !=, <, <=, >, >=),
+        [NOT] IN, [NOT] BETWEEN, IS [NOT] NULL, AND, OR, NOT, and parentheses, with
+        numbers, 'quoted strings', TRUE/FALSE, DATE 'YYYY-MM-DD', and TIMESTAMP
+        'YYYY-MM-DD HH:MM:SS[.ffffff]' values, over numeric, CHAR/VARCHAR/LVARCHAR,
+        BOOLEAN, DATE, and YEAR-anchored DATETIME columns; NVARCHAR takes equality
+        tests only and FLOAT columns are rejected. NULL follows SQL's three-valued
+        logic. Strings compare by code point with trailing spaces ignored. Every
+        column it uses must be selected. Changing the filter on a running table
+        fails closed until a full refresh. Combined with snapshot.filter by AND.
 
     - name: snapshot.isolation
       type: string
@@ -1250,4 +1295,4 @@ connection:
 
 # Exact per-table overrides consumed by the connector. `qualified_source_table` maps a
 # pipeline table to a dynamically discovered exposed name (`owner.table`).
-external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
+external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"

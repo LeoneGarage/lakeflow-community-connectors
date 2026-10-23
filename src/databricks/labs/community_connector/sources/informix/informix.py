@@ -2390,14 +2390,15 @@ class PurePythonInformixBridge:
                 for column in value["descriptors"]
             }
 
-        capture_columns = list(capture["columns"])
-        refreshed_columns = list(refreshed["columns"])
+        # Every captured column must still exist with the layout it is decoded by. Matched
+        # by name, not position: a column selection captures a subset of the catalog, and
+        # the CDC metadata record already fixes the order rows arrive in.
         refreshed_layout = layout(refreshed)
         capture_layout = layout(capture)
-        prefix_is_unchanged = refreshed_columns[: len(capture_columns)] == capture_columns and all(
-            refreshed_layout.get(column) == capture_layout[column] for column in capture_columns
+        captured_unchanged = all(
+            refreshed_layout.get(column) == capture_layout[column] for column in capture["columns"]
         )
-        if not prefix_is_unchanged:
+        if not captured_unchanged:
             raise InformixError(
                 f"Informix schema changed for {native!r} during CDC; "
                 "run a full refresh before decoding additional records"
@@ -3882,8 +3883,8 @@ def _select_unique_index_key(
     return min(candidates, key=lambda candidate: (candidate[0], candidate[1]))[2]
 
 
-def _parse_key_columns(raw: str) -> list[str]:
-    # Docstring: Parse the primary.keys option -- a comma-separated list or a JSON array.
+def _parse_key_columns(raw: str, option: str = _PRIMARY_KEYS_OPTION) -> list[str]:
+    # Docstring: Parse a column-list option -- a comma-separated list or a JSON array.
 
     text = (raw or "").strip()
     if not text:
@@ -3892,9 +3893,7 @@ def _parse_key_columns(raw: str) -> list[str]:
         try:
             values = json.loads(text)
         except json.JSONDecodeError as error:
-            raise ValueError(
-                f"Option '{_PRIMARY_KEYS_OPTION}' is not a valid JSON array: {text!r}"
-            ) from error
+            raise ValueError(f"Option '{option}' is not a valid JSON array: {text!r}") from error
         items = [str(value).strip() for value in values]
     else:
         items = [item.strip() for item in text.split(",")]
@@ -3919,6 +3918,577 @@ def _snapshot_filter(options: dict[str, str]) -> str | None:
             "Option 'snapshot.filter' must be one SQL predicate without comments or semicolons"
         )
     return predicate
+
+
+def _snapshot_predicate(snapshot_filter: str | None, table: Table) -> str | None:
+    # Docstring: The WHERE predicate a snapshot read applies: snapshot.filter and row_filter.
+
+    row_filter = _row_filter_sql(table)
+    if snapshot_filter and row_filter:
+        return f"({snapshot_filter}) AND ({row_filter})"
+    return snapshot_filter or row_filter
+
+
+_INCLUDE_COLUMNS_OPTION = "include_columns"
+_EXCLUDE_COLUMNS_OPTION = "exclude_columns"
+
+
+def _column_selection(options: dict[str, str]) -> tuple[str, tuple[str, ...]] | None:
+    # Docstring: The table's include_columns / exclude_columns choice as (mode, sorted names).
+    #
+    # Named as in Lakeflow Connect's managed connectors. Either takes a comma-separated
+    # list or a JSON array, as primary.keys does; setting both is ambiguous, so rejected.
+    # include_columns keeps a column added to the source later out, exclude_columns lets
+    # it in.
+
+    include = options.get(_INCLUDE_COLUMNS_OPTION)
+    exclude = options.get(_EXCLUDE_COLUMNS_OPTION)
+    if include is None and exclude is None:
+        return None
+    if include is not None and exclude is not None:
+        raise ValueError(
+            f"Set '{_INCLUDE_COLUMNS_OPTION}' or '{_EXCLUDE_COLUMNS_OPTION}', not both"
+        )
+    mode, option, raw = (
+        ("include", _INCLUDE_COLUMNS_OPTION, include)
+        if include is not None
+        else ("exclude", _EXCLUDE_COLUMNS_OPTION, exclude)
+    )
+    names = _parse_key_columns(raw, option)
+    if not names:
+        raise ValueError(f"Option '{option}' is set but lists no columns")
+    if len(names) != len(set(names)):
+        raise ValueError(f"Option '{option}' lists a duplicate column")
+    return mode, tuple(sorted(names))
+
+
+def _apply_column_selection(table: Table, selection: tuple[str, tuple[str, ...]] | None) -> Table:
+    # Docstring: Narrow ``table`` to the selected columns; see ``Table.column_selection``.
+    #
+    # Every listed name must be a column of the table, so a typo fails instead of quietly
+    # ingesting a column exclude_columns was meant to keep out. After a listed column is
+    # dropped at the source, take it out of the list; the schema transition accepts that
+    # edit. A nullable-index key candidate that loses a column is no candidate any more.
+
+    if selection is None:
+        return table
+    mode, names = selection
+    option = _INCLUDE_COLUMNS_OPTION if mode == "include" else _EXCLUDE_COLUMNS_OPTION
+    catalog = table.catalog_columns or table.columns
+    known = {column.name for column in catalog}
+    missing = [name for name in names if name not in known]
+    if missing:
+        raise InformixError(
+            f"Option '{option}' names column(s) that '{table.exposed_name}' does not have: "
+            f"{', '.join(missing)}"
+        )
+    chosen = set(names)
+    columns = tuple(column for column in catalog if (column.name in chosen) == (mode == "include"))
+    if not columns:
+        raise ValueError(f"Option '{option}' leaves '{table.exposed_name}' with no columns")
+    keep_index = set(table.nullable_index_key) <= {column.name for column in columns}
+    return replace(
+        table,
+        columns=columns,
+        catalog_columns=catalog,
+        column_selection=selection,
+        nullable_index_key=table.nullable_index_key if keep_index else (),
+        nullable_index_descending=table.nullable_index_descending if keep_index else (),
+    )
+
+
+def _ensure_selected_keys(table: Table) -> None:
+    # Docstring: Fail when the column selection leaves out a key column.
+    #
+    # The pipeline merges and deletes by the key, so it must be ingested. Checked after the
+    # key options, so a primary.keys override naming other columns can stand in for an
+    # excluded catalog key.
+
+    if table.column_selection is None:
+        return
+    selected = {column.name for column in table.columns}
+    missing = [key for key in table.primary_keys if key not in selected]
+    if missing:
+        raise InformixError(
+            f"Key column(s) {', '.join(missing)} of '{table.exposed_name}' must be selected; add "
+            f"them to '{_INCLUDE_COLUMNS_OPTION}' or remove them from '{_EXCLUDE_COLUMNS_OPTION}'"
+        )
+
+
+_ROW_FILTER_OPTION = "row_filter"
+# row_filter keeps only the rows matching a predicate -- in snapshots, file-sourced
+# snapshots, and the change stream alike -- and is named as in Lakeflow Connect. The
+# connector parses it itself so the same predicate can be rendered to SQL for snapshots
+# and evaluated in Python on CDC before- and after-images and on file records. That
+# limits it to a grammar whose meaning is identical both ways: comparisons, IN, BETWEEN,
+# IS [NOT] NULL, AND/OR/NOT and parentheses, over numeric, string, BOOLEAN, DATE, and
+# YEAR-anchored DATETIME columns, with SQL's three-valued NULL logic. Strings compare by
+# code point with trailing spaces ignored, which is Informix's CHAR/VARCHAR order for ISO
+# 8859-1 and UTF-8 code sets; NVARCHAR collates by locale, so it takes equality tests
+# only. FLOAT columns are rejected because binary floating point compares differently
+# in SQL and Python. An UPDATE that moves a row into the filter is upserted and one that
+# moves it out is deleted, so a keyed target holds exactly the matching rows.
+_ROW_FILTER_KEYWORDS = frozenset(
+    {"AND", "OR", "NOT", "IN", "BETWEEN", "IS", "NULL", "TRUE", "FALSE", "DATE", "TIMESTAMP"}
+)
+_ROW_FILTER_TOKEN = re.compile(
+    r"\s*(?:(?P<number>-?\d+(?:\.\d+)?)|(?P<string>'(?:[^']|'')*')"
+    r"|(?P<op><>|!=|<=|>=|=|<|>)|(?P<punct>[(),])|(?P<word>[^\W\d][\w$]*))",
+    re.UNICODE,
+)
+_ROW_FILTER_TEMPORAL = re.compile(
+    r"(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,6}))?)?)?"
+)
+_ROW_FILTER_NUMERIC_TYPES = frozenset(
+    {
+        "SMALLINT",
+        "INT2",
+        "INTEGER",
+        "INT",
+        "SERIAL",
+        "BIGINT",
+        "INT8",
+        "BIGSERIAL",
+        "SERIAL8",
+        "DECIMAL",
+        "NUMERIC",
+        "MONEY",
+    }
+)
+_ROW_FILTER_STRING_TYPES = frozenset({"CHAR", "VARCHAR", "LVARCHAR", "NVARCHAR"})
+_ROW_FILTER_CACHE: dict[str, tuple] = {}
+
+
+class _RowFilterParser:
+    # Docstring: Recursive-descent parser turning row_filter text into a hashable tree.
+    #
+    # Nodes: ("and"|"or", children), ("not", child), ("cmp", column, op, literal),
+    # ("in", column, negated, literals), ("between", column, negated, low, high), and
+    # ("null", column, negated). A literal is (kind, value) with kind number, string,
+    # bool, date, or timestamp.
+
+    def __init__(self, text: str) -> None:
+        self.tokens: list[tuple[str, str]] = []
+        self.index = 0
+        text = text.strip()
+        position = 0
+        while position < len(text):
+            match = _ROW_FILTER_TOKEN.match(text, position)
+            if match is None or match.lastgroup is None:
+                self.fail(f"unexpected character at position {position + 1}")
+            self.tokens.append((match.lastgroup, match.group(match.lastgroup)))
+            position = match.end()
+
+    def fail(self, message: str) -> None:
+        raise ValueError(f"Option '{_ROW_FILTER_OPTION}' is not a valid filter: {message}")
+
+    def peek(self) -> tuple[str | None, str | None]:
+        return self.tokens[self.index] if self.index < len(self.tokens) else (None, None)
+
+    def take(self) -> tuple[str | None, str | None]:
+        token = self.peek()
+        self.index += 1
+        return token
+
+    def at_keyword(self, word: str) -> bool:
+        kind, value = self.peek()
+        return kind == "word" and str(value).upper() == word
+
+    def accept_keyword(self, word: str) -> bool:
+        if self.at_keyword(word):
+            self.index += 1
+            return True
+        return False
+
+    def expect_keyword(self, word: str) -> None:
+        if not self.accept_keyword(word):
+            self.fail(f"expected {word}")
+
+    def expect_punct(self, character: str) -> None:
+        if self.take() != ("punct", character):
+            self.fail(f"expected '{character}'")
+
+    def parse(self) -> tuple:
+        if not self.tokens:
+            self.fail("it is empty")
+        tree = self.parse_or()
+        if self.index != len(self.tokens):
+            self.fail(f"unexpected {self.peek()[1]!r}")
+        return tree
+
+    def parse_or(self) -> tuple:
+        terms = [self.parse_and()]
+        while self.accept_keyword("OR"):
+            terms.append(self.parse_and())
+        return terms[0] if len(terms) == 1 else ("or", tuple(terms))
+
+    def parse_and(self) -> tuple:
+        terms = [self.parse_not()]
+        while self.accept_keyword("AND"):
+            terms.append(self.parse_not())
+        return terms[0] if len(terms) == 1 else ("and", tuple(terms))
+
+    def parse_not(self) -> tuple:
+        if self.accept_keyword("NOT"):
+            return ("not", self.parse_not())
+        if self.peek() == ("punct", "("):
+            self.index += 1
+            tree = self.parse_or()
+            self.expect_punct(")")
+            return tree
+        return self.parse_predicate()
+
+    def parse_predicate(self) -> tuple:
+        kind, name = self.take()
+        if (
+            kind != "word"
+            or str(name).upper() in _ROW_FILTER_KEYWORDS
+            or not _IDENTIFIER.fullmatch(str(name))
+        ):
+            self.fail(f"expected a column name, found {name!r}")
+        column = str(name)
+        if self.accept_keyword("IS"):
+            negated = self.accept_keyword("NOT")
+            self.expect_keyword("NULL")
+            return ("null", column, negated)
+        negated = self.accept_keyword("NOT")
+        if self.accept_keyword("IN"):
+            self.expect_punct("(")
+            values = [self.parse_literal()]
+            while self.peek() == ("punct", ","):
+                self.index += 1
+                values.append(self.parse_literal())
+            self.expect_punct(")")
+            return ("in", column, negated, tuple(values))
+        if self.accept_keyword("BETWEEN"):
+            low = self.parse_literal()
+            self.expect_keyword("AND")
+            return ("between", column, negated, low, self.parse_literal())
+        if negated:
+            self.fail(f"expected IN or BETWEEN after NOT for {column}")
+        kind, op = self.take()
+        if kind != "op":
+            self.fail(f"expected a comparison after {column}")
+        return ("cmp", column, "<>" if op == "!=" else op, self.parse_literal())
+
+    def parse_literal(self) -> tuple:
+        kind, value = self.take()
+        text = str(value)
+        if kind == "number":
+            return ("number", Decimal(text))
+        if kind == "string":
+            return ("string", text[1:-1].replace("''", "'"))
+        upper = text.upper()
+        if kind == "word" and upper in {"TRUE", "FALSE"}:
+            return ("bool", upper == "TRUE")
+        if kind == "word" and upper in {"DATE", "TIMESTAMP"}:
+            quoted_kind, quoted = self.take()
+            match = (
+                _ROW_FILTER_TEMPORAL.fullmatch(str(quoted)[1:-1])
+                if quoted_kind == "string"
+                else None
+            )
+            if match is None or (upper == "DATE" and match.group(4) is not None):
+                self.fail(f"expected {upper} 'YYYY-MM-DD{'' if upper == 'DATE' else ' HH:MM:SS'}'")
+            year, month, day, hour, minute, second, fraction = match.groups()
+            try:
+                if upper == "DATE":
+                    return ("date", date(int(year), int(month), int(day)))
+                micro = int((fraction + "000000")[:6]) if fraction else 0
+                return (
+                    "timestamp",
+                    datetime(
+                        int(year),
+                        int(month),
+                        int(day),
+                        int(hour or 0),
+                        int(minute or 0),
+                        int(second or 0),
+                        micro,
+                    ),
+                )
+            except ValueError:
+                self.fail(f"{upper} {quoted} is not a valid calendar value")
+        if kind == "word" and upper == "NULL":
+            self.fail("compare with NULL using IS NULL or IS NOT NULL")
+        self.fail(f"expected a value, found {value!r}")
+        raise AssertionError  # unreachable: fail() raises
+
+
+def _parse_row_filter(text: str) -> tuple:
+    # Docstring: Parse ``text`` with :class:`_RowFilterParser`, caching the tree by text.
+
+    tree = _ROW_FILTER_CACHE.get(text)
+    if tree is None:
+        tree = _RowFilterParser(text).parse()
+        if len(_ROW_FILTER_CACHE) >= 64:
+            _ROW_FILTER_CACHE.clear()
+        _ROW_FILTER_CACHE[text] = tree
+    return tree
+
+
+def _row_filter_literal_text(literal: tuple) -> str:
+    kind, value = literal
+    if kind == "number":
+        return format(value.normalize(), "f")
+    if kind == "string":
+        return "'" + value.replace("'", "''") + "'"
+    if kind == "bool":
+        return "TRUE" if value else "FALSE"
+    if kind == "date":
+        return f"DATE '{value.isoformat()}'"
+    return f"TIMESTAMP '{value.isoformat(sep=' ')}'"
+
+
+def _row_filter_text(tree: tuple) -> str:
+    # Docstring: Canonical row_filter text: fully parenthesised with normalised literals.
+    #
+    # Formatting-only edits (spacing, keyword case, ``!=`` for ``<>``, ``1.50`` for
+    # ``1.5``) therefore keep the fingerprint, and the text parses back to the same tree.
+
+    tag = tree[0]
+    if tag in ("and", "or"):
+        return f" {tag.upper()} ".join(f"({_row_filter_text(child)})" for child in tree[1])
+    if tag == "not":
+        return f"NOT ({_row_filter_text(tree[1])})"
+    column = tree[1]
+    if tag == "null":
+        return f"{column} IS {'NOT ' if tree[2] else ''}NULL"
+    if tag == "cmp":
+        return f"{column} {tree[2]} {_row_filter_literal_text(tree[3])}"
+    negation = "NOT " if tree[2] else ""
+    if tag == "in":
+        values = ", ".join(_row_filter_literal_text(value) for value in tree[3])
+        return f"{column} {negation}IN ({values})"
+    low, high = _row_filter_literal_text(tree[3]), _row_filter_literal_text(tree[4])
+    return f"{column} {negation}BETWEEN {low} AND {high}"
+
+
+def _row_filter_kind(column: Column) -> str | None:
+    # Docstring: The literal kind a row_filter may compare ``column`` with, or None if none.
+
+    name = column.type_name.split("(", 1)[0].strip()
+    if name in _ROW_FILTER_NUMERIC_TYPES:
+        return "number"
+    if name in _ROW_FILTER_STRING_TYPES:
+        return "nstring" if name == "NVARCHAR" else "string"
+    if name in {"BOOLEAN", "BOOL"}:
+        return "bool"
+    if name == "DATE":
+        return "date"
+    if name.startswith("DATETIME"):
+        # Only a YEAR-anchored qualifier down to at least DAY decodes to a datetime.
+        start, end = ((column.length or 0) >> 8) & 0xF, (column.length or 0) & 0xF
+        if start == 0 and end >= 4:
+            return "timestamp"
+    return None
+
+
+def _row_filter_datetime_sql(value: datetime, column: Column) -> str:
+    # Docstring: Render ``value`` as an Informix DATETIME literal in ``column``'s qualifier.
+    #
+    # Fails when ``value`` carries a non-zero field finer than the qualifier holds, which
+    # could match in Python yet never in SQL.
+
+    end = (column.length or 0) & 0xF
+    digits = end - 10 if end > 10 else 0
+    scale = 10 ** (6 - digits)
+    kept = value.replace(
+        hour=value.hour if end >= 6 else 0,
+        minute=value.minute if end >= 8 else 0,
+        second=value.second if end >= 10 else 0,
+        microsecond=(value.microsecond // scale) * scale if digits else 0,
+    )
+    if kept != value:
+        raise InformixError(
+            f"Option '{_ROW_FILTER_OPTION}' value TIMESTAMP '{value}' is more precise than "
+            f"DATETIME column {column.name}"
+        )
+    text = f"{value.year:04d}-{value.month:02d}-{value.day:02d}"
+    fields = {6: f" {value.hour:02d}", 8: f":{value.minute:02d}", 10: f":{value.second:02d}"}
+    text += "".join(part for code, part in fields.items() if end >= code)
+    if digits:
+        text += "." + f"{value.microsecond:06d}"[:digits]
+    names = {4: "DAY", 6: "HOUR", 8: "MINUTE", 10: "SECOND"}
+    qualifier = f"FRACTION({digits})" if digits else names[end]
+    return f"DATETIME({text}) YEAR TO {qualifier}"
+
+
+def _check_row_filter(tree: tuple, table: Table) -> None:
+    # Docstring: Fail unless every predicate in ``tree`` compares a selected, filterable
+    # column of ``table`` with values of its kind.
+
+    columns = {column.name: column for column in table.columns}
+
+    def check(node: tuple) -> None:
+        tag = node[0]
+        if tag in ("and", "or"):
+            for child in node[1]:
+                check(child)
+            return
+        if tag == "not":
+            check(node[1])
+            return
+        name = node[1]
+        column = columns.get(name)
+        if column is None:
+            raise InformixError(
+                f"Option '{_ROW_FILTER_OPTION}' uses column {name}, which "
+                f"'{table.exposed_name}' does not have or does not select"
+            )
+        kind = _row_filter_kind(column)
+        if kind is None:
+            raise InformixError(
+                f"Option '{_ROW_FILTER_OPTION}' cannot filter on {column.type_name} column {name}"
+            )
+        if tag == "null":
+            return
+        literals = node[3] if tag == "in" else (node[3],) if tag == "cmp" else node[3:5]
+        expected = "string" if kind == "nstring" else kind
+        for literal in literals:
+            if literal[0] != expected:
+                raise InformixError(
+                    f"Option '{_ROW_FILTER_OPTION}' compares {column.type_name} column {name} "
+                    f"with a {literal[0]} value"
+                )
+            if kind == "timestamp":
+                _row_filter_datetime_sql(literal[1], column)
+        ordered = tag == "between" or (tag == "cmp" and node[2] not in ("=", "<>"))
+        if ordered and kind in ("nstring", "bool"):
+            raise InformixError(
+                f"Option '{_ROW_FILTER_OPTION}' can only test {column.type_name} column {name} "
+                "for equality"
+            )
+
+    check(tree)
+
+
+def _apply_row_filter(table: Table, text: str | None) -> Table:
+    # Docstring: Validate ``text`` against ``table`` and record its canonical form on the table.
+
+    if text is None or not str(text).strip():
+        return table if table.row_filter is None else replace(table, row_filter=None)
+    if len(str(text)) > 8192:
+        raise ValueError(f"Option '{_ROW_FILTER_OPTION}' cannot exceed 8192 characters")
+    tree = _parse_row_filter(str(text))
+    _check_row_filter(tree, table)
+    canonical = _row_filter_text(tree)
+    return table if table.row_filter == canonical else replace(table, row_filter=canonical)
+
+
+def _row_filter_sql(table: Table) -> str | None:
+    # Docstring: ``table``'s row_filter as an Informix SQL predicate, or None.
+
+    if table.row_filter is None:
+        return None
+    columns = {column.name: column for column in table.columns}
+
+    def literal(value: tuple, column: Column) -> str:
+        kind, item = value
+        if kind == "number":
+            return format(item, "f")
+        if kind == "string":
+            return "'" + item.replace("'", "''") + "'"
+        if kind == "bool":
+            return "'t'" if item else "'f'"
+        if kind == "date":
+            # MDY() builds the DATE without depending on the server's DBDATE format.
+            return f"MDY({item.month}, {item.day}, {item.year})"
+        return _row_filter_datetime_sql(item, column)
+
+    def render(node: tuple) -> str:
+        tag = node[0]
+        if tag in ("and", "or"):
+            return f" {tag.upper()} ".join(f"({render(child)})" for child in node[1])
+        if tag == "not":
+            return f"NOT ({render(node[1])})"
+        column = columns[node[1]]
+        name = _sql_identifier(column.name)
+        if tag == "null":
+            return f"{name} IS {'NOT ' if node[2] else ''}NULL"
+        if tag == "cmp":
+            return f"{name} {node[2]} {literal(node[3], column)}"
+        negation = "NOT " if node[2] else ""
+        if tag == "in":
+            values = ", ".join(literal(value, column) for value in node[3])
+            return f"{name} {negation}IN ({values})"
+        low, high = literal(node[3], column), literal(node[4], column)
+        return f"{name} {negation}BETWEEN {low} AND {high}"
+
+    return render(_parse_row_filter(table.row_filter))
+
+
+def _row_filter_predicate(table: Table) -> tuple[tuple, dict[str, str | None]] | None:
+    # Docstring: ``table``'s parsed row_filter with its columns' kinds, ready for
+    # :func:`_row_filter_matches`, or None when the table has no filter.
+
+    if table.row_filter is None:
+        return None
+    kinds = {column.name: _row_filter_kind(column) for column in table.columns}
+    return _parse_row_filter(table.row_filter), kinds
+
+
+def _row_filter_matches(predicate: tuple[tuple, dict[str, str | None]], row: dict) -> bool:
+    # Docstring: Whether ``row`` -- decoded Python values by column -- passes the filter.
+    # Unknown (NULL) counts as no match, exactly as in a SQL WHERE clause.
+
+    tree, kinds = predicate
+    return _row_filter_value(tree, row, kinds) is True
+
+
+def _row_filter_value(node: tuple, row: dict, kinds: dict[str, str | None]) -> bool | None:
+    tag = node[0]
+    if tag in ("and", "or"):
+        # AND stops at the first False, OR at the first True; a NULL otherwise wins.
+        stop = tag == "or"
+        result: bool | None = not stop
+        for child in node[1]:
+            value = _row_filter_value(child, row, kinds)
+            if value is stop:
+                return stop
+            if value is None:
+                result = None
+        return result
+    if tag == "not":
+        value = _row_filter_value(node[1], row, kinds)
+        return None if value is None else not value
+    value = row.get(node[1])
+    if tag == "null":
+        return (value is None) != node[2]
+    if value is None:
+        return None
+    kind = kinds[node[1]]
+    if tag == "cmp":
+        return _row_filter_compare(value, node[2], node[3][1], kind)
+    if tag == "in":
+        hit = any(_row_filter_compare(value, "=", literal[1], kind) for literal in node[3])
+        return hit != node[2]
+    inside = _row_filter_compare(value, ">=", node[3][1], kind) and _row_filter_compare(
+        value, "<=", node[4][1], kind
+    )
+    return inside != node[2]
+
+
+def _row_filter_compare(value: Any, op: str, literal: Any, kind: str | None) -> bool:
+    if kind in ("string", "nstring"):
+        # Pad to equal width: SQL compares CHAR and VARCHAR as if blank-padded.
+        value = str(value)
+        width = max(len(value), len(literal))
+        value, literal = value.ljust(width), literal.ljust(width)
+    elif kind == "timestamp" and isinstance(value, datetime) and value.tzinfo is not None:
+        # The decoder tags year-1 values UTC only so PySpark accepts them.
+        value = value.replace(tzinfo=None)
+    if op == "=":
+        return value == literal
+    if op == "<>":
+        return value != literal
+    if op == "<":
+        return value < literal
+    if op == "<=":
+        return value <= literal
+    if op == ">":
+        return value > literal
+    return value >= literal
 
 
 def _validated_volume_location(location: str, option_name: str, options: dict[str, str]) -> str:
@@ -4322,6 +4892,14 @@ class Table:
     nullable_index_key: tuple[str, ...] = ()
     nullable_index_descending: tuple[bool, ...] = ()
     key_from_nullable_index: bool = False
+    # The include_columns / exclude_columns selection as (mode, sorted names), or None.
+    # ``columns`` then holds only the selected columns, and ``catalog_columns`` every
+    # catalog column, which a positional `.unl` extract still needs. The selection and
+    # the canonical row_filter text are fingerprinted when set, so changing either on a
+    # running stream fails closed rather than silently diverging from rows already landed.
+    column_selection: tuple[str, tuple[str, ...]] | None = None
+    catalog_columns: tuple[Column, ...] = ()
+    row_filter: str | None = None
 
     @property
     def exposed_name(self) -> str:
@@ -4384,6 +4962,17 @@ class Table:
                     f"Nullable-index candidate for {database}.{owner}.{name} names unknown "
                     f"column {column_name!r}"
                 )
+        # Only schema-history state carries these two; a catalog description never does.
+        selection_raw = raw.get("column_selection")
+        selection = None
+        if selection_raw is not None:
+            mode, names = selection_raw
+            if mode not in {"include", "exclude"}:
+                raise InformixError(
+                    f"Invalid column selection metadata for {database}.{owner}.{name}"
+                )
+            selection = (str(mode), tuple(str(value) for value in names))
+        row_filter = raw.get("row_filter")
         return cls(
             database,
             owner,
@@ -4394,6 +4983,8 @@ class Table:
             key_descending=key_descending,
             nullable_index_key=nullable_index_key,
             nullable_index_descending=nullable_index_descending,
+            column_selection=selection,
+            row_filter=None if row_filter is None else str(row_filter),
         )
 
 
@@ -4818,25 +5409,13 @@ def _run_shared_cdc_shard(shard: _SharedCdcShard) -> None:
                 schema_map = {}
                 for identity, table in identities:
                     fresh = Table.parse(reader._bridge.get_table(table.identity), table.database)
-                    if table.key_override:
-                        # Preserve the subscriber's primary.keys override (and its
-                        # fingerprint) on the daemon's schema, exactly as
-                        # _refresh_table_schema does. Without this an overridden table's
-                        # fingerprint never matches its checkpoint, so it would always
-                        # fall back to a direct read and never benefit from sharding --
-                        # and its PK-change detection would use the wrong keys. A
-                        # wildcard key is re-expanded to the fresh columns instead.
-                        fresh = _carry_key_override(fresh, table)
-                    elif table.key_from_nullable_index:
-                        # Same for a nullable-index promotion (a table-level option
-                        # the catalog re-derivation cannot see): keep the promoted key.
-                        fresh = replace(
-                            fresh,
-                            primary_keys=table.primary_keys,
-                            key_descending=table.key_descending,
-                            key_from_nullable_index=True,
-                        )
-                    schema_map[identity] = fresh
+                    # Preserve the subscriber's table options (column selection, key
+                    # override or promotion, row_filter, and so its fingerprint) on the
+                    # daemon's schema, exactly as _refresh_table_schema does. Without this
+                    # an overridden table's fingerprint never matches its checkpoint, so it
+                    # would always fall back to a direct read and never benefit from
+                    # sharding -- and its PK-change detection would use the wrong keys.
+                    schema_map[identity] = _carry_table_options(fresh, table)
                 min_lsn = reader._bridge.minimum_lsn()
                 current_lsn = reader._bridge.current_lsn()
                 raw = reader._read_changes_with_reconnect(
@@ -5734,7 +6313,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             if self._tables is None:
                 self._tables = {}
             self._tables[exposed] = table
-            return self._apply_key_options(table, table_options)
+            return self._apply_table_options(table, table_options)
 
     def _resolve_registration_table(self, exposed: str) -> Table:
         # Docstring: Resolve a single configured table by exposed ``owner.name`` via a
@@ -7302,6 +7881,18 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             self._apply_nullable_index_promotion(table, table_options), table_options
         )
 
+    def _apply_table_options(self, table: Table, table_options: dict[str, str]) -> Table:
+        # Docstring: Apply every per-table option that reshapes the catalog table.
+        #
+        # The column selection runs first, so the key options see only the selected
+        # columns (a wildcard key covers just those), and row_filter last, since it may
+        # only use selected columns.
+
+        table = _apply_column_selection(table, _column_selection(table_options))
+        table = self._apply_key_options(table, table_options)
+        _ensure_selected_keys(table)
+        return _apply_row_filter(table, table_options.get(_ROW_FILTER_OPTION))
+
     def _snapshot_mode(self, table_options: dict[str, str]) -> str:
         mode = (
             str(
@@ -8862,7 +9453,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 table.identity,
                 list(table.primary_keys),
                 chunk_exprs=chunk_exprs or None,
-                snapshot_filter=snapshot_filter,
+                snapshot_filter=_snapshot_predicate(snapshot_filter, table),
                 key_descending=list(table.key_descending),
             ),
             table=table,
@@ -8920,7 +9511,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 table.identity,
                 list(table.primary_keys),
                 chunk_exprs=chunk_exprs or None,
-                snapshot_filter=incremental.get("snapshot_filter"),
+                snapshot_filter=_snapshot_predicate(incremental.get("snapshot_filter"), table),
                 key_descending=list(table.key_descending),
             ),
             table=table,
@@ -9062,7 +9653,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     cursor,
                     page_size + 1,
                     chunk_exprs=chunk_exprs or None,
-                    snapshot_filter=incremental.get("snapshot_filter"),
+                    snapshot_filter=_snapshot_predicate(incremental.get("snapshot_filter"), table),
                     key_descending=list(table.key_descending),
                 ),
                 table=table,
@@ -9441,7 +10032,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                         for column in table.columns
                     ),
                     page_consumer=page_consumer,
-                    snapshot_filter=_snapshot_filter(options),
+                    snapshot_filter=_snapshot_predicate(_snapshot_filter(options), table),
                     isolation=self._snapshot_isolation(options),
                 )
                 if pipeline is not None:
@@ -10246,7 +10837,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         commit_time = self._resolve_unl_commit_time(
             self._table_snapshot_source(table_options) or ""
         )
-        return [
+        shaped = (
             _shape_unl_record(
                 raw,
                 table,
@@ -10258,7 +10849,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 commit_time=commit_time,
             )
             for raw in raw_records
-        ]
+        )
+        return [row for row in shaped if row is not None]
 
     def _serve_unl_snapshot(
         self, table: Table, options: dict[str, str], snapshot_lsn: int
@@ -10286,7 +10878,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             else:
                 records = _iter_unl_records(read_chunk, 0, size, escape=escape_byte)
             for raw in records:
-                yield _shape_unl_record(
+                row = _shape_unl_record(
                     raw,
                     table,
                     snapshot_lsn,
@@ -10296,6 +10888,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     escape=escape,
                     commit_time=commit_time,
                 )
+                if row is not None:
+                    yield row
 
     def _read_unl_split(
         self, partition: dict, table_options: dict[str, str]
@@ -10309,13 +10903,22 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # seek -- the same fallback shape as the driver's ``_unl_read_chunk``. A gzip split
         # (``gzip=True``) spans the whole file and is decompressed as one stream.
 
-        columns = tuple(Column.parse(raw) for raw in partition["columns"])
+        # ``columns`` is the extract's full catalog layout; ``selected`` (absent without a
+        # column selection) names the columns to keep, and ``row_filter`` the filter.
+        catalog = tuple(Column.parse(raw) for raw in partition["columns"])
+        selected = partition.get("selected")
+        columns = catalog
+        if selected is not None:
+            wanted = set(selected)
+            columns = tuple(column for column in catalog if column.name in wanted)
         table = Table(
             database="",
             owner="",
             name=str(partition.get("exposed_name", "")),
             columns=columns,
             primary_keys=(),
+            catalog_columns=catalog if selected is not None else (),
+            row_filter=partition.get("row_filter"),
         )
         snapshot_lsn = int(partition["snapshot_lsn"])
         encoding = str(partition.get("encoding") or "utf-8")
@@ -10339,7 +10942,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         else:
             records = _iter_unl_records(read_chunk, start, end, escape=escape_byte)
         for raw in records:
-            yield _shape_unl_record(
+            row = _shape_unl_record(
                 raw,
                 table,
                 snapshot_lsn,
@@ -10350,6 +10953,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 escape=escape,
                 commit_time=commit_time,
             )
+            if row is not None:
+                yield row
 
     def _unl_all_splits(
         self, table: Table, table_options: dict[str, str]
@@ -10417,7 +11022,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 "precision": column.precision,
                 "scale": column.scale,
             }
-            for column in table.columns
+            for column in table.catalog_columns or table.columns
         ]
         files_api = self._staging_transport()
         token = files_api._credential.bearer() if files_api is not None else None
@@ -10436,6 +11041,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 "end_byte": end_byte,
                 "gzip": is_gzip,
                 "columns": columns,
+                **(
+                    {}
+                    if table.column_selection is None
+                    else {"selected": [column.name for column in table.columns]}
+                ),
+                **({} if table.row_filter is None else {"row_filter": table.row_filter}),
                 "snapshot_lsn": snapshot_lsn,
                 "exposed_name": table.exposed_name,
                 "encoding": encoding,
@@ -10565,7 +11176,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 None,
                 limit + 1,
                 self._table_int_option(options, "snapshot.max.bytes", 0, minimum=0),
-                snapshot_filter=_snapshot_filter(options),
+                snapshot_filter=_snapshot_predicate(_snapshot_filter(options), table),
             ),
             table=table,
             operation="snapshot read",
@@ -11446,7 +12057,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     f"Immutable schema node identity mismatch for '{table.exposed_name}'"
                 )
             previous_table = _table_from_schema_state(previous, table.database)
-            _ensure_additive_schema_change(previous_table, table, extend_wildcard_key=extend_key)
+            _ensure_compatible_schema_change(previous_table, table, extend_wildcard_key=extend_key)
             transition_record = self._read_immutable_head(namespace)
             if transition_record is None and owner:
                 if previous_table.primary_keys != table.primary_keys:
@@ -11498,11 +12109,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     raise InformixError(
                         f"Invalid immutable schema identity for '{table.exposed_name}'"
                     )
-                _ensure_additive_schema_change(
+                _ensure_compatible_schema_change(
                     previous_table, target_table, extend_wildcard_key=extend_key
                 )
                 if _schema_fingerprint(target_table) != _schema_fingerprint(table):
-                    _ensure_additive_schema_change(
+                    _ensure_compatible_schema_change(
                         target_table, table, extend_wildcard_key=extend_key
                     )
                 schema_winner = self._publish_immutable_head(
@@ -11565,27 +12176,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
 
     def _refresh_table_schema(self, table: Table, expected_fingerprint: str | None) -> Table:
         refreshed = Table.parse(self._bridge.get_table(table.identity), table.database)
-        if table.key_override:
-            # Keep the primary.keys override (and therefore the fingerprint) across a
-            # schema refresh instead of reverting to the catalog's keys. Only applies
-            # when the caller was already overridden, so a genuine catalog key change
-            # on a normal table is still detected as drift. The override's adopted
-            # key-index directions are preserved too, so a mixed-direction override
-            # keeps paging in its index order across the refresh. A wildcard key is
-            # every column, so it is re-expanded instead: an added column joins the key,
-            # which the schema transition accepts for a streaming table.
-            refreshed = _carry_key_override(refreshed, table)
-        elif table.key_from_nullable_index:
-            # Preserve a nullable-index promotion across the refresh: the catalog
-            # re-derives the table as key-less (no all-NOT-NULL index), so without
-            # this the promoted key -- and its directions -- would be dropped and the
-            # key-order guard would trip mid-copy.
-            refreshed = replace(
-                refreshed,
-                primary_keys=table.primary_keys,
-                key_descending=table.key_descending,
-                key_from_nullable_index=True,
-            )
+        # Keep the table options (and therefore the fingerprint) across a schema refresh
+        # instead of reverting to the bare catalog table. A primary.keys override is only
+        # carried when the caller was already overridden, so a genuine catalog key change
+        # on a normal table is still detected as drift; its adopted key-index directions
+        # come along, so a mixed-direction override keeps paging in its index order. A
+        # wildcard key is every column, so it is re-expanded instead: an added column
+        # joins the key, which the schema transition accepts for a streaming table.
+        refreshed = _carry_table_options(refreshed, table)
         _ensure_materializable(refreshed)
         fingerprint = _schema_fingerprint(refreshed)
         if expected_fingerprint is not None and expected_fingerprint != fingerprint:
@@ -12449,7 +13047,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _table(self, name: str, options: dict[str, str], refresh: bool = False) -> Table:
         exposed = options.get("qualified_source_table", name)
         if self._tables is not None and exposed in self._tables and not refresh:
-            return self._apply_key_options(self._tables[exposed], options)
+            return self._apply_table_options(self._tables[exposed], options)
         parts = _split_identity(exposed)
         if len(parts) == 2 and all(_IDENTIFIER.fullmatch(part) for part in parts):
             database = self.options.get("database", "")
@@ -12462,11 +13060,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             if self._tables is None:
                 self._tables = {}
             self._tables[exposed] = table
-            return self._apply_key_options(table, options)
+            return self._apply_table_options(table, options)
         tables = self._table_map(refresh=refresh)
         if exposed not in tables:
             raise ValueError(f"Unknown or excluded Informix table '{exposed}'")
-        return self._apply_key_options(tables[exposed], options)
+        return self._apply_table_options(tables[exposed], options)
 
 
 # Conventional alias used by some connector loaders.
@@ -13049,6 +13647,13 @@ def _project_transaction(
     # has no key to change, so its UPDATEs land only their after-image. TRUNCATE is
     # unrepresentable on either channel.
 
+    #
+    # With a row_filter, membership comes from the images: a change whose rows never match
+    # is dropped, an UPDATE that moves a row out of the filter is a delete of its
+    # before-image, and one that moves a row in is an upsert of its after-image alone --
+    # its old key was never landed, so there is no old key to delete.
+
+    predicate = _row_filter_predicate(table)
     output = []
     for record in tx.records:
         if not _record_matches(record, table):
@@ -13060,18 +13665,21 @@ def _project_transaction(
             )
         before = record.get("before", record.get("row") if op == "DELETE" else None)
         after = record.get("after", record.get("row") if op == "INSERT" else None)
+        entered = False
+        if predicate is not None:
+            was_in = op in {"UPDATE", "DELETE"} and _row_filter_matches(predicate, before or {})
+            is_in = op in {"INSERT", "UPDATE"} and _row_filter_matches(predicate, after or {})
+            if not (was_in or is_in):
+                continue
+            if op == "UPDATE" and not is_in:
+                op = "DELETE"
+            entered = op == "UPDATE" and not was_in
+        key_changed = op == "UPDATE" and not entered and _key(before, table) != _key(after, table)
         if deletes:
-            if op == "DELETE":
-                output.append(_shape_delete(before, table, record, tx))
-            elif op == "UPDATE" and _key(before, table) != _key(after, table):
+            if op == "DELETE" or key_changed:
                 output.append(_shape_delete(before, table, record, tx))
         elif op in {"INSERT", "UPDATE"}:
-            if (
-                op == "UPDATE"
-                and tombstones
-                and table.primary_keys
-                and _key(before, table) != _key(after, table)
-            ):
+            if tombstones and table.primary_keys and key_changed:
                 output.append(_shape_tombstone(before, table, record, tx, lsn=_before_lsn(record)))
             output.append(_shape_change(after, record, tx, "u" if op == "UPDATE" else "c"))
         elif op == "DELETE" and tombstones:
@@ -13655,7 +14263,7 @@ def _shape_unl_record(
     delimiter: str = _UNL_DEFAULT_DELIMITER,
     escape: str = _UNL_DEFAULT_ESCAPE,
     commit_time: int | None = None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     # Docstring: Parse, type-convert, and shape one UNLOAD / HPL DELIMITED record -- shared by both
     # serve paths.
     #
@@ -13665,20 +14273,29 @@ def _shape_unl_record(
     # ``delimiter``/``escape`` select the delimited dialect (UNLOAD's ``|``/backslash by
     # default, or an HPL job's configured pair).
 
+    #
+    # An extract holds every catalog column, so fields are matched positionally against
+    # ``catalog_columns`` under a column selection and only the selected ones converted.
+    # Returns None for a record the table's row_filter drops.
+
     fields = _parse_unload_fields(
         raw.decode(encoding, "strict"), delimiter=delimiter, escape=escape
     )
-    columns = table.columns
-    if len(fields) != len(columns):
+    catalog = table.catalog_columns or table.columns
+    if len(fields) != len(catalog):
         name = exposed_name if exposed_name is not None else table.exposed_name
         raise InformixError(
             f"UNLOAD record in snapshot.source for '{name}' has {len(fields)} fields "
-            f"but the table has {len(columns)} columns"
+            f"but the table has {len(catalog)} columns"
         )
+    position = {column.name: index for index, column in enumerate(catalog)}
     row = {
-        column.name: _unload_value(fields[index], column.type_name)
-        for index, column in enumerate(columns)
+        column.name: _unload_value(fields[position[column.name]], column.type_name)
+        for column in table.columns
     }
+    predicate = _row_filter_predicate(table)
+    if predicate is not None and not _row_filter_matches(predicate, row):
+        return None
     return _shape_snapshot(row, snapshot_lsn, table, options, commit_time=commit_time)
 
 
@@ -14059,28 +14676,32 @@ def _offset(
 
 
 def _schema_fingerprint(table: Table) -> str:
-    layout = repr(
-        (
-            table.database,
-            table.owner,
-            table.name,
-            table.incarnation,
-            table.primary_keys,
-            tuple(
-                (
-                    column.name,
-                    column.type_name,
-                    column.nullable,
-                    column.length,
-                    column.precision,
-                    column.scale,
-                    column.cdc_supported,
-                )
-                for column in table.columns
-            ),
-        )
-    ).encode("utf-8")
-    return hashlib.sha256(layout).hexdigest()
+    parts: tuple[Any, ...] = (
+        table.database,
+        table.owner,
+        table.name,
+        table.incarnation,
+        table.primary_keys,
+        tuple(
+            (
+                column.name,
+                column.type_name,
+                column.nullable,
+                column.length,
+                column.precision,
+                column.scale,
+                column.cdc_supported,
+            )
+            for column in table.columns
+        ),
+    )
+    # Appended only when set, so a table using neither keeps the fingerprint every
+    # existing checkpoint was written with.
+    if table.column_selection is not None:
+        parts += (("column_selection", table.column_selection),)
+    if table.row_filter is not None:
+        parts += (("row_filter", table.row_filter),)
+    return hashlib.sha256(repr(parts).encode("utf-8")).hexdigest()
 
 
 def _schema_state(
@@ -14113,6 +14734,17 @@ def _schema_state(
                 }
                 for column in table.columns
             ],
+            **(
+                {}
+                if table.column_selection is None
+                else {
+                    "column_selection": [
+                        table.column_selection[0],
+                        list(table.column_selection[1]),
+                    ]
+                }
+            ),
+            **({} if table.row_filter is None else {"row_filter": table.row_filter}),
         },
     }
 
@@ -14140,6 +14772,33 @@ def _table_from_schema_state(state: dict[str, object], default_database: str) ->
     return table
 
 
+def _carry_table_options(fresh: Table, previous: Table) -> Table:
+    # Docstring: Re-apply ``previous``'s option-derived state to ``fresh``, re-read from
+    # the catalog.
+    #
+    # A catalog read knows nothing of table options, so without this a refresh would
+    # revert a column selection, a primary.keys override, a nullable-index promotion, or a
+    # row_filter, change the fingerprint, and read as drift. The selection runs first so a
+    # wildcard key re-expands over the selected columns only.
+
+    fresh = _apply_column_selection(fresh, previous.column_selection)
+    if previous.key_override:
+        # A wildcard key is re-expanded to the fresh columns instead of kept as listed.
+        fresh = _carry_key_override(fresh, previous)
+    elif previous.key_from_nullable_index:
+        # The catalog re-derives the table as key-less (no all-NOT-NULL index), so without
+        # this the promoted key -- and its directions -- would be dropped and the
+        # key-order guard would trip mid-copy.
+        fresh = replace(
+            fresh,
+            primary_keys=previous.primary_keys,
+            key_descending=previous.key_descending,
+            key_from_nullable_index=True,
+        )
+    _ensure_selected_keys(fresh)
+    return _apply_row_filter(fresh, previous.row_filter)
+
+
 def _carry_key_override(fresh: Table, overridden: Table) -> Table:
     # Docstring: Carry a ``primary.keys`` override from ``overridden`` onto a re-read ``fresh``
     # table.
@@ -14163,21 +14822,69 @@ def _carry_key_override(fresh: Table, overridden: Table) -> Table:
     )
 
 
-def _ensure_additive_schema_change(
+_WIDENABLE_STRING_TYPES = frozenset({"CHAR", "VARCHAR", "NVARCHAR", "LVARCHAR"})
+
+
+def _string_capacity(column: Column) -> int:
+    # VARCHAR and NVARCHAR pack their minimum reserved length into the high byte.
+    length = column.length or 0
+    return length & 0xFF if column.type_name in {"VARCHAR", "NVARCHAR"} else length
+
+
+def _widened(previous: Column, current: Column) -> bool:
+    # Docstring: Whether ``current`` widens ``previous`` without changing its Spark type.
+    #
+    # A longer CHAR, VARCHAR, NVARCHAR, or LVARCHAR stays StringType, and SMALLINT is
+    # already reported as IntegerType, so neither changes what the destination holds.
+    # Nullability must not change.
+
+    if (previous.name, previous.nullable, previous.cdc_supported) != (
+        current.name,
+        current.nullable,
+        current.cdc_supported,
+    ):
+        return False
+    if previous.type_name == current.type_name in _WIDENABLE_STRING_TYPES:
+        return _string_capacity(current) >= _string_capacity(previous)
+    return previous.type_name in {"SMALLINT", "INT2"} and current.type_name in {"INTEGER", "INT"}
+
+
+def _ensure_compatible_schema_change(
     previous: Table, current: Table, *, extend_wildcard_key: bool = False
 ) -> None:
-    # Docstring: Fail closed unless ``current`` only appends nullable, CDC-supported columns.
+    # Docstring: Fail closed unless the stream can adopt ``current`` without a full refresh.
     #
-    # The key must be unchanged, except that with ``extend_wildcard_key`` a whole-row key may
-    # grow by exactly the appended columns: every previous column, in order, followed by
-    # the additions.
+    # Columns are matched by name. Allowed, in any combination:
+    #
+    # - widening a column without changing its Spark type (see :func:`_widened`);
+    # - dropping a nullable, non-key column -- the connector stops reporting it, and the
+    #   destination keeps it: an SCD1 row updated afterwards keeps its last value there,
+    #   while rows inserted and SCD2 versions written afterwards hold NULL;
+    # - appending nullable, CDC-supported columns after every surviving one.
+    #
+    # Anything else -- reordering, another type change, a NOT NULL or key column dropped
+    # or added -- fails closed, and so does changing include_columns / exclude_columns or
+    # row_filter: rows already landed were selected under the old setting, and the new
+    # one cannot be applied to them without a re-read. The one selection edit accepted is
+    # taking out a name whose column no longer exists. The key must be unchanged, except
+    # that with ``extend_wildcard_key`` a whole-row key may grow by exactly the appended
+    # columns (and nothing dropped).
 
+    name = current.exposed_name
+    current_names = {column.name for column in current.columns}
+    survivors = [column for column in previous.columns if column.name in current_names]
+    dropped = [column for column in previous.columns if column.name not in current_names]
+    additions = current.columns[len(survivors) :]
     keys_match = previous.primary_keys == current.primary_keys
     if not keys_match and extend_wildcard_key:
-        additions = tuple(column.name for column in current.columns[len(previous.columns) :])
-        keys_match = bool(additions) and (
-            previous.primary_keys == tuple(column.name for column in previous.columns)
-            and current.primary_keys == previous.primary_keys + additions
+        added = tuple(column.name for column in additions)
+        keys_match = (
+            bool(added)
+            and not dropped
+            and (
+                previous.primary_keys == tuple(column.name for column in previous.columns)
+                and current.primary_keys == previous.primary_keys + added
+            )
         )
     if not keys_match or (
         previous.database,
@@ -14191,25 +14898,57 @@ def _ensure_additive_schema_change(
         current.incarnation,
     ):
         raise InformixError(
-            f"Informix schema change for '{current.exposed_name}' changed table identity or "
-            "primary keys; run a full refresh"
+            f"Informix schema change for '{name}' changed table identity or primary keys; "
+            "run a full refresh"
         )
-    if len(current.columns) <= len(previous.columns):
+    if [column.name for column in current.columns[: len(survivors)]] != [
+        column.name for column in survivors
+    ]:
         raise InformixError(
-            f"Informix schema change for '{current.exposed_name}' is not an additive column "
-            "change; run a full refresh"
+            f"Informix schema change for '{name}' reordered existing columns or added one "
+            "before them; run a full refresh"
         )
-    if current.columns[: len(previous.columns)] != previous.columns:
-        raise InformixError(
-            f"Informix schema change for '{current.exposed_name}' modified, removed, or "
-            "reordered existing columns; run a full refresh"
-        )
-    additions = current.columns[len(previous.columns) :]
+    for old, new in zip(survivors, current.columns):
+        if old != new and not _widened(old, new):
+            raise InformixError(
+                f"Informix schema change for '{name}' changed column {old.name} other than "
+                "by widening its length or SMALLINT to INTEGER; run a full refresh"
+            )
     if any(not column.nullable or not column.cdc_supported for column in additions):
         raise InformixError(
-            f"Informix schema change for '{current.exposed_name}' added a non-nullable or "
-            "CDC-unsupported column; run a full refresh"
+            f"Informix schema change for '{name}' added a non-nullable or CDC-unsupported "
+            "column; run a full refresh"
         )
+    for column in dropped:
+        if not column.nullable:
+            raise InformixError(
+                f"Informix schema change for '{name}' dropped NOT NULL column {column.name}; "
+                "run a full refresh"
+            )
+    if previous.column_selection != current.column_selection and not _selection_cleanup_only(
+        previous, current
+    ):
+        raise InformixError(
+            f"'{_INCLUDE_COLUMNS_OPTION}' / '{_EXCLUDE_COLUMNS_OPTION}' changed for '{name}'; "
+            "run a full refresh so every row is read under the new selection"
+        )
+    if previous.row_filter != current.row_filter:
+        raise InformixError(
+            f"'{_ROW_FILTER_OPTION}' changed for '{name}'; run a full refresh so every row "
+            "is read under the new filter"
+        )
+
+
+def _selection_cleanup_only(previous: Table, current: Table) -> bool:
+    # Docstring: Whether the selection only lost names of columns the table no longer has.
+
+    if previous.column_selection is None or current.column_selection is None:
+        return False
+    if previous.column_selection[0] != current.column_selection[0]:
+        return False
+    catalog = {column.name for column in current.catalog_columns or current.columns}
+    changed = set(previous.column_selection[1]) ^ set(current.column_selection[1])
+    return not changed & catalog
 
 
 def _unl_position(offset: dict[str, Any], *, terminal: int | None = None) -> tuple[int, int]:
