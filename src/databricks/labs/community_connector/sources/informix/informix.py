@@ -33,7 +33,7 @@ import zlib
 from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
-from decimal import ROUND_DOWN, Decimal, InvalidOperation
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal, InvalidOperation, localcontext
 from typing import Any, Callable, Iterable, Iterator, Protocol, Sequence
 
 from databricks.labs.community_connector.interface import LakeflowConnect
@@ -4103,6 +4103,148 @@ def _apply_column_renames(table: Table, renames: tuple[tuple[str, str], ...] | N
     return table if table.column_renames == renames else replace(table, column_renames=renames)
 
 
+_TRANSFORM_COLUMNS_OPTION = "transform_columns"
+# transform_columns replaces chosen columns' values as rows leave the connector: an
+# object from column name to an expression over that column, e.g. {"ssn": "MASK(ssn, 4)",
+# "email": "HASH(LOWER(email))"}. Expressions use row_filter's grammar and functions plus
+# MASK, HASH, and NULLIFY, and run in Python only, on the values the connector emits
+# (CHAR without its padding, dates and timestamps as ISO text), so raw values never
+# reach Spark. A key column takes only HASH(column), which keeps keys one-to-one so
+# deletes still match. row_filter, the column selection, and the key options keep
+# seeing source values; renames apply after.
+_TRANSFORM_CACHE: dict[str, tuple] = {}
+# Functions whose result is an integer whatever their input; the others keep the type of
+# what they apply to (strings stay strings, ABS/ROUND/TRUNC/MOD/NVL keep a number's type).
+_INTEGER_RESULT_FUNCTIONS = frozenset({"YEAR", "MONTH", "DAY", "WEEKDAY", "LENGTH", "CHAR_LENGTH"})
+
+
+def _column_transforms(options: dict[str, str]) -> tuple[tuple[str, str, Any], ...] | None:
+    # Docstring: The table's transform_columns as sorted (column, canonical text, operand).
+
+    raw = options.get(_TRANSFORM_COLUMNS_OPTION)
+    if raw is None or not str(raw).strip():
+        return None
+    text = str(raw).strip()
+    cached = _TRANSFORM_CACHE.get(text)
+    if cached is not None:
+        return cached
+    option = _TRANSFORM_COLUMNS_OPTION
+    try:
+        pairs = json.loads(text, object_pairs_hook=list)
+    except ValueError as error:
+        raise ValueError(f"Option '{option}' is not a valid JSON object") from error
+    if not isinstance(pairs, list) or not all(
+        isinstance(pair, tuple) and all(isinstance(value, str) for value in pair) for pair in pairs
+    ):
+        raise ValueError(f"Option '{option}' must map column names to expressions")
+    columns = [column for column, _ in pairs]
+    if len(columns) != len(set(columns)):
+        raise ValueError(f"Option '{option}' transforms a column twice")
+    parsed = []
+    for column, expression in pairs:
+        operand = _RowFilterParser(expression, option, "transform").parse_expression()
+        if isinstance(operand, str):
+            raise ValueError(f"Option '{option}' for {column} applies no function")
+        parsed.append((column, _expression_text(operand), operand))
+    result = tuple(sorted(parsed, key=lambda item: item[0])) or None
+    if len(_TRANSFORM_CACHE) >= 64:
+        _TRANSFORM_CACHE.clear()
+    _TRANSFORM_CACHE[text] = result
+    return result
+
+
+def _transform_key_id(key: str | None) -> str | None:
+    # Docstring: A non-secret id of the HASH key, fingerprinted so a new key fails closed.
+    #
+    # An HMAC under the key itself, so it says nothing about the key without it.
+
+    if not key:
+        return None
+    digest = hmac.new(key.encode("utf-8"), b"lakeflow-informix-transform-key-id", hashlib.sha256)
+    return digest.hexdigest()[:16]
+
+
+def _apply_column_transforms(
+    table: Table, transforms: tuple | None, key: str | None, *, key_id: str | None = None
+) -> Table:
+    # Docstring: Validate ``transforms`` against ``table`` and record their canonical form.
+    #
+    # ``key`` is the transform.hash.key connection option, required when HASH is used;
+    # a schema refresh, which carries a validated table forward, passes its ``key_id``.
+
+    option = _TRANSFORM_COLUMNS_OPTION
+    if transforms is None:
+        if table.column_transforms is None:
+            return table
+        return replace(table, column_transforms=None, transform_key_id=None)
+    columns = {column.name: column for column in table.columns}
+    uses_hash = False
+    for name, canonical, operand in transforms:
+        if name not in columns:
+            raise InformixError(
+                f"Option '{option}' transforms column {name}, which '{table.exposed_name}' "
+                "does not have or does not select"
+            )
+        if _expression_column(operand) != name:
+            raise InformixError(
+                f"Option '{option}' for {name} reads {_expression_column(operand)}; an "
+                "expression may only read the column it replaces"
+            )
+        _expression_kind(operand, columns, option, table.exposed_name, filtering=False)
+        uses_hash = uses_hash or "HASH(" in canonical
+        if name in table.primary_keys and canonical != f"HASH({name})":
+            raise InformixError(
+                f"Option '{option}' may only HASH key column {name}: any other change could "
+                "map two keys to one, and deletes would remove the wrong rows"
+            )
+    if uses_hash and key_id is None:
+        if not key or len(key) < 16:
+            raise InformixError(
+                f"Option '{option}' uses HASH, which needs the connection option "
+                f"'{_TRANSFORM_HASH_KEY_OPTION}' set to a secret of at least 16 characters"
+            )
+        key_id = _transform_key_id(key)
+    recorded = tuple((name, canonical) for name, canonical, _ in transforms)
+    key_id = key_id if uses_hash else None
+    if table.column_transforms == recorded and table.transform_key_id == key_id:
+        return table
+    return replace(table, column_transforms=recorded, transform_key_id=key_id)
+
+
+def _transform_spark_type(operand: str | tuple, column: "Column", options: dict[str, str]):
+    # Docstring: The Spark type a transform lands as, given the column it reads.
+
+    if isinstance(operand, str):
+        return _spark_type(column, options)
+    name = operand[1]
+    if name in ("HASH", "MASK") or name in _STRING_FUNCTION_NAMES:
+        return StringType()
+    if name in _INTEGER_RESULT_FUNCTIONS:
+        return IntegerType()
+    inner = _transform_spark_type(operand[2][0], column, options)
+    if name == "ROUND" and isinstance(inner, DecimalType):
+        # Rounding up can carry into one more integer digit (999.99 to 1000).
+        return DecimalType(min(inner.precision + 1, 38), inner.scale)
+    return inner
+
+
+def _transformed_rows(rows: Iterator[dict], transforms: tuple | None, context: dict):
+    # Docstring: ``rows`` with each transformed column's value replaced (source names).
+
+    if not transforms:
+        return rows
+
+    def apply(row: dict) -> dict:
+        out = dict(row)
+        for name, _, operand in transforms:
+            if name in out:
+                value = _expression_value(operand, out, context)
+                out[name] = _framework_value(value)
+        return out
+
+    return (apply(row) for row in rows)
+
+
 def _renamed_rows(rows: Iterator[dict], renames: tuple[tuple[str, str], ...] | None):
     # Docstring: ``rows`` with their keys under the destination names ``renames`` gives.
 
@@ -4113,6 +4255,8 @@ def _renamed_rows(rows: Iterator[dict], renames: tuple[tuple[str, str], ...] | N
 
 
 _ROW_FILTER_OPTION = "row_filter"
+# The connection option holding transform_columns' HMAC key (see HASH).
+_TRANSFORM_HASH_KEY_OPTION = "transform.hash.key"
 # row_filter keeps only the rows matching a predicate -- in snapshots, file-sourced
 # snapshots, and the change stream alike -- and is named as in Lakeflow Connect. The
 # connector parses it itself so the same predicate can be rendered to SQL for snapshots
@@ -4177,17 +4321,322 @@ _ROW_FILTER_STRING_TYPES = frozenset({"CHAR", "VARCHAR", "LVARCHAR", "NVARCHAR"}
 _ROW_FILTER_CACHE: dict[str, tuple] = {}
 
 
+# Deterministic functions shared by row_filter and transform_columns: name -> (input
+# kinds, literal argument kinds, result kind, filter). An argument kind ending in "?"
+# is optional; "same" means the kind of the function's input. row_filter renders each
+# function to Informix SQL for snapshots and evaluates it in Python on change images and
+# file records, so the two must agree: every filter function's Python twin below was
+# measured against Informix 14.10 (see the README). MASK, HASH, and NULLIFY run only in
+# Python, where transform_columns applies them, so they are not filter functions.
+# Functions whose result depends on the clock, the session, or the database locale's
+# collation (TODAY, CURRENT, USER) are deliberately absent: a filter on them would
+# change a row's membership without any change event to carry it.
+_STRING_KINDS = ("string", "nstring")
+_VALUE_KINDS = ("string", "nstring", "number", "bool", "date", "timestamp")
+_DATE_KINDS = ("date", "timestamp")
+_EXPRESSION_FUNCTIONS = {
+    "UPPER": (_STRING_KINDS, (), "same", True),
+    "LOWER": (_STRING_KINDS, (), "same", True),
+    "TRIM": (_STRING_KINDS, (), "same", True),
+    "LTRIM": (_STRING_KINDS, (), "same", True),
+    "RTRIM": (_STRING_KINDS, (), "same", True),
+    "LENGTH": (_STRING_KINDS, (), "number", True),
+    "CHAR_LENGTH": (_STRING_KINDS, (), "number", True),
+    "SUBSTR": (_STRING_KINDS, ("number", "number?"), "same", True),
+    "REPLACE": (_STRING_KINDS, ("string", "string?"), "same", True),
+    "LPAD": (_STRING_KINDS, ("number", "string"), "same", True),
+    "RPAD": (_STRING_KINDS, ("number", "string"), "same", True),
+    "NVL": (_VALUE_KINDS, ("same",), "same", True),
+    "COALESCE": (_VALUE_KINDS, ("same",), "same", True),
+    "ABS": (("number",), (), "number", True),
+    "MOD": (("number",), ("number",), "number", True),
+    "ROUND": (("number",), ("number?",), "number", True),
+    "TRUNC": (("number",), ("number?",), "number", True),
+    "YEAR": (_DATE_KINDS, (), "number", True),
+    "MONTH": (_DATE_KINDS, (), "number", True),
+    "DAY": (_DATE_KINDS, (), "number", True),
+    "WEEKDAY": (_DATE_KINDS, (), "number", True),
+    "MASK": (_STRING_KINDS, ("number?", "string?"), "string", False),
+    "HASH": ((*_VALUE_KINDS, "other"), (), "string", False),
+    "NULLIFY": ((*_VALUE_KINDS, "other"), (), "same", False),
+}
+# Functions on numbers whose result keeps an integer input an integer.
+_INTEGRAL_FUNCTIONS = frozenset({"ABS", "MOD", "ROUND", "TRUNC"})
+
+
+def _expression_text(operand: str | tuple) -> str:
+    # Docstring: Canonical text of an operand: a column name or NAME(operand, literals).
+
+    if isinstance(operand, str):
+        return operand
+    _, name, arguments = operand
+    parts = [_expression_text(arguments[0])]
+    parts += [_row_filter_literal_text(literal) for literal in arguments[1:]]
+    return f"{name}({', '.join(parts)})"
+
+
+def _expression_column(operand: str | tuple) -> str:
+    # Docstring: The column an operand reads (every function applies to one operand).
+
+    while not isinstance(operand, str):
+        operand = operand[2][0]
+    return operand
+
+
+def _expression_kind(
+    operand: str | tuple, columns: dict[str, "Column"], option: str, table_name: str, *,
+    filtering: bool,
+) -> str:
+    # Docstring: The kind ``operand`` evaluates to, failing on anything ill-typed.
+    #
+    # A column of a type a filter cannot compare has kind "other", which only HASH and
+    # NULLIFY accept; in a filter such a column fails outright.
+
+    if isinstance(operand, str):
+        column = columns.get(operand)
+        if column is None:
+            raise InformixError(
+                f"Option '{option}' uses column {operand}, which '{table_name}' does not "
+                "have or does not select"
+            )
+        kind = _row_filter_kind(column)
+        if kind is None and filtering:
+            raise InformixError(
+                f"Option '{option}' cannot filter on {column.type_name} column {operand}"
+            )
+        return kind or "other"
+    _, name, arguments = operand
+    inputs, literal_kinds, result, in_filters = _EXPRESSION_FUNCTIONS[name]
+    if filtering and not in_filters:
+        raise InformixError(
+            f"Option '{option}' cannot use {name}, which only transform_columns applies"
+        )
+    kind = _expression_kind(arguments[0], columns, option, table_name, filtering=filtering)
+    if kind not in inputs:
+        raise InformixError(f"Option '{option}' cannot apply {name} to a {kind} value")
+    literals = arguments[1:]
+    required = sum(1 for expected in literal_kinds if not expected.endswith("?"))
+    if not required <= len(literals) <= len(literal_kinds):
+        most = f" to {len(literal_kinds) + 1}" if required < len(literal_kinds) else ""
+        raise InformixError(
+            f"Option '{option}' gives {name} {len(literals) + 1} argument(s); it takes "
+            f"{required + 1}{most}"
+        )
+    for expected, literal in zip(literal_kinds, literals):
+        expected = expected.rstrip("?")
+        if expected == "same":
+            expected = "string" if kind == "nstring" else kind
+        if literal[0] != expected:
+            raise InformixError(
+                f"Option '{option}' gives {name} a {literal[0]} where it takes a {expected}"
+            )
+    _check_function_literals(name, [literal[1] for literal in literals], option)
+    return kind if result == "same" else result
+
+
+def _check_function_literals(name: str, values: list, option: str) -> None:
+    # Docstring: Refuse literal arguments outside the range each function was measured on.
+
+    def whole(value, low, high) -> bool:
+        return value == value.to_integral_value() and low <= value <= high
+
+    if name == "SUBSTR" and not (
+        whole(values[0], 1, 32767) and (len(values) == 1 or whole(values[1], 0, 32767))
+    ):
+        raise InformixError(f"Option '{option}': SUBSTR takes a start from 1 and a length from 0")
+    if name in ("LPAD", "RPAD") and not (whole(values[0], 0, 32767) and values[1]):
+        raise InformixError(f"Option '{option}': {name} takes a length from 0 and a pad string")
+    if name == "REPLACE" and not values[0]:
+        raise InformixError(f"Option '{option}': REPLACE needs a non-empty string to replace")
+    if name == "MOD" and not (whole(values[0], -(1 << 31), (1 << 31) - 1) and values[0]):
+        raise InformixError(f"Option '{option}': MOD takes a whole, non-zero divisor")
+    if name in ("ROUND", "TRUNC") and values and not whole(values[0], -32, 32):
+        raise InformixError(f"Option '{option}': {name} takes whole digits from -32 to 32")
+    if name == "MASK" and (
+        (values and not whole(values[0], 0, 32767)) or (len(values) > 1 and len(values[1]) != 1)
+    ):
+        raise InformixError(f"Option '{option}': MASK takes a count from 0 and one character")
+
+
+def _expression_sql(operand: str | tuple, columns: dict[str, "Column"], literal) -> str:
+    # Docstring: Render a filter operand as Informix SQL; ``literal`` renders its literals.
+
+    if isinstance(operand, str):
+        return _sql_identifier(columns[operand].name)
+    _, name, arguments = operand
+    base = columns[_expression_column(operand)]
+    parts = [_expression_sql(arguments[0], columns, literal)]
+    parts += [literal(value, base) for value in arguments[1:]]
+    # COALESCE pads an LVARCHAR result to its declared width on Informix; with the one
+    # fallback allowed here NVL is the same function without that, so it is sent instead.
+    return f"{'NVL' if name == 'COALESCE' else name}({', '.join(parts)})"
+
+
+def _case_map(text: str, upper: bool) -> str:
+    # Docstring: UPPER/LOWER as Informix applies them: to the ASCII letters only. Measured
+    # on an ISO 8859-1 database, where accented letters (\u00e0, \u00c9) stay as they are.
+
+    if upper:
+        return text.translate(_ASCII_UPPER)
+    return text.translate(_ASCII_LOWER)
+
+
+_ASCII_UPPER = str.maketrans("abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def _temporal(value: Any) -> date:
+    # Docstring: A date or datetime from a decoded value or its ISO text at the boundary.
+
+    if isinstance(value, (date, datetime)):
+        return value
+    text = str(value)
+    return datetime.fromisoformat(text) if len(text) > 10 else date.fromisoformat(text)
+
+
+def _hash_text(value: Any) -> str:
+    # Docstring: The text HASH digests: one form per value, whichever path decoded it.
+    #
+    # Rows reach the output boundary with dates and timestamps already in ISO text (see
+    # _framework_value) and CHAR padding removed, identically from snapshots, files, and
+    # CDC, so the text of those values is stable; the other cases fix one spelling each.
+
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None).isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).hex()
+    if isinstance(value, float):
+        return repr(value)
+    return str(value)
+
+
+def _apply_function(name: str, value: Any, literals: list, context: dict) -> Any:
+    # Docstring: Evaluate one function on an already-evaluated operand ``value``.
+    #
+    # NULL in gives NULL out, except NVL/COALESCE, which replace it, and NULLIFY, which
+    # always gives NULL. ``context`` holds the byte encoding LENGTH counts in and the
+    # HMAC key HASH uses.
+
+    if name == "NULLIFY":
+        return None
+    if name in ("NVL", "COALESCE"):
+        return literals[0] if value is None else value
+    if value is None:
+        return None
+    if name == "HASH":
+        key = context.get("hash_key")
+        if not key:
+            raise InformixError(
+                f"HASH needs the connection option '{_TRANSFORM_HASH_KEY_OPTION}'"
+            )
+        return hmac.new(key, _hash_text(value).encode("utf-8"), hashlib.sha256).hexdigest()
+    if name in _STRING_FUNCTION_NAMES:
+        text = str(value)
+        if name in ("UPPER", "LOWER"):
+            return _case_map(text, name == "UPPER")
+        if name == "TRIM":
+            return text.strip(" ")
+        if name == "LTRIM":
+            return text.lstrip(" ")
+        if name == "RTRIM":
+            return text.rstrip(" ")
+        if name == "LENGTH":
+            # Bytes, without trailing blanks, as Informix counts.
+            return len(text.rstrip(" ").encode(context.get("encoding", "latin-1"), "replace"))
+        if name == "CHAR_LENGTH":
+            return len(text)
+        if name == "SUBSTR":
+            # A start past the end gives NULL, as on Informix; an in-range empty slice is ''.
+            start = int(literals[0]) - 1
+            if start >= len(text):
+                return None
+            return text[start:] if len(literals) == 1 else text[start : start + int(literals[1])]
+        if name == "REPLACE":
+            return text.replace(literals[0], literals[1] if len(literals) > 1 else "")
+        if name in ("LPAD", "RPAD"):
+            width, pad = int(literals[0]), literals[1]
+            if len(text) >= width:
+                return text[:width]
+            fill = (pad * width)[: width - len(text)]
+            return fill + text if name == "LPAD" else text + fill
+        # MASK keeps the last ``keep`` characters; a value no longer than that is
+        # masked whole, so a short value does not pass through unmasked.
+        keep = int(literals[0]) if literals else 0
+        character = literals[1] if len(literals) > 1 else "*"
+        if len(text) <= keep:
+            return character * len(text)
+        return character * (len(text) - keep) + (text[len(text) - keep :] if keep else "")
+    if name in ("YEAR", "MONTH", "DAY", "WEEKDAY"):
+        moment = _temporal(value)
+        if name == "WEEKDAY":
+            return moment.isoweekday() % 7  # Informix: 0 is Sunday
+        return getattr(moment, name.lower())
+    with localcontext() as decimal_context:
+        decimal_context.prec = 80
+        number = Decimal(value)
+        if name == "ABS":
+            result = abs(number)
+        elif name == "MOD":
+            # Informix truncates both operands to integers; the sign follows the dividend.
+            whole = number.to_integral_value(rounding=ROUND_DOWN)
+            result = whole % Decimal(literals[0]).to_integral_value(rounding=ROUND_DOWN)
+            return result if isinstance(value, Decimal) else int(result)
+        else:
+            digits = int(literals[0]) if literals else 0
+            result = number.quantize(
+                Decimal(1).scaleb(-digits),
+                rounding=ROUND_HALF_UP if name == "ROUND" else ROUND_DOWN,
+            )
+    return int(result) if isinstance(value, int) and not isinstance(value, bool) else result
+
+
+_STRING_FUNCTION_NAMES = frozenset(
+    {"UPPER", "LOWER", "TRIM", "LTRIM", "RTRIM", "LENGTH", "CHAR_LENGTH", "SUBSTR", "REPLACE",
+     "LPAD", "RPAD", "MASK"}
+)
+
+
+def _expression_value(operand: str | tuple, row: dict, context: dict) -> Any:
+    # Docstring: Evaluate an operand on ``row``. In a filter, ``context["pad"]`` names the
+    # CHAR columns and their widths: Informix applies functions to the blank-padded
+    # value, which decoding stripped, so a CHAR operand is padded back first.
+
+    if isinstance(operand, str):
+        value = row.get(operand)
+        width = context.get("pad", {}).get(operand)
+        if width and value is not None:
+            value = str(value).ljust(width)
+        return value
+    _, name, arguments = operand
+    value = _expression_value(arguments[0], row, context)
+    literals = [literal[1] for literal in arguments[1:]]
+    if name in ("NVL", "COALESCE") and value is None and isinstance(arguments[0], str):
+        # The fallback takes the column's type: a CHAR column pads it to its width.
+        width = context.get("pad", {}).get(arguments[0])
+        if width and isinstance(literals[0], str):
+            return literals[0].ljust(width)
+    return _apply_function(name, value, literals, context)
+
+
 class _RowFilterParser:
     # Docstring: Recursive-descent parser turning row_filter text into a hashable tree.
     #
-    # Nodes: ("and"|"or", children), ("not", child), ("cmp", column, op, literal),
-    # ("in", column, negated, literals), ("between", column, negated, low, high),
-    # ("like", column, negated, pattern, escape), and ("null", column, negated). A
-    # literal is (kind, value) with kind number, string, bool, date, or timestamp; a LIKE
-    # pattern is a string literal with its trailing blanks removed, since Informix
-    # ignores them, and its escape is the one character ESCAPE names (backslash if none).
+    # Nodes: ("and"|"or", children), ("not", child), ("cmp", operand, op, literal),
+    # ("in", operand, negated, literals), ("between", operand, negated, low, high),
+    # ("like", operand, negated, pattern, escape), and ("null", operand, negated). An
+    # operand is a column name or a function call ("fn", NAME, (operand, *literals)) --
+    # see _EXPRESSION_FUNCTIONS. A literal is (kind, value) with kind number, string,
+    # bool, date, or timestamp; a LIKE pattern is a string literal with its trailing
+    # blanks removed, since Informix ignores them, and its escape is the one character
+    # ESCAPE names (backslash if none). transform_columns parses one operand per column
+    # with the same grammar (``option``/``noun`` only change the error text).
 
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, option: str = "row_filter", noun: str = "filter") -> None:
+        self.option, self.noun = option, noun
         self.tokens: list[tuple[str, str]] = []
         self.index = 0
         text = text.strip()
@@ -4200,7 +4649,7 @@ class _RowFilterParser:
             position = match.end()
 
     def fail(self, message: str) -> None:
-        raise ValueError(f"Option '{_ROW_FILTER_OPTION}' is not a valid filter: {message}")
+        raise ValueError(f"Option '{self.option}' is not a valid {self.noun}: {message}")
 
     def peek(self) -> tuple[str | None, str | None]:
         return self.tokens[self.index] if self.index < len(self.tokens) else (None, None)
@@ -4258,19 +4707,40 @@ class _RowFilterParser:
             return tree
         return self.parse_predicate()
 
-    def parse_predicate(self) -> tuple:
+    def parse_operand(self) -> str | tuple:
         kind, name = self.take()
-        if (
-            kind != "word"
-            or str(name).upper() in _ROW_FILTER_KEYWORDS
-            or not _IDENTIFIER.fullmatch(str(name))
-        ):
+        if kind != "word" or not _IDENTIFIER.fullmatch(str(name)):
             self.fail(f"expected a column name, found {name!r}")
-        column = str(name)
+        upper = str(name).upper()
+        if self.peek() == ("punct", "(") and upper not in _EXPRESSION_FUNCTIONS:
+            self.fail(f"{upper}() is not a supported function")
+        if self.peek() == ("punct", "(") and upper in _EXPRESSION_FUNCTIONS:
+            self.index += 1
+            arguments = [self.parse_operand()]
+            while self.peek() == ("punct", ","):
+                self.index += 1
+                arguments.append(self.parse_literal())
+            self.expect_punct(")")
+            return ("fn", upper, tuple(arguments))
+        if upper in _ROW_FILTER_KEYWORDS:
+            self.fail(f"expected a column name, found {name!r}")
+        return str(name)
+
+    def parse_expression(self) -> str | tuple:
+        if not self.tokens:
+            self.fail("it is empty")
+        operand = self.parse_operand()
+        if self.index != len(self.tokens):
+            self.fail(f"unexpected {self.peek()[1]!r}")
+        return operand
+
+    def parse_predicate(self) -> tuple:
+        operand = self.parse_operand()
+        column = _expression_text(operand)
         if self.accept_keyword("IS"):
             negated = self.accept_keyword("NOT")
             self.expect_keyword("NULL")
-            return ("null", column, negated)
+            return ("null", operand, negated)
         negated = self.accept_keyword("NOT")
         if self.accept_keyword("IN"):
             self.expect_punct("(")
@@ -4279,21 +4749,21 @@ class _RowFilterParser:
                 self.index += 1
                 values.append(self.parse_literal())
             self.expect_punct(")")
-            return ("in", column, negated, tuple(values))
+            return ("in", operand, negated, tuple(values))
         if self.accept_keyword("BETWEEN"):
             low = self.parse_literal()
             self.expect_keyword("AND")
-            return ("between", column, negated, low, self.parse_literal())
+            return ("between", operand, negated, low, self.parse_literal())
         if self.accept_keyword("LIKE"):
-            return self.parse_like(column, negated)
+            return self.parse_like(operand, column, negated)
         if negated:
             self.fail(f"expected IN, BETWEEN, or LIKE after NOT for {column}")
         kind, op = self.take()
         if kind != "op":
             self.fail(f"expected a comparison after {column}")
-        return ("cmp", column, "<>" if op == "!=" else op, self.parse_literal())
+        return ("cmp", operand, "<>" if op == "!=" else op, self.parse_literal())
 
-    def parse_like(self, column: str, negated: bool) -> tuple:
+    def parse_like(self, operand: str | tuple, column: str, negated: bool) -> tuple:
         kind, pattern = self.parse_literal()
         if kind != "string":
             self.fail(f"LIKE for {column} needs a quoted pattern")
@@ -4311,7 +4781,7 @@ class _RowFilterParser:
                     self.fail(f"LIKE pattern for {column} ends with its escape character")
                 index += 1
             index += 1
-        return ("like", column, negated, ("string", pattern), escape)
+        return ("like", operand, negated, ("string", pattern), escape)
 
     def parse_literal(self) -> tuple:
         kind, value = self.take()
@@ -4393,7 +4863,7 @@ def _row_filter_text(tree: tuple) -> str:
         return f" {tag.upper()} ".join(f"({_row_filter_text(child)})" for child in tree[1])
     if tag == "not":
         return f"NOT ({_row_filter_text(tree[1])})"
-    column = tree[1]
+    column = _expression_text(tree[1])
     if tag == "null":
         return f"{column} IS {'NOT ' if tree[2] else ''}NULL"
     if tag == "cmp":
@@ -4461,8 +4931,8 @@ def _row_filter_datetime_sql(value: datetime, column: Column) -> str:
 
 
 def _check_row_filter(tree: tuple, table: Table) -> None:
-    # Docstring: Fail unless every predicate in ``tree`` compares a selected, filterable
-    # column of ``table`` with values of its kind.
+    # Docstring: Fail unless every predicate in ``tree`` compares a well-typed operand over
+    # selected, filterable columns of ``table`` with values of its kind.
 
     columns = {column.name: column for column in table.columns}
 
@@ -4475,25 +4945,25 @@ def _check_row_filter(tree: tuple, table: Table) -> None:
         if tag == "not":
             check(node[1])
             return
-        name = node[1]
-        column = columns.get(name)
-        if column is None:
-            raise InformixError(
-                f"Option '{_ROW_FILTER_OPTION}' uses column {name}, which "
-                f"'{table.exposed_name}' does not have or does not select"
-            )
-        kind = _row_filter_kind(column)
-        if kind is None:
-            raise InformixError(
-                f"Option '{_ROW_FILTER_OPTION}' cannot filter on {column.type_name} column {name}"
-            )
+        operand = node[1]
+        name = _expression_text(operand)
+        column = columns.get(_expression_column(operand))
+        kind = _expression_kind(
+            operand, columns, _ROW_FILTER_OPTION, table.exposed_name, filtering=True
+        )
+        # Typed literals render in the qualifier of the column the operand reads.
+        described = column.type_name if isinstance(operand, str) else kind
+        if not isinstance(operand, str):
+            for literal in _operand_literals(operand):
+                if literal[0] == "timestamp":
+                    _row_filter_datetime_sql(literal[1], column)
         if tag == "null":
             return
         if tag == "like":
             if kind not in ("string", "nstring"):
                 raise InformixError(
                     f"Option '{_ROW_FILTER_OPTION}' can only apply LIKE to a string column, "
-                    f"not {column.type_name} column {name}"
+                    f"not {described} {name}"
                 )
             return
         literals = node[3] if tag == "in" else (node[3],) if tag == "cmp" else node[3:5]
@@ -4501,7 +4971,10 @@ def _check_row_filter(tree: tuple, table: Table) -> None:
         for literal in literals:
             if literal[0] != expected:
                 raise InformixError(
-                    f"Option '{_ROW_FILTER_OPTION}' compares {column.type_name} column {name} "
+                    f"Option '{_ROW_FILTER_OPTION}' compares {described} column {name} "
+                    f"with a {literal[0]} value"
+                    if isinstance(operand, str)
+                    else f"Option '{_ROW_FILTER_OPTION}' compares {name}, a {kind}, "
                     f"with a {literal[0]} value"
                 )
             if kind == "timestamp":
@@ -4509,11 +4982,21 @@ def _check_row_filter(tree: tuple, table: Table) -> None:
         ordered = tag == "between" or (tag == "cmp" and node[2] not in ("=", "<>"))
         if ordered and kind in ("nstring", "bool"):
             raise InformixError(
-                f"Option '{_ROW_FILTER_OPTION}' can only test {column.type_name} column {name} "
+                f"Option '{_ROW_FILTER_OPTION}' can only test {described} column {name} "
                 "for equality"
+                if isinstance(operand, str)
+                else f"Option '{_ROW_FILTER_OPTION}' can only test {name} for equality"
             )
 
     check(tree)
+
+
+def _operand_literals(operand: str | tuple):
+    # Docstring: Every literal argument inside an operand's function calls.
+
+    while not isinstance(operand, str):
+        yield from operand[2][1:]
+        operand = operand[2][0]
 
 
 def _apply_row_filter(table: Table, text: str | None) -> Table:
@@ -4555,8 +5038,8 @@ def _row_filter_sql(table: Table) -> str | None:
             return f" {tag.upper()} ".join(f"({render(child)})" for child in node[1])
         if tag == "not":
             return f"NOT ({render(node[1])})"
-        column = columns[node[1]]
-        name = _sql_identifier(column.name)
+        column = columns[_expression_column(node[1])]
+        name = _expression_sql(node[1], columns, literal)
         if tag == "null":
             return f"{name} IS {'NOT ' if node[2] else ''}NULL"
         if tag == "cmp":
@@ -4574,46 +5057,56 @@ def _row_filter_sql(table: Table) -> str | None:
     return render(_parse_row_filter(table.row_filter))
 
 
-def _row_filter_predicate(table: Table) -> tuple[tuple, dict[str, str | None]] | None:
-    # Docstring: ``table``'s parsed row_filter with its columns' kinds, ready for
-    # :func:`_row_filter_matches`, or None when the table has no filter.
+def _row_filter_predicate(table: Table, encoding: str = "latin-1") -> tuple | None:
+    # Docstring: ``table``'s parsed row_filter with what evaluating it needs -- each
+    # column's kind and, for functions, the CHAR widths to re-pad and the byte encoding
+    # LENGTH counts in -- ready for :func:`_row_filter_matches`, or None without a filter.
 
     if table.row_filter is None:
         return None
     kinds = {column.name: _row_filter_kind(column) for column in table.columns}
-    return _parse_row_filter(table.row_filter), kinds
+    pad = {
+        column.name: int(column.length)
+        for column in table.columns
+        if column.type_name == "CHAR" and column.length
+    }
+    return _parse_row_filter(table.row_filter), kinds, {"pad": pad, "encoding": encoding}
 
 
-def _row_filter_matches(predicate: tuple[tuple, dict[str, str | None]], row: dict) -> bool:
+def _row_filter_matches(predicate: tuple, row: dict) -> bool:
     # Docstring: Whether ``row`` -- decoded Python values by column -- passes the filter.
     # Unknown (NULL) counts as no match, exactly as in a SQL WHERE clause.
 
-    tree, kinds = predicate
-    return _row_filter_value(tree, row, kinds) is True
+    tree, kinds, context = predicate
+    return _row_filter_value(tree, row, kinds, context) is True
 
 
-def _row_filter_value(node: tuple, row: dict, kinds: dict[str, str | None]) -> bool | None:
+def _row_filter_value(node: tuple, row: dict, kinds: dict, context: dict) -> bool | None:
     tag = node[0]
     if tag in ("and", "or"):
         # AND stops at the first False, OR at the first True; a NULL otherwise wins.
         stop = tag == "or"
         result: bool | None = not stop
         for child in node[1]:
-            value = _row_filter_value(child, row, kinds)
+            value = _row_filter_value(child, row, kinds, context)
             if value is stop:
                 return stop
             if value is None:
                 result = None
         return result
     if tag == "not":
-        value = _row_filter_value(node[1], row, kinds)
+        value = _row_filter_value(node[1], row, kinds, context)
         return None if value is None else not value
-    value = row.get(node[1])
+    operand = node[1]
+    if isinstance(operand, str):
+        value, kind = row.get(operand), kinds[operand]
+    else:
+        value = _expression_value(operand, row, context)
+        kind = _operand_kind(operand, kinds)
     if tag == "null":
         return (value is None) != node[2]
     if value is None:
         return None
-    kind = kinds[node[1]]
     if tag == "cmp":
         return _row_filter_compare(value, node[2], node[3][1], kind)
     if tag == "in":
@@ -4626,6 +5119,15 @@ def _row_filter_value(node: tuple, row: dict, kinds: dict[str, str | None]) -> b
         value, "<=", node[4][1], kind
     )
     return inside != node[2]
+
+
+def _operand_kind(operand: str | tuple, kinds: dict) -> str | None:
+    # Docstring: The kind a validated operand evaluates to (see _expression_kind).
+
+    if isinstance(operand, str):
+        return kinds[operand]
+    result = _EXPRESSION_FUNCTIONS[operand[1]][2]
+    return _operand_kind(operand[2][0], kinds) if result == "same" else result
 
 
 def _row_filter_like(pattern: str, escape: str) -> re.Pattern:
@@ -5091,6 +5593,10 @@ class Table:
     # rows, the key -- uses the destination names. Fingerprinted when set, like the
     # selection, since rows already landed carry the old names.
     column_renames: tuple[tuple[str, str], ...] | None = None
+    # transform_columns as sorted (column, canonical expression) pairs, or None, and the
+    # id of the HASH key they use; fingerprinted like the renames.
+    column_transforms: tuple[tuple[str, str], ...] | None = None
+    transform_key_id: str | None = None
 
     @property
     def exposed_name(self) -> str:
@@ -5164,6 +5670,12 @@ class Table:
                 )
             selection = (str(mode), tuple(str(value) for value in names))
         row_filter = raw.get("row_filter")
+        transforms_raw = raw.get("column_transforms")
+        transforms = (
+            None
+            if transforms_raw is None
+            else tuple((str(name), str(expression)) for name, expression in transforms_raw)
+        )
         renames_raw = raw.get("column_renames")
         renames = (
             None
@@ -5183,6 +5695,10 @@ class Table:
             column_selection=selection,
             row_filter=None if row_filter is None else str(row_filter),
             column_renames=renames,
+            column_transforms=transforms,
+            transform_key_id=(
+                None if raw.get("transform_key_id") is None else str(raw["transform_key_id"])
+            ),
         )
 
 
@@ -6425,11 +6941,17 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             table = self._registration_table(table_name, table_options)
             _ensure_materializable(table, table_options)
             renames = dict(table.column_renames or ())
+            transforms = {
+                name: operand
+                for name, _, operand in _recorded_transforms(table.column_transforms) or ()
+            }
             fields = [
                 StructField(
                     renames.get(column.name, column.name),
-                    _spark_type(column, table_options),
-                    column.nullable,
+                    _transform_spark_type(transforms[column.name], column, table_options)
+                    if column.name in transforms
+                    else _spark_type(column, table_options),
+                    column.nullable or column.name in transforms,
                 )
                 for column in table.columns
             ]
@@ -6568,7 +7090,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         self, table_name: str, start_offset: dict, table_options: dict[str, str]
     ) -> tuple[Iterator[dict], dict]:
         rows, offset = self._read_upserts(table_name, start_offset, table_options)
-        return _renamed_rows(rows, _column_renames(table_options)), offset
+        return self._output_rows(rows, table_options), offset
 
     def _read_upserts(
         self, table_name: str, start_offset: dict, table_options: dict[str, str]
@@ -7179,6 +7701,21 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         self, table_name: str, partition: dict, table_options: dict[str, str]
     ) -> Iterator[dict]:
         rows = self._read_partition_rows(partition, table_options)
+        return self._output_rows(rows, table_options)
+
+    def _output_rows(self, rows: Iterator[dict], table_options: dict[str, str]) -> Iterator[dict]:
+        # Docstring: Rows as they leave the connector: transformed, then renamed.
+
+        transforms = _column_transforms(table_options)
+        if transforms:
+            key = self.options.get(_TRANSFORM_HASH_KEY_OPTION) or table_options.get(
+                _TRANSFORM_HASH_KEY_OPTION
+            )
+            context = {
+                "hash_key": key.encode("utf-8") if key else None,
+                "encoding": _database_encoding({**self.options, **table_options}),
+            }
+            rows = _transformed_rows(rows, transforms, context)
         return _renamed_rows(rows, _column_renames(table_options))
 
     def _read_partition_rows(
@@ -7215,7 +7752,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         self, table_name: str, start_offset: dict, table_options: dict[str, str]
     ) -> tuple[Iterator[dict], dict]:
         rows, offset = self._read_deletes(table_name, start_offset, table_options)
-        return _renamed_rows(rows, _column_renames(table_options)), offset
+        return self._output_rows(rows, table_options), offset
 
     def _read_deletes(
         self, table_name: str, start_offset: dict, table_options: dict[str, str]
@@ -8123,12 +8660,19 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         #
         # The column selection runs first, so the key options see only the selected
         # columns (a wildcard key covers just those), then row_filter, since it may only
-        # use selected columns, and the renames last, which may only rename them.
+        # use selected columns, then the transforms and the renames, which may only
+        # change them.
 
         table = _apply_column_selection(table, _column_selection(table_options))
         table = self._apply_key_options(table, table_options)
         _ensure_selected_keys(table)
         table = _apply_row_filter(table, table_options.get(_ROW_FILTER_OPTION))
+        table = _apply_column_transforms(
+            table,
+            _column_transforms(table_options),
+            self.options.get(_TRANSFORM_HASH_KEY_OPTION)
+            or table_options.get(_TRANSFORM_HASH_KEY_OPTION),
+        )
         return _apply_column_renames(table, _column_renames(table_options))
 
     def _snapshot_mode(self, table_options: dict[str, str]) -> str:
@@ -12042,7 +12586,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             if stop_lsn is not None and tx.commit_lsn > stop_lsn:
                 crossed_trigger_boundary = True
                 break
-            projected = _project_transaction(tx, table, deletes, tombstones=tombstones)
+            projected = _project_transaction(
+                tx, table, deletes, tombstones=tombstones, encoding=_database_encoding(self.options)
+            )
             projected = [_coerce_variable_decimal_values(row, table, options) for row in projected]
             # Never split a transaction.  A single large transaction is
             # accepted; subsequent complete transactions wait for next poll.
@@ -13923,6 +14469,15 @@ def _recover(
     return [tx for tx in transactions if tx.commit_lsn > commit]
 
 
+def _database_encoding(options: dict[str, str]) -> str:
+    # Docstring: The database code set's Python encoding: what LENGTH counts bytes in.
+
+    locale = (
+        options.get("db_locale") or options.get("DB_LOCALE") or options.get("db.locale")
+    )
+    return informix_locale_encoding(locale or "en_US.819")
+
+
 def _client_encoding(options: dict[str, str]) -> str:
     # Spark lowercases option keys, so ``CLIENT_LOCALE`` arrives as
     # ``client_locale``; check that first, then the original-case / dotted forms.
@@ -13956,7 +14511,11 @@ def _capture_descriptor(table: Table, encoding: str = "utf-8") -> dict[str, Any]
 
 
 def _project_transaction(
-    tx: CommittedTransaction, table: Table, deletes: bool, tombstones: bool = False
+    tx: CommittedTransaction,
+    table: Table,
+    deletes: bool,
+    tombstones: bool = False,
+    encoding: str = "latin-1",
 ) -> list[dict[str, Any]]:
     # Docstring: Project one committed transaction onto one output channel.
     #
@@ -13981,7 +14540,7 @@ def _project_transaction(
     # before-image, and one that moves a row in is an upsert of its after-image alone --
     # its old key was never landed, so there is no old key to delete.
 
-    predicate = _row_filter_predicate(table)
+    predicate = _row_filter_predicate(table, encoding)
     output = []
     for record in tx.records:
         if not _record_matches(record, table):
@@ -14625,7 +15184,7 @@ def _shape_unl_record(
         column.name: _unload_value(fields[position[column.name]], column.type_name)
         for column in table.columns
     }
-    predicate = _row_filter_predicate(table)
+    predicate = _row_filter_predicate(table, _database_encoding(options))
     if predicate is not None and not _row_filter_matches(predicate, row):
         return None
     return _shape_snapshot(row, snapshot_lsn, table, options, commit_time=commit_time)
@@ -15035,6 +15594,8 @@ def _schema_fingerprint(table: Table) -> str:
         parts += (("row_filter", table.row_filter),)
     if table.column_renames is not None:
         parts += (("column_renames", table.column_renames),)
+    if table.column_transforms is not None:
+        parts += (("column_transforms", table.column_transforms, table.transform_key_id),)
     return hashlib.sha256(repr(parts).encode("utf-8")).hexdigest()
 
 
@@ -15083,6 +15644,14 @@ def _schema_state(
                 {}
                 if table.column_renames is None
                 else {"column_renames": [list(pair) for pair in table.column_renames]}
+            ),
+            **(
+                {}
+                if table.column_transforms is None
+                else {
+                    "column_transforms": [list(pair) for pair in table.column_transforms],
+                    "transform_key_id": table.transform_key_id,
+                }
             ),
         },
     }
@@ -15136,7 +15705,9 @@ def _carry_table_options(fresh: Table, previous: Table) -> Table:
         )
     _ensure_selected_keys(fresh)
     fresh = _apply_row_filter(fresh, previous.row_filter)
-    return _apply_column_renames(fresh, previous.column_renames)
+    fresh = _apply_column_renames(fresh, previous.column_renames)
+    carried = _recorded_transforms(previous.column_transforms)
+    return _apply_column_transforms(fresh, carried, None, key_id=previous.transform_key_id)
 
 
 def _carry_key_override(fresh: Table, overridden: Table) -> Table:
@@ -15327,6 +15898,18 @@ def _ensure_compatible_schema_change(
             f"'{_ROW_FILTER_OPTION}' changed for '{name}'; run a full refresh so every row "
             "is read under the new filter"
         )
+    if (
+        previous.column_transforms != current.column_transforms
+        and not _transforms_cleanup_only(previous, current)
+    ) or (
+        previous.column_transforms is not None
+        and current.column_transforms is not None
+        and previous.transform_key_id != current.transform_key_id
+    ):
+        raise InformixError(
+            f"'{_TRANSFORM_COLUMNS_OPTION}' or '{_TRANSFORM_HASH_KEY_OPTION}' changed for "
+            f"'{name}'; run a full refresh so every row lands under the new transforms"
+        )
     if previous.column_renames != current.column_renames and not _renames_cleanup_only(
         previous, current
     ):
@@ -15346,6 +15929,29 @@ def _selection_cleanup_only(previous: Table, current: Table) -> bool:
     catalog = {column.name for column in current.catalog_columns or current.columns}
     changed = set(previous.column_selection[1]) ^ set(current.column_selection[1])
     return not changed & catalog
+
+
+def _transforms_cleanup_only(previous: Table, current: Table) -> bool:
+    # Docstring: Whether the transforms only lost entries for columns the table no longer has.
+
+    before, after = set(previous.column_transforms or ()), set(current.column_transforms or ())
+    catalog = {column.name for column in current.catalog_columns or current.columns}
+    return after <= before and all(name not in catalog for name, _ in before - after)
+
+
+def _recorded_transforms(recorded: tuple | None) -> tuple | None:
+    # Docstring: Parse recorded (column, canonical) transforms back to (column, text, operand).
+
+    if recorded is None:
+        return None
+    return tuple(
+        (
+            name,
+            canonical,
+            _RowFilterParser(canonical, _TRANSFORM_COLUMNS_OPTION, "transform").parse_expression(),
+        )
+        for name, canonical in recorded
+    )
 
 
 def _renames_cleanup_only(previous: Table, current: Table) -> bool:

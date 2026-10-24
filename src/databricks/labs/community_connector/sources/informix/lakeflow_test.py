@@ -7,6 +7,7 @@ import dataclasses
 import errno
 import gzip
 import hashlib
+import hmac
 import importlib
 import json
 import logging
@@ -15275,7 +15276,7 @@ class _TableOptionTestCase(unittest.TestCase):
     def tearDown(self):
         self._shared_state.cleanup()
 
-    def connector(self, bridge):
+    def connector(self, bridge, **extra):
         connector = InformixLakeflowConnect(
             {
                 "database": "demo",
@@ -15285,6 +15286,7 @@ class _TableOptionTestCase(unittest.TestCase):
                 "cdc.shared.session": "false",
                 "snapshot.shared.session": "false",
                 "stream.partitioned": "false",
+                **extra,
             }
         )
         connector.set_registration_scope(hashlib.sha256(b"test-pipeline").hexdigest()[:32])
@@ -15901,6 +15903,100 @@ class RowFilterTests(_TableOptionTestCase):
                 with self.assertRaisesRegex((InformixError, ValueError), message):
                     self.filtered_table(text)
 
+    def _function_table(self):
+        raw = _wide_table()
+        raw["columns"] += [
+            {"name": "code", "type_name": "CHAR", "length": 10},
+            {
+                "name": "amount",
+                "type_name": "DECIMAL",
+                "length": 0x0A03,
+                "precision": 10,
+                "scale": 3,
+            },
+            {"name": "born", "type_name": "DATE"},
+        ]
+        return raw
+
+    def test_function_filters_render_and_reparse_canonically(self):
+        table = self.filtered_table(
+            "upper(trim(code)) = 'AB' and year(born) >= 2020 and coalesce(value, 'x') <> 'y'"
+            " and mod(extra, 2) = 1 and round(amount, -1) between 10 and 20",
+            self._function_table(),
+        )
+        canonical = (
+            "(UPPER(TRIM(code)) = 'AB') AND (YEAR(born) >= 2020) AND "
+            "(COALESCE(value, 'x') <> 'y') AND (MOD(extra, 2) = 1) AND "
+            "(ROUND(amount, -1) BETWEEN 10 AND 20)"
+        )
+        self.assertEqual(table.row_filter, canonical)
+        self.assertEqual(
+            self.filtered_table(canonical, self._function_table()).row_filter, canonical
+        )
+        # COALESCE goes to Informix as NVL, which keeps an LVARCHAR result unpadded.
+        self.assertEqual(
+            informix_module._row_filter_sql(table), canonical.replace("COALESCE(", "NVL(")
+        )
+
+    def test_functions_evaluate_as_informix_was_measured_to(self):
+        # Each case was measured on Informix 14.10 (2,352 function cases in all), with
+        # CHAR values blank-padded to their width before a function sees them.
+        raw = self._function_table()
+        cases = (
+            ("upper(code) = 'ABC'", {"code": "abc"}, True),
+            ("upper(value) = '\u00e0B'", {"value": "\u00e0b"}, True),  # ASCII letters only
+            ("char_length(code) = 10", {"code": "abc"}, True),  # padded CHAR
+            ("char_length(rtrim(code)) = 3", {"code": "abc"}, True),
+            ("length(value) = 3", {"value": "abc  "}, True),  # trailing blanks not counted
+            ("substr(value, 4) IS NULL", {"value": "abc"}, True),  # start past the end
+            ("substr(value, 1, 0) = ''", {"value": "abc"}, True),
+            ("substr(code, 11) IS NULL", {"code": "abc"}, True),
+            ("substr(code, 2, 3) = 'bc'", {"code": "abc"}, True),
+            ("char_length(substr(code, 2, 3)) = 3", {"code": "abc"}, True),
+            ("char_length(nvl(code, 'none')) = 10", {"code": None}, True),  # fallback padded
+            ("lpad(value, 2, '*') = 'ab'", {"value": "abc"}, True),  # truncates
+            ("rpad(value, 5, '.-') = 'ab.-.'", {"value": "ab"}, True),
+            ("mod(amount, 3) = -2", {"amount": Decimal("-2.500")}, True),  # truncates first
+            ("round(amount, 0) = -3", {"amount": Decimal("-2.500")}, True),  # half away from 0
+            ("trunc(amount, -1) = 120", {"amount": Decimal("123.456")}, True),
+            ("weekday(born) = 0", {"born": date(2023, 1, 1)}, True),  # Sunday
+            ("upper(value) = 'X'", {"value": None}, False),
+        )
+        for text, row, expected in cases:
+            with self.subTest(text):
+                predicate = informix_module._row_filter_predicate(self.filtered_table(text, raw))
+                self.assertIs(informix_module._row_filter_matches(predicate, row), expected)
+
+    def test_invalid_function_filters_fail(self):
+        raw = self._function_table()
+        for text, message in (
+            ("hash(value) = 'x'", "only transform_columns applies"),
+            ("upper(extra) = 'x'", "cannot apply UPPER to a number"),
+            ("year(value) = 1", "cannot apply YEAR to a string"),
+            ("substr(value, 0) = 'x'", "SUBSTR takes a start from 1"),
+            ("mod(extra, 0) = 1", "MOD takes a whole, non-zero divisor"),
+            ("round(amount, 0.5) = 1", "takes whole digits"),
+            ("upper(value, 'x') = 'x'", "gives UPPER 2 argument"),
+            ("nvl(extra, 'x') = 1", "gives NVL a string where it takes a number"),
+            ("upper(value) > 1", "a string, with a number value"),
+            ("today() = 1", "TODAY\\(\\) is not a supported function"),
+        ):
+            with self.subTest(text):
+                with self.assertRaisesRegex((InformixError, ValueError), message):
+                    self.filtered_table(text, raw)
+
+    def test_cdc_membership_follows_a_function_filter(self):
+        options = {"row_filter": "upper(value) LIKE 'B%'"}
+        bridge = _ProjectingBridge()
+        connector, checkpoint = self.stream(bridge, options)
+        moved_out = (
+            ("BEFORE_UPDATE", {"id": 2, "value": "b", "extra": 8}),
+            ("AFTER_UPDATE", {"id": 2, "value": "x", "extra": 8}),
+        )
+        self.assertEqual(
+            self.changes(connector, bridge, checkpoint, options, *moved_out), ([], [(2, "d")])
+        )
+
     def test_cdc_membership_follows_a_like_filter(self):
         options = {"row_filter": "value LIKE 'b%'"}
         bridge = _ProjectingBridge()
@@ -16046,6 +16142,168 @@ class ColumnRenameTests(_TableOptionTestCase):
         restored = Table.parse(_schema_state(renamed, 1)["table"], "demo")
         self.assertEqual(restored.column_renames, renamed.column_renames)
         self.assertEqual(_schema_fingerprint(restored), _schema_fingerprint(renamed))
+
+
+class ColumnTransformTests(_TableOptionTestCase):
+    """transform_columns replaces values as rows leave the connector, on every path, before
+    renames; row_filter and the key options keep seeing source values."""
+
+    KEY = "0123456789abcdef-test-key"
+    MASKED = {"transform_columns": '{"value": "MASK(value, 1)", "extra": "NULLIFY(extra)"}'}
+
+    def keyed(self, bridge):
+        return self.connector(bridge, **{"transform.hash.key": self.KEY})
+
+    def stream(self, bridge, options, connector=None):
+        connector = connector or self.connector(bridge)
+        rows, checkpoint = connector.read_table("app.orders", {}, dict(options))
+        return connector, checkpoint, list(rows)
+
+    def test_transforms_parse_from_a_json_object(self):
+        parse = informix_module._column_transforms
+        parsed = parse({"transform_columns": '{"value": "mask( value ,1)", "id": "hash(id)"}'})
+        self.assertEqual(
+            [(name, text) for name, text, _ in parsed],
+            [("id", "HASH(id)"), ("value", "MASK(value, 1)")],
+        )
+        self.assertIsNone(parse({}))
+        for raw, message in (
+            ("{not json", "not a valid JSON object"),
+            ('{"value": 1}', "map column names to expressions"),
+            ('{"value": "MASK(value)", "value": "HASH(value)"}', "transforms a column twice"),
+            ('{"value": "value"}', "applies no function"),
+            ('{"value": "SHA2(value)"}', "SHA2\\(\\) is not a supported function"),
+            ('{"value": "MASK(value) = 1"}', "unexpected"),
+        ):
+            with self.subTest(raw):
+                with self.assertRaisesRegex(ValueError, message):
+                    parse({"transform_columns": raw})
+
+    def test_snapshot_changes_and_schema_carry_the_transformed_values(self):
+        bridge = _ProjectingBridge()
+        connector, checkpoint, snapshot = self.stream(bridge, self.MASKED)
+        schema = connector.get_table_schema("app.orders", dict(self.MASKED))
+        bridge.now = 200
+        bridge.changes = self.committed(("INSERT", {"id": 3, "value": "secret", "extra": 9}))
+        upserts = list(connector.read_table("app.orders", checkpoint, dict(self.MASKED))[0])
+
+        # A value no longer than the characters MASK keeps is masked whole.
+        self.assertEqual(
+            [(row["id"], row["value"], row["extra"]) for row in snapshot],
+            [(1, "*", None), (2, "*", None)],
+        )
+        self.assertEqual(
+            [(row["id"], row["value"], row["extra"]) for row in upserts], [(3, "*****t", None)]
+        )
+        fields = {field.name: field for field in schema.fields}
+        self.assertEqual(type(fields["value"].dataType).__name__, "StringType")
+        self.assertEqual(type(fields["extra"].dataType).__name__, "IntegerType")
+        self.assertTrue(fields["extra"].nullable)
+
+    def test_a_hashed_key_matches_across_snapshot_changes_and_deletes(self):
+        options = {"transform_columns": '{"id": "HASH(id)", "value": "UPPER(value)"}'}
+        bridge = _ProjectingBridge()
+        connector, checkpoint, snapshot = self.stream(bridge, options, self.keyed(bridge))
+        bridge.now = 200
+        bridge.changes = self.committed(
+            ("BEFORE_UPDATE", {"id": 2, "value": "b", "extra": 8}),
+            ("AFTER_UPDATE", {"id": 2, "value": "z", "extra": 8}),
+            ("DELETE", {"id": 1, "value": "a", "extra": 7}),
+        )
+        upserts = list(connector.read_table("app.orders", checkpoint, dict(options))[0])
+        deletes = list(connector.read_table_deletes("app.orders", checkpoint, dict(options))[0])
+        expected = {
+            n: hmac.new(self.KEY.encode(), str(n).encode(), hashlib.sha256).hexdigest()
+            for n in (1, 2)
+        }
+
+        self.assertEqual([row["id"] for row in snapshot], [expected[1], expected[2]])
+        self.assertEqual([(row["id"], row["value"]) for row in upserts], [(expected[2], "Z")])
+        self.assertEqual([row["id"] for row in deletes], [expected[1]])  # matches its row
+        schema = connector.get_table_schema("app.orders", dict(options))
+        self.assertEqual(type(schema.fields[0].dataType).__name__, "StringType")
+        metadata = connector.read_table_metadata("app.orders", dict(options))
+        self.assertEqual(metadata["primary_keys"], ["id"])
+
+    def test_hash_needs_a_key_and_keys_only_take_hash(self):
+        bridge = _ProjectingBridge()
+        unkeyed = self.connector(bridge)
+        with self.assertRaisesRegex(InformixError, "transform.hash.key"):
+            unkeyed._table("app.orders", {"transform_columns": '{"value": "HASH(value)"}'})
+        short = self.connector(bridge, **{"transform.hash.key": "short"})
+        with self.assertRaisesRegex(InformixError, "at least 16 characters"):
+            short._table("app.orders", {"transform_columns": '{"value": "HASH(value)"}'})
+        keyed = self.keyed(bridge)
+        for raw, message in (
+            ('{"id": "ABS(id)"}', "may only HASH key column id"),
+            ('{"id": "HASH(ABS(id))"}', "may only HASH key column id"),
+            ('{"value": "UPPER(extra)"}', "may only read the column it replaces"),
+            ('{"missing": "MASK(missing)"}', "does not have or does not select"),
+            ('{"extra": "UPPER(extra)"}', "cannot apply UPPER to a number"),
+        ):
+            with self.subTest(raw):
+                with self.assertRaisesRegex(InformixError, message):
+                    keyed._table("app.orders", {"transform_columns": raw})
+
+    def test_renames_follow_and_filters_see_source_values(self):
+        options = {
+            "transform_columns": '{"value": "MASK(value)"}',
+            "rename_columns": "value:label",
+            "row_filter": "value = 'b'",
+        }
+        bridge = _ProjectingBridge()
+        _, _, snapshot = self.stream(bridge, options)
+        self.assertEqual(bridge.snapshot_filters[-1], "value = 'b'")
+        connector = self.connector(bridge)
+        rows, checkpoint = connector.read_table("app.orders", {}, dict(options))
+        bridge.now = 200
+        bridge.changes = self.committed(
+            ("INSERT", {"id": 3, "value": "b", "extra": 1}),
+            ("INSERT", {"id": 4, "value": "c", "extra": 1}),
+        )
+        upserts = list(connector.read_table("app.orders", checkpoint, dict(options))[0])
+        self.assertEqual([(row["id"], row["label"]) for row in upserts], [(3, "*")])  # 4 filtered
+
+    def test_append_tombstones_are_transformed_too(self):
+        bridge = _ProjectingBridge()
+        bridge.tables = [_wide_table(primary_keys=())]
+        options = {"append.only.ingestion": "true", **self.MASKED}
+        connector, checkpoint, _ = self.stream(bridge, options)
+        bridge.now = 200
+        bridge.changes = self.committed(("DELETE", {"id": 2, "value": "bb", "extra": 8}))
+        rows = list(connector.read_table("app.orders", checkpoint, options)[0])
+        self.assertEqual(
+            [(row["value"], row["extra"], row["_informix_op"]) for row in rows], [("*b", None, "d")]
+        )
+
+    def test_changing_transforms_or_the_key_on_a_running_stream_fails_closed(self):
+        options = {"transform_columns": '{"value": "HASH(value)"}'}
+        bridge = _ProjectingBridge()
+        connector, checkpoint, _ = self.stream(bridge, options, self.keyed(bridge))
+        bridge.now = 200
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 200}]
+        reformatted = {"transform_columns": '{"value":"hash(value)"}'}
+        list(connector.read_table("app.orders", checkpoint, reformatted)[0])  # same transform
+        masked = {"transform_columns": '{"value": "MASK(value)"}'}
+        with self.assertRaisesRegex(InformixError, "transform_columns.*changed.*full refresh"):
+            connector.read_table("app.orders", checkpoint, masked)
+        rekeyed = self.connector(bridge, **{"transform.hash.key": "another-key-of-16+chars"})
+        with self.assertRaisesRegex(InformixError, "transform.hash.key.*changed"):
+            rekeyed.read_table("app.orders", checkpoint, dict(options))
+
+    def test_tables_without_transforms_keep_their_fingerprint(self):
+        connector = self.keyed(_ProjectingBridge())
+        plain = connector._table("app.orders", {})
+        hashed = {"transform_columns": '{"value": "HASH(value)"}'}
+        transformed = connector._table("app.orders", hashed)
+        self.assertIsNone(plain.column_transforms)
+        self.assertNotIn("column_transforms", _schema_state(plain, 1)["table"])
+        self.assertNotEqual(_schema_fingerprint(plain), _schema_fingerprint(transformed))
+        restored = Table.parse(_schema_state(transformed, 1)["table"], "demo")
+        self.assertEqual(restored.column_transforms, (("value", "HASH(value)"),))
+        self.assertEqual(_schema_fingerprint(restored), _schema_fingerprint(transformed))
+        # The key id is an HMAC under the key, not the key or a plain digest of it.
+        self.assertNotIn(self.KEY, json.dumps(_schema_state(transformed, 1)))
 
 
 if __name__ == "__main__":
