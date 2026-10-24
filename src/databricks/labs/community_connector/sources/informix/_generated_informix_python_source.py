@@ -12487,6 +12487,9 @@ def register_lakeflow_source(spark):
             self._snapshot_schema_ids: dict[tuple[str, str], str] = {}
             self._trigger_available_now = False
             self._trigger_boundaries: dict[str, tuple[int, str, str]] = {}
+            # When a delete reader first yielded for a schema transition, per (identity,
+            # checkpoint schema id); see _ensure_schema_transition_wait_bounded.
+            self._schema_transition_waits: dict[tuple[str, str], float] = {}
             self._activity_touched: dict[tuple[str, str], float] = {}
             self._cleaned_update_scopes: set[tuple[str, str]] = set()
             self._cleaned_snapshot_stages: set[str] = set()
@@ -12549,6 +12552,7 @@ def register_lakeflow_source(spark):
                 self._snapshot_high_water.clear()
                 self._snapshot_schema_ids.clear()
                 self._trigger_boundaries.clear()
+                self._schema_transition_waits.clear()
                 self._activity_touched.clear()
                 self._cleaned_update_scopes.clear()
                 self._cleaned_snapshot_stages.clear()
@@ -14223,12 +14227,14 @@ def register_lakeflow_source(spark):
             # The offset must differ from ``start_offset`` or the framework reads the
             # unchanged offset as exhaustion and stops the stream, so bump a counter the
             # way the sibling coordination retries do. Unlike the capacity retry this
-            # carries no failure cap: the wait is on the paired upsert reader for the
+            # carries no retry cap: the wait is on the paired upsert reader for the
             # *same* table, which either publishes (this reader proceeds) or fails its
-            # own flow with a real error. Capping here would convert a slow schema
+            # own flow with a real error. Capping the count would convert a slow schema
             # transition into a delete-channel failure while the upsert side is still
             # healthy, and the whole point of yielding is that the slot is free for that
-            # publication to happen.
+            # publication to happen. A triggered update is bounded in time instead (see
+            # _ensure_schema_transition_wait_bounded): there a failed upsert flow does not
+            # end the update, and this reader would otherwise yield forever.
 
             result = dict(start_offset)
             retry_count = _schema_transition_retry_count(result)
@@ -18759,6 +18765,7 @@ def register_lakeflow_source(spark):
                         record_type="schema-transition",
                     )
                 if transition_record is not None:
+                    self._schema_transition_waits.pop((table.identity, checkpoint_schema_id), None)
                     self._validate_immutable_record_header(
                         transition_record, "schema-transition", table.exposed_name
                     )
@@ -18824,6 +18831,13 @@ def register_lakeflow_source(spark):
                     # _shared_trigger_boundary raises TriggerBoundaryUnavailable). The
                     # caller converts this into an unchanged-offset empty batch, which
                     # releases the slot and lets the owning upsert reader acquire one.
+                    #
+                    # Fail with the upsert reader's own error where it rejects the change
+                    # before publishing, or this reader would wait for a transition that
+                    # never comes.
+                    if set(table.primary_keys) - set(previous_table.primary_keys):
+                        self._ensure_added_key_columns_have_no_default(previous_table, table)
+                    self._ensure_schema_transition_wait_bounded(table, checkpoint_schema_id)
                     raise SchemaTransitionUnavailable(
                         f"The upsert reader has not published the schema transition for "
                         f"'{table.exposed_name}' from schema node {checkpoint_schema_id} yet"
@@ -18834,6 +18848,34 @@ def register_lakeflow_source(spark):
                         f"state for '{table.exposed_name}'"
                     )
                 delay = _sleep_with_backoff(deadline, delay)
+
+        def _ensure_schema_transition_wait_bounded(
+            self, table: Table, checkpoint_schema_id: str
+        ) -> None:
+            # Docstring: Fail a triggered delete reader that has waited too long for its upsert reader.
+            #
+            # A triggered update ends only when every flow has. If the upsert reader fails
+            # before publishing the transition, its flow stops but this reader keeps yielding
+            # empty batches, so the update never ends. A continuous update fails as a whole
+            # once a flow fails, so only AvailableNow is bounded, at
+            # cdc.shared.state.wait.seconds from the first yield. A healthy upsert reader
+            # publishes on its first read after the change.
+
+            if not self._trigger_available_now:
+                return
+            started = self._schema_transition_waits.setdefault(
+                (table.identity, checkpoint_schema_id), time.monotonic()
+            )
+            limit = int(
+                self.options.get("cdc.shared.state.wait.seconds", str(_SHARED_STATE_WAIT_SECONDS))
+            )
+            if time.monotonic() - started >= limit:
+                raise InformixError(
+                    f"The upsert reader has not published the schema transition for "
+                    f"'{table.exposed_name}' in {limit} seconds, so this update cannot finish. "
+                    "Its flow has most likely failed: see its error, fix the cause, and restart "
+                    "the pipeline"
+                )
 
         def _ensure_added_key_columns_have_no_default(self, previous: Table, current: Table) -> None:
             # Docstring: Fail closed when a column joining a wildcard key was added with a default.

@@ -1027,7 +1027,9 @@ connection:
       description: >
         Maximum seconds a reader waits for per-table initialization state.
         Default `300`; minimum `1`. In shared-session mode this also bounds how long
-        a shard retains a subscriber after its last poll before dropping it.
+        a shard retains a subscriber after its last poll before dropping it. In a
+        triggered update it also bounds how long a delete reader waits for its upsert
+        reader's schema transition before failing.
 
     - name: cdc.shared.session
       type: string

@@ -10126,6 +10126,68 @@ class LakeflowContractTests(unittest.TestCase):
         # advances past the transition rather than repeating the yield.
         self.assertNotIn("schema_transition_retry_count", resumed)
 
+    def _checkpoint_then_add_a_column(self, bridge, options):
+        _, checkpoint = self.connector(bridge).read_table("app.orders", {}, options)
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+        return checkpoint
+
+    def test_delete_reader_fails_with_the_upsert_error_for_a_defaulted_key_column(self):
+        """The upsert reader rejects a column joining a wildcard key with a default before
+        it publishes the transition; the delete reader must fail the same way rather
+        than wait for a transition that never comes (it would hang a triggered update)."""
+
+        options = {"primary.keys": "*"}
+        bridge = FakeBridge()
+        bridge.tables = [_table(primary_keys=())]
+        bridge.column_default_names = {"added"}
+        checkpoint = self._checkpoint_then_add_a_column(bridge, options)
+
+        with mock.patch.object(informix_module.time, "sleep"):
+            with self.assertRaisesRegex(InformixError, "with a default.*run a full refresh"):
+                rows, _ = self.connector(bridge).read_table_deletes(
+                    "app.orders", checkpoint, options
+                )
+                list(rows)
+
+    def test_triggered_delete_reader_stops_waiting_for_a_transition_that_never_comes(self):
+        """A failed upsert flow does not end a triggered update, so the delete reader's
+        wait for its transition is bounded by cdc.shared.state.wait.seconds."""
+
+        bridge = FakeBridge()
+        checkpoint = self._checkpoint_then_add_a_column(bridge, {})
+        delete = self.connector(bridge)
+        delete.prepare_for_trigger_available_now()
+
+        with mock.patch.object(informix_module.time, "sleep"):
+            _, yielded = delete.read_table_deletes("app.orders", checkpoint, {})
+            self.assertEqual(yielded["schema_transition_retry_count"], 1)
+            # The upsert reader never publishes; let the wait run out.
+            for key in delete._schema_transition_waits:
+                delete._schema_transition_waits[key] -= informix_module._SHARED_STATE_WAIT_SECONDS
+            with self.assertRaisesRegex(
+                InformixError, "has not published the schema transition .* in 300 seconds"
+            ):
+                delete.read_table_deletes("app.orders", yielded, {})
+
+    def test_continuous_delete_reader_keeps_yielding_for_a_transition(self):
+        """A continuous update fails as a whole once a flow fails, so there the delete
+        reader keeps yielding with no time bound."""
+
+        bridge = FakeBridge()
+        checkpoint = self._checkpoint_then_add_a_column(bridge, {})
+        delete = self.connector(bridge)
+
+        with mock.patch.object(informix_module.time, "sleep"):
+            _, first = delete.read_table_deletes("app.orders", checkpoint, {})
+            _, second = delete.read_table_deletes("app.orders", first, {})
+
+        self.assertEqual(delete._schema_transition_waits, {})
+        self.assertEqual(second["schema_transition_retry_count"], 2)
+
     def test_upsert_schema_transition_still_waits_for_its_own_publication(self):
         """The owner keeps its retry loop: it is the writer, not a waiter."""
 
