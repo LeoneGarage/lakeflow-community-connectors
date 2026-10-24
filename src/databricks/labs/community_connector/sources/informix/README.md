@@ -35,6 +35,7 @@ The pure-Python protocol implementation has completed authentication, query, dis
   - [Option reference](#option-reference)
 - [Table configuration](#table-configuration)
   - [Column selection](#column-selection)
+  - [Column renames](#column-renames)
   - [Row filtering](#row-filtering)
   - [Snapshot modes](#snapshot-modes)
     - [Migrating a table without a re-snapshot](#migrating-a-table-without-a-re-snapshot)
@@ -157,6 +158,7 @@ rather than start from an unrelated position.
 | `row_filter` | No | none | Per-table predicate, without `WHERE`, that keeps only matching rows in snapshots, file-sourced snapshots, and the change stream. An update that moves a row out of the filter deletes it. See [Row filtering](#row-filtering). |
 | `include_columns` | No | all columns | Per-table list of the columns to ingest (comma-separated or a JSON array). Columns added to the source later stay out. See [Column selection](#column-selection). |
 | `exclude_columns` | No | none | Per-table list of columns to leave out (comma-separated or a JSON array). Columns added to the source later come in. Can't be combined with `include_columns`. See [Column selection](#column-selection). |
+| `rename_columns` | No | none | Per-table new destination names for columns, as a JSON object (`{"cust_nm": "customer_name"}`) or `source:destination` pairs. Other options keep using source names. See [Column renames](#column-renames). |
 | `snapshot.isolation` | No | `committed_read_last_committed` | Per-table isolation level for the monolithic `snapshot.mode=initial` full-table snapshot. `committed_read_last_committed` (default) reads the last-committed image of a locked row instead of holding shared locks, so the snapshot does **not** lock the table against writers. `repeatable_read` restores the exactly-once, table-locking behavior. Tokens are case- and whitespace-insensitive; unknown values are rejected. **⚠️ Duplicate-row warning:** under `committed_read_last_committed` the table is no longer frozen at the snapshot LSN, so a row inserted **during** the scan can be captured by both the snapshot and the change stream. A keyed table de-duplicates these by primary key, but a **keyless (append-only) table has no key to de-duplicate on and may therefore emit duplicate rows**. Use `repeatable_read` for keyless tables that require exactly-once, or run the `initial` backfill during a quiet window. See [Snapshot isolation](#snapshot-isolation). |
 | `snapshot.scan` | No | `keyset` | Per-table (also connection-scope) read strategy for a **keyed** table's one-pass snapshot. `keyset` (default) pages in key order: each page is its own query ordered by the key columns, which an index on those columns serves cheaply. Without such an index every page can scan and sort the table, so the cost grows with pages times table size, which is the usual case for a `primary.keys` override and especially the `"*"` wildcard. `cursor` reads the table through one forward-only cursor with no sorting, as a keyless table is read, while the key still drives the destination merge and delete handling. It also avoids keyset paging's trouble with NULL key values. Pages are sized by `keyless.snapshot.page.size`. Rows committed during a non-locking scan can reach both the snapshot and the change stream, which the key de-duplicates; set `snapshot.isolation=repeatable_read` for an exactly-once scan that locks the table. With `snapshot.mode=incremental` or `auto_snapshot`, a cursor scan has no key ranges to chunk by, so a new snapshot uses the one-pass snapshot instead of the chunked one; a chunked copy already in progress finishes as it started. A keyless table always reads through the cursor. Accepts `keyset`/`cursor`. |
 | `stream.partitioned` | No | `true` | Whether the connector uses the **partitioned stream reader**. When enabled (default), the staged-snapshot page-serve phase **fans out**: a microbatch spans up to `stream.partitioned.snapshot.pages.per.batch` immutable staged pages, each read and decoded on a **separate Spark executor** instead of one page per microbatch on the driver — the parallel-read win for large snapshots. Every other phase (staging bootstrap, the live CDC/incremental stream, snapshot→CDC transitions, deletes) is a **single driver-computed partition** whose rows are byte-for-byte the current output, just wrapped — **CDC is never parallelized here** (the shard daemon remains the CDC lever; see `cdc.shared.session`). Applies only to tables with a bounded staged-snapshot→stream lifecycle (keyed CDC tables and append-only tables); snapshot-only tables always use the simple reader. Both readers persist the **same offset**, so this can be flipped on a **running** pipeline and it resumes the existing checkpoint in place with **no full refresh** (verified: serverless SDP resumes across the reader-class swap). **Requires `cdc.shared.session=true` (the default)**, because an embedded CDC microbatch that Spark re-plans after a driver restart is recomputed from its committed start offset **bounded at its committed end offset** — the recompute must reach exactly that `end` and fails closed on a shortfall, the same contract as the simple reader's `readBetweenOffsets` — and only the shared session's accumulating buffer lets a bounded replay of a range larger than one `cdc.max.records` poll converge (a direct per-table poll is capped per read and could never satisfy the bound). Because `stream.partitioned` is on by default, **if you set `cdc.shared.session=false` you must also set `stream.partitioned=false`**; otherwise the connector **fails fast at construction** with an explanatory error. There is no silent fallback. Set `false` to force the simple single-partition driver reader. Accepts `true`/`false`. |
@@ -167,7 +169,7 @@ rather than start from an unrelated position.
 | `snapshot.read.timeout.seconds` | No | `300` | SQLI socket read timeout while fetching transactional snapshot pages and while reading the incremental-snapshot key bound that seeds a keyed table; raise it if a large table's key-bound read times out. Minimum `1`. |
 | `cdc.read.timeout.seconds` | No | `60` | SQLI socket read timeout for CDC session setup and teardown (open/start/activate/end/close) when validating the initial CDC boundary. Raise it if `syscdcv1` teardown stalls under many concurrent CDC sessions. |
 | `snapshot.max.rows` | No | `0` | Optional total row bound for a staged CDC snapshot. `0` disables the bound. Snapshot-only tables remain limited to 100,000 rows when this option is `0`. |
-| `append.only.ingestion` | No | `auto` | Tri-state: `auto` (default), `true`, or `false`. `auto` appends only CDC-streamable tables **without** a primary key — the connector reports `ingestion_type=append` with a cursor and streams changes instead of repeatedly reading a bounded snapshot — and leaves keyed tables on their normal CDC path (so keyed tables follow the pipeline `scd_type`, default `SCD_TYPE_1`). For a keyless table `auto` is equivalent to `true`. `true` forces append for every capturable table, including keyed ones; `false` forces the normal CDC/snapshot path, opting a keyless table into bounded snapshot-only ingestion. Append output is a **change log**, not current state: an update appends its after-image as a `u` row, and a delete appends a `d` **tombstone** row carrying the full before-image (see `append.delete.tombstones`). On a keyless table a tombstone is a change-log record, not an applied delete — there is no key to pair it with — so consumers wanting current state filter on `_informix_op`; use `false` for a mutable keyless table that needs merge semantics. To append a **keyed** table also set `scd_type: APPEND_ONLY`; the connector cannot read that pipeline setting. Uncapturable types remain snapshot-only, and append-only tables have no delete channel. |
+| `append.only.ingestion` | No | `auto` | Tri-state: `auto` (default), `true`, or `false`. `auto` appends only CDC-streamable tables **without** a primary key — the connector reports `ingestion_type=append` with a cursor and streams changes instead of repeatedly reading a bounded snapshot — and leaves keyed tables on their normal CDC path (so keyed tables follow the pipeline `scd_type`, default `SCD_TYPE_1`). For a keyless table `auto` is equivalent to `true`. `true` forces append for every capturable table, including keyed ones; `false` forces the normal CDC/snapshot path, opting a keyless table into bounded snapshot-only ingestion. Append output is a **change log**, not current state: an update appends its after-image as a `u` row, and a delete appends a `d` **tombstone** row carrying the full before-image (see `append.delete.tombstones`). On a keyless table a tombstone is a change-log record, not an applied delete — there is no key to pair it with — so consumers wanting current state filter on `_informix_op`; use `false` for a mutable keyless table that needs merge semantics. To append a **keyed** table also set `scd_type: APPEND_ONLY`; the connector cannot read that pipeline setting. A table with an unsupported column type is rejected unless column selection leaves that column out, and append-only tables have no delete channel. |
 | `append.delete.tombstones` | No | `true` | Per-table boolean, also accepted at connection scope (the table option wins). Applies only to a table on the append path (`append.only.ingestion`) and has no effect elsewhere. When `true`, a source `DELETE` lands on the upsert channel as a `d` tombstone row carrying the **full before-image** plus the usual `_informix_change_lsn`, `_informix_commit_lsn`, `_informix_tx_id` and `_informix_commit_time` columns, so the change log is lossless (an update already lands as a `u` row). On a keyed table forced to append, a key-changing update also removes the old key, so it lands the old row's before-image as a `d` tombstone ahead of the new key's `u` row. That tombstone's `_informix_change_lsn` is the before-image's own log position, strictly lower than the `u` row's, so ordering by the cursor applies them in the right order. Every CDC session enables full-row logging, so the before-image is always available. On a keyless table a tombstone is a change-log record, not an applied delete — there is no key to pair it with — so consumers wanting current state filter on `_informix_op`. A genuinely insert-only table never deletes, so the default costs it nothing. Set `false` for an archive-style table where retention purges would otherwise append one tombstone per purged row; the delete is then dropped. A keyed table on the normal CDC path ignores this option: its deletes are applied only through the separate delete flow. Accepts `true`/`false`. |
 | `primary.keys` | No | *(catalog key)* | Per-table override of the table's primary key — a comma-separated list (or JSON array) of column names. When set, the connector treats the table as **keyed** on those columns even if it is physically keyless: it reports `ingestion_type=cdc_with_deletes`, reads incrementally with keyset-paginated snapshots and delete identification, and reports the keys so the pipeline uses them as the destination merge key too (no separate `primary_keys` needed). The columns must exist in the table. **You must guarantee they are unique per row** — a non-unique override corrupts upserts, delete identification, and snapshot pagination. A key column declared nullable may hold NULL: a delete carries the NULL through, and the pipeline's delete flow matches NULL key values, so updates and deletes of that row apply normally. A NULL in a `NOT NULL` key column still fails the pipeline as a broken log record. A NULL key value can still make a snapshot skip rows or fail, because keyset snapshot paging compares key values; `snapshot.scan=cursor` avoids that. Leave unset to use the catalog's primary key, then a `UNIQUE` index if the connection has `primary.key.from.unique.index` enabled (the default), and otherwise none. Set `"*"` (or `["*"]`) to key on **every column**, in catalog column order, so the whole row is its identity. This suits a keyless table whose rows are unique as a whole, such as a junction or lookup table. Nullable columns join the wildcard key too, so the NULL behaviour above applies to every nullable column. On an append-only table with `snapshot.mode=cdc_only`, its default, nothing pages by key, so NULLs are harmless there. It also follows the schema: a column appended to the table joins the key. Once the table is streaming changes, a nullable column added without a default extends the key without a full refresh, as described in [Schema evolution without full refresh](#schema-evolution-without-full-refresh). A column added with a default, or added while an incremental copy is still running, still needs a full refresh. Keyset snapshot paging sorts and compares on every column, so for a large table set `snapshot.scan=cursor`, or use an explicit key that matches an index. |
 | `allow.nullable.index` | No | `false` | Per-table opt-in that lets a `UNIQUE` index containing **nullable** column(s) be promoted to the key when the table has **no primary key and no all-`NOT NULL` unique index**. Normally such an index is rejected because a key column is expected to be non-null; setting this `true` asserts the columns are **unique for every row**. A row that does hold NULL in one of them is still updated and deleted correctly: as for a `primary.keys` override, a delete carries the NULL through and the pipeline's delete flow matches NULL key values. What a NULL can still break is keyset snapshot paging, which compares key values and may skip the row or fail; `snapshot.scan=cursor` avoids that. Only takes effect when `primary.key.from.unique.index` is enabled (the default) and no non-null key exists; an all-`NOT NULL` unique index and an explicit `primary.keys` both still win. Promoting a table changes its keyed/key-less classification and schema fingerprint, so enable it before first ingest or run a full refresh. Accepts `true`/`false`. |
@@ -193,7 +195,7 @@ rather than start from an unrelated position.
 Because per-table options are supported, configure the Unity Catalog connection with this exact `externalOptionsAllowList`:
 
 ```text
-qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration
+qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,rename_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration
 ```
 
 Create the connection from the Lakeflow Community Connector flow on the **Add Data** page, with the Databricks CLI, or with the Databricks SDK for Python. The Unity Catalog connection type must be `COMMUNITY`, and `sourceName` must be `informix`.
@@ -226,7 +228,7 @@ databricks connections create --json "$(jq -n \
       encrypt: "true",
       "snapshot.staging.location": "/Volumes/main/informix_cdc/staging",
       "lakebase.password": $lakebase_password,
-      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
+      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,rename_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
     }
   }')"
 
@@ -264,7 +266,7 @@ databricks connections update informix_sales --json "$(jq -n \
       "ssl.ca.file": "/Volumes/catalog/schema/artifacts/informix-ca.pem",
       "snapshot.staging.location": "/Volumes/main/informix_cdc/staging",
       "lakebase.password": $lakebase_password,
-      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
+      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,rename_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
     }
   }')" \
   --profile "$DATABRICKS_PROFILE"
@@ -311,7 +313,7 @@ connection = w.connections.create(
         "lakebase.password": os.environ["LAKEBASE_PASSWORD"],
         "externalOptionsAllowList": (
             "qualified_source_table,decimal.variable.type,decimal.variable.column.type,"
-            "snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,"
+            "snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,rename_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,"
             "append.only.ingestion,append.delete.tombstones,"
             "max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
         ),
@@ -352,7 +354,7 @@ connection = w.connections.update(
         "lakebase.password": os.environ["LAKEBASE_PASSWORD"],
         "externalOptionsAllowList": (
             "qualified_source_table,decimal.variable.type,decimal.variable.column.type,"
-            "snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,"
+            "snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,rename_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,"
             "append.only.ingestion,append.delete.tombstones,"
             "max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
         ),
@@ -450,15 +452,17 @@ A table is captured via CDC when **every column has a supported CDC encoding**. 
 - **With a primary key** → keyed CDC with deletes (`cdc_with_deletes`): inserts, updates, and deletes are applied to the destination by key.
 - **Without a primary key** → an append-only CDC stream (`ingestion_type="append"`, cursor `_informix_change_lsn`): changes are still read from the logical log, but with no key to identify a row they are appended rather than merged (no delete application; a delete appends a `d` tombstone row carrying the full before-image, see `append.delete.tombstones`). See [Keyless tables](#keyless-tables) for the ways to manage upserts and deletes on such a table.
 
-A table that has **any** column without a CDC encoding is not captured via CDC: it falls back to a snapshot-only read, or is rejected outright if the type cannot be represented at all (see the type table below).
+The types without a CDC encoding are also the ones the snapshot reader can't materialize, so a table with **any** such column is rejected when its schema is read (see the type table below). Leave those columns out with [column selection](#column-selection) and the rest of the table is ingested and captured normally.
 
 | CDC status | Informix types |
 |---|---|
-| Live-validated end to end | `SMALLINT`, `INTEGER`/`INT`, `SERIAL`, `INT8`, `SERIAL8`, `BIGINT`, `BIGSERIAL`, `FLOAT`/`DOUBLE`, `REAL`/`SMALLFLOAT`, `DECIMAL`/`NUMERIC`, `MONEY`, `DATE`, supported `DATETIME` qualifiers, `BOOLEAN`, `CHAR`, `VARCHAR`/`NVARCHAR`, `LVARCHAR` |
-| Rejected before ingestion | `BYTE`, `TEXT`, `BLOB`, `CLOB`, `INTERVAL`, `NCHAR`, complex and opaque types |
+| Live-validated end to end | `SMALLINT`, `INTEGER`/`INT`, `SERIAL`, `INT8`, `SERIAL8`, `BIGINT`, `BIGSERIAL`, `FLOAT`/`DOUBLE`, `REAL`/`SMALLFLOAT`, `DECIMAL`/`NUMERIC`, `MONEY`, `DATE`, supported `DATETIME` qualifiers, `INTERVAL`, `BOOLEAN`, `CHAR`, `VARCHAR`/`NVARCHAR`, `LVARCHAR` |
+| Rejected before ingestion | `BYTE`, `TEXT`, `BLOB`, `CLOB`, `NCHAR`, complex and opaque types |
 | Excluded from speculative decoding | Unknown catalog types, UDT and complex types such as `ROW`, `SET`, `LIST`, and `MULTISET` |
 
 `INT8` and `SERIAL8` use Informix's complete ten-byte signed-magnitude CDC representation. `LVARCHAR` supports its variable-width ordinary SQLI snapshot envelope and native CDC representation. A `DATETIME` qualifier is CDC-capable when its start and end fields are supported by the native decoder. Values containing `YEAR` through at least `DAY` are exposed as timezone-free Spark timestamps. `HOUR`-based values are SQL TIME strings such as `13:03:36.93100`; other partial values remain qualifier-aware strings and never acquire the worker's current date.
+
+`INTERVAL` lands as a string, because Delta tables can't store Spark's interval types. The string is Informix's own literal for the value with its padding trimmed: the first field unpadded, the others two digits each, the fraction at its declared width, and a leading `-` when negative. For example, `INTERVAL DAY(3) TO FRACTION(3)` gives `-12 13:14:15.016`, `YEAR TO MONTH` gives `1-02`, and `HOUR TO MINUTE` gives `10:30`. Snapshots, file loads, and the change stream all produce the same text, which matches `TRIM(CAST(col AS VARCHAR(40)))` on the server. That was checked against a live Informix 14.10 on twelve qualifiers covering every start field, leading precisions up to 9, and fractions of 1, 3, and 5 digits, with positive, negative, zero, and NULL values. The text doesn't sort by duration, so a snapshot keyed on an `INTERVAL` column copies the table in one consistent snapshot instead of in incremental chunks. `row_filter` can't filter on an `INTERVAL` column.
 
 ### Variable-scale decimals
 
@@ -582,7 +586,7 @@ physical table under its current pipeline/update scope. Upsert and delete reader
 use that boundary even when cancellation or retry left their predecessor
 generations different, then independently checkpoint the shared generation.
 
-An idle timeout returns no rows and leaves the checkpoint unchanged. Incomplete or open transactions do not advance it. If the restart LSN predates the minimum retained logical log in `sysmaster:syslogs`, continuation fails and the table must be resnapshotted. Every CDC session validates its initial METADATA frame against a fresh catalog layout before decoding later records; another METADATA frame in that session fails immediately and requires a full refresh.
+A CDC poll ends when Informix's log reader goes idle for `cdc.timeout` seconds, which on a busy log can happen before it reaches the end. In a continuous pipeline an idle poll returns no rows and leaves the checkpoint unchanged. A triggered update reads until the log reader has passed the update's high-water boundary: a poll that goes idle short of it, with no transaction open, moves the checkpoint to where the log reader stopped, so the next read carries on from there instead of rescanning, and the update doesn't end early. Incomplete or open transactions never advance the checkpoint past their `BEGIN`. If the restart LSN predates the minimum retained logical log in `sysmaster:syslogs`, continuation fails and the table must be resnapshotted. Every CDC session validates its initial METADATA frame against a fresh catalog layout before decoding later records; another METADATA frame in that session fails immediately and requires a full refresh.
 
 ### Schema evolution without full refresh
 
@@ -596,16 +600,21 @@ without a full refresh:
 - **`SMALLINT` to `INTEGER`:** both arrive as integers, so the destination column doesn't
   change.
 - **Wider numeric types:** `SMALLINT` or `INTEGER` (including `SERIAL`) to `BIGINT` or
-  `INT8`, `SMALLFLOAT` to `FLOAT`, and a `DECIMAL`, `NUMERIC`, or `MONEY` column given more
+  `INT8`, `SMALLFLOAT` to `FLOAT`, a `DECIMAL`, `NUMERIC`, or `MONEY` column given more
   precision without losing integer digits (its scale may grow only as far as its
-  precision grows, up to precision 38). Key columns may widen too. These change the
+  precision grows, up to precision 38), and an integer to a fixed-scale `DECIMAL`,
+  `NUMERIC`, or `MONEY` with at least 10 integer digits (`SMALLINT`, `INTEGER`) or 20
+  (`BIGINT`, `INT8`), such as `INTEGER` to `DECIMAL(12,2)`. `SMALLINT` and `INTEGER` may
+  also become `FLOAT`. Key columns may widen too. These change the
   destination column's type, so the pipeline must allow it: set
   `"pipelines.enableTypeWidening": "true"` in the pipeline's `configuration` (Databricks
   Runtime 15.4 or later). The destination then widens the column in place, keeping its
   rows. Without the setting, the update fails with `DELTA_MERGE_INCOMPATIBLE_DATATYPE`;
   add it and run the pipeline again, and it recovers with no full refresh. Narrowing,
-  `INT8` to `BIGINT` (the same width), variable-scale `DECIMAL(p)`, and integer to
-  `DECIMAL` or `FLOAT` still need a full refresh.
+  `INT8` to `BIGINT` (the same width), variable-scale `DECIMAL(p)`, an integer to a
+  `DECIMAL` with fewer integer digits than those minimums (Delta's, even where the values
+  would fit), `BIGINT` or `INT8` to `FLOAT`, and an integer to `SMALLFLOAT` still need a
+  full refresh.
 - **Dropped columns:** a nullable column that isn't part of the key. The connector stops
   reading it and no longer reports it, and the destination keeps the column. With SCD
   type 1, a row updated after the drop keeps the value it had; rows inserted after the
@@ -615,13 +624,15 @@ without a full refresh:
 Anything else still needs a full refresh: renames, reorders, a column added before
 existing ones, other type changes, nullability changes, non-nullable additions,
 unsupported types, primary-key changes, and dropping a `NOT NULL` or key column. Changing `include_columns`,
-`exclude_columns`, or `row_filter` on a running table also needs one.
+`exclude_columns`, `rename_columns`, or `row_filter` on a running table also needs one.
 
 All of these have been validated against a live Informix server: after the change,
 Informix returns log records written before it in the current layout. Values logged
 under the old layout arrive with the column at its new width or type (a `SMALLINT` as a
-`BIGINT`, a `DECIMAL(5,2)` as a `DECIMAL(10,4)`) and a dropped column left out, so the
-connector decodes old and new records alike.
+`BIGINT`, a `DECIMAL(5,2)` as a `DECIMAL(10,4)`, an `INTEGER` as a `DECIMAL(12,2)` or a
+`FLOAT`, an `INT8` as a `DECIMAL(20,0)`) and a dropped column left out, so the
+connector decodes old and new records alike. The integer-to-`DECIMAL` changes were
+checked on `DECIMAL` targets; `MONEY` targets follow the same rule but weren't run live.
 
 A table keyed with `primary.keys: "*"` is the one exception to an unchanged key: its
 key is every column, so an appended column joins it. The key may grow that way without
@@ -652,10 +663,13 @@ EXECUTE FUNCTION syscdcv1:cdc_set_fullrowlogging(
 
 The other supported changes follow the same sequence with a different `ALTER TABLE`. A
 `MODIFY` restates the whole column definition, so keep `NOT NULL` on a column that has
-it; otherwise the column becomes nullable and the change needs a full refresh:
+it; otherwise the column becomes nullable and the change needs a full refresh. On a
+primary-key column, restate `PRIMARY KEY` as well: Informix drops the table's primary
+key when its column is modified without it, and a lost key needs a full refresh.
 
 ```sql
 ALTER TABLE informix.members MODIFY (surname VARCHAR(120) NOT NULL);
+ALTER TABLE informix.members MODIFY (member_id BIGINT NOT NULL PRIMARY KEY);
 ALTER TABLE informix.members DROP (legacy_code);
 ```
 
@@ -715,8 +729,8 @@ A table is keyed when any of these supplies a key, highest precedence first:
 3. the catalog primary key, or a `UNIQUE` index whose columns are all `NOT NULL`
    (`primary.key.from.unique.index`, on by default).
 
-A table with none of these is keyless. A table with any column Informix cannot
-capture is snapshot-only, whatever its key.
+A table with none of these is keyless. A table with a column of an unsupported
+type is rejected, whatever its key, unless column selection leaves that column out.
 
 ### Choosing an approach
 
@@ -936,7 +950,8 @@ position in a `_manifest.json` or `snapshot.boundary.lsn`. See
   by a nullable column added without a default, once the table is streaming.
 - Changing the files under a running file snapshot fails the read with a
   full-refresh error.
-- A table with a column Informix can't capture is always snapshot-only.
+- A table with a column of an unsupported type is rejected unless column selection
+  leaves that column out.
 
 ### Option reference
 
@@ -980,7 +995,7 @@ Full definitions are in [Connection parameters](#connection-parameters).
 }
 ```
 
-Supported source-specific table options are `qualified_source_table`, `decimal.variable.type`, `decimal.variable.column.type`, `snapshot.mode`, `snapshot.source`, `snapshot.boundary.lsn`, `snapshot.split.bytes`, `snapshot.unl.delimiter`, `snapshot.unl.escape`, `snapshot.page.size`, `keyless.snapshot.page.size`, `snapshot.filter`, `row_filter`, `include_columns`, `exclude_columns`, `snapshot.isolation`, `snapshot.max.rows`, `snapshot.max.bytes`, `max.records.per.batch`, `cdc.timeout`, and `cdc.max.records`. `qualified_source_table` maps the pipeline's logical table name to an Informix `owner.table` name. Standard destination, SCD, key, sequence, and clustering options remain available.
+Supported source-specific table options are `qualified_source_table`, `decimal.variable.type`, `decimal.variable.column.type`, `snapshot.mode`, `snapshot.source`, `snapshot.boundary.lsn`, `snapshot.split.bytes`, `snapshot.unl.delimiter`, `snapshot.unl.escape`, `snapshot.page.size`, `keyless.snapshot.page.size`, `snapshot.filter`, `row_filter`, `include_columns`, `exclude_columns`, `rename_columns`, `snapshot.isolation`, `snapshot.max.rows`, `snapshot.max.bytes`, `max.records.per.batch`, `cdc.timeout`, and `cdc.max.records`. `qualified_source_table` maps the pipeline's logical table name to an Informix `owner.table` name. Standard destination, SCD, key, sequence, and clustering options remain available.
 
 ### Column selection
 
@@ -1009,13 +1024,47 @@ destination.
 - **Names:** every name must be a column of the table, so a typo fails instead of letting
   in a column you meant to keep out. After dropping a listed column at the source, take
   it out of the list; that edit needs no full refresh.
-- **Uncapturable columns:** a table with a BYTE, TEXT, BLOB, CLOB, INTERVAL, or
-  collection column is otherwise snapshot-only. Excluding those columns lets it stream
-  its changes.
+- **Unsupported types:** a table with a BYTE, TEXT, BLOB, CLOB, NCHAR, or
+  collection column is otherwise rejected. Leave those columns out and the rest of the
+  table is ingested, with its changes streamed.
 - **Changing the selection:** on a running table this fails closed, because rows already
   landed were read under the old selection. Run a full refresh to apply the new one.
 - **File-sourced snapshots:** an extract still holds every column. The connector matches
   fields by catalog position and keeps the selected ones.
+
+### Column renames
+
+`rename_columns` lands columns under new names. Give it an object from source name to
+destination name, or a string of comma-separated `source:destination` pairs:
+
+```json
+{
+  "source_table": "orders",
+  "table_configuration": {
+    "qualified_source_table": "informix.orders",
+    "rename_columns": {"cust_nm": "customer_name", "ord_dt": "ordered_at"}
+  }
+}
+```
+
+- **What changes:** the names in the reported schema, in every row (snapshots,
+  file-sourced snapshots, changes, deletes, and tombstones), and in the primary key the
+  connector reports. A renamed key column is the key under its new name.
+- **What doesn't:** every other option still names source columns: `include_columns`,
+  `exclude_columns`, `primary.keys`, `row_filter`, and `snapshot.filter`. Pipeline-level
+  settings such as `sequence_by` see the destination names, because they apply to the
+  landed table.
+- **Names:** each source name must be a selected column. The renames apply together, so
+  two columns can swap names. A destination name can't match another landed column or a
+  connector metadata column such as `_informix_op`; the check ignores case, as Delta does.
+  A destination name can't hold a space or any of `,;{}()=`.
+- **Changing the renames:** on a running table this fails closed, because rows already
+  landed under the old names. Run a full refresh to apply new ones. After dropping a
+  renamed column at the source, take its entry out; that edit needs no full refresh.
+
+To transform values on the way in (masking, hashing, trimming), read the landed table
+from a downstream view or materialized view in the pipeline. The connector doesn't apply
+functions to values.
 
 ### Row filtering
 
@@ -1052,7 +1101,8 @@ The predicate is parsed by the connector, so it can be evaluated the same way in
 on change images. That limits it to:
 
 - **Operators:** `=`, `<>` (or `!=`), `<`, `<=`, `>`, `>=`, `[NOT] IN (...)`,
-  `[NOT] BETWEEN ... AND ...`, `IS [NOT] NULL`, `AND`, `OR`, `NOT`, and parentheses.
+  `[NOT] BETWEEN ... AND ...`, `[NOT] LIKE '...' [ESCAPE '...']`, `IS [NOT] NULL`,
+  `AND`, `OR`, `NOT`, and parentheses.
 - **Values:** numbers, `'quoted strings'` (double a quote to include one), `TRUE` and
   `FALSE`, `DATE 'YYYY-MM-DD'`, and `TIMESTAMP 'YYYY-MM-DD HH:MM:SS[.ffffff]'`. A
   `TIMESTAMP` can't be more precise than the column's `DATETIME` qualifier.
@@ -1061,7 +1111,14 @@ on change images. That limits it to:
   match its column's type.
 - **Strings:** compare by code point with trailing spaces ignored, which is Informix's
   `CHAR` and `VARCHAR` order in ISO 8859-1 and UTF-8 databases. `NVARCHAR` collates by
-  locale, so it only takes `=`, `<>`, and `IN`.
+  locale, so it only takes `=`, `<>`, `IN`, and `LIKE`.
+- **`LIKE`:** `%` matches any run of characters and `_` matches one. Matching is
+  case-sensitive and ignores trailing blanks in both the value and the pattern, as
+  Informix does on every string type. A backslash makes the next character literal
+  (`'50\%'`), or `ESCAPE` names another escape character (`'50!%' ESCAPE '!'`). The
+  connector always sends the escape character to Informix, so the server's
+  `DEFAULTESCCHAR` setting doesn't change the result. A pattern can't end with its escape
+  character.
 - **NULL:** follows SQL's three-valued logic; a row is kept only when the predicate is
   true.
 

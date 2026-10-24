@@ -33,7 +33,8 @@
 # there is no trailer-discard compatibility option. DATETIME values containing
 # YEAR/MONTH/DAY are emitted as naive source calendar values and interpreted by
 # Spark as timestamps; partial qualifiers are deterministic labeled strings and
-# never acquire a current date. BYTE, TEXT, BLOB, CLOB, INTERVAL, NCHAR, and
+# never acquire a current date. INTERVAL lands as Informix's trimmed literal text
+# ("-12 13:14:15.016"), live-validated on Informix 14.10. BYTE, TEXT, BLOB, CLOB, NCHAR, and
 # complex or opaque types lack end-to-end snapshot/CDC materialization and cause
 # an explicit metadata error. Unknown catalog types fail discovery rather than being decoded
 # speculatively. Ordinary TEXT/BYTE fetch framing has a bounded internal helper,
@@ -651,9 +652,9 @@ connection:
         the destination. A column added to the source later stays out. Key columns
         must be listed, and so must any column row_filter uses. Every name must be a
         column of the table; after dropping a listed column at the source, take it
-        out of the list (no full refresh needed). Excluding a column CDC cannot
-        capture (BYTE, TEXT, BLOB, CLOB, INTERVAL, collections) lets the table stream
-        changes instead of being snapshot-only. Changing the selection on a running
+        out of the list (no full refresh needed). Leaving out a column of an
+        unsupported type (BYTE, TEXT, BLOB, CLOB, NCHAR, collections) lets a
+        table be ingested, with its changes streamed, that would otherwise be rejected. Changing the selection on a running
         table fails closed until a full refresh. Mutually exclusive with
         exclude_columns.
 
@@ -668,6 +669,20 @@ connection:
         changing the list on a running table fails closed until a full refresh.
         Mutually exclusive with include_columns.
 
+    - name: rename_columns
+      type: string
+      required: false
+      description: >
+        Per-table destination names for columns, as a JSON object from source name
+        to destination name or comma-separated source:destination pairs. Renames the
+        reported schema, every row, and the reported primary key; every other option
+        still names source columns. Each source must be a selected column; renames
+        apply together, so columns may swap names; a destination name may not clash,
+        ignoring case, with another landed or connector metadata column, nor hold a
+        space or any of ,;{}()=. Changing the renames on a running table fails closed
+        until a full refresh, except removing the entry for a column dropped at the
+        source.
+
     - name: row_filter
       type: string
       required: false
@@ -677,12 +692,16 @@ connection:
         moves a row into the filter is upserted and one that moves it out is
         deleted (a tombstone on the append path), so a keyed destination holds
         exactly the matching rows. Supports comparisons (=, <>, !=, <, <=, >, >=),
-        [NOT] IN, [NOT] BETWEEN, IS [NOT] NULL, AND, OR, NOT, and parentheses, with
-        numbers, 'quoted strings', TRUE/FALSE, DATE 'YYYY-MM-DD', and TIMESTAMP
-        'YYYY-MM-DD HH:MM:SS[.ffffff]' values, over numeric, CHAR/VARCHAR/LVARCHAR,
-        BOOLEAN, DATE, and YEAR-anchored DATETIME columns; NVARCHAR takes equality
-        tests only and FLOAT columns are rejected. NULL follows SQL's three-valued
-        logic. Strings compare by code point with trailing spaces ignored. Every
+        [NOT] IN, [NOT] BETWEEN, [NOT] LIKE 'pattern' [ESCAPE 'c'], IS [NOT] NULL,
+        AND, OR, NOT, and parentheses, with numbers, 'quoted strings', TRUE/FALSE,
+        DATE 'YYYY-MM-DD', and TIMESTAMP 'YYYY-MM-DD HH:MM:SS[.ffffff]' values, over
+        numeric, CHAR/VARCHAR/LVARCHAR, BOOLEAN, DATE, and YEAR-anchored DATETIME
+        columns; NVARCHAR takes equality tests and LIKE only, and FLOAT columns are
+        rejected. NULL follows SQL's three-valued logic. Strings compare by code point
+        with trailing spaces ignored. LIKE matches as Informix does: % and _ are
+        wildcards, matching is case-sensitive, trailing blanks of the value and the
+        pattern are ignored, and a backslash (or the ESCAPE character) makes the next
+        character literal; a pattern can't end with its escape character. Every
         column it uses must be selected. Changing the filter on a running table
         fails closed until a full refresh. Combined with snapshot.filter by AND.
 
@@ -742,8 +761,8 @@ connection:
         Set `scd_type: APPEND_ONLY` on the same table so the destination appends
         rather than attempting a keyed merge; the connector cannot read scd_type
         itself because the spec parser strips it before options reach the connector.
-        A table whose columns Informix cannot capture ignores this and stays
-        snapshot-only. There is no delete channel: requesting one for an
+        A table with an unsupported column type is rejected unless column
+        selection leaves that column out. There is no delete channel: requesting one for an
         append-only table fails rather than returning empty forever.
 
     - name: append.delete.tombstones
@@ -1295,4 +1314,4 @@ connection:
 
 # Exact per-table overrides consumed by the connector. `qualified_source_table` maps a
 # pipeline table to a dynamically discovered exposed name (`owner.table`).
-external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
+external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,rename_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"

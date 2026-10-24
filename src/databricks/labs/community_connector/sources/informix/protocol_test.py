@@ -16,7 +16,9 @@ from databricks.labs.community_connector.sources.informix.cdc_protocol import (
     apply_null_byte,
     cdc_routine,
     decode_frame,
+    decode_interval,
     decode_value,
+    interval_layout,
     metadata_column_names,
     validate_snapshot_arity,
 )
@@ -40,6 +42,7 @@ from databricks.labs.community_connector.sources.informix.sqli import (
     _connector_sql,
     _DeadlineReader,
     _decode_result_value,
+    _fixed_result_size,
     _statement_keyword,
     decode_asc_accept,
     decode_asc_response,
@@ -423,6 +426,80 @@ class FrameTests(unittest.TestCase):
         self.assertIsNone(_decode_result_value(b"\x01" + struct.pack(">i", 0), column, "utf-8"))
         with self.assertRaisesRegex(SqliProtocolError, "length"):
             _decode_result_value(b"\x00" + struct.pack(">i", 4) + b"short", column, "utf-8")
+
+
+# (qualifier, packed bytes, Informix's text) read from a live Informix 14.10 table: the
+# bytes from the SQLI snapshot and CDC decoders alike, the text from CAST(... AS
+# VARCHAR) with its padding trimmed.
+_LIVE_INTERVALS = (
+    (0x0602, "c6010200", "1-02"),  # YEAR TO MONTH
+    (0x0602, "39626200", "-1-02"),
+    (0x0802, "c80c22380b", "123456-11"),  # YEAR(6) TO MONTH
+    (0x0322, "c60117", "123"),  # MONTH(3) TO MONTH
+    (0x0322, "3a5f00", "-5"),
+    (0x084A, "c402000001", "2 00:00:01"),  # DAY TO SECOND
+    (0x084A, "3b62616060", "-1 02:03:04"),
+    (0x0C4D, "3b57565554622800", "-12 13:14:15.016"),  # DAY(3) TO FRACTION(3)
+    (0x0C4D, "405a000000000000", "-0 00:00:00.001"),
+    (0x0468, "c30a1e", "10:30"),  # HOUR TO MINUTE
+    (0x0468, "3d6300", "-0:01"),
+    (0x078A, "c401172d38", "12345:56"),  # MINUTE(5) TO SECOND
+    (0x0BAF, "c30c22380c2232", "123456.12345"),  # SECOND(6) TO FRACTION(5)
+    (0x0BAF, "415a0000000000", "-0.00001"),
+    (0x144F, "c801172d4359173b3b63635a", "123456789 23:59:59.99999"),  # DAY(9) TO FRACTION(5)
+    (0x144F, "3b6300000000000000000000", "-1 00:00:00.00000"),
+    (0x0346, "c40506", "5 06"),  # DAY(1) TO HOUR
+    (0x0346, "3b5a4d", "-9 23"),
+    (0x086B, "c401172d3b5a", "123:45:59.9"),  # HOUR(3) TO FRACTION(1)
+    (0x086B, "3f5a00000000", "-0:00:00.1"),
+    (0x0100, "c607", "7"),  # YEAR(1) TO YEAR
+    (0x0100, "395d", "-7"),
+    (0x0602, "80000000", "0-00"),
+    (0x0C4D, "8000000000000000", "0 00:00:00.000"),
+    (0x0602, "00000000", None),
+    (0x144F, "000000000000000000000000", None),
+)
+
+
+class IntervalTests(unittest.TestCase):
+    """INTERVAL decodes to Informix's own literal text on the CDC and SQLI paths."""
+
+    def test_live_intervals_decode_to_informix_text(self):
+        for qualifier, packed, expected in _LIVE_INTERVALS:
+            with self.subTest(qualifier=hex(qualifier), packed=packed):
+                raw = bytes.fromhex(packed)
+                self.assertEqual(decode_interval(memoryview(raw), qualifier), (expected, len(raw)))
+                column = ColumnDescriptor("i", "INTERVAL", length=qualifier)
+                decoded = decode_value(memoryview(raw + b"\xff"), column)
+                self.assertEqual(decoded, (expected, len(raw)))
+                result = ResultColumn("i", 0, 14, 0, qualifier)
+                self.assertEqual(_fixed_result_size(result, raw), len(raw))
+                self.assertEqual(_decode_result_value(raw, result, "utf-8"), expected)
+
+    def test_interval_layouts(self):
+        self.assertEqual(interval_layout(0x0C4D), ((4, 6, 8, 10), 3, 3))
+        self.assertEqual(interval_layout(0x0602), ((0, 2), 4, 0))
+        self.assertEqual(interval_layout(0x0100), ((0,), 1, 0))
+        for qualifier in (0x0624, 0x03BD, 0x0202, 0x0C02, 0x0420, 0x0642):
+            # MONTH TO DAY mixes classes; FRACTION can't start one; too few digits for
+            # YEAR TO MONTH; a ten-digit leading field; MONTH TO YEAR and DAY TO MONTH
+            # run backwards.
+            with self.subTest(hex(qualifier)):
+                self.assertIsNone(interval_layout(qualifier))
+        with self.assertRaises(CdcProtocolError):
+            decode_interval(memoryview(b"\x00\x00"), 0x0624)
+
+    def test_corrupt_intervals_are_rejected(self):
+        for qualifier, packed, message in (
+            (0x0468, "c30a3c", "field 8 holds 60"),  # HOUR TO MINUTE, minute 60
+            (0x0602, "c6010c00", "field 2 holds 12"),  # YEAR TO MONTH, month 12
+            (0x0468, "c20a1e", "below its last field"),  # seconds in HOUR TO MINUTE
+            (0x0346, "c50100", "exceeds 1 digits"),  # DAY(1) TO HOUR, 100 days
+        ):
+            with self.subTest(packed):
+                raw = bytes.fromhex(packed)
+                with self.assertRaisesRegex(CdcProtocolError, message):
+                    decode_interval(memoryview(raw), qualifier)
 
 
 class LoDataTests(unittest.TestCase):

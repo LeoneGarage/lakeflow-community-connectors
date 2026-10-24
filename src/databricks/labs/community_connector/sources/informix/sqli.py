@@ -29,8 +29,10 @@ from typing import BinaryIO, Callable, Protocol
 from databricks.labs.community_connector.sources.informix.cdc_protocol import (
     ColumnDescriptor,
     apply_null_byte,
+    decode_interval,
     decode_packed_decimal,
     decode_value,
+    interval_layout,
 )
 
 
@@ -1218,6 +1220,8 @@ def _decode_result_value_raw(
             ColumnDescriptor("datetime", "DATETIME", length=qualifier),
         )
         return value
+    if kind == 14:
+        return decode_interval(memoryview(data), column.encoded_length)[0]
     if kind == 45:
         if len(data) >= 5:
             envelope_size = struct.unpack_from(">i", data, 1)[0]
@@ -1268,6 +1272,12 @@ def _fixed_result_size(column: ResultColumn, remaining: bytes) -> int:
     if kind == 10:
         total, fraction = (column.encoded_length >> 8) & 0xFF, column.encoded_length & 0xFF
         return (total + (fraction & 1) + 3) // 2
+    if kind == 14:
+        layout = interval_layout(column.encoded_length)
+        if layout is None:
+            raise SqliProtocolError(f"invalid INTERVAL qualifier 0x{column.encoded_length:04x}")
+        total = (column.encoded_length >> 8) & 0xFF
+        return (total + (layout[2] & 1) + 3) // 2
     if kind == 45:
         if column.encoded_length not in {1, 2}:
             raise SqliProtocolError(

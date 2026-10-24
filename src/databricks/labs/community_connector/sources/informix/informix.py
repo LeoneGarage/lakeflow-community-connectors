@@ -48,6 +48,7 @@ from databricks.labs.community_connector.sources.informix.cdc_protocol import (
     cdc_routine,
     decode_frame,
     frame_log_file,
+    interval_layout,
     metadata_column_names,
     validate_snapshot_arity,
 )
@@ -1109,6 +1110,17 @@ def _replay_between_offsets(start, end, read, options, connector_options):
             records, reached = read(replay_start)
             record_parts.append(records)
             if isinstance(reached, dict) and reached.get("commit_lsn") is not None:
+                if (
+                    not replaying_chunk
+                    and isinstance(replay_start, dict)
+                    and replay_start.get("commit_lsn") is not None
+                    and int(replay_start["commit_lsn"]) < int(reached["commit_lsn"]) < int(stop)
+                ):
+                    # One poll can go idle short of the committed end; the original
+                    # read then advanced across the quiet log in several batches.
+                    # Keep reading from where this one stopped, as it did.
+                    replay_start = reached
+                    continue
                 break
             advisory_yield = (
                 initial_range
@@ -4018,22 +4030,125 @@ def _ensure_selected_keys(table: Table) -> None:
         )
 
 
+_RENAME_COLUMNS_OPTION = "rename_columns"
+# rename_columns lands chosen columns under new names: a JSON object such as
+# {"cust_nm": "customer_name"}, or "cust_nm:customer_name, ..." pairs. Every other
+# option still names source columns. The renames apply together, so two columns may
+# swap names, and a destination name may not clash (ignoring case, as Delta does) with
+# another reported column or a connector metadata column.
+_RENAME_FORBIDDEN = re.compile(r"[ ,;{}()\n\t=]")
+
+
+def _column_renames(options: dict[str, str]) -> tuple[tuple[str, str], ...] | None:
+    # Docstring: The table's rename_columns as sorted (source, destination) pairs, or None.
+
+    raw = options.get(_RENAME_COLUMNS_OPTION)
+    if raw is None or not str(raw).strip():
+        return None
+    text = str(raw).strip()
+    option = _RENAME_COLUMNS_OPTION
+    if text.startswith("{"):
+        try:
+            pairs = json.loads(text, object_pairs_hook=list)
+        except ValueError as error:
+            raise ValueError(f"Option '{option}' is not a valid JSON object") from error
+        if not all(isinstance(value, str) for pair in pairs for value in pair):
+            raise ValueError(f"Option '{option}' must map column names to column names")
+    else:
+        pairs = []
+        for item in text.split(","):
+            source, separator, target = item.partition(":")
+            if not separator:
+                raise ValueError(
+                    f"Option '{option}' takes a JSON object or 'source:destination' pairs"
+                )
+            pairs.append((source, target))
+    pairs = [(source.strip(), target.strip()) for source, target in pairs]
+    sources = [source for source, _ in pairs]
+    if len(sources) != len(set(sources)):
+        raise ValueError(f"Option '{option}' renames a column twice")
+    for source, target in pairs:
+        if not source or not target:
+            raise ValueError(f"Option '{option}' has an empty column name")
+        if _RENAME_FORBIDDEN.search(target):
+            raise ValueError(
+                f"Option '{option}' destination name {target!r} contains a space or one "
+                "of ,;{}()= that Delta column names can't hold"
+            )
+    return tuple(sorted((source, target) for source, target in pairs if source != target)) or None
+
+
+def _apply_column_renames(table: Table, renames: tuple[tuple[str, str], ...] | None) -> Table:
+    # Docstring: Validate ``renames`` against ``table``'s selected columns and record them.
+
+    if renames is None:
+        return table if table.column_renames is None else replace(table, column_renames=None)
+    selected = {column.name for column in table.columns}
+    missing = [source for source, _ in renames if source not in selected]
+    if missing:
+        raise InformixError(
+            f"Option '{_RENAME_COLUMNS_OPTION}' renames column(s) that '{table.exposed_name}' "
+            f"does not have or does not select: {', '.join(missing)}"
+        )
+    mapping = dict(renames)
+    names = [mapping.get(column.name, column.name) for column in table.columns]
+    names += [CURSOR, COMMIT_LSN, TX_ID, OP, COMMIT_TIME]
+    folded = [name.casefold() for name in names]
+    clashes = sorted({name for name, fold in zip(names, folded) if folded.count(fold) > 1})
+    if clashes:
+        raise InformixError(
+            f"Option '{_RENAME_COLUMNS_OPTION}' gives '{table.exposed_name}' more than one "
+            f"column named {', '.join(clashes)}"
+        )
+    return table if table.column_renames == renames else replace(table, column_renames=renames)
+
+
+def _renamed_rows(rows: Iterator[dict], renames: tuple[tuple[str, str], ...] | None):
+    # Docstring: ``rows`` with their keys under the destination names ``renames`` gives.
+
+    if not renames:
+        return rows
+    mapping = dict(renames)
+    return ({mapping.get(key, key): value for key, value in row.items()} for row in rows)
+
+
 _ROW_FILTER_OPTION = "row_filter"
 # row_filter keeps only the rows matching a predicate -- in snapshots, file-sourced
 # snapshots, and the change stream alike -- and is named as in Lakeflow Connect. The
 # connector parses it itself so the same predicate can be rendered to SQL for snapshots
 # and evaluated in Python on CDC before- and after-images and on file records. That
 # limits it to a grammar whose meaning is identical both ways: comparisons, IN, BETWEEN,
-# IS [NOT] NULL, AND/OR/NOT and parentheses, over numeric, string, BOOLEAN, DATE, and
-# YEAR-anchored DATETIME columns, with SQL's three-valued NULL logic. Strings compare by
-# code point with trailing spaces ignored, which is Informix's CHAR/VARCHAR order for ISO
-# 8859-1 and UTF-8 code sets; NVARCHAR collates by locale, so it takes equality tests
-# only. FLOAT columns are rejected because binary floating point compares differently
-# in SQL and Python. An UPDATE that moves a row into the filter is upserted and one that
-# moves it out is deleted, so a keyed target holds exactly the matching rows.
+# LIKE, IS [NOT] NULL, AND/OR/NOT and parentheses, over numeric, string, BOOLEAN, DATE,
+# and YEAR-anchored DATETIME columns, with SQL's three-valued NULL logic. Strings compare
+# by code point with trailing spaces ignored, which is Informix's CHAR/VARCHAR order for
+# ISO 8859-1 and UTF-8 code sets; NVARCHAR collates by locale, so it takes equality tests
+# and LIKE only. LIKE follows what Informix 14.10 was measured to do on every string
+# type: case-sensitive, trailing blanks of the value and of the pattern ignored, and an
+# escape character (backslash unless ESCAPE names another) that makes the next
+# character literal. The SQL always spells the ESCAPE out, so the server's
+# DEFAULTESCCHAR setting cannot change the meaning. FLOAT columns are rejected because
+# binary floating point compares differently in SQL and Python. An UPDATE that moves a
+# row into the filter is upserted and one that moves it out is deleted, so a keyed
+# target holds exactly the matching rows.
 _ROW_FILTER_KEYWORDS = frozenset(
-    {"AND", "OR", "NOT", "IN", "BETWEEN", "IS", "NULL", "TRUE", "FALSE", "DATE", "TIMESTAMP"}
+    {
+        "AND",
+        "OR",
+        "NOT",
+        "IN",
+        "BETWEEN",
+        "LIKE",
+        "ESCAPE",
+        "IS",
+        "NULL",
+        "TRUE",
+        "FALSE",
+        "DATE",
+        "TIMESTAMP",
+    }
 )
+_ROW_FILTER_LIKE_ESCAPE = "\\"
+_ROW_FILTER_LIKE_CACHE: dict[tuple[str, str], re.Pattern] = {}
 _ROW_FILTER_TOKEN = re.compile(
     r"\s*(?:(?P<number>-?\d+(?:\.\d+)?)|(?P<string>'(?:[^']|'')*')"
     r"|(?P<op><>|!=|<=|>=|=|<|>)|(?P<punct>[(),])|(?P<word>[^\W\d][\w$]*))",
@@ -4066,9 +4181,11 @@ class _RowFilterParser:
     # Docstring: Recursive-descent parser turning row_filter text into a hashable tree.
     #
     # Nodes: ("and"|"or", children), ("not", child), ("cmp", column, op, literal),
-    # ("in", column, negated, literals), ("between", column, negated, low, high), and
-    # ("null", column, negated). A literal is (kind, value) with kind number, string,
-    # bool, date, or timestamp.
+    # ("in", column, negated, literals), ("between", column, negated, low, high),
+    # ("like", column, negated, pattern, escape), and ("null", column, negated). A
+    # literal is (kind, value) with kind number, string, bool, date, or timestamp; a LIKE
+    # pattern is a string literal with its trailing blanks removed, since Informix
+    # ignores them, and its escape is the one character ESCAPE names (backslash if none).
 
     def __init__(self, text: str) -> None:
         self.tokens: list[tuple[str, str]] = []
@@ -4167,12 +4284,34 @@ class _RowFilterParser:
             low = self.parse_literal()
             self.expect_keyword("AND")
             return ("between", column, negated, low, self.parse_literal())
+        if self.accept_keyword("LIKE"):
+            return self.parse_like(column, negated)
         if negated:
-            self.fail(f"expected IN or BETWEEN after NOT for {column}")
+            self.fail(f"expected IN, BETWEEN, or LIKE after NOT for {column}")
         kind, op = self.take()
         if kind != "op":
             self.fail(f"expected a comparison after {column}")
         return ("cmp", column, "<>" if op == "!=" else op, self.parse_literal())
+
+    def parse_like(self, column: str, negated: bool) -> tuple:
+        kind, pattern = self.parse_literal()
+        if kind != "string":
+            self.fail(f"LIKE for {column} needs a quoted pattern")
+        escape = _ROW_FILTER_LIKE_ESCAPE
+        if self.accept_keyword("ESCAPE"):
+            kind, escape = self.parse_literal()
+            if kind != "string" or len(escape) != 1 or escape in "%_ ":
+                self.fail(f"ESCAPE for {column} must be one character other than %, _, or a space")
+        pattern = pattern.rstrip(" ")
+        index = 0
+        while index < len(pattern):
+            if pattern[index] == escape:
+                if index + 1 == len(pattern):
+                    # Informix matches such a pattern inconsistently, so it is refused.
+                    self.fail(f"LIKE pattern for {column} ends with its escape character")
+                index += 1
+            index += 1
+        return ("like", column, negated, ("string", pattern), escape)
 
     def parse_literal(self) -> tuple:
         kind, value = self.take()
@@ -4263,6 +4402,10 @@ def _row_filter_text(tree: tuple) -> str:
     if tag == "in":
         values = ", ".join(_row_filter_literal_text(value) for value in tree[3])
         return f"{column} {negation}IN ({values})"
+    if tag == "like":
+        pattern = _row_filter_literal_text(tree[3])
+        escape = _row_filter_literal_text(("string", tree[4]))
+        return f"{column} {negation}LIKE {pattern} ESCAPE {escape}"
     low, high = _row_filter_literal_text(tree[3]), _row_filter_literal_text(tree[4])
     return f"{column} {negation}BETWEEN {low} AND {high}"
 
@@ -4346,6 +4489,13 @@ def _check_row_filter(tree: tuple, table: Table) -> None:
             )
         if tag == "null":
             return
+        if tag == "like":
+            if kind not in ("string", "nstring"):
+                raise InformixError(
+                    f"Option '{_ROW_FILTER_OPTION}' can only apply LIKE to a string column, "
+                    f"not {column.type_name} column {name}"
+                )
+            return
         literals = node[3] if tag == "in" else (node[3],) if tag == "cmp" else node[3:5]
         expected = "string" if kind == "nstring" else kind
         for literal in literals:
@@ -4415,6 +4565,9 @@ def _row_filter_sql(table: Table) -> str | None:
         if tag == "in":
             values = ", ".join(literal(value, column) for value in node[3])
             return f"{name} {negation}IN ({values})"
+        if tag == "like":
+            escape = literal(("string", node[4]), column)
+            return f"{name} {negation}LIKE {literal(node[3], column)} ESCAPE {escape}"
         low, high = literal(node[3], column), literal(node[4], column)
         return f"{name} {negation}BETWEEN {low} AND {high}"
 
@@ -4466,10 +4619,40 @@ def _row_filter_value(node: tuple, row: dict, kinds: dict[str, str | None]) -> b
     if tag == "in":
         hit = any(_row_filter_compare(value, "=", literal[1], kind) for literal in node[3])
         return hit != node[2]
+    if tag == "like":
+        hit = _row_filter_like(node[3][1], node[4]).fullmatch(str(value).rstrip(" ")) is not None
+        return hit != node[2]
     inside = _row_filter_compare(value, ">=", node[3][1], kind) and _row_filter_compare(
         value, "<=", node[4][1], kind
     )
     return inside != node[2]
+
+
+def _row_filter_like(pattern: str, escape: str) -> re.Pattern:
+    # Docstring: Compile a LIKE pattern (trailing blanks already removed) to a regex.
+
+    key = (pattern, escape)
+    compiled = _ROW_FILTER_LIKE_CACHE.get(key)
+    if compiled is None:
+        parts = []
+        index = 0
+        while index < len(pattern):
+            character = pattern[index]
+            if character == escape:
+                index += 1
+                parts.append(re.escape(pattern[index]))
+            elif character == "%":
+                parts.append(".*")
+            elif character == "_":
+                parts.append(".")
+            else:
+                parts.append(re.escape(character))
+            index += 1
+        compiled = re.compile("".join(parts), re.DOTALL)
+        if len(_ROW_FILTER_LIKE_CACHE) >= 256:
+            _ROW_FILTER_LIKE_CACHE.clear()
+        _ROW_FILTER_LIKE_CACHE[key] = compiled
+    return compiled
 
 
 def _row_filter_compare(value: Any, op: str, literal: Any, kind: str | None) -> bool:
@@ -4903,6 +5086,11 @@ class Table:
     column_selection: tuple[str, tuple[str, ...]] | None = None
     catalog_columns: tuple[Column, ...] = ()
     row_filter: str | None = None
+    # rename_columns as sorted (source, destination) pairs, or None. Internally every
+    # column keeps its source name; only what the connector reports -- the schema, the
+    # rows, the key -- uses the destination names. Fingerprinted when set, like the
+    # selection, since rows already landed carry the old names.
+    column_renames: tuple[tuple[str, str], ...] | None = None
 
     @property
     def exposed_name(self) -> str:
@@ -4976,6 +5164,12 @@ class Table:
                 )
             selection = (str(mode), tuple(str(value) for value in names))
         row_filter = raw.get("row_filter")
+        renames_raw = raw.get("column_renames")
+        renames = (
+            None
+            if renames_raw is None
+            else tuple((str(source), str(target)) for source, target in renames_raw)
+        )
         return cls(
             database,
             owner,
@@ -4988,6 +5182,7 @@ class Table:
             nullable_index_descending=nullable_index_descending,
             column_selection=selection,
             row_filter=None if row_filter is None else str(row_filter),
+            column_renames=renames,
         )
 
 
@@ -5119,6 +5314,8 @@ class _SharedCdcSnapshot:
     committed: list
     caught_up: bool
     open_begin: int | None
+    # Where the daemon's latest read went idle (its TIMEOUT LSN), or None.
+    reached_lsn: int | None = None
 
 
 class _SharedCdcShard:
@@ -5143,6 +5340,7 @@ class _SharedCdcShard:
         self.schema: dict[str, "Table"] = {}
         self.min_lsn: int | None = None
         self.current_lsn: int | None = None
+        self.reached_lsn: int | None = None
         self.caught_up = False
         self.open_begins: dict[str, int | None] = {}
         self.ready = False
@@ -5239,6 +5437,7 @@ class _SharedCdcShard:
                 committed=committed,
                 caught_up=caught_up,
                 open_begin=self.open_begins.get(identity),
+                reached_lsn=self.reached_lsn if caught_up else None,
             )
 
     # ---- daemon side --------------------------------------------------------
@@ -5265,9 +5464,11 @@ class _SharedCdcShard:
         buffer = TransactionBuffer()
         committed = []
         timed_out = False
+        reached = None
         for record in raw:
             if _operation(record) == "TIMEOUT":
                 timed_out = True
+                reached = _lsn(record)
             done = buffer.feed(record)
             if done is not None:
                 committed.append(done)
@@ -5295,6 +5496,12 @@ class _SharedCdcShard:
             global_open = min((item.begin_lsn for item in buffer.open.values()), default=None)
             if global_open is not None:
                 advanced = global_open
+            elif timed_out and reached is not None:
+                # Idle with nothing open: everything the shard captures up to where the
+                # log reader stopped has been delivered, so resume from there. Resuming
+                # from the last commit instead rescans the same stretch of a busy log on
+                # every poll and can time out before ever passing it.
+                advanced = max(reached, committed[-1].commit_lsn if committed else reached)
             elif committed:
                 advanced = committed[-1].commit_lsn
             else:
@@ -5323,6 +5530,7 @@ class _SharedCdcShard:
             self.min_lsn = min_lsn
             self.current_lsn = current_lsn
             self.caught_up = timed_out and not buffer.open
+            self.reached_lsn = reached if self.caught_up else None
             self.ready = True
             self.condition.notify_all()
         return self.caught_up
@@ -6216,9 +6424,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         try:
             table = self._registration_table(table_name, table_options)
             _ensure_materializable(table, table_options)
+            renames = dict(table.column_renames or ())
             fields = [
                 StructField(
-                    column.name,
+                    renames.get(column.name, column.name),
                     _spark_type(column, table_options),
                     column.nullable,
                 )
@@ -6274,8 +6483,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                         "ingestion_type": "snapshot",
                     }
                 else:
+                    renames = dict(table.column_renames or ())
                     result = {
-                        "primary_keys": list(table.primary_keys),
+                        "primary_keys": [renames.get(key, key) for key in table.primary_keys],
                         "cursor_field": CURSOR,
                         "ingestion_type": "cdc_with_deletes",
                     }
@@ -6357,6 +6567,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def read_table(
         self, table_name: str, start_offset: dict, table_options: dict[str, str]
     ) -> tuple[Iterator[dict], dict]:
+        rows, offset = self._read_upserts(table_name, start_offset, table_options)
+        return _renamed_rows(rows, _column_renames(table_options)), offset
+
+    def _read_upserts(
+        self, table_name: str, start_offset: dict, table_options: dict[str, str]
+    ) -> tuple[Iterator[dict], dict]:
+        # Docstring: ``read_table`` under source column names; rename_columns is applied
+        # only where rows leave the connector.
+
         effective_start = self._effective_start_offset(start_offset)
         snapshot_mode = self._snapshot_mode(table_options)
         self._publish_checkpoint_channel_start_before_capacity(
@@ -6725,9 +6944,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _embedded_read(
         self, table_name: str, start_offset: dict, table_options: dict[str, str]
     ) -> tuple[Iterator[dict], dict]:
+        # Source names: read_partition renames every partition's rows as they leave.
         if self._is_delete_flow():
-            return self.read_table_deletes(table_name, start_offset, table_options)
-        return self.read_table(table_name, start_offset, table_options)
+            return self._read_deletes(table_name, start_offset, table_options)
+        return self._read_upserts(table_name, start_offset, table_options)
 
     def latest_offset(
         self,
@@ -6958,6 +7178,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def read_partition(
         self, table_name: str, partition: dict, table_options: dict[str, str]
     ) -> Iterator[dict]:
+        rows = self._read_partition_rows(partition, table_options)
+        return _renamed_rows(rows, _column_renames(table_options))
+
+    def _read_partition_rows(
+        self, partition: dict, table_options: dict[str, str]
+    ) -> Iterator[dict]:
         kind = partition.get("kind")
         if kind == "embedded":
             # F1: reverse the staging-codec encoding get_partitions applied, so the
@@ -6988,6 +7214,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def read_table_deletes(
         self, table_name: str, start_offset: dict, table_options: dict[str, str]
     ) -> tuple[Iterator[dict], dict]:
+        rows, offset = self._read_deletes(table_name, start_offset, table_options)
+        return _renamed_rows(rows, _column_renames(table_options)), offset
+
+    def _read_deletes(
+        self, table_name: str, start_offset: dict, table_options: dict[str, str]
+    ) -> tuple[Iterator[dict], dict]:
+        # Docstring: ``read_table_deletes`` under source column names.
+
         effective_start = self._effective_start_offset(start_offset)
         snapshot_mode = self._snapshot_mode(table_options)
         # An uncheckpointed delete reader cannot do useful source work until its
@@ -7888,13 +8122,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # Docstring: Apply every per-table option that reshapes the catalog table.
         #
         # The column selection runs first, so the key options see only the selected
-        # columns (a wildcard key covers just those), and row_filter last, since it may
-        # only use selected columns.
+        # columns (a wildcard key covers just those), then row_filter, since it may only
+        # use selected columns, and the renames last, which may only rename them.
 
         table = _apply_column_selection(table, _column_selection(table_options))
         table = self._apply_key_options(table, table_options)
         _ensure_selected_keys(table)
-        return _apply_row_filter(table, table_options.get(_ROW_FILTER_OPTION))
+        table = _apply_row_filter(table, table_options.get(_ROW_FILTER_OPTION))
+        return _apply_column_renames(table, _column_renames(table_options))
 
     def _snapshot_mode(self, table_options: dict[str, str]) -> str:
         mode = (
@@ -9294,6 +9529,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # caller to fall back to the blocking snapshot rather than risk skipped
         # rows.
 
+        if any(
+            column.name in table.primary_keys and column.type_name == "INTERVAL"
+            for column in table.columns
+        ):
+            # An INTERVAL key has no order-preserving string cast (a sign and an
+            # unpadded leading field), so it is copied by the blocking snapshot, whose
+            # positional paging never renders a key back into SQL.
+            return {}, False
         datetime_keys = [
             column
             for column in table.columns
@@ -9405,8 +9648,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         if not viable:
             logging.getLogger(__name__).info(
                 "Informix incremental snapshot for '%s' falling back to the blocking "
-                "consistent snapshot because a DATETIME primary-key column cannot be "
-                "chunked as an order-preserving string",
+                "consistent snapshot because a DATETIME or INTERVAL primary-key column "
+                "cannot be chunked as an order-preserving string",
                 table.exposed_name,
             )
             return self._read_snapshot(
@@ -10046,7 +10289,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     max_rows,
                     self._table_int_option(options, "snapshot.max.bytes", 0, minimum=0),
                     datetime_primary_key=any(
-                        column.name in scan_keys and column.type_name == "DATETIME"
+                        column.name in scan_keys and column.type_name in _LITERAL_UNSAFE_KEY_TYPES
                         for column in table.columns
                     ),
                     page_consumer=page_consumer,
@@ -11737,10 +11980,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         if shared_view is not None:
             # The daemon already assembled and fanned out this shard's transactions and
             # re-validated the schema; take them as-is (no Informix I/O, no re-fetch).
-            committed, caught_up, open_begin = (
+            committed, caught_up, open_begin, reached = (
                 shared_view.committed,
                 shared_view.caught_up,
                 shared_view.open_begin,
+                shared_view.reached_lsn,
             )
         else:
             raw_records = self._read_changes_with_reconnect(
@@ -11753,7 +11997,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 table=table,
             )
             table = self._refresh_table_schema(table, fingerprint)
-            committed, caught_up, open_begin = _transaction_batch(raw_records)
+            committed, caught_up, open_begin, reached = _transaction_batch(raw_records)
         recovered = _recover(committed, checkpoint)
         output: list[dict[str, Any]] = []
         end = dict(start)
@@ -11853,9 +12097,54 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 trigger_generation=checkpoint.get("trigger_generation"),
                 trigger_high_water=checkpoint.get("trigger_high_water"),
             )
-        reached_trigger_boundary = trigger_generation is not None and (
-            crossed_trigger_boundary or (caught_up and consumed == len(recovered))
+        drained = (
+            caught_up
+            and open_begin is None
+            and consumed == len(recovered)
+            and not crossed_transition
         )
+        # Caught up only counts once Informix's log reader is past the frozen boundary:
+        # a poll can go idle short of it, and stopping there would leave the changes in
+        # between for a later update. An unknown position keeps the old reading.
+        reached_trigger_boundary = trigger_generation is not None and (
+            crossed_trigger_boundary
+            or (drained and (reached is None or reached >= trigger_high_water))
+        )
+        # A triggered or replayed read that went idle with nothing left to emit moves its
+        # checkpoint to where the log reader stopped (capped at the read's bound), so the
+        # next read continues from there rather than rescanning -- and, below the
+        # boundary, so AvailableNow sees progress and keeps reading. Everything this
+        # table needs up to that position was delivered: an open transaction keeps the
+        # offset at its BEGIN instead (drained is False), and Informix delivers a
+        # transaction's BEGIN with its first captured change, as the commit-based
+        # offsets above already rely on. A continuous read keeps its checkpoint: idle
+        # polls there would otherwise each become an empty microbatch.
+        quiet_bound = None
+        if trigger_high_water is not None:
+            quiet_bound = trigger_high_water
+        if replay_stop is not None:
+            quiet_bound = replay_stop if quiet_bound is None else min(quiet_bound, replay_stop)
+        if (
+            quiet_bound is not None
+            and drained
+            and reached is not None
+            and transition_lsn is None
+            and not projection_schema_transition
+            and min(reached, quiet_bound) > int(end["commit_lsn"])
+        ):
+            quiet = min(reached, quiet_bound)
+            end = _offset(
+                quiet,
+                quiet,
+                quiet,
+                None,
+                "stream",
+                capture_table,
+                capture_schema_id,
+                pipeline_scope,
+                trigger_generation=checkpoint.get("trigger_generation"),
+                trigger_high_water=checkpoint.get("trigger_high_water"),
+            )
         if reached_trigger_boundary:
             end = dict(end)
             end["trigger_generation"] = trigger_generation
@@ -13195,7 +13484,6 @@ def _catalog_column(row: Any) -> dict[str, Any]:
         "TEXT",
         "BLOB",
         "CLOB",
-        "INTERVAL",
         "NCHAR",
         "SET",
         "MULTISET",
@@ -13208,6 +13496,8 @@ def _catalog_column(row: Any) -> dict[str, Any]:
     cdc_supported = type_name not in unsupported
     if type_name == "DATETIME":
         cdc_supported = _datetime_qualifier_supported(length)
+    if type_name == "INTERVAL":
+        cdc_supported = interval_layout(length) is not None
     return {
         "name": name,
         "type_name": type_name,
@@ -13337,7 +13627,6 @@ def _snapshot_unsupported_columns(table: Table) -> tuple[Column, ...]:
         "TEXT",
         "BLOB",
         "CLOB",
-        "INTERVAL",
         "NCHAR",
         "SET",
         "MULTISET",
@@ -13354,7 +13643,13 @@ def _snapshot_unsupported_columns(table: Table) -> tuple[Column, ...]:
         or (
             column.type_name == "DATETIME" and not _datetime_qualifier_supported(column.length or 0)
         )
+        or (column.type_name == "INTERVAL" and interval_layout(column.length or 0) is None)
     )
+
+
+# Key types whose values Informix doesn't reliably parse back from a SQL literal, so a
+# snapshot keyed on one pages by position within its transaction instead.
+_LITERAL_UNSAFE_KEY_TYPES = frozenset({"DATETIME", "INTERVAL"})
 
 
 def _datetime_qualifier_supported(qualifier: int) -> bool:
@@ -13586,13 +13881,22 @@ def _committed_transactions(records: Sequence[dict[str, Any]]) -> list[Committed
 
 def _transaction_batch(
     records: Sequence[dict[str, Any]],
-) -> tuple[list[CommittedTransaction], bool, int | None]:
+) -> tuple[list[CommittedTransaction], bool, int | None, int | None]:
+    # Docstring: Assemble one poll's records: ``(committed, caught_up, open_begin, reached)``.
+    #
+    # ``reached`` is the LSN of the poll's TIMEOUT record -- how far Informix's log
+    # reader had scanned when it went idle -- or None if the poll did not time out.
+    # That can be short of the log's end (measured: idle at page 6141 while the log was
+    # at 6157), so being caught up says nothing about a later position by itself.
+
     buffer = TransactionBuffer()
     result = []
     timed_out = False
+    reached = None
     for record in records:
         if _operation(record) == "TIMEOUT":
             timed_out = True
+            reached = _lsn(record)
         committed = buffer.feed(record)
         if committed is not None:
             result.append(committed)
@@ -13605,7 +13909,7 @@ def _transaction_batch(
     # Open transactions are intentionally discarded.  The returned offset
     # remains before their BEGIN so a finite next call safely replays them.
     open_begin = min((tx.begin_lsn for tx in buffer.open.values()), default=None)
-    return result, timed_out and not buffer.open, open_begin
+    return result, timed_out and not buffer.open, open_begin, reached
 
 
 def _recover(
@@ -13982,6 +14286,10 @@ def _unload_value(text: str, type_name: str) -> Any:
         return datetime.fromisoformat(text)
     if upper == "BOOLEAN":
         return text.strip().lower() in {"t", "true", "1", "y"}
+    if upper == "INTERVAL":
+        # UNLOAD right-aligns an INTERVAL in its field width ("  -5 10:30:00"); the
+        # trimmed text is exactly what the snapshot and CDC decoders produce.
+        return text.strip()
     return text
 
 
@@ -14725,6 +15033,8 @@ def _schema_fingerprint(table: Table) -> str:
         parts += (("column_selection", table.column_selection),)
     if table.row_filter is not None:
         parts += (("row_filter", table.row_filter),)
+    if table.column_renames is not None:
+        parts += (("column_renames", table.column_renames),)
     return hashlib.sha256(repr(parts).encode("utf-8")).hexdigest()
 
 
@@ -14769,6 +15079,11 @@ def _schema_state(
                 }
             ),
             **({} if table.row_filter is None else {"row_filter": table.row_filter}),
+            **(
+                {}
+                if table.column_renames is None
+                else {"column_renames": [list(pair) for pair in table.column_renames]}
+            ),
         },
     }
 
@@ -14820,7 +15135,8 @@ def _carry_table_options(fresh: Table, previous: Table) -> Table:
             key_from_nullable_index=True,
         )
     _ensure_selected_keys(fresh)
-    return _apply_row_filter(fresh, previous.row_filter)
+    fresh = _apply_row_filter(fresh, previous.row_filter)
+    return _apply_column_renames(fresh, previous.column_renames)
 
 
 def _carry_key_override(fresh: Table, overridden: Table) -> Table:
@@ -14876,11 +15192,14 @@ def _widened(previous: Column, current: Column) -> bool:
     # A longer CHAR, VARCHAR, NVARCHAR, or LVARCHAR stays StringType, and SMALLINT to
     # INTEGER stays IntegerType, so neither changes what the destination holds. The
     # numeric widenings change the Spark type -- SMALLINT or INTEGER to BIGINT/INT8
-    # (IntegerType to LongType), SMALLFLOAT to FLOAT (FloatType to DoubleType), and a
-    # fixed-scale DECIMAL or MONEY gaining precision without losing integer digits -- and
-    # match what Delta type widening accepts, so the destination widens the column in
-    # place when the pipeline sets pipelines.enableTypeWidening. Nullability must not
-    # change, and a variable-scale DECIMAL never widens.
+    # (IntegerType to LongType), SMALLFLOAT to FLOAT (FloatType to DoubleType), a
+    # fixed-scale DECIMAL or MONEY gaining precision without losing integer digits, and
+    # an integer to a fixed-scale DECIMAL or MONEY with room for all its digits (10 for
+    # SMALLINT and INTEGER, which land as IntegerType; 20 for the 64-bit types) or, for
+    # SMALLINT and INTEGER, to FLOAT -- and match what Delta type widening accepts, so
+    # the destination widens the column in place when the pipeline sets
+    # pipelines.enableTypeWidening. Nullability must not change, and a variable-scale
+    # DECIMAL never widens.
 
     if (previous.name, previous.nullable, previous.cdc_supported) != (
         current.name,
@@ -14893,6 +15212,16 @@ def _widened(previous: Column, current: Column) -> bool:
         return _string_capacity(current) >= _string_capacity(previous)
     if old_type in _INTEGER_RANKS and new_type in _INTEGER_RANKS:
         return _INTEGER_RANKS[new_type] > _INTEGER_RANKS[old_type]
+    if old_type in _INTEGER_RANKS and new_type in {"DECIMAL", "NUMERIC", "MONEY"}:
+        if current.precision is None or current.scale in (None, 0xFF):
+            return False
+        # Delta's minimum: decimal(10,0) for IntegerType, decimal(20,0) for LongType,
+        # with any scale added on top of those integer digits.
+        digits = 20 if _INTEGER_RANKS[old_type] == 3 else 10
+        return current.precision <= 38 and current.precision - current.scale >= digits
+    if old_type in _INTEGER_RANKS and new_type in {"FLOAT", "DOUBLE", "DOUBLE PRECISION"}:
+        # IntegerType to DoubleType is exact; Delta doesn't widen LongType to DoubleType.
+        return _INTEGER_RANKS[old_type] < 3
     if old_type in {"SMALLFLOAT", "REAL"}:
         return new_type in {"FLOAT", "DOUBLE", "DOUBLE PRECISION"}
     if old_type == new_type in {"DECIMAL", "NUMERIC", "MONEY"}:
@@ -14998,6 +15327,13 @@ def _ensure_compatible_schema_change(
             f"'{_ROW_FILTER_OPTION}' changed for '{name}'; run a full refresh so every row "
             "is read under the new filter"
         )
+    if previous.column_renames != current.column_renames and not _renames_cleanup_only(
+        previous, current
+    ):
+        raise InformixError(
+            f"'{_RENAME_COLUMNS_OPTION}' changed for '{name}'; run a full refresh so every "
+            "row lands under the new names"
+        )
 
 
 def _selection_cleanup_only(previous: Table, current: Table) -> bool:
@@ -15010,6 +15346,14 @@ def _selection_cleanup_only(previous: Table, current: Table) -> bool:
     catalog = {column.name for column in current.catalog_columns or current.columns}
     changed = set(previous.column_selection[1]) ^ set(current.column_selection[1])
     return not changed & catalog
+
+
+def _renames_cleanup_only(previous: Table, current: Table) -> bool:
+    # Docstring: Whether the renames only lost entries for columns the table no longer has.
+
+    before, after = set(previous.column_renames or ()), set(current.column_renames or ())
+    catalog = {column.name for column in current.catalog_columns or current.columns}
+    return after <= before and all(source not in catalog for source, _ in before - after)
 
 
 def _unl_position(offset: dict[str, Any], *, terminal: int | None = None) -> tuple[int, int]:

@@ -1,10 +1,10 @@
 """Verified Informix change-stream framing and primitive codecs.
 
 Layouts follow the Informix change-stream wire format.
-The supported packed DECIMAL/MONEY, INT8/SERIAL8, and qualifier-aware DATETIME
-paths are implemented below. Types omitted by the native capture-column API
-(including INTERVAL, LOB, and complex/opaque values) remain explicit exclusions;
-the source API supplies no row payload for a Python decoder to reconstruct.
+The supported packed DECIMAL/MONEY, INT8/SERIAL8, and qualifier-aware DATETIME and
+INTERVAL paths are implemented below. Types omitted by the native capture-column API
+(LOB and complex/opaque values) remain explicit exclusions; the source API supplies
+no row payload for a Python decoder to reconstruct.
 """
 
 from __future__ import annotations
@@ -369,7 +369,9 @@ def _decode_value_bytes(data: memoryview, column: ColumnDescriptor) -> tuple[Any
         return (-magnitude if sign == -1 else magnitude), 10
     if kind == "DATETIME":
         return _decode_datetime(data, column)
-    if kind in {"BYTE", "TEXT", "BLOB", "CLOB", "INTERVAL", "UDT", "ROW", "SET", "LIST"}:
+    if kind == "INTERVAL":
+        return decode_interval(data, column.length)
+    if kind in {"BYTE", "TEXT", "BLOB", "CLOB", "UDT", "ROW", "SET", "LIST"}:
         raise UnsupportedCdcType(f"{kind} is not supported by the IBM capture-column path")
     raise UnsupportedCdcType(f"unsupported CDC type {column.type_name}")
 
@@ -531,6 +533,77 @@ def _decode_datetime(
     return rendered, size
 
 
+# INTERVAL qualifier field codes: YEAR, MONTH | DAY, HOUR, MINUTE, SECOND, then
+# FRACTION(n) as 10 + n. The separator written before each field after the first.
+_INTERVAL_SEPARATORS = {2: "-", 6: " ", 8: ":", 10: ":"}
+_INTERVAL_FIELD_LIMITS = {2: 12, 6: 24, 8: 60, 10: 60}
+
+
+def interval_layout(qualifier: int) -> tuple[tuple[int, ...], int, int] | None:
+    # Docstring: Split an INTERVAL qualifier into ``(fields, leading_digits, fraction)``.
+    #
+    # ``qualifier`` is the syscolumns.collength layout, which SQLI result descriptors
+    # carry too: total digits in the high byte, then the start and end field codes in
+    # the low byte's nibbles (``DAY(3) TO SECOND`` is 0x094a). Returns None for a
+    # qualifier no INTERVAL can have, such as one mixing YEAR-MONTH and DAY-TIME fields.
+
+    total, start, end = (qualifier >> 8) & 0xFF, (qualifier >> 4) & 0xF, qualifier & 0xF
+    if start in (0, 2):
+        if end not in (0, 2) or end < start:
+            return None
+    elif start not in (4, 6, 8, 10) or end not in (4, 6, 8, 10, 11, 12, 13, 14, 15):
+        return None
+    if end < start:
+        return None
+    fields = tuple(range(start, min(end, 10) + 1, 2))
+    fraction = end - 10 if end > 10 else 0
+    leading = total - 2 * (len(fields) - 1) - fraction
+    if not 1 <= leading <= 9:
+        return None
+    return fields, leading, fraction
+
+
+def decode_interval(data: memoryview, qualifier: int) -> tuple[str | None, int]:
+    # Docstring: Decode a packed INTERVAL into Informix's literal text, e.g. ``-5 10:30:00.250``.
+    #
+    # An INTERVAL is stored as a signed packed DECIMAL whose digits are its fields run
+    # together on a fixed grid: the decimal point always follows the SECOND position,
+    # whatever the qualifier's last field, so ``HOUR TO MINUTE`` holds 10:30 as 103000 and
+    # ``YEAR TO MONTH`` holds 1-02 as 10200000000 (measured on Informix 14.10). The text
+    # gives the first field without padding, the rest two digits each, and the fraction
+    # at its declared width, with ``-`` before a negative interval -- Informix's own
+    # rendering, trimmed. Delta tables cannot store Spark's interval types, so this text
+    # is what lands.
+
+    layout = interval_layout(qualifier)
+    if layout is None:
+        raise UnsupportedCdcType(f"unsupported INTERVAL qualifier 0x{qualifier:04x}")
+    fields, leading, fraction = layout
+    total = (qualifier >> 8) & 0xFF
+    size = (total + (fraction & 1) + 3) // 2
+    _need(data, size)
+    value = decode_packed_decimal(bytes(data[:size]), total, fraction)
+    if value is None:
+        return None, size
+    negative = value < 0
+    magnitude = -value if negative else value
+    whole, below = divmod(int(magnitude), 10 ** (10 - fields[-1]))
+    if below:
+        raise CdcProtocolError(f"INTERVAL holds digits below its last field: {value}")
+    parts = []
+    for code in reversed(fields[1:]):
+        whole, part = divmod(whole, 100)
+        if part >= _INTERVAL_FIELD_LIMITS[code]:
+            raise CdcProtocolError(f"INTERVAL field {code} holds {part}")
+        parts.append(f"{_INTERVAL_SEPARATORS[code]}{part:02d}")
+    if whole >= 10**leading:
+        raise CdcProtocolError(f"INTERVAL leading field {whole} exceeds {leading} digits")
+    text = ("-" if negative and magnitude else "") + str(whole) + "".join(reversed(parts))
+    if fraction:
+        text += "." + str(int((magnitude - int(magnitude)).scaleb(fraction))).zfill(fraction)
+    return text, size
+
+
 def _need(data: memoryview, size: int) -> None:
     if size < 0 or len(data) < size:
         raise CdcProtocolError(f"truncated CDC value: need {size}, have {len(data)}")
@@ -551,6 +624,8 @@ __all__ = [
     "UnsupportedCdcType",
     "apply_null_byte",
     "decode_frame",
+    "decode_interval",
+    "interval_layout",
     "metadata_column_names",
     "decode_packed_decimal",
     "decode_row",

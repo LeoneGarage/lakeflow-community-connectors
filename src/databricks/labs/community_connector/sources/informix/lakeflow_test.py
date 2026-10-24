@@ -1195,6 +1195,40 @@ class LakeflowContractTests(unittest.TestCase):
         )
         self.assertFalse(unsupported["cdc_supported"])
 
+    def test_catalog_accepts_interval_qualifiers(self):
+        column = _catalog_column(
+            {"colname": "elapsed", "coltype": 14, "collength": 0x0C4D, "colno": 2}
+        )  # DAY(3) TO FRACTION(3), kept in the collength layout the decoder reads
+        self.assertEqual((column["type_name"], column["length"]), ("INTERVAL", 0x0C4D))
+        self.assertTrue(column["cdc_supported"])
+        mixed = _catalog_column({"colname": "bad", "coltype": 14, "collength": 0x0624, "colno": 3})
+        self.assertFalse(mixed["cdc_supported"])
+
+    def test_an_interval_column_streams_and_lands_as_a_string(self):
+        bridge = FakeBridge()
+        raw = _table()
+        raw["columns"].append(
+            {"name": "elapsed", "type_name": "INTERVAL", "length": 0x084A, "nullable": True}
+        )
+        bridge.tables = [raw]
+        connector = self.connector(bridge)
+
+        metadata = connector.read_table_metadata("app.orders", {})
+        fields = {f.name: f.dataType for f in connector.get_table_schema("app.orders", {}).fields}
+
+        self.assertEqual(metadata["ingestion_type"], "cdc_with_deletes")
+        self.assertEqual(type(fields["elapsed"]).__name__, "StringType")
+        # UNLOAD right-aligns the text; the file path lands it as the decoders do.
+        self.assertEqual(informix_module._unload_value("  -5 10:30:00", "INTERVAL"), "-5 10:30:00")
+
+    def test_an_interval_key_is_copied_by_the_blocking_snapshot(self):
+        raw = _table()
+        raw["columns"][0] = {"name": "id", "type_name": "INTERVAL", "length": 0x084A}
+        table = Table.parse(raw, "demo")
+        connector = self.connector(FakeBridge())
+        self.assertEqual(connector._incremental_datetime_chunk_exprs(table, {}), ({}, False))
+        self.assertIn("INTERVAL", informix_module._LITERAL_UNSAFE_KEY_TYPES)
+
     def test_catalog_enables_implemented_scalar_cdc_types(self):
         for type_id in (17, 18, 43):
             with self.subTest(type_id=type_id):
@@ -5050,7 +5084,7 @@ class LakeflowContractTests(unittest.TestCase):
         sentinel_rows = [{"id": 7, "value": "x"}]
         sentinel_end = {"phase": "stream", "commit_lsn": "9"}
         with mock.patch.object(
-            connector, "read_table", return_value=(iter(sentinel_rows), sentinel_end)
+            connector, "_read_upserts", return_value=(iter(sentinel_rows), sentinel_end)
         ) as read_table:
             end = connector.latest_offset("app.orders", {}, stream_start)
             partitions = connector.get_partitions("app.orders", {}, stream_start, end)
@@ -5073,9 +5107,9 @@ class LakeflowContractTests(unittest.TestCase):
         sentinel = ([{"id": 1}], {"phase": "stream", "commit_lsn": "6"})
         with (
             mock.patch.object(
-                connector, "read_table_deletes", return_value=(iter(sentinel[0]), sentinel[1])
+                connector, "_read_deletes", return_value=(iter(sentinel[0]), sentinel[1])
             ) as deletes,
-            mock.patch.object(connector, "read_table") as upserts,
+            mock.patch.object(connector, "_read_upserts") as upserts,
         ):
             end = connector.latest_offset("app.orders", {}, start)
 
@@ -5091,7 +5125,7 @@ class LakeflowContractTests(unittest.TestCase):
         start = {"phase": "stream", "commit_lsn": "5"}
         with mock.patch.object(
             connector,
-            "read_table",
+            "_read_upserts",
             side_effect=lambda *a, **k: (iter([{"id": 3}]), {"phase": "stream", "commit_lsn": "6"}),
         ) as read_table:
             connector.latest_offset("app.orders", {}, start)
@@ -5119,7 +5153,7 @@ class LakeflowContractTests(unittest.TestCase):
             seen.append(dict(opts))
             return iter([{"id": 1}, {"id": 2}, {"id": 3}]), dict(end)
 
-        with mock.patch.object(connector, "read_table", side_effect=read_table):
+        with mock.patch.object(connector, "_read_upserts", side_effect=read_table):
             connector.latest_offset("app.orders", {}, start)
             connector._partition_embedded_rows.clear()  # fresh driver process
             partitions = connector.get_partitions("app.orders", {}, start, end)
@@ -5133,21 +5167,50 @@ class LakeflowContractTests(unittest.TestCase):
 
     def test_partitioned_cache_miss_replay_fails_closed_on_a_short_read(self):
         # A recompute that reaches a lower LSN than the committed end must raise rather
-        # than serve a prefix: Spark would commit ``end`` and the rest would be lost.
+        # than serve a prefix: Spark would commit ``end`` and the rest would be lost. It
+        # keeps reading while it makes progress, so it fails once a read stalls short.
         connector = self._partitioned_connector()
         start = {"phase": "stream", "commit_lsn": "5"}
         end = {"phase": "stream", "commit_lsn": "9"}
-        reached = iter([dict(end), {"phase": "stream", "commit_lsn": "6"}])
+        short = {"phase": "stream", "commit_lsn": "6"}
+        reached = iter([dict(end), dict(short), dict(short)])
 
         with mock.patch.object(
             connector,
-            "read_table",
+            "_read_upserts",
             side_effect=lambda *a, **k: (iter([{"id": 1}]), next(reached)),
         ):
             connector.latest_offset("app.orders", {}, start)
             connector._partition_embedded_rows.clear()
             with self.assertRaisesRegex(InformixError, "did not reach its committed end LSN"):
                 connector.get_partitions("app.orders", {}, start, end)
+
+    def test_partitioned_cache_miss_replay_continues_past_an_idle_poll(self):
+        # The original batch may have crossed quiet log in several reads; a recompute
+        # whose first read goes idle short of the committed end reads on to reach it.
+        connector = self._partitioned_connector()
+        start = {"phase": "stream", "commit_lsn": "5"}
+        end = {"phase": "stream", "commit_lsn": "9"}
+        reads = iter(
+            [
+                (iter([{"id": 0}]), dict(end)),
+                (iter([{"id": 1}]), {"phase": "stream", "commit_lsn": "6"}),
+                (iter([{"id": 2}]), dict(end)),
+            ]
+        )
+        starts = []
+
+        def read(name, start_offset, options):
+            starts.append(start_offset.get("commit_lsn"))
+            return next(reads)
+
+        with mock.patch.object(connector, "_read_upserts", side_effect=read):
+            connector.latest_offset("app.orders", {}, start)
+            connector._partition_embedded_rows.clear()
+            partitions = connector.get_partitions("app.orders", {}, start, end)
+
+        self.assertEqual(starts, ["5", "5", "6"])
+        self.assertEqual(partitions, [{"kind": "embedded", "rows": [{"id": 1}, {"id": 2}]}])
 
     def test_partitioned_cache_miss_replay_routes_the_delete_flow(self):
         connector = self._partitioned_connector(**{"isDeleteFlow": "true"})
@@ -5160,8 +5223,8 @@ class LakeflowContractTests(unittest.TestCase):
             return iter([{"id": 1}]), dict(end)
 
         with (
-            mock.patch.object(connector, "read_table_deletes", side_effect=read_table_deletes),
-            mock.patch.object(connector, "read_table") as upserts,
+            mock.patch.object(connector, "_read_deletes", side_effect=read_table_deletes),
+            mock.patch.object(connector, "_read_upserts") as upserts,
         ):
             partitions = connector.get_partitions("app.orders", {}, start, end)
         self.assertEqual(partitions, [{"kind": "embedded", "rows": [{"id": 1}]}])
@@ -5186,7 +5249,7 @@ class LakeflowContractTests(unittest.TestCase):
         row = {"id": 1, "amount": Decimal("10.50"), "blob": b"\x00\xffdata"}
         with mock.patch.object(
             connector,
-            "read_table",
+            "_read_upserts",
             return_value=(iter([dict(row)]), {"phase": "stream", "commit_lsn": "6"}),
         ):
             connector.latest_offset("app.orders", {}, start)
@@ -5241,7 +5304,7 @@ class LakeflowContractTests(unittest.TestCase):
         bad = {"phase": "snapshot", "schema_id": "s1", "snapshot": {"page_index": 0}}
         with mock.patch.object(
             connector,
-            "read_table",
+            "_read_upserts",
             return_value=(iter([{"id": 1}]), {"phase": "snapshot", "commit_lsn": "1"}),
         ) as read_table:
             end = connector.latest_offset("app.orders", {}, bad)
@@ -5255,7 +5318,7 @@ class LakeflowContractTests(unittest.TestCase):
         connector = self._partitioned_connector()
         with mock.patch.object(
             connector,
-            "read_table",
+            "_read_upserts",
             side_effect=lambda name, start, opts: (
                 iter([{"id": 1}]),
                 {"phase": "stream", "commit_lsn": str(int(start.get("commit_lsn", "0")) + 1)},
@@ -9336,6 +9399,128 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(list(changes), [])
         self.assertEqual(end, start)
 
+    class _PollBridge(FakeBridge):
+        """A FakeBridge whose CDC poll depends on where it starts, as Informix's log
+        reader does on a busy log: a poll scans from its start and goes idle a fixed
+        distance on, so re-polling from the same LSN goes idle at the same place.
+        ``polls`` maps a start LSN to what a poll from there (or any later start below
+        the next key) returns."""
+
+        def __init__(self, polls):
+            super().__init__()
+            self.polls = dict(polls)
+
+        def read_changes(self, tables, start_lsn, timeout_seconds, max_records):
+            self.change_reads.append((tables, start_lsn))
+            key = max(lsn for lsn in self.polls if lsn <= start_lsn)
+            return list(self.polls[key])
+
+    @staticmethod
+    def _tx(tx_id, begin, row, commit, op="INSERT"):
+        return [
+            {"op": "BEGIN", "tx_id": tx_id, "lsn": begin},
+            {"op": op, "tx_id": tx_id, "lsn": begin + 1, "row": row},
+            {"op": "COMMIT", "tx_id": tx_id, "lsn": commit},
+        ]
+
+    def test_triggered_read_goes_on_past_an_idle_poll_short_of_its_high_water(self):
+        # The log reader went idle at 120 while the update's boundary is 150: not caught
+        # up. The offset moves to 120 -- so AvailableNow sees progress -- and the next
+        # poll resumes there, finds the change at 130, and only a poll idle at 150
+        # reaches the boundary.
+        bridge = self._PollBridge(
+            {
+                100: [{"op": "TIMEOUT", "lsn": 120}],
+                120: self._tx(9, 125, {"id": 3, "value": "c"}, 130)
+                + [{"op": "TIMEOUT", "lsn": 150}],
+                150: [{"op": "TIMEOUT", "lsn": 150}],
+            }
+        )
+        bridge.now = 150
+        connector = self.connector(bridge)
+        connector.prepare_for_trigger_available_now()
+        start = _stream_offset(100)
+
+        rows, first = connector.read_table("app.orders", start, {})
+        self.assertEqual(list(rows), [])
+        self.assertEqual(
+            (first["commit_lsn"], first["begin_lsn"], first["tx_id"]), ("120", "120", None)
+        )
+        self.assertNotIn("trigger_generation", {k for k, v in first.items() if v is not None})
+
+        rows, second = connector.read_table("app.orders", first, {})
+        self.assertEqual([row["id"] for row in list(rows)], [3])
+        self.assertEqual(bridge.change_reads[-1][1], 120)
+        self.assertEqual(second["commit_lsn"], "150")  # idle at the boundary: moved there
+        self.assertEqual(second["trigger_high_water"], "150")
+
+        rows, third = connector.read_table("app.orders", second, {})
+        self.assertEqual(list(rows), [])
+        self.assertEqual(third, second)  # unchanged: AvailableNow is drained
+
+    def test_an_available_now_update_lands_changes_behind_an_idle_poll(self):
+        # Spark ends an AvailableNow update at the first read that returns its start
+        # offset. Before the fix the idle poll at 120 was taken as caught up and the
+        # update ended there, leaving the change at 130 for the next update.
+        bridge = self._PollBridge(
+            {
+                100: [{"op": "TIMEOUT", "lsn": 120}],
+                120: self._tx(9, 125, {"id": 3, "value": "c"}, 130)
+                + [{"op": "TIMEOUT", "lsn": 150}],
+                150: [{"op": "TIMEOUT", "lsn": 150}],
+            }
+        )
+        bridge.now = 150
+        connector = self.connector(bridge)
+        connector.prepare_for_trigger_available_now()
+        start, landed = _stream_offset(100), []
+        for _ in range(10):
+            rows, end = connector.read_table("app.orders", start, {})
+            landed += [row["id"] for row in rows]
+            if end == start:
+                break
+            start = end
+        self.assertEqual(landed, [3])
+
+    def test_an_open_transaction_keeps_an_idle_triggered_read_at_its_begin(self):
+        open_tx = [
+            {"op": "BEGIN", "tx_id": 9, "lsn": 110},
+            {"op": "INSERT", "tx_id": 9, "lsn": 111, "row": {"id": 3, "value": "c"}},
+            {"op": "TIMEOUT", "lsn": 120},
+        ]
+        bridge = self._PollBridge({100: open_tx})
+        bridge.now = 150
+        connector = self.connector(bridge)
+        connector.prepare_for_trigger_available_now()
+        start = _stream_offset(100)
+        rows, end = connector.read_table("app.orders", start, {})
+        self.assertEqual(list(rows), [])
+        self.assertEqual((end["commit_lsn"], end["begin_lsn"]), ("100", "100"))
+
+    def test_a_continuous_read_keeps_its_checkpoint_on_an_idle_poll(self):
+        bridge = self._PollBridge({100: [{"op": "TIMEOUT", "lsn": 120}]})
+        bridge.now = 150
+        connector = self.connector(bridge)
+        start = _stream_offset(100)
+        rows, end = connector.read_table("app.orders", start, {})
+        self.assertEqual(list(rows), [])
+        self.assertEqual(end["commit_lsn"], "100")
+
+    def test_a_replay_lands_on_a_quiet_end_once_the_log_reader_passes_it(self):
+        bridge = self._PollBridge({100: [{"op": "TIMEOUT", "lsn": 140}]})
+        bridge.now = 150
+        connector = self.connector(bridge)
+        start = _stream_offset(100)
+        quiet_end = {**start, "commit_lsn": "120", "change_lsn": "120", "begin_lsn": "120"}
+        rows = informix_module._replay_between_offsets(
+            start,
+            quiet_end,
+            lambda offset: connector.read_table("app.orders", offset, options),
+            options := {},
+            connector.options,
+        )
+        self.assertEqual(list(rows), [])
+
     def test_triggered_stream_stops_at_initial_high_water(self):
         bridge = FakeBridge()
         bridge.now = 105
@@ -11616,7 +11801,25 @@ class SharedCdcShardTests(unittest.TestCase):
         self.assertEqual([tx.tx_id for tx in shard.snapshot(self.id_b, 600).committed], [3])
         # A's already-delivered transactions were not re-delivered.
         self.assertEqual([tx.tx_id for tx in shard.snapshot(self.id_a, 0).committed], [1, 2])
-        self.assertEqual(shard.shared_restart, 900)
+        # Idle with nothing open, so the next read resumes where the log reader stopped.
+        self.assertEqual(shard.shared_restart, 901)
+
+    def test_an_idle_read_resumes_where_the_log_reader_stopped(self):
+        shard = _SharedCdcShard()
+        shard.subscribe(self.id_a, self.table_a, _capture_descriptor(self.table_a), 500, 500)
+        shard.ingest([{"op": "TIMEOUT", "lsn": 700}], {self.id_a: self.table_a}, 1, 900, 500)
+        # Nothing open: the next read starts at 700 rather than rescanning from 500, and
+        # consumers learn the log reader is only at 700 of the current 900.
+        self.assertEqual(shard.shared_restart, 700)
+        self.assertEqual(shard.snapshot(self.id_a, 500).reached_lsn, 700)
+
+        open_tx = [
+            {"op": "BEGIN", "tx_id": 4, "lsn": 710, "table": self.table_a.identity},
+            {"op": "TIMEOUT", "lsn": 800},
+        ]
+        shard.ingest(open_tx, {self.id_a: self.table_a}, 1, 900, 700)
+        self.assertEqual(shard.shared_restart, 710)  # back to the open BEGIN
+        self.assertIsNone(shard.snapshot(self.id_a, 500).reached_lsn)
 
     def test_snapshot_is_none_until_a_read_activated_at_or_below_the_floor_covers_it(self):
         shard = _SharedCdcShard()
@@ -15368,6 +15571,19 @@ class SchemaEvolutionTests(_TableOptionTestCase):
             (column("DECIMAL", 5, 2), column("DECIMAL", 10, 4)),
             (column("DECIMAL", 5, 2), column("DECIMAL", 7, 2)),
             (column("MONEY", 8, 2), column("MONEY", 12, 2)),
+            # Live Informix 14.10 returned pre-ALTER records in the new type for INTEGER
+            # (key included) to DECIMAL(10,0)/(12,2) and FLOAT, SMALLINT to DECIMAL(10,0)
+            # and FLOAT, INT8 to DECIMAL(20,0), and BIGINT to DECIMAL(22,2); AUTO CDC on
+            # Databricks widened int to decimal(10,0)/(12,2) and double, and bigint to
+            # decimal(20,0), in place.
+            (column("INTEGER"), column("DECIMAL", 10, 0)),
+            (column("INTEGER"), column("DECIMAL", 12, 2)),
+            (column("SMALLINT"), column("DECIMAL", 10, 0)),
+            (column("SERIAL"), column("MONEY", 14, 2)),
+            (column("INT8"), column("DECIMAL", 20, 0)),
+            (column("BIGINT"), column("DECIMAL", 22, 2)),
+            (column("INTEGER"), column("FLOAT")),
+            (column("SMALLINT"), column("FLOAT")),
         )
         for old, new in widenings:
             with self.subTest(f"{old['type_name']} to {new['type_name']}"):
@@ -15376,7 +15592,13 @@ class SchemaEvolutionTests(_TableOptionTestCase):
             (column("BIGINT"), column("INTEGER")),
             (column("INT8"), column("BIGINT")),  # same width, different encoding
             (column("FLOAT"), column("SMALLFLOAT")),
-            (column("INTEGER"), column("FLOAT")),
+            (column("INTEGER"), column("SMALLFLOAT")),
+            (column("INT8"), column("FLOAT")),  # Delta doesn't widen LongType to DoubleType
+            (column("SMALLINT"), column("DECIMAL", 5, 0)),  # Delta needs decimal(10,0)+
+            (column("INTEGER"), column("DECIMAL", 11, 2)),  # nine integer digits
+            (column("BIGINT"), column("DECIMAL", 19, 0)),
+            (column("INTEGER"), column("DECIMAL", 16, 0xFF)),  # variable scale
+            (column("DECIMAL", 10, 0), column("INTEGER")),
             (column("DECIMAL", 5, 2), column("DECIMAL", 6, 4)),  # loses an integer digit
             (column("DECIMAL", 10, 2), column("DECIMAL", 8, 2)),
             (column("DECIMAL", 30, 2), column("DECIMAL", 40, 2)),  # past DecimalType's 38
@@ -15620,6 +15842,210 @@ class RowFilterTests(_TableOptionTestCase):
             self.connector(_ProjectingBridge())._table(
                 "app.orders", {"exclude_columns": "extra", "row_filter": "extra > 1"}
             )
+
+    def test_like_is_stored_and_rendered_with_its_escape_spelled_out(self):
+        table = self.filtered_table("value like 'ab%  ' and value not like 'a!_c' escape '!'")
+        canonical = "(value LIKE 'ab%' ESCAPE '\\') AND (value NOT LIKE 'a!_c' ESCAPE '!')"
+        self.assertEqual(table.row_filter, canonical)
+        self.assertEqual(self.filtered_table(table.row_filter).row_filter, canonical)
+        self.assertEqual(informix_module._row_filter_sql(table), canonical)
+
+    def test_like_matches_as_informix_does(self):
+        # Each case was measured on Informix 14.10 against CHAR, VARCHAR, NVARCHAR, and
+        # LVARCHAR columns alike (CHAR values arrive with their padding stripped).
+        cases = (
+            ("value LIKE 'abc'", "abc  ", True),  # the value's trailing blanks are ignored
+            ("value LIKE 'abc_'", "abc  ", False),
+            ("value LIKE 'abc  '", "abc", True),  # and so are the pattern's
+            ("value LIKE '% '", "", True),
+            ("value LIKE '%abc'", " abc", True),  # leading blanks count
+            ("value LIKE 'ABC'", "abc", False),  # case-sensitive
+            ("value LIKE ''", "", True),
+            ("value LIKE '%_%'", "", False),
+            ("value LIKE 'a_c'", "a%c", True),
+            ("value LIKE 'a\\_c'", "a_c", True),  # backslash escapes by default
+            ("value LIKE 'a\\_c'", "abc", False),
+            ("value LIKE 'a\\bc'", "abc", True),  # an escaped ordinary character is literal
+            ("value LIKE 'a\\c'", "a\\c", False),
+            ("value LIKE 'a\\\\c'", "a\\c", True),
+            ("value LIKE 'a!_c' ESCAPE '!'", "a_c", True),
+            ("value LIKE 'a\\c' ESCAPE '!'", "a\\c", True),  # another escape frees backslash
+            ("value LIKE 'a!!c' ESCAPE '!'", "a!c", True),
+            ("value LIKE 'a%c'", "a\nc", True),
+            ("value NOT LIKE 'a%'", "bc", True),
+            ("value NOT LIKE 'a%'", None, False),  # NULL is unknown either way
+            ("value LIKE '%'", None, False),
+        )
+        for text, value, expected in cases:
+            with self.subTest(text=text, value=value):
+                predicate = informix_module._row_filter_predicate(self.filtered_table(text))
+                self.assertIs(
+                    informix_module._row_filter_matches(predicate, {"value": value}), expected
+                )
+
+    def test_invalid_like_filters_fail(self):
+        nvarchar_table = _wide_table()
+        nvarchar_table["columns"][1]["type_name"] = "NVARCHAR"
+        self.filtered_table("value LIKE 'a%'", nvarchar_table)  # NVARCHAR takes LIKE
+        for text, message in (
+            ("extra LIKE '1%'", "only apply LIKE to a string column"),
+            ("value LIKE 1", "needs a quoted pattern"),
+            ("value LIKE 'ab\\'", "ends with its escape character"),
+            ("value LIKE 'ab\\ '", "ends with its escape character"),
+            ("value LIKE 'ab!' ESCAPE '!'", "ends with its escape character"),
+            ("value LIKE 'a' ESCAPE '!!'", "must be one character"),
+            ("value LIKE 'a' ESCAPE '%'", "must be one character"),
+            ("value NOT = 'a'", "IN, BETWEEN, or LIKE after NOT"),
+        ):
+            with self.subTest(text):
+                with self.assertRaisesRegex((InformixError, ValueError), message):
+                    self.filtered_table(text)
+
+    def test_cdc_membership_follows_a_like_filter(self):
+        options = {"row_filter": "value LIKE 'b%'"}
+        bridge = _ProjectingBridge()
+        connector, checkpoint = self.stream(bridge, options)
+        moved_out = (
+            ("BEFORE_UPDATE", {"id": 2, "value": "b", "extra": 8}),
+            ("AFTER_UPDATE", {"id": 2, "value": "x", "extra": 8}),
+        )
+        self.assertEqual(
+            self.changes(connector, bridge, checkpoint, options, *moved_out), ([], [(2, "d")])
+        )
+        inserted = ("INSERT", {"id": 3, "value": "bob", "extra": 1})
+        self.assertEqual(
+            self.changes(connector, bridge, checkpoint, options, inserted), ([(3, "c")], [])
+        )
+
+
+class ColumnRenameTests(_TableOptionTestCase):
+    """rename_columns changes only the names the connector reports -- schema, rows, and
+    key -- while every other option keeps naming source columns."""
+
+    RENAME = {"rename_columns": '{"value": "label", "extra": "amount"}'}
+
+    def test_renames_parse_from_json_or_pairs(self):
+        parse = informix_module._column_renames
+        expected = (("extra", "amount"), ("value", "label"))
+        self.assertEqual(parse(self.RENAME), expected)
+        self.assertEqual(parse({"rename_columns": " value : label, extra:amount "}), expected)
+        self.assertIsNone(parse({"rename_columns": "value:value"}))  # no-op entries drop out
+        self.assertIsNone(parse({}))
+        for raw, message in (
+            ('{"value": "a", "value": "b"}', "renames a column twice"),
+            ("value:a, value:b", "renames a column twice"),
+            ('{"value": 1}', "map column names to column names"),
+            ("{not json", "not a valid JSON object"),
+            ("value=label", "JSON object or 'source:destination' pairs"),
+            ("value:", "empty column name"),
+            ("value:my label", "can't hold"),
+            ("value:a(b)", "can't hold"),
+        ):
+            with self.subTest(raw):
+                with self.assertRaisesRegex(ValueError, message):
+                    parse({"rename_columns": raw})
+
+    def test_schema_rows_and_key_use_the_destination_names(self):
+        options = {"rename_columns": "id:order_id, value:label"}
+        bridge = _ProjectingBridge()
+        connector, checkpoint = self.stream(bridge, options)
+
+        schema = connector.get_table_schema("app.orders", dict(options))
+        metadata = connector.read_table_metadata("app.orders", dict(options))
+        bridge.now = 200
+        bridge.changes = self.committed(
+            ("INSERT", {"id": 3, "value": "c", "extra": 9}),
+            ("DELETE", {"id": 1, "value": "a", "extra": 7}),
+        )
+        upserts = list(connector.read_table("app.orders", checkpoint, dict(options))[0])
+        deletes = list(connector.read_table_deletes("app.orders", checkpoint, dict(options))[0])
+
+        names = [field.name for field in schema.fields]
+        self.assertEqual(names[:3], ["order_id", "label", "extra"])
+        self.assertEqual(metadata["primary_keys"], ["order_id"])
+        self.assertEqual(
+            [(row["order_id"], row["label"], row["extra"]) for row in upserts], [(3, "c", 9)]
+        )
+        self.assertEqual([(row["order_id"], row["_informix_op"]) for row in deletes], [(1, "d")])
+        self.assertFalse({"id", "value"} & (set(upserts[0]) | set(deletes[0])))
+        # Internally the source names stand: the capture still asks Informix for them.
+        self.assertEqual(bridge.change_reads[-1][0][0]["columns"], ["id", "value", "extra"])
+
+    def test_snapshot_rows_and_partitions_are_renamed(self):
+        bridge = _ProjectingBridge()
+        connector = self.connector(bridge)
+        rows, _ = connector.read_table("app.orders", {}, dict(self.RENAME))
+        self.assertEqual(
+            [(row["id"], row["label"], row["amount"]) for row in rows], [(1, "a", 7), (2, "b", 8)]
+        )
+        encoded = connector._encode_embedded_rows([{"id": 5, "value": "e", "extra": 1}])
+        partition_rows = list(
+            connector.read_partition(
+                "app.orders", {"kind": "embedded", "rows": encoded}, dict(self.RENAME)
+            )
+        )
+        self.assertEqual(partition_rows, [{"id": 5, "label": "e", "amount": 1}])
+
+    def test_columns_may_swap_names_but_not_clash(self):
+        connector = self.connector(_ProjectingBridge())
+        swapped = connector._table("app.orders", {"rename_columns": "value:extra, extra:value"})
+        self.assertEqual(swapped.column_renames, (("extra", "value"), ("value", "extra")))
+        for raw, message in (
+            ("value:extra", "more than one column named extra"),
+            ("value:EXTRA", "more than one column named"),  # Delta ignores case
+            ("value:_informix_op", "more than one column named _informix_op"),
+            ("missing:x", "does not have or does not select: missing"),
+        ):
+            with self.subTest(raw):
+                with self.assertRaisesRegex(InformixError, message):
+                    connector._table("app.orders", {"rename_columns": raw})
+        with self.assertRaisesRegex(InformixError, "does not select: extra"):
+            connector._table(
+                "app.orders", {"exclude_columns": "extra", "rename_columns": "extra:amount"}
+            )
+
+    def test_other_options_keep_naming_source_columns(self):
+        options = {"rename_columns": "extra:amount", "row_filter": "extra >= 8"}
+        bridge = _ProjectingBridge()
+        connector, checkpoint = self.stream(bridge, options)
+        inserted = ("INSERT", {"id": 3, "value": "c", "extra": 9})
+        self.assertEqual(
+            self.changes(connector, bridge, checkpoint, options, inserted), ([(3, "c")], [])
+        )
+
+    def test_changing_the_renames_on_a_running_stream_fails_closed(self):
+        bridge = _ProjectingBridge()
+        connector, checkpoint = self.stream(bridge, self.RENAME)
+        bridge.now = 200
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 200}]
+        reordered = {"rename_columns": "extra:amount,value:label"}
+        list(connector.read_table("app.orders", checkpoint, reordered)[0])  # same renames
+        with self.assertRaisesRegex(InformixError, "rename_columns.*changed.*full refresh"):
+            connector.read_table("app.orders", checkpoint, {"rename_columns": "value:label"})
+
+    def test_a_renamed_column_dropped_at_the_source_asks_for_its_entry_to_go(self):
+        bridge = _ProjectingBridge()
+        connector, checkpoint = self.stream(bridge, self.RENAME)
+        del bridge.tables[0]["columns"][2]  # ALTER TABLE ... DROP (extra)
+        bridge.now = 200
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 200}]
+        with self.assertRaisesRegex(InformixError, "does not select: extra"):
+            connector.read_table("app.orders", checkpoint, dict(self.RENAME))
+        edited = {"rename_columns": "value:label"}
+        rows, end = connector.read_table("app.orders", checkpoint, edited)
+        self.assertEqual(list(rows), [])
+        self.assertNotEqual(end["schema_fingerprint"], checkpoint["schema_fingerprint"])
+
+    def test_tables_without_renames_keep_their_fingerprint(self):
+        connector = self.connector(_ProjectingBridge())
+        plain = connector._table("app.orders", {})
+        renamed = connector._table("app.orders", dict(self.RENAME))
+        self.assertIsNone(plain.column_renames)
+        self.assertNotIn("column_renames", _schema_state(plain, 1)["table"])
+        self.assertNotEqual(_schema_fingerprint(plain), _schema_fingerprint(renamed))
+        restored = Table.parse(_schema_state(renamed, 1)["table"], "demo")
+        self.assertEqual(restored.column_renames, renamed.column_renames)
+        self.assertEqual(_schema_fingerprint(restored), _schema_fingerprint(renamed))
 
 
 if __name__ == "__main__":
