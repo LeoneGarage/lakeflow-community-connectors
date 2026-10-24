@@ -15228,8 +15228,8 @@ class ColumnSelectionTests(_TableOptionTestCase):
 
 
 class SchemaEvolutionTests(_TableOptionTestCase):
-    """A running stream adopts widened strings, SMALLINT to INTEGER, and dropped nullable
-    columns without a full refresh; every other change still fails closed."""
+    """A running stream adopts widened columns and dropped nullable columns without a full
+    refresh; every other change still fails closed."""
 
     @staticmethod
     def table(columns, keys=("id",), selection=None):
@@ -15303,10 +15303,63 @@ class SchemaEvolutionTests(_TableOptionTestCase):
             with self.subTest(name):
                 with self.assertRaisesRegex(InformixError, message):
                     ensure(base, self.table(current))
-        with self.subTest("numeric widening waits for destination type widening"):
-            ints = self.table([self.ID, self.column("v", "INTEGER", 4)])
-            with self.assertRaisesRegex(InformixError, "other than by widening"):
-                ensure(ints, self.table([self.ID, self.column("v", "BIGINT", 8)]))
+
+    def test_numeric_widening_follows_delta_type_widening(self):
+        ensure = informix_module._ensure_compatible_schema_change
+
+        def column(type_name, precision=None, scale=None):
+            return {
+                "name": "n",
+                "type_name": type_name,
+                "nullable": True,
+                "precision": precision,
+                "scale": scale,
+            }
+
+        widenings = (
+            (column("SMALLINT"), column("BIGINT")),
+            (column("INTEGER"), column("INT8")),
+            (column("SERIAL"), column("BIGINT")),
+            (column("SMALLFLOAT"), column("FLOAT")),
+            (column("DECIMAL", 5, 2), column("DECIMAL", 10, 4)),
+            (column("DECIMAL", 5, 2), column("DECIMAL", 7, 2)),
+            (column("MONEY", 8, 2), column("MONEY", 12, 2)),
+        )
+        for old, new in widenings:
+            with self.subTest(f"{old['type_name']} to {new['type_name']}"):
+                ensure(self.table([self.ID, old]), self.table([self.ID, new]))
+        narrowings = (
+            (column("BIGINT"), column("INTEGER")),
+            (column("INT8"), column("BIGINT")),  # same width, different encoding
+            (column("FLOAT"), column("SMALLFLOAT")),
+            (column("INTEGER"), column("FLOAT")),
+            (column("DECIMAL", 5, 2), column("DECIMAL", 6, 4)),  # loses an integer digit
+            (column("DECIMAL", 10, 2), column("DECIMAL", 8, 2)),
+            (column("DECIMAL", 30, 2), column("DECIMAL", 40, 2)),  # past DecimalType's 38
+            (column("DECIMAL", 10, 0xFF), column("DECIMAL", 16, 0xFF)),  # variable scale
+            (column("DECIMAL", 5, 2), column("MONEY", 8, 2)),
+        )
+        for old, new in narrowings:
+            with self.subTest(f"{old} to {new}"):
+                with self.assertRaisesRegex(InformixError, "other than by widening"):
+                    ensure(self.table([self.ID, old]), self.table([self.ID, new]))
+
+    def test_a_numeric_widening_transitions_the_stream_and_its_reported_type(self):
+        bridge = _ProjectingBridge()
+        connector, checkpoint = self.stream(bridge, {})
+        before = connector.get_table_schema("app.orders", {})
+        bridge.tables[0]["columns"][2]["type_name"] = "BIGINT"  # extra: INTEGER -> BIGINT
+        upserts, _ = self.changes(
+            connector, bridge, checkpoint, {}, ("INSERT", {"id": 3, "value": "c", "extra": 5 << 32})
+        )
+        after = connector.get_table_schema("app.orders", {})
+
+        self.assertEqual(upserts, [(3, "c")])
+        types = [
+            {field.name: type(field.dataType).__name__ for field in schema.fields}["extra"]
+            for schema in (before, after)
+        ]
+        self.assertEqual(types, ["IntegerType", "LongType"])
 
     def test_a_selection_may_only_lose_names_of_columns_gone_from_the_source(self):
         ensure = informix_module._ensure_compatible_schema_change

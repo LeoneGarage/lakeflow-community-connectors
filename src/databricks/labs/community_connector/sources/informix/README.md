@@ -595,6 +595,17 @@ without a full refresh:
   destination column doesn't change.
 - **`SMALLINT` to `INTEGER`:** both arrive as integers, so the destination column doesn't
   change.
+- **Wider numeric types:** `SMALLINT` or `INTEGER` (including `SERIAL`) to `BIGINT` or
+  `INT8`, `SMALLFLOAT` to `FLOAT`, and a `DECIMAL`, `NUMERIC`, or `MONEY` column given more
+  precision without losing integer digits (its scale may grow only as far as its
+  precision grows, up to precision 38). Key columns may widen too. These change the
+  destination column's type, so the pipeline must allow it: set
+  `"pipelines.enableTypeWidening": "true"` in the pipeline's `configuration` (Databricks
+  Runtime 15.4 or later). The destination then widens the column in place, keeping its
+  rows. Without the setting, the update fails with `DELTA_MERGE_INCOMPATIBLE_DATATYPE`;
+  add it and run the pipeline again, and it recovers with no full refresh. Narrowing,
+  `INT8` to `BIGINT` (the same width), variable-scale `DECIMAL(p)`, and integer to
+  `DECIMAL` or `FLOAT` still need a full refresh.
 - **Dropped columns:** a nullable column that isn't part of the key. The connector stops
   reading it and no longer reports it, and the destination keeps the column. With SCD
   type 1, a row updated after the drop keeps the value it had; rows inserted after the
@@ -602,16 +613,15 @@ without a full refresh:
   versions keep their values.
 
 Anything else still needs a full refresh: renames, reorders, a column added before
-existing ones, other type changes (numeric widening such as `INTEGER` to `BIGINT`
-included), nullability changes, non-nullable additions, unsupported types, primary-key
-changes, and dropping a `NOT NULL` or key column. Changing `include_columns`,
+existing ones, other type changes, nullability changes, non-nullable additions,
+unsupported types, primary-key changes, and dropping a `NOT NULL` or key column. Changing `include_columns`,
 `exclude_columns`, or `row_filter` on a running table also needs one.
 
-All four have been validated against a live Informix server: after the change,
+All of these have been validated against a live Informix server: after the change,
 Informix returns log records written before it in the current layout. Values logged
-under the old layout arrive with the column at its new width, a `SMALLINT` as an
-`INTEGER`, and a dropped column left out, so the connector decodes old and new records
-alike.
+under the old layout arrive with the column at its new width or type (a `SMALLINT` as a
+`BIGINT`, a `DECIMAL(5,2)` as a `DECIMAL(10,4)`) and a dropped column left out, so the
+connector decodes old and new records alike.
 
 A table keyed with `primary.keys: "*"` is the one exception to an unchanged key: its
 key is every column, so an appended column joins it. The key may grow that way without

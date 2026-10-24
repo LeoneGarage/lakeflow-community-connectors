@@ -11651,9 +11651,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # both transactions in one replay session.  The same holds for the
             # other changes _ensure_compatible_schema_change accepts: live
             # Informix 14.10 returned records logged before a CHAR/VARCHAR
-            # widening, a SMALLINT -> INTEGER change, and a column drop in the
-            # current layout (the CHAR at its new width, the SMALLINT as INTEGER,
-            # the dropped column absent), so they decode with the new descriptor.
+            # widening, numeric widenings (SMALLINT/INTEGER -> BIGINT/INT8, a
+            # widened key included, SMALLFLOAT -> FLOAT, DECIMAL and MONEY
+            # precision), and a column drop in the current layout, so they decode
+            # with the new descriptor.
             #
             # Previously this method captured with the predecessor descriptor
             # only up to a restart-time ``current_lsn`` and then advanced the
@@ -14836,12 +14837,32 @@ def _string_capacity(column: Column) -> int:
     return length & 0xFF if column.type_name in {"VARCHAR", "NVARCHAR"} else length
 
 
+# Integer types by width; a change to a higher rank widens. INT8 and BIGINT share a rank:
+# both are 64-bit, so a change between them is a different encoding, not a widening.
+_INTEGER_RANKS = {
+    "SMALLINT": 1,
+    "INT2": 1,
+    "INTEGER": 2,
+    "INT": 2,
+    "SERIAL": 2,
+    "BIGINT": 3,
+    "INT8": 3,
+    "BIGSERIAL": 3,
+    "SERIAL8": 3,
+}
+
+
 def _widened(previous: Column, current: Column) -> bool:
-    # Docstring: Whether ``current`` widens ``previous`` without changing its Spark type.
+    # Docstring: Whether ``current`` widens ``previous`` so every old value still fits.
     #
-    # A longer CHAR, VARCHAR, NVARCHAR, or LVARCHAR stays StringType, and SMALLINT is
-    # already reported as IntegerType, so neither changes what the destination holds.
-    # Nullability must not change.
+    # A longer CHAR, VARCHAR, NVARCHAR, or LVARCHAR stays StringType, and SMALLINT to
+    # INTEGER stays IntegerType, so neither changes what the destination holds. The
+    # numeric widenings change the Spark type -- SMALLINT or INTEGER to BIGINT/INT8
+    # (IntegerType to LongType), SMALLFLOAT to FLOAT (FloatType to DoubleType), and a
+    # fixed-scale DECIMAL or MONEY gaining precision without losing integer digits -- and
+    # match what Delta type widening accepts, so the destination widens the column in
+    # place when the pipeline sets pipelines.enableTypeWidening. Nullability must not
+    # change, and a variable-scale DECIMAL never widens.
 
     if (previous.name, previous.nullable, previous.cdc_supported) != (
         current.name,
@@ -14849,9 +14870,24 @@ def _widened(previous: Column, current: Column) -> bool:
         current.cdc_supported,
     ):
         return False
-    if previous.type_name == current.type_name in _WIDENABLE_STRING_TYPES:
+    old_type, new_type = previous.type_name, current.type_name
+    if old_type == new_type in _WIDENABLE_STRING_TYPES:
         return _string_capacity(current) >= _string_capacity(previous)
-    return previous.type_name in {"SMALLINT", "INT2"} and current.type_name in {"INTEGER", "INT"}
+    if old_type in _INTEGER_RANKS and new_type in _INTEGER_RANKS:
+        return _INTEGER_RANKS[new_type] > _INTEGER_RANKS[old_type]
+    if old_type in {"SMALLFLOAT", "REAL"}:
+        return new_type in {"FLOAT", "DOUBLE", "DOUBLE PRECISION"}
+    if old_type == new_type in {"DECIMAL", "NUMERIC", "MONEY"}:
+        scales = (previous.scale, current.scale)
+        if None in (previous.precision, current.precision, *scales) or 0xFF in scales:
+            return False
+        # Delta's rule: the scale may grow only as far as the precision grows with it.
+        return (
+            current.precision <= 38
+            and current.scale >= previous.scale
+            and current.precision - current.scale >= previous.precision - previous.scale
+        )
+    return False
 
 
 def _ensure_compatible_schema_change(
@@ -14861,7 +14897,9 @@ def _ensure_compatible_schema_change(
     #
     # Columns are matched by name. Allowed, in any combination:
     #
-    # - widening a column without changing its Spark type (see :func:`_widened`);
+    # - widening a column so every old value still fits (see :func:`_widened`); a numeric
+    #   widening also widens the Spark type, which the destination adopts in place when
+    #   the pipeline enables type widening, and otherwise fails that update loudly;
     # - dropping a nullable, non-key column -- the connector stops reporting it, and the
     #   destination keeps it: an SCD1 row updated afterwards keeps its last value there,
     #   while rows inserted and SCD2 versions written afterwards hold NULL;
@@ -14917,7 +14955,7 @@ def _ensure_compatible_schema_change(
         if old != new and not _widened(old, new):
             raise InformixError(
                 f"Informix schema change for '{name}' changed column {old.name} other than "
-                "by widening its length or SMALLINT to INTEGER; run a full refresh"
+                "by widening it; run a full refresh"
             )
     if any(not column.nullable or not column.cdc_supported for column in additions):
         raise InformixError(
