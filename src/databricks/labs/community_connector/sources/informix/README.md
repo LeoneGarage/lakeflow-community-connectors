@@ -180,7 +180,7 @@ rather than start from an unrelated position.
 | `metadata.max.bytes` | No | `67108864` | Maximum estimated decoded Python bytes retained by an individual catalog query and by complete discovery. Set `0` to disable the limit and byte accounting. |
 | `max.records.per.batch` | No | `10000` | Target maximum projected CDC rows; minimum `1`. A complete transaction may exceed it. |
 | `cdc.timeout` | No | `5` | CDC idle-read timeout in seconds; minimum `1`. Zero is rejected because it can select an unbounded native wait. |
-| `cdc.shared.state.wait.seconds` | No | `300` | Maximum time a delete reader waits for its table's upsert reader to publish initialization, trigger-boundary, or schema-transition state. |
+| `cdc.shared.state.wait.seconds` | No | `300` | Maximum time a delete reader waits for its table's upsert reader to publish initialization, trigger-boundary, or schema-transition state. In a triggered update, a delete reader still waiting this long for a schema transition fails, naming the upsert reader, whose flow has most likely failed: otherwise the update would never end. A continuous update needs no such bound, since one failed flow fails it. |
 | `cdc.max.records` | No | `256` | Soft native record target per CDC session; range `1`–`256`. Defaults to the source's own per-session ceiling because each poll pays a connection slot plus a full CDC session open/activate/close, so a smaller window amortises that fixed cost over less log progress. Once reached, records continue until every transaction already observed commits, rolls back, or Informix returns TIMEOUT. |
 | `cdc.max.frame.bytes` | No | `16777216` | Maximum accepted native CDC frame size (16 MiB by default; minimum `16`). |
 | `cdc.max.transaction.records` | No | `100000` | Maximum records buffered in an open transaction. Exceeding it fails without emitting uncommitted data. |
@@ -617,7 +617,11 @@ without a full refresh:
   `INT8` to `BIGINT` (the same width), variable-scale `DECIMAL(p)`, an integer to a
   `DECIMAL` with fewer integer digits than those minimums (Delta's, even where the values
   would fit), `BIGINT` or `INT8` to `FLOAT`, and an integer to `SMALLFLOAT` still need a
-  full refresh.
+  full refresh. Until it runs, every update fails as it starts. Usually the error is the
+  pipeline's own `CANNOT_UPDATE_TABLE_SCHEMA` ("Failed to merge the current and new
+  schemas"), because the destination can't take the new type; where it can, the
+  connector fails instead with "changed column … other than by widening it; run a full
+  refresh".
 - **Dropped columns:** any column that isn't part of the key, `NOT NULL` or not. Dropping
   any key column fails closed, whatever its nullability: a key set with `primary.keys` or
   taken from a nullable index may name a nullable column, and rows would otherwise key on
@@ -670,7 +674,8 @@ an update that rewrites a row with the same values keeps the old value under SCD
 and opens a version holding NULL under SCD type 2. Rows that differed only in the dropped
 column become one key, like exact duplicate rows, and a change to one copy at the source
 reaches every target row under that key: under SCD type 1, deleting one copy removes all
-of them; under SCD type 2, it closes only the newest version and the others stay current.
+of them; under SCD type 2, it closes the newest version and the others stay current.
+Versions tied for newest all close, such as rows that one snapshot loaded.
 
 Informix rejects `ALTER TABLE` while full-row logging is enabled. Stop every
 pipeline using this connection, then quiesce source writes before disabling
