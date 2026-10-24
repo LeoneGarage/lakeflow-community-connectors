@@ -117,9 +117,9 @@ def informix_counts(args: argparse.Namespace) -> dict[str, int]:
     return counts
 
 
-def databricks_count(table: str) -> tuple[str, int]:
+def databricks_count(table: str, warehouse_id: str = WAREHOUSE) -> tuple[str, int]:
     payload = {
-        "warehouse_id": WAREHOUSE,
+        "warehouse_id": warehouse_id,
         "wait_timeout": "50s",
         "statement": f"SELECT COUNT(*) FROM members.connector_bronze.{table}",
     }
@@ -154,6 +154,11 @@ def main() -> int:
         help="Write per-table counts to this path as JSON "
         "([{table_name, informix_count, pipeline_count}, ...]) for dashboard ingestion.",
     )
+    _p.add_argument(
+        "--warehouse-id",
+        default=WAREHOUSE,
+        help=f"SQL warehouse that runs the pipeline-side COUNT(*) queries (default {WAREHOUSE}).",
+    )
     _cli = _p.parse_args()
 
     # The sandbox SSO profile is not logged in here, but the ambient default AWS
@@ -186,7 +191,7 @@ def main() -> int:
     # Run both sides concurrently: Informix as one SSM job, Databricks as a pool.
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(TABLES) + 1) as ex:
         inf_future = ex.submit(informix_counts, args)
-        dbx_futures = {ex.submit(databricks_count, t): t for t in TABLES}
+        dbx_futures = {ex.submit(databricks_count, t, _cli.warehouse_id): t for t in TABLES}
         dbx: dict[str, int] = {}
         for f in concurrent.futures.as_completed(dbx_futures):
             t, c = f.result()

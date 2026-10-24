@@ -11,7 +11,7 @@ zero of these files). The `.json` is never merged (the merge tool only scans
 
 | File | Purpose |
 | --- | --- |
-| `count_compare_test_tool.py` | Row-count comparison, Informix (SSM→dbaccess) vs pipeline tables. `--json-out <path>` emits per-table counts for dashboard ingestion. |
+| `count_compare_test_tool.py` | Row-count comparison, Informix (SSM→dbaccess) vs pipeline tables. `--json-out <path>` emits per-table counts for dashboard ingestion; `--warehouse-id <id>` picks the SQL warehouse for the pipeline-side counts. |
 | `s3_slot_cost_test_tool.py` | Measured S3 request cost for the connection-slot volume prefix, parsed from S3 access logs. `--start`/`--end` are UTC unless `--timezone Australia/Sydney` is given, which reads them as local wall-clock instead. Note: access-log delivery lags ~1h, so a just-closed window undercounts. |
 | `s3_slot_model_test_tool.py` | Analytical (upper-bound) S3 request-cost model from the slot-loop cadences. ~150× above the measured FUSE-cached cost. |
 | `phase_switch_test_tool.py` | Snapshot→stream timing: last pipeline start → last incremental-snapshot chunk write. `--run-start <utc>`. |
