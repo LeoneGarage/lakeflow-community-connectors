@@ -5439,6 +5439,50 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertFalse(os.path.exists(stage))
 
+    def test_completed_stage_cleanup_survives_a_concurrent_page_delete(self):
+        # The serve path deletes consumed pages on a background pool, so one can vanish
+        # mid-walk; the walk then stops with FileNotFoundError. The cleanup must walk
+        # again rather than leave the rest of the stage behind marked as cleaned.
+        bridge = FakeBridge()
+        connector = self.connector(
+            bridge,
+            registration_scope="snapshot-stage-race",
+            **{"snapshot.page.size": "1"},
+        )
+        _, first_end = connector.read_table("app.orders", {}, {})
+        _, stream_end = connector.read_table("app.orders", first_end, {})
+        table = Table.parse(bridge.tables[0], "demo")
+        stage = connector._snapshot_stage_namespace(
+            table, connector._pipeline_scope(stream_end), str(stream_end["schema_id"])
+        )
+        remove = PurePythonInformixBridge._remove_connection_slot_tree
+        calls = []
+
+        def cut_short(path):
+            calls.append(path)
+            if len(calls) == 1:
+                os.makedirs(os.path.join(path, "late-page"), exist_ok=True)
+                raise FileNotFoundError(path)
+            return remove(path)
+
+        with mock.patch.object(PurePythonInformixBridge, "_remove_connection_slot_tree", cut_short):
+            connector._cleanup_completed_snapshot_stage(table, stream_end)
+
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertFalse(os.path.exists(stage))
+        self.assertIn(stage, connector._cleaned_snapshot_stages)
+
+        os.makedirs(stage)
+        connector._cleaned_snapshot_stages.discard(stage)
+        always_cut = mock.Mock(side_effect=FileNotFoundError(stage))
+        with mock.patch.object(
+            PurePythonInformixBridge, "_remove_connection_slot_tree", always_cut
+        ):
+            connector._cleanup_completed_snapshot_stage(table, stream_end)
+
+        self.assertTrue(os.path.exists(stage))
+        self.assertNotIn(stage, connector._cleaned_snapshot_stages)  # a later read retries
+
     def test_snapshot_staging_retention_days_is_configurable(self):
         connector = self.connector(**{"snapshot.staging.retention.days": "7"})
 

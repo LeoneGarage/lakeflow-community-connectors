@@ -478,6 +478,9 @@ _UNLOAD_FLOAT_TYPES = frozenset({"FLOAT", "SMALLFLOAT", "REAL", "DOUBLE", "DOUBL
 _SNAPSHOT_STAGING_TOKEN_LIFETIME_OPTION = "snapshot.staging.token.lifetime.seconds"
 # One secret scope holds every pipeline's current staging token, keyed per pipeline id.
 _SNAPSHOT_STAGING_SECRET_SCOPE = "informix-snapshot-staging"
+# Walks a completed snapshot stage's removal may take when background page deletes keep
+# cutting it short (see _cleanup_completed_snapshot_stage); each walk removes more.
+_SNAPSHOT_STAGE_CLEANUP_ATTEMPTS = 5
 # Overlap a keyless positional drain's next page fetch with the previous page's
 # shape+upload, through one bounded background uploader. Only engaged for a keyless
 # drain writing over the REST transport -- pipelining FUSE writes would raise the
@@ -8533,15 +8536,30 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         path = self._snapshot_stage_namespace(table, scope, schema_id)
         if path in self._cleaned_snapshot_stages:
             return
-        try:
-            PurePythonInformixBridge._remove_connection_slot_tree(path)
-        except FileNotFoundError:
-            pass
-        except OSError:
+        # The serve path deletes consumed pages on a background pool (see
+        # _cleanup_consumed_snapshot_stage_pages), so a page can vanish while this walk is
+        # visiting it, and the walk then stops part-way with FileNotFoundError. Walk again
+        # until the stage is gone, and record it as cleaned only then, so the rest of it
+        # is not left behind for the retention sweep.
+        for _ in range(_SNAPSHOT_STAGE_CLEANUP_ATTEMPTS):
+            try:
+                PurePythonInformixBridge._remove_connection_slot_tree(path)
+            except FileNotFoundError:
+                if os.path.lexists(path):
+                    continue
+            except OSError:
+                logging.getLogger(__name__).warning(
+                    "Cannot remove completed Informix snapshot staging data: %s",
+                    path,
+                    exc_info=True,
+                )
+                return
+            break
+        if os.path.lexists(path):
             logging.getLogger(__name__).warning(
-                "Cannot remove completed Informix snapshot staging data: %s",
+                "Completed Informix snapshot staging data is still changing; leaving %s for "
+                "a later read or the retention sweep",
                 path,
-                exc_info=True,
             )
             return
         self._cleaned_snapshot_stages.add(path)
