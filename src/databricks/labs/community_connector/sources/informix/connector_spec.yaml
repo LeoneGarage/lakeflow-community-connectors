@@ -82,6 +82,15 @@ connection:
       secret: true
       description: Password used by Informix ASC normal username/password authentication.
 
+    - name: transform.hash.key
+      type: string
+      required: false
+      secret: true
+      description: >
+        Secret of at least 16 characters that keys HASH in transform_columns
+        (HMAC-SHA256). Set it on the connection rather than in a pipeline spec.
+        Changing it fails closed on running tables that use HASH until a full refresh.
+
     - name: server
       type: string
       required: true
@@ -669,6 +678,20 @@ connection:
         changing the list on a running table fails closed until a full refresh.
         Mutually exclusive with include_columns.
 
+    - name: transform_columns
+      type: string
+      required: false
+      description: >
+        Per-table JSON object from column name to an expression over that column that
+        replaces its value as rows leave the connector (snapshots, files, CDC upserts,
+        deletes, and tombstones), so raw values never reach Spark. Expressions use the
+        row_filter functions plus MASK(s[, keep[, char]]), HASH(x) (HMAC-SHA256 hex
+        keyed by transform.hash.key), and NULLIFY(x), and may read only the column they
+        replace. A key column takes only HASH(column). row_filter and the key options see
+        source values; renames apply after. Changing the transforms on a running table
+        fails closed until a full refresh, except removing the entry for a column
+        dropped at the source.
+
     - name: rename_columns
       type: string
       required: false
@@ -701,8 +724,12 @@ connection:
         with trailing spaces ignored. LIKE matches as Informix does: % and _ are
         wildcards, matching is case-sensitive, trailing blanks of the value and the
         pattern are ignored, and a backslash (or the ESCAPE character) makes the next
-        character literal; a pattern can't end with its escape character. Every
-        column it uses must be selected. Changing the filter on a running table
+        character literal; a pattern can't end with its escape character. A function
+        can stand in for the column on the left of a test: UPPER, LOWER, TRIM, LTRIM,
+        RTRIM, LENGTH, CHAR_LENGTH, SUBSTR, REPLACE, LPAD, RPAD, NVL, COALESCE, ABS,
+        MOD, ROUND, TRUNC, YEAR, MONTH, DAY, and WEEKDAY, each evaluated as Informix
+        does (see the README); clock- and session-dependent functions are refused.
+        Every column it uses must be selected. Changing the filter on a running table
         fails closed until a full refresh. Combined with snapshot.filter by AND.
 
     - name: snapshot.isolation
@@ -1314,4 +1341,4 @@ connection:
 
 # Exact per-table overrides consumed by the connector. `qualified_source_table` maps a
 # pipeline table to a dynamically discovered exposed name (`owner.table`).
-external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,rename_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
+external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,rename_columns,transform_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"

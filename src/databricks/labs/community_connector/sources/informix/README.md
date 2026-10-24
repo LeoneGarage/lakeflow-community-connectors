@@ -36,6 +36,7 @@ The pure-Python protocol implementation has completed authentication, query, dis
 - [Table configuration](#table-configuration)
   - [Column selection](#column-selection)
   - [Column renames](#column-renames)
+  - [Value transforms](#value-transforms)
   - [Row filtering](#row-filtering)
   - [Snapshot modes](#snapshot-modes)
     - [Migrating a table without a re-snapshot](#migrating-a-table-without-a-re-snapshot)
@@ -120,6 +121,7 @@ rather than start from an unrelated position.
 | `capacity.retry.max.delay.seconds` | No | `5` | Enables capacity backpressure for **continuous** pipelines, where every flow is a permanent standing consumer of a fixed slot count so contention is the steady state rather than a fault. Instead of blocking for the whole `connection.wait.timeout.seconds` and then failing, a continuous reader spends a short bounded budget trying to claim a slot and then returns an empty batch, waiting up to this many seconds (jittered) first. With a positive value this also caps each acquisition attempt to a short, miss-scaled budget: the budget grows with the number of consecutive reads that reader has finished without ever getting a slot, so a reader starved longest presses hardest; acquiring a slot resets that count. The default `5` spaces starved readers apart with jittered backoff, floored at `0.1s` so a low draw cannot re-sweep almost immediately. It was briefly `8` with a `0.5s` floor to reduce how often starved readers touched the shared Volume, whose FUSE mount disconnects with `ENOTCONN` under sustained write frequency. Slots are Postgres rows now — a measured 247–266 req/s at 120 concurrent connections held latency flat with no errors — so that traffic is no longer a constraint and the narrower range is restored for faster slot handoff. This value applies only to the steady-state **stream** (CDC) phase: the blocking **snapshot** is bulk, latency-tolerant work, so it always uses an effective delay of `0` regardless of this setting — it blocks the full `connection.wait.timeout.seconds` per attempt to patiently wait out contention for a slot, and the **incremental** snapshot reader phase does the same by default (governed by `snapshot.incremental.blocking`). Setting `0` extends that full-block behavior to the stream phase too for a **continuous** flow: the acquisition attempt blocks the full `connection.wait.timeout.seconds` (maximum chance to claim a slot before giving up) and there is no inter-read delay before the next attempt — prompt re-scan with no spacing, which raises shared-Volume metadata load under heavy contention. Either way a continuous flow **always yields** an empty batch on exhaustion rather than failing, bounded by `capacity.retry.max.retries` consecutive misses; the returned offset carries the count so the stream stays live and never reaches a durable checkpoint. Once that cap is reached the flow logs an error and fails with `ConnectionCapacityUnavailable`, so an undersized endpoint cannot pass unnoticed — prefer a triggered pipeline, a higher `max.concurrent.connections`, or fewer flows when readers outnumber slots. This value is irrelevant to a **triggered** flow, which always blocks the full wait and raises on exhaustion. Must be `>= 0`. |
 | `capacity.retry.max.retries` | No | `500` | Consecutive capacity misses a **continuous** flow tolerates before it stops yielding and fails with `ConnectionCapacityUnavailable`. A reader that never claims a slot yields empty batches, which is indistinguishable from an idle source; this bound makes a permanently undersized endpoint fail loudly instead of replicating nothing forever. Acquiring a slot resets the count, so it only ever measures a current run of misses. Minimum `1`. Irrelevant to a triggered flow, which raises on the first exhausted wait. |
 | `dropped.mount.max.retries` | No | `10` | Consecutive reads that find the snapshot staging Volume's FUSE mount disconnected (`ENOTCONN`) before the flow stops yielding empty batches and fails with `InformixError`. A dropped mount is normally transient — the connector yields an empty batch and the next read proceeds once the mount returns, leaving the checkpoint untouched — but a mount that never comes back leaves every flow yielding empties while the pipeline reports `RUNNING` and commits zero-row Delta versions on schedule, which is indistinguishable from an idle source. This bound surfaces that outage as a flow failure instead of a silent stall. The count measures **reads, not seconds**, so the wall-clock tolerance is this many microbatch intervals (the default is roughly 5 minutes at a 30s interval); raise it for a long trigger interval. Any read that reaches the Volume resets the count, so a flapping mount does not accumulate toward the cap. Minimum `1`. |
+| `transform.hash.key` | No | none | Secret of at least 16 characters that keys `HASH` in `transform_columns` (HMAC-SHA256). Set it on the connection, not in a pipeline spec. Changing it fails closed on running tables that use `HASH` until a full refresh. See [Value transforms](#value-transforms). |
 | `lakebase.password` | **Yes** | | Password for `informix_state_user`, the long-lived Postgres role all state access authenticates as. Required, because it is the credential the running pipeline uses for every read and write of state, so nothing in that path depends on a token that can expire. It is the source of truth: a role whose password differs is repaired to match, which invalidates the previous password. The role name is fixed and not configurable — every pipeline sharing an endpoint must agree on which role owns the state tables. |
 | `lakebase.admin_user` | No | ambient identity | Postgres role used **only** to provision `informix_state_user`, which requires CREATEROLE. Separate from the state role on purpose, so the credential every reader holds cannot create roles. Defaults to `DATABRICKS_CLIENT_ID` for a service principal, otherwise the workspace user. |
 | `lakebase.admin_password` | No | OAuth credential | Password for `lakebase.admin_user`. When unset the admin authenticates with a short-lived OAuth credential minted for the pipeline's identity, which is the usual case. Not the same as `lakebase.password`. |
@@ -158,6 +160,7 @@ rather than start from an unrelated position.
 | `row_filter` | No | none | Per-table predicate, without `WHERE`, that keeps only matching rows in snapshots, file-sourced snapshots, and the change stream. An update that moves a row out of the filter deletes it. See [Row filtering](#row-filtering). |
 | `include_columns` | No | all columns | Per-table list of the columns to ingest (comma-separated or a JSON array). Columns added to the source later stay out. See [Column selection](#column-selection). |
 | `exclude_columns` | No | none | Per-table list of columns to leave out (comma-separated or a JSON array). Columns added to the source later come in. Can't be combined with `include_columns`. See [Column selection](#column-selection). |
+| `transform_columns` | No | none | Per-table object from column name to an expression replacing its value as rows leave the connector, such as `{"ssn": "MASK(ssn, 4)"}`; keys take only `HASH`. See [Value transforms](#value-transforms). |
 | `rename_columns` | No | none | Per-table new destination names for columns, as a JSON object (`{"cust_nm": "customer_name"}`) or `source:destination` pairs. Other options keep using source names. See [Column renames](#column-renames). |
 | `snapshot.isolation` | No | `committed_read_last_committed` | Per-table isolation level for the monolithic `snapshot.mode=initial` full-table snapshot. `committed_read_last_committed` (default) reads the last-committed image of a locked row instead of holding shared locks, so the snapshot does **not** lock the table against writers. `repeatable_read` restores the exactly-once, table-locking behavior. Tokens are case- and whitespace-insensitive; unknown values are rejected. **⚠️ Duplicate-row warning:** under `committed_read_last_committed` the table is no longer frozen at the snapshot LSN, so a row inserted **during** the scan can be captured by both the snapshot and the change stream. A keyed table de-duplicates these by primary key, but a **keyless (append-only) table has no key to de-duplicate on and may therefore emit duplicate rows**. Use `repeatable_read` for keyless tables that require exactly-once, or run the `initial` backfill during a quiet window. See [Snapshot isolation](#snapshot-isolation). |
 | `snapshot.scan` | No | `keyset` | Per-table (also connection-scope) read strategy for a **keyed** table's one-pass snapshot. `keyset` (default) pages in key order: each page is its own query ordered by the key columns, which an index on those columns serves cheaply. Without such an index every page can scan and sort the table, so the cost grows with pages times table size, which is the usual case for a `primary.keys` override and especially the `"*"` wildcard. `cursor` reads the table through one forward-only cursor with no sorting, as a keyless table is read, while the key still drives the destination merge and delete handling. It also avoids keyset paging's trouble with NULL key values. Pages are sized by `keyless.snapshot.page.size`. Rows committed during a non-locking scan can reach both the snapshot and the change stream, which the key de-duplicates; set `snapshot.isolation=repeatable_read` for an exactly-once scan that locks the table. With `snapshot.mode=incremental` or `auto_snapshot`, a cursor scan has no key ranges to chunk by, so a new snapshot uses the one-pass snapshot instead of the chunked one; a chunked copy already in progress finishes as it started. A keyless table always reads through the cursor. Accepts `keyset`/`cursor`. |
@@ -195,7 +198,7 @@ rather than start from an unrelated position.
 Because per-table options are supported, configure the Unity Catalog connection with this exact `externalOptionsAllowList`:
 
 ```text
-qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,rename_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration
+qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,rename_columns,transform_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration
 ```
 
 Create the connection from the Lakeflow Community Connector flow on the **Add Data** page, with the Databricks CLI, or with the Databricks SDK for Python. The Unity Catalog connection type must be `COMMUNITY`, and `sourceName` must be `informix`.
@@ -228,7 +231,7 @@ databricks connections create --json "$(jq -n \
       encrypt: "true",
       "snapshot.staging.location": "/Volumes/main/informix_cdc/staging",
       "lakebase.password": $lakebase_password,
-      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,rename_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
+      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,rename_columns,transform_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
     }
   }')"
 
@@ -266,7 +269,7 @@ databricks connections update informix_sales --json "$(jq -n \
       "ssl.ca.file": "/Volumes/catalog/schema/artifacts/informix-ca.pem",
       "snapshot.staging.location": "/Volumes/main/informix_cdc/staging",
       "lakebase.password": $lakebase_password,
-      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,rename_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
+      externalOptionsAllowList: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,rename_columns,transform_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
     }
   }')" \
   --profile "$DATABRICKS_PROFILE"
@@ -313,7 +316,7 @@ connection = w.connections.create(
         "lakebase.password": os.environ["LAKEBASE_PASSWORD"],
         "externalOptionsAllowList": (
             "qualified_source_table,decimal.variable.type,decimal.variable.column.type,"
-            "snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,rename_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,"
+            "snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,rename_columns,transform_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,"
             "append.only.ingestion,append.delete.tombstones,"
             "max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
         ),
@@ -354,7 +357,7 @@ connection = w.connections.update(
         "lakebase.password": os.environ["LAKEBASE_PASSWORD"],
         "externalOptionsAllowList": (
             "qualified_source_table,decimal.variable.type,decimal.variable.column.type,"
-            "snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,rename_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,"
+            "snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,rename_columns,transform_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,"
             "append.only.ingestion,append.delete.tombstones,"
             "max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
         ),
@@ -624,7 +627,7 @@ without a full refresh:
 Anything else still needs a full refresh: renames, reorders, a column added before
 existing ones, other type changes, nullability changes, non-nullable additions,
 unsupported types, primary-key changes, and dropping a `NOT NULL` or key column. Changing `include_columns`,
-`exclude_columns`, `rename_columns`, or `row_filter` on a running table also needs one.
+`exclude_columns`, `rename_columns`, `transform_columns`, or `row_filter` on a running table also needs one.
 
 All of these have been validated against a live Informix server: after the change,
 Informix returns log records written before it in the current layout. Values logged
@@ -995,7 +998,7 @@ Full definitions are in [Connection parameters](#connection-parameters).
 }
 ```
 
-Supported source-specific table options are `qualified_source_table`, `decimal.variable.type`, `decimal.variable.column.type`, `snapshot.mode`, `snapshot.source`, `snapshot.boundary.lsn`, `snapshot.split.bytes`, `snapshot.unl.delimiter`, `snapshot.unl.escape`, `snapshot.page.size`, `keyless.snapshot.page.size`, `snapshot.filter`, `row_filter`, `include_columns`, `exclude_columns`, `rename_columns`, `snapshot.isolation`, `snapshot.max.rows`, `snapshot.max.bytes`, `max.records.per.batch`, `cdc.timeout`, and `cdc.max.records`. `qualified_source_table` maps the pipeline's logical table name to an Informix `owner.table` name. Standard destination, SCD, key, sequence, and clustering options remain available.
+Supported source-specific table options are `qualified_source_table`, `decimal.variable.type`, `decimal.variable.column.type`, `snapshot.mode`, `snapshot.source`, `snapshot.boundary.lsn`, `snapshot.split.bytes`, `snapshot.unl.delimiter`, `snapshot.unl.escape`, `snapshot.page.size`, `keyless.snapshot.page.size`, `snapshot.filter`, `row_filter`, `include_columns`, `exclude_columns`, `rename_columns`, `transform_columns`, `snapshot.isolation`, `snapshot.max.rows`, `snapshot.max.bytes`, `max.records.per.batch`, `cdc.timeout`, and `cdc.max.records`. `qualified_source_table` maps the pipeline's logical table name to an Informix `owner.table` name. Standard destination, SCD, key, sequence, and clustering options remain available.
 
 ### Column selection
 
@@ -1062,9 +1065,64 @@ destination name, or a string of comma-separated `source:destination` pairs:
   landed under the old names. Run a full refresh to apply new ones. After dropping a
   renamed column at the source, take its entry out; that edit needs no full refresh.
 
-To transform values on the way in (masking, hashing, trimming), read the landed table
-from a downstream view or materialized view in the pipeline. The connector doesn't apply
-functions to values.
+### Value transforms
+
+`transform_columns` replaces columns' values as rows leave the connector, so the raw
+values never reach Spark, the destination, or its history. Give it an object from column
+name to an expression over that column:
+
+```json
+{
+  "source_table": "members",
+  "table_configuration": {
+    "qualified_source_table": "informix.members",
+    "transform_columns": {
+      "ssn": "MASK(ssn, 4)",
+      "member_id": "HASH(member_id)",
+      "email": "HASH(LOWER(TRIM(email)))",
+      "notes": "NULLIFY(notes)",
+      "salary": "ROUND(salary, -3)"
+    }
+  }
+}
+```
+
+- **Functions:** every [row filter function](#row-filtering), plus three for transforms:
+
+  | Function | Result |
+  |---|---|
+  | `MASK(s[, keep[, char]])` | replaces every character but the last `keep` (default 0) with `char` (default `*`); a value no longer than `keep` is masked whole |
+  | `HASH(x)` | HMAC-SHA256 of the value as 64 hex characters, keyed by the connection's `transform.hash.key` |
+  | `NULLIFY(x)` | NULL |
+
+- **`HASH`:** set `transform.hash.key` on the connection to a secret of at least 16
+  characters, and keep it out of the pipeline spec. Keyed hashing means a hashed SSN or
+  email can't be reversed by hashing guesses without the key. The same value hashes the
+  same from snapshots, files, and CDC, and across tables sharing the connection, so
+  hashed keys still join. The connector records only an HMAC-derived id of the key;
+  changing the key on a running table fails closed until a full refresh, since old and
+  new hashes would otherwise mix.
+- **Keys:** a key column takes only `HASH(column)`, which keeps keys one-to-one, so
+  updates and deletes still find their rows. Any other change to a key could map two
+  rows to one.
+- **What a transform sees:** the value the connector emits, so `CHAR` values without
+  their padding and dates and timestamps as ISO text. Transforms run in Python only, so
+  they apply the functions above without the `CHAR` padding a filter uses.
+- **Types:** a transform lands as its result's type: strings for string functions,
+  `MASK`, and `HASH`; integers for `LENGTH`, `CHAR_LENGTH`, `YEAR`, `MONTH`, `DAY`, and
+  `WEEKDAY`; and the column's own type otherwise. `ROUND` on a decimal adds one digit of
+  precision, since rounding up can carry. A transformed column is always nullable.
+- **Order:** `row_filter`, the column selection, and the key options see source values;
+  `rename_columns` applies after, so a renamed column's transform still uses its source
+  name. Change images, deletes, and append-path tombstones are transformed like
+  snapshot rows.
+- **Changing the transforms:** on a running table this fails closed, because rows
+  already landed hold the old values. Run a full refresh to apply new ones. After
+  dropping a transformed column at the source, take its entry out; that edit needs no
+  full refresh.
+
+If raw values may land but must be hidden from most readers, Unity Catalog column masks
+on the destination table do that without any connector option.
 
 ### Row filtering
 
@@ -1119,8 +1177,33 @@ on change images. That limits it to:
   connector always sends the escape character to Informix, so the server's
   `DEFAULTESCCHAR` setting doesn't change the result. A pattern can't end with its escape
   character.
+- **Functions:** a function can stand in for the column on the left of any test, as in
+  `UPPER(TRIM(status)) = 'OPEN'` or `YEAR(ordered_on) >= 2020`. Its first argument is a
+  column or another function and the rest are literals. Each one below is evaluated by
+  Informix in snapshot queries and by the connector on change images and files, and
+  every Python twin was checked against Informix 14.10 on 2,352 cases (on an ISO 8859-1
+  database) to give the same result:
+
+  | Function | Takes | Notes |
+  |---|---|---|
+  | `UPPER(s)`, `LOWER(s)` | strings | ASCII letters only, as Informix maps them: `à` and `É` stay as they are |
+  | `TRIM(s)`, `LTRIM(s)`, `RTRIM(s)` | strings | blanks only |
+  | `LENGTH(s)` | strings | bytes in the database code set, without trailing blanks |
+  | `CHAR_LENGTH(s)` | strings | characters, counting a `CHAR` column's padding |
+  | `SUBSTR(s, start[, length])` | strings | `start` from 1; a start past the end gives NULL |
+  | `REPLACE(s, from[, to])` | strings | `to` defaults to `''` |
+  | `LPAD(s, n, pad)`, `RPAD(s, n, pad)` | strings | a longer value is cut to `n` |
+  | `NVL(x, value)`, `COALESCE(x, value)` | any | `value` replaces NULL, padded like a `CHAR` column |
+  | `ABS(n)`, `ROUND(n[, digits])`, `TRUNC(n[, digits])` | numbers | `ROUND` rounds halves away from zero; `digits` from -32 to 32 |
+  | `MOD(n, divisor)` | numbers | truncates both to integers first, so `MOD(2.5, 3)` is 2 |
+  | `YEAR(d)`, `MONTH(d)`, `DAY(d)`, `WEEKDAY(d)` | `DATE`, `DATETIME` | `WEEKDAY` counts from 0 for Sunday |
+
+  A `CHAR` value is blank-padded to its width before a function sees it, as on
+  Informix. Functions that depend on the clock or the session (`TODAY`, `CURRENT`,
+  `USER`) aren't offered: a row's membership would change without any change event to
+  carry it, so CDC couldn't keep the target right. Filter on those downstream instead.
 - **NULL:** follows SQL's three-valued logic; a row is kept only when the predicate is
-  true.
+  true. Functions give NULL for a NULL input, except `NVL` and `COALESCE`.
 
 Changing the filter on a running table fails closed until a full refresh, since rows
 already landed were selected under the old one. Formatting-only edits, such as spacing,
