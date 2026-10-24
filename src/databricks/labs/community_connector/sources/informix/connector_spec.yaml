@@ -843,7 +843,9 @@ connection:
         follows the schema: an appended column joins the key. For a table already
         streaming changes, a nullable column added without a default extends the
         key without a full refresh; a column added with a default, or while an
-        incremental copy is still running, needs a full refresh.
+        incremental copy is still running, needs a full refresh. A dropped
+        column leaves the key the same way, from the pipeline's next start; rows that differed only in that column then collapse like exact
+        duplicates.
 
     - name: snapshot.max.bytes
       type: string

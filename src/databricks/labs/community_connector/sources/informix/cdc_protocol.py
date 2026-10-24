@@ -545,7 +545,10 @@ def interval_layout(qualifier: int) -> tuple[tuple[int, ...], int, int] | None:
     # ``qualifier`` is the syscolumns.collength layout, which SQLI result descriptors
     # carry too: total digits in the high byte, then the start and end field codes in
     # the low byte's nibbles (``DAY(3) TO SECOND`` is 0x094a). Returns None for a
-    # qualifier no INTERVAL can have, such as one mixing YEAR-MONTH and DAY-TIME fields.
+    # qualifier no INTERVAL can have, such as one mixing YEAR-MONTH and DAY-TIME fields,
+    # and for ``FRACTION TO FRACTION(n)`` (start code 12), a valid qualifier whose text
+    # form has not been measured on a live server and so is not decoded; the catalog
+    # reports such a column as unsupported.
 
     total, start, end = (qualifier >> 8) & 0xFF, (qualifier >> 4) & 0xF, qualifier & 0xF
     if start in (0, 2):

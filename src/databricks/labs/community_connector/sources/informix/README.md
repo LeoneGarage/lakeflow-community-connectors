@@ -465,7 +465,7 @@ The types without a CDC encoding are also the ones the snapshot reader can't mat
 
 `INT8` and `SERIAL8` use Informix's complete ten-byte signed-magnitude CDC representation. `LVARCHAR` supports its variable-width ordinary SQLI snapshot envelope and native CDC representation. A `DATETIME` qualifier is CDC-capable when its start and end fields are supported by the native decoder. Values containing `YEAR` through at least `DAY` are exposed as timezone-free Spark timestamps. `HOUR`-based values are SQL TIME strings such as `13:03:36.93100`; other partial values remain qualifier-aware strings and never acquire the worker's current date.
 
-`INTERVAL` lands as a string, because Delta tables can't store Spark's interval types. The string is Informix's own literal for the value with its padding trimmed: the first field unpadded, the others two digits each, the fraction at its declared width, and a leading `-` when negative. For example, `INTERVAL DAY(3) TO FRACTION(3)` gives `-12 13:14:15.016`, `YEAR TO MONTH` gives `1-02`, and `HOUR TO MINUTE` gives `10:30`. Snapshots, file loads, and the change stream all produce the same text, which matches `TRIM(CAST(col AS VARCHAR(40)))` on the server. That was checked against a live Informix 14.10 on twelve qualifiers covering every start field, leading precisions up to 9, and fractions of 1, 3, and 5 digits, with positive, negative, zero, and NULL values. The text doesn't sort by duration, so a snapshot keyed on an `INTERVAL` column copies the table in one consistent snapshot instead of in incremental chunks. `row_filter` can't filter on an `INTERVAL` column.
+`INTERVAL` lands as a string, because Delta tables can't store Spark's interval types. The string is Informix's own literal for the value with its padding trimmed: the first field unpadded, the others two digits each, the fraction at its declared width, and a leading `-` when negative. For example, `INTERVAL DAY(3) TO FRACTION(3)` gives `-12 13:14:15.016`, `YEAR TO MONTH` gives `1-02`, and `HOUR TO MINUTE` gives `10:30`. Snapshots, file loads, and the change stream all produce the same text, which matches `TRIM(CAST(col AS VARCHAR(40)))` on the server. That was checked against a live Informix 14.10 on twelve qualifiers covering every start field, leading precisions up to 9, and fractions of 1, 3, and 5 digits, with positive, negative, zero, and NULL values. The text doesn't sort by duration, so a snapshot keyed on an `INTERVAL` column copies the table in one consistent snapshot instead of in incremental chunks. `row_filter` can't filter on an `INTERVAL` column. `INTERVAL FRACTION TO FRACTION(n)`, whose only field is the fraction, is not decoded: its text form hasn't been measured on a live server, so the catalog reports such a column as unsupported and the table is rejected unless `exclude_columns` leaves the column out.
 
 ### Variable-scale decimals
 
@@ -618,15 +618,21 @@ without a full refresh:
   `DECIMAL` with fewer integer digits than those minimums (Delta's, even where the values
   would fit), `BIGINT` or `INT8` to `FLOAT`, and an integer to `SMALLFLOAT` still need a
   full refresh.
-- **Dropped columns:** a nullable column that isn't part of the key. The connector stops
-  reading it and no longer reports it, and the destination keeps the column. With SCD
-  type 1, a row updated after the drop keeps the value it had; rows inserted after the
-  drop hold NULL. With SCD type 2, versions written after the drop hold NULL, and earlier
-  versions keep their values.
+- **Dropped columns:** any column that isn't part of the key, `NOT NULL` or not. Dropping
+  any key column fails closed, whatever its nullability: a key set with `primary.keys` or
+  taken from a nullable index may name a nullable column, and rows would otherwise key on
+  NULL. The exception is a whole-row key, which shrinks with the drop (see below).
+  For a dropped non-key column the connector stops reading it and no longer reports it,
+  and the destination keeps the column. With SCD type 1, a row updated after the drop
+  keeps the value it had; rows inserted after the drop hold NULL. With SCD type 2,
+  versions written after the drop hold NULL, and earlier versions keep their values. NULL
+  fits even where the source column was `NOT NULL`, because the pipeline creates every
+  destination column nullable.
 
 Anything else still needs a full refresh: renames, reorders, a column added before
 existing ones, other type changes, nullability changes, non-nullable additions,
-unsupported types, primary-key changes, and dropping a `NOT NULL` or key column. Changing `include_columns`,
+unsupported types, primary-key changes, and dropping a column of any key but a
+whole-row one. Changing `include_columns`,
 `exclude_columns`, `rename_columns`, `transform_columns`, or `row_filter` on a running table also needs one.
 
 All of these have been validated against a live Informix server: after the change,
@@ -646,6 +652,25 @@ so their later updates and deletes still match by the longer key. The connector
 reports the longer key, and the pipeline uses it from the restart. A column added with
 a default fails the read with a full-refresh error: existing rows would carry the
 default at the source but NULL in the target, so their changes would never match.
+
+A dropped column leaves a whole-row key the same way: the key shrinks to the
+remaining columns without a full refresh, as long as no incremental copy is still
+running and no column was added in the same step. Informix returns changes logged
+before the drop without the column, and the target keeps it as an ordinary column, so
+changes match by the shorter key; a Databricks pipeline was checked to accept a key that
+shrinks between updates, under SCD types 1 and 2. The shorter key takes effect when the
+pipeline next starts, since a running update keeps merging on the key it started with: a
+drop seen mid-update fails the read until the pipeline is stopped and started again, with
+no full refresh. The DDL steps below stop the pipelines first anyway. To drop one column
+and add another, run the pipeline once between the two changes.
+
+In the target, the dropped column keeps its value in rows that don't change. A changed
+row lands with NULL there, since a change to a whole-row key is a delete plus an insert;
+an update that rewrites a row with the same values keeps the old value under SCD type 1
+and opens a version holding NULL under SCD type 2. Rows that differed only in the dropped
+column become one key, like exact duplicate rows, and a change to one copy at the source
+reaches every target row under that key: under SCD type 1, deleting one copy removes all
+of them; under SCD type 2, it closes only the newest version and the others stay current.
 
 Informix rejects `ALTER TABLE` while full-row logging is enabled. Stop every
 pipeline using this connection, then quiesce source writes before disabling
@@ -840,6 +865,10 @@ Use something else when:
   later updates and deletes still match. A column added with a default, or added
   while an incremental copy is still running, needs a full refresh. See
   [Schema evolution without full refresh](#schema-evolution-without-full-refresh).
+- A dropped column leaves the key, with no full refresh: the pipeline uses the shorter
+  key from its next start. Rows that differed only in that
+  column then behave like exact duplicates. A column dropped while an incremental copy
+  is still running, or together with an added one, needs a full refresh.
 - Paging a snapshot by every column sorts the table once per page, so set
   `snapshot.scan: cursor`.
 
@@ -950,7 +979,8 @@ position in a `_manifest.json` or `snapshot.boundary.lsn`. See
   to one row.
 - A NULL in a `NOT NULL` key column fails the read as a broken log record.
 - Changing a key needs a full refresh. The exception is a whole-row key growing
-  by a nullable column added without a default, once the table is streaming.
+  by a nullable column added without a default, or shrinking by a dropped column,
+  once the table is streaming.
 - Changing the files under a running file snapshot fails the read with a
   full-refresh error.
 - A table with a column of an unsupported type is rejected unless column selection
@@ -1092,7 +1122,7 @@ name to an expression over that column:
   | Function | Result |
   |---|---|
   | `MASK(s[, keep[, char]])` | replaces every character but the last `keep` (default 0) with `char` (default `*`); a value no longer than `keep` is masked whole |
-  | `HASH(x)` | HMAC-SHA256 of the value as 64 hex characters, keyed by the connection's `transform.hash.key` |
+  | `HASH(x)` | HMAC-SHA256 of the value's text as 64 hex characters, keyed by the connection's `transform.hash.key`. Numbers hash in one form whatever type carries them (`5`, `5.0`, and `5.00` all hash as `5`; `1.50` as `1.5`), so a hashed key keeps its digest when its column widens; dates and timestamps hash as ISO text, booleans as `true`/`false`, binary as hex |
   | `NULLIFY(x)` | NULL |
 
 - **`HASH`:** set `transform.hash.key` on the connection to a secret of at least 16
@@ -1111,7 +1141,11 @@ name to an expression over that column:
 - **Types:** a transform lands as its result's type: strings for string functions,
   `MASK`, and `HASH`; integers for `LENGTH`, `CHAR_LENGTH`, `YEAR`, `MONTH`, `DAY`, and
   `WEEKDAY`; and the column's own type otherwise. `ROUND` on a decimal adds one digit of
-  precision, since rounding up can carry. A transformed column is always nullable.
+  precision, since rounding up can carry. A transformed column is nullable when its source
+  column is, or when `NULLIFY` or `SUBSTR` (NULL past the end) can produce NULL; `HASH` on
+  a `NOT NULL` key keeps it `NOT NULL`. `NVL` and `COALESCE` fall back to a value of the
+  column's own type, so on an integer column, or over `LENGTH`, `CHAR_LENGTH`, `YEAR`,
+  `MONTH`, `DAY`, or `WEEKDAY`, the fallback must be a whole number.
 - **Order:** `row_filter`, the column selection, and the key options see source values;
   `rename_columns` applies after, so a renamed column's transform still uses its source
   name. Change images, deletes, and append-path tombstones are transformed like
@@ -1182,18 +1216,20 @@ on change images. That limits it to:
   column or another function and the rest are literals. Each one below is evaluated by
   Informix in snapshot queries and by the connector on change images and files, and
   every Python twin was checked against Informix 14.10 on 2,352 cases (on an ISO 8859-1
-  database) to give the same result:
+  database) to give the same result. The twins count bytes and pad `CHAR` values in the
+  connection's `DB_LOCALE` (default `en_US.819`), so set it when the database uses another
+  code set, such as UTF-8:
 
   | Function | Takes | Notes |
   |---|---|---|
   | `UPPER(s)`, `LOWER(s)` | strings | ASCII letters only, as Informix maps them: `à` and `É` stay as they are |
   | `TRIM(s)`, `LTRIM(s)`, `RTRIM(s)` | strings | blanks only |
-  | `LENGTH(s)` | strings | bytes in the database code set, without trailing blanks |
-  | `CHAR_LENGTH(s)` | strings | characters, counting a `CHAR` column's padding |
+  | `LENGTH(s)` | strings | bytes in the database code set (`DB_LOCALE`), without trailing blanks |
+  | `CHAR_LENGTH(s)` | strings | characters, counting a `CHAR` column's padding to its byte width |
   | `SUBSTR(s, start[, length])` | strings | `start` from 1; a start past the end gives NULL |
   | `REPLACE(s, from[, to])` | strings | `to` defaults to `''` |
   | `LPAD(s, n, pad)`, `RPAD(s, n, pad)` | strings | a longer value is cut to `n` |
-  | `NVL(x, value)`, `COALESCE(x, value)` | any | `value` replaces NULL, padded like a `CHAR` column |
+  | `NVL(x, value)`, `COALESCE(x, value)` | any | `value` replaces NULL, padded like a `CHAR` column; in a transform it takes the column's own type |
   | `ABS(n)`, `ROUND(n[, digits])`, `TRUNC(n[, digits])` | numbers | `ROUND` rounds halves away from zero; `digits` from -32 to 32 |
   | `MOD(n, divisor)` | numbers | truncates both to integers first, so `MOD(2.5, 3)` is 2 |
   | `YEAR(d)`, `MONTH(d)`, `DAY(d)`, `WEEKDAY(d)` | `DATE`, `DATETIME` | `WEEKDAY` counts from 0 for Sunday |

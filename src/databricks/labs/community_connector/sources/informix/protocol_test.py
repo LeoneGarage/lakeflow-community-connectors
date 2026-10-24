@@ -481,9 +481,9 @@ class IntervalTests(unittest.TestCase):
         self.assertEqual(interval_layout(0x0602), ((0, 2), 4, 0))
         self.assertEqual(interval_layout(0x0100), ((0,), 1, 0))
         for qualifier in (0x0624, 0x03BD, 0x0202, 0x0C02, 0x0420, 0x0642):
-            # MONTH TO DAY mixes classes; FRACTION can't start one; too few digits for
-            # YEAR TO MONTH; a ten-digit leading field; MONTH TO YEAR and DAY TO MONTH
-            # run backwards.
+            # MONTH TO DAY mixes classes; a FRACTION start (FRACTION TO FRACTION(n)) is
+            # valid but not decoded; too few digits for YEAR TO MONTH; a ten-digit leading
+            # field; MONTH TO YEAR and DAY TO MONTH run backwards.
             with self.subTest(hex(qualifier)):
                 self.assertIsNone(interval_layout(qualifier))
         with self.assertRaises(CdcProtocolError):
