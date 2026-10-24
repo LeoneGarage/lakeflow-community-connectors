@@ -7587,6 +7587,107 @@ class LakeflowContractTests(unittest.TestCase):
                 explicit, table(("id", "value", "added"), ("id", "added")), extend_wildcard_key=True
             )
 
+    def test_a_wildcard_key_may_shrink_only_by_exactly_the_dropped_columns(self):
+        def table(columns, keys, not_null=("id",)):
+            raw = _table(primary_keys=keys)
+            raw["columns"] = [
+                {"name": name, "type_name": "INTEGER", "nullable": name not in not_null}
+                for name in columns
+            ]
+            return informix_module.Table.parse(raw, "demo")
+
+        previous = table(("id", "value", "extra"), ("id", "value", "extra"))
+        shrunk = table(("id", "value"), ("id", "value"))
+        ensure = informix_module._ensure_compatible_schema_change
+
+        ensure(previous, shrunk, extend_wildcard_key=True, shrink_wildcard_key=True)
+        # Mid-update the destination still merges on the longer key: restart, no refresh.
+        with self.assertRaisesRegex(InformixError, "running update; stop and restart"):
+            ensure(previous, shrunk, extend_wildcard_key=True)
+        # No wildcard (or an incremental copy still running): the key change needs a refresh.
+        with self.assertRaisesRegex(InformixError, "primary keys; run a full refresh"):
+            ensure(previous, shrunk, shrink_wildcard_key=True)
+        allowed = {"extend_wildcard_key": True, "shrink_wildcard_key": True}
+        # A NOT NULL column leaves the key too: the target column is nullable regardless.
+        ensure(
+            table(("id", "value", "extra"), ("id", "value", "extra"), ("id", "extra")),
+            shrunk,
+            **allowed,
+        )
+        for current in (
+            table(("id", "value", "added"), ("id", "value", "added")),  # drop and add at once
+            table(("id", "value"), ("id",)),  # shrank by more than the dropped column
+        ):
+            with self.subTest(keys=current.primary_keys, columns=len(current.columns)):
+                with self.assertRaisesRegex(InformixError, "primary keys"):
+                    ensure(previous, current, **allowed)
+        explicit = table(("id", "value", "extra"), ("id", "extra"))
+        with self.assertRaisesRegex(InformixError, "primary keys"):
+            ensure(explicit, table(("id", "value"), ("id",)), **allowed)
+
+    def _checkpoint_then_drop_a_column(self, options):
+        """Checkpoint app.orders with a nullable ``extra`` column, then drop it at the
+        source: ``(bridge, checkpoint)``."""
+        bridge = FakeBridge()
+        bridge.tables = [_table(primary_keys=())]
+        bridge.tables[0]["columns"].append(
+            {"name": "extra", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.rows = [{**row, "extra": index} for index, row in enumerate(bridge.rows)]
+        snapshot, checkpoint = self.connector(bridge).read_table("app.orders", {}, options)
+        list(snapshot)  # Spark consumes a batch before it commits the offset
+        bridge.tables[0]["columns"].pop()
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+        return bridge, checkpoint
+
+    # A whole-row key shrinks with a dropped column on the first read of a new
+    # update: the destination keeps the column, and changes match by the shorter key.
+    def test_a_dropped_column_shrinks_a_restarted_wildcard_key(self):
+        options = dict(self.WILDCARD)
+        bridge, checkpoint = self._checkpoint_then_drop_a_column(options)
+        reader = self.connector(bridge, registration_scope="next-update")
+        rows, transitioned = reader.read_table("app.orders", checkpoint, options)
+
+        self.assertEqual(list(rows), [])
+        self.assertNotEqual(transitioned["schema_fingerprint"], checkpoint["schema_fingerprint"])
+        metadata = reader.read_table_metadata("app.orders", options)
+        self.assertEqual(metadata["primary_keys"], ["id", "value"])
+
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 121},
+            # Logged before the drop; Informix returns it without the column.
+            {"op": "DELETE", "tx_id": 7, "lsn": 122, "row": {"id": 1, "value": "a"}},
+            {"op": "BEFORE_UPDATE", "tx_id": 7, "lsn": 123, "row": {"id": 2, "value": "b"}},
+            {"op": "AFTER_UPDATE", "tx_id": 7, "lsn": 124, "row": {"id": 2, "value": "c"}},
+            {"op": "COMMIT", "tx_id": 7, "lsn": 125},
+        ]
+        upserts, _ = reader.read_table("app.orders", transitioned, options)
+        deletes, _ = reader.read_table_deletes("app.orders", transitioned, options)
+
+        upserts, deletes = list(upserts), list(deletes)
+        self.assertEqual(
+            [(row["id"], row["value"], row["_informix_op"]) for row in upserts], [(2, "c", "u")]
+        )
+        self.assertEqual(
+            [(row["id"], row["value"], row["_informix_op"]) for row in deletes],
+            [(1, "a", "d"), (2, "b", "d")],
+        )
+        self.assertFalse(any("extra" in row for row in upserts + deletes))
+
+    def test_a_dropped_column_fails_a_running_wildcard_key_until_the_pipeline_restarts(self):
+        options = dict(self.WILDCARD)
+        bridge, checkpoint = self._checkpoint_then_drop_a_column(options)
+        with self.assertRaisesRegex(InformixError, "stop and restart the pipeline"):
+            self.connector(bridge).read_table("app.orders", checkpoint, options)
+        # The same checkpoint read in the next update adopts the shorter key.
+        reader = self.connector(bridge, registration_scope="next-update")
+        rows, _ = reader.read_table("app.orders", checkpoint, options)
+        self.assertEqual(list(rows), [])
+        self.assertEqual(
+            reader.read_table_metadata("app.orders", options)["primary_keys"], ["id", "value"]
+        )
+
     def test_an_added_column_transitions_an_explicitly_keyed_flow(self):
         # The contrast: an explicit key list is not tied to the column set.
         rows, checkpoint, transitioned = self._read_after_adding_a_column(
@@ -11845,6 +11946,27 @@ class SharedCdcShardTests(unittest.TestCase):
         self.assertIsNone(shard.snapshot(self.id_a, 0))  # read at 5 did not cover floor 0
         self.assertEqual(shard.shared_restart, 0)
 
+    def test_a_table_whose_options_no_longer_fit_is_left_to_direct_reads(self):
+        # One table's stale rename must not take every table in the shard off shared reads.
+        class Bridge:
+            def get_table(self, identity):
+                return _wide_table()
+
+        fit = Table.parse(_wide_table(), "demo")
+        unfit = dataclasses.replace(fit, column_renames=(("gone", "label"),))
+        with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
+            schema_map, dropped = informix_module._shard_schema_map(
+                Bridge(), [("app.a", unfit), ("app.b", fit)]
+            )
+        self.assertEqual((list(schema_map), dropped), (["app.b"], ["app.a"]))
+        self.assertIn("app.a", logs.output[0])
+        shard = _SharedCdcShard()
+        shard.subscribe("app.a", unfit, {"capture": 1}, 0, 10)
+        shard.subscribe("app.b", fit, {"capture": 2}, 0, 20)
+        shard.evict("app.a")
+        self.assertEqual(list(shard.subscribers), ["app.b"])
+        self.assertNotIn("app.a", shard.buffers)
+
 
 class SharedCdcOptionTests(unittest.TestCase):
     def setUp(self):
@@ -15442,12 +15564,18 @@ class ColumnSelectionTests(_TableOptionTestCase):
         table = connector._table(
             "app.orders", {"exclude_columns": "value", "row_filter": "extra >= 8"}
         )
-        shape = informix_module._shape_unl_record
-        kept = shape(b"2|b|8|", table, 100, {}, "utf-8")
+        predicate = informix_module._row_filter_predicate(table, "latin-1")
+
+        def shape(raw):
+            return informix_module._shape_unl_record(
+                raw, table, 100, {}, "utf-8", predicate=predicate
+            )
+
+        kept = shape(b"2|b|8|")
         self.assertEqual((kept["id"], kept["extra"], "value" in kept), (2, 8, False))
-        self.assertIsNone(shape(b"1|a|7|", table, 100, {}, "utf-8"))
+        self.assertIsNone(shape(b"1|a|7|"))
         with self.assertRaisesRegex(InformixError, "has 2 fields but the table has 3 columns"):
-            shape(b"1|7|", table, 100, {}, "utf-8")
+            shape(b"1|7|")
 
     def test_an_executor_unl_split_rebuilds_the_selection_and_filter(self):
         connector = self.connector(_ProjectingBridge())
@@ -15477,7 +15605,7 @@ class ColumnSelectionTests(_TableOptionTestCase):
 
 
 class SchemaEvolutionTests(_TableOptionTestCase):
-    """A running stream adopts widened columns and dropped nullable columns without a full
+    """A running stream adopts widened columns and dropped non-key columns without a full
     refresh; every other change still fails closed."""
 
     @staticmethod
@@ -15511,6 +15639,12 @@ class SchemaEvolutionTests(_TableOptionTestCase):
         ):
             with self.subTest(name):
                 ensure(base, self.table(current))
+        # AUTO CDC creates every target column nullable, even from a NOT NULL source, so
+        # a dropped NOT NULL column just holds NULL in later rows, like a nullable one.
+        ensure(
+            self.table([self.ID, self.column("v"), self.column("n", nullable=False)]),
+            self.table([self.ID, self.column("v")]),
+        )
 
     def test_incompatible_changes_fail_closed(self):
         ensure = informix_module._ensure_compatible_schema_change
@@ -15531,7 +15665,6 @@ class SchemaEvolutionTests(_TableOptionTestCase):
                 [self.ID, self.column("v", "INTEGER", 4), self.column("n", nullable=False)],
                 "other than by widening",
             ),
-            ("drop NOT NULL", [self.ID, self.column("v")], "dropped NOT NULL column n"),
             ("reorder", [self.ID, self.column("n", nullable=False), self.column("v")], "reordered"),
             (
                 "insert before",
@@ -15662,6 +15795,18 @@ class SchemaEvolutionTests(_TableOptionTestCase):
         self.assertEqual([(row["id"], "extra" in row) for row in rows], [(3, False)])
         self.assertEqual(bridge.change_reads[-1][0][0]["columns"], ["id", "value"])
 
+    def test_a_dropped_not_null_column_transitions_a_running_stream(self):
+        # The destination's copy of the column is nullable whatever the source said, so
+        # later rows hold NULL there as they would for a nullable column.
+        bridge = _ProjectingBridge()
+        bridge.tables[0]["columns"][2]["nullable"] = False
+        connector, checkpoint = self.stream(bridge, {})
+        del bridge.tables[0]["columns"][2]  # ALTER TABLE ... DROP (extra)
+        bridge.now = 200
+        bridge.changes = self.committed(("INSERT", {"id": 3, "value": "c"}))
+        rows = list(connector.read_table("app.orders", checkpoint, {})[0])
+        self.assertEqual([(row["id"], "extra" in row) for row in rows], [(3, False)])
+
     def test_dropping_a_selected_column_asks_for_the_list_to_be_edited(self):
         options = {"include_columns": "id,value,extra"}
         bridge = _ProjectingBridge()
@@ -15674,6 +15819,28 @@ class SchemaEvolutionTests(_TableOptionTestCase):
         rows, end = connector.read_table("app.orders", checkpoint, {"include_columns": "id,value"})
         self.assertEqual(list(rows), [])
         self.assertNotEqual(end["schema_fingerprint"], checkpoint["schema_fingerprint"])
+
+    def test_a_dropped_key_column_fails_closed_whatever_its_nullability(self):
+        # A primary.keys override or a nullable-index promotion may key on a nullable
+        # column; dropping it must not pass as a dropped non-key column, or every row
+        # would key on NULL.
+        base = self.table([self.ID, self.column("k", "INTEGER", 4), self.column("v")], keys=("k",))
+        fresh = self.table([self.ID, self.column("v")], keys=())
+        for name, previous in (
+            ("primary.keys override", dataclasses.replace(base, key_override=True)),
+            (
+                "nullable-index promotion",
+                dataclasses.replace(base, key_from_nullable_index=True, nullable_index_key=("k",)),
+            ),
+        ):
+            with self.subTest(name):
+                with self.assertRaisesRegex(
+                    InformixError, "Key column\\(s\\) k .* no longer exist"
+                ):
+                    informix_module._carry_table_options(fresh, previous)
+                carried = dataclasses.replace(fresh, primary_keys=("k",), key_override=True)
+                with self.assertRaisesRegex(InformixError, "dropped key column k"):
+                    informix_module._ensure_compatible_schema_change(previous, carried)
 
 
 class RowFilterTests(_TableOptionTestCase):
@@ -16013,6 +16180,44 @@ class RowFilterTests(_TableOptionTestCase):
             self.changes(connector, bridge, checkpoint, options, inserted), ([(3, "c")], [])
         )
 
+    def test_a_char_operand_is_padded_to_its_byte_width(self):
+        # Informix pads a CHAR(4) to four bytes: '\u00e9' is two bytes in UTF-8, so the padded
+        # value is three characters, and one byte in ISO 8859-1, so four.
+        raw = _table()
+        raw["columns"].append({"name": "code", "type_name": "CHAR", "length": 4})
+        table = informix_module._apply_row_filter(Table.parse(raw, "demo"), "CHAR_LENGTH(code) = 3")
+        matches = informix_module._row_filter_matches
+        predicate = informix_module._row_filter_predicate
+        self.assertTrue(matches(predicate(table, "utf-8"), {"code": "\u00e9"}))
+        self.assertFalse(matches(predicate(table, "latin-1"), {"code": "\u00e9"}))
+
+    def test_file_records_count_length_in_the_connection_database_locale(self):
+        # DB_LOCALE is a connection option: an executor's filter must read it from there
+        # rather than default to ISO 8859-1 while the CDC path counts UTF-8 bytes.
+        path = os.path.join(self._shared_state.name, "orders.unl")
+        with open(path, "wb") as handle:
+            handle.write("3|caf\u00e9|9|\n4|cafe|9|\n".encode("utf-8"))
+        partition = {
+            "kind": "unl_split",
+            "path": path,
+            "start_byte": 0,
+            "end_byte": os.path.getsize(path),
+            "gzip": False,
+            "columns": [
+                {"name": "id", "type_name": "INTEGER"},
+                {"name": "value", "type_name": "VARCHAR", "length": 20},
+                {"name": "extra", "type_name": "INTEGER"},
+            ],
+            "row_filter": "LENGTH(value) = 5",
+            "snapshot_lsn": 100,
+            "exposed_name": "app.orders",
+            "encoding": "utf-8",
+        }
+        utf8 = self.connector(_ProjectingBridge(), DB_LOCALE="en_US.utf8")
+        self.assertEqual([row["id"] for row in utf8._read_unl_split(partition, {})], [3])
+        latin1 = self.connector(_ProjectingBridge())
+        self.assertEqual([row["id"] for row in latin1._read_unl_split(partition, {})], [])
+
 
 class ColumnRenameTests(_TableOptionTestCase):
     """rename_columns changes only the names the connector reports -- schema, rows, and
@@ -16244,6 +16449,93 @@ class ColumnTransformTests(_TableOptionTestCase):
             with self.subTest(raw):
                 with self.assertRaisesRegex(InformixError, message):
                     keyed._table("app.orders", {"transform_columns": raw})
+
+    def test_hash_digests_numbers_in_one_form(self):
+        # A hashed INTEGER key widened to DECIMAL or FLOAT keeps its digest, and a
+        # variable-scale DECIMAL hashes the same from a file ("1.5") and CDC ("1.50").
+        text = informix_module._hash_text
+        self.assertEqual({text(5), text(5.0), text(Decimal("5.00")), text(Decimal("5E+0"))}, {"5"})
+        self.assertEqual({text(1.5), text(Decimal("1.5")), text(Decimal("1.50"))}, {"1.5"})
+        self.assertEqual((text(Decimal("0.00")), text(Decimal("-12.340"))), ("0", "-12.34"))
+        self.assertEqual((text(True), text(b"\x01")), ("true", "01"))
+
+    def test_hash_is_detected_in_the_expression_not_its_literals(self):
+        unkeyed = self.connector(_ProjectingBridge())
+        table = unkeyed._table(
+            "app.orders", {"transform_columns": "{\"value\": \"REPLACE(value, 'HASH(', 'x')\"}"}
+        )
+        self.assertIsNone(table.transform_key_id)
+
+    def test_integer_result_functions_land_as_integers(self):
+        options = {"transform_columns": '{"value": "LENGTH(value)"}'}
+        connector, _, snapshot = self.stream(_ProjectingBridge(), options)
+        schema = connector.get_table_schema("app.orders", dict(options))
+        fields = {field.name: field for field in schema.fields}
+        self.assertEqual(type(fields["value"].dataType).__name__, "IntegerType")
+        self.assertEqual([row["value"] for row in snapshot], [1, 1])
+
+    def test_nvl_falls_back_in_the_column_type(self):
+        options = {"transform_columns": '{"extra": "NVL(extra, 0)"}'}
+        bridge = _ProjectingBridge()
+        connector, checkpoint, _ = self.stream(bridge, options)
+        bridge.now = 200
+        bridge.changes = self.committed(("INSERT", {"id": 3, "value": "c", "extra": None}))
+        upserts = list(connector.read_table("app.orders", checkpoint, dict(options))[0])
+        self.assertEqual([(row["id"], row["extra"]) for row in upserts], [(3, 0)])
+        self.assertIs(type(upserts[0]["extra"]), int)  # not the Decimal the literal parsed to
+        with self.assertRaisesRegex(InformixError, "whole numbers only"):
+            connector._table("app.orders", {"transform_columns": '{"extra": "NVL(extra, 1.5)"}'})
+        number = informix_module._number_for_column
+        column = informix_module.Column.parse
+        decimal = column({"name": "p", "type_name": "DECIMAL", "precision": 10, "scale": 2})
+        money = column({"name": "m", "type_name": "MONEY", "precision": 16, "scale": 2})
+        self.assertEqual(number(Decimal("7"), decimal, {}), Decimal("7.00"))
+        self.assertEqual(str(number(Decimal("7"), money, {})), "7.00")
+        bigint = column({"name": "n", "type_name": "BIGINT"})
+        self.assertIs(type(number(Decimal("7"), bigint, {})), int)
+
+    def test_an_executor_types_the_fallback_from_the_descriptor(self):
+        options = {"transform_columns": '{"extra": "NVL(extra, 0)"}'}
+        connector = self.connector(_ProjectingBridge())
+        table = connector._table("app.orders", options)
+        fields = connector._transform_descriptor_fields(table)
+        self.assertEqual([column["name"] for column in fields["transform_columns"]], ["extra"])
+        path = os.path.join(self._shared_state.name, "orders.unl")
+        with open(path, "wb") as handle:
+            handle.write(b"3|c||\n")
+        partition = {
+            "kind": "unl_split",
+            "path": path,
+            "start_byte": 0,
+            "end_byte": os.path.getsize(path),
+            "gzip": False,
+            "columns": [
+                {"name": "id", "type_name": "INTEGER"},
+                {"name": "value", "type_name": "VARCHAR", "length": 20},
+                {"name": "extra", "type_name": "INTEGER"},
+            ],
+            "snapshot_lsn": 100,
+            "exposed_name": "app.orders",
+        }
+        rows = list(connector.read_partition("app.orders", partition, dict(options)))
+        self.assertEqual([(row["id"], row["extra"]) for row in rows], [(3, 0)])
+        self.assertIs(type(rows[0]["extra"]), int)
+
+    def test_a_transform_keeps_a_not_null_column_not_null_unless_it_can_null(self):
+        connector = self.keyed(_ProjectingBridge())
+        options = {"transform_columns": '{"id": "HASH(id)", "value": "SUBSTR(value, 2)"}'}
+        fields = {f.name: f for f in connector.get_table_schema("app.orders", options).fields}
+        self.assertFalse(fields["id"].nullable)
+        self.assertTrue(fields["value"].nullable)
+        parsed = informix_module._column_transforms(
+            {
+                "transform_columns": '{"a": "UPPER(MASK(a))", "b": "LOWER(SUBSTR(b, 3))", '
+                '"c": "NULLIFY(c)", "d": "ABS(NVL(d, 1))"}'
+            }
+        )
+        operands = {name: operand for name, _, operand in parsed}
+        may_null = informix_module._transform_may_null
+        self.assertEqual([may_null(operands[name]) for name in "abcd"], [False, True, True, False])
 
     def test_renames_follow_and_filters_see_source_values(self):
         options = {

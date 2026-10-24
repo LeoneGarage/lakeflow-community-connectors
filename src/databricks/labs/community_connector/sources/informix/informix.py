@@ -3773,6 +3773,14 @@ _PRIMARY_KEYS_OPTION = "primary.keys"
 # source but NULL in the target) or while an incremental copy is still in progress (its
 # stored chunk position is laid out by the old key).
 #
+# A dropped column leaves the key the same way: the check accepts the old key
+# minus exactly the dropped columns. Informix returns records logged before the ALTER
+# without the column, and the target keeps it as an ordinary column, so changes match by
+# the shorter key (probe-verified: AUTO CDC accepts a key that shrinks between updates).
+# Only the first read of a new update may shrink it -- a running update still merges on
+# the key it started with -- and never in the same step as a growth. Rows that differed
+# only in the dropped column become one key, like exact duplicates.
+#
 # Nullable columns join the key like any other. On the keyed CDC path a delete carries a
 # NULL key value through, and the pipeline's AUTO CDC delete flow matches it (see
 # _shape_delete), so updates and deletes of a row holding NULL apply normally -- under a
@@ -4191,7 +4199,7 @@ def _apply_column_transforms(
                 "expression may only read the column it replaces"
             )
         _expression_kind(operand, columns, option, table.exposed_name, filtering=False)
-        uses_hash = uses_hash or "HASH(" in canonical
+        uses_hash = uses_hash or "HASH" in _operand_functions(operand)
         if name in table.primary_keys and canonical != f"HASH({name})":
             raise InformixError(
                 f"Option '{option}' may only HASH key column {name}: any other change could "
@@ -4217,10 +4225,11 @@ def _transform_spark_type(operand: str | tuple, column: "Column", options: dict[
     if isinstance(operand, str):
         return _spark_type(column, options)
     name = operand[1]
+    if name in _INTEGER_RESULT_FUNCTIONS:
+        # Before the string functions: LENGTH and CHAR_LENGTH read a string, give an int.
+        return IntegerType()
     if name in ("HASH", "MASK") or name in _STRING_FUNCTION_NAMES:
         return StringType()
-    if name in _INTEGER_RESULT_FUNCTIONS:
-        return IntegerType()
     inner = _transform_spark_type(operand[2][0], column, options)
     if name == "ROUND" and isinstance(inner, DecimalType):
         # Rounding up can carry into one more integer digit (999.99 to 1000).
@@ -4384,7 +4393,11 @@ def _expression_column(operand: str | tuple) -> str:
 
 
 def _expression_kind(
-    operand: str | tuple, columns: dict[str, "Column"], option: str, table_name: str, *,
+    operand: str | tuple,
+    columns: dict[str, "Column"],
+    option: str,
+    table_name: str,
+    *,
     filtering: bool,
 ) -> str:
     # Docstring: The kind ``operand`` evaluates to, failing on anything ill-typed.
@@ -4429,6 +4442,19 @@ def _expression_kind(
         if literal[0] != expected:
             raise InformixError(
                 f"Option '{option}' gives {name} a {literal[0]} where it takes a {expected}"
+            )
+    if name in ("NVL", "COALESCE") and not filtering and kind == "number":
+        # A transform's fallback lands in the column's own type (see _fallback_value), so
+        # an integer column, or an integer-result function, takes a whole number only.
+        column = columns[_expression_column(operand)]
+        integral = column.type_name in _INTEGER_RANKS or any(
+            inner in _INTEGER_RESULT_FUNCTIONS for inner in _operand_functions(arguments[0])
+        )
+        fallback = literals[0][1]
+        if integral and fallback != fallback.to_integral_value():
+            raise InformixError(
+                f"Option '{option}' gives {name} the fallback {fallback} for {column.name}, "
+                "which holds whole numbers only"
             )
     _check_function_literals(name, [literal[1] for literal in literals], option)
     return kind if result == "same" else result
@@ -4509,9 +4535,31 @@ def _hash_text(value: Any) -> str:
         return value.isoformat()
     if isinstance(value, (bytes, bytearray)):
         return bytes(value).hex()
-    if isinstance(value, float):
-        return repr(value)
+    if isinstance(value, (int, float, Decimal)):
+        return _hash_number_text(value)
     return str(value)
+
+
+def _hash_number_text(value: int | float | Decimal) -> str:
+    # Docstring: One text per numeric value, whichever Python type carries it: 5, 5.0, and
+    # Decimal("5.00") all give "5". A key then keeps its digest when its column widens
+    # (INTEGER to DECIMAL or FLOAT, which the stream adopts without a full refresh), and a
+    # variable-scale DECIMAL hashes the same from a file ("1.5") and the change stream
+    # ("1.50").
+
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            return repr(value)
+        value = Decimal(repr(value))
+    elif isinstance(value, int):
+        return str(value)
+    if not value.is_finite():
+        return str(value)
+    if not value:
+        return "0"
+    with localcontext() as context:
+        context.prec = 80
+        return format(value.normalize(), "f")
 
 
 def _apply_function(name: str, value: Any, literals: list, context: dict) -> Any:
@@ -4530,9 +4578,7 @@ def _apply_function(name: str, value: Any, literals: list, context: dict) -> Any
     if name == "HASH":
         key = context.get("hash_key")
         if not key:
-            raise InformixError(
-                f"HASH needs the connection option '{_TRANSFORM_HASH_KEY_OPTION}'"
-            )
+            raise InformixError(f"HASH needs the connection option '{_TRANSFORM_HASH_KEY_OPTION}'")
         return hmac.new(key, _hash_text(value).encode("utf-8"), hashlib.sha256).hexdigest()
     if name in _STRING_FUNCTION_NAMES:
         text = str(value)
@@ -4595,8 +4641,20 @@ def _apply_function(name: str, value: Any, literals: list, context: dict) -> Any
 
 
 _STRING_FUNCTION_NAMES = frozenset(
-    {"UPPER", "LOWER", "TRIM", "LTRIM", "RTRIM", "LENGTH", "CHAR_LENGTH", "SUBSTR", "REPLACE",
-     "LPAD", "RPAD", "MASK"}
+    {
+        "UPPER",
+        "LOWER",
+        "TRIM",
+        "LTRIM",
+        "RTRIM",
+        "LENGTH",
+        "CHAR_LENGTH",
+        "SUBSTR",
+        "REPLACE",
+        "LPAD",
+        "RPAD",
+        "MASK",
+    }
 )
 
 
@@ -4609,17 +4667,69 @@ def _expression_value(operand: str | tuple, row: dict, context: dict) -> Any:
         value = row.get(operand)
         width = context.get("pad", {}).get(operand)
         if width and value is not None:
-            value = str(value).ljust(width)
+            value = _pad_char(str(value), width, context.get("encoding", "latin-1"))
         return value
     _, name, arguments = operand
     value = _expression_value(arguments[0], row, context)
     literals = [literal[1] for literal in arguments[1:]]
-    if name in ("NVL", "COALESCE") and value is None and isinstance(arguments[0], str):
-        # The fallback takes the column's type: a CHAR column pads it to its width.
-        width = context.get("pad", {}).get(arguments[0])
-        if width and isinstance(literals[0], str):
-            return literals[0].ljust(width)
+    if name in ("NVL", "COALESCE") and value is None:
+        return _fallback_value(literals[0], arguments[0], context)
     return _apply_function(name, value, literals, context)
+
+
+def _pad_char(text: str, width: int, encoding: str) -> str:
+    # Docstring: ``text`` blank-padded as Informix stores a CHAR: to ``width`` bytes of the
+    # database code set, so a multibyte character takes more than one of them.
+
+    missing = width - len(text.encode(encoding, "replace"))
+    return text + " " * missing if missing > 0 else text
+
+
+def _fallback_value(literal: Any, operand: str | tuple, context: dict) -> Any:
+    # Docstring: NVL/COALESCE's fallback in the representation of what it stands in for.
+    #
+    # In a filter a CHAR column's fallback is padded to the column's width, as Informix
+    # pads it. In a transform a number literal, parsed as a Decimal, becomes the Python
+    # type the operand's other values have -- an int for an integer column or an
+    # integer-result function, a Decimal at the column's scale, or the configured
+    # variable-scale form -- so every row of a transformed column carries one type.
+    # ``context["columns"]`` supplies the columns, on demand when it is callable.
+
+    if isinstance(literal, str):
+        if isinstance(operand, str):
+            width = context.get("pad", {}).get(operand)
+            if width:
+                return _pad_char(literal, width, context.get("encoding", "latin-1"))
+        return literal
+    if not isinstance(literal, Decimal):
+        return literal
+    if any(name in _INTEGER_RESULT_FUNCTIONS for name in _operand_functions(operand)):
+        return int(literal)
+    columns = context.get("columns")
+    if callable(columns):
+        columns = context["columns"] = {column.name: column for column in columns()}
+    column = (columns or {}).get(_expression_column(operand))
+    if column is None:
+        return literal
+    return _number_for_column(literal, column, context.get("options") or {})
+
+
+def _number_for_column(value: Decimal, column: "Column", options: dict[str, str]) -> Any:
+    # Docstring: ``value`` as the Python number ``column``'s decoded values are.
+
+    if column.type_name in _INTEGER_RANKS:
+        return int(value)
+    if column.type_name in {"DECIMAL", "NUMERIC", "MONEY"}:
+        if _is_variable_scale_decimal(column):
+            return _coerce_variable_decimal_value(
+                value, column, _variable_decimal_target(column, options)
+            )
+        if column.scale is not None:
+            scale = column.scale
+        else:
+            scale = 2 if column.type_name == "MONEY" else 0
+        return value.quantize(Decimal(1).scaleb(-scale))
+    return value
 
 
 class _RowFilterParser:
@@ -4997,6 +5107,24 @@ def _operand_literals(operand: str | tuple):
     while not isinstance(operand, str):
         yield from operand[2][1:]
         operand = operand[2][0]
+
+
+def _operand_functions(operand: str | tuple) -> list[str]:
+    # Docstring: The functions an operand applies, outermost first.
+
+    names = []
+    while not isinstance(operand, str):
+        names.append(operand[1])
+        operand = operand[2][0]
+    return names
+
+
+def _transform_may_null(operand: str | tuple) -> bool:
+    # Docstring: Whether a transform can turn a non-NULL value into NULL: NULLIFY always does
+    # and SUBSTR does past the end of the string. Every other function keeps a value, so a
+    # NOT NULL column stays NOT NULL through HASH, MASK, UPPER, ABS, and the rest.
+
+    return any(name in ("NULLIFY", "SUBSTR") for name in _operand_functions(operand))
 
 
 def _apply_row_filter(table: Table, text: str | None) -> Table:
@@ -5965,10 +6093,19 @@ class _SharedCdcShard:
         now = time.monotonic()
         for identity in list(self.subscribers):
             if now - self.subscribers[identity]["last_seen"] > self.subscriber_ttl:
-                del self.subscribers[identity]
-                for store in (self.buffers, self.cursors, self.schema, self.open_begins):
-                    store.pop(identity, None)
+                self._evict_locked(identity)
         return dict(self.subscribers)
+
+    def evict(self, identity):
+        # Docstring: Drop one subscriber and its state; it re-subscribes on its next poll.
+
+        with self.condition:
+            self._evict_locked(identity)
+
+    def _evict_locked(self, identity):
+        self.subscribers.pop(identity, None)
+        for store in (self.buffers, self.cursors, self.schema, self.open_begins):
+            store.pop(identity, None)
 
     def ingest(self, raw, schema_map, min_lsn, current_lsn, read_start):
         # Docstring: Assemble one read's records into transactions, fan them out per table, and
@@ -6097,6 +6234,34 @@ def _shared_cdc_shard(
         return shard
 
 
+def _shard_schema_map(bridge, identities) -> tuple[dict[str, Table], list[str]]:
+    # Docstring: Re-read each subscriber's catalog table and carry its options, as
+    # _refresh_table_schema does, for one shard read: ``(identity -> table, unfit)``.
+    #
+    # Without the carry an overridden table's fingerprint never matches its checkpoint, so
+    # it would always fall back to a direct read and never benefit from sharding -- and
+    # its PK-change detection would use the wrong keys. A table whose options no longer
+    # fit its catalog (a selected, renamed, or transformed column gone, a carried key
+    # column dropped) is listed as unfit instead of failing the whole read: its own direct
+    # read reports the error, and the shard keeps serving the others.
+
+    schema_map: dict[str, Table] = {}
+    unfit: list[str] = []
+    for identity, table in identities:
+        fresh = Table.parse(bridge.get_table(table.identity), table.database)
+        try:
+            schema_map[identity] = _carry_table_options(fresh, table)
+        except (InformixError, ValueError):
+            logging.getLogger(__name__).warning(
+                "Shared CDC shard leaves %s to direct reads: its table options no longer fit "
+                "the catalog",
+                identity,
+                exc_info=True,
+            )
+            unfit.append(identity)
+    return schema_map, unfit
+
+
 def _close_shared_cdc_reader(reader) -> None:
     if reader is None:
         return
@@ -6122,7 +6287,6 @@ def _run_shared_cdc_shard(shard: _SharedCdcShard) -> None:
                     len(buf) >= shard.buffer_cap for buf in shard.buffers.values()
                 )
                 restart = shard.shared_restart
-                captures = [sub["capture"] for sub in subscribers.values()]
                 identities = [(identity, sub["table"]) for identity, sub in subscribers.items()]
             if not have_subscribers or throttled or restart is None or shard.reader_factory is None:
                 _close_shared_cdc_reader(reader)
@@ -6133,16 +6297,18 @@ def _run_shared_cdc_shard(shard: _SharedCdcShard) -> None:
             if reader is None:
                 reader = shard.reader_factory()
             try:
-                schema_map = {}
-                for identity, table in identities:
-                    fresh = Table.parse(reader._bridge.get_table(table.identity), table.database)
-                    # Preserve the subscriber's table options (column selection, key
-                    # override or promotion, row_filter, and so its fingerprint) on the
-                    # daemon's schema, exactly as _refresh_table_schema does. Without this
-                    # an overridden table's fingerprint never matches its checkpoint, so it
-                    # would always fall back to a direct read and never benefit from
-                    # sharding -- and its PK-change detection would use the wrong keys.
-                    schema_map[identity] = _carry_table_options(fresh, table)
+                schema_map, unfit = _shard_schema_map(reader._bridge, identities)
+                for identity in unfit:
+                    # Its consumer falls back to a direct read, which reports the error;
+                    # evicting it keeps its floor from pinning the shared restart.
+                    shard.evict(identity)
+                if not schema_map:
+                    _close_shared_cdc_reader(reader)
+                    reader = None
+                    with shard.condition:
+                        shard.condition.wait(timeout=_SHARED_CDC_IDLE_POLL_SECONDS)
+                    continue
+                captures = [subscribers[identity]["capture"] for identity in schema_map]
                 min_lsn = reader._bridge.minimum_lsn()
                 current_lsn = reader._bridge.current_lsn()
                 raw = reader._read_changes_with_reconnect(
@@ -6150,7 +6316,7 @@ def _run_shared_cdc_shard(shard: _SharedCdcShard) -> None:
                     restart,
                     shard.timeout_seconds,
                     shard.max_records,
-                    table=identities[0][1],
+                    table=subscribers[next(iter(schema_map))]["table"],
                 )
                 caught_up = shard.ingest(raw, schema_map, min_lsn, current_lsn, restart)
             except Exception:  # noqa: BLE001 - surfaced by degrading to direct reads
@@ -6951,7 +7117,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     _transform_spark_type(transforms[column.name], column, table_options)
                     if column.name in transforms
                     else _spark_type(column, table_options),
-                    column.nullable or column.name in transforms,
+                    column.nullable
+                    or (column.name in transforms and _transform_may_null(transforms[column.name])),
                 )
                 for column in table.columns
             ]
@@ -7090,7 +7257,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         self, table_name: str, start_offset: dict, table_options: dict[str, str]
     ) -> tuple[Iterator[dict], dict]:
         rows, offset = self._read_upserts(table_name, start_offset, table_options)
-        return self._output_rows(rows, table_options), offset
+
+        def columns():
+            return self._table(table_name, table_options).columns
+
+        return self._output_rows(rows, table_options, columns), offset
 
     def _read_upserts(
         self, table_name: str, start_offset: dict, table_options: dict[str, str]
@@ -7636,7 +7807,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                         stop_record=end_record if end_split == start_split else None,
                     )
                     encoded = self._encode_embedded_rows(rows)
-                return [{"kind": "embedded", "rows": encoded}]
+                return [self._embedded_descriptor(table, encoded)]
             # The window is whatever latest_offset logged: up to pages-per-batch splits,
             # ending early before a gzip split that is served in record windows.
             return self._unl_split_descriptors(
@@ -7658,6 +7829,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     "schema_id": schema_id,
                     "snapshot_lsn": snapshot_lsn,
                     "page_index": page_index,
+                    **self._transform_descriptor_fields(table),
                 }
                 for page_index in range(start_page, end_page)
             ]
@@ -7676,7 +7848,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 table_name, start_offset or {}, end_offset or {}, table_options
             )
             encoded = self._encode_embedded_rows(rows)
-        return [{"kind": "embedded", "rows": encoded}]
+        return [self._embedded_descriptor(table, encoded)]
 
     def _replay_embedded_range(
         self, table_name: str, start: dict, end: dict, table_options: dict[str, str]
@@ -7701,10 +7873,20 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         self, table_name: str, partition: dict, table_options: dict[str, str]
     ) -> Iterator[dict]:
         rows = self._read_partition_rows(partition, table_options)
-        return self._output_rows(rows, table_options)
+        return self._output_rows(rows, table_options, lambda: _descriptor_columns(partition))
 
-    def _output_rows(self, rows: Iterator[dict], table_options: dict[str, str]) -> Iterator[dict]:
+    def _output_rows(
+        self,
+        rows: Iterator[dict],
+        table_options: dict[str, str],
+        columns: Callable[[], Iterable[Column]] | None = None,
+    ) -> Iterator[dict]:
         # Docstring: Rows as they leave the connector: transformed, then renamed.
+        #
+        # ``columns`` yields the table's columns on demand. A transform needs them only when
+        # NVL or COALESCE replaces a NULL in a numeric column (see _fallback_value), so the
+        # lookup -- the reader's cached table, or descriptor metadata on an executor -- waits
+        # until then.
 
         transforms = _column_transforms(table_options)
         if transforms:
@@ -7713,10 +7895,36 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             )
             context = {
                 "hash_key": key.encode("utf-8") if key else None,
-                "encoding": _database_encoding({**self.options, **table_options}),
+                "encoding": self._source_encoding(table_options),
+                "columns": columns,
+                "options": {**self.options, **table_options},
             }
             rows = _transformed_rows(rows, transforms, context)
         return _renamed_rows(rows, _column_renames(table_options))
+
+    def _source_encoding(self, table_options: dict[str, str]) -> str:
+        # Docstring: The database code set's Python encoding for a table: the connection's
+        # DB_LOCALE, which a table option may override. LENGTH counts bytes in it and a CHAR
+        # operand is re-padded to its byte width, on the snapshot, file, and CDC paths alike.
+
+        return _database_encoding({**self.options, **table_options})
+
+    @staticmethod
+    def _transform_descriptor_fields(table: Table) -> dict[str, Any]:
+        # Docstring: Column metadata a partition descriptor carries so an executor can type a
+        # transform's NVL fallback (see _fallback_value) without a catalog connection.
+
+        if not table.column_transforms:
+            return {}
+        transformed = {name for name, _ in table.column_transforms}
+        return {
+            "transform_columns": [
+                _partition_column(column) for column in table.columns if column.name in transformed
+            ]
+        }
+
+    def _embedded_descriptor(self, table: Table, encoded) -> dict[str, Any]:
+        return {"kind": "embedded", "rows": encoded, **self._transform_descriptor_fields(table)}
 
     def _read_partition_rows(
         self, partition: dict, table_options: dict[str, str]
@@ -7752,7 +7960,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         self, table_name: str, start_offset: dict, table_options: dict[str, str]
     ) -> tuple[Iterator[dict], dict]:
         rows, offset = self._read_deletes(table_name, start_offset, table_options)
-        return self._output_rows(rows, table_options), offset
+
+        def columns():
+            return self._table(table_name, table_options).columns
+
+        return self._output_rows(rows, table_options, columns), offset
 
     def _read_deletes(
         self, table_name: str, start_offset: dict, table_options: dict[str, str]
@@ -11642,6 +11854,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         commit_time = self._resolve_unl_commit_time(
             self._table_snapshot_source(table_options) or ""
         )
+        predicate = _row_filter_predicate(table, self._source_encoding(table_options))
         shaped = (
             _shape_unl_record(
                 raw,
@@ -11652,6 +11865,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 delimiter=delimiter,
                 escape=escape,
                 commit_time=commit_time,
+                predicate=predicate,
             )
             for raw in raw_records
         )
@@ -11675,6 +11889,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         delimiter, escape = self._unl_field_format(options)
         escape_byte = _unl_escape_byte(escape, encoding)
         commit_time = self._resolve_unl_commit_time(source)
+        predicate = _row_filter_predicate(table, self._source_encoding(options))
         for path in files:
             size = os.path.getsize(path)
             read_chunk = self._unl_read_chunk(path)
@@ -11692,6 +11907,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     delimiter=delimiter,
                     escape=escape,
                     commit_time=commit_time,
+                    predicate=predicate,
                 )
                 if row is not None:
                     yield row
@@ -11738,6 +11954,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # `r` rows share the extract's one commit time; None -> NULL commit time.
         raw_commit_time = partition.get("commit_time")
         commit_time = None if raw_commit_time is None else int(raw_commit_time)
+        # The filter counts LENGTH in the connection's DB_LOCALE here as on the driver; the
+        # connection options travel with the pickled connector, the catalog does not.
+        predicate = _row_filter_predicate(table, self._source_encoding(table_options))
         read_chunk = _unl_split_read_chunk(partition)
         start = int(partition["start_byte"])
         end = int(partition["end_byte"])
@@ -11757,6 +11976,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 delimiter=delimiter,
                 escape=escape,
                 commit_time=commit_time,
+                predicate=predicate,
             )
             if row is not None:
                 yield row
@@ -11818,17 +12038,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
 
         all_splits = self._unl_all_splits(table, table_options)
         end_split = min(start_split + window, len(all_splits))
-        columns = [
-            {
-                "name": column.name,
-                "type_name": column.type_name,
-                "nullable": column.nullable,
-                "length": column.length,
-                "precision": column.precision,
-                "scale": column.scale,
-            }
-            for column in table.catalog_columns or table.columns
-        ]
+        columns = [_partition_column(column) for column in table.catalog_columns or table.columns]
         files_api = self._staging_transport()
         token = files_api._credential.bearer() if files_api is not None else None
         host = files_api._host if files_api is not None else None
@@ -12446,6 +12656,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 # offset, laid out by the old key, so a wildcard key may only grow once
                 # the copy has finished and dropped that block.
                 allow_key_extension=not isinstance(checkpoint.get("incremental"), dict),
+                # Every offset records the update that wrote it, so a checkpoint from an
+                # earlier update marks this update's first read: the destination's merge
+                # key was read at its start and already reflects a dropped column.
+                new_update=checkpoint.get("pipeline_scope") != pipeline_scope,
             )
             # Informix capture registration is a projection, not a raw decoder
             # tied to the catalog layout at ``start_lsn``.  For an appended
@@ -12587,7 +12801,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 crossed_trigger_boundary = True
                 break
             projected = _project_transaction(
-                tx, table, deletes, tombstones=tombstones, encoding=_database_encoding(self.options)
+                tx, table, deletes, tombstones=tombstones, encoding=self._source_encoding(options)
             )
             projected = [_coerce_variable_decimal_values(row, table, options) for row in projected]
             # Never split a transaction.  A single large transaction is
@@ -12890,9 +13104,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         *,
         owner: bool,
         allow_key_extension: bool = False,
+        new_update: bool = False,
     ) -> tuple[Table, Table, int, str]:
-        # A wildcard key may grow by the appended columns (see _PRIMARY_KEYS_WILDCARD).
+        # A wildcard key may grow by the appended columns, and on the first read of a new
+        # update shrink by the dropped ones (see _PRIMARY_KEYS_WILDCARD).
         extend_key = allow_key_extension and table.key_wildcard
+        shrink_key = extend_key and new_update
         namespace = self._immutable_namespace(table, "schemas", checkpoint_schema_id)
         deadline = time.monotonic() + int(
             self.options.get("cdc.shared.state.wait.seconds", str(_SHARED_STATE_WAIT_SECONDS))
@@ -12916,12 +13133,18 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     f"Immutable schema node identity mismatch for '{table.exposed_name}'"
                 )
             previous_table = _table_from_schema_state(previous, table.database)
-            _ensure_compatible_schema_change(previous_table, table, extend_wildcard_key=extend_key)
+            _ensure_compatible_schema_change(
+                previous_table,
+                table,
+                extend_wildcard_key=extend_key,
+                shrink_wildcard_key=shrink_key,
+            )
             transition_record = self._read_immutable_head(namespace)
             if transition_record is None and owner:
-                if previous_table.primary_keys != table.primary_keys:
+                if set(table.primary_keys) - set(previous_table.primary_keys):
                     # The key grew: only safe when existing rows really hold NULL in the
-                    # new columns at the source, as they will in the target.
+                    # new columns at the source, as they will in the target. A key that
+                    # shrank needs no check: the dropped columns simply leave it.
                     self._ensure_added_key_columns_have_no_default(previous_table, table)
                 transition = self._bridge.current_lsn()
                 if transition < checkpoint_lsn:
@@ -12969,11 +13192,17 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                         f"Invalid immutable schema identity for '{table.exposed_name}'"
                     )
                 _ensure_compatible_schema_change(
-                    previous_table, target_table, extend_wildcard_key=extend_key
+                    previous_table,
+                    target_table,
+                    extend_wildcard_key=extend_key,
+                    shrink_wildcard_key=shrink_key,
                 )
                 if _schema_fingerprint(target_table) != _schema_fingerprint(table):
                     _ensure_compatible_schema_change(
-                        target_table, table, extend_wildcard_key=extend_key
+                        target_table,
+                        table,
+                        extend_wildcard_key=extend_key,
+                        shrink_wildcard_key=shrink_key,
                     )
                 schema_winner = self._publish_immutable_head(
                     self._immutable_namespace(table, "schema-nodes", str(current["id"])),
@@ -13016,7 +13245,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # Existing rows would carry the default in their before-images at the source while
         # the target holds NULL for them, so their updates and deletes would never match.
 
-        added = [column.name for column in current.columns[len(previous.columns) :]]
+        known = {column.name for column in previous.columns}
+        added = [column.name for column in current.columns if column.name not in known]
         lookup = getattr(self._bridge, "column_defaults", None)
         if not callable(lookup):
             raise InformixError(
@@ -14472,9 +14702,7 @@ def _recover(
 def _database_encoding(options: dict[str, str]) -> str:
     # Docstring: The database code set's Python encoding: what LENGTH counts bytes in.
 
-    locale = (
-        options.get("db_locale") or options.get("DB_LOCALE") or options.get("db.locale")
-    )
+    locale = options.get("db_locale") or options.get("DB_LOCALE") or options.get("db.locale")
     return informix_locale_encoding(locale or "en_US.819")
 
 
@@ -15143,6 +15371,26 @@ def _unl_split_read_chunk(partition: dict) -> Callable[[int, int], bytes]:
     return local
 
 
+def _partition_column(column: Column) -> dict[str, Any]:
+    # Docstring: A column as a partition descriptor carries it; Column.parse reads it back.
+
+    return {
+        "name": column.name,
+        "type_name": column.type_name,
+        "nullable": column.nullable,
+        "length": column.length,
+        "precision": column.precision,
+        "scale": column.scale,
+    }
+
+
+def _descriptor_columns(partition: dict) -> tuple[Column, ...]:
+    # Docstring: The columns a partition descriptor carries for shaping rows on an executor.
+
+    raw = partition.get("transform_columns") or partition.get("columns") or ()
+    return tuple(Column.parse(column) for column in raw)
+
+
 def _shape_unl_record(
     raw: bytes,
     table: Table,
@@ -15154,6 +15402,7 @@ def _shape_unl_record(
     delimiter: str = _UNL_DEFAULT_DELIMITER,
     escape: str = _UNL_DEFAULT_ESCAPE,
     commit_time: int | None = None,
+    predicate: tuple | None = None,
 ) -> dict[str, Any] | None:
     # Docstring: Parse, type-convert, and shape one UNLOAD / HPL DELIMITED record -- shared by both
     # serve paths.
@@ -15167,7 +15416,8 @@ def _shape_unl_record(
     #
     # An extract holds every catalog column, so fields are matched positionally against
     # ``catalog_columns`` under a column selection and only the selected ones converted.
-    # Returns None for a record the table's row_filter drops.
+    # ``predicate`` is the table's row_filter from :func:`_row_filter_predicate`, built once
+    # per extract by the caller; a record it drops returns None.
 
     fields = _parse_unload_fields(
         raw.decode(encoding, "strict"), delimiter=delimiter, escape=escape
@@ -15184,7 +15434,6 @@ def _shape_unl_record(
         column.name: _unload_value(fields[position[column.name]], column.type_name)
         for column in table.columns
     }
-    predicate = _row_filter_predicate(table, _database_encoding(options))
     if predicate is not None and not _row_filter_matches(predicate, row):
         return None
     return _shape_snapshot(row, snapshot_lsn, table, options, commit_time=commit_time)
@@ -15703,11 +15952,28 @@ def _carry_table_options(fresh: Table, previous: Table) -> Table:
             key_descending=previous.key_descending,
             key_from_nullable_index=True,
         )
+    _ensure_key_columns_exist(fresh)
     _ensure_selected_keys(fresh)
     fresh = _apply_row_filter(fresh, previous.row_filter)
     fresh = _apply_column_renames(fresh, previous.column_renames)
     carried = _recorded_transforms(previous.column_transforms)
     return _apply_column_transforms(fresh, carried, None, key_id=previous.transform_key_id)
+
+
+def _ensure_key_columns_exist(table: Table) -> None:
+    # Docstring: Fail when a carried key names a column the catalog no longer has.
+    #
+    # A primary.keys override or a nullable-index promotion is carried as listed, so a
+    # key column dropped at the source would otherwise outlive the refresh and every row
+    # would then key on NULL.
+
+    known = {column.name for column in table.columns}
+    missing = [key for key in table.primary_keys if key not in known]
+    if missing:
+        raise InformixError(
+            f"Key column(s) {', '.join(missing)} of '{table.exposed_name}' no longer exist at "
+            "the source; run a full refresh"
+        )
 
 
 def _carry_key_override(fresh: Table, overridden: Table) -> Table:
@@ -15809,7 +16075,11 @@ def _widened(previous: Column, current: Column) -> bool:
 
 
 def _ensure_compatible_schema_change(
-    previous: Table, current: Table, *, extend_wildcard_key: bool = False
+    previous: Table,
+    current: Table,
+    *,
+    extend_wildcard_key: bool = False,
+    shrink_wildcard_key: bool = False,
 ) -> None:
     # Docstring: Fail closed unless the stream can adopt ``current`` without a full refresh.
     #
@@ -15818,18 +16088,22 @@ def _ensure_compatible_schema_change(
     # - widening a column so every old value still fits (see :func:`_widened`); a numeric
     #   widening also widens the Spark type, which the destination adopts in place when
     #   the pipeline enables type widening, and otherwise fails that update loudly;
-    # - dropping a nullable, non-key column -- the connector stops reporting it, and the
-    #   destination keeps it: an SCD1 row updated afterwards keeps its last value there,
-    #   while rows inserted and SCD2 versions written afterwards hold NULL;
+    # - dropping a non-key column, NOT NULL or not -- the connector stops reporting it, and
+    #   the destination keeps it: an SCD1 row updated afterwards keeps its last value there,
+    #   while rows inserted and SCD2 versions written afterwards hold NULL. AUTO CDC creates
+    #   every target column nullable, even from a NOT NULL source, so NULL always fits;
     # - appending nullable, CDC-supported columns after every surviving one.
     #
-    # Anything else -- reordering, another type change, a NOT NULL or key column dropped
-    # or added -- fails closed, and so does changing include_columns / exclude_columns or
-    # row_filter: rows already landed were selected under the old setting, and the new
-    # one cannot be applied to them without a re-read. The one selection edit accepted is
-    # taking out a name whose column no longer exists. The key must be unchanged, except
-    # that with ``extend_wildcard_key`` a whole-row key may grow by exactly the appended
-    # columns (and nothing dropped).
+    # Anything else -- reordering, another type change, a key column dropped, a NOT NULL
+    # or key column added -- fails closed, and so does changing include_columns /
+    # exclude_columns or row_filter: rows already landed were selected under the old
+    # setting, and the new one cannot be applied to them without a re-read. The one
+    # selection edit accepted is taking out a name whose column no longer exists. The key
+    # must be unchanged, except that with ``extend_wildcard_key`` a whole-row key may grow
+    # by exactly the appended columns (and nothing dropped), and with ``shrink_wildcard_key``
+    # as well -- the first read of a new update -- shrink by exactly the dropped columns
+    # (and nothing appended). A running update keeps merging on the key it started with,
+    # so a shorter key mid-update fails until the pipeline restarts with it.
 
     name = current.exposed_name
     current_names = {column.name for column in current.columns}
@@ -15837,16 +16111,28 @@ def _ensure_compatible_schema_change(
     dropped = [column for column in previous.columns if column.name not in current_names]
     additions = current.columns[len(survivors) :]
     keys_match = previous.primary_keys == current.primary_keys
-    if not keys_match and extend_wildcard_key:
+    shrunk = False
+    whole_row = previous.primary_keys == tuple(column.name for column in previous.columns)
+    if not keys_match and extend_wildcard_key and whole_row:
         added = tuple(column.name for column in additions)
-        keys_match = (
-            bool(added)
-            and not dropped
-            and (
-                previous.primary_keys == tuple(column.name for column in previous.columns)
-                and current.primary_keys == previous.primary_keys + added
-            )
-        )
+        removed = {column.name for column in dropped}
+        if added and not dropped:
+            keys_match = current.primary_keys == previous.primary_keys + added
+        elif (
+            dropped
+            and not added
+            and current.primary_keys
+            == tuple(key for key in previous.primary_keys if key not in removed)
+        ):
+            if not shrink_wildcard_key:
+                raise InformixError(
+                    f"Informix schema change for '{name}' dropped "
+                    f"{', '.join(column.name for column in dropped)} from its "
+                    f"{_PRIMARY_KEYS_OPTION}='{_PRIMARY_KEYS_WILDCARD}' key during a running "
+                    "update; stop and restart the pipeline so the destination merges on the "
+                    "shorter key"
+                )
+            keys_match = shrunk = True
     if not keys_match or (
         previous.database,
         previous.owner,
@@ -15881,9 +16167,14 @@ def _ensure_compatible_schema_change(
             "column; run a full refresh"
         )
     for column in dropped:
-        if not column.nullable:
+        if not shrunk and (
+            column.name in previous.primary_keys or column.name in current.primary_keys
+        ):
+            # Whatever its nullability: a primary.keys override or a nullable-index key can
+            # name a nullable column, and every row would then key on NULL. A whole-row
+            # key that shrank above no longer names the column.
             raise InformixError(
-                f"Informix schema change for '{name}' dropped NOT NULL column {column.name}; "
+                f"Informix schema change for '{name}' dropped key column {column.name}; "
                 "run a full refresh"
             )
     if previous.column_selection != current.column_selection and not _selection_cleanup_only(
