@@ -455,6 +455,17 @@ _LIVE_INTERVALS = (
     (0x0100, "c607", "7"),  # YEAR(1) TO YEAR
     (0x0100, "395d", "-7"),
     (0x0602, "80000000", "0-00"),
+    (0x01CB, "c032", ".5"),  # FRACTION TO FRACTION(1)
+    (0x01CB, "3f32", "-.5"),
+    (0x01CB, "8000", ".0"),
+    (0x03CD, "c0013c", ".016"),  # FRACTION TO FRACTION(3)
+    (0x03CD, "3f6228", "-.016"),
+    (0x03CD, "c00100", ".010"),
+    (0x03CD, "000000", None),
+    (0x05CF, "c0011728", ".01234"),  # FRACTION TO FRACTION(5)
+    (0x05CF, "3f624c3c", "-.01234"),
+    (0x05CF, "c063635a", ".99999"),
+    (0x05CF, "80000000", ".00000"),
     (0x0C4D, "8000000000000000", "0 00:00:00.000"),
     (0x0602, "00000000", None),
     (0x144F, "000000000000000000000000", None),
@@ -480,10 +491,12 @@ class IntervalTests(unittest.TestCase):
         self.assertEqual(interval_layout(0x0C4D), ((4, 6, 8, 10), 3, 3))
         self.assertEqual(interval_layout(0x0602), ((0, 2), 4, 0))
         self.assertEqual(interval_layout(0x0100), ((0,), 1, 0))
-        for qualifier in (0x0624, 0x03BD, 0x0202, 0x0C02, 0x0420, 0x0642):
-            # MONTH TO DAY mixes classes; a FRACTION start (FRACTION TO FRACTION(n)) is
-            # valid but not decoded; too few digits for YEAR TO MONTH; a ten-digit leading
-            # field; MONTH TO YEAR and DAY TO MONTH run backwards.
+        self.assertEqual(interval_layout(0x01CB), ((), 0, 1))  # FRACTION TO FRACTION(1)
+        self.assertEqual(interval_layout(0x05CF), ((), 0, 5))
+        for qualifier in (0x0624, 0x03BD, 0x02CB, 0x01CA, 0x0202, 0x0C02, 0x0420, 0x0642):
+            # MONTH TO DAY mixes classes; FRACTION never starts at code 11; FRACTION TO
+            # FRACTION(1) with two digits, or ending at SECOND; too few digits for YEAR TO
+            # MONTH; a ten-digit leading field; MONTH TO YEAR and DAY TO MONTH run backwards.
             with self.subTest(hex(qualifier)):
                 self.assertIsNone(interval_layout(qualifier))
         with self.assertRaises(CdcProtocolError):
@@ -495,6 +508,7 @@ class IntervalTests(unittest.TestCase):
             (0x0602, "c6010c00", "field 2 holds 12"),  # YEAR TO MONTH, month 12
             (0x0468, "c20a1e", "below its last field"),  # seconds in HOUR TO MINUTE
             (0x0346, "c50100", "exceeds 1 digits"),  # DAY(1) TO HOUR, 100 days
+            (0x03CD, "c1013c", "above its fraction"),  # FRACTION TO FRACTION(3), 1.016
         ):
             with self.subTest(packed):
                 raw = bytes.fromhex(packed)

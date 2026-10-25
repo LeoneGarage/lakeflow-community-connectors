@@ -1173,13 +1173,14 @@ def register_lakeflow_source(spark):
         #
         # ``qualifier`` is the syscolumns.collength layout, which SQLI result descriptors
         # carry too: total digits in the high byte, then the start and end field codes in
-        # the low byte's nibbles (``DAY(3) TO SECOND`` is 0x094a). Returns None for a
-        # qualifier no INTERVAL can have, such as one mixing YEAR-MONTH and DAY-TIME fields,
-        # and for ``FRACTION TO FRACTION(n)`` (start code 12), a valid qualifier whose text
-        # form has not been measured on a live server and so is not decoded; the catalog
-        # reports such a column as unsupported.
+        # the low byte's nibbles (``DAY(3) TO SECOND`` is 0x094a). ``FRACTION TO
+        # FRACTION(n)`` starts at code 12 whatever n is, so its end code 10 + n can sit below
+        # its start (0x01cb for n = 1); it has no fields, only the fraction. Returns None for
+        # a qualifier no INTERVAL can have, such as one mixing YEAR-MONTH and DAY-TIME fields.
 
         total, start, end = (qualifier >> 8) & 0xFF, (qualifier >> 4) & 0xF, qualifier & 0xF
+        if start == 12:
+            return ((), 0, end - 10) if 11 <= end <= 15 and total == end - 10 else None
         if start in (0, 2):
             if end not in (0, 2) or end < start:
                 return None
@@ -1204,8 +1205,9 @@ def register_lakeflow_source(spark):
         # ``YEAR TO MONTH`` holds 1-02 as 10200000000 (measured on Informix 14.10). The text
         # gives the first field without padding, the rest two digits each, and the fraction
         # at its declared width, with ``-`` before a negative interval -- Informix's own
-        # rendering, trimmed. Delta tables cannot store Spark's interval types, so this text
-        # is what lands.
+        # rendering, trimmed. ``FRACTION TO FRACTION(n)`` has no field before the point and
+        # renders as ``.016`` or ``-.016``. Delta tables cannot store Spark's interval types,
+        # so this text is what lands.
 
         layout = interval_layout(qualifier)
         if layout is None:
@@ -1219,18 +1221,23 @@ def register_lakeflow_source(spark):
             return None, size
         negative = value < 0
         magnitude = -value if negative else value
-        whole, below = divmod(int(magnitude), 10 ** (10 - fields[-1]))
-        if below:
-            raise CdcProtocolError(f"INTERVAL holds digits below its last field: {value}")
-        parts = []
-        for code in reversed(fields[1:]):
-            whole, part = divmod(whole, 100)
-            if part >= _INTERVAL_FIELD_LIMITS[code]:
-                raise CdcProtocolError(f"INTERVAL field {code} holds {part}")
-            parts.append(f"{_INTERVAL_SEPARATORS[code]}{part:02d}")
-        if whole >= 10**leading:
-            raise CdcProtocolError(f"INTERVAL leading field {whole} exceeds {leading} digits")
-        text = ("-" if negative and magnitude else "") + str(whole) + "".join(reversed(parts))
+        text = "-" if negative and magnitude else ""
+        if not fields:
+            if int(magnitude):
+                raise CdcProtocolError(f"INTERVAL holds digits above its fraction: {value}")
+        else:
+            whole, below = divmod(int(magnitude), 10 ** (10 - fields[-1]))
+            if below:
+                raise CdcProtocolError(f"INTERVAL holds digits below its last field: {value}")
+            parts = []
+            for code in reversed(fields[1:]):
+                whole, part = divmod(whole, 100)
+                if part >= _INTERVAL_FIELD_LIMITS[code]:
+                    raise CdcProtocolError(f"INTERVAL field {code} holds {part}")
+                parts.append(f"{_INTERVAL_SEPARATORS[code]}{part:02d}")
+            if whole >= 10**leading:
+                raise CdcProtocolError(f"INTERVAL leading field {whole} exceeds {leading} digits")
+            text += str(whole) + "".join(reversed(parts))
         if fraction:
             text += "." + str(int((magnitude - int(magnitude)).scaleb(fraction))).zfill(fraction)
         return text, size
