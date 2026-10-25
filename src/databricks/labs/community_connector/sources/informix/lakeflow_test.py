@@ -10242,10 +10242,73 @@ class LakeflowContractTests(unittest.TestCase):
 
         with mock.patch.object(informix_module.time, "sleep"):
             with self.assertRaisesRegex(InformixError, "with a default.*run a full refresh"):
+                self.connector(bridge).read_table("app.orders", checkpoint, options)
+            with self.assertRaisesRegex(
+                InformixError, "upsert reader refused .*with a default.*run a full refresh"
+            ):
                 rows, _ = self.connector(bridge).read_table_deletes(
                     "app.orders", checkpoint, options
                 )
                 list(rows)
+
+    def test_delete_reader_fails_with_any_refusal_the_upsert_reader_records(self):
+        bridge = FakeBridge()
+        checkpoint = self._checkpoint_then_add_a_column(bridge, {})
+        refused = InformixError("cdc_startcapture failed with Informix error -83713")
+
+        with mock.patch.object(informix_module.time, "sleep"):
+            with mock.patch.object(bridge, "validate_initial_lsn", side_effect=refused):
+                with self.assertRaisesRegex(InformixError, "-83713"):
+                    self.connector(bridge).read_table("app.orders", checkpoint, {})
+            with self.assertRaisesRegex(
+                InformixError, "upsert reader refused the schema change .*-83713"
+            ):
+                self.connector(bridge).read_table_deletes("app.orders", checkpoint, {})
+
+    def test_a_refusal_stays_with_the_update_that_recorded_it(self):
+        bridge = FakeBridge()
+        checkpoint = self._checkpoint_then_add_a_column(bridge, {})
+        refused = InformixError("cdc_startcapture failed with Informix error -83713")
+        with mock.patch.object(informix_module.time, "sleep"):
+            with mock.patch.object(bridge, "validate_initial_lsn", side_effect=refused):
+                with self.assertRaises(InformixError):
+                    self.connector(bridge).read_table("app.orders", checkpoint, {})
+            next_update = self.connector(bridge)
+            next_update.set_registration_scope(hashlib.sha256(b"next-update").hexdigest()[:32])
+
+            _, yielded = next_update.read_table_deletes("app.orders", checkpoint, {})
+
+        self.assertEqual(yielded["schema_transition_retry_count"], 1)
+
+    def test_a_published_transition_wins_over_an_earlier_refusal(self):
+        # An upsert retry in the same update got past what refused it the first time.
+        bridge = FakeBridge()
+        checkpoint = self._checkpoint_then_add_a_column(bridge, {})
+        refused = InformixError("cdc_startcapture failed with Informix error -83713")
+        with mock.patch.object(informix_module.time, "sleep"):
+            with mock.patch.object(bridge, "validate_initial_lsn", side_effect=refused):
+                with self.assertRaises(InformixError):
+                    self.connector(bridge).read_table("app.orders", checkpoint, {})
+            self.connector(bridge).read_table("app.orders", checkpoint, {})
+
+            rows, resumed = self.connector(bridge).read_table_deletes("app.orders", checkpoint, {})
+
+        self.assertEqual(list(rows), [])
+        self.assertNotIn("schema_transition_retry_count", resumed)
+
+    def test_a_transient_upsert_failure_records_no_refusal(self):
+        bridge = FakeBridge()
+        checkpoint = self._checkpoint_then_add_a_column(bridge, {})
+        with mock.patch.object(informix_module.time, "sleep"):
+            with mock.patch.object(
+                bridge, "validate_initial_lsn", side_effect=TimeoutError("read timed out")
+            ):
+                with self.assertRaises(TimeoutError):
+                    self.connector(bridge).read_table("app.orders", checkpoint, {})
+
+            _, yielded = self.connector(bridge).read_table_deletes("app.orders", checkpoint, {})
+
+        self.assertEqual(yielded["schema_transition_retry_count"], 1)
 
     def test_triggered_delete_reader_stops_waiting_for_a_transition_that_never_comes(self):
         """A failed upsert flow does not end a triggered update, so the delete reader's

@@ -13191,21 +13191,29 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             )
             transition_record = self._read_immutable_head(namespace)
             if transition_record is None and owner:
-                if set(table.primary_keys) - set(previous_table.primary_keys):
-                    # The key grew: only safe when existing rows really hold NULL in the
-                    # new columns at the source, as they will in the target. A key that
-                    # shrank needs no check: the dropped columns simply leave it.
-                    self._ensure_added_key_columns_have_no_default(previous_table, table)
-                transition = self._bridge.current_lsn()
-                if transition < checkpoint_lsn:
-                    raise InformixError(
-                        f"Current LSN {transition} precedes checkpoint LSN "
-                        f"{checkpoint_lsn} for '{table.exposed_name}'"
+                try:
+                    if set(table.primary_keys) - set(previous_table.primary_keys):
+                        # The key grew: only safe when existing rows really hold NULL in
+                        # the new columns at the source, as they will in the target. A
+                        # key that shrank needs no check: the dropped columns leave it.
+                        self._ensure_added_key_columns_have_no_default(previous_table, table)
+                    transition = self._bridge.current_lsn()
+                    if transition < checkpoint_lsn:
+                        raise InformixError(
+                            f"Current LSN {transition} precedes checkpoint LSN "
+                            f"{checkpoint_lsn} for '{table.exposed_name}'"
+                        )
+                    self._bridge.validate_initial_lsn(
+                        _capture_descriptor(table, _client_encoding(self.options)),
+                        transition,
                     )
-                self._bridge.validate_initial_lsn(
-                    _capture_descriptor(table, _client_encoding(self.options)),
-                    transition,
-                )
+                except InformixError as error:
+                    # The delete reader waits for this transition; record why it won't
+                    # come, so that reader fails with this error instead of waiting.
+                    # Transient failures (socket timeouts) aren't InformixError and
+                    # leave nothing behind.
+                    self._publish_schema_rejection(table, checkpoint_schema_id, error)
+                    raise
                 node = _schema_state(table, transition, predecessor=checkpoint_schema_id)
                 transition_record = self._publish_immutable_head(
                     namespace,
@@ -13280,11 +13288,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 # caller converts this into an unchanged-offset empty batch, which
                 # releases the slot and lets the owning upsert reader acquire one.
                 #
-                # Fail with the upsert reader's own error where it rejects the change
+                # Fail with the upsert reader's own error where it refused the change
                 # before publishing, or this reader would wait for a transition that
-                # never comes.
-                if set(table.primary_keys) - set(previous_table.primary_keys):
-                    self._ensure_added_key_columns_have_no_default(previous_table, table)
+                # never comes. A published transition wins over a refusal, read first
+                # above: an upsert retry in the same update may have succeeded since.
+                refusal = self._schema_rejection(table, checkpoint_schema_id)
+                if refusal is not None:
+                    raise InformixError(
+                        f"The upsert reader refused the schema change for "
+                        f"'{table.exposed_name}': {refusal}"
+                    )
                 self._ensure_schema_transition_wait_bounded(table, checkpoint_schema_id)
                 raise SchemaTransitionUnavailable(
                     f"The upsert reader has not published the schema transition for "
@@ -13296,6 +13309,57 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     f"state for '{table.exposed_name}'"
                 )
             delay = _sleep_with_backoff(deadline, delay)
+
+    def _schema_rejection_namespace(self, table: Table, checkpoint_schema_id: str) -> str | None:
+        # Docstring: Where an update's upsert reader records refusing a schema change.
+        #
+        # Scoped to the update: the next one may succeed where this one failed (the cause
+        # fixed, or a refusal that no longer holds), so its delete reader must not inherit
+        # the refusal. Without a registration scope the two readers share no update, and
+        # the delete reader falls back to its bounded wait.
+
+        scope = self._registration_scope
+        if not isinstance(scope, str) or _PIPELINE_SCOPE.fullmatch(scope) is None:
+            return None
+        return self._immutable_namespace(
+            table, "schema-rejections", "scopes", scope, checkpoint_schema_id
+        )
+
+    def _publish_schema_rejection(
+        self, table: Table, checkpoint_schema_id: str, error: Exception
+    ) -> None:
+        # Docstring: Record the upsert reader's refusal of a schema change; best effort.
+        #
+        # The refusal itself fails the upsert flow either way; if it can't be recorded,
+        # the delete reader still stops at its bounded wait.
+
+        namespace = self._schema_rejection_namespace(table, checkpoint_schema_id)
+        if namespace is None:
+            return
+        try:
+            self._publish_immutable_head(
+                namespace,
+                {"created_at": time.time(), "error": str(error)},
+                record_type="schema-rejection",
+            )
+        except Exception as publish_error:  # pylint: disable=broad-except
+            logging.getLogger(__name__).warning(
+                "Could not record that the upsert reader refused the schema change for %s: %s",
+                table.exposed_name,
+                publish_error,
+            )
+
+    def _schema_rejection(self, table: Table, checkpoint_schema_id: str) -> str | None:
+        # Docstring: This update's recorded refusal of the schema change, if any.
+
+        namespace = self._schema_rejection_namespace(table, checkpoint_schema_id)
+        if namespace is None:
+            return None
+        record = self._read_immutable_head(namespace)
+        if record is None:
+            return None
+        self._validate_immutable_record_header(record, "schema-rejection", table.exposed_name)
+        return str(record.get("error") or "no reason was recorded")
 
     def _ensure_schema_transition_wait_bounded(
         self, table: Table, checkpoint_schema_id: str
