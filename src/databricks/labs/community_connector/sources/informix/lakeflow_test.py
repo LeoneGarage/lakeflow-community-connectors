@@ -15712,6 +15712,10 @@ class SchemaEvolutionTests(_TableOptionTestCase):
                 "VARCHAR min length only",
                 [self.ID, self.column("v", length=20 + 5 * 256), self.column("w", "SMALLINT", 2)],
             ),
+            (
+                "shorter VARCHAR",
+                [self.ID, self.column("v", length=10), self.column("w", "SMALLINT", 2)],
+            ),
         ):
             with self.subTest(name):
                 ensure(base, self.table(current))
@@ -15731,9 +15735,9 @@ class SchemaEvolutionTests(_TableOptionTestCase):
         base = self.table([self.ID, self.column("v"), self.column("n", nullable=False)])
         for name, current, message in (
             (
-                "shorter",
-                [self.ID, self.column("v", length=10), self.column("n", nullable=False)],
-                "other than by widening",
+                "string retyped",
+                [self.ID, self.column("v", "CHAR", 20), self.column("n", nullable=False)],
+                "other than by widening it or shortening a string",
             ),
             (
                 "nullability",
@@ -15855,6 +15859,40 @@ class SchemaEvolutionTests(_TableOptionTestCase):
         )
         with self.assertRaisesRegex(InformixError, "include_columns.*changed"):
             ensure(before, still_there)
+
+    def test_shorter_strings_are_accepted(self):
+        def column(type_name, length, nullable=True):
+            return Column(name="s", type_name=type_name, length=length, nullable=nullable)
+
+        shortened = informix_module._shortened
+        # Informix 14.10 shortens these in place, keeping the table's tabid.
+        for type_name in ("CHAR", "NCHAR", "VARCHAR", "NVARCHAR"):
+            with self.subTest(type_name):
+                self.assertTrue(shortened(column(type_name, 30), column(type_name, 10)))
+        for old, new in (
+            # It rebuilds the table under a new tabid for an LVARCHAR change.
+            (column("LVARCHAR", 100), column("LVARCHAR", 20)),
+            (column("VARCHAR", 10), column("VARCHAR", 30)),  # a widening
+            (column("VARCHAR", 30), column("CHAR", 10)),  # another type
+            (column("VARCHAR", 30), column("VARCHAR", 10, nullable=False)),
+            (Column(name="s", type_name="BIGINT"), Column(name="s", type_name="INTEGER")),
+        ):
+            with self.subTest(f"not {old.type_name} to {new.type_name}"):
+                self.assertFalse(shortened(old, new))
+
+    def test_a_shortened_string_transitions_a_running_stream(self):
+        bridge = _ProjectingBridge()
+        connector, checkpoint = self.stream(bridge, {})
+        bridge.tables[0]["columns"][1]["length"] = 5  # ALTER ... MODIFY (value VARCHAR(5))
+        upserts, _ = self.changes(
+            connector, bridge, checkpoint, {}, ("INSERT", {"id": 3, "value": "abcde", "extra": 1})
+        )
+        schema = connector.get_table_schema("app.orders", {})
+
+        self.assertEqual(upserts, [(3, "c")])
+        self.assertEqual(
+            type({f.name: f.dataType for f in schema.fields}["value"]).__name__, "StringType"
+        )
 
     def test_a_widened_column_transitions_a_running_stream(self):
         bridge = _ProjectingBridge()

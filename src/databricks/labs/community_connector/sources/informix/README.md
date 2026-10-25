@@ -597,9 +597,18 @@ A normal pipeline restart adopts these Informix schema changes on a streaming ta
 without a full refresh:
 
 - **Appended columns:** nullable, CDC-supported columns added after every existing one.
-- **Longer strings:** a `CHAR`, `NCHAR`, `VARCHAR`, `NVARCHAR`, or `LVARCHAR` column made
-  longer, with its type and nullability unchanged. It still arrives as a string, so the
-  destination column doesn't change.
+- **Longer strings:** a `CHAR`, `NCHAR`, `VARCHAR`, or `NVARCHAR` column made longer,
+  with its type and nullability unchanged. It still arrives as a string, so the
+  destination column doesn't change. Changing an `LVARCHAR` column's length needs a full
+  refresh: Informix 14.10 rebuilds the table under a new table ID for it, which the
+  connector can't tell from a dropped and re-created table.
+- **Shorter strings:** the same types made shorter, the destination column again
+  unchanged: it keeps its type and is never shrunk. Informix shortens in place,
+  truncating existing values longer than the new length without logging a change for
+  each row, so those rows keep their old, longer values in the destination until they
+  next change or a full refresh. Changes logged before the `ALTER` but read after it
+  arrive cut to the new length, as the source now holds them (checked live on all four
+  types).
 - **`SMALLINT` to `INTEGER`:** both arrive as integers, so the destination column doesn't
   change.
 - **Wider numeric types:** `SMALLINT` or `INTEGER` (including `SERIAL`) to `BIGINT` or
@@ -613,15 +622,19 @@ without a full refresh:
   `"pipelines.enableTypeWidening": "true"` in the pipeline's `configuration` (Databricks
   Runtime 15.4 or later). The destination then widens the column in place, keeping its
   rows. Without the setting, the update fails with `DELTA_MERGE_INCOMPATIBLE_DATATYPE`;
-  add it and run the pipeline again, and it recovers with no full refresh. Narrowing,
-  `INT8` to `BIGINT` (the same width), variable-scale `DECIMAL(p)`, an integer to a
-  `DECIMAL` with fewer integer digits than those minimums (Delta's, even where the values
-  would fit), `BIGINT` or `INT8` to `FLOAT`, and an integer to `SMALLFLOAT` still need a
-  full refresh. Until it runs, every update fails as it starts. Usually the error is the
-  pipeline's own `CANNOT_UPDATE_TABLE_SCHEMA` ("Failed to merge the current and new
-  schemas"), because the destination can't take the new type; where it can, the
-  connector fails instead with "changed column … other than by widening it; run a full
-  refresh".
+  add it and run the pipeline again, and it recovers with no full refresh. Narrowing a
+  number or a `DATETIME` qualifier, `INT8` to `BIGINT` (the same width), variable-scale
+  `DECIMAL(p)`, an integer to a `DECIMAL` with fewer integer digits than those minimums
+  (Delta's, even where the values would fit), `BIGINT` or `INT8` to `FLOAT`, and an
+  integer to `SMALLFLOAT` still need a full refresh; for a narrowing, Informix 14.10
+  rebuilds the table under a new table ID as well. After a rebuild the change stream
+  delivers every row again as an insert but not the changes logged before it, so a row
+  deleted in between would stay in the destination; a full refresh is the only exact
+  recovery. Until it runs, every update fails as it starts. Usually the error is the pipeline's own
+  `CANNOT_UPDATE_TABLE_SCHEMA` ("Failed to merge the current and new schemas"), because
+  the destination can't take the new type; where it can, the connector fails instead with
+  "changed column … other than by widening it or shortening a string; run a full refresh"
+  or, after a rebuild, "changed table identity or primary keys; run a full refresh".
 - **Dropped columns:** any column that isn't part of the key, `NOT NULL` or not. Dropping
   any key column fails closed, whatever its nullability: a key set with `primary.keys` or
   taken from a nullable index may name a nullable column, and rows would otherwise key on
