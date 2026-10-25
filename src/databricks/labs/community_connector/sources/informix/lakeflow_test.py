@@ -1209,6 +1209,24 @@ class LakeflowContractTests(unittest.TestCase):
         )  # FRACTION TO FRACTION(3)
         self.assertTrue(fraction["cdc_supported"])
 
+    def test_catalog_names_blob_and_clob_columns(self):
+        # A live catalog reports both as fixed-length opaque types (coltype 41) named by
+        # their extended type; any other opaque type keeps its generic name.
+        for extended, expected in (("blob", "BLOB"), ("clob", "CLOB"), ("point", "UDT_FIXED")):
+            with self.subTest(extended):
+                column = _catalog_column(
+                    {
+                        "colname": "doc",
+                        "coltype": 41,
+                        "collength": 72,
+                        "colno": 2,
+                        "extended_name": extended,
+                        "extended_owner": "informix",
+                    }
+                )
+                self.assertEqual(column["type_name"], expected)
+                self.assertFalse(column["cdc_supported"])
+
     def test_catalog_accepts_nchar(self):
         column = _catalog_column({"colname": "code", "coltype": 15, "collength": 10, "colno": 2})
         self.assertEqual((column["type_name"], column["length"]), ("NCHAR", 10))
@@ -7154,7 +7172,8 @@ class LakeflowContractTests(unittest.TestCase):
         with self.assertRaisesRegex(InformixError, "schema changed"):
             connector.read_table("app.orders", {}, {})
 
-    def test_snapshot_revalidates_materializability_after_initial_refresh(self):
+    def test_a_refresh_leaves_out_an_unsupported_column(self):
+        informix_module._STATE_VALIDATION_COORDINATOR.unsupported_column_warnings.clear()
         bridge = FakeBridge()
         original = bridge.get_table
 
@@ -7164,15 +7183,24 @@ class LakeflowContractTests(unittest.TestCase):
                 **raw,
                 "columns": [
                     *raw["columns"],
-                    {"name": "payload", "type_name": "TEXT", "nullable": True},
+                    {
+                        "name": "payload",
+                        "type_name": "TEXT",
+                        "nullable": True,
+                        "cdc_supported": False,
+                    },
                 ],
             }
 
         bridge.get_table = refreshed_with_unsupported_column
         connector = self.connector(bridge)
 
-        with self.assertRaisesRegex(InformixError, "cannot materialize.*payload"):
-            connector.read_table("app.orders", {}, {})
+        with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
+            rows, _ = connector.read_table("app.orders", {}, {})
+            rows = list(rows)
+        self.assertEqual(sorted(row["id"] for row in rows), [1, 2])
+        self.assertTrue(all("payload" not in row for row in rows))
+        self.assertTrue(any("payload (TEXT)" in line for line in logs.output))
 
     def test_initial_refresh_reclassifies_a_keyless_table_as_append_cdc(self):
         bridge = FakeBridge()
@@ -8362,23 +8390,28 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertLess(delete_cursors[0], snapshot_cursor)
         self.assertGreater(delete_cursors[1], snapshot_cursor)
 
-    def test_unmaterializable_snapshot_type_fails_during_metadata(self):
+    def test_an_unsupported_column_is_left_out_with_one_warning(self):
+        # The rest of the table is ingested, and streamed, as if exclude_columns listed the
+        # column; the warning names it once per process, not on every read.
+        informix_module._STATE_VALIDATION_COORDINATOR.unsupported_column_warnings.clear()
         bridge = FakeBridge()
         table = _table(name="documents", cdc=False)
         table["columns"][1]["type_name"] = "TEXT"
         bridge.tables.append(table)
         connector = self.connector(bridge)
 
-        with self.assertRaisesRegex(InformixError, r"value \(TEXT\)"):
+        with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
+            metadata = connector.read_table_metadata("app.documents", {})
+            schema = connector.get_table_schema("app.documents", {})
             connector.read_table_metadata("app.documents", {})
 
-        for operation in (
-            lambda: connector.get_table_schema("app.documents", {}),
-            lambda: connector.read_table("app.documents", {}, {}),
-            lambda: connector.read_table_deletes("app.documents", {}, {}),
-        ):
-            with self.assertRaisesRegex(InformixError, r"value \(TEXT\)"):
-                operation()
+        self.assertEqual(metadata["ingestion_type"], "cdc_with_deletes")
+        self.assertEqual(metadata["primary_keys"], ["id"])
+        self.assertIn("id", schema.fieldNames())
+        self.assertNotIn("value", schema.fieldNames())
+        warnings = [line for line in logs.output if "app.documents" in line]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("value (TEXT)", warnings[0])
 
     def test_interleaved_transaction_recovery_is_atomic(self):
         early_record = {"op": "INSERT", "tx_id": 1, "lsn": 101, "row": {"id": 1}}
@@ -11409,8 +11442,9 @@ class IncrementalSnapshotTests(unittest.TestCase):
 
     def test_malformed_datetime_qualifier_is_rejected_before_chunking(self):
         # A malformed DATETIME qualifier (0x0105, non-field start nibble) is not
-        # materializable, so it fails discovery well before the chunk gate is
-        # consulted -- it never reaches the string-cast fallback path.
+        # materializable, and as the key the column can't be left out, so it fails
+        # discovery well before the chunk gate is consulted -- it never reaches the
+        # string-cast fallback path.
         bridge = self._datetime_bridge(0x0105)
         connector = self.connector(bridge, **{"snapshot.mode": "incremental"})
 
@@ -14731,6 +14765,36 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
                 informix_module._commit_time_value(1_700_000_000),
             )
 
+    def test_unl_partitions_skip_a_field_of_an_unsupported_type(self):
+        # The extract holds the TEXT column's field; the descriptor names the columns
+        # ingested so the executor drops it, as under exclude_columns.
+        bridge = FakeBridge()
+        bridge.tables[0]["columns"].insert(
+            1, {"name": "note", "type_name": "TEXT", "nullable": True, "cdc_supported": False}
+        )
+        source = self._source("1|first note|a|\n2|second|b|\n")
+        options = {"snapshot.source": source}
+        connector = self.connector(bridge)
+        offset = connector.latest_offset("app.orders", options, {})
+        partitions = connector.get_partitions("app.orders", options, {}, offset)
+        splits = [partition for partition in partitions if partition.get("kind") == "unl_split"]
+        self.assertTrue(splits)
+        self.assertTrue(all(split["selected"] == ["id", "value"] for split in splits))
+        fanned = [
+            row
+            for partition in partitions
+            for row in connector.read_partition("app.orders", partition, options)
+        ]
+        self.assertEqual(
+            sorted((row["id"], row["value"], "note" in row) for row in fanned),
+            [(1, "a", False), (2, "b", False)],
+        )
+        rows, _ = self.connector(bridge).read_table("app.orders", {}, options)
+        self.assertEqual(
+            sorted((row["id"], row["value"], "note" in row) for row in rows),
+            [(1, "a", False), (2, "b", False)],
+        )
+
     def test_unl_manifest_rejects_a_non_integer_boundary_time(self):
         source = self._source("1|a|\n")
         self._write_manifest(source, boundary_time="not-a-number")
@@ -15823,6 +15887,170 @@ class ColumnSelectionTests(_TableOptionTestCase):
         )
 
 
+def _unsupported_bridge(type_name="BLOB", **column):
+    """A _ProjectingBridge whose ``extra`` column has a type the connector can't read."""
+    bridge = _ProjectingBridge()
+    bridge.tables[0]["columns"][2] = {
+        "name": "extra",
+        "type_name": type_name,
+        "nullable": True,
+        "cdc_supported": False,
+        **column,
+    }
+    return bridge
+
+
+class UnsupportedColumnTests(_TableOptionTestCase):
+    """A column of a type the connector can't read is left out, as if exclude_columns
+    listed it, and the rest of the table is snapshotted and streamed with a warning."""
+
+    def setUp(self):
+        super().setUp()
+        informix_module._STATE_VALIDATION_COORDINATOR.unsupported_column_warnings.clear()
+
+    def test_it_is_left_out_of_schema_snapshot_and_capture(self):
+        bridge = _unsupported_bridge()
+        with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
+            connector, checkpoint = self.stream(bridge, {})
+        self.assertTrue(
+            any("app.orders" in line and "extra (BLOB)" in line for line in logs.output)
+        )
+
+        schema = connector.get_table_schema("app.orders", {})
+        self.assertNotIn("extra", schema.fieldNames())
+        self.assertEqual(bridge.snapshot_columns, [("id", "value")])
+        self.assertEqual(
+            connector.read_table_metadata("app.orders", {})["ingestion_type"], "cdc_with_deletes"
+        )
+        bridge.now = 200
+        bridge.changes = self.committed(("INSERT", {"id": 3, "value": "c", "extra": b"\x00"}))
+        rows = list(connector.read_table("app.orders", checkpoint, {})[0])
+        self.assertEqual(bridge.change_reads[-1][0][0]["columns"], ["id", "value"])
+        self.assertEqual([(row["id"], "extra" in row) for row in rows], [(3, False)])
+
+    def test_every_unsupported_type_is_left_out(self):
+        for type_name, length in (
+            ("BYTE", None),
+            ("TEXT", None),
+            ("BLOB", None),
+            ("CLOB", None),
+            ("SET", None),
+            ("MULTISET", None),
+            ("LIST", None),
+            ("ROW", None),
+            ("UDT_VAR", None),
+            ("UDT_FIXED", None),
+            ("DATETIME", 0x0105),
+        ):
+            with self.subTest(type_name):
+                bridge = _unsupported_bridge(type_name, length=length)
+                schema = self.connector(bridge).get_table_schema("app.orders", {})
+                self.assertNotIn("extra", schema.fieldNames())
+
+    def test_a_fresh_delete_reader_checks_only_the_columns_it_reads(self):
+        # Registration caches the bare catalog table, and a delete reader without a
+        # checkpoint validates that cache before waiting for the upsert reader. It must
+        # narrow it as the read path does, whether the connector or exclude_columns left
+        # the column out, or the column fails the delete flow.
+        for options in ({}, {"exclude_columns": "extra"}):
+            with self.subTest(options=options):
+                connector = self.connector(_unsupported_bridge("TEXT"))
+                connector.get_table_schema("app.orders", dict(options))
+                rows, _ = connector.read_table_deletes("app.orders", {}, dict(options))
+                self.assertEqual(list(rows), [])
+
+    def test_it_warns_once_per_table(self):
+        connector = self.connector(_unsupported_bridge("CLOB"))
+        with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
+            for _ in range(3):
+                connector.read_table_metadata("app.orders", {})
+                connector.get_table_schema("app.orders", {})
+        self.assertEqual(len([line for line in logs.output if "extra (CLOB)" in line]), 1)
+
+    def test_listing_it_in_exclude_columns_draws_no_warning(self):
+        connector = self.connector(_unsupported_bridge())
+        with self.assertNoLogs(informix_module.__name__, level="WARNING"):
+            schema = connector.get_table_schema("app.orders", {"exclude_columns": "extra"})
+        self.assertNotIn("extra", schema.fieldNames())
+
+    def test_naming_it_in_include_columns_fails(self):
+        connector = self.connector(_unsupported_bridge())
+        with self.assertRaisesRegex(InformixError, r"include_columns.*can't read: extra \(BLOB\)"):
+            connector.read_table_metadata("app.orders", {"include_columns": "id,extra"})
+        metadata = connector.read_table_metadata("app.orders", {"include_columns": "id,value"})
+        self.assertEqual(metadata["primary_keys"], ["id"])
+
+    def test_a_key_column_of_an_unsupported_type_fails_the_table(self):
+        # Rows are merged and deleted by the key, so its column can't be left out: the
+        # table fails as it always did. A primary.keys list naming other columns keys the
+        # table on those instead, and "*" keys it on the columns ingested.
+        bridge = _unsupported_bridge("DATETIME", length=0x0105, nullable=False)
+        bridge.tables[0]["primary_keys"] = ["extra"]
+        connector = self.connector(bridge)
+        for options in ({}, {"primary.keys": "id,extra"}):
+            with self.subTest(options=options):
+                with self.assertRaisesRegex(InformixError, r"cannot materialize: extra"):
+                    connector.read_table_metadata("app.orders", dict(options))
+                with self.assertRaisesRegex(InformixError, r"cannot materialize: extra"):
+                    connector.get_table_schema("app.orders", dict(options))
+        for options, key in (({"primary.keys": "id"}, ["id"]), ({"primary.keys": "*"}, ["id", "value"])):
+            with self.subTest(options=options):
+                metadata = connector.read_table_metadata("app.orders", dict(options))
+                self.assertEqual(metadata["primary_keys"], key)
+
+    def test_primary_keys_naming_an_unsupported_column_fails_the_table(self):
+        connector = self.connector(_unsupported_bridge())
+        with self.assertRaisesRegex(InformixError, r"cannot materialize: extra \(BLOB\)"):
+            connector.read_table_metadata("app.orders", {"primary.keys": "extra"})
+
+    def test_a_promoted_nullable_index_with_an_unsupported_column_fails_the_table(self):
+        bridge = _unsupported_bridge("DATETIME", length=0x0105)
+        bridge.tables[0]["primary_keys"] = []
+        bridge.tables[0]["nullable_index_key"] = [["value", False], ["extra", False]]
+        connector = self.connector(bridge)
+        with self.assertRaisesRegex(InformixError, r"cannot materialize: extra"):
+            connector.read_table_metadata("app.orders", {"allow.nullable.index": "true"})
+        # Not promoted, the index is no key: the column is left out of a keyless table.
+        metadata = connector.read_table_metadata("app.orders", {})
+        self.assertEqual(metadata["ingestion_type"], "append")
+
+    def test_a_wildcard_key_covers_only_the_readable_columns(self):
+        connector = self.connector(_unsupported_bridge())
+        metadata = connector.read_table_metadata("app.orders", {"primary.keys": "*"})
+        self.assertEqual(metadata["primary_keys"], ["id", "value"])
+
+    def test_a_table_of_only_unsupported_columns_fails(self):
+        bridge = FakeBridge()
+        bridge.tables = [
+            {
+                "database": "demo",
+                "owner": "app",
+                "name": "orders",
+                "columns": [{"name": "doc", "type_name": "BLOB", "cdc_supported": False}],
+                "primary_keys": [],
+            }
+        ]
+        with self.assertRaisesRegex(InformixError, r"no column the connector can read: doc"):
+            self.connector(bridge).get_table_schema("app.orders", {})
+
+    def test_the_fingerprint_matches_the_table_without_the_column(self):
+        # So a column of an unsupported type added at the source later is left out without
+        # a schema transition.
+        with_column = self.connector(_unsupported_bridge())._table("app.orders", {})
+        bridge = _ProjectingBridge()
+        del bridge.tables[0]["columns"][2]
+        without = self.connector(bridge)._table("app.orders", {})
+        self.assertEqual(_schema_fingerprint(with_column), _schema_fingerprint(without))
+
+    def test_a_unl_record_keeps_the_unsupported_field_position(self):
+        connector = self.connector(_unsupported_bridge("TEXT"))
+        table = connector._table("app.orders", {})
+        kept = informix_module._shape_unl_record(b"2|b|some text|", table, 100, {}, "utf-8")
+        self.assertEqual((kept["id"], kept["value"], "extra" in kept), (2, "b", False))
+        with self.assertRaisesRegex(InformixError, "has 2 fields but the table has 3 columns"):
+            informix_module._shape_unl_record(b"2|b|", table, 100, {}, "utf-8")
+
+
 class SchemaEvolutionTests(_TableOptionTestCase):
     """A running stream adopts widened columns and dropped non-key columns without a full
     refresh; every other change still fails closed."""
@@ -16134,6 +16362,73 @@ class SchemaEvolutionTests(_TableOptionTestCase):
         rows, end = connector.read_table("app.orders", checkpoint, {"include_columns": "id,value"})
         self.assertEqual(list(rows), [])
         self.assertNotEqual(end["schema_fingerprint"], checkpoint["schema_fingerprint"])
+
+    def test_an_unsupported_column_added_to_a_running_stream_is_left_out(self):
+        informix_module._STATE_VALIDATION_COORDINATOR.unsupported_column_warnings.clear()
+        bridge = _ProjectingBridge()
+        connector, checkpoint = self.stream(bridge, {})
+        bridge.tables[0]["columns"].append(  # ALTER TABLE ... ADD (doc BLOB)
+            {"name": "doc", "type_name": "BLOB", "nullable": True, "cdc_supported": False}
+        )
+        bridge.now = 200
+        bridge.changes = self.committed(("INSERT", {"id": 3, "value": "c", "extra": 9}))
+        with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
+            rows, end = connector.read_table("app.orders", checkpoint, {})
+            rows = list(rows)
+        self.assertTrue(any("doc (BLOB)" in line for line in logs.output))
+        self.assertEqual([(row["id"], "doc" in row) for row in rows], [(3, False)])
+        self.assertEqual(bridge.change_reads[-1][0][0]["columns"], ["id", "value", "extra"])
+        self.assertEqual(end["schema_fingerprint"], checkpoint["schema_fingerprint"])
+
+    def test_a_wildcard_key_leaves_out_an_unsupported_column_added_while_streaming(self):
+        informix_module._STATE_VALIDATION_COORDINATOR.unsupported_column_warnings.clear()
+        options = {"primary.keys": "*"}
+        bridge = _ProjectingBridge()
+        connector, checkpoint = self.stream(bridge, options)
+        bridge.tables[0]["columns"].append(  # ALTER TABLE ... ADD (doc TEXT)
+            {"name": "doc", "type_name": "TEXT", "nullable": True, "cdc_supported": False}
+        )
+        bridge.now = 200
+        bridge.changes = self.committed(("INSERT", {"id": 3, "value": "c", "extra": 9}))
+        rows, end = connector.read_table("app.orders", checkpoint, dict(options))
+        self.assertEqual([(row["id"], "doc" in row) for row in rows], [(3, False)])
+        self.assertEqual(end["schema_fingerprint"], checkpoint["schema_fingerprint"])
+        metadata = connector.read_table_metadata("app.orders", dict(options))
+        self.assertEqual(metadata["primary_keys"], ["id", "value", "extra"])
+
+    def test_a_key_column_changed_to_an_unsupported_type_fails_the_read(self):
+        bridge = _ProjectingBridge()
+        connector, checkpoint = self.stream(bridge, {})
+        bridge.tables[0]["columns"][0] = {  # ALTER TABLE ... MODIFY (id DATETIME ...)
+            "name": "id",
+            "type_name": "DATETIME",
+            "length": 0x0105,
+            "nullable": False,
+            "cdc_supported": False,
+        }
+        bridge.now = 200
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 200}]
+        with self.assertRaisesRegex(InformixError, "cannot materialize: id"):
+            connector.read_table("app.orders", checkpoint, {})
+
+    def test_a_column_changed_to_an_unsupported_type_needs_a_full_refresh(self):
+        # Left out, it would otherwise pass as a dropped column and stop updating silently.
+        bridge = _ProjectingBridge()
+        connector, checkpoint = self.stream(bridge, {})
+        bridge.tables[0]["columns"][2] = {  # ALTER TABLE ... MODIFY (extra TEXT)
+            "name": "extra",
+            "type_name": "TEXT",
+            "nullable": True,
+            "cdc_supported": False,
+        }
+        bridge.now = 200
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 200}]
+        with self.assertRaisesRegex(
+            InformixError,
+            r"changed column\(s\) to a type the connector can't read: extra "
+            r"\(TEXT\); run a full refresh",
+        ):
+            connector.read_table("app.orders", checkpoint, {})
 
     def test_a_dropped_key_column_fails_closed_whatever_its_nullability(self):
         # A primary.keys override or a nullable-index promotion may key on a nullable

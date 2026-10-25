@@ -979,6 +979,9 @@ class _StateValidationCoordinator:
         self.claims: dict[str, tuple[object, float]] = {}
         self.table_caches: dict[tuple[str, ...], "Table"] = {}
         self.connection_limits: set[tuple[str, int]] = set()
+        # (table identity, left-out column names) pairs already warned about, so a table
+        # resolved on every read warns once per process rather than on each microbatch.
+        self.unsupported_column_warnings: set[tuple[str, tuple[str, ...]]] = set()
 
     def __getstate__(self) -> dict[str, object]:
         # Spark workers must establish their own process-local validation state.
@@ -4035,6 +4038,72 @@ def _apply_column_selection(table: Table, selection: tuple[str, tuple[str, ...]]
     )
 
 
+def _unsupported_column_list(columns: Iterable[Column]) -> str:
+    # Docstring: ``name (TYPE)`` for each column, noting a DATETIME or INTERVAL qualifier.
+
+    return ", ".join(
+        f"{column.name} ({column.type_name}"
+        + (" with an unsupported qualifier" if column.type_name in {"DATETIME", "INTERVAL"} else "")
+        + ")"
+        for column in columns
+    )
+
+
+def _leave_out_unsupported_columns(table: Table, key: tuple[str, ...] | None) -> Table:
+    # Docstring: Leave the columns of a type the connector can't read out of ``table``.
+    #
+    # BYTE, TEXT, BLOB, CLOB, collection, ROW and opaque columns, and DATETIME or INTERVAL
+    # columns whose qualifier the decoder doesn't handle, can be neither snapshotted nor
+    # captured. Rather than rejecting the table, the connector reads the rest of it, as if
+    # exclude_columns listed them, and warns once per process naming what it left out.
+    # Runs after the column selection, so a column it already excludes draws no warning,
+    # and include_columns naming one fails: that asks for a column the connector can't land.
+    #
+    # ``key`` is the key the table will merge and delete by (see _requested_key), or None
+    # for a primary.keys "*" wildcard, which keys on whatever is ingested. A key column
+    # can't be left out, so then the table is returned as it is and fails as it always
+    # did, once _ensure_materializable finds the column.
+
+    unsupported = _snapshot_unsupported_columns(table)
+    if not unsupported:
+        return table
+    if key is not None and {column.name for column in unsupported} & set(key):
+        return table
+    if table.column_selection is not None and table.column_selection[0] == "include":
+        raise InformixError(
+            f"Option '{_INCLUDE_COLUMNS_OPTION}' names column(s) of '{table.exposed_name}' "
+            f"whose type the connector can't read: {_unsupported_column_list(unsupported)}"
+        )
+    names = {column.name for column in unsupported}
+    columns = tuple(column for column in table.columns if column.name not in names)
+    if not columns:
+        raise InformixError(
+            f"Table '{table.exposed_name}' has no column the connector can read: "
+            f"{_unsupported_column_list(unsupported)}"
+        )
+    warning = (table.identity, tuple(sorted(names)))
+    coordinator = _STATE_VALIDATION_COORDINATOR
+    with coordinator.condition:
+        first = warning not in coordinator.unsupported_column_warnings
+        coordinator.unsupported_column_warnings.add(warning)
+    if first:
+        logging.getLogger(__name__).warning(
+            "Informix table '%s' has column(s) of a type the connector can't read: %s. "
+            "They are left out; the rest of the table is ingested without them.",
+            table.exposed_name,
+            _unsupported_column_list(unsupported),
+        )
+    keep_index = not set(table.nullable_index_key) & names
+    return replace(
+        table,
+        columns=columns,
+        catalog_columns=table.catalog_columns or table.columns,
+        unsupported_columns=unsupported,
+        nullable_index_key=table.nullable_index_key if keep_index else (),
+        nullable_index_descending=table.nullable_index_descending if keep_index else (),
+    )
+
+
 def _ensure_selected_keys(table: Table) -> None:
     # Docstring: Fail when the column selection leaves out a key column.
     #
@@ -5730,6 +5799,12 @@ class Table:
     # running stream fails closed rather than silently diverging from rows already landed.
     column_selection: tuple[str, tuple[str, ...]] | None = None
     catalog_columns: tuple[Column, ...] = ()
+    # Columns of a type the connector can't read, left out of ``columns`` (which sets
+    # ``catalog_columns`` too) so the rest of the table is ingested; see
+    # _leave_out_unsupported_columns. Re-derived from the catalog on every resolve, so
+    # neither fingerprinted nor kept in schema history: a table without such columns keeps
+    # its fingerprint, and one added at the source later is left out without a transition.
+    unsupported_columns: tuple[Column, ...] = ()
     row_filter: str | None = None
     # rename_columns as sorted (source, destination) pairs, or None. Internally every
     # column keeps its source name; only what the connector reports -- the schema, the
@@ -8878,6 +8953,35 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             key_from_nullable_index=True,
         )
 
+    def _requested_key(self, table: Table, table_options: dict[str, str]) -> tuple[str, ...] | None:
+        # Docstring: The key the table options will give ``table``, ahead of applying them.
+        #
+        # In _apply_key_options' precedence: the primary.keys list, a nullable index the
+        # table opts into promoting, then the catalog key. None for the primary.keys "*"
+        # wildcard, which keys on whatever columns are ingested.
+
+        raw = table_options.get(_PRIMARY_KEYS_OPTION)
+        if raw is not None:
+            keys = _parse_key_columns(raw)
+            return None if _PRIMARY_KEYS_WILDCARD in keys else tuple(keys)
+        if (
+            not table.primary_keys
+            and table.nullable_index_key
+            and _option_bool(table_options, _ALLOW_NULLABLE_INDEX_OPTION, False)
+        ):
+            return table.nullable_index_key
+        return table.primary_keys
+
+    def _ingested_columns(self, table: Table, table_options: dict[str, str]) -> Table:
+        # Docstring: Narrow ``table`` to the columns it ingests: the column selection, then
+        # the columns of a type the connector can't read left out, unless one is in its key.
+        #
+        # Opens no Informix connection, unlike the key options, which can query the
+        # override's index directions.
+
+        table = _apply_column_selection(table, _column_selection(table_options))
+        return _leave_out_unsupported_columns(table, self._requested_key(table, table_options))
+
     def _apply_key_options(self, table: Table, table_options: dict[str, str]) -> Table:
         # Docstring: Apply the per-table key options in precedence order: an explicit
         # ``primary.keys`` override wins over a nullable-index promotion, which wins
@@ -8891,12 +8995,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _apply_table_options(self, table: Table, table_options: dict[str, str]) -> Table:
         # Docstring: Apply every per-table option that reshapes the catalog table.
         #
-        # The column selection runs first, so the key options see only the selected
-        # columns (a wildcard key covers just those), then row_filter, since it may only
-        # use selected columns, then the transforms and the renames, which may only
-        # change them.
+        # The column selection runs first, then the columns of a type the connector can't
+        # read are left out, so the key options see only the columns ingested (a wildcard
+        # key covers just those), then row_filter, since it may only use selected columns,
+        # then the transforms and the renames, which may only change them.
 
-        table = _apply_column_selection(table, _column_selection(table_options))
+        table = self._ingested_columns(table, table_options)
         table = self._apply_key_options(table, table_options)
         _ensure_selected_keys(table)
         table = _apply_row_filter(table, table_options.get(_ROW_FILTER_OPTION))
@@ -11945,8 +12049,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # seek -- the same fallback shape as the driver's ``_unl_read_chunk``. A gzip split
         # (``gzip=True``) spans the whole file and is decompressed as one stream.
 
-        # ``columns`` is the extract's full catalog layout; ``selected`` (absent without a
-        # column selection) names the columns to keep, and ``row_filter`` the filter.
+        # ``columns`` is the extract's full catalog layout; ``selected`` (absent when every
+        # column is ingested) names the columns to keep, and ``row_filter`` the filter.
         catalog = tuple(Column.parse(raw) for raw in partition["columns"])
         selected = partition.get("selected")
         columns = catalog
@@ -12077,9 +12181,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 "end_byte": end_byte,
                 "gzip": is_gzip,
                 "columns": columns,
+                # Set whenever the table ingests fewer columns than the extract holds: under
+                # a column selection, or with columns of a type the connector can't read.
                 **(
                     {}
-                    if table.column_selection is None
+                    if not table.catalog_columns
                     else {"selected": [column.name for column in table.columns]}
                 ),
                 **({} if table.row_filter is None else {"row_filter": table.row_filter}),
@@ -13686,6 +13792,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             return True
         cached = self._tables.get(exposed) if self._tables is not None else None
         if cached is not None:
+            # The cache holds the bare catalog table, so narrow it to the columns the read
+            # path ingests first, or a column left out there would fail the check here.
+            cached = self._ingested_columns(cached, table_options)
             _ensure_materializable(cached, table_options)
             if self._append_only_table(cached, table_options) or not _cdc_capable(cached):
                 return True
@@ -14387,9 +14496,13 @@ def _catalog_column(row: Any) -> dict[str, Any]:
         else:
             extended_name = str(row[6] or "").strip().upper() if len(row) > 6 else ""
             extended_owner = str(row[7] or "").strip().upper() if len(row) > 7 else ""
+        # BLOB and CLOB are built-in opaque types too; naming them lets the warning for a
+        # column left out say which type it was. Both stay unsupported.
         builtin_extended_types = {
             ("UDT_VAR", "INFORMIX", "LVARCHAR"): "LVARCHAR",
             ("UDT_FIXED", "INFORMIX", "BOOLEAN"): "BOOLEAN",
+            ("UDT_FIXED", "INFORMIX", "BLOB"): "BLOB",
+            ("UDT_FIXED", "INFORMIX", "CLOB"): "CLOB",
         }
         type_name = builtin_extended_types.get(
             (type_name, extended_owner, extended_name), type_name
@@ -16087,6 +16200,15 @@ def _carry_table_options(fresh: Table, previous: Table) -> Table:
     # wildcard key re-expands over the selected columns only.
 
     fresh = _apply_column_selection(fresh, previous.column_selection)
+    # The key the carry below gives ``fresh``: the override or promotion carried, else
+    # the catalog's; a wildcard keys on whatever is ingested.
+    if previous.key_wildcard:
+        key = None
+    elif previous.key_override or previous.key_from_nullable_index:
+        key = previous.primary_keys
+    else:
+        key = fresh.primary_keys
+    fresh = _leave_out_unsupported_columns(fresh, key)
     if previous.key_override:
         # A wildcard key is re-expanded to the fresh columns instead of kept as listed.
         fresh = _carry_key_override(fresh, previous)
@@ -16267,9 +16389,12 @@ def _ensure_compatible_schema_change(
     #   the destination keeps it: an SCD1 row updated afterwards keeps its last value there,
     #   while rows inserted and SCD2 versions written afterwards hold NULL. AUTO CDC creates
     #   every target column nullable, even from a NOT NULL source, so NULL always fits;
-    # - appending nullable, CDC-supported columns after every surviving one.
+    # - appending nullable, CDC-supported columns after every surviving one. A column of a
+    #   type the connector can't read is left out of ``current`` before this runs, so
+    #   adding one changes nothing here.
     #
-    # Anything else -- reordering, another type change, a key column dropped, a NOT NULL
+    # Anything else -- reordering, another type change (a column changed to a type the
+    # connector can't read would otherwise pass as dropped), a key column dropped, a NOT NULL
     # or key column added -- fails closed, and so does changing include_columns /
     # exclude_columns or row_filter: rows already landed were selected under the old
     # setting, and the new one cannot be applied to them without a re-read. The one
@@ -16284,6 +16409,13 @@ def _ensure_compatible_schema_change(
     current_names = {column.name for column in current.columns}
     survivors = [column for column in previous.columns if column.name in current_names]
     dropped = [column for column in previous.columns if column.name not in current_names]
+    unsupported = {column.name: column for column in current.unsupported_columns}
+    retyped = [unsupported[column.name] for column in dropped if column.name in unsupported]
+    if retyped:
+        raise InformixError(
+            f"Informix schema change for '{name}' changed column(s) to a type the connector "
+            f"can't read: {_unsupported_column_list(retyped)}; run a full refresh"
+        )
     additions = current.columns[len(survivors) :]
     keys_match = previous.primary_keys == current.primary_keys
     shrunk = False
