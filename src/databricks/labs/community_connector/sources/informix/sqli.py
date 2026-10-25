@@ -1147,7 +1147,7 @@ def _decode_result_value_raw(
     data: bytes, column: ResultColumn, encoding: str, pad_varchar: bool = False
 ) -> object:
     kind = _effective_result_kind(column)
-    if kind == 0:  # CHAR
+    if kind in {0, 15}:  # CHAR, NCHAR
         return _decode_text(data[: column.encoded_length], encoding).rstrip(" ")
     if kind == 1:
         value = struct.unpack(">h", data[:2])[0]
@@ -1262,7 +1262,7 @@ def _fixed_result_size(column: ResultColumn, remaining: bytes) -> int:
         52: 8,
         53: 8,
     }
-    if kind == 0:
+    if kind in {0, 15}:
         return column.encoded_length
     if kind in widths:
         return widths[kind]

@@ -4274,11 +4274,11 @@ _TRANSFORM_HASH_KEY_OPTION = "transform.hash.key"
 # LIKE, IS [NOT] NULL, AND/OR/NOT and parentheses, over numeric, string, BOOLEAN, DATE,
 # and YEAR-anchored DATETIME columns, with SQL's three-valued NULL logic. Strings compare
 # by code point with trailing spaces ignored, which is Informix's CHAR/VARCHAR order for
-# ISO 8859-1 and UTF-8 code sets; NVARCHAR collates by locale, so it takes equality tests
-# and LIKE only. LIKE follows what Informix 14.10 was measured to do on every string
-# type: case-sensitive, trailing blanks of the value and of the pattern ignored, and an
-# escape character (backslash unless ESCAPE names another) that makes the next
-# character literal. The SQL always spells the ESCAPE out, so the server's
+# ISO 8859-1 and UTF-8 code sets; NCHAR and NVARCHAR collate by locale, so they take
+# equality tests and LIKE only. LIKE follows what Informix 14.10 was measured to do on
+# every string type: case-sensitive, trailing blanks of the value and of the pattern
+# ignored, and an escape character (backslash unless ESCAPE names another) that makes
+# the next character literal. The SQL always spells the ESCAPE out, so the server's
 # DEFAULTESCCHAR setting cannot change the meaning. FLOAT columns are rejected because
 # binary floating point compares differently in SQL and Python. An UPDATE that moves a
 # row into the filter is upserted and one that moves it out is deleted, so a keyed
@@ -4326,7 +4326,7 @@ _ROW_FILTER_NUMERIC_TYPES = frozenset(
         "MONEY",
     }
 )
-_ROW_FILTER_STRING_TYPES = frozenset({"CHAR", "VARCHAR", "LVARCHAR", "NVARCHAR"})
+_ROW_FILTER_STRING_TYPES = frozenset({"CHAR", "NCHAR", "VARCHAR", "LVARCHAR", "NVARCHAR"})
 _ROW_FILTER_CACHE: dict[str, tuple] = {}
 
 
@@ -4997,7 +4997,7 @@ def _row_filter_kind(column: Column) -> str | None:
     if name in _ROW_FILTER_NUMERIC_TYPES:
         return "number"
     if name in _ROW_FILTER_STRING_TYPES:
-        return "nstring" if name == "NVARCHAR" else "string"
+        return "nstring" if name in {"NCHAR", "NVARCHAR"} else "string"
     if name in {"BOOLEAN", "BOOL"}:
         return "bool"
     if name == "DATE":
@@ -5196,7 +5196,7 @@ def _row_filter_predicate(table: Table, encoding: str = "latin-1") -> tuple | No
     pad = {
         column.name: int(column.length)
         for column in table.columns
-        if column.type_name == "CHAR" and column.length
+        if column.type_name in {"CHAR", "NCHAR"} and column.length
     }
     return _parse_row_filter(table.row_filter), kinds, {"pad": pad, "encoding": encoding}
 
@@ -14302,7 +14302,6 @@ def _catalog_column(row: Any) -> dict[str, Any]:
         "TEXT",
         "BLOB",
         "CLOB",
-        "NCHAR",
         "SET",
         "MULTISET",
         "LIST",
@@ -14445,7 +14444,6 @@ def _snapshot_unsupported_columns(table: Table) -> tuple[Column, ...]:
         "TEXT",
         "BLOB",
         "CLOB",
-        "NCHAR",
         "SET",
         "MULTISET",
         "LIST",
@@ -16041,7 +16039,7 @@ def _carry_key_override(fresh: Table, overridden: Table) -> Table:
     )
 
 
-_WIDENABLE_STRING_TYPES = frozenset({"CHAR", "VARCHAR", "NVARCHAR", "LVARCHAR"})
+_WIDENABLE_STRING_TYPES = frozenset({"CHAR", "NCHAR", "VARCHAR", "NVARCHAR", "LVARCHAR"})
 
 
 def _string_capacity(column: Column) -> int:
@@ -16068,7 +16066,7 @@ _INTEGER_RANKS = {
 def _widened(previous: Column, current: Column) -> bool:
     # Docstring: Whether ``current`` widens ``previous`` so every old value still fits.
     #
-    # A longer CHAR, VARCHAR, NVARCHAR, or LVARCHAR stays StringType, and SMALLINT to
+    # A longer CHAR, NCHAR, VARCHAR, NVARCHAR, or LVARCHAR stays StringType, and SMALLINT to
     # INTEGER stays IntegerType, so neither changes what the destination holds. The
     # numeric widenings change the Spark type -- SMALLINT or INTEGER to BIGINT/INT8
     # (IntegerType to LongType), SMALLFLOAT to FLOAT (FloatType to DoubleType), a

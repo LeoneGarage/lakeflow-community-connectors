@@ -34,8 +34,8 @@
 # YEAR/MONTH/DAY are emitted as naive source calendar values and interpreted by
 # Spark as timestamps; partial qualifiers are deterministic labeled strings and
 # never acquire a current date. INTERVAL lands as Informix's trimmed literal text
-# ("-12 13:14:15.016"), live-validated on Informix 14.10. BYTE, TEXT, BLOB, CLOB, NCHAR, and
-# complex or opaque types lack end-to-end snapshot/CDC materialization and cause
+# ("-12 13:14:15.016"), live-validated on Informix 14.10, and NCHAR as CHAR does. BYTE, TEXT,
+# BLOB, CLOB, and complex or opaque types lack end-to-end snapshot/CDC materialization and cause
 # an explicit metadata error. Unknown catalog types fail discovery rather than being decoded
 # speculatively. Ordinary TEXT/BYTE fetch framing has a bounded internal helper,
 # but content materialization and limits are not exposed by this connector.
@@ -662,7 +662,7 @@ connection:
         must be listed, and so must any column row_filter uses. Every name must be a
         column of the table; after dropping a listed column at the source, take it
         out of the list (no full refresh needed). Leaving out a column of an
-        unsupported type (BYTE, TEXT, BLOB, CLOB, NCHAR, collections) lets a
+        unsupported type (BYTE, TEXT, BLOB, CLOB, collections) lets a
         table be ingested, with its changes streamed, that would otherwise be rejected. Changing the selection on a running
         table fails closed until a full refresh. Mutually exclusive with
         exclude_columns.

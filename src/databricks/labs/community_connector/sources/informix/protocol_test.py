@@ -411,6 +411,15 @@ class FrameTests(unittest.TestCase):
         column = ColumnDescriptor("value", "CHAR", length=4)
         self.assertEqual(decode_value(memoryview(b"a   "), column), ("a", 4))
 
+    def test_nchar_decodes_as_char_on_both_paths(self):
+        # NCHAR differs from CHAR only in collating by locale: it is fixed width and blank
+        # padded in the database code set on the SQLI wire (type 15) and in CDC images.
+        result = ResultColumn("value", 0, 15, 0, 5)
+        self.assertEqual(_fixed_result_size(result, b"ab   "), 5)
+        self.assertEqual(_decode_result_value(b"ab   ", result, "utf-8"), "ab")
+        column = ColumnDescriptor("value", "NCHAR", length=5)
+        self.assertEqual(decode_value(memoryview(b"ab   "), column), ("ab", 5))
+
     def test_ordinary_varchar_null_sentinel(self):
         for type_code in (13, 16):
             with self.subTest(type_code=type_code):
