@@ -9637,6 +9637,86 @@ class LakeflowContractTests(unittest.TestCase):
         )
         self.assertEqual(list(rows), [])
 
+    def test_a_replay_lands_on_a_quiet_end_with_later_commits_in_the_log(self):
+        # Regression (cycle 4, tw241): a triggered read went idle with nothing open and
+        # moved its offset to where the log reader stopped, 120, past its last commit,
+        # 105; the update was cancelled before Spark committed that batch. By the replay
+        # the log held a later commit, 130, so the poll crossed the replay's bound
+        # instead of going idle -- and the replay ended at 105 on every attempt, short of
+        # 120. Crossing the bound proves every transaction up to it was delivered.
+        bridge = self._PollBridge(
+            {
+                100: self._tx(8, 101, {"id": 3, "value": "c"}, 105)
+                + self._tx(9, 125, {"id": 4, "value": "d"}, 130)
+                + [{"op": "TIMEOUT", "lsn": 150}],
+            }
+        )
+        bridge.now = 150
+        connector = self.connector(bridge)
+        start = _stream_offset(100)
+        quiet_end = {**start, "commit_lsn": "120", "change_lsn": "120", "begin_lsn": "120"}
+        rows = informix_module._replay_between_offsets(
+            start,
+            quiet_end,
+            lambda offset: connector.read_table("app.orders", offset, options),
+            options := {},
+            connector.options,
+        )
+        self.assertEqual([row["id"] for row in rows], [3])
+
+    def test_a_replay_still_fails_short_of_its_end_while_a_transaction_is_open(self):
+        # The original read went idle at 120 with nothing open, so a transaction open
+        # with its BEGIN below 120 is one the replay cannot account for: fail closed.
+        bridge = self._PollBridge(
+            {
+                100: [
+                    {"op": "BEGIN", "tx_id": 8, "lsn": 110},
+                    {"op": "INSERT", "tx_id": 8, "lsn": 111, "row": {"id": 3, "value": "c"}},
+                ]
+                + self._tx(9, 125, {"id": 4, "value": "d"}, 130)
+                + [{"op": "TIMEOUT", "lsn": 150}],
+            }
+        )
+        bridge.now = 150
+        connector = self.connector(bridge)
+        start = _stream_offset(100)
+        quiet_end = {**start, "commit_lsn": "120", "change_lsn": "120", "begin_lsn": "120"}
+        with self.assertRaisesRegex(InformixError, "did not reach its committed end LSN 120"):
+            list(
+                informix_module._replay_between_offsets(
+                    start,
+                    quiet_end,
+                    lambda offset: connector.read_table("app.orders", offset, options),
+                    options := {},
+                    connector.options,
+                )
+            )
+
+    def test_a_replay_fails_when_its_end_transaction_never_arrives(self):
+        # The committed end is transaction 7's commit at 120, but the log the replay
+        # reads has no such transaction: landing on 120 would drop its rows.
+        bridge = self._PollBridge(
+            {
+                100: self._tx(8, 101, {"id": 3, "value": "c"}, 105)
+                + self._tx(9, 125, {"id": 4, "value": "d"}, 130)
+                + [{"op": "TIMEOUT", "lsn": 150}],
+            }
+        )
+        bridge.now = 150
+        connector = self.connector(bridge)
+        start = _stream_offset(100)
+        tx_end = {**start, "commit_lsn": "120", "change_lsn": "120", "begin_lsn": "115", "tx_id": 7}
+        with self.assertRaisesRegex(InformixError, "did not reach its committed end transaction 7"):
+            list(
+                informix_module._replay_between_offsets(
+                    start,
+                    tx_end,
+                    lambda offset: connector.read_table("app.orders", offset, options),
+                    options := {},
+                    connector.options,
+                )
+            )
+
     def test_triggered_stream_stops_at_initial_high_water(self):
         bridge = FakeBridge()
         bridge.now = 105

@@ -6768,6 +6768,21 @@ def register_lakeflow_source(spark):
                     "Informix replay did not reach its committed end LSN "
                     f"{stop_lsn}; reached {reached_lsn}"
                 )
+            # An end that names a transaction is reached only by consuming that transaction.
+            # The read lands on its bound without one only for an end the original read
+            # reached by going idle, so landing there for this end means the replay never
+            # saw the transaction.
+            expected_tx = (end or {}).get("tx_id")
+            if (
+                not initial_range
+                and not replaying_chunk
+                and expected_tx is not None
+                and str(reached.get("tx_id")) != str(expected_tx)
+            ):
+                raise InformixError(
+                    "Informix replay did not reach its committed end transaction "
+                    f"{expected_tx} at LSN {stop_lsn}; reached {reached.get('tx_id')}"
+                )
             expected_incremental = (end or {}).get("incremental")
             reached_incremental = reached.get("incremental")
             if isinstance(expected_incremental, dict):
@@ -18506,6 +18521,35 @@ def register_lakeflow_source(spark):
                     quiet,
                     quiet,
                     quiet,
+                    None,
+                    "stream",
+                    capture_table,
+                    capture_schema_id,
+                    pipeline_scope,
+                    trigger_generation=checkpoint.get("trigger_generation"),
+                    trigger_high_water=checkpoint.get("trigger_high_water"),
+                )
+            # A replay of a range whose original read went idle lands on that idle end even
+            # when the log has since moved on. The replay then delivers a commit beyond its
+            # bound instead of going idle, so it is not drained, but the crossing commit
+            # proves the log reader passed the bound, and every transaction committed below
+            # it was consumed in commit order before the loop broke. A transaction still open
+            # with its BEGIN below the bound keeps the replay short, as before: the original
+            # read went idle with nothing open, so the replay cannot account for it, and a
+            # retry lands once it commits. _replay_between_offsets refuses this landing for
+            # an end that names a transaction the replay did not reach.
+            if (
+                replay_stop is not None
+                and crossed_trigger_boundary
+                and transition_lsn is None
+                and not projection_schema_transition
+                and (open_begin is None or open_begin >= replay_stop)
+                and replay_stop > int(end["commit_lsn"])
+            ):
+                end = _offset(
+                    replay_stop,
+                    replay_stop,
+                    replay_stop,
                     None,
                     "stream",
                     capture_table,
