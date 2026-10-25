@@ -6768,6 +6768,21 @@ def register_lakeflow_source(spark):
                     "Informix replay did not reach its committed end LSN "
                     f"{stop_lsn}; reached {reached_lsn}"
                 )
+            # An end that names a transaction is reached only by consuming that transaction.
+            # The read lands on its bound without one only for an end the original read
+            # reached by going idle, so landing there for this end means the replay never
+            # saw the transaction.
+            expected_tx = (end or {}).get("tx_id")
+            if (
+                not initial_range
+                and not replaying_chunk
+                and expected_tx is not None
+                and str(reached.get("tx_id")) != str(expected_tx)
+            ):
+                raise InformixError(
+                    "Informix replay did not reach its committed end transaction "
+                    f"{expected_tx} at LSN {stop_lsn}; reached {reached.get('tx_id')}"
+                )
             expected_incremental = (end or {}).get("incremental")
             reached_incremental = reached.get("incremental")
             if isinstance(expected_incremental, dict):
@@ -18514,6 +18529,35 @@ def register_lakeflow_source(spark):
                     trigger_generation=checkpoint.get("trigger_generation"),
                     trigger_high_water=checkpoint.get("trigger_high_water"),
                 )
+            # A replay of a range whose original read went idle lands on that idle end even
+            # when the log has since moved on. The replay then delivers a commit beyond its
+            # bound instead of going idle, so it is not drained, but the crossing commit
+            # proves the log reader passed the bound, and every transaction committed below
+            # it was consumed in commit order before the loop broke. A transaction still open
+            # with its BEGIN below the bound keeps the replay short, as before: the original
+            # read went idle with nothing open, so the replay cannot account for it, and a
+            # retry lands once it commits. _replay_between_offsets refuses this landing for
+            # an end that names a transaction the replay did not reach.
+            if (
+                replay_stop is not None
+                and crossed_trigger_boundary
+                and transition_lsn is None
+                and not projection_schema_transition
+                and (open_begin is None or open_begin >= replay_stop)
+                and replay_stop > int(end["commit_lsn"])
+            ):
+                end = _offset(
+                    replay_stop,
+                    replay_stop,
+                    replay_stop,
+                    None,
+                    "stream",
+                    capture_table,
+                    capture_schema_id,
+                    pipeline_scope,
+                    trigger_generation=checkpoint.get("trigger_generation"),
+                    trigger_high_water=checkpoint.get("trigger_high_water"),
+                )
             if reached_trigger_boundary:
                 end = dict(end)
                 end["trigger_generation"] = trigger_generation
@@ -21717,6 +21761,28 @@ def register_lakeflow_source(spark):
         return False
 
 
+    # String types Informix 14.10 shortens in place: the table keeps its tabid, so the stream
+    # carries on. LVARCHAR is not one, nor is a narrower number or DATETIME qualifier: Informix
+    # rebuilds the table under a new tabid for those, which reads as a new table.
+    _SHORTENABLE_STRING_TYPES = frozenset({"CHAR", "NCHAR", "VARCHAR", "NVARCHAR"})
+
+
+    def _shortened(previous: Column, current: Column) -> bool:
+        # Docstring: Whether ``current`` is ``previous`` made shorter and nothing else.
+        #
+        # The destination column is a string either way, so it stays as it is and is never
+        # shrunk. Informix's ALTER truncates existing values longer than the
+        # new length without logging a change per row, so those rows keep their old values in
+        # the destination until they next change or a full refresh.
+
+        return (
+            (previous.name, previous.type_name, previous.nullable, previous.cdc_supported)
+            == (current.name, current.type_name, current.nullable, current.cdc_supported)
+            and previous.type_name in _SHORTENABLE_STRING_TYPES
+            and _string_capacity(current) < _string_capacity(previous)
+        )
+
+
     def _ensure_compatible_schema_change(
         previous: Table,
         current: Table,
@@ -21731,6 +21797,8 @@ def register_lakeflow_source(spark):
         # - widening a column so every old value still fits (see :func:`_widened`); a numeric
         #   widening also widens the Spark type, which the destination adopts in place when
         #   the pipeline enables type widening, and otherwise fails that update loudly;
+        # - shortening a CHAR, NCHAR, VARCHAR, or NVARCHAR column (see :func:`_shortened`),
+        #   which is a string in the destination either way;
         # - dropping a non-key column, NOT NULL or not -- the connector stops reporting it, and
         #   the destination keeps it: an SCD1 row updated afterwards keeps its last value there,
         #   while rows inserted and SCD2 versions written afterwards hold NULL. AUTO CDC creates
@@ -21799,10 +21867,10 @@ def register_lakeflow_source(spark):
                 "before them; run a full refresh"
             )
         for old, new in zip(survivors, current.columns):
-            if old != new and not _widened(old, new):
+            if old != new and not _widened(old, new) and not _shortened(old, new):
                 raise InformixError(
                     f"Informix schema change for '{name}' changed column {old.name} other than "
-                    "by widening it; run a full refresh"
+                    "by widening it or shortening a string; run a full refresh"
                 )
         if any(not column.nullable or not column.cdc_supported for column in additions):
             raise InformixError(

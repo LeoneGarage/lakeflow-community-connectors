@@ -9637,6 +9637,86 @@ class LakeflowContractTests(unittest.TestCase):
         )
         self.assertEqual(list(rows), [])
 
+    def test_a_replay_lands_on_a_quiet_end_with_later_commits_in_the_log(self):
+        # Regression (cycle 4, tw241): a triggered read went idle with nothing open and
+        # moved its offset to where the log reader stopped, 120, past its last commit,
+        # 105; the update was cancelled before Spark committed that batch. By the replay
+        # the log held a later commit, 130, so the poll crossed the replay's bound
+        # instead of going idle -- and the replay ended at 105 on every attempt, short of
+        # 120. Crossing the bound proves every transaction up to it was delivered.
+        bridge = self._PollBridge(
+            {
+                100: self._tx(8, 101, {"id": 3, "value": "c"}, 105)
+                + self._tx(9, 125, {"id": 4, "value": "d"}, 130)
+                + [{"op": "TIMEOUT", "lsn": 150}],
+            }
+        )
+        bridge.now = 150
+        connector = self.connector(bridge)
+        start = _stream_offset(100)
+        quiet_end = {**start, "commit_lsn": "120", "change_lsn": "120", "begin_lsn": "120"}
+        rows = informix_module._replay_between_offsets(
+            start,
+            quiet_end,
+            lambda offset: connector.read_table("app.orders", offset, options),
+            options := {},
+            connector.options,
+        )
+        self.assertEqual([row["id"] for row in rows], [3])
+
+    def test_a_replay_still_fails_short_of_its_end_while_a_transaction_is_open(self):
+        # The original read went idle at 120 with nothing open, so a transaction open
+        # with its BEGIN below 120 is one the replay cannot account for: fail closed.
+        bridge = self._PollBridge(
+            {
+                100: [
+                    {"op": "BEGIN", "tx_id": 8, "lsn": 110},
+                    {"op": "INSERT", "tx_id": 8, "lsn": 111, "row": {"id": 3, "value": "c"}},
+                ]
+                + self._tx(9, 125, {"id": 4, "value": "d"}, 130)
+                + [{"op": "TIMEOUT", "lsn": 150}],
+            }
+        )
+        bridge.now = 150
+        connector = self.connector(bridge)
+        start = _stream_offset(100)
+        quiet_end = {**start, "commit_lsn": "120", "change_lsn": "120", "begin_lsn": "120"}
+        with self.assertRaisesRegex(InformixError, "did not reach its committed end LSN 120"):
+            list(
+                informix_module._replay_between_offsets(
+                    start,
+                    quiet_end,
+                    lambda offset: connector.read_table("app.orders", offset, options),
+                    options := {},
+                    connector.options,
+                )
+            )
+
+    def test_a_replay_fails_when_its_end_transaction_never_arrives(self):
+        # The committed end is transaction 7's commit at 120, but the log the replay
+        # reads has no such transaction: landing on 120 would drop its rows.
+        bridge = self._PollBridge(
+            {
+                100: self._tx(8, 101, {"id": 3, "value": "c"}, 105)
+                + self._tx(9, 125, {"id": 4, "value": "d"}, 130)
+                + [{"op": "TIMEOUT", "lsn": 150}],
+            }
+        )
+        bridge.now = 150
+        connector = self.connector(bridge)
+        start = _stream_offset(100)
+        tx_end = {**start, "commit_lsn": "120", "change_lsn": "120", "begin_lsn": "115", "tx_id": 7}
+        with self.assertRaisesRegex(InformixError, "did not reach its committed end transaction 7"):
+            list(
+                informix_module._replay_between_offsets(
+                    start,
+                    tx_end,
+                    lambda offset: connector.read_table("app.orders", offset, options),
+                    options := {},
+                    connector.options,
+                )
+            )
+
     def test_triggered_stream_stops_at_initial_high_water(self):
         bridge = FakeBridge()
         bridge.now = 105
@@ -15712,6 +15792,10 @@ class SchemaEvolutionTests(_TableOptionTestCase):
                 "VARCHAR min length only",
                 [self.ID, self.column("v", length=20 + 5 * 256), self.column("w", "SMALLINT", 2)],
             ),
+            (
+                "shorter VARCHAR",
+                [self.ID, self.column("v", length=10), self.column("w", "SMALLINT", 2)],
+            ),
         ):
             with self.subTest(name):
                 ensure(base, self.table(current))
@@ -15731,9 +15815,9 @@ class SchemaEvolutionTests(_TableOptionTestCase):
         base = self.table([self.ID, self.column("v"), self.column("n", nullable=False)])
         for name, current, message in (
             (
-                "shorter",
-                [self.ID, self.column("v", length=10), self.column("n", nullable=False)],
-                "other than by widening",
+                "string retyped",
+                [self.ID, self.column("v", "CHAR", 20), self.column("n", nullable=False)],
+                "other than by widening it or shortening a string",
             ),
             (
                 "nullability",
@@ -15855,6 +15939,40 @@ class SchemaEvolutionTests(_TableOptionTestCase):
         )
         with self.assertRaisesRegex(InformixError, "include_columns.*changed"):
             ensure(before, still_there)
+
+    def test_shorter_strings_are_accepted(self):
+        def column(type_name, length, nullable=True):
+            return Column(name="s", type_name=type_name, length=length, nullable=nullable)
+
+        shortened = informix_module._shortened
+        # Informix 14.10 shortens these in place, keeping the table's tabid.
+        for type_name in ("CHAR", "NCHAR", "VARCHAR", "NVARCHAR"):
+            with self.subTest(type_name):
+                self.assertTrue(shortened(column(type_name, 30), column(type_name, 10)))
+        for old, new in (
+            # It rebuilds the table under a new tabid for an LVARCHAR change.
+            (column("LVARCHAR", 100), column("LVARCHAR", 20)),
+            (column("VARCHAR", 10), column("VARCHAR", 30)),  # a widening
+            (column("VARCHAR", 30), column("CHAR", 10)),  # another type
+            (column("VARCHAR", 30), column("VARCHAR", 10, nullable=False)),
+            (Column(name="s", type_name="BIGINT"), Column(name="s", type_name="INTEGER")),
+        ):
+            with self.subTest(f"not {old.type_name} to {new.type_name}"):
+                self.assertFalse(shortened(old, new))
+
+    def test_a_shortened_string_transitions_a_running_stream(self):
+        bridge = _ProjectingBridge()
+        connector, checkpoint = self.stream(bridge, {})
+        bridge.tables[0]["columns"][1]["length"] = 5  # ALTER ... MODIFY (value VARCHAR(5))
+        upserts, _ = self.changes(
+            connector, bridge, checkpoint, {}, ("INSERT", {"id": 3, "value": "abcde", "extra": 1})
+        )
+        schema = connector.get_table_schema("app.orders", {})
+
+        self.assertEqual(upserts, [(3, "c")])
+        self.assertEqual(
+            type({f.name: f.dataType for f in schema.fields}["value"]).__name__, "StringType"
+        )
 
     def test_a_widened_column_transitions_a_running_stream(self):
         bridge = _ProjectingBridge()
