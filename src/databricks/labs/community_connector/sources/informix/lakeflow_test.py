@@ -15974,6 +15974,60 @@ class SchemaEvolutionTests(_TableOptionTestCase):
             type({f.name: f.dataType for f in schema.fields}["value"]).__name__, "StringType"
         )
 
+    def test_a_shortened_key_column_needs_a_full_refresh(self):
+        # Informix truncates the existing keys without logging a change, so the rows
+        # already landed would no longer match by key.
+        ensure = informix_module._ensure_compatible_schema_change
+
+        def code(length):
+            return self.column("code", "CHAR", length, nullable=False)
+
+        keyed = self.table([code(10), self.column("v")], keys=("code",))
+        with self.assertRaisesRegex(
+            InformixError, "shortened key column code: .*no longer match.*run a full refresh"
+        ):
+            ensure(keyed, self.table([code(5), self.column("v")], keys=("code",)))
+        # A shorter non-key column of the same table carries on.
+        ensure(keyed, self.table([code(10), self.column("v", length=5)], keys=("code",)))
+
+        def whole_row(length):
+            table = self.table([self.ID, self.column("v", length=length)], keys=("id", "v"))
+            return dataclasses.replace(table, key_override=True, key_wildcard=True)
+
+        with self.assertRaisesRegex(
+            InformixError, "shortened key column v \\(every column is in its primary.keys='\\*'"
+        ):
+            ensure(whole_row(20), whole_row(5))
+
+    def test_a_shortened_column_of_a_whole_row_key_fails_the_read(self):
+        options = {"primary.keys": "*"}
+        bridge = FakeBridge()
+        bridge.tables = [_table(primary_keys=())]
+        _, checkpoint = self.stream(bridge, options)
+        bridge.tables[0]["columns"][1]["length"] = 5  # ALTER ... MODIFY (value VARCHAR(5))
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+
+        with self.assertRaisesRegex(InformixError, "shortened key column value"):
+            rows, _ = self.connector(bridge).read_table("app.orders", checkpoint, options)
+            list(rows)
+
+    def test_a_shortened_string_carries_on_during_an_incremental_copy(self):
+        # The copy pages by the key, which the shortened column isn't part of.
+        options = {"snapshot.mode": "incremental", "snapshot.page.size": "1"}
+        bridge = FakeBridge()
+        connector = self.connector(bridge)
+        _, checkpoint = connector.read_table("app.orders", {}, options)
+        self.assertIn("incremental", checkpoint, "the copy must still be in progress")
+        bridge.tables[0]["columns"][1]["length"] = 5
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+
+        rows, resumed = self.connector(bridge).read_table("app.orders", checkpoint, options)
+        list(rows)
+
+        self.assertNotEqual(resumed["schema_id"], checkpoint["schema_id"])
+
     def test_a_widened_column_transitions_a_running_stream(self):
         bridge = _ProjectingBridge()
         connector, checkpoint = self.stream(bridge, {})

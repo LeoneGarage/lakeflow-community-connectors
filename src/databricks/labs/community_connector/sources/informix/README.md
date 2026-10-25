@@ -608,7 +608,10 @@ without a full refresh:
   each row, so those rows keep their old, longer values in the destination until they
   next change or a full refresh. Changes logged before the `ALTER` but read after it
   arrive cut to the new length, as the source now holds them (checked live on all four
-  types).
+  types). Shortening a key column needs a full refresh instead, and so does shortening
+  any column of a table keyed with `primary.keys: "*"`, where every column is in the key:
+  the truncated keys would no longer match the rows already landed, so later updates
+  and deletes would miss them.
 - **`SMALLINT` to `INTEGER`:** both arrive as integers, so the destination column doesn't
   change.
 - **Wider numeric types:** `SMALLINT` or `INTEGER` (including `SERIAL`) to `BIGINT` or
