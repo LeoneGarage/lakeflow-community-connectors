@@ -57,10 +57,13 @@ Informix CDC can hold changes back for minutes, so a triggered update often ends
 before reading them: each step keeps running updates until the heartbeat arrives,
 for up to HEARTBEAT_BUDGET_SECONDS, and reports how many it needed. A heartbeat that
 never arrives means CDC stopped delivering -- on the demo server that has happened
-server-wide, and only a container restart clears it. The probe then records the
-stall with the server's CDC state, restarts the container (which rebuilds testdb, so
-the probe tables are gone), recreates the tables as the stalled phase found them,
-checks a full refresh of them, and reruns that phase; at most MAX_RESTARTS times.
+server-wide, and only restarting Informix clears it. The probe then records the stall
+with the server's CDC state and restarts the Informix engine inside the container,
+which keeps testdb and the probe tables, resets the tables to the rows the stalled
+phase found, checks a full refresh of them, and reruns that phase; at most
+MAX_RESTARTS times. A phase that had already changed the tables' DDL can't be reset in
+place, so then the container is restarted instead: it rebuilds testdb, dropping every
+table, and the probe recreates its tables as the phase found them.
 
 Usage (from the repo root, with the repo virtualenv):
 
@@ -83,6 +86,7 @@ import copy
 import datetime
 import decimal
 import json
+import os
 import pathlib
 import random
 import re
@@ -113,6 +117,16 @@ STALL_DIAGNOSTICS = r"""
 onstat -l | awk '$3 ~ /^U/ && $3 ~ /C/'
 onstat -g cdc config 2>&1 | sed -n '4,40p'
 grep -E 'Checkpoint Completed|CDC:' /opt/ibm/data/logs/online.log | tail -20
+"""
+
+
+# What informix_stop.sh and informix_online.sh run, waiting for On-Line (onstat - says so).
+ENGINE_RESTART = r"""
+export APP_VENDOR_DIR=ibm
+. /opt/ibm/scripts/informix_inf.env
+timeout 60 onmode -kuy; echo "__ONMODE=$?"
+oninit -w 300 </dev/null; echo "__ONINIT=$?"
+onstat - | sed -n 2p
 """
 
 
@@ -200,6 +214,19 @@ class Informix:
         )
         return C.wait_ssm(self.args, C.send_ssm(self.args, command), 600)
 
+    def restart_engine(self) -> None:
+        """Restart the Informix engine inside the container; testdb and every table stay.
+
+        This clears a CDC stall -- the shared log reader lives in engine memory -- without
+        the container restart's testdb rebuild. Every connection drops, so stop the
+        pipelines first. ``informix_entry.sh`` runs the rebuild only at container start
+        and then just tails the message log, so the container keeps running meanwhile.
+        """
+        out = self.shell(ENGINE_RESTART)
+        if "On-Line" not in out.split("__ONINIT=")[-1]:
+            raise RuntimeError(f"the Informix engine did not come back On-Line:\n{out[-2000:]}")
+        log("restarted the Informix engine")
+
     def restart(self) -> None:
         """Restart the container and wait for it to rebuild testdb.
 
@@ -283,11 +310,17 @@ class Databricks:
 
     def cli(self, *args: str, input_json: dict | None = None) -> Any:
         command = ["databricks", *args, "-p", self.profile, "-o", "json"]
+        path = None
         if input_json is not None:
             with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
                 json.dump(input_json, handle)
-            command += ["--json", f"@{handle.name}"]
-        done = subprocess.run(command, capture_output=True, text=True, check=False)
+            path = handle.name
+            command += ["--json", f"@{path}"]
+        try:
+            done = subprocess.run(command, capture_output=True, text=True, check=False)
+        finally:
+            if path is not None:
+                os.unlink(path)
         if done.returncode != 0:
             raise RuntimeError(f"databricks {' '.join(args[:2])} failed: {done.stderr.strip()}")
         return json.loads(done.stdout) if done.stdout.strip() else None
@@ -362,21 +395,24 @@ class Pipeline:
         spec["continuous"] = continuous
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
             json.dump(spec, handle)
-        subprocess.run(
-            [
-                "databricks",
-                "pipelines",
-                "update",
-                self.id,
-                "-p",
-                self.dbx.profile,
-                "--json",
-                f"@{handle.name}",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+        try:
+            subprocess.run(
+                [
+                    "databricks",
+                    "pipelines",
+                    "update",
+                    self.id,
+                    "-p",
+                    self.dbx.profile,
+                    "--json",
+                    f"@{handle.name}",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        finally:
+            os.unlink(handle.name)
 
     def latest_update(self) -> str | None:
         updates = self.dbx.cli("pipelines", "get", self.id).get("latest_updates") or []
@@ -550,7 +586,7 @@ def lit(value: str | None) -> str:
 class Probe:
     def __init__(self, cli: argparse.Namespace) -> None:
         self.cli = cli
-        self.run_id = datetime.datetime.now(datetime.timezone.utc).strftime("%m%d%H%M")
+        self.run_id = datetime.datetime.now(datetime.timezone.utc).strftime("%m%d%H%M%S")
         self.prefix = f"kstar_{self.run_id}"
         self.variants = {
             "s1": f"{self.prefix}_s1",
@@ -714,15 +750,17 @@ class Probe:
         log(f"created pipeline {self.pipeline.id}")
 
     def teardown(self) -> None:
-        if self.cli.keep or self.pipeline is None:
+        if self.cli.keep:
             log("kept the pipeline, schema and workspace folder (--keep)")
             return
-        self.pipeline.stop()
-        subprocess.run(
-            ["databricks", "pipelines", "delete", self.pipeline.id, "-p", self.cli.profile],
-            capture_output=True,
-            check=False,
-        )
+        # Setup may have failed part way: clean up whatever it got to.
+        if self.pipeline is not None:
+            self.pipeline.stop()
+            subprocess.run(
+                ["databricks", "pipelines", "delete", self.pipeline.id, "-p", self.cli.profile],
+                capture_output=True,
+                check=False,
+            )
         # Deleting the pipeline can leave its __materialization_* storage tables behind.
         leftovers = self.dbx.sql(
             f"SELECT table_name FROM {self.cli.catalog}.information_schema.tables "
@@ -751,8 +789,8 @@ class Probe:
             check=False,
         )
         log(
-            "deleted the pipeline, its destination tables and the workspace folder; "
-            f"Informix tables {self.prefix}_* are left in place"
+            "deleted the pipeline, its destination tables and the workspace folder, as far as "
+            f"they were created; Informix tables {self.prefix}_* are left in place"
         )
 
     # -- Informix changes, applied to every variant table and to the model
@@ -775,6 +813,18 @@ class Probe:
         statements += f"INSERT INTO informix.{self.heartbeat} VALUES (1, {self.beat});\n"
         self.ifx.sql(statements)
         log(f"created Informix tables {self.prefix}_s1/_s2/_log/_hb holding {len(rows)} rows")
+
+    def reset_tables(self, rows: list[tuple] = ()) -> None:
+        """Put the variant tables back to holding ``rows``, in place: no table is dropped."""
+        statements = self.each("DELETE FROM informix.{t};")
+        for row in rows:
+            values = ", ".join(lit(value) for value in row)
+            statements += self.each(
+                f"INSERT INTO informix.{{t}} ({', '.join(self.ddl)}) VALUES ({values});"
+            )
+        statements += f"UPDATE informix.{self.heartbeat} SET n = {self.beat} WHERE id = 1;\n"
+        self.ifx.sql(statements)
+        log(f"reset Informix tables {self.prefix}_s1/_s2/_log to {len(rows)} rows")
 
     def insert(self, *rows: tuple) -> str:
         sql = ""
@@ -1077,10 +1127,13 @@ class Probe:
         return [row[0] for row in beat] == [str(self.beat)]
 
     def recover(self, phase: str, stall: Stalled, saved: tuple) -> None:
-        """Restart the container after a stall and rebuild the tables as ``phase`` found them.
+        """Clear a stall and put the tables back as ``phase`` found them.
 
-        The phase's own results are discarded with it; the stall is reported separately,
-        with the server's CDC state, since it is not a connector check.
+        An engine restart clears the stall and keeps testdb, so the tables are reset in
+        place. Only a phase that had already changed the tables' DDL needs the container
+        restart, which rebuilds testdb, so the tables can be created afresh. The phase's
+        own results are discarded with it; the stall is reported separately, with the
+        server's CDC state, since it is not a connector check.
         """
         model, ddl, results = saved
         self.stalls.append(
@@ -1093,16 +1146,23 @@ class Probe:
         )
         if len(self.stalls) > MAX_RESTARTS:
             raise RuntimeError(f"CDC stalled {len(self.stalls)} times; giving up") from stall
-        log(f"STALL {stall}; restarting the Informix container (it rebuilds testdb)")
         self.pipeline.stop()
         if self.cli.mode == "triggered":
             self.pipeline.set_continuous(False)
-        self.ifx.restart()
+        ddl_changed = self.ddl != ddl
         self.model, self.ddl = model, ddl
         del self.results[results:]
         if list(self.ddl) != self.model.columns:
             raise RuntimeError(f"saved columns {list(self.ddl)} != model {self.model.columns}")
-        self.create_tables(self.model.source)
+        if ddl_changed:
+            log(f"STALL {stall}; the phase changed the tables' DDL, so restarting the "
+                "Informix container (it rebuilds testdb)")
+            self.ifx.restart()
+            self.create_tables(self.model.source)
+        else:
+            log(f"STALL {stall}; restarting the Informix engine (testdb and the tables stay)")
+            self.ifx.restart_engine()
+            self.reset_tables(self.model.source)
         if not self.model.source:  # before the initial snapshot: the phase reloads itself
             self.refresh_next = True
             return
@@ -1427,10 +1487,10 @@ class Probe:
         if start > 1:
             self.fast_forward(start - 1)
             log(f"replayed phases 1-{start - 1} on the model; starting at phase {start}")
-        self.create_tables(self.model.source)
-        self.deploy()
-        self.create_pipeline()
         try:
+            self.create_tables(self.model.source)
+            self.deploy()
+            self.create_pipeline()
             if start > 1:
                 self.run_update(f"{start} start", full_refresh=True)
                 self.model.full_refresh()
@@ -1458,7 +1518,7 @@ class Probe:
         if self.lagged:
             log("updates that ended before reading every change: " + "; ".join(self.lagged))
         for stall in self.stalls:
-            log(f"CDC stalled in {stall['phase']} ({stall['stall']}); the container was restarted")
+            log(f"CDC stalled in {stall['phase']} ({stall['stall']}); Informix was restarted")
         for note in self.skipped:
             log(f"not reached: {note}")
         if self.cli.report:

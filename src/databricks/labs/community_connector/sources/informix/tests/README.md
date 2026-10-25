@@ -162,11 +162,14 @@ Two behaviours of the demo server shape the probe:
   destination short re-checks (continuous) or runs more updates (triggered) within the
   same budget before it fails. Wrong rows stay wrong; late ones settle and are reported.
 - **Server-wide CDC stalls.** If the heartbeat never arrives, CDC has stopped
-  delivering for every session on the server; only a container restart clears it. The
+  delivering for every session on the server; only restarting Informix clears it. The
   probe records the stall with the server's CDC state (`stalls` in the report),
-  restarts the container — which rebuilds `testdb` and starts the demo workload —
-  recreates the tables as the stalled phase found them, checks a full refresh, and
-  reruns that phase, at most three times per run.
+  restarts the Informix engine inside the container (`onmode -kuy`, then `oninit -w`),
+  which keeps `testdb` and every table, resets the probe tables to the rows the stalled
+  phase found, checks a full refresh, and reruns that phase, at most three times per
+  run. If the phase had already changed the tables' DDL, the probe restarts the
+  container instead, which rebuilds `testdb` (dropping every table on the server) and
+  starts the demo workload, and recreates its tables as the phase found them.
 
 Phase 9 retries its DDL until it lands between two polls of the running update. If
 none of 40 tries gets through, the drop is applied with the pipeline stopped, the
