@@ -96,11 +96,11 @@ def run(command: list[str], *, input_text: str | None = None) -> str:
 
 
 def _profile_flags(args: argparse.Namespace) -> list[str]:
-    """Return ``--profile <name>`` unless running on ambient credentials.
+    """Return ``--profile <name>`` when ``--aws-profile`` names one.
 
-    With ``--ambient-creds`` (``aws_profile`` is None) every AWS call uses the
-    default credential chain, mirroring how the count-comparison helper drives
-    the same host without an SSO profile.
+    By default (``aws_profile`` is None) every AWS call uses the default
+    credential chain, mirroring how the count-comparison helper drives the same
+    host without an SSO profile.
     """
 
     return ["--profile", args.aws_profile] if args.aws_profile else []
@@ -614,16 +614,21 @@ def cleanup(args: argparse.Namespace, run_id: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--aws-profile", default="aws-sandbox-field-eng_databricks-sandbox-admin")
-    # Drop the profile entirely and use the default credential chain. Handy for
-    # unattended runs where no SSO session exists: the ambient IAM keys reach the
-    # same SSM host and S3 bucket, and presigning omits the (absent) session token.
+    # The default credential chain, as the count comparison uses: the ambient IAM keys
+    # reach the same SSM host and S3 bucket with no SSO session to expire mid-run, and
+    # presigning omits the (absent) session token. --aws-profile names a profile instead.
+    parser.add_argument(
+        "--aws-profile",
+        default=None,
+        help="AWS profile to use (for example an SSO profile); default: ambient credentials.",
+    )
+    # Kept so existing commands still run: it is now the default.
     parser.add_argument(
         "--ambient-creds",
         action="store_const",
         const=None,
         dest="aws_profile",
-        help="Use default AWS credentials instead of --aws-profile (no SSO required).",
+        help="Use the default AWS credentials (the default; overrides --aws-profile).",
     )
     parser.add_argument("--aws-region", default="us-east-1")
     # Resolved from --instance-name at run time unless given explicitly; the
