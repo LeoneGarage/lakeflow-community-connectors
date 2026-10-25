@@ -1204,6 +1204,10 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertTrue(column["cdc_supported"])
         mixed = _catalog_column({"colname": "bad", "coltype": 14, "collength": 0x0624, "colno": 3})
         self.assertFalse(mixed["cdc_supported"])
+        fraction = _catalog_column(
+            {"colname": "jitter", "coltype": 14, "collength": 0x03CD, "colno": 4}
+        )  # FRACTION TO FRACTION(3)
+        self.assertTrue(fraction["cdc_supported"])
 
     def test_an_interval_column_streams_and_lands_as_a_string(self):
         bridge = FakeBridge()
@@ -1221,6 +1225,7 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(type(fields["elapsed"]).__name__, "StringType")
         # UNLOAD right-aligns the text; the file path lands it as the decoders do.
         self.assertEqual(informix_module._unload_value("  -5 10:30:00", "INTERVAL"), "-5 10:30:00")
+        self.assertEqual(informix_module._unload_value(" .016", "INTERVAL"), ".016")
 
     def test_an_interval_key_is_copied_by_the_blocking_snapshot(self):
         raw = _table()
