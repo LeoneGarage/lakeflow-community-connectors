@@ -459,11 +459,11 @@ The types without a CDC encoding are also the ones the snapshot reader can't mat
 
 | CDC status | Informix types |
 |---|---|
-| Live-validated end to end | `SMALLINT`, `INTEGER`/`INT`, `SERIAL`, `INT8`, `SERIAL8`, `BIGINT`, `BIGSERIAL`, `FLOAT`/`DOUBLE`, `REAL`/`SMALLFLOAT`, `DECIMAL`/`NUMERIC`, `MONEY`, `DATE`, supported `DATETIME` qualifiers, `INTERVAL`, `BOOLEAN`, `CHAR`, `VARCHAR`/`NVARCHAR`, `LVARCHAR` |
-| Rejected before ingestion | `BYTE`, `TEXT`, `BLOB`, `CLOB`, `NCHAR`, complex and opaque types |
+| Live-validated end to end | `SMALLINT`, `INTEGER`/`INT`, `SERIAL`, `INT8`, `SERIAL8`, `BIGINT`, `BIGSERIAL`, `FLOAT`/`DOUBLE`, `REAL`/`SMALLFLOAT`, `DECIMAL`/`NUMERIC`, `MONEY`, `DATE`, supported `DATETIME` qualifiers, `INTERVAL`, `BOOLEAN`, `CHAR`, `NCHAR`, `VARCHAR`/`NVARCHAR`, `LVARCHAR` |
+| Rejected before ingestion | `BYTE`, `TEXT`, `BLOB`, `CLOB`, complex and opaque types |
 | Excluded from speculative decoding | Unknown catalog types, UDT and complex types such as `ROW`, `SET`, `LIST`, and `MULTISET` |
 
-`INT8` and `SERIAL8` use Informix's complete ten-byte signed-magnitude CDC representation. `LVARCHAR` supports its variable-width ordinary SQLI snapshot envelope and native CDC representation. A `DATETIME` qualifier is CDC-capable when its start and end fields are supported by the native decoder. Values containing `YEAR` through at least `DAY` are exposed as timezone-free Spark timestamps. `HOUR`-based values are SQL TIME strings such as `13:03:36.93100`; other partial values remain qualifier-aware strings and never acquire the worker's current date.
+`INT8` and `SERIAL8` use Informix's complete ten-byte signed-magnitude CDC representation. `NCHAR` lands as `CHAR` does, without its blank padding; it differs only in collating by the database locale, which limits it in `row_filter` (see [Row filtering](#row-filtering)). `LVARCHAR` supports its variable-width ordinary SQLI snapshot envelope and native CDC representation. A `DATETIME` qualifier is CDC-capable when its start and end fields are supported by the native decoder. Values containing `YEAR` through at least `DAY` are exposed as timezone-free Spark timestamps. `HOUR`-based values are SQL TIME strings such as `13:03:36.93100`; other partial values remain qualifier-aware strings and never acquire the worker's current date.
 
 `INTERVAL` lands as a string, because Delta tables can't store Spark's interval types. The string is Informix's own literal for the value with its padding trimmed: the first field unpadded, the others two digits each, the fraction at its declared width, and a leading `-` when negative. For example, `INTERVAL DAY(3) TO FRACTION(3)` gives `-12 13:14:15.016`, `YEAR TO MONTH` gives `1-02`, and `HOUR TO MINUTE` gives `10:30`. `FRACTION TO FRACTION(n)` has no field before the point, so `FRACTION TO FRACTION(3)` gives `.016`, `-.016`, and `.000`. Snapshots, file loads, and the change stream all produce the same text, which matches `TRIM(CAST(col AS VARCHAR(40)))` on the server. That was checked against a live Informix 14.10 on fifteen qualifiers covering every start field, leading precisions up to 9, and fractions of 1, 3, and 5 digits, with positive, negative, zero, and NULL values. The text doesn't sort by duration, so a snapshot keyed on an `INTERVAL` column copies the table in one consistent snapshot instead of in incremental chunks. `row_filter` can't filter on an `INTERVAL` column.
 
@@ -597,8 +597,8 @@ A normal pipeline restart adopts these Informix schema changes on a streaming ta
 without a full refresh:
 
 - **Appended columns:** nullable, CDC-supported columns added after every existing one.
-- **Longer strings:** a `CHAR`, `VARCHAR`, `NVARCHAR`, or `LVARCHAR` column made longer,
-  with its type and nullability unchanged. It still arrives as a string, so the
+- **Longer strings:** a `CHAR`, `NCHAR`, `VARCHAR`, `NVARCHAR`, or `LVARCHAR` column made
+  longer, with its type and nullability unchanged. It still arrives as a string, so the
   destination column doesn't change.
 - **`SMALLINT` to `INTEGER`:** both arrive as integers, so the destination column doesn't
   change.
@@ -1062,8 +1062,8 @@ destination.
 - **Names:** every name must be a column of the table, so a typo fails instead of letting
   in a column you meant to keep out. After dropping a listed column at the source, take
   it out of the list; that edit needs no full refresh.
-- **Unsupported types:** a table with a BYTE, TEXT, BLOB, CLOB, NCHAR, or
-  collection column is otherwise rejected. Leave those columns out and the rest of the
+- **Unsupported types:** a table with a BYTE, TEXT, BLOB, CLOB, or collection
+  column is otherwise rejected. Leave those columns out and the rest of the
   table is ingested, with its changes streamed.
 - **Changing the selection:** on a running table this fails closed, because rows already
   landed were read under the old selection. Run a full refresh to apply the new one.
@@ -1203,12 +1203,12 @@ on change images. That limits it to:
 - **Values:** numbers, `'quoted strings'` (double a quote to include one), `TRUE` and
   `FALSE`, `DATE 'YYYY-MM-DD'`, and `TIMESTAMP 'YYYY-MM-DD HH:MM:SS[.ffffff]'`. A
   `TIMESTAMP` can't be more precise than the column's `DATETIME` qualifier.
-- **Columns:** numeric (except `FLOAT` and `SMALLFLOAT`), `CHAR`, `VARCHAR`, `LVARCHAR`,
-  `NVARCHAR`, `BOOLEAN`, `DATE`, and `DATETIME YEAR TO DAY` or finer. Each value must
-  match its column's type.
+- **Columns:** numeric (except `FLOAT` and `SMALLFLOAT`), `CHAR`, `NCHAR`, `VARCHAR`,
+  `LVARCHAR`, `NVARCHAR`, `BOOLEAN`, `DATE`, and `DATETIME YEAR TO DAY` or finer. Each
+  value must match its column's type.
 - **Strings:** compare by code point with trailing spaces ignored, which is Informix's
-  `CHAR` and `VARCHAR` order in ISO 8859-1 and UTF-8 databases. `NVARCHAR` collates by
-  locale, so it only takes `=`, `<>`, `IN`, and `LIKE`.
+  `CHAR` and `VARCHAR` order in ISO 8859-1 and UTF-8 databases. `NCHAR` and `NVARCHAR`
+  collate by locale, so they only take `=`, `<>`, `IN`, and `LIKE`.
 - **`LIKE`:** `%` matches any run of characters and `_` matches one. Matching is
   case-sensitive and ignores trailing blanks in both the value and the pattern, as
   Informix does on every string type. A backslash makes the next character literal

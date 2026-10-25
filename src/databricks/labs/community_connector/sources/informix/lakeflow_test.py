@@ -1209,6 +1209,15 @@ class LakeflowContractTests(unittest.TestCase):
         )  # FRACTION TO FRACTION(3)
         self.assertTrue(fraction["cdc_supported"])
 
+    def test_catalog_accepts_nchar(self):
+        column = _catalog_column({"colname": "code", "coltype": 15, "collength": 10, "colno": 2})
+        self.assertEqual((column["type_name"], column["length"]), ("NCHAR", 10))
+        self.assertTrue(column["cdc_supported"])
+        raw = _table()
+        raw["columns"].append({"name": "code", "type_name": "NCHAR", "length": 10})
+        table = Table.parse(raw, "demo")
+        self.assertEqual(informix_module._snapshot_unsupported_columns(table), ())
+
     def test_an_interval_column_streams_and_lands_as_a_string(self):
         bridge = FakeBridge()
         raw = _table()
@@ -15706,6 +15715,10 @@ class SchemaEvolutionTests(_TableOptionTestCase):
         ):
             with self.subTest(name):
                 ensure(base, self.table(current))
+        ensure(
+            self.table([self.ID, self.column("c", "NCHAR", 10)]),
+            self.table([self.ID, self.column("c", "NCHAR", 20)]),
+        )
         # AUTO CDC creates every target column nullable, even from a NOT NULL source, so
         # a dropped NOT NULL column just holds NULL in later rows, like a nullable one.
         ensure(
@@ -15936,6 +15949,8 @@ class RowFilterTests(_TableOptionTestCase):
         float_table["columns"][2]["type_name"] = "FLOAT"
         nvarchar_table = _wide_table()
         nvarchar_table["columns"][1]["type_name"] = "NVARCHAR"
+        nchar_table = _wide_table()
+        nchar_table["columns"][1].update(type_name="NCHAR", length=10)
         for text, raw, message in (
             ("extra = NULL", None, "IS NULL"),
             ("extra >", None, "expected a value"),
@@ -15945,6 +15960,7 @@ class RowFilterTests(_TableOptionTestCase):
             ("extra ~ 1", None, "unexpected character"),
             ("extra = 1.5", float_table, "cannot filter on FLOAT"),
             ("value > 'a'", nvarchar_table, "only test NVARCHAR column value for equality"),
+            ("value BETWEEN 'a' AND 'b'", nchar_table, "only test NCHAR column value for"),
             ("id = DATE '2024-02-30'", None, "valid calendar"),
         ):
             with self.subTest(text):
@@ -16123,6 +16139,9 @@ class RowFilterTests(_TableOptionTestCase):
         nvarchar_table = _wide_table()
         nvarchar_table["columns"][1]["type_name"] = "NVARCHAR"
         self.filtered_table("value LIKE 'a%'", nvarchar_table)  # NVARCHAR takes LIKE
+        nchar_table = _wide_table()
+        nchar_table["columns"][1].update(type_name="NCHAR", length=10)
+        self.filtered_table("value LIKE 'a%' OR value IN ('b', 'c')", nchar_table)
         for text, message in (
             ("extra LIKE '1%'", "only apply LIKE to a string column"),
             ("value LIKE 1", "needs a quoted pattern"),
@@ -16249,14 +16268,18 @@ class RowFilterTests(_TableOptionTestCase):
 
     def test_a_char_operand_is_padded_to_its_byte_width(self):
         # Informix pads a CHAR(4) to four bytes: '\u00e9' is two bytes in UTF-8, so the padded
-        # value is three characters, and one byte in ISO 8859-1, so four.
-        raw = _table()
-        raw["columns"].append({"name": "code", "type_name": "CHAR", "length": 4})
-        table = informix_module._apply_row_filter(Table.parse(raw, "demo"), "CHAR_LENGTH(code) = 3")
+        # value is three characters, and one byte in ISO 8859-1, so four. NCHAR pads alike.
         matches = informix_module._row_filter_matches
         predicate = informix_module._row_filter_predicate
-        self.assertTrue(matches(predicate(table, "utf-8"), {"code": "\u00e9"}))
-        self.assertFalse(matches(predicate(table, "latin-1"), {"code": "\u00e9"}))
+        for type_name in ("CHAR", "NCHAR"):
+            with self.subTest(type_name):
+                raw = _table()
+                raw["columns"].append({"name": "code", "type_name": type_name, "length": 4})
+                table = informix_module._apply_row_filter(
+                    Table.parse(raw, "demo"), "CHAR_LENGTH(code) = 3"
+                )
+                self.assertTrue(matches(predicate(table, "utf-8"), {"code": "\u00e9"}))
+                self.assertFalse(matches(predicate(table, "latin-1"), {"code": "\u00e9"}))
 
     def test_file_records_count_length_in_the_connection_database_locale(self):
         # DB_LOCALE is a connection option: an executor's filter must read it from there
