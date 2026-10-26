@@ -15993,7 +15993,10 @@ class UnsupportedColumnTests(_TableOptionTestCase):
                     connector.read_table_metadata("app.orders", dict(options))
                 with self.assertRaisesRegex(InformixError, r"cannot materialize: extra"):
                     connector.get_table_schema("app.orders", dict(options))
-        for options, key in (({"primary.keys": "id"}, ["id"]), ({"primary.keys": "*"}, ["id", "value"])):
+        for options, key in (
+            ({"primary.keys": "id"}, ["id"]),
+            ({"primary.keys": "*"}, ["id", "value"]),
+        ):
             with self.subTest(options=options):
                 metadata = connector.read_table_metadata("app.orders", dict(options))
                 self.assertEqual(metadata["primary_keys"], key)
@@ -16410,6 +16413,24 @@ class SchemaEvolutionTests(_TableOptionTestCase):
         bridge.changes = [{"op": "TIMEOUT", "lsn": 200}]
         with self.assertRaisesRegex(InformixError, "cannot materialize: id"):
             connector.read_table("app.orders", checkpoint, {})
+
+    def test_a_recreated_table_reports_its_new_identity_before_a_retyped_column(self):
+        # Informix can't convert a column to TEXT or BYTE in place (-608), so a column that
+        # comes back as TEXT came with a re-created table under a new tabid: that is the
+        # change to report, not the column.
+        ensure = informix_module._ensure_compatible_schema_change
+        text = {"name": "w", "type_name": "TEXT", "nullable": True, "cdc_supported": False}
+        base = dataclasses.replace(
+            self.table([self.ID, self.column("v"), self.column("w")], keys=()), incarnation="137"
+        )
+        fresh = dataclasses.replace(
+            self.table([self.ID, self.column("v"), text], keys=()), incarnation="144"
+        )
+        current = informix_module._leave_out_unsupported_columns(fresh, fresh.primary_keys)
+        with self.assertRaisesRegex(InformixError, "changed table identity"):
+            ensure(base, current)
+        with self.assertRaisesRegex(InformixError, r"type the connector can't read: w \(TEXT\)"):
+            ensure(base, dataclasses.replace(current, incarnation="137"))
 
     def test_a_column_changed_to_an_unsupported_type_needs_a_full_refresh(self):
         # Left out, it would otherwise pass as a dropped column and stop updating silently.

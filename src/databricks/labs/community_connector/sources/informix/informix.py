@@ -16409,13 +16409,6 @@ def _ensure_compatible_schema_change(
     current_names = {column.name for column in current.columns}
     survivors = [column for column in previous.columns if column.name in current_names]
     dropped = [column for column in previous.columns if column.name not in current_names]
-    unsupported = {column.name: column for column in current.unsupported_columns}
-    retyped = [unsupported[column.name] for column in dropped if column.name in unsupported]
-    if retyped:
-        raise InformixError(
-            f"Informix schema change for '{name}' changed column(s) to a type the connector "
-            f"can't read: {_unsupported_column_list(retyped)}; run a full refresh"
-        )
     additions = current.columns[len(survivors) :]
     keys_match = previous.primary_keys == current.primary_keys
     shrunk = False
@@ -16454,6 +16447,16 @@ def _ensure_compatible_schema_change(
         raise InformixError(
             f"Informix schema change for '{name}' changed table identity or primary keys; "
             "run a full refresh"
+        )
+    # Checked after the identity: Informix can't convert a column to TEXT or BYTE in place
+    # (-608), so one that turns up as such usually came with a re-created table, and the
+    # new table ID is then the change to report.
+    unsupported = {column.name: column for column in current.unsupported_columns}
+    retyped = [unsupported[column.name] for column in dropped if column.name in unsupported]
+    if retyped:
+        raise InformixError(
+            f"Informix schema change for '{name}' changed column(s) to a type the connector "
+            f"can't read: {_unsupported_column_list(retyped)}; run a full refresh"
         )
     if [column.name for column in current.columns[: len(survivors)]] != [
         column.name for column in survivors
