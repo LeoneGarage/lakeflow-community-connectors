@@ -3808,6 +3808,13 @@ _PRIMARY_KEYS_OPTION = "primary.keys"
 # On the append path with snapshot.mode=cdc_only, its default, nothing pages by key, so a
 # NULL there is harmless.
 _PRIMARY_KEYS_WILDCARD = "*"
+# ``"* except(c1, c2)"`` keys the table on every column but the ones named, which suits a
+# table whose rows are unique as a whole bar a few columns that change or are too wide to
+# key on (an audit timestamp, a free-text note). It follows the schema like the bare
+# wildcard: a column added later joins the key unless it is named, and one dropped leaves
+# it. So a name needn't be a column yet, which also means a misspelt one isn't caught.
+# EXCEPT and the names are matched case-insensitively (see _wildcard_key).
+_PRIMARY_KEYS_WILDCARD_EXCEPT = re.compile(r"\*\s*except\s*\((?P<names>.*)\)", re.I | re.S)
 # When a table has no primary-key constraint, promote a UNIQUE index to stand in as the
 # primary key, so a physically key-less table becomes keyed (resumable keyset snapshots and
 # CDC dedup) instead of falling back to the one-shot key-less drain. Default on. An explicit
@@ -3941,27 +3948,48 @@ def _parse_key_columns(raw: str, option: str = _PRIMARY_KEYS_OPTION) -> list[str
     return [item for item in items if item]
 
 
-def _key_override(table_options: dict[str, str]) -> list[str] | None:
-    # Docstring: The ``primary.keys`` option, parsed and checked: its column names, ``["*"]``
-    # for the whole-row wildcard, or None when unset.
+def _key_override(
+    table_options: dict[str, str],
+) -> tuple[list[str], tuple[str, ...]] | None:
+    # Docstring: The ``primary.keys`` option, parsed and checked, as (keys, excepted): the
+    # column names, or ``["*"]`` for the wildcard with the names its ``except(...)`` leaves
+    # out (none for a bare ``*``); None when unset.
     #
     # Parsed once per table resolve and shared by _requested_key and the override itself,
-    # so a malformed value fails before any column is left out.
+    # so a malformed value fails before any column is left out. The except form is matched
+    # before the comma split, since its own list holds commas; a JSON array may hold it as
+    # its one element.
 
     raw = table_options.get(_PRIMARY_KEYS_OPTION)
     if raw is None:
         return None
+    text = str(raw).strip()
+    if text.startswith("["):
+        items = _parse_key_columns(text)
+        text = items[0] if len(items) == 1 else text
+    match = _PRIMARY_KEYS_WILDCARD_EXCEPT.fullmatch(text)
+    if match:
+        excepted = _parse_key_columns(match.group("names"))
+        if not excepted:
+            raise ValueError(
+                f"Option '{_PRIMARY_KEYS_OPTION}' names no columns in "
+                f"'{_PRIMARY_KEYS_WILDCARD} except(...)'"
+            )
+        if len(excepted) != len(set(excepted)):
+            raise ValueError(f"Option '{_PRIMARY_KEYS_OPTION}' excepts a column twice")
+        return [_PRIMARY_KEYS_WILDCARD], tuple(excepted)
     keys = _parse_key_columns(raw)
     if not keys:
         raise ValueError(f"Option '{_PRIMARY_KEYS_OPTION}' is set but lists no columns")
     if _PRIMARY_KEYS_WILDCARD in keys and keys != [_PRIMARY_KEYS_WILDCARD]:
         raise ValueError(
-            f"Option '{_PRIMARY_KEYS_OPTION}' must be '{_PRIMARY_KEYS_WILDCARD}' alone "
-            "to key on every column, or a list of column names"
+            f"Option '{_PRIMARY_KEYS_OPTION}' must be '{_PRIMARY_KEYS_WILDCARD}' alone to key "
+            f"on every column, '{_PRIMARY_KEYS_WILDCARD} except(c1, c2)' to key on every "
+            "column but those, or a list of column names"
         )
     if len(keys) != len(set(keys)):
         raise ValueError(f"Option '{_PRIMARY_KEYS_OPTION}' lists a duplicate column")
-    return keys
+    return keys, ()
 
 
 def _snapshot_filter(options: dict[str, str]) -> str | None:
@@ -5799,6 +5827,10 @@ class Table:
     # added column joins the key; the schema transition accepts that growth (see
     # _PRIMARY_KEYS_WILDCARD). Not fingerprinted either.
     key_wildcard: bool = False
+    # The columns a ``"* except(...)"`` wildcard leaves out of the key, kept so a refresh
+    # re-expands it the same way; empty for a bare ``*``. Not fingerprinted: the resolved
+    # primary_keys are, so changing the list changes the key and needs a full refresh.
+    key_wildcard_except: tuple[str, ...] = ()
     # Per-column key index direction, parallel to primary_keys: True == DESC.
     # Empty means all-ascending (the common case) -- paging then uses the default
     # lexicographic order untouched. A mixed/descending key carries the full
@@ -8881,7 +8913,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return mode == "true"
 
     def _apply_primary_key_override(
-        self, table: Table, table_options: dict[str, str], keys: list[str] | None = None
+        self,
+        table: Table,
+        table_options: dict[str, str],
+        override: tuple[list[str], tuple[str, ...]] | None = None,
     ) -> Table:
         # Docstring: Override a table's primary key with the connector ``primary.keys`` option.
         #
@@ -8899,15 +8934,23 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # paging stays ascending.
         #
         # ``"*"`` (or ``["*"]``) keys the table on every column in catalog order, nullable
-        # ones included; see ``_PRIMARY_KEYS_WILDCARD``. ``keys`` is the option already
-        # parsed by _key_override, which runs here when the caller didn't.
+        # ones included, and ``"* except(c1, c2)"`` on every column but those; see
+        # ``_PRIMARY_KEYS_WILDCARD``. ``override`` is the option already parsed by
+        # _key_override, which runs here when the caller didn't.
 
-        keys = _key_override(table_options) if keys is None else keys
-        if keys is None:
+        override = _key_override(table_options) if override is None else override
+        if override is None:
             return table
+        keys, excepted = override
         wildcard = keys == [_PRIMARY_KEYS_WILDCARD]
         if wildcard:
-            keys = [column.name for column in table.columns]
+            # A name needn't be a column yet: one added later under it stays out of the key.
+            keys = _wildcard_key(table.columns, excepted)
+            if not keys:
+                raise InformixError(
+                    f"Option '{_PRIMARY_KEYS_OPTION}' excepts every column of "
+                    f"'{table.exposed_name}', leaving no key"
+                )
         column_names = {column.name for column in table.columns}
         missing = [key for key in keys if key not in column_names]
         if missing:
@@ -8919,10 +8962,18 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # The override restates the current key; keep its directions (already
             # reflecting the key index) rather than looking them up again. It is now
             # owned by the override, not a nullable-index promotion.
-            if table.key_override and table.key_wildcard == wildcard:
+            if (
+                table.key_override
+                and table.key_wildcard == wildcard
+                and table.key_wildcard_except == excepted
+            ):
                 return table
             return replace(
-                table, key_override=True, key_wildcard=wildcard, key_from_nullable_index=False
+                table,
+                key_override=True,
+                key_wildcard=wildcard,
+                key_wildcard_except=excepted,
+                key_from_nullable_index=False,
             )
         directions = self._override_key_directions(table.identity, tuple(keys))
         return replace(
@@ -8930,6 +8981,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             primary_keys=tuple(keys),
             key_override=True,
             key_wildcard=wildcard,
+            key_wildcard_except=excepted,
             key_descending=tuple(directions or ()),
             key_from_nullable_index=False,
         )
@@ -8970,16 +9022,20 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         )
 
     def _requested_key(
-        self, table: Table, table_options: dict[str, str], keys: list[str] | None
+        self,
+        table: Table,
+        table_options: dict[str, str],
+        override: tuple[list[str], tuple[str, ...]] | None,
     ) -> tuple[str, ...] | None:
         # Docstring: The key the table options will give ``table``, ahead of applying them.
         #
-        # In _apply_key_options' precedence: the primary.keys list (``keys``, from
+        # In _apply_key_options' precedence: the primary.keys list (``override``, from
         # _key_override), a nullable index the table opts into promoting, then the catalog
-        # key. None for the primary.keys "*" wildcard, which keys on whatever columns are
-        # ingested.
+        # key. None for the primary.keys "*" wildcard, with or without except(...), which
+        # keys on whatever columns are ingested.
 
-        if keys is not None:
+        if override is not None:
+            keys, _ = override
             return None if keys == [_PRIMARY_KEYS_WILDCARD] else tuple(keys)
         if (
             not table.primary_keys
@@ -8990,30 +9046,36 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return table.primary_keys
 
     def _ingested_columns(
-        self, table: Table, table_options: dict[str, str], keys: list[str] | None
+        self,
+        table: Table,
+        table_options: dict[str, str],
+        override: tuple[list[str], tuple[str, ...]] | None,
     ) -> Table:
         # Docstring: Narrow ``table`` to the columns it ingests: the column selection, then
         # the columns of a type the connector can't read left out, unless one is in its key.
         #
-        # ``keys`` is the primary.keys option from _key_override. Opens no Informix
+        # ``override`` is the primary.keys option from _key_override. Opens no Informix
         # connection, unlike the key options, which can query the override's index
         # directions.
 
         table = _apply_column_selection(table, _column_selection(table_options))
         return _leave_out_unsupported_columns(
-            table, self._requested_key(table, table_options, keys)
+            table, self._requested_key(table, table_options, override)
         )
 
     def _apply_key_options(
-        self, table: Table, table_options: dict[str, str], keys: list[str] | None = None
+        self,
+        table: Table,
+        table_options: dict[str, str],
+        override: tuple[list[str], tuple[str, ...]] | None = None,
     ) -> Table:
         # Docstring: Apply the per-table key options in precedence order: an explicit
         # ``primary.keys`` override wins over a nullable-index promotion, which wins
         # over the catalog-derived key. Promotion runs first so the override, applied
-        # last, still takes precedence. ``keys`` is as for _apply_primary_key_override.
+        # last, still takes precedence. ``override`` is as for _apply_primary_key_override.
 
         return self._apply_primary_key_override(
-            self._apply_nullable_index_promotion(table, table_options), table_options, keys
+            self._apply_nullable_index_promotion(table, table_options), table_options, override
         )
 
     def _apply_table_options(self, table: Table, table_options: dict[str, str]) -> Table:
@@ -9024,9 +9086,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # key covers just those), then row_filter, since it may only use selected columns,
         # then the transforms and the renames, which may only change them.
 
-        keys = _key_override(table_options)
-        table = self._ingested_columns(table, table_options, keys)
-        table = self._apply_key_options(table, table_options, keys)
+        override = _key_override(table_options)
+        table = self._ingested_columns(table, table_options, override)
+        table = self._apply_key_options(table, table_options, override)
         _ensure_selected_keys(table)
         table = _apply_row_filter(table, table_options.get(_ROW_FILTER_OPTION))
         table = _apply_column_transforms(
@@ -13319,6 +13381,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 table,
                 extend_wildcard_key=extend_key,
                 shrink_wildcard_key=shrink_key,
+                wildcard_except=table.key_wildcard_except,
             )
             transition_record = self._read_immutable_head(namespace)
             if transition_record is None and owner:
@@ -13386,6 +13449,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     target_table,
                     extend_wildcard_key=extend_key,
                     shrink_wildcard_key=shrink_key,
+                    wildcard_except=table.key_wildcard_except,
                 )
                 if _schema_fingerprint(target_table) != _schema_fingerprint(table):
                     _ensure_compatible_schema_change(
@@ -13393,6 +13457,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                         table,
                         extend_wildcard_key=extend_key,
                         shrink_wildcard_key=shrink_key,
+                        wildcard_except=table.key_wildcard_except,
                     )
                 schema_winner = self._publish_immutable_head(
                     self._immutable_namespace(table, "schema-nodes", str(current["id"])),
@@ -13527,7 +13592,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # the target holds NULL for them, so their updates and deletes would never match.
 
         known = {column.name for column in previous.columns}
-        added = [column.name for column in current.columns if column.name not in known]
+        joining = set(current.primary_keys)
+        # Only the added columns that join the key: a "* except(...)" wildcard may leave one
+        # out, and it then needs no NULL in existing rows to match by.
+        added = [
+            column.name
+            for column in current.columns
+            if column.name not in known and column.name in joining
+        ]
         lookup = getattr(self._bridge, "column_defaults", None)
         if not callable(lookup):
             raise InformixError(
@@ -16276,18 +16348,29 @@ def _ensure_key_columns_exist(table: Table) -> None:
         )
 
 
+def _wildcard_key(columns: Iterable[Column], excepted: Iterable[str]) -> list[str]:
+    # Docstring: The names of ``columns`` a wildcard key covers: all of them, in order, but
+    # the ``excepted`` ones of a "* except(...)" key.
+    #
+    # Matched ignoring case, as Informix folds an undelimited identifier to lower case, so
+    # "* except(Note)" leaves out a column catalogued as ``note``.
+
+    folded = {name.casefold() for name in excepted}
+    return [column.name for column in columns if column.name.casefold() not in folded]
+
+
 def _carry_key_override(fresh: Table, overridden: Table) -> Table:
     # Docstring: Carry a ``primary.keys`` override from ``overridden`` onto a re-read ``fresh``
     # table.
     #
     # An explicit key list is preserved as-is, with its adopted key-index directions. A
-    # wildcard key is re-expanded to ``fresh``'s columns, keeping the directions only when
-    # the column set is unchanged.
+    # wildcard key is re-expanded to ``fresh``'s columns, less any its except(...) names,
+    # keeping the directions only when the key is unchanged.
 
     keys = overridden.primary_keys
     descending = overridden.key_descending
     if overridden.key_wildcard:
-        keys = tuple(column.name for column in fresh.columns)
+        keys = tuple(_wildcard_key(fresh.columns, overridden.key_wildcard_except))
         if keys != overridden.primary_keys:
             descending = ()
     return replace(
@@ -16295,6 +16378,7 @@ def _carry_key_override(fresh: Table, overridden: Table) -> Table:
         primary_keys=keys,
         key_override=True,
         key_wildcard=overridden.key_wildcard,
+        key_wildcard_except=overridden.key_wildcard_except,
         key_descending=descending,
     )
 
@@ -16403,6 +16487,7 @@ def _ensure_compatible_schema_change(
     *,
     extend_wildcard_key: bool = False,
     shrink_wildcard_key: bool = False,
+    wildcard_except: tuple[str, ...] = (),
 ) -> None:
     # Docstring: Fail closed unless the stream can adopt ``current`` without a full refresh.
     #
@@ -16431,10 +16516,11 @@ def _ensure_compatible_schema_change(
     # edits accepted leave the ingested columns as they were: taking out a name whose
     # column no longer exists, or adding or taking out an exclude_columns name of a column
     # the connector leaves out anyway (see _selection_cleanup_only). The key
-    # must be unchanged, except that with ``extend_wildcard_key`` a whole-row key may grow
-    # by exactly the appended columns (and nothing dropped), and with ``shrink_wildcard_key``
-    # as well -- the first read of a new update -- shrink by exactly the dropped columns
-    # (and nothing appended). A running update keeps merging on the key it started with,
+    # must be unchanged, except that with ``extend_wildcard_key`` a wildcard key -- the whole
+    # row, or the whole row but its except(...) columns -- may grow by exactly the appended
+    # columns that join it (and nothing dropped), and with ``shrink_wildcard_key`` as well
+    # -- the first read of a new update -- shrink by exactly the dropped columns (and
+    # nothing appended). A running update keeps merging on the key it started with,
     # so a shorter key mid-update fails until the pipeline restarts with it.
 
     name = current.exposed_name
@@ -16473,9 +16559,15 @@ def _ensure_compatible_schema_change(
         )
     keys_match = previous.primary_keys == current.primary_keys
     shrunk = False
-    whole_row = previous.primary_keys == tuple(column.name for column in previous.columns)
-    if not keys_match and extend_wildcard_key and whole_row:
-        added = tuple(column.name for column in additions)
+    # A wildcard key is the columns in catalog order, less the ``wildcard_except`` names of
+    # a "* except(...)" one (the live table's, since schema history keeps only the key), and
+    # every appended column it doesn't except joins it. A changed except list fails here
+    # as any other key change does.
+    wildcard_shaped = previous.primary_keys == tuple(
+        _wildcard_key(previous.columns, wildcard_except)
+    )
+    if not keys_match and extend_wildcard_key and wildcard_shaped:
+        added = tuple(_wildcard_key(additions, wildcard_except))
         removed = {column.name for column in dropped}
         if added and not dropped:
             keys_match = current.primary_keys == previous.primary_keys + added
@@ -16518,10 +16610,14 @@ def _ensure_compatible_schema_change(
             # Informix truncates the existing values without logging a change, so the
             # keys already landed would no longer match the source's.
             wildcard = previous.key_wildcard or current.key_wildcard
+            excepting = previous.key_wildcard_except or current.key_wildcard_except
             raise InformixError(
                 f"Informix schema change for '{name}' shortened key column {old.name}"
                 + (
-                    f" (every column is in its {_PRIMARY_KEYS_OPTION}="
+                    f" (every column it doesn't except is in its {_PRIMARY_KEYS_OPTION}="
+                    f"'{_PRIMARY_KEYS_WILDCARD} except(...)' key)"
+                    if excepting
+                    else f" (every column is in its {_PRIMARY_KEYS_OPTION}="
                     f"'{_PRIMARY_KEYS_WILDCARD}' key)"
                     if wildcard
                     else ""

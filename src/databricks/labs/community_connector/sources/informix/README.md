@@ -174,7 +174,7 @@ rather than start from an unrelated position.
 | `snapshot.max.rows` | No | `0` | Optional total row bound for a staged CDC snapshot. `0` disables the bound. Snapshot-only tables remain limited to 100,000 rows when this option is `0`. |
 | `append.only.ingestion` | No | `auto` | Tri-state: `auto` (default), `true`, or `false`. `auto` appends only CDC-streamable tables **without** a primary key — the connector reports `ingestion_type=append` with a cursor and streams changes instead of repeatedly reading a bounded snapshot — and leaves keyed tables on their normal CDC path (so keyed tables follow the pipeline `scd_type`, default `SCD_TYPE_1`). For a keyless table `auto` is equivalent to `true`. `true` forces append for every capturable table, including keyed ones; `false` forces the normal CDC/snapshot path, opting a keyless table into bounded snapshot-only ingestion. Append output is a **change log**, not current state: an update appends its after-image as a `u` row, and a delete appends a `d` **tombstone** row carrying the full before-image (see `append.delete.tombstones`). On a keyless table a tombstone is a change-log record, not an applied delete — there is no key to pair it with — so consumers wanting current state filter on `_informix_op`; use `false` for a mutable keyless table that needs merge semantics. To append a **keyed** table also set `scd_type: APPEND_ONLY`; the connector cannot read that pipeline setting. Columns of an unsupported type are left out (see [CDC type support](#cdc-type-support)), and append-only tables have no delete channel. |
 | `append.delete.tombstones` | No | `true` | Per-table boolean, also accepted at connection scope (the table option wins). Applies only to a table on the append path (`append.only.ingestion`) and has no effect elsewhere. When `true`, a source `DELETE` lands on the upsert channel as a `d` tombstone row carrying the **full before-image** plus the usual `_informix_change_lsn`, `_informix_commit_lsn`, `_informix_tx_id` and `_informix_commit_time` columns, so the change log is lossless (an update already lands as a `u` row). On a keyed table forced to append, a key-changing update also removes the old key, so it lands the old row's before-image as a `d` tombstone ahead of the new key's `u` row. That tombstone's `_informix_change_lsn` is the before-image's own log position, strictly lower than the `u` row's, so ordering by the cursor applies them in the right order. Every CDC session enables full-row logging, so the before-image is always available. On a keyless table a tombstone is a change-log record, not an applied delete — there is no key to pair it with — so consumers wanting current state filter on `_informix_op`. A genuinely insert-only table never deletes, so the default costs it nothing. Set `false` for an archive-style table where retention purges would otherwise append one tombstone per purged row; the delete is then dropped. A keyed table on the normal CDC path ignores this option: its deletes are applied only through the separate delete flow. Accepts `true`/`false`. |
-| `primary.keys` | No | *(catalog key)* | Per-table override of the table's primary key — a comma-separated list (or JSON array) of column names. When set, the connector treats the table as **keyed** on those columns even if it is physically keyless: it reports `ingestion_type=cdc_with_deletes`, reads incrementally with keyset-paginated snapshots and delete identification, and reports the keys so the pipeline uses them as the destination merge key too (no separate `primary_keys` needed). The columns must exist in the table, and naming one of an unsupported type fails the table (see [CDC type support](#cdc-type-support)). **You must guarantee they are unique per row** — a non-unique override corrupts upserts, delete identification, and snapshot pagination. A key column declared nullable may hold NULL: a delete carries the NULL through, and the pipeline's delete flow matches NULL key values, so updates and deletes of that row apply normally. A NULL in a `NOT NULL` key column still fails the pipeline as a broken log record. A NULL key value can still make a snapshot skip rows or fail, because keyset snapshot paging compares key values; `snapshot.scan=cursor` avoids that. Leave unset to use the catalog's primary key, then a `UNIQUE` index if the connection has `primary.key.from.unique.index` enabled (the default), and otherwise none. Set `"*"` (or `["*"]`) to key on **every column**, in catalog column order, so the whole row is its identity; columns of an unsupported type are left out of the table and so of the key. This suits a keyless table whose rows are unique as a whole, such as a junction or lookup table. Nullable columns join the wildcard key too, so the NULL behaviour above applies to every nullable column. On an append-only table with `snapshot.mode=cdc_only`, its default, nothing pages by key, so NULLs are harmless there. It also follows the schema: a column appended to the table joins the key. Once the table is streaming changes, a nullable column added without a default extends the key without a full refresh, as described in [Schema evolution without full refresh](#schema-evolution-without-full-refresh). A column added with a default, or added while an incremental copy is still running, still needs a full refresh. Keyset snapshot paging sorts and compares on every column, so for a large table set `snapshot.scan=cursor`, or use an explicit key that matches an index. |
+| `primary.keys` | No | *(catalog key)* | Per-table override of the table's primary key — a comma-separated list (or JSON array) of column names. When set, the connector treats the table as **keyed** on those columns even if it is physically keyless: it reports `ingestion_type=cdc_with_deletes`, reads incrementally with keyset-paginated snapshots and delete identification, and reports the keys so the pipeline uses them as the destination merge key too (no separate `primary_keys` needed). The columns must exist in the table, and naming one of an unsupported type fails the table (see [CDC type support](#cdc-type-support)). **You must guarantee they are unique per row** — a non-unique override corrupts upserts, delete identification, and snapshot pagination. A key column declared nullable may hold NULL: a delete carries the NULL through, and the pipeline's delete flow matches NULL key values, so updates and deletes of that row apply normally. A NULL in a `NOT NULL` key column still fails the pipeline as a broken log record. A NULL key value can still make a snapshot skip rows or fail, because keyset snapshot paging compares key values; `snapshot.scan=cursor` avoids that. Leave unset to use the catalog's primary key, then a `UNIQUE` index if the connection has `primary.key.from.unique.index` enabled (the default), and otherwise none. Set `"*"` (or `["*"]`) to key on **every column**, in catalog column order, so the whole row is its identity; columns of an unsupported type are left out of the table and so of the key. Set `"* except(c1, c2)"` to key on every column but those; it follows the schema the same way, and a column added later joins the key unless the list names it. `except` and the names match ignoring case, and a name needn't be a column yet, so a misspelt one isn't caught. See [Keyed on the whole row](#keyed-on-the-whole-row). This suits a keyless table whose rows are unique as a whole, such as a junction or lookup table. Nullable columns join the wildcard key too, so the NULL behaviour above applies to every nullable column. On an append-only table with `snapshot.mode=cdc_only`, its default, nothing pages by key, so NULLs are harmless there. It also follows the schema: a column appended to the table joins the key. Once the table is streaming changes, a nullable column added without a default extends the key without a full refresh, as described in [Schema evolution without full refresh](#schema-evolution-without-full-refresh). A column added with a default, or added while an incremental copy is still running, still needs a full refresh. Keyset snapshot paging sorts and compares on every column, so for a large table set `snapshot.scan=cursor`, or use an explicit key that matches an index. |
 | `allow.nullable.index` | No | `false` | Per-table opt-in that lets a `UNIQUE` index containing **nullable** column(s) be promoted to the key when the table has **no primary key and no all-`NOT NULL` unique index**. Normally such an index is rejected because a key column is expected to be non-null; setting this `true` asserts the columns are **unique for every row**. A row that does hold NULL in one of them is still updated and deleted correctly: as for a `primary.keys` override, a delete carries the NULL through and the pipeline's delete flow matches NULL key values. What a NULL can still break is keyset snapshot paging, which compares key values and may skip the row or fail; `snapshot.scan=cursor` avoids that. Only takes effect when `primary.key.from.unique.index` is enabled (the default) and no non-null key exists; an all-`NOT NULL` unique index and an explicit `primary.keys` both still win. Promoting a table changes its keyed/key-less classification and schema fingerprint, so enable it before first ingest or run a full refresh. Accepts `true`/`false`. |
 | `snapshot.max.bytes` | No | `0` | Optional estimated decoded Python byte bound for the complete staged snapshot. The default `0` disables the limit and byte accounting. Each encoded staged page also has a fixed 256 MiB safety bound. |
 | `metadata.max.bytes` | No | `67108864` | Maximum estimated decoded Python bytes retained by an individual catalog query and by complete discovery. Set `0` to disable the limit and byte accounting. |
@@ -668,7 +668,9 @@ connector decodes old and new records alike. The integer-to-`DECIMAL` changes we
 checked on `DECIMAL` targets; `MONEY` targets follow the same rule but weren't run live.
 
 A table keyed with `primary.keys: "*"` is the one exception to an unchanged key: its
-key is every column, so an appended column joins it. The key may grow that way without
+key is every column, so an appended column joins it. The same holds for
+`"* except(c1, c2)"`, except that a column the list names stays out of the key and
+needs none of what follows. The key may grow that way without
 a full refresh when every added column is nullable and has no default, and no
 incremental copy is still running. Rows that existed before the change hold NULL in
 the new column at the source, and the target gives them NULL when it gains the column,
@@ -783,8 +785,8 @@ A table is keyed when any of these supplies a key, highest precedence first:
    (`primary.key.from.unique.index`, on by default).
 
 A table with none of these is keyless. A column of an unsupported type is left out of
-the table, unless it is part of the key, which fails the table; `primary.keys: "*"`
-instead keys the table on the columns ingested.
+the table, unless it is part of the key, which fails the table; `primary.keys: "*"` and
+`"* except(...)"` instead key the table on the columns ingested.
 
 ### Choosing an approach
 
@@ -859,6 +861,18 @@ update, so each change maps onto the target exactly:
 | `INSERT` | Row inserted |
 | `UPDATE` | Old row removed, new row inserted |
 | `DELETE` | Row removed |
+
+`primary.keys: "* except(c1, c2)"` keys on every column but the ones named. It suits a
+table whose rows are unique as a whole bar a few columns that change or are too wide to
+key on, such as an audit timestamp or a free-text note. An update that changes only an
+excepted column keeps the row's key, so it updates the row in place instead of deleting
+it and inserting a new one. What this section says about the whole-row key holds for
+it too, counting only the columns it keys on: a column added later joins the key unless
+the list names it, and a dropped column leaves it. `except` and the names are matched
+ignoring case. A name needn't be a column yet, so the list can keep a column that is
+still to be added out of the key; the flip side is that a misspelt name isn't caught,
+and the column it meant joins the key. Changing the list changes the key, so on a
+running table it needs a full refresh.
 
 It fits tables where the row itself is the identity:
 
@@ -1004,13 +1018,14 @@ position in a `_manifest.json` or `snapshot.boundary.lsn`. See
 - Exact duplicate rows can't be told apart once the table is keyed; they collapse
   to one row.
 - A NULL in a `NOT NULL` key column fails the read as a broken log record.
-- Changing a key needs a full refresh. The exception is a whole-row key growing
-  by a nullable column added without a default, or shrinking by a dropped column,
-  once the table is streaming.
+- Changing a key needs a full refresh. The exception is a whole-row key, with or
+  without `except(...)`, growing by a nullable column added without a default, or
+  shrinking by a dropped column, once the table is streaming.
 - Changing the files under a running file snapshot fails the read with a
   full-refresh error.
 - A column of an unsupported type is left out, with a warning. One in the key fails
-  the table, except under `primary.keys: "*"`, which keys on the columns ingested.
+  the table, except under `primary.keys: "*"` or `"* except(...)"`, which key on the
+  columns ingested.
 
 ### Option reference
 
@@ -1018,7 +1033,7 @@ position in a `_manifest.json` or `snapshot.boundary.lsn`. See
 |---|---|---|
 | `append.only.ingestion` | `auto` | `auto` appends keyless tables; `true` appends keyed ones too; `false` makes a keyless table snapshot-only |
 | `append.delete.tombstones` | `true` | Records deletes on a change log as `d` rows |
-| `primary.keys` | catalog key | An explicit key, or `"*"` for the whole row |
+| `primary.keys` | catalog key | An explicit key, `"*"` for the whole row, or `"* except(c1, c2)"` for the whole row but those columns |
 | `primary.key.from.unique.index` | `true` | Promotes an all-`NOT NULL` `UNIQUE` index to the key |
 | `allow.nullable.index` | `false` | Also promotes a `UNIQUE` index with nullable columns |
 | `snapshot.mode` | `incremental`, or `cdc_only` for a change log | How existing rows are copied |
