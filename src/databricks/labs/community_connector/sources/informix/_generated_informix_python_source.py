@@ -20263,6 +20263,13 @@ def register_lakeflow_source(spark):
     def _snapshot_unsupported_columns(table: Table) -> tuple[Column, ...]:
         # Docstring: Return types whose ordinary SQLI row representation is not implemented.
 
+        return tuple(column for column in table.columns if _unsupported_column(column))
+
+
+    def _unsupported_column(column: Column) -> bool:
+        # Docstring: Whether ``column`` has a type whose ordinary SQLI row representation is not
+        # implemented.
+
         unsupported = {
             "BYTE",
             "TEXT",
@@ -20276,10 +20283,8 @@ def register_lakeflow_source(spark):
             "UDT_VAR",
             "UDT_FIXED",
         }
-        return tuple(
-            column
-            for column in table.columns
-            if column.type_name in unsupported
+        return (
+            column.type_name in unsupported
             or (
                 column.type_name == "DATETIME" and not _datetime_qualifier_supported(column.length or 0)
             )
@@ -22053,9 +22058,15 @@ def register_lakeflow_source(spark):
             )
         # Checked after the identity: Informix can't convert a column to TEXT or BYTE in place
         # (-608), so one that turns up as such usually came with a re-created table, and the
-        # new table ID is then the change to report.
+        # new table ID is then the change to report. A column the history already records with
+        # an unsupported type (a build that kept it in the schema) didn't change type: leaving
+        # it out now is a drop, accepted below like any other.
         unsupported = {column.name: column for column in current.unsupported_columns}
-        retyped = [unsupported[column.name] for column in dropped if column.name in unsupported]
+        retyped = [
+            unsupported[column.name]
+            for column in dropped
+            if column.name in unsupported and not _unsupported_column(column)
+        ]
         if retyped:
             raise InformixError(
                 f"Informix schema change for '{name}' changed column(s) to a type the connector "

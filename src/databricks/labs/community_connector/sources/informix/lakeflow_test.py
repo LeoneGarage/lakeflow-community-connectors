@@ -16432,6 +16432,27 @@ class SchemaEvolutionTests(_TableOptionTestCase):
         with self.assertRaisesRegex(InformixError, r"type the connector can't read: w \(TEXT\)"):
             ensure(base, dataclasses.replace(current, incarnation="137"))
 
+    def test_a_column_recorded_with_an_unsupported_type_is_dropped_without_a_refresh(self):
+        # A build that kept a TEXT column in the schema recorded it in the history. It
+        # didn't change type, so leaving it out now is an ordinary drop: no full refresh,
+        # and the destination keeps the column.
+        ensure = informix_module._ensure_compatible_schema_change
+        text = {"name": "w", "type_name": "TEXT", "nullable": True, "cdc_supported": False}
+        for keys in ((), ("id",)):
+            with self.subTest(keys=keys):
+                base = self.table([self.ID, self.column("v"), text], keys=keys)
+                current = informix_module._leave_out_unsupported_columns(
+                    self.table([self.ID, self.column("v"), text], keys=keys), keys
+                )
+                self.assertEqual([column.name for column in current.columns], ["id", "v"])
+                ensure(base, current)
+        # In the key it isn't left out at all, so the table fails as it always did.
+        keyed = self.table([self.ID, self.column("v"), text], keys=("id", "w"))
+        kept = informix_module._leave_out_unsupported_columns(keyed, keyed.primary_keys)
+        self.assertEqual([column.name for column in kept.columns], ["id", "v", "w"])
+        with self.assertRaisesRegex(InformixError, "cannot materialize: w"):
+            informix_module._ensure_materializable(kept)
+
     def test_a_column_changed_to_an_unsupported_type_needs_a_full_refresh(self):
         # Left out, it would otherwise pass as a dropped column and stop updating silently.
         bridge = _ProjectingBridge()
