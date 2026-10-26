@@ -15940,7 +15940,9 @@ class UnsupportedColumnTests(_TableOptionTestCase):
             ("ROW", None),
             ("UDT_VAR", None),
             ("UDT_FIXED", None),
+            ("COLLECTION", None),
             ("DATETIME", 0x0105),
+            ("INTERVAL", 0x0624),
         ):
             with self.subTest(type_name):
                 bridge = _unsupported_bridge(type_name, length=length)
@@ -15973,6 +15975,24 @@ class UnsupportedColumnTests(_TableOptionTestCase):
             schema = connector.get_table_schema("app.orders", {"exclude_columns": "extra"})
         self.assertNotIn("extra", schema.fieldNames())
 
+    def test_an_exclude_columns_entry_for_it_comes_and_goes_without_a_refresh(self):
+        # It is left out either way, so listing it (to silence the warning) or taking the
+        # entry out again leaves the ingested columns as they were.
+        bridge = _unsupported_bridge("TEXT")
+        connector, checkpoint = self.stream(bridge, {})
+        for options in ({"exclude_columns": "extra"}, {}):
+            with self.subTest(options=options):
+                bridge.now += 50
+                bridge.changes = self.committed(
+                    ("INSERT", {"id": bridge.now, "value": "c", "extra": "x"}), lsn=bridge.now - 10
+                )
+                rows, checkpoint = connector.read_table("app.orders", checkpoint, dict(options))
+                self.assertEqual(
+                    [(row["id"], "extra" in row) for row in rows], [(bridge.now, False)]
+                )
+        with self.assertRaisesRegex(InformixError, "exclude_columns.*changed.*full refresh"):
+            connector.read_table("app.orders", checkpoint, {"exclude_columns": "value"})
+
     def test_naming_it_in_include_columns_fails(self):
         connector = self.connector(_unsupported_bridge())
         with self.assertRaisesRegex(InformixError, r"include_columns.*can't read: extra \(BLOB\)"):
@@ -15987,11 +16007,12 @@ class UnsupportedColumnTests(_TableOptionTestCase):
         bridge = _unsupported_bridge("DATETIME", length=0x0105, nullable=False)
         bridge.tables[0]["primary_keys"] = ["extra"]
         connector = self.connector(bridge)
+        failure = r"cannot materialize: extra \(DATETIME with an unsupported qualifier\)"
         for options in ({}, {"primary.keys": "id,extra"}):
             with self.subTest(options=options):
-                with self.assertRaisesRegex(InformixError, r"cannot materialize: extra"):
+                with self.assertRaisesRegex(InformixError, failure):
                     connector.read_table_metadata("app.orders", dict(options))
-                with self.assertRaisesRegex(InformixError, r"cannot materialize: extra"):
+                with self.assertRaisesRegex(InformixError, failure):
                     connector.get_table_schema("app.orders", dict(options))
         for options, key in (
             ({"primary.keys": "id"}, ["id"]),
@@ -16000,6 +16021,18 @@ class UnsupportedColumnTests(_TableOptionTestCase):
             with self.subTest(options=options):
                 metadata = connector.read_table_metadata("app.orders", dict(options))
                 self.assertEqual(metadata["primary_keys"], key)
+
+    def test_a_malformed_primary_keys_fails_before_a_column_is_left_out(self):
+        connector = self.connector(_unsupported_bridge())
+        for raw, message in (
+            (" ", "lists no columns"),
+            ("*,id", "alone"),
+            ("id,id", "duplicate"),
+        ):
+            with self.subTest(raw=raw):
+                with self.assertNoLogs(informix_module.__name__, level="WARNING"):
+                    with self.assertRaisesRegex(ValueError, message):
+                        connector.read_table_metadata("app.orders", {"primary.keys": raw})
 
     def test_primary_keys_naming_an_unsupported_column_fails_the_table(self):
         connector = self.connector(_unsupported_bridge())
@@ -16370,18 +16403,90 @@ class SchemaEvolutionTests(_TableOptionTestCase):
         informix_module._STATE_VALIDATION_COORDINATOR.unsupported_column_warnings.clear()
         bridge = _ProjectingBridge()
         connector, checkpoint = self.stream(bridge, {})
-        bridge.tables[0]["columns"].append(  # ALTER TABLE ... ADD (doc BLOB)
-            {"name": "doc", "type_name": "BLOB", "nullable": True, "cdc_supported": False}
+        bridge.tables[0]["columns"].append(  # ALTER TABLE ... ADD (doc TEXT), in place
+            {"name": "doc", "type_name": "TEXT", "nullable": True, "cdc_supported": False}
         )
         bridge.now = 200
         bridge.changes = self.committed(("INSERT", {"id": 3, "value": "c", "extra": 9}))
         with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
             rows, end = connector.read_table("app.orders", checkpoint, {})
             rows = list(rows)
-        self.assertTrue(any("doc (BLOB)" in line for line in logs.output))
+        self.assertTrue(any("doc (TEXT)" in line for line in logs.output))
         self.assertEqual([(row["id"], "doc" in row) for row in rows], [(3, False)])
         self.assertEqual(bridge.change_reads[-1][0][0]["columns"], ["id", "value", "extra"])
         self.assertEqual(end["schema_fingerprint"], checkpoint["schema_fingerprint"])
+
+    def test_a_blob_column_added_with_a_rebuild_needs_a_full_refresh(self):
+        # Informix 14.10 rebuilds the table under a new tabid to add a BLOB or CLOB column.
+        bridge = _ProjectingBridge()
+        connector, checkpoint = self.stream(bridge, {})
+        bridge.tables[0]["incarnation"] = "144"  # ALTER TABLE ... ADD (doc BLOB): rebuilt
+        bridge.tables[0]["columns"].append(
+            {"name": "doc", "type_name": "BLOB", "nullable": True, "cdc_supported": False}
+        )
+        bridge.now = 200
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 200}]
+        with self.assertRaisesRegex(InformixError, "changed table identity"):
+            connector.read_table("app.orders", checkpoint, {})
+
+    def added_column_is_left_out_under(self, options, raw):
+        """Stream app.orders keyed by ``options``, add a TEXT column, and check it is left out
+        while the key stays ``id``."""
+        informix_module._STATE_VALIDATION_COORDINATOR.unsupported_column_warnings.clear()
+        bridge = _ProjectingBridge()
+        bridge.tables[0].update(raw)
+        connector, checkpoint = self.stream(bridge, options)
+        bridge.tables[0]["columns"].append(  # ALTER TABLE ... ADD (doc TEXT)
+            {"name": "doc", "type_name": "TEXT", "nullable": True, "cdc_supported": False}
+        )
+        bridge.now = 200
+        bridge.changes = self.committed(("INSERT", {"id": 3, "value": "c", "extra": 9}))
+        with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
+            rows, end = connector.read_table("app.orders", checkpoint, dict(options))
+            rows = list(rows)
+        self.assertTrue(any("doc (TEXT)" in line for line in logs.output))
+        self.assertEqual([(row["id"], "doc" in row) for row in rows], [(3, False)])
+        self.assertEqual(end["schema_fingerprint"], checkpoint["schema_fingerprint"])
+        metadata = connector.read_table_metadata("app.orders", dict(options))
+        self.assertEqual(metadata["primary_keys"], ["id"])
+
+    def test_a_primary_keys_override_leaves_out_an_unsupported_column_added(self):
+        # The carry path's key for an override, as for the catalog key and the wildcard.
+        self.added_column_is_left_out_under({"primary.keys": "id"}, {"primary_keys": []})
+
+    def test_a_promoted_nullable_index_leaves_out_an_unsupported_column_added(self):
+        # The carry path's key for a nullable-index promotion.
+        self.added_column_is_left_out_under(
+            {"allow.nullable.index": "true"},
+            {"primary_keys": [], "nullable_index_key": [["id", False]]},
+        )
+
+    def test_a_wildcard_key_reports_a_retyped_column_before_the_key_shrinks(self):
+        # Left out, the column would otherwise pass for one dropped from the whole-row key,
+        # and a running update would ask for a restart before the full refresh it needs.
+        ensure = informix_module._ensure_compatible_schema_change
+        retyped = {"name": "w", "type_name": "DATETIME", "length": 0x0105, "nullable": True,
+                   "cdc_supported": False}
+        base = dataclasses.replace(
+            self.table([self.ID, self.column("v"), self.column("w")], keys=("id", "v", "w")),
+            key_override=True,
+            key_wildcard=True,
+            incarnation="137",
+        )
+        for incarnation, message in (
+            ("144", "changed table identity"),
+            ("137", r"type the connector can't read: w \(DATETIME with an unsupported"),
+        ):
+            with self.subTest(incarnation=incarnation):
+                fresh = dataclasses.replace(
+                    self.table([self.ID, self.column("v"), retyped], keys=()),
+                    incarnation=incarnation,
+                )
+                current = informix_module._carry_table_options(fresh, base)
+                self.assertEqual(current.primary_keys, ("id", "v"))
+                for shrink in (False, True):
+                    with self.assertRaisesRegex(InformixError, message):
+                        ensure(base, current, extend_wildcard_key=True, shrink_wildcard_key=shrink)
 
     def test_a_wildcard_key_leaves_out_an_unsupported_column_added_while_streaming(self):
         informix_module._STATE_VALIDATION_COORDINATOR.unsupported_column_warnings.clear()

@@ -455,7 +455,7 @@ A table is captured via CDC when **every column it ingests has a supported CDC e
 - **With a primary key** → keyed CDC with deletes (`cdc_with_deletes`): inserts, updates, and deletes are applied to the destination by key.
 - **Without a primary key** → an append-only CDC stream (`ingestion_type="append"`, cursor `_informix_change_lsn`): changes are still read from the logical log, but with no key to identify a row they are appended rather than merged (no delete application; a delete appends a `d` tombstone row carrying the full before-image, see `append.delete.tombstones`). See [Keyless tables](#keyless-tables) for the ways to manage upserts and deletes on such a table.
 
-The types without a CDC encoding are also the ones the snapshot reader can't materialize (see the type table below). The connector leaves a column of such a type out and ingests the rest of the table as if [`exclude_columns`](#column-selection) listed it: the snapshot and the change stream read only the other columns, and the destination table has no column for it. It logs a warning naming the table and the columns left out, once per table in each Spark process; the warning goes to the Python log of that process, not to the pipeline event log. Listing those columns in `exclude_columns` leaves them out without the warning. A key column can't be left out, so a table whose key includes one fails, as it always did, with an error that it has columns the connector can't materialize. That holds whether the key is the catalog's, a unique index promoted to it, a nullable index promoted with `allow.nullable.index`, or a `primary.keys` list. The exception is `primary.keys: "*"`, which keys the table on the columns ingested, so rows that differ only in a left-out column share a key. A `primary.keys` list naming only other columns keys the table on those. Naming one in `include_columns` fails, and so does a table with no other columns.
+The types without a CDC encoding are also the ones the snapshot reader can't materialize (see the type table below). The connector leaves a column of such a type out and ingests the rest of the table as if [`exclude_columns`](#column-selection) listed it: the snapshot and the change stream read only the other columns, and the destination table has no column for it. It logs a warning naming the table and the columns left out, once per table in each Spark process; the warning goes to the Python log of that process, not to the pipeline event log. Listing those columns in `exclude_columns` leaves them out without the warning; on a running table that needs no full refresh, and neither does taking the entry out again. A key column can't be left out, so a table whose key includes one fails, as it always did, with an error that it has columns the connector can't materialize. That holds whether the key is the catalog's, a unique index promoted to it, a nullable index promoted with `allow.nullable.index`, or a `primary.keys` list. The exception is `primary.keys: "*"`, which keys the table on the columns ingested, so rows that differ only in a left-out column share a key. A `primary.keys` list naming only other columns keys the table on those. Naming one in `include_columns` fails, and so does a table with no other columns.
 
 | CDC status | Informix types |
 |---|---|
@@ -657,7 +657,7 @@ Anything else still needs a full refresh: renames, reorders, a column added befo
 existing ones, other type changes, nullability changes, non-nullable additions,
 a column changed to an unsupported type, primary-key changes, and dropping a column of
 any key but a whole-row one. Changing `include_columns`,
-`exclude_columns`, `rename_columns`, `transform_columns`, or `row_filter` on a running table also needs one.
+`exclude_columns`, `rename_columns`, `transform_columns`, or `row_filter` on a running table also needs one, except for an `exclude_columns` entry naming a column of an unsupported type.
 
 All of these have been validated against a live Informix server: after the change,
 Informix returns log records written before it in the current layout. Values logged
@@ -1087,7 +1087,9 @@ destination.
   other unsupported columns out on its own, with a warning. Listing them in
   `exclude_columns` leaves them out without the warning; `include_columns` can't name them.
 - **Changing the selection:** on a running table this fails closed, because rows already
-  landed were read under the old selection. Run a full refresh to apply the new one.
+  landed were read under the old selection. Run a full refresh to apply the new one. The
+  exception is an `exclude_columns` entry for a column of an unsupported type, which may
+  be added or taken out freely: the connector leaves that column out either way.
 - **File-sourced snapshots:** an extract still holds every column. The connector matches
   fields by catalog position and keeps the selected ones.
 

@@ -3941,6 +3941,29 @@ def _parse_key_columns(raw: str, option: str = _PRIMARY_KEYS_OPTION) -> list[str
     return [item for item in items if item]
 
 
+def _key_override(table_options: dict[str, str]) -> list[str] | None:
+    # Docstring: The ``primary.keys`` option, parsed and checked: its column names, ``["*"]``
+    # for the whole-row wildcard, or None when unset.
+    #
+    # Parsed once per table resolve and shared by _requested_key and the override itself,
+    # so a malformed value fails before any column is left out.
+
+    raw = table_options.get(_PRIMARY_KEYS_OPTION)
+    if raw is None:
+        return None
+    keys = _parse_key_columns(raw)
+    if not keys:
+        raise ValueError(f"Option '{_PRIMARY_KEYS_OPTION}' is set but lists no columns")
+    if _PRIMARY_KEYS_WILDCARD in keys and keys != [_PRIMARY_KEYS_WILDCARD]:
+        raise ValueError(
+            f"Option '{_PRIMARY_KEYS_OPTION}' must be '{_PRIMARY_KEYS_WILDCARD}' alone "
+            "to key on every column, or a list of column names"
+        )
+    if len(keys) != len(set(keys)):
+        raise ValueError(f"Option '{_PRIMARY_KEYS_OPTION}' lists a duplicate column")
+    return keys
+
+
 def _snapshot_filter(options: dict[str, str]) -> str | None:
     # Docstring: Return a validated connector-owned snapshot WHERE predicate.
 
@@ -8857,7 +8880,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             return not table.primary_keys
         return mode == "true"
 
-    def _apply_primary_key_override(self, table: Table, table_options: dict[str, str]) -> Table:
+    def _apply_primary_key_override(
+        self, table: Table, table_options: dict[str, str], keys: list[str] | None = None
+    ) -> Table:
         # Docstring: Override a table's primary key with the connector ``primary.keys`` option.
         #
         # When set (per table), treat the table as keyed on those columns -- even a
@@ -8874,24 +8899,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # paging stays ascending.
         #
         # ``"*"`` (or ``["*"]``) keys the table on every column in catalog order, nullable
-        # ones included; see ``_PRIMARY_KEYS_WILDCARD``.
+        # ones included; see ``_PRIMARY_KEYS_WILDCARD``. ``keys`` is the option already
+        # parsed by _key_override, which runs here when the caller didn't.
 
-        raw = table_options.get(_PRIMARY_KEYS_OPTION)
-        if raw is None:
+        keys = _key_override(table_options) if keys is None else keys
+        if keys is None:
             return table
-        keys = _parse_key_columns(raw)
-        if not keys:
-            raise ValueError(f"Option '{_PRIMARY_KEYS_OPTION}' is set but lists no columns")
-        wildcard = _PRIMARY_KEYS_WILDCARD in keys
+        wildcard = keys == [_PRIMARY_KEYS_WILDCARD]
         if wildcard:
-            if keys != [_PRIMARY_KEYS_WILDCARD]:
-                raise ValueError(
-                    f"Option '{_PRIMARY_KEYS_OPTION}' must be '{_PRIMARY_KEYS_WILDCARD}' alone "
-                    "to key on every column, or a list of column names"
-                )
             keys = [column.name for column in table.columns]
-        if len(keys) != len(set(keys)):
-            raise ValueError(f"Option '{_PRIMARY_KEYS_OPTION}' lists a duplicate column")
         column_names = {column.name for column in table.columns}
         missing = [key for key in keys if key not in column_names]
         if missing:
@@ -8953,17 +8969,18 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             key_from_nullable_index=True,
         )
 
-    def _requested_key(self, table: Table, table_options: dict[str, str]) -> tuple[str, ...] | None:
+    def _requested_key(
+        self, table: Table, table_options: dict[str, str], keys: list[str] | None
+    ) -> tuple[str, ...] | None:
         # Docstring: The key the table options will give ``table``, ahead of applying them.
         #
-        # In _apply_key_options' precedence: the primary.keys list, a nullable index the
-        # table opts into promoting, then the catalog key. None for the primary.keys "*"
-        # wildcard, which keys on whatever columns are ingested.
+        # In _apply_key_options' precedence: the primary.keys list (``keys``, from
+        # _key_override), a nullable index the table opts into promoting, then the catalog
+        # key. None for the primary.keys "*" wildcard, which keys on whatever columns are
+        # ingested.
 
-        raw = table_options.get(_PRIMARY_KEYS_OPTION)
-        if raw is not None:
-            keys = _parse_key_columns(raw)
-            return None if _PRIMARY_KEYS_WILDCARD in keys else tuple(keys)
+        if keys is not None:
+            return None if keys == [_PRIMARY_KEYS_WILDCARD] else tuple(keys)
         if (
             not table.primary_keys
             and table.nullable_index_key
@@ -8972,24 +8989,31 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             return table.nullable_index_key
         return table.primary_keys
 
-    def _ingested_columns(self, table: Table, table_options: dict[str, str]) -> Table:
+    def _ingested_columns(
+        self, table: Table, table_options: dict[str, str], keys: list[str] | None
+    ) -> Table:
         # Docstring: Narrow ``table`` to the columns it ingests: the column selection, then
         # the columns of a type the connector can't read left out, unless one is in its key.
         #
-        # Opens no Informix connection, unlike the key options, which can query the
-        # override's index directions.
+        # ``keys`` is the primary.keys option from _key_override. Opens no Informix
+        # connection, unlike the key options, which can query the override's index
+        # directions.
 
         table = _apply_column_selection(table, _column_selection(table_options))
-        return _leave_out_unsupported_columns(table, self._requested_key(table, table_options))
+        return _leave_out_unsupported_columns(
+            table, self._requested_key(table, table_options, keys)
+        )
 
-    def _apply_key_options(self, table: Table, table_options: dict[str, str]) -> Table:
+    def _apply_key_options(
+        self, table: Table, table_options: dict[str, str], keys: list[str] | None = None
+    ) -> Table:
         # Docstring: Apply the per-table key options in precedence order: an explicit
         # ``primary.keys`` override wins over a nullable-index promotion, which wins
         # over the catalog-derived key. Promotion runs first so the override, applied
-        # last, still takes precedence.
+        # last, still takes precedence. ``keys`` is as for _apply_primary_key_override.
 
         return self._apply_primary_key_override(
-            self._apply_nullable_index_promotion(table, table_options), table_options
+            self._apply_nullable_index_promotion(table, table_options), table_options, keys
         )
 
     def _apply_table_options(self, table: Table, table_options: dict[str, str]) -> Table:
@@ -9000,8 +9024,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # key covers just those), then row_filter, since it may only use selected columns,
         # then the transforms and the renames, which may only change them.
 
-        table = self._ingested_columns(table, table_options)
-        table = self._apply_key_options(table, table_options)
+        keys = _key_override(table_options)
+        table = self._ingested_columns(table, table_options, keys)
+        table = self._apply_key_options(table, table_options, keys)
         _ensure_selected_keys(table)
         table = _apply_row_filter(table, table_options.get(_ROW_FILTER_OPTION))
         table = _apply_column_transforms(
@@ -13794,7 +13819,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         if cached is not None:
             # The cache holds the bare catalog table, so narrow it to the columns the read
             # path ingests first, or a column left out there would fail the check here.
-            cached = self._ingested_columns(cached, table_options)
+            cached = self._ingested_columns(cached, table_options, _key_override(table_options))
             _ensure_materializable(cached, table_options)
             if self._append_only_table(cached, table_options) or not _cdc_capable(cached):
                 return True
@@ -14800,7 +14825,7 @@ def _is_variable_scale_decimal(column: Column) -> bool:
 def _ensure_materializable(table: Table, options: dict[str, str] | None = None) -> None:
     unsupported = _snapshot_unsupported_columns(table)
     if unsupported:
-        details = ", ".join(f"{column.name} ({column.type_name})" for column in unsupported)
+        details = _unsupported_column_list(unsupported)
         raise InformixError(
             f"Table '{table.exposed_name}' contains columns that the pure-Python SQLI "
             f"snapshot decoder cannot materialize: {details}"
@@ -16402,8 +16427,10 @@ def _ensure_compatible_schema_change(
     # connector can't read would otherwise pass as dropped), a key column dropped, a NOT NULL
     # or key column added -- fails closed, and so does changing include_columns /
     # exclude_columns or row_filter: rows already landed were selected under the old
-    # setting, and the new one cannot be applied to them without a re-read. The one
-    # selection edit accepted is taking out a name whose column no longer exists. The key
+    # setting, and the new one cannot be applied to them without a re-read. The selection
+    # edits accepted leave the ingested columns as they were: taking out a name whose
+    # column no longer exists, or adding or taking out an exclude_columns name of a column
+    # the connector leaves out anyway (see _selection_cleanup_only). The key
     # must be unchanged, except that with ``extend_wildcard_key`` a whole-row key may grow
     # by exactly the appended columns (and nothing dropped), and with ``shrink_wildcard_key``
     # as well -- the first read of a new update -- shrink by exactly the dropped columns
@@ -16415,6 +16442,35 @@ def _ensure_compatible_schema_change(
     survivors = [column for column in previous.columns if column.name in current_names]
     dropped = [column for column in previous.columns if column.name not in current_names]
     additions = current.columns[len(survivors) :]
+    # The identity first: a re-created table can pass for a dropped column, a key that
+    # shrank, or a retyped column, and its new table ID is the change to report.
+    if (previous.database, previous.owner, previous.name, previous.incarnation) != (
+        current.database,
+        current.owner,
+        current.name,
+        current.incarnation,
+    ):
+        raise InformixError(
+            f"Informix schema change for '{name}' changed table identity or primary keys; "
+            "run a full refresh"
+        )
+    # Then a retyped column, ahead of the key: under a whole-row key one left out would
+    # otherwise pass for a column dropped from the key. Informix can't convert a column
+    # to TEXT or BYTE in place (-608), so this is mostly a DATETIME or INTERVAL qualifier
+    # the decoder doesn't handle. A column the history already records with an
+    # unsupported type (a build that kept it in the schema) didn't change type: leaving
+    # it out now is a drop, accepted below like any other.
+    unsupported = {column.name: column for column in current.unsupported_columns}
+    retyped = [
+        unsupported[column.name]
+        for column in dropped
+        if column.name in unsupported and not _unsupported_column(column)
+    ]
+    if retyped:
+        raise InformixError(
+            f"Informix schema change for '{name}' changed column(s) to a type the connector "
+            f"can't read: {_unsupported_column_list(retyped)}; run a full refresh"
+        )
     keys_match = previous.primary_keys == current.primary_keys
     shrunk = False
     whole_row = previous.primary_keys == tuple(column.name for column in previous.columns)
@@ -16438,36 +16494,10 @@ def _ensure_compatible_schema_change(
                     "shorter key"
                 )
             keys_match = shrunk = True
-    if not keys_match or (
-        previous.database,
-        previous.owner,
-        previous.name,
-        previous.incarnation,
-    ) != (
-        current.database,
-        current.owner,
-        current.name,
-        current.incarnation,
-    ):
+    if not keys_match:
         raise InformixError(
             f"Informix schema change for '{name}' changed table identity or primary keys; "
             "run a full refresh"
-        )
-    # Checked after the identity: Informix can't convert a column to TEXT or BYTE in place
-    # (-608), so one that turns up as such usually came with a re-created table, and the
-    # new table ID is then the change to report. A column the history already records with
-    # an unsupported type (a build that kept it in the schema) didn't change type: leaving
-    # it out now is a drop, accepted below like any other.
-    unsupported = {column.name: column for column in current.unsupported_columns}
-    retyped = [
-        unsupported[column.name]
-        for column in dropped
-        if column.name in unsupported and not _unsupported_column(column)
-    ]
-    if retyped:
-        raise InformixError(
-            f"Informix schema change for '{name}' changed column(s) to a type the connector "
-            f"can't read: {_unsupported_column_list(retyped)}; run a full refresh"
         )
     if [column.name for column in current.columns[: len(survivors)]] != [
         column.name for column in survivors
@@ -16549,15 +16579,35 @@ def _ensure_compatible_schema_change(
 
 
 def _selection_cleanup_only(previous: Table, current: Table) -> bool:
-    # Docstring: Whether the selection only lost names of columns the table no longer has.
+    # Docstring: Whether the selection only changed by names that leave the ingested columns
+    # as they were.
+    #
+    # That is a name whose column the table no longer has, or, under exclude_columns, a
+    # column of a type the connector leaves out anyway: listing one only silences its
+    # warning, and taking it out again leaves it out all the same. Such an exclude_columns
+    # entry may also be the whole list, so the selection appears or goes. include_columns
+    # can't name such a column, so a change there stays strict.
 
-    if previous.column_selection is None or current.column_selection is None:
+    before, after = previous.column_selection, current.column_selection
+    catalog = {column.name: column for column in current.catalog_columns or current.columns}
+
+    def needless(name: str) -> bool:
+        column = catalog.get(name)
+        return column is None or _unsupported_column(column)
+
+    if before is None or after is None:
+        selection = before or after
+        return (
+            selection is not None
+            and selection[0] == "exclude"
+            and all(needless(name) for name in selection[1])
+        )
+    if before[0] != after[0]:
         return False
-    if previous.column_selection[0] != current.column_selection[0]:
-        return False
-    catalog = {column.name for column in current.catalog_columns or current.columns}
-    changed = set(previous.column_selection[1]) ^ set(current.column_selection[1])
-    return not changed & catalog
+    changed = set(before[1]) ^ set(after[1])
+    if before[0] == "include":
+        return not changed & catalog.keys()
+    return all(needless(name) for name in changed)
 
 
 def _transforms_cleanup_only(previous: Table, current: Table) -> bool:
