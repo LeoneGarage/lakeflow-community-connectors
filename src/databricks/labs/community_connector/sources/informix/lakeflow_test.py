@@ -7500,15 +7500,16 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(refreshed.primary_keys, ("id", "value", "added"))
         self.assertTrue(refreshed.key_override and refreshed.key_wildcard)
 
-    def _read_after_adding_a_column(self, options, *, restart, bridge=None):
+    def _read_after_adding_a_column(self, options, *, restart, bridge=None, then=None):
         """Checkpoint app.orders, append a nullable column at the source, then read on
-        from that checkpoint with the same connector or a restarted one."""
+        from that checkpoint with the same connector or a restarted one, under ``then``'s
+        options when given."""
         rows, checkpoint, end, _reader, _bridge = self._add_column_and_read(
-            options, restart=restart, bridge=bridge
+            options, restart=restart, bridge=bridge, then=then
         )
         return rows, checkpoint, end
 
-    def _add_column_and_read(self, options, *, restart, bridge=None):
+    def _add_column_and_read(self, options, *, restart, bridge=None, then=None):
         bridge = bridge or FakeBridge()
         if bridge.tables == FakeBridge().tables:
             bridge.tables = [_table(primary_keys=())]
@@ -7520,7 +7521,7 @@ class LakeflowContractTests(unittest.TestCase):
         bridge.now = 120
         bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
         reader = self.connector(bridge) if restart else connector
-        rows, end = reader.read_table("app.orders", checkpoint, options)
+        rows, end = reader.read_table("app.orders", checkpoint, options if then is None else then)
         return list(rows), checkpoint, end, reader, bridge
 
     # A whole-row key grows by an appended nullable column without a full refresh: rows
@@ -7753,10 +7754,12 @@ class LakeflowContractTests(unittest.TestCase):
                 self.assertTrue(table.key_override and table.key_wildcard)
                 self.assertEqual([n.casefold() for n in table.key_wildcard_except], ["value"])
 
-    def test_primary_keys_wildcard_except_may_name_a_column_not_there_yet(self):
+    def test_primary_keys_wildcard_except_must_name_columns_of_the_table(self):
         connector, _ = self._keyless_connector()
-        metadata = connector.read_table_metadata("app.orders", {"primary.keys": "* except(later)"})
-        self.assertEqual(metadata["primary_keys"], ["id", "value"])
+        for raw, missing in (("* except(later)", "later"), ("* except(Value, vaule)", "vaule")):
+            with self.subTest(raw=raw):
+                with self.assertRaisesRegex(InformixError, f"does not have: {missing}$"):
+                    connector.read_table_metadata("app.orders", {"primary.keys": raw})
 
     def test_primary_keys_wildcard_except_rejects_malformed_values(self):
         connector, _ = self._keyless_connector()
@@ -7764,6 +7767,7 @@ class LakeflowContractTests(unittest.TestCase):
             ("* except()", "names no columns"),
             ("* except( , )", "names no columns"),
             ("* except(value, value)", "twice"),
+            ("* except(value, VALUE)", "twice"),
             ("* except(id, value)", "leaving no key"),
             ("*, except(value)", "alone"),
         ):
@@ -7784,6 +7788,17 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(refreshed.primary_keys, ("id", "added"))
         self.assertEqual(refreshed.key_wildcard_except, ("value",))
 
+    def test_a_schema_refresh_fails_when_an_excepted_column_is_dropped(self):
+        connector, bridge = self._keyless_connector()
+        bridge.tables[0]["columns"].append(
+            {"name": "extra", "type_name": "INTEGER", "nullable": True}
+        )
+        table = connector._table("app.orders", {"primary.keys": "* except(extra)"})
+        bridge.tables[0]["columns"].pop()
+
+        with self.assertRaisesRegex(InformixError, "does not have: extra"):
+            connector._refresh_table_schema(table, None)
+
     def test_an_added_column_extends_a_running_wildcard_except_key(self):
         rows, checkpoint, transitioned, reader, _ = self._add_column_and_read(
             dict(self.EXCEPT), restart=False
@@ -7795,9 +7810,10 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(metadata["primary_keys"], ["id", "added"])
 
     def test_an_added_column_named_in_except_stays_out_of_the_key(self):
+        # The column can be named once it exists, before the pipeline restarts.
         options = {"primary.keys": "* except(value, added)"}
         rows, checkpoint, transitioned, reader, _ = self._add_column_and_read(
-            options, restart=True
+            dict(self.EXCEPT), restart=True, then=options
         )
 
         self.assertEqual(rows, [])
@@ -7816,9 +7832,10 @@ class LakeflowContractTests(unittest.TestCase):
     def test_an_excepted_column_added_with_a_default_needs_no_full_refresh(self):
         # Only a column joining the key needs existing rows to hold NULL in it.
         rows, _, _ = self._read_after_adding_a_column(
-            {"primary.keys": "* except(added)"},
+            dict(self.EXCEPT),
             restart=True,
             bridge=self._with_a_defaulted_added_column(),
+            then={"primary.keys": "* except(value, added)"},
         )
         self.assertEqual(rows, [])
 
@@ -7840,12 +7857,23 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertNotEqual(transitioned["schema_fingerprint"], checkpoint["schema_fingerprint"])
         self.assertEqual(reader.read_table_metadata("app.orders", options)["primary_keys"], ["id"])
 
-    def test_dropping_an_excepted_column_leaves_the_key_as_it_was(self):
-        options = {"primary.keys": "* except(extra)"}
-        bridge, checkpoint = self._checkpoint_then_drop_a_column(options)
-        rows, transitioned = self.connector(bridge).read_table("app.orders", checkpoint, options)
+    def test_dropping_an_excepted_column_needs_only_its_name_taken_out(self):
+        bridge, checkpoint = self._checkpoint_then_drop_a_column(
+            {"primary.keys": "* except(extra)"}
+        )
+        with self.assertRaisesRegex(InformixError, "does not have: extra"):
+            self.connector(bridge).read_table(
+                "app.orders", checkpoint, {"primary.keys": "* except(extra)"}
+            )
+        # The key was every other column, which is the whole row now.
+        options = dict(self.WILDCARD)
+        reader = self.connector(bridge)
+        rows, transitioned = reader.read_table("app.orders", checkpoint, options)
         self.assertEqual(list(rows), [])
         self.assertNotEqual(transitioned["schema_fingerprint"], checkpoint["schema_fingerprint"])
+        self.assertEqual(
+            reader.read_table_metadata("app.orders", options)["primary_keys"], ["id", "value"]
+        )
 
     def test_changing_the_except_list_on_a_running_table_needs_a_full_refresh(self):
         bridge = _ProjectingBridge()
@@ -7879,21 +7907,35 @@ class LakeflowContractTests(unittest.TestCase):
         ensure(previous, grown, **allowed)
         for current, why in (
             (grown, "the except list differs"),
-            (table(("id", "note", "value", "added", "memo"), ("id", "value", "added", "memo")),
-             "an excepted column joined"),
+            (
+                table(("id", "note", "value", "added", "memo"), ("id", "value", "added", "memo")),
+                "an excepted column joined",
+            ),
         ):
             with self.subTest(why):
-                options = {"extend_wildcard_key": True, "wildcard_except": ("note",)} if (
-                    why == "the except list differs"
-                ) else allowed
+                options = (
+                    {"extend_wildcard_key": True, "wildcard_except": ("note",)}
+                    if (why == "the except list differs")
+                    else allowed
+                )
                 with self.assertRaisesRegex(InformixError, "primary keys"):
                     ensure(previous, current, **options)
 
     def test_a_wildcard_except_key_covers_the_selected_readable_columns(self):
         for bridge, options, key in (
-            (_ProjectingBridge(), {"exclude_columns": "value", "primary.keys": "* except(extra)"},
-             ["id"]),
+            (
+                _ProjectingBridge(),
+                {"exclude_columns": "value", "primary.keys": "* except(extra)"},
+                ["id"],
+            ),
             (_unsupported_bridge("TEXT"), {"primary.keys": "* except(value)"}, ["id"]),
+            # A column left out is still a column of the table, so naming it is no typo.
+            (
+                _ProjectingBridge(),
+                {"exclude_columns": "extra", "primary.keys": "* except(extra)"},
+                ["id", "value"],
+            ),
+            (_unsupported_bridge("TEXT"), {"primary.keys": "* except(extra)"}, ["id", "value"]),
         ):
             with self.subTest(options=options):
                 metadata = self.connector(bridge).read_table_metadata("app.orders", options)
@@ -16634,8 +16676,13 @@ class SchemaEvolutionTests(_TableOptionTestCase):
         # Left out, the column would otherwise pass for one dropped from the whole-row key,
         # and a running update would ask for a restart before the full refresh it needs.
         ensure = informix_module._ensure_compatible_schema_change
-        retyped = {"name": "w", "type_name": "DATETIME", "length": 0x0105, "nullable": True,
-                   "cdc_supported": False}
+        retyped = {
+            "name": "w",
+            "type_name": "DATETIME",
+            "length": 0x0105,
+            "nullable": True,
+            "cdc_supported": False,
+        }
         base = dataclasses.replace(
             self.table([self.ID, self.column("v"), self.column("w")], keys=("id", "v", "w")),
             key_override=True,

@@ -9415,8 +9415,9 @@ def register_lakeflow_source(spark):
     # table whose rows are unique as a whole bar a few columns that change or are too wide to
     # key on (an audit timestamp, a free-text note). It follows the schema like the bare
     # wildcard: a column added later joins the key unless it is named, and one dropped leaves
-    # it. So a name needn't be a column yet, which also means a misspelt one isn't caught.
-    # EXCEPT and the names are matched case-insensitively (see _wildcard_key).
+    # it. Every name must be a column of the table, so a misspelt one fails instead of
+    # keeping its column in the key (see _ensure_excepted_columns_exist). EXCEPT and the
+    # names are matched case-insensitively (see _wildcard_key).
     _PRIMARY_KEYS_WILDCARD_EXCEPT = re.compile(r"\*\s*except\s*\((?P<names>.*)\)", re.I | re.S)
     # When a table has no primary-key constraint, promote a UNIQUE index to stand in as the
     # primary key, so a physically key-less table becomes keyed (resumable keyset snapshots and
@@ -9578,7 +9579,7 @@ def register_lakeflow_source(spark):
                     f"Option '{_PRIMARY_KEYS_OPTION}' names no columns in "
                     f"'{_PRIMARY_KEYS_WILDCARD} except(...)'"
                 )
-            if len(excepted) != len(set(excepted)):
+            if len(excepted) != len({name.casefold() for name in excepted}):
                 raise ValueError(f"Option '{_PRIMARY_KEYS_OPTION}' excepts a column twice")
             return [_PRIMARY_KEYS_WILDCARD], tuple(excepted)
         keys = _parse_key_columns(raw)
@@ -14547,7 +14548,7 @@ def register_lakeflow_source(spark):
             keys, excepted = override
             wildcard = keys == [_PRIMARY_KEYS_WILDCARD]
             if wildcard:
-                # A name needn't be a column yet: one added later under it stays out of the key.
+                _ensure_excepted_columns_exist(table, excepted)
                 keys = _wildcard_key(table.columns, excepted)
                 if not keys:
                     raise InformixError(
@@ -21962,17 +21963,38 @@ def register_lakeflow_source(spark):
         return [column.name for column in columns if column.name.casefold() not in folded]
 
 
+    def _ensure_excepted_columns_exist(table: Table, excepted: Iterable[str]) -> None:
+        # Docstring: Fail when a "* except(...)" key names a column the table doesn't have.
+        #
+        # Checked against every catalog column, those the column selection or an unsupported
+        # type leaves out included, and ignoring case as _wildcard_key matches, so a typo fails
+        # instead of quietly keeping the column it meant in the key. After a named column is
+        # dropped at the source, take it out of the list: the key stays as it was, so the
+        # schema transition accepts that edit. A column still to be added can't be named
+        # ahead; add it to the list once it exists, before the pipeline restarts.
+
+        known = {column.name.casefold() for column in table.catalog_columns or table.columns}
+        missing = [name for name in excepted if name.casefold() not in known]
+        if missing:
+            raise InformixError(
+                f"Option '{_PRIMARY_KEYS_OPTION}' excepts column(s) that '{table.exposed_name}' "
+                f"does not have: {', '.join(missing)}"
+            )
+
+
     def _carry_key_override(fresh: Table, overridden: Table) -> Table:
         # Docstring: Carry a ``primary.keys`` override from ``overridden`` onto a re-read ``fresh``
         # table.
         #
         # An explicit key list is preserved as-is, with its adopted key-index directions. A
         # wildcard key is re-expanded to ``fresh``'s columns, less any its except(...) names,
-        # keeping the directions only when the key is unchanged.
+        # keeping the directions only when the key is unchanged. A name whose column was
+        # dropped fails, as it does when the option is applied.
 
         keys = overridden.primary_keys
         descending = overridden.key_descending
         if overridden.key_wildcard:
+            _ensure_excepted_columns_exist(fresh, overridden.key_wildcard_except)
             keys = tuple(_wildcard_key(fresh.columns, overridden.key_wildcard_except))
             if keys != overridden.primary_keys:
                 descending = ()
