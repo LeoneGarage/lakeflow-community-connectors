@@ -338,6 +338,9 @@ _SHARED_CDC_SUBSCRIBER_TTL_SECONDS = 300.0
 # Idle back-off between reads once a shard has drained its log, so a caught-up daemon
 # does not busy-spin (and releases its connection slot for consumer bootstrap).
 _SHARED_CDC_IDLE_POLL_SECONDS = 1.0
+# Tables per batched catalog query (table_versions, get_tables), well inside the SQLI
+# limit of 1024 bind values a statement.
+_CATALOG_BATCH = 500
 # Snapshot-drain fairness. An ``initial``-mode snapshot drains the whole table through
 # one REPEATABLE READ transaction, holding one connection slot for the entire scan; with
 # many tables this can consume every slot and starve the streaming/CDC readers waiting
@@ -537,7 +540,8 @@ _SNAPSHOT_CLEANUP_THREADS = 4
 # change is caught within this window and aborts the copy -- while most pages skip
 # Informix entirely. The window trades detection latency for throughput; the pages
 # served in between are immutable as-of snapshot_lsn, so serving a few extra before
-# an abort is harmless.
+# an abort is harmless. A shared CDC shard's daemon checks its tables' definitions as
+# often, for the same reason (see _ShardCatalog).
 _SNAPSHOT_SCHEMA_REFRESH_INTERVAL_SECONDS = 60
 # Bootstrap deferrals a delete reader records before its advisory offset stops
 # changing (see _schema_node_fallback_offset). The upsert reader publishes this
@@ -2398,8 +2402,132 @@ class PurePythonInformixBridge:
             raise InformixError(f"Invalid logical table identity {identity!r}")
         return self._describe_table(parts[1], parts[2])
 
-    def _assert_capture_layout(self, capture: dict[str, Any], encoding: str) -> None:
-        # Docstring: Fail before decoding rows when catalog metadata changed mid-session.
+    @_serialized_sqli_operation
+    def table_versions(self, tabids: Sequence[int]) -> dict[int, tuple[str, str, int]]:
+        # Docstring: ``systables.version`` of the tables with these IDs, as table ID ->
+        # (owner, name, version), in one catalog query per _CATALOG_BATCH IDs.
+        #
+        # Informix bumps the version on every change to a table's definition -- a column
+        # added, changed, dropped, or renamed, an index or constraint created or dropped, a
+        # default changed, the table renamed -- and on UPDATE STATISTICS. An ID missing from
+        # the result no longer names a table.
+
+        self._ensure_connected()
+        maximum = int(self.options.get("metadata.max.bytes", str(64 << 20))) or None
+        wanted = sorted({int(tabid) for tabid in tabids})
+        versions: dict[int, tuple[str, str, int]] = {}
+        for start in range(0, len(wanted), _CATALOG_BATCH):
+            batch = wanted[start : start + _CATALOG_BATCH]
+            rows = self.transport.execute(
+                "SELECT tabid, owner, tabname, version FROM systables "
+                f"WHERE tabtype = 'T' AND tabid IN ({', '.join('?' * len(batch))})",
+                tuple(batch),
+                max_result_bytes=maximum,
+            )
+            for row in rows:
+                versions[int(_field(row, "tabid", 0))] = (
+                    str(_field(row, "owner", 1)).strip(),
+                    str(_field(row, "tabname", 2)).strip(),
+                    int(_field(row, "version", 3)),
+                )
+        return versions
+
+    @_serialized_sqli_operation
+    def get_tables(self, identities: Sequence[str]) -> dict[str, dict[str, Any]]:
+        # Docstring: Describe several tables as get_table does, as identity -> table, in
+        # two or three catalog queries per _CATALOG_BATCH tables rather than per table; an
+        # identity missing from the result names no table. See _describe_tables.
+
+        self._ensure_connected()
+        wanted: dict[tuple[str, str], str] = {}
+        for identity in identities:
+            parts = _split_identity(identity)
+            if len(parts) != 3:
+                raise InformixError(f"Invalid logical table identity {identity!r}")
+            wanted[(parts[1], parts[2])] = identity
+        described = self._describe_tables(wanted)
+        return {wanted[table]: raw for table, raw in described.items()}
+
+    def _describe_tables(
+        self, tables: Iterable[tuple[str, str]]
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        # Docstring: _describe_table for several (owner, name) tables at once, as
+        # (owner, name) -> table; a table missing from the result doesn't exist.
+        #
+        # The queries select by table name and keep the owners asked for, so a same-named
+        # table of another owner is read and dropped. The UNIQUE-index query runs only for
+        # the tables without a primary key, as in _describe_table.
+
+        maximum = int(self.options.get("metadata.max.bytes", str(64 << 20))) or None
+        wanted = set(tables)
+        names = sorted({name for _, name in wanted})
+        columns: dict[tuple[str, str], list[Any]] = {}
+        keys: dict[tuple[str, str], list[Any]] = {}
+        unique_indexes: dict[tuple[str, str], list[Any]] = {}
+
+        def rows_by_table(sql: str, batch: list[str], owner_at: int, into: dict) -> None:
+            for row in self.transport.execute(
+                sql + f" AND t.tabname IN ({', '.join('?' * len(batch))})",
+                tuple(batch),
+                max_result_bytes=maximum,
+            ):
+                table = (
+                    str(_field(row, "owner", owner_at)).strip(),
+                    str(_field(row, "tabname", owner_at + 1)).strip(),
+                )
+                if table in wanted:
+                    into.setdefault(table, []).append(row)
+
+        for start in range(0, len(names), _CATALOG_BATCH):
+            batch = names[start : start + _CATALOG_BATCH]
+            rows_by_table(
+                "SELECT c.colname, c.coltype, c.collength, c.colno, t.tabid, "
+                "c.extended_id, x.name AS extended_name, x.owner AS extended_owner, "
+                "t.owner, t.tabname "
+                "FROM systables t JOIN syscolumns c ON t.tabid = c.tabid "
+                "LEFT JOIN sysxtdtypes x ON x.extended_id = c.extended_id "
+                "WHERE t.tabtype = 'T'",
+                batch,
+                8,
+                columns,
+            )
+            rows_by_table(
+                "SELECT i.part1,i.part2,i.part3,i.part4,i.part5,i.part6,i.part7,i.part8,"
+                "i.part9,i.part10,i.part11,i.part12,i.part13,i.part14,i.part15,i.part16,"
+                "t.owner,t.tabname "
+                "FROM systables t JOIN sysconstraints x ON t.tabid=x.tabid "
+                "JOIN sysindexes i ON x.idxname=i.idxname AND x.tabid=i.tabid "
+                "WHERE t.tabtype='T' AND x.constrtype='P'",
+                batch,
+                16,
+                keys,
+            )
+        keyless = sorted({table[1] for table in wanted if table in columns and table not in keys})
+        if keyless and _option_bool(self.options, _PROMOTE_UNIQUE_INDEX_OPTION, True):
+            for start in range(0, len(keyless), _CATALOG_BATCH):
+                rows_by_table(
+                    "SELECT i.idxname,i.part1,i.part2,i.part3,i.part4,i.part5,i.part6,i.part7,"
+                    "i.part8,i.part9,i.part10,i.part11,i.part12,i.part13,i.part14,i.part15,"
+                    "i.part16,t.owner,t.tabname "
+                    "FROM systables t JOIN sysindexes i ON t.tabid=i.tabid "
+                    "WHERE t.tabtype='T' AND i.idxtype='U'",
+                    keyless[start : start + _CATALOG_BATCH],
+                    17,
+                    unique_indexes,
+                )
+        described: dict[tuple[str, str], dict[str, Any]] = {}
+        for table in wanted:
+            if table not in columns:
+                continue
+            ordered = sorted(columns[table], key=lambda row: int(_field(row, "colno", 3)))
+            described[table] = self._table_from_catalog_rows(
+                table[0], table[1], ordered, keys.get(table, [])[:1], unique_indexes.get(table, [])
+            )
+        return described
+
+    @staticmethod
+    def _capture_table(capture: dict[str, Any]) -> tuple[str, str, str]:
+        # Docstring: A capture's native identity as (database, owner, name).
 
         native = str(capture["identity"])
         try:
@@ -2407,9 +2535,28 @@ class PurePythonInformixBridge:
             owner, name = _split_identity(qualified)
         except ValueError as error:
             raise InformixError(f"Invalid native table identity {native!r}") from error
-        refreshed = _capture_descriptor(
-            Table.parse(self._describe_table(owner, name), database), encoding
-        )
+        return database, owner, name
+
+    def _assert_capture_layout(
+        self,
+        capture: dict[str, Any],
+        encoding: str,
+        catalog: dict[tuple[str, str], dict[str, Any]],
+    ) -> None:
+        # Docstring: Fail before decoding rows when catalog metadata changed mid-session.
+        #
+        # ``catalog`` is the read's captured tables as _describe_tables read them, once,
+        # when the first CDC metadata record arrived (see read_changes).
+
+        native = str(capture["identity"])
+        database, owner, name = self._capture_table(capture)
+        described = catalog.get((owner, name))
+        if described is None:
+            raise InformixError(
+                f"Informix schema changed for {native!r} during CDC; "
+                "run a full refresh before decoding additional records"
+            )
+        refreshed = _capture_descriptor(Table.parse(described, database), encoding)
 
         def layout(value: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
             return {
@@ -3496,6 +3643,11 @@ class PurePythonInformixBridge:
             truncated = False
             completed_transactions = 0
             metadata_labels: set[int] = set()
+            # Every captured table's catalog entry, read in one batch when the first
+            # metadata record arrives. Full-row logging is on for each of them by then, so
+            # Informix rejects an ALTER TABLE, and the batch sees what each table's own
+            # metadata record describes, as reading each table at its record did.
+            capture_catalog: dict[tuple[str, str], dict[str, Any]] | None = None
 
             def _stop_at_poll_bound(bound: str) -> None:
                 # The poll bounds cap what one poll may retain, not how much the
@@ -3568,7 +3720,11 @@ class PurePythonInformixBridge:
                                 f"CDC metadata for capture label {label} does not match "
                                 "the requested columns"
                             )
-                        self._assert_capture_layout(tables[label - 1], encoding)
+                        if capture_catalog is None:
+                            capture_catalog = self._describe_tables(
+                                {self._capture_table(capture)[1:] for capture in tables}
+                            )
+                        self._assert_capture_layout(tables[label - 1], encoding, capture_catalog)
                         labels[label] = tuple(descriptors[name] for name in names)
                         metadata_labels.add(label)
                     if label and 1 <= label <= len(tables):
@@ -6140,6 +6296,8 @@ class _SharedCdcShard:
         self.max_records = _DEFAULT_CDC_MAX_RECORDS
         self.buffer_cap = _DEFAULT_SHARED_CDC_BUFFER
         self.subscriber_ttl = _SHARED_CDC_SUBSCRIBER_TTL_SECONDS
+        # The daemon's catalog tables, re-read only when they change; daemon-thread only.
+        self.catalog = _ShardCatalog()
 
     def configure(
         self, *, reader_factory, timeout_seconds, max_records, buffer_cap, subscriber_ttl
@@ -6380,21 +6538,143 @@ def _shared_cdc_shard(
         return shard
 
 
-def _shard_schema_map(bridge, identities) -> tuple[dict[str, Table], list[str]]:
-    # Docstring: Re-read each subscriber's catalog table and carry its options, as
+def _table_id(table: Table) -> int | None:
+    # Docstring: The Informix table ID a catalog read recorded as ``table.incarnation``.
+
+    try:
+        return int(table.incarnation)
+    except (TypeError, ValueError):
+        return None
+
+
+class _ShardCatalog:
+    # Docstring: The catalog tables one shard's daemon reads under, re-read only when changed.
+    #
+    # Describing every subscribed table before every read cost two or three catalog
+    # queries a table each cycle. Instead the daemon keeps each table as last read, with
+    # its systables.version, and every _SNAPSHOT_SCHEMA_REFRESH_INTERVAL_SECONDS asks for all
+    # their versions in one query. Only the tables whose version moved, or whose table ID
+    # no longer names them, are read again, together in one batch (get_tables). Informix
+    # bumps the version on every change to a table's definition, and on UPDATE STATISTICS,
+    # which just costs a needless re-read. A new subscriber is read at once, and a failed
+    # read forces a check before the next one.
+    #
+    # A change waits for the next check without misreading rows. Informix rejects ALTER
+    # TABLE while full-row logging is on, which every read switches on, so a column change
+    # needs the pipelines stopped (see the README), and the restarted update gets a new
+    # shard, read afresh. A captured column changed anyway still fails the read that meets
+    # it, which compares the layout Informix reports with the catalog
+    # (_assert_capture_layout). What a check does pick up is an index or key constraint
+    # created or dropped while the table is captured, which Informix allows and which can
+    # change the key a table is merged by; consumers see it at the next check rather than
+    # the next read. A bridge without table_versions re-reads every table at each check,
+    # and one without get_tables reads them one at a time.
+    #
+    # Used by the shard's daemon thread alone, so it needs no lock.
+
+    def __init__(self) -> None:
+        # identity -> (systables.version, or None when unknown, and the catalog table)
+        self.entries: dict[str, tuple[int | None, Table]] = {}
+        self.next_check = 0.0
+
+    def force_check(self) -> None:
+        self.next_check = 0.0
+
+    def tables(self, bridge, identities, now: float, check_seconds: float) -> dict[str, Table]:
+        # Docstring: The catalog table of each subscribed (identity, table) pair that still
+        # names one, re-read as the class describes.
+
+        wanted = dict(identities)
+        for identity in [identity for identity in self.entries if identity not in wanted]:
+            del self.entries[identity]
+        if now >= self.next_check:
+            self.next_check = now + check_seconds
+            check = wanted
+        else:
+            check = {
+                identity: table
+                for identity, table in wanted.items()
+                if identity not in self.entries
+            }
+        if check:
+            self._refresh(bridge, check)
+        return {
+            identity: self.entries[identity][1] for identity in wanted if identity in self.entries
+        }
+
+    def _refresh(self, bridge, check: dict[str, Table]) -> None:
+        # The versions come first: a definition changed between this query and the reads
+        # below leaves an older version on the newer table, which the next check re-reads.
+        table_versions = getattr(bridge, "table_versions", None)
+        known = {
+            identity: self.entries[identity][1] if identity in self.entries else table
+            for identity, table in check.items()
+        }
+        versions = None
+        if table_versions is not None:
+            versions = table_versions(
+                [tabid for tabid in map(_table_id, known.values()) if tabid is not None]
+            )
+        stale: dict[str, int | None] = {}
+        for identity, table in known.items():
+            version = None
+            found = versions.get(_table_id(table)) if versions is not None else None
+            if found is not None and found[:2] == (table.owner.strip(), table.name.strip()):
+                version = found[2]
+            entry = self.entries.get(identity)
+            if entry is None or version is None or entry[0] != version:
+                stale[identity] = version
+        if not stale:
+            return
+        logical = {identity: check[identity].identity for identity in stale}
+        get_tables = getattr(bridge, "get_tables", None)
+        if get_tables is not None:
+            described = get_tables(sorted(set(logical.values())))
+        else:
+            described = {name: bridge.get_table(name) for name in sorted(set(logical.values()))}
+        for identity, version in stale.items():
+            raw = described.get(logical[identity])
+            if raw is None:
+                # The name no longer names a table: the subscriber is left to its own
+                # direct read, which reports that.
+                self.entries.pop(identity, None)
+                continue
+            fresh = Table.parse(raw, check[identity].database)
+            if fresh.incarnation != known[identity].incarnation:
+                # Re-created under a new table ID, whose version wasn't asked for: the
+                # next check reads it again with its version.
+                version = None
+            self.entries[identity] = (version, fresh)
+
+
+def _shard_schema_map(
+    bridge, identities, catalog: _ShardCatalog | None = None, check_seconds: float = 0
+) -> tuple[dict[str, Table], list[str]]:
+    # Docstring: Each subscriber's catalog table with its options carried, as
     # _refresh_table_schema does, for one shard read: ``(identity -> table, unfit)``.
     #
-    # Without the carry an overridden table's fingerprint never matches its checkpoint, so
-    # it would always fall back to a direct read and never benefit from sharding -- and
-    # its PK-change detection would use the wrong keys. A table whose options no longer
-    # fit its catalog (a selected, renamed, or transformed column gone, a carried key
-    # column dropped) is listed as unfit instead of failing the whole read: its own direct
+    # The catalog tables come from ``catalog``, which re-reads only what changed (see
+    # _ShardCatalog); without one, every table is read now. Without the carry an overridden
+    # table's fingerprint never matches its checkpoint, so it would always fall back to a
+    # direct read and never benefit from sharding -- and its PK-change detection would use
+    # the wrong keys. A table whose options no longer fit its catalog (a selected, renamed,
+    # or transformed column gone, a carried key column dropped), or whose name no longer
+    # names a table, is listed as unfit instead of failing the whole read: its own direct
     # read reports the error, and the shard keeps serving the others.
 
+    catalog = _ShardCatalog() if catalog is None else catalog
+    fresh_tables = catalog.tables(bridge, identities, time.monotonic(), check_seconds)
     schema_map: dict[str, Table] = {}
     unfit: list[str] = []
     for identity, table in identities:
-        fresh = Table.parse(bridge.get_table(table.identity), table.database)
+        fresh = fresh_tables.get(identity)
+        if fresh is None:
+            logging.getLogger(__name__).warning(
+                "Shared CDC shard leaves %s to direct reads: the catalog no longer has it",
+                identity,
+            )
+            unfit.append(identity)
+            continue
         try:
             schema_map[identity] = _carry_table_options(fresh, table)
         except (InformixError, ValueError):
@@ -6443,7 +6723,12 @@ def _run_shared_cdc_shard(shard: _SharedCdcShard) -> None:
             if reader is None:
                 reader = shard.reader_factory()
             try:
-                schema_map, unfit = _shard_schema_map(reader._bridge, identities)
+                schema_map, unfit = _shard_schema_map(
+                    reader._bridge,
+                    identities,
+                    shard.catalog,
+                    _SNAPSHOT_SCHEMA_REFRESH_INTERVAL_SECONDS,
+                )
                 for identity in unfit:
                     # Its consumer falls back to a direct read, which reports the error;
                     # evicting it keeps its floor from pinning the shared restart.
@@ -6472,6 +6757,8 @@ def _run_shared_cdc_shard(shard: _SharedCdcShard) -> None:
                     exc_info=True,
                 )
                 shard.mark_unready()
+                # Whatever failed, the next read starts from a fresh look at the catalog.
+                shard.catalog.force_check()
                 _close_shared_cdc_reader(reader)
                 reader = None
                 time.sleep(_SHARED_CDC_IDLE_POLL_SECONDS)

@@ -1651,6 +1651,7 @@ class LakeflowContractTests(unittest.TestCase):
                 informix_module, "decode_frame", side_effect=lambda frame, labels, **_: dict(frame)
             ),
             mock.patch.object(informix_module, "metadata_column_names", return_value=["id"]),
+            mock.patch.object(bridge, "_describe_tables", return_value={}),
             mock.patch.object(bridge, "_assert_capture_layout"),
         ):
             records = bridge.read_changes([capture], 90, 1, 1)
@@ -1667,11 +1668,55 @@ class LakeflowContractTests(unittest.TestCase):
             "type_name": "BIGINT",
             "nullable": False,
         }
-        bridge._describe_table = mock.Mock(return_value=changed)
         original = _capture_descriptor(Table.parse(_table(), "demo"), "utf-8")
 
-        with self.assertRaisesRegex(InformixError, "schema changed.*full refresh"):
-            bridge._assert_capture_layout(original, "utf-8")
+        bridge._assert_capture_layout(original, "utf-8", {("app", "orders"): _table()})
+        for catalog in ({("app", "orders"): changed}, {}):
+            with self.subTest(catalog=catalog):
+                with self.assertRaisesRegex(InformixError, "schema changed.*full refresh"):
+                    bridge._assert_capture_layout(original, "utf-8", catalog)
+
+    def _read_with_metadata(self, captures, records):
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.transport = FakeCdcTransport([records])
+        bridge._describe_table = mock.Mock(side_effect=AssertionError("read one table"))
+        bridge._describe_tables = mock.Mock(
+            return_value={("app", "orders"): _table(), ("app", "lines"): _table(name="lines")}
+        )
+        with (
+            mock.patch.object(informix_module, "CdcFrameParser", RecordParser),
+            mock.patch.object(
+                informix_module, "decode_frame", side_effect=lambda frame, labels, **_: dict(frame)
+            ),
+            mock.patch.object(
+                informix_module, "metadata_column_names", return_value=["id", "value"]
+            ),
+        ):
+            bridge.read_changes(captures, 90, 1, 64)
+        return bridge
+
+    def test_native_poll_reads_every_captured_tables_catalog_in_one_batch(self):
+        captures = [
+            _capture_descriptor(Table.parse(_table(name=name), "demo"), "utf-8")
+            for name in ("orders", "lines")
+        ]
+        bridge = self._read_with_metadata(
+            captures,
+            [
+                {"op": "METADATA", "label": 1, "metadata": b"id integer, value varchar(20)"},
+                {"op": "METADATA", "label": 2, "metadata": b"id integer, value varchar(20)"},
+                {"op": "TIMEOUT", "lsn": 100},
+            ],
+        )
+
+        bridge._describe_tables.assert_called_once_with({("app", "orders"), ("app", "lines")})
+
+    def test_native_poll_without_metadata_reads_no_catalog(self):
+        capture = _capture_descriptor(Table.parse(_table(), "demo"), "utf-8")
+        bridge = self._read_with_metadata([capture], [{"op": "TIMEOUT", "lsn": 100}])
+
+        bridge._describe_tables.assert_not_called()
 
     def test_native_poll_rejects_second_metadata_layout(self):
         transport = FakeCdcTransport(
@@ -1698,6 +1743,7 @@ class LakeflowContractTests(unittest.TestCase):
                 informix_module, "decode_frame", side_effect=lambda frame, labels, **_: dict(frame)
             ),
             mock.patch.object(informix_module, "metadata_column_names", return_value=["id"]),
+            mock.patch.object(bridge, "_describe_tables", return_value={}),
             mock.patch.object(bridge, "_assert_capture_layout"),
             self.assertRaisesRegex(InformixError, "second CDC metadata layout"),
         ):
@@ -12430,6 +12476,325 @@ class SharedCdcShardTests(unittest.TestCase):
         shard.evict("app.a")
         self.assertEqual(list(shard.subscribers), ["app.b"])
         self.assertNotIn("app.a", shard.buffers)
+
+
+class _CatalogTransport:
+    """Answers the bridge's catalog queries from per-table catalog facts, as Informix would:
+    ``tables`` maps (owner, name) to {tabid, version, columns: [(name, coltype, colno)],
+    pk: [colno, ...], unique: [(idxname, [colno, ...])]}."""
+
+    def __init__(self, tables):
+        self.tables = tables
+        self.statements = []
+
+    def _matching(self, sql, parameters):
+        values = list(parameters)
+        if "t.owner = ?" in sql or "t.owner=?" in sql:
+            return [(key, facts) for key, facts in self.tables.items() if key == tuple(values)]
+        return [(key, facts) for key, facts in self.tables.items() if key[1] in values]
+
+    @staticmethod
+    def _parts(colnos):
+        return {
+            f"part{index + 1}": (colnos[index] if index < len(colnos) else 0) for index in range(16)
+        }
+
+    def execute(self, sql, parameters=(), max_result_bytes=None):
+        self.statements.append(sql)
+        if "SELECT tabid, owner, tabname, version" in sql:
+            return [
+                {
+                    "tabid": facts["tabid"],
+                    "owner": owner + "  ",
+                    "tabname": name,
+                    "version": facts["version"],
+                }
+                for (owner, name), facts in self.tables.items()
+                if facts["tabid"] in parameters
+            ]
+        rows = []
+        for (owner, name), facts in self._matching(sql, parameters):
+            where = {"owner": owner, "tabname": name}
+            if "syscolumns" in sql:
+                # Without an ORDER BY the rows come in no particular order.
+                columns = facts["columns"] if "ORDER BY" in sql else reversed(facts["columns"])
+                rows += [
+                    {
+                        "colname": column,
+                        "coltype": coltype,
+                        "collength": 4,
+                        "colno": colno,
+                        "tabid": facts["tabid"],
+                        "extended_id": 0,
+                        "extended_name": None,
+                        "extended_owner": None,
+                        **where,
+                    }
+                    for column, coltype, colno in columns
+                ]
+            elif "constrtype" in sql and facts.get("pk"):
+                rows.append({**self._parts(facts["pk"]), **where})
+            elif "idxtype='U'" in sql:
+                rows += [
+                    {"idxname": index, **self._parts(colnos), **where}
+                    for index, colnos in facts.get("unique", [])
+                ]
+        return rows
+
+
+class _CatalogBridge:
+    """A shard bridge with batched catalog reads that records each one. ``versions`` holds
+    systables.version per table ID; ``tables`` the described tables by owner.name."""
+
+    def __init__(self, *tables):
+        self.tables = {f"{t['owner']}.{t['name']}": t for t in tables}
+        self.versions = {int(t["incarnation"]): 1 for t in tables}
+        self.calls = []
+
+    def table_versions(self, tabids):
+        self.calls.append(("versions", tuple(sorted(tabids))))
+        return {
+            int(t["incarnation"]): (t["owner"], t["name"], self.versions[int(t["incarnation"])])
+            for t in self.tables.values()
+            if int(t["incarnation"]) in tabids
+        }
+
+    def get_tables(self, identities):
+        self.calls.append(("describe", tuple(identities)))
+        return {
+            identity: json.loads(json.dumps(self.tables[identity.split(".", 1)[1]]))
+            for identity in identities
+            if identity.split(".", 1)[1] in self.tables
+        }
+
+
+def _catalog_table(name, tabid):
+    return {**_table(name=name), "incarnation": str(tabid)}
+
+
+class ShardCatalogTests(unittest.TestCase):
+    """A shard's daemon re-reads its tables' catalog only when systables.version says one
+    changed, checked on a timer, and reads the changed tables in one batch."""
+
+    def setUp(self):
+        self.bridge = _CatalogBridge(_catalog_table("a", 11), _catalog_table("b", 12))
+        self.subscribed = {
+            name: Table.parse(_catalog_table(name, tabid), "demo")
+            for name, tabid in (("a", 11), ("b", 12), ("c", 13))
+        }
+        self.catalog = informix_module._ShardCatalog()
+
+    def tables(self, now, *names, check_seconds=30):
+        names = names or ("a", "b")
+        return self.catalog.tables(
+            self.bridge, [(name, self.subscribed[name]) for name in names], now, check_seconds
+        )
+
+    def test_the_first_read_describes_every_table_in_one_batch(self):
+        tables = self.tables(0)
+
+        self.assertEqual(sorted(tables), ["a", "b"])
+        self.assertEqual(
+            self.bridge.calls,
+            [("versions", (11, 12)), ("describe", ("demo.app.a", "demo.app.b"))],
+        )
+
+    def test_a_read_before_the_next_check_touches_no_catalog(self):
+        first = self.tables(0)
+        self.bridge.calls.clear()
+
+        again = self.tables(29)
+
+        self.assertEqual(self.bridge.calls, [])
+        self.assertIs(again["a"], first["a"])
+
+    def test_a_check_with_unchanged_versions_reads_nothing_else(self):
+        self.tables(0)
+        self.bridge.calls.clear()
+
+        self.tables(30)
+
+        self.assertEqual(self.bridge.calls, [("versions", (11, 12))])
+
+    def test_a_check_re_reads_only_the_tables_whose_version_moved(self):
+        self.tables(0)
+        self.bridge.calls.clear()
+        self.bridge.tables["app.b"]["columns"].append({"name": "added", "type_name": "INTEGER"})
+        self.bridge.versions[12] = 2
+
+        tables = self.tables(30)
+
+        self.assertEqual(self.bridge.calls, [("versions", (11, 12)), ("describe", ("demo.app.b",))])
+        self.assertEqual([column.name for column in tables["b"].columns][-1], "added")
+        self.bridge.calls.clear()
+        self.tables(60)
+        self.assertEqual(self.bridge.calls, [("versions", (11, 12))])
+
+    def test_a_new_subscriber_is_read_at_once_on_its_own(self):
+        self.bridge.tables["app.c"] = _catalog_table("c", 13)
+        self.bridge.versions[13] = 1
+        self.tables(0)
+        self.bridge.calls.clear()
+
+        tables = self.tables(5, "a", "b", "c")
+
+        self.assertEqual(sorted(tables), ["a", "b", "c"])
+        self.assertEqual(self.bridge.calls, [("versions", (13,)), ("describe", ("demo.app.c",))])
+
+    def test_a_zero_interval_checks_before_every_read(self):
+        self.tables(0, check_seconds=0)
+        self.bridge.calls.clear()
+
+        self.tables(0, check_seconds=0)
+
+        self.assertEqual(self.bridge.calls, [("versions", (11, 12))])
+
+    def test_a_forced_check_runs_on_the_next_read(self):
+        self.tables(0)
+        self.bridge.calls.clear()
+
+        self.catalog.force_check()
+        self.tables(1)
+
+        self.assertEqual(self.bridge.calls, [("versions", (11, 12))])
+
+    def test_a_table_no_longer_in_the_catalog_is_left_to_direct_reads(self):
+        self.tables(0)
+        del self.bridge.tables["app.b"]
+        del self.bridge.versions[12]
+
+        with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
+            schema_map, unfit = informix_module._shard_schema_map(
+                self.bridge,
+                [(name, self.subscribed[name]) for name in ("a", "b")],
+                self.catalog,
+                30,
+            )
+
+        self.assertEqual((sorted(schema_map), unfit), (["a"], ["b"]))
+        self.assertIn("no longer has it", logs.output[0])
+
+    def test_a_renamed_table_is_read_again_under_its_name(self):
+        # The table ID stays, but systables names another table: the name is read again.
+        self.tables(0)
+        self.bridge.calls.clear()
+        self.bridge.tables["app.b"]["name"] = "renamed"
+
+        self.tables(30)
+
+        self.assertEqual(self.bridge.calls, [("versions", (11, 12)), ("describe", ("demo.app.b",))])
+
+    def test_a_re_created_table_is_read_again_with_its_new_version(self):
+        self.tables(0)
+        self.bridge.calls.clear()
+        self.bridge.tables["app.b"]["incarnation"] = "40"
+        del self.bridge.versions[12]
+        self.bridge.versions[40] = 1
+
+        self.assertEqual(self.tables(30)["b"].incarnation, "40")
+        # Its new table ID's version wasn't asked for, so the next check reads it again.
+        self.tables(60)
+        self.tables(90)
+
+        self.assertEqual(
+            self.bridge.calls,
+            [
+                ("versions", (11, 12)),
+                ("describe", ("demo.app.b",)),
+                ("versions", (11, 40)),
+                ("describe", ("demo.app.b",)),
+                ("versions", (11, 40)),
+            ],
+        )
+
+    def test_a_bridge_without_batched_reads_re_reads_every_table_at_each_check(self):
+        class Bridge:
+            def __init__(self, tables):
+                self.tables = tables
+                self.read = []
+
+            def get_table(self, identity):
+                self.read.append(identity)
+                return self.tables[identity.split(".", 1)[1]]
+
+        self.bridge = Bridge(
+            _CatalogBridge(_catalog_table("a", 11), _catalog_table("b", 12)).tables
+        )
+        self.tables(0)
+        self.tables(10)
+        self.tables(30)
+
+        self.assertEqual(self.bridge.read, ["demo.app.a", "demo.app.b"] * 2)
+
+
+class BatchedCatalogReadTests(unittest.TestCase):
+    """table_versions and get_tables read many tables per catalog query, and get_tables
+    describes each one exactly as get_table does."""
+
+    TABLES = {
+        ("app", "keyed"): {
+            "tabid": 101,
+            "version": 7,
+            "columns": [("id", 2 + 256, 1), ("note", 13, 2)],
+            "pk": [1],
+        },
+        ("app", "indexed"): {
+            "tabid": 102,
+            "version": 9,
+            "columns": [("code", 2 + 256, 1), ("name", 13, 2)],
+            "unique": [("ux_code", [1])],
+        },
+        ("other", "keyed"): {"tabid": 103, "version": 1, "columns": [("x", 2, 1)]},
+    }
+
+    def bridge(self):
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.config = {"database": "demo"}
+        bridge.transport = _CatalogTransport(self.TABLES)
+        return bridge
+
+    def test_get_tables_describes_each_table_as_get_table_does(self):
+        bridge = self.bridge()
+        identities = ["demo.app.keyed", "demo.app.indexed"]
+
+        batched = bridge.get_tables(identities + ["demo.app.gone"])
+
+        self.assertEqual(sorted(batched), sorted(identities))
+        for identity in identities:
+            with self.subTest(identity=identity):
+                self.assertEqual(batched[identity], self.bridge().get_table(identity))
+        self.assertEqual(batched["demo.app.indexed"]["primary_keys"], ["code"])
+        # Columns, keys, and the keyless table's unique indexes: three queries in all.
+        self.assertEqual(len(bridge.transport.statements), 3)
+
+    def test_get_tables_keeps_only_the_owners_asked_for(self):
+        batched = self.bridge().get_tables(["demo.app.keyed"])
+
+        self.assertEqual(
+            [column["name"] for column in batched["demo.app.keyed"]["columns"]], ["id", "note"]
+        )
+
+    def test_table_versions_reads_each_tables_version_by_table_id(self):
+        bridge = self.bridge()
+
+        self.assertEqual(
+            bridge.table_versions([101, 102, 999]),
+            {101: ("app", "keyed", 7), 102: ("app", "indexed", 9)},
+        )
+        self.assertEqual(len(bridge.transport.statements), 1)
+
+    def test_batched_reads_split_into_batches(self):
+        bridge = self.bridge()
+        with mock.patch.object(informix_module, "_CATALOG_BATCH", 1):
+            bridge.table_versions([101, 102])
+            versions_queries = len(bridge.transport.statements)
+            bridge.transport.statements.clear()
+            bridge.get_tables(["demo.app.keyed", "demo.app.indexed"])
+
+        self.assertEqual(versions_queries, 2)
+        # Two names, two queries each, and one unique-index query for the keyless table.
+        self.assertEqual(len(bridge.transport.statements), 5)
 
 
 class SharedCdcOptionTests(unittest.TestCase):
