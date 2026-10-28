@@ -1,0 +1,1944 @@
+{
+ "datasets": [
+  {
+   "name": "ds_summary",
+   "displayName": "Latest run summary",
+   "queryLines": [
+    "WITH latest AS ( SELECT run_id FROM events WHERE kind = 'start' AND message NOT LIKE '%smoke=True%' ",
+    "ORDER BY run_id DESC LIMIT 1) , ev AS (SELECT e.* FROM events e JOIN latest USING (run_id)), ",
+    "cy AS (SELECT c.* FROM cycles c JOIN latest USING (run_id)) SELECT l.run_id, (SELECT min(at) ",
+    "FROM ev) AS started_at, CAST(regexp_extract((SELECT max(message) FROM ev WHERE kind = 'start'), ",
+    "': ([0-9]+) cycles', 1) AS INT) AS cycles_planned, (SELECT count(*) FROM cy) AS cycles_done, ",
+    "(SELECT count_if(verdict = 'MATCH') FROM cy) AS matched, (SELECT count_if(verdict <> 'MATCH') ",
+    "FROM cy) AS mismatched, (SELECT count_if(extra_run) FROM cy) AS extra_runs, (SELECT count(*) ",
+    "FROM ev WHERE kind = 'ended' AND message LIKE '%FAILED') AS failed_updates, (SELECT max(cycle) ",
+    "FROM ev) AS current_cycle, (SELECT max(at) FROM ev) AS last_event_at, (SELECT max_by(message, ",
+    "at) FROM ev) AS last_event, round((unix_timestamp(current_timestamp()) - unix_timestamp((SELECT ",
+    "max(at) FROM ev))) / 60, 1) AS minutes_since_last_event, CASE WHEN (SELECT count(*) FROM ev ",
+    "WHERE kind = 'summary') > 0 THEN 'Finished' WHEN unix_timestamp(current_timestamp()) - unix_timestamp((SELECT ",
+    "max(at) FROM ev)) > 1800 THEN 'No events for 30+ min: check the job run' ELSE 'Running' END ",
+    "AS status FROM latest l "
+   ]
+  },
+  {
+   "name": "ds_cycles",
+   "displayName": "Latest run cycles",
+   "queryLines": [
+    "WITH latest AS ( SELECT run_id FROM events WHERE kind = 'start' AND message NOT LIKE '%smoke=True%' ",
+    "ORDER BY run_id DESC LIMIT 1) SELECT c.cycle, concat('Cycle ', c.cycle) AS cycle_label, c.verdict, ",
+    "c.extra_run, st.cycle_started_at, c.at AS finished_at, round((unix_timestamp(c.at) - unix_timestamp(st.cycle_started_at)) ",
+    "/ 60, 1) AS minutes, CAST(regexp_extract(c.first_count, 'TOTAL ([0-9]+) ([0-9]+) ([-+]?[0-9]+) ",
+    "([0-9]+)', 3) AS BIGINT) AS first_count_diff, CAST(regexp_extract(c.first_count, 'TOTAL ([0-9]+) ",
+    "([0-9]+) ([-+]?[0-9]+) ([0-9]+)', 4) AS INT) AS first_tables_differing, CAST(regexp_extract(c.final_count, ",
+    "'TOTAL ([0-9]+) ([0-9]+) ([-+]?[0-9]+) ([0-9]+)', 3) AS BIGINT) AS final_count_diff, CAST(regexp_extract(c.final_count, ",
+    "'TOTAL ([0-9]+) ([0-9]+) ([-+]?[0-9]+) ([0-9]+)', 4) AS INT) AS final_tables_differing, CAST(regexp_extract(c.final_count, ",
+    "'TOTAL ([0-9]+) ([0-9]+) ([-+]?[0-9]+) ([0-9]+)', 1) AS BIGINT) AS informix_rows, CAST(regexp_extract(c.final_count, ",
+    "'TOTAL ([0-9]+) ([0-9]+) ([-+]?[0-9]+) ([0-9]+)', 2) AS BIGINT) AS pipeline_rows, CAST(regexp_extract(c.data_compare, ",
+    "'missing_rows=([0-9]+)', 1) AS BIGINT) AS missing_rows, CAST(regexp_extract(c.data_compare, ",
+    "'extra_rows=([0-9]+)', 1) AS BIGINT) AS extra_rows, CAST(regexp_extract(c.data_compare, 'mismatched_rows=([0-9]+)', ",
+    "1) AS BIGINT) AS mismatched_rows, CAST(regexp_extract(c.data_compare, 'duplicate_source_keys=([0-9]+)', ",
+    "1) AS BIGINT) + CAST(regexp_extract(c.data_compare, 'duplicate_destination_keys=([0-9]+)', ",
+    "1) AS BIGINT) AS duplicate_keys, nullif(regexp_extract(c.data_compare, 'tables with differences: ",
+    "(.*)$', 1), '') AS tables_with_differences FROM cycles c JOIN latest l ON l.run_id = c.run_id ",
+    "LEFT JOIN (SELECT run_id, cycle, min(at) AS cycle_started_at FROM events WHERE kind = 'cycle' ",
+    "AND message LIKE 'cycle % starting' GROUP BY run_id, cycle) st ON st.run_id = c.run_id AND ",
+    "st.cycle = c.cycle ORDER BY c.cycle "
+   ]
+  },
+  {
+   "name": "ds_updates",
+   "displayName": "Latest run pipeline updates",
+   "queryLines": [
+    "WITH latest AS ( SELECT run_id FROM events WHERE kind = 'start' AND message NOT LIKE '%smoke=True%' ",
+    "ORDER BY run_id DESC LIMIT 1) , s AS (SELECT run_id, cycle, at AS started_at, regexp_extract(message, ",
+    "'^(run [0-9]+|extra run):', 1) AS run_label, regexp_extract(message, 'started (.+) update ', ",
+    "1) AS update_type, regexp_extract(message, '([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', ",
+    "1) AS update_id FROM events WHERE kind = 'started'), x AS (SELECT run_id, at AS ended_at, regexp_extract(message, ",
+    "'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', 1) AS update_id, regexp_extract(message, ",
+    "'(COMPLETED|FAILED|CANCELED)$', 1) AS final_state, message LIKE '%ended before%' AS ended_early ",
+    "FROM events WHERE kind = 'ended') SELECT s.cycle, concat('Cycle ', s.cycle) AS cycle_label, ",
+    "s.run_label, s.update_type, s.update_id, s.started_at, x.ended_at, coalesce(x.final_state, ",
+    "'RUNNING') AS state, coalesce(x.ended_early, false) AS ended_early, round((unix_timestamp(coalesce(x.ended_at, ",
+    "current_timestamp())) - unix_timestamp(s.started_at)) / 60, 1) AS minutes FROM s JOIN latest ",
+    "l ON l.run_id = s.run_id LEFT JOIN x ON x.run_id = s.run_id AND x.update_id = s.update_id ORDER ",
+    "BY s.started_at "
+   ]
+  },
+  {
+   "name": "ds_events",
+   "displayName": "Latest run events",
+   "queryLines": [
+    "WITH latest AS ( SELECT run_id FROM events WHERE kind = 'start' AND message NOT LIKE '%smoke=True%' ",
+    "ORDER BY run_id DESC LIMIT 1) SELECT e.at, e.cycle, e.kind, e.message FROM events e JOIN latest ",
+    "l ON l.run_id = e.run_id ORDER BY e.at DESC "
+   ]
+  },
+  {
+   "name": "ds_runs",
+   "displayName": "All runs",
+   "queryLines": [
+    "WITH r AS (SELECT run_id, min(at) AS started_at, max(at) AS last_event_at, max(CASE WHEN kind ",
+    "= 'start' THEN message END) AS start_message, count_if(kind = 'summary') > 0 AS finished FROM ",
+    "events GROUP BY run_id), c AS (SELECT run_id, count(*) AS cycles_done, count_if(verdict = 'MATCH') ",
+    "AS matched, count_if(verdict <> 'MATCH') AS mismatched, count_if(extra_run) AS extra_runs FROM ",
+    "cycles GROUP BY run_id) SELECT r.run_id, r.started_at, r.last_event_at, CASE WHEN r.start_message ",
+    "LIKE '%smoke=True%' THEN 'smoke' ELSE 'full' END AS run_type, CAST(regexp_extract(r.start_message, ",
+    "': ([0-9]+) cycles', 1) AS INT) AS cycles_planned, coalesce(c.cycles_done, 0) AS cycles_done, ",
+    "coalesce(c.matched, 0) AS matched, coalesce(c.mismatched, 0) AS mismatched, coalesce(c.extra_runs, ",
+    "0) AS extra_runs, CASE WHEN r.finished THEN 'Finished' ELSE 'Not finished' END AS status FROM ",
+    "r LEFT JOIN c ON c.run_id = r.run_id ORDER BY r.run_id DESC "
+   ]
+  },
+  {
+   "name": "ds_all_cycles",
+   "displayName": "All cycles",
+   "queryLines": [
+    "SELECT c.run_id, c.cycle, concat('Cycle ', c.cycle) AS cycle_label, c.verdict, c.extra_run, ",
+    "st.cycle_started_at, c.at AS finished_at, round((unix_timestamp(c.at) - unix_timestamp(st.cycle_started_at)) ",
+    "/ 60, 1) AS minutes, CAST(regexp_extract(c.first_count, 'TOTAL ([0-9]+) ([0-9]+) ([-+]?[0-9]+) ",
+    "([0-9]+)', 3) AS BIGINT) AS first_count_diff, CAST(regexp_extract(c.first_count, 'TOTAL ([0-9]+) ",
+    "([0-9]+) ([-+]?[0-9]+) ([0-9]+)', 4) AS INT) AS first_tables_differing, CAST(regexp_extract(c.final_count, ",
+    "'TOTAL ([0-9]+) ([0-9]+) ([-+]?[0-9]+) ([0-9]+)', 3) AS BIGINT) AS final_count_diff, CAST(regexp_extract(c.final_count, ",
+    "'TOTAL ([0-9]+) ([0-9]+) ([-+]?[0-9]+) ([0-9]+)', 4) AS INT) AS final_tables_differing, CAST(regexp_extract(c.final_count, ",
+    "'TOTAL ([0-9]+) ([0-9]+) ([-+]?[0-9]+) ([0-9]+)', 1) AS BIGINT) AS informix_rows, CAST(regexp_extract(c.final_count, ",
+    "'TOTAL ([0-9]+) ([0-9]+) ([-+]?[0-9]+) ([0-9]+)', 2) AS BIGINT) AS pipeline_rows, CAST(regexp_extract(c.data_compare, ",
+    "'missing_rows=([0-9]+)', 1) AS BIGINT) AS missing_rows, CAST(regexp_extract(c.data_compare, ",
+    "'extra_rows=([0-9]+)', 1) AS BIGINT) AS extra_rows, CAST(regexp_extract(c.data_compare, 'mismatched_rows=([0-9]+)', ",
+    "1) AS BIGINT) AS mismatched_rows, CAST(regexp_extract(c.data_compare, 'duplicate_source_keys=([0-9]+)', ",
+    "1) AS BIGINT) + CAST(regexp_extract(c.data_compare, 'duplicate_destination_keys=([0-9]+)', ",
+    "1) AS BIGINT) AS duplicate_keys, nullif(regexp_extract(c.data_compare, 'tables with differences: ",
+    "(.*)$', 1), '') AS tables_with_differences FROM cycles c LEFT JOIN (SELECT run_id, cycle, min(at) ",
+    "AS cycle_started_at FROM events WHERE kind = 'cycle' AND message LIKE 'cycle % starting' GROUP ",
+    "BY run_id, cycle) st ON st.run_id = c.run_id AND st.cycle = c.cycle ORDER BY c.run_id DESC, ",
+    "c.cycle "
+   ]
+  }
+ ],
+ "pages": [
+  {
+   "name": "latest",
+   "displayName": "Latest run",
+   "pageType": "PAGE_TYPE_CANVAS",
+   "layoutVersion": "GRID_V1",
+   "layout": [
+    {
+     "widget": {
+      "name": "title",
+      "multilineTextboxSpec": {
+       "lines": [
+        "## Informix cycles: latest run"
+       ]
+      }
+     },
+     "position": {
+      "x": 0,
+      "y": 0,
+      "width": 12,
+      "height": 1
+     }
+    },
+    {
+     "widget": {
+      "name": "subtitle",
+      "multilineTextboxSpec": {
+       "lines": [
+        "Each cycle restarts the Informix container, then runs informix-pipeline as a triggered full refresh, a triggered update and 5 continuous updates of 5 minutes. It compares counts (with one extra 8-minute continuous run if they differ), then compares the data. From job *Informix cycles*; times are UTC."
+       ]
+      }
+     },
+     "position": {
+      "x": 0,
+      "y": 1,
+      "width": 12,
+      "height": 1
+     }
+    },
+    {
+     "widget": {
+      "name": "k-done",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_summary",
+         "fields": [
+          {
+           "name": "cycles_done",
+           "expression": "`cycles_done`"
+          }
+         ],
+         "disaggregated": true
+        }
+       }
+      ],
+      "spec": {
+       "version": 2,
+       "widgetType": "counter",
+       "encodings": {
+        "value": {
+         "fieldName": "cycles_done",
+         "displayName": "Cycles done"
+        }
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Cycles done"
+       }
+      }
+     },
+     "position": {
+      "x": 0,
+      "y": 2,
+      "width": 2,
+      "height": 3
+     }
+    },
+    {
+     "widget": {
+      "name": "k-match",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_summary",
+         "fields": [
+          {
+           "name": "matched",
+           "expression": "`matched`"
+          }
+         ],
+         "disaggregated": true
+        }
+       }
+      ],
+      "spec": {
+       "version": 2,
+       "widgetType": "counter",
+       "encodings": {
+        "value": {
+         "fieldName": "matched",
+         "displayName": "Matched"
+        }
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Matched"
+       }
+      }
+     },
+     "position": {
+      "x": 2,
+      "y": 2,
+      "width": 2,
+      "height": 3
+     }
+    },
+    {
+     "widget": {
+      "name": "k-mismatch",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_summary",
+         "fields": [
+          {
+           "name": "mismatched",
+           "expression": "`mismatched`"
+          }
+         ],
+         "disaggregated": true
+        }
+       }
+      ],
+      "spec": {
+       "version": 2,
+       "widgetType": "counter",
+       "encodings": {
+        "value": {
+         "fieldName": "mismatched",
+         "displayName": "Mismatched"
+        }
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Mismatched"
+       }
+      }
+     },
+     "position": {
+      "x": 4,
+      "y": 2,
+      "width": 2,
+      "height": 3
+     }
+    },
+    {
+     "widget": {
+      "name": "k-extra",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_summary",
+         "fields": [
+          {
+           "name": "extra_runs",
+           "expression": "`extra_runs`"
+          }
+         ],
+         "disaggregated": true
+        }
+       }
+      ],
+      "spec": {
+       "version": 2,
+       "widgetType": "counter",
+       "encodings": {
+        "value": {
+         "fieldName": "extra_runs",
+         "displayName": "Extra runs needed"
+        }
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Extra runs needed"
+       }
+      }
+     },
+     "position": {
+      "x": 6,
+      "y": 2,
+      "width": 2,
+      "height": 3
+     }
+    },
+    {
+     "widget": {
+      "name": "k-failed",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_summary",
+         "fields": [
+          {
+           "name": "failed_updates",
+           "expression": "`failed_updates`"
+          }
+         ],
+         "disaggregated": true
+        }
+       }
+      ],
+      "spec": {
+       "version": 2,
+       "widgetType": "counter",
+       "encodings": {
+        "value": {
+         "fieldName": "failed_updates",
+         "displayName": "Failed updates"
+        }
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Failed updates"
+       }
+      }
+     },
+     "position": {
+      "x": 8,
+      "y": 2,
+      "width": 2,
+      "height": 3
+     }
+    },
+    {
+     "widget": {
+      "name": "k-quiet",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_summary",
+         "fields": [
+          {
+           "name": "minutes_since_last_event",
+           "expression": "`minutes_since_last_event`"
+          }
+         ],
+         "disaggregated": true
+        }
+       }
+      ],
+      "spec": {
+       "version": 2,
+       "widgetType": "counter",
+       "encodings": {
+        "value": {
+         "fieldName": "minutes_since_last_event",
+         "displayName": "Minutes since last event"
+        }
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Minutes since last event"
+       }
+      }
+     },
+     "position": {
+      "x": 10,
+      "y": 2,
+      "width": 2,
+      "height": 3
+     }
+    },
+    {
+     "widget": {
+      "name": "status",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_summary",
+         "fields": [
+          {
+           "name": "run_id",
+           "expression": "`run_id`"
+          },
+          {
+           "name": "status",
+           "expression": "`status`"
+          },
+          {
+           "name": "current_cycle",
+           "expression": "`current_cycle`"
+          },
+          {
+           "name": "cycles_planned",
+           "expression": "`cycles_planned`"
+          },
+          {
+           "name": "started_at",
+           "expression": "`started_at`"
+          },
+          {
+           "name": "last_event_at",
+           "expression": "`last_event_at`"
+          },
+          {
+           "name": "last_event",
+           "expression": "`last_event`"
+          }
+         ],
+         "disaggregated": true
+        }
+       }
+      ],
+      "spec": {
+       "version": 2,
+       "widgetType": "table",
+       "encodings": {
+        "columns": [
+         {
+          "fieldName": "run_id",
+          "displayName": "Run"
+         },
+         {
+          "fieldName": "status",
+          "displayName": "Status"
+         },
+         {
+          "fieldName": "current_cycle",
+          "displayName": "Current cycle"
+         },
+         {
+          "fieldName": "cycles_planned",
+          "displayName": "Cycles planned"
+         },
+         {
+          "fieldName": "started_at",
+          "displayName": "Started (UTC)"
+         },
+         {
+          "fieldName": "last_event_at",
+          "displayName": "Last event (UTC)"
+         },
+         {
+          "fieldName": "last_event",
+          "displayName": "Last event"
+         }
+        ]
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Status"
+       }
+      }
+     },
+     "position": {
+      "x": 0,
+      "y": 5,
+      "width": 12,
+      "height": 3
+     }
+    },
+    {
+     "widget": {
+      "name": "h-cycles",
+      "multilineTextboxSpec": {
+       "lines": [
+        "### Cycle results"
+       ]
+      }
+     },
+     "position": {
+      "x": 0,
+      "y": 8,
+      "width": 12,
+      "height": 1
+     }
+    },
+    {
+     "widget": {
+      "name": "cycles-tbl",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_cycles",
+         "fields": [
+          {
+           "name": "cycle",
+           "expression": "`cycle`"
+          },
+          {
+           "name": "verdict",
+           "expression": "`verdict`"
+          },
+          {
+           "name": "extra_run",
+           "expression": "`extra_run`"
+          },
+          {
+           "name": "first_count_diff",
+           "expression": "`first_count_diff`"
+          },
+          {
+           "name": "first_tables_differing",
+           "expression": "`first_tables_differing`"
+          },
+          {
+           "name": "final_count_diff",
+           "expression": "`final_count_diff`"
+          },
+          {
+           "name": "final_tables_differing",
+           "expression": "`final_tables_differing`"
+          },
+          {
+           "name": "informix_rows",
+           "expression": "`informix_rows`"
+          },
+          {
+           "name": "pipeline_rows",
+           "expression": "`pipeline_rows`"
+          },
+          {
+           "name": "missing_rows",
+           "expression": "`missing_rows`"
+          },
+          {
+           "name": "extra_rows",
+           "expression": "`extra_rows`"
+          },
+          {
+           "name": "mismatched_rows",
+           "expression": "`mismatched_rows`"
+          },
+          {
+           "name": "duplicate_keys",
+           "expression": "`duplicate_keys`"
+          },
+          {
+           "name": "tables_with_differences",
+           "expression": "`tables_with_differences`"
+          },
+          {
+           "name": "minutes",
+           "expression": "`minutes`"
+          },
+          {
+           "name": "finished_at",
+           "expression": "`finished_at`"
+          }
+         ],
+         "disaggregated": true
+        }
+       }
+      ],
+      "spec": {
+       "version": 2,
+       "widgetType": "table",
+       "encodings": {
+        "columns": [
+         {
+          "fieldName": "cycle",
+          "displayName": "Cycle"
+         },
+         {
+          "fieldName": "verdict",
+          "displayName": "Verdict",
+          "style": {
+           "type": "basic",
+           "rules": [
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "MISMATCH"
+              },
+              "operator": "="
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            },
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "MATCH"
+              },
+              "operator": "="
+             },
+             "backgroundColor": {
+              "hex": "#B8E6D3"
+             }
+            }
+           ]
+          }
+         },
+         {
+          "fieldName": "extra_run",
+          "displayName": "Extra run"
+         },
+         {
+          "fieldName": "first_count_diff",
+          "displayName": "First count diff",
+          "style": {
+           "type": "basic",
+           "rules": [
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "0"
+              },
+              "operator": ">"
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            },
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "0"
+              },
+              "operator": "<"
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            }
+           ]
+          }
+         },
+         {
+          "fieldName": "first_tables_differing",
+          "displayName": "Tables differing (first)",
+          "style": {
+           "type": "basic",
+           "rules": [
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "0"
+              },
+              "operator": ">"
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            }
+           ]
+          }
+         },
+         {
+          "fieldName": "final_count_diff",
+          "displayName": "Final count diff",
+          "style": {
+           "type": "basic",
+           "rules": [
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "0"
+              },
+              "operator": ">"
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            },
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "0"
+              },
+              "operator": "<"
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            }
+           ]
+          }
+         },
+         {
+          "fieldName": "final_tables_differing",
+          "displayName": "Tables differing (final)",
+          "style": {
+           "type": "basic",
+           "rules": [
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "0"
+              },
+              "operator": ">"
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            }
+           ]
+          }
+         },
+         {
+          "fieldName": "informix_rows",
+          "displayName": "Informix rows"
+         },
+         {
+          "fieldName": "pipeline_rows",
+          "displayName": "Pipeline rows"
+         },
+         {
+          "fieldName": "missing_rows",
+          "displayName": "Missing rows",
+          "style": {
+           "type": "basic",
+           "rules": [
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "0"
+              },
+              "operator": ">"
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            }
+           ]
+          }
+         },
+         {
+          "fieldName": "extra_rows",
+          "displayName": "Extra rows",
+          "style": {
+           "type": "basic",
+           "rules": [
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "0"
+              },
+              "operator": ">"
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            }
+           ]
+          }
+         },
+         {
+          "fieldName": "mismatched_rows",
+          "displayName": "Mismatched rows",
+          "style": {
+           "type": "basic",
+           "rules": [
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "0"
+              },
+              "operator": ">"
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            }
+           ]
+          }
+         },
+         {
+          "fieldName": "duplicate_keys",
+          "displayName": "Duplicate keys",
+          "style": {
+           "type": "basic",
+           "rules": [
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "0"
+              },
+              "operator": ">"
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            }
+           ]
+          }
+         },
+         {
+          "fieldName": "tables_with_differences",
+          "displayName": "Tables with data differences"
+         },
+         {
+          "fieldName": "minutes",
+          "displayName": "Cycle minutes",
+          "format": {
+           "type": "number",
+           "decimalPlaces": {
+            "type": "exact",
+            "places": 1
+           }
+          }
+         },
+         {
+          "fieldName": "finished_at",
+          "displayName": "Finished (UTC)"
+         }
+        ]
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Cycles"
+       }
+      }
+     },
+     "position": {
+      "x": 0,
+      "y": 9,
+      "width": 12,
+      "height": 5
+     }
+    },
+    {
+     "widget": {
+      "name": "count-diff",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_cycles",
+         "fields": [
+          {
+           "name": "cycle_label",
+           "expression": "`cycle_label`"
+          },
+          {
+           "name": "sum(first_count_diff)",
+           "expression": "SUM(`first_count_diff`)"
+          },
+          {
+           "name": "sum(final_count_diff)",
+           "expression": "SUM(`final_count_diff`)"
+          }
+         ],
+         "disaggregated": false
+        }
+       }
+      ],
+      "spec": {
+       "version": 3,
+       "widgetType": "bar",
+       "encodings": {
+        "x": {
+         "fieldName": "cycle_label",
+         "scale": {
+          "type": "categorical"
+         },
+         "displayName": "Cycle"
+        },
+        "y": {
+         "scale": {
+          "type": "quantitative"
+         },
+         "fields": [
+          {
+           "fieldName": "sum(first_count_diff)",
+           "displayName": "First count"
+          },
+          {
+           "fieldName": "sum(final_count_diff)",
+           "displayName": "Final count"
+          }
+         ]
+        }
+       },
+       "mark": {
+        "layout": "group"
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Count difference (pipeline - Informix)"
+       }
+      }
+     },
+     "position": {
+      "x": 0,
+      "y": 14,
+      "width": 6,
+      "height": 5
+     }
+    },
+    {
+     "widget": {
+      "name": "data-diff",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_cycles",
+         "fields": [
+          {
+           "name": "cycle_label",
+           "expression": "`cycle_label`"
+          },
+          {
+           "name": "sum(missing_rows)",
+           "expression": "SUM(`missing_rows`)"
+          },
+          {
+           "name": "sum(extra_rows)",
+           "expression": "SUM(`extra_rows`)"
+          },
+          {
+           "name": "sum(mismatched_rows)",
+           "expression": "SUM(`mismatched_rows`)"
+          }
+         ],
+         "disaggregated": false
+        }
+       }
+      ],
+      "spec": {
+       "version": 3,
+       "widgetType": "bar",
+       "encodings": {
+        "x": {
+         "fieldName": "cycle_label",
+         "scale": {
+          "type": "categorical"
+         },
+         "displayName": "Cycle"
+        },
+        "y": {
+         "scale": {
+          "type": "quantitative"
+         },
+         "fields": [
+          {
+           "fieldName": "sum(missing_rows)",
+           "displayName": "Missing"
+          },
+          {
+           "fieldName": "sum(extra_rows)",
+           "displayName": "Extra"
+          },
+          {
+           "fieldName": "sum(mismatched_rows)",
+           "displayName": "Mismatched"
+          }
+         ]
+        }
+       },
+       "mark": {
+        "layout": "group"
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Data compare differences"
+       }
+      }
+     },
+     "position": {
+      "x": 6,
+      "y": 14,
+      "width": 6,
+      "height": 5
+     }
+    },
+    {
+     "widget": {
+      "name": "h-updates",
+      "multilineTextboxSpec": {
+       "lines": [
+        "### Pipeline updates"
+       ]
+      }
+     },
+     "position": {
+      "x": 0,
+      "y": 19,
+      "width": 12,
+      "height": 1
+     }
+    },
+    {
+     "widget": {
+      "name": "durations",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_updates",
+         "fields": [
+          {
+           "name": "run_label",
+           "expression": "`run_label`"
+          },
+          {
+           "name": "sum(minutes)",
+           "expression": "SUM(`minutes`)"
+          },
+          {
+           "name": "cycle_label",
+           "expression": "`cycle_label`"
+          }
+         ],
+         "disaggregated": false
+        }
+       }
+      ],
+      "spec": {
+       "version": 3,
+       "widgetType": "bar",
+       "encodings": {
+        "x": {
+         "fieldName": "run_label",
+         "scale": {
+          "type": "categorical",
+          "sort": {
+           "by": "custom-order",
+           "orderedValues": [
+            "run 1",
+            "run 2",
+            "run 3",
+            "run 4",
+            "run 5",
+            "run 6",
+            "run 7",
+            "extra run"
+           ]
+          }
+         },
+         "displayName": "Run"
+        },
+        "y": {
+         "fieldName": "sum(minutes)",
+         "displayName": "Minutes",
+         "scale": {
+          "type": "quantitative"
+         }
+        },
+        "color": {
+         "fieldName": "cycle_label",
+         "scale": {
+          "type": "categorical"
+         },
+         "displayName": "Cycle"
+        }
+       },
+       "mark": {
+        "layout": "group"
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Update minutes by run"
+       }
+      }
+     },
+     "position": {
+      "x": 0,
+      "y": 20,
+      "width": 12,
+      "height": 5
+     }
+    },
+    {
+     "widget": {
+      "name": "updates-tbl",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_updates",
+         "fields": [
+          {
+           "name": "cycle",
+           "expression": "`cycle`"
+          },
+          {
+           "name": "run_label",
+           "expression": "`run_label`"
+          },
+          {
+           "name": "update_type",
+           "expression": "`update_type`"
+          },
+          {
+           "name": "state",
+           "expression": "`state`"
+          },
+          {
+           "name": "ended_early",
+           "expression": "`ended_early`"
+          },
+          {
+           "name": "minutes",
+           "expression": "`minutes`"
+          },
+          {
+           "name": "started_at",
+           "expression": "`started_at`"
+          },
+          {
+           "name": "ended_at",
+           "expression": "`ended_at`"
+          },
+          {
+           "name": "update_id",
+           "expression": "`update_id`"
+          }
+         ],
+         "disaggregated": true
+        }
+       }
+      ],
+      "spec": {
+       "version": 2,
+       "widgetType": "table",
+       "encodings": {
+        "columns": [
+         {
+          "fieldName": "cycle",
+          "displayName": "Cycle"
+         },
+         {
+          "fieldName": "run_label",
+          "displayName": "Run"
+         },
+         {
+          "fieldName": "update_type",
+          "displayName": "Type"
+         },
+         {
+          "fieldName": "state",
+          "displayName": "State",
+          "style": {
+           "type": "basic",
+           "rules": [
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "FAILED"
+              },
+              "operator": "="
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            },
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "RUNNING"
+              },
+              "operator": "="
+             },
+             "backgroundColor": {
+              "hex": "#CDE7F7"
+             }
+            }
+           ]
+          }
+         },
+         {
+          "fieldName": "ended_early",
+          "displayName": "Ended early"
+         },
+         {
+          "fieldName": "minutes",
+          "displayName": "Minutes",
+          "format": {
+           "type": "number",
+           "decimalPlaces": {
+            "type": "exact",
+            "places": 1
+           }
+          }
+         },
+         {
+          "fieldName": "started_at",
+          "displayName": "Started (UTC)"
+         },
+         {
+          "fieldName": "ended_at",
+          "displayName": "Ended (UTC)"
+         },
+         {
+          "fieldName": "update_id",
+          "displayName": "Update"
+         }
+        ]
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Updates"
+       }
+      }
+     },
+     "position": {
+      "x": 0,
+      "y": 25,
+      "width": 12,
+      "height": 7
+     }
+    },
+    {
+     "widget": {
+      "name": "h-events",
+      "multilineTextboxSpec": {
+       "lines": [
+        "### Event log"
+       ]
+      }
+     },
+     "position": {
+      "x": 0,
+      "y": 32,
+      "width": 12,
+      "height": 1
+     }
+    },
+    {
+     "widget": {
+      "name": "events-tbl",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_events",
+         "fields": [
+          {
+           "name": "at",
+           "expression": "`at`"
+          },
+          {
+           "name": "cycle",
+           "expression": "`cycle`"
+          },
+          {
+           "name": "kind",
+           "expression": "`kind`"
+          },
+          {
+           "name": "message",
+           "expression": "`message`"
+          }
+         ],
+         "disaggregated": true
+        }
+       }
+      ],
+      "spec": {
+       "version": 2,
+       "widgetType": "table",
+       "encodings": {
+        "columns": [
+         {
+          "fieldName": "at",
+          "displayName": "At (UTC)"
+         },
+         {
+          "fieldName": "cycle",
+          "displayName": "Cycle"
+         },
+         {
+          "fieldName": "kind",
+          "displayName": "Kind"
+         },
+         {
+          "fieldName": "message",
+          "displayName": "Message"
+         }
+        ]
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Events (newest first)"
+       }
+      }
+     },
+     "position": {
+      "x": 0,
+      "y": 33,
+      "width": 12,
+      "height": 8
+     }
+    }
+   ]
+  },
+  {
+   "name": "history",
+   "displayName": "All runs",
+   "pageType": "PAGE_TYPE_CANVAS",
+   "layoutVersion": "GRID_V1",
+   "layout": [
+    {
+     "widget": {
+      "name": "h-title",
+      "multilineTextboxSpec": {
+       "lines": [
+        "## Informix cycles: all runs"
+       ]
+      }
+     },
+     "position": {
+      "x": 0,
+      "y": 0,
+      "width": 12,
+      "height": 1
+     }
+    },
+    {
+     "widget": {
+      "name": "runs-tbl",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_runs",
+         "fields": [
+          {
+           "name": "run_id",
+           "expression": "`run_id`"
+          },
+          {
+           "name": "run_type",
+           "expression": "`run_type`"
+          },
+          {
+           "name": "status",
+           "expression": "`status`"
+          },
+          {
+           "name": "cycles_planned",
+           "expression": "`cycles_planned`"
+          },
+          {
+           "name": "cycles_done",
+           "expression": "`cycles_done`"
+          },
+          {
+           "name": "matched",
+           "expression": "`matched`"
+          },
+          {
+           "name": "mismatched",
+           "expression": "`mismatched`"
+          },
+          {
+           "name": "extra_runs",
+           "expression": "`extra_runs`"
+          },
+          {
+           "name": "started_at",
+           "expression": "`started_at`"
+          },
+          {
+           "name": "last_event_at",
+           "expression": "`last_event_at`"
+          }
+         ],
+         "disaggregated": true
+        }
+       }
+      ],
+      "spec": {
+       "version": 2,
+       "widgetType": "table",
+       "encodings": {
+        "columns": [
+         {
+          "fieldName": "run_id",
+          "displayName": "Run"
+         },
+         {
+          "fieldName": "run_type",
+          "displayName": "Type"
+         },
+         {
+          "fieldName": "status",
+          "displayName": "Status"
+         },
+         {
+          "fieldName": "cycles_planned",
+          "displayName": "Cycles planned"
+         },
+         {
+          "fieldName": "cycles_done",
+          "displayName": "Cycles done"
+         },
+         {
+          "fieldName": "matched",
+          "displayName": "Matched"
+         },
+         {
+          "fieldName": "mismatched",
+          "displayName": "Mismatched",
+          "style": {
+           "type": "basic",
+           "rules": [
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "0"
+              },
+              "operator": ">"
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            }
+           ]
+          }
+         },
+         {
+          "fieldName": "extra_runs",
+          "displayName": "Extra runs"
+         },
+         {
+          "fieldName": "started_at",
+          "displayName": "Started (UTC)"
+         },
+         {
+          "fieldName": "last_event_at",
+          "displayName": "Last event (UTC)"
+         }
+        ]
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Job runs"
+       }
+      }
+     },
+     "position": {
+      "x": 0,
+      "y": 1,
+      "width": 12,
+      "height": 5
+     }
+    },
+    {
+     "widget": {
+      "name": "h-all",
+      "multilineTextboxSpec": {
+       "lines": [
+        "### Cycles across runs"
+       ]
+      }
+     },
+     "position": {
+      "x": 0,
+      "y": 6,
+      "width": 8,
+      "height": 2
+     }
+    },
+    {
+     "widget": {
+      "name": "f-run",
+      "queries": [
+       {
+        "name": "q_run",
+        "query": {
+         "datasetName": "ds_all_cycles",
+         "fields": [
+          {
+           "name": "run_id",
+           "expression": "`run_id`"
+          }
+         ],
+         "disaggregated": false
+        }
+       }
+      ],
+      "spec": {
+       "version": 2,
+       "widgetType": "filter-multi-select",
+       "encodings": {
+        "fields": [
+         {
+          "fieldName": "run_id",
+          "displayName": "Run",
+          "queryName": "q_run"
+         }
+        ]
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Run"
+       }
+      }
+     },
+     "position": {
+      "x": 8,
+      "y": 6,
+      "width": 4,
+      "height": 2
+     }
+    },
+    {
+     "widget": {
+      "name": "all-cycles-tbl",
+      "queries": [
+       {
+        "name": "main_query",
+        "query": {
+         "datasetName": "ds_all_cycles",
+         "fields": [
+          {
+           "name": "run_id",
+           "expression": "`run_id`"
+          },
+          {
+           "name": "cycle",
+           "expression": "`cycle`"
+          },
+          {
+           "name": "verdict",
+           "expression": "`verdict`"
+          },
+          {
+           "name": "extra_run",
+           "expression": "`extra_run`"
+          },
+          {
+           "name": "first_count_diff",
+           "expression": "`first_count_diff`"
+          },
+          {
+           "name": "first_tables_differing",
+           "expression": "`first_tables_differing`"
+          },
+          {
+           "name": "final_count_diff",
+           "expression": "`final_count_diff`"
+          },
+          {
+           "name": "final_tables_differing",
+           "expression": "`final_tables_differing`"
+          },
+          {
+           "name": "informix_rows",
+           "expression": "`informix_rows`"
+          },
+          {
+           "name": "pipeline_rows",
+           "expression": "`pipeline_rows`"
+          },
+          {
+           "name": "missing_rows",
+           "expression": "`missing_rows`"
+          },
+          {
+           "name": "extra_rows",
+           "expression": "`extra_rows`"
+          },
+          {
+           "name": "mismatched_rows",
+           "expression": "`mismatched_rows`"
+          },
+          {
+           "name": "duplicate_keys",
+           "expression": "`duplicate_keys`"
+          },
+          {
+           "name": "tables_with_differences",
+           "expression": "`tables_with_differences`"
+          },
+          {
+           "name": "minutes",
+           "expression": "`minutes`"
+          },
+          {
+           "name": "finished_at",
+           "expression": "`finished_at`"
+          }
+         ],
+         "disaggregated": true
+        }
+       }
+      ],
+      "spec": {
+       "version": 2,
+       "widgetType": "table",
+       "encodings": {
+        "columns": [
+         {
+          "fieldName": "run_id",
+          "displayName": "Run"
+         },
+         {
+          "fieldName": "cycle",
+          "displayName": "Cycle"
+         },
+         {
+          "fieldName": "verdict",
+          "displayName": "Verdict",
+          "style": {
+           "type": "basic",
+           "rules": [
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "MISMATCH"
+              },
+              "operator": "="
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            },
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "MATCH"
+              },
+              "operator": "="
+             },
+             "backgroundColor": {
+              "hex": "#B8E6D3"
+             }
+            }
+           ]
+          }
+         },
+         {
+          "fieldName": "extra_run",
+          "displayName": "Extra run"
+         },
+         {
+          "fieldName": "first_count_diff",
+          "displayName": "First count diff",
+          "style": {
+           "type": "basic",
+           "rules": [
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "0"
+              },
+              "operator": ">"
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            },
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "0"
+              },
+              "operator": "<"
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            }
+           ]
+          }
+         },
+         {
+          "fieldName": "first_tables_differing",
+          "displayName": "Tables differing (first)",
+          "style": {
+           "type": "basic",
+           "rules": [
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "0"
+              },
+              "operator": ">"
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            }
+           ]
+          }
+         },
+         {
+          "fieldName": "final_count_diff",
+          "displayName": "Final count diff",
+          "style": {
+           "type": "basic",
+           "rules": [
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "0"
+              },
+              "operator": ">"
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            },
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "0"
+              },
+              "operator": "<"
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            }
+           ]
+          }
+         },
+         {
+          "fieldName": "final_tables_differing",
+          "displayName": "Tables differing (final)",
+          "style": {
+           "type": "basic",
+           "rules": [
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "0"
+              },
+              "operator": ">"
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            }
+           ]
+          }
+         },
+         {
+          "fieldName": "informix_rows",
+          "displayName": "Informix rows"
+         },
+         {
+          "fieldName": "pipeline_rows",
+          "displayName": "Pipeline rows"
+         },
+         {
+          "fieldName": "missing_rows",
+          "displayName": "Missing rows",
+          "style": {
+           "type": "basic",
+           "rules": [
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "0"
+              },
+              "operator": ">"
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            }
+           ]
+          }
+         },
+         {
+          "fieldName": "extra_rows",
+          "displayName": "Extra rows",
+          "style": {
+           "type": "basic",
+           "rules": [
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "0"
+              },
+              "operator": ">"
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            }
+           ]
+          }
+         },
+         {
+          "fieldName": "mismatched_rows",
+          "displayName": "Mismatched rows",
+          "style": {
+           "type": "basic",
+           "rules": [
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "0"
+              },
+              "operator": ">"
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            }
+           ]
+          }
+         },
+         {
+          "fieldName": "duplicate_keys",
+          "displayName": "Duplicate keys",
+          "style": {
+           "type": "basic",
+           "rules": [
+            {
+             "condition": {
+              "operand": {
+               "type": "data-value",
+               "value": "0"
+              },
+              "operator": ">"
+             },
+             "backgroundColor": {
+              "hex": "#FF7E5C"
+             }
+            }
+           ]
+          }
+         },
+         {
+          "fieldName": "tables_with_differences",
+          "displayName": "Tables with data differences"
+         },
+         {
+          "fieldName": "minutes",
+          "displayName": "Cycle minutes",
+          "format": {
+           "type": "number",
+           "decimalPlaces": {
+            "type": "exact",
+            "places": 1
+           }
+          }
+         },
+         {
+          "fieldName": "finished_at",
+          "displayName": "Finished (UTC)"
+         }
+        ]
+       },
+       "frame": {
+        "showTitle": true,
+        "title": "Cycles"
+       }
+      }
+     },
+     "position": {
+      "x": 0,
+      "y": 8,
+      "width": 12,
+      "height": 8
+     }
+    }
+   ]
+  }
+ ],
+ "uiSettings": {
+  "theme": {
+   "canvasBackgroundColor": {
+    "light": "#FCFCFC",
+    "dark": "#1F272D"
+   },
+   "widgetBackgroundColor": {
+    "light": "#FFFFFF",
+    "dark": "#11171C"
+   },
+   "widgetBorderColor": {
+    "light": "#FFFFFF",
+    "dark": "#11171C"
+   },
+   "fontColor": {
+    "light": "#11171C",
+    "dark": "#E8ECF0"
+   },
+   "selectionColor": {
+    "light": "#2272B4",
+    "dark": "#8ACAFF"
+   },
+   "visualizationColors": [
+    "#0072B2",
+    "#E69F00",
+    "#009E73",
+    "#CC79A7",
+    "#D55E00",
+    "#56B4E9",
+    "#F0E442"
+   ],
+   "widgetHeaderAlignment": "LEFT"
+  }
+ }
+}
