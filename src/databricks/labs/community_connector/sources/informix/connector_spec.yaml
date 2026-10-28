@@ -191,47 +191,28 @@ connection:
         configured limit, so lowering it takes effect immediately while
         surplus rows are left in place rather than deleted (removing a row a
         live reader holds would silently revoke its lease), and raising it
-        seeds additional rows idempotently.
-
-    - name: upsert.connection.reservation
-      type: string
-      required: false
-      description: >
-        Connection slots reserved for the upsert channel, which the delete
-        channel may not claim. Range 0 through max.concurrent.connections - 1;
-        default 0, which is exactly the unreserved behaviour. A floor rather than
-        a partition: beyond the reserved slots both channels compete for all
-        remaining capacity, and total capacity is unchanged. Raise it with care,
-        because a delete reader throttled until its checkpoint predates log
-        retention forces a re-snapshot. Recorded in the endpoint's
-        connection-limit configuration (the Lakebase `conn_limits` row) and
-        validated like
-        max.concurrent.connections, so every pipeline sharing one Informix
-        endpoint must configure the same value: the reservation partitions a
-        single shared slot namespace, so a mismatch would let one pipeline's
-        delete readers claim slots another reserves for upserts. A mismatch fails
-        at startup rather than silently voiding the reservation.
-
-    - name: snapshot.shared.session
-      type: string
-      required: false
-      description: >
-        Always on: an `initial`-mode snapshot's full-table drain runs on a bounded pool of
-        `snapshot.reader.threads` daemon workers, off the microbatch thread, so it can't
-        starve streaming readers while it holds a connection slot for the whole scan. The
-        consumer waits, holding no slot, for a worker to stage the table and publish its
-        manifest, then serves the staged pages. Each worker claims its slot one band below
-        the CDC daemon's floor, so the lowest slots stay with consumer reads. The pool
-        belongs to one Python process, and serverless SDP runs each flow in its own, so its
-        bound applies per flow. Accepts true; false, which drained on the microbatch
-        thread, is rejected with a message saying to remove it.
+        seeds additional rows idempotently. A reader blocked on a slot waits in a
+        fair queue: it enqueues a ticket so acquisition is first-come per slot rather
+        than a raw race, which prevents an unlucky reader being lapped indefinitely
+        while others churn the pool; ordering is per slot, so an older reader
+        reserved to high slots never blocks a younger one from a low slot it could
+        not use. Service rotates across requester classes -- consumer reads, the CDC
+        shard daemon, and the snapshot drain -- so a burst of consumer
+        bootstrap/fallback tickets can't crowd out the few CDC-daemon tickets by
+        sheer count.
 
     - name: snapshot.reader.threads
       type: string
       required: false
       description: >
         The number of daemon workers that drain `initial` snapshots concurrently, which
-        is also the ceiling on connection slots one process's snapshots can hold at once. Minimum 1. Default one below the
+        is also the ceiling on connection slots one process's snapshots can hold at once.
+        An `initial`-mode snapshot's full-table drain always runs on this pool, off the
+        microbatch thread, so it can't starve streaming readers while it holds a
+        connection slot for the whole scan: the consumer waits, holding no slot, for a
+        worker to stage the table and publish its manifest, then serves the staged pages.
+        The pool belongs to one Python process, and serverless SDP runs each flow in its
+        own, so its bound applies per flow. Minimum 1. Default one below the
         CDC-daemon reservation -- max(1, daemon.connection.reservation - 1), where the
         reservation is itself about a third of the pool. Keeping it strictly below the
         reservation guarantees the snapshot-drain floor (daemon.connection.reservation -
@@ -245,14 +226,6 @@ connection:
         consumer waits on the drain as a liveness window (it may run as long as it keeps
         staging pages; see connection.wait.timeout.seconds), so a large keyless table is
         not capped by a fixed timeout.
-
-    - name: snapshot.connection.reservation
-      type: string
-      required: false
-      description: >
-        No longer used: it reserved slots from the drain on the microbatch thread
-        (snapshot.shared.session=false), which is gone. Setting it logs a warning and is
-        ignored.
 
     - name: daemon.connection.reservation
       type: string
@@ -1028,9 +1001,7 @@ connection:
         into K shards; a bounded pool of K driver-resident daemon threads each hold a
         single shared CDC session multiplexing their shard's tables and fan the changes
         out in memory, so concurrent CDC sessions drop from ~N to K and reads run in
-        parallel across the K threads. Accepts `host` or `process`; the earlier values
-        `true` (now `process`) and `false` (sharing can no longer be turned off) are
-        rejected with a message saying what to set.
+        parallel across the K threads. Accepts `host` or `process`.
         Note: each shard's log-retention floor tracks that shard's slowest table.
 
     - name: cdc.shared.reader.threads
@@ -1099,22 +1070,11 @@ connection:
         cap: the drain worker resets it on each staged page and, while still waiting
         for its slot, on each pool slot claim (turnover), so a drain queued behind a
         busy backfill waits it out and fails only when the pool is wedged (no
-        turnover for a whole window). See snapshot.drain.slot.liveness.enabled.
-
-    - name: snapshot.drain.slot.liveness.enabled
-      type: string
-      required: false
-      description: >
-        Whether the shared snapshot drain worker treats its connection-slot wait as
-        a turnover-based liveness watchdog. Default true: a drain worker blocked
-        acquiring its slot resets its connection.wait.timeout.seconds window every
-        time the pool claims a slot (other work completing and recycling capacity),
-        so it waits out a busy multi-table backfill on a small pool instead of timing
-        out against a pool that is full but healthy, and gives up only when the pool
-        is genuinely wedged. Set false to revert to a plain fixed deadline. Only
-        affects the snapshot-drain daemon; the CDC shard daemon has its own
-        cdc.shared.slot.liveness.enabled and consumer reads always keep the plain
-        deadline. Accepts true/false (1/yes, 0/no).
+        turnover for a whole window). The CDC shard daemon waits for its slot on the
+        same turnover-based window, keeping its queue ticket so the round-robin
+        rotation has time to reach it -- a round is paid in slot turnover, not
+        wall-clock -- and degrades its consumers to direct reads only when the pool
+        is wedged. Consumer reads keep the plain deadline.
 
     - name: connection.startup.jitter.seconds
       type: string
@@ -1129,21 +1089,6 @@ connection:
         spreading the startup wave over the window. Default 0 (disabled); steady-state polls
         and reconnects are never delayed. Set it to a few seconds on a large multi-table
         pipeline that intermittently fails at startup. Must be a number >= 0.
-
-    - name: cdc.shared.slot.liveness.enabled
-      type: string
-      required: false
-      description: >
-        Whether the CDC shard daemon treats its connection-slot wait as the same
-        turnover-based liveness watchdog the snapshot drain uses. Default true: while
-        actively catching up, a shard daemon blocked acquiring its slot keeps its
-        queue ticket and resets its connection.wait.timeout.seconds window every time
-        the pool claims a slot (turnover), so the round-robin rotation has time to
-        reach it -- a round is paid in slot turnover, not wall-clock -- rather than
-        failing fast and re-queuing at the back. It gives up only when the pool is
-        genuinely wedged (no turnover for a whole window), then degrades its consumers
-        to direct reads. Set false to revert to the plain connection.wait.timeout.seconds
-        deadline. Accepts true/false (1/yes, 0/no).
 
     - name: string.null.byte
       type: string
@@ -1191,31 +1136,6 @@ connection:
         Only has effect when primary.key.from.unique.index is enabled (the default)
         and no non-null key exists; an all-NOT-NULL index and an explicit
         primary.keys option both still win. Accepts true/false.
-
-    - name: connection.fair.queue.enabled
-      type: string
-      required: false
-      description: >
-        Whether slot acquisition uses the fair waiter queue. Default true. When on,
-        a reader blocked on a slot enqueues a ticket so acquisition is first-come per
-        slot rather than a raw race, which prevents an unlucky reader being lapped
-        indefinitely while others churn the pool; ordering is per slot, so an older
-        reader reserved to high slots never blocks a younger one from a low slot it
-        could not use. Set false to revert to the unordered race (a kill-switch if the
-        queue ever misbehaves). Accepts true/false (1/yes, 0/no).
-
-    - name: connection.fair.queue.policy
-      type: string
-      required: false
-      description: >
-        How the fair waiter queue (connection.fair.queue.enabled) orders waiters.
-        round_robin (default) rotates service across requester classes -- consumer
-        reads, the CDC shard daemon, and the snapshot drain -- so a class gets a turn
-        regardless of how many tickets another class holds; this stops a burst of
-        consumer bootstrap/fallback tickets from crowding out the few CDC-daemon
-        tickets by sheer count. fifo serves strictly by arrival (the older behaviour),
-        which is fair per ticket but not per class. Only has effect when
-        connection.fair.queue.enabled is true. Accepts round_robin/fifo.
 
     - name: capacity.retry.max.delay.seconds
       type: string

@@ -3590,26 +3590,6 @@ class LakeflowContractTests(unittest.TestCase):
             self.assertFalse(os.path.lexists(link))
             self.assertTrue(os.path.isfile(protected))
 
-    def test_delete_channel_is_declared_before_anything_can_connect(self):
-        # The slot is taken by the first call reaching _ensure_connected, which
-        # is the schema refresh rather than read_changes. Declaring the channel
-        # later would let that first acquisition land outside the delete band.
-        connector = self.connector()
-        observed: list[str | None] = []
-
-        def record(*args, **kwargs):
-            observed.append(connector.options.get("_informix.connection.channel"))
-            raise InformixError("stop after observing the channel")
-
-        with mock.patch.object(connector, "_read_table_deletes", side_effect=record):
-            with self.assertRaisesRegex(InformixError, "stop after observing"):
-                connector.read_table_deletes("orders", _stream_offset(), {})
-
-        self.assertEqual(observed, ["delete"])
-        # And it must not leak past the read, or a later upsert read on the same
-        # reader would inherit the delete channel's restricted band.
-        self.assertIsNone(connector.options.get("_informix.connection.channel"))
-
     def test_continuous_reads_yield_and_count_consecutive_capacity_misses(self):
         bridge = FakeBridge()
         bridge.get_table = mock.Mock(
@@ -12794,24 +12774,19 @@ class HostSharedCdcTests(unittest.TestCase):
                                 ("Process", "process")):
             with self.subTest(value=value):
                 self.assertEqual(mode({"cdc.shared.session": value}), expected)
-        for values, message in (
-            (("false", "0", "no"), "can no longer be turned off"),
-            (("true", "1", "yes"), "set 'process', which it meant"),
-            (("maybe",), "must be 'host' or 'process'"),
-        ):
-            for value in values:
-                with self.subTest(value=value):
-                    with self.assertRaisesRegex(ValueError, message):
-                        mode({"cdc.shared.session": value})
+        for value in ("false", "true", "maybe"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "must be 'host' or 'process'"):
+                    mode({"cdc.shared.session": value})
 
-    def test_shared_cdc_cannot_be_turned_off(self):
+    def test_an_unknown_mode_fails_the_connector(self):
         options = {
             "database": "demo",
             "snapshot.staging.location": self._shared_state.name,
             "lakebase.password": "test-state-password",
         }
         InformixLakeflowConnect(dict(options))  # partitioned by default, shared by host
-        with self.assertRaisesRegex(ValueError, "can no longer be turned off"):
+        with self.assertRaisesRegex(ValueError, "must be 'host' or 'process'"):
             InformixLakeflowConnect({**options, "cdc.shared.session": "false"})
 
     def test_a_view_crosses_processes_as_plain_data(self):
@@ -13180,28 +13155,6 @@ class SharedCdcOptionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._connector(**{"cdc.shared.buffer.max.records": "0"})
 
-    def test_fair_queue_policy_defaults_to_round_robin(self):
-        connector = self._connector()
-        self.assertEqual(
-            connector.options.get(
-                informix_module._CONNECTION_FAIR_QUEUE_POLICY_OPTION,
-                informix_module._DEFAULT_CONNECTION_FAIR_QUEUE_POLICY,
-            ),
-            informix_module._CONNECTION_FAIR_QUEUE_POLICY_ROUND_ROBIN,
-        )
-
-    def test_fair_queue_policy_accepts_fifo(self):
-        # No raise: fifo is the kill-switch value.
-        self._connector(**{"connection.fair.queue.policy": "fifo"})
-
-    def test_invalid_fair_queue_policy_rejected(self):
-        with self.assertRaises(ValueError):
-            self._connector(**{"connection.fair.queue.policy": "lifo"})
-
-    def test_invalid_daemon_liveness_value_rejected(self):
-        with self.assertRaises(ValueError):
-            self._connector(**{"cdc.shared.slot.liveness.enabled": "maybe"})
-
     def test_negative_startup_jitter_rejected(self):
         with self.assertRaises(ValueError):
             self._connector(**{"connection.startup.jitter.seconds": "-1"})
@@ -13388,11 +13341,6 @@ class SnapshotFairnessOptionTests(unittest.TestCase):
         connector._bridge_instance = FakeBridge()
         return connector
 
-    def test_shared_session_cannot_be_turned_off(self):
-        self._connector(**{"snapshot.shared.session": "true"})  # still accepted
-        with self.assertRaisesRegex(ValueError, "can no longer be turned off; remove it"):
-            self._connector(**{"snapshot.shared.session": "false"})
-
     def test_reader_threads_default_is_one_below_the_daemon_reservation(self):
         # The default sits one below the CDC-daemon reservation so the snapshot-drain
         # floor never collapses to 0 -- a low slot always stays reachable by consumer
@@ -13436,14 +13384,6 @@ class SnapshotFairnessOptionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._connector(**{"snapshot.reader.threads": "0"})
 
-    def test_invalid_shared_session_rejected(self):
-        with self.assertRaises(ValueError):
-            self._connector(**{"snapshot.shared.session": "maybe"})
-
-    def test_snapshot_reservation_is_ignored_with_a_warning(self):
-        with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
-            self._connector(**{"snapshot.connection.reservation": "3"})
-        self.assertIn("'snapshot.connection.reservation' is no longer used", logs.output[0])
 
 class SnapshotDrainWorkerFloorTests(unittest.TestCase):
     """A drain-pool worker claims its slot one band below the CDC daemon's floor, so a busy
@@ -13511,27 +13451,6 @@ class SnapshotDrainWorkerFloorTests(unittest.TestCase):
         worker = connector._snapshot_drain_reader_factory()()
         self.assertFalse(connector._is_snapshot_drain_worker())
         self.assertTrue(worker._is_snapshot_drain_worker())
-        self.assertNotIn("snapshot.shared.session", worker.options)
-
-    def test_a_stale_reservation_warns_once_per_flow_not_per_daemon_reader(self):
-        with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
-            connector = InformixLakeflowConnect(
-                {
-                    "database": "demo",
-                    "snapshot.staging.location": self._shared_state.name,
-                    "lakebase.password": "test-state-password",
-                    "snapshot.connection.reservation": "3",
-                }
-            )
-            readers = [
-                connector._snapshot_drain_reader_factory()(),
-                connector._shared_cdc_reader_factory("upsert")(),
-                connector._shared_cdc_reader_factory("delete")(),
-            ]
-        stale = [line for line in logs.output if "snapshot.connection.reservation" in line]
-        self.assertEqual(len(stale), 1)
-        for reader in readers:
-            self.assertNotIn("snapshot.connection.reservation", reader.options)
 
 class DaemonReservationFloorTests(unittest.TestCase):
     """A background daemon (sharded CDC, snapshot drain pool) claims its slot above the
@@ -13588,15 +13507,6 @@ class DaemonReservationFloorTests(unittest.TestCase):
         bridge = self._bridge(**{"daemon.connection.reservation": "1"})
         bridge.options[informix_module._DAEMON_SLOT_MARKER_OPTION] = "true"
         self.assertEqual(self._captured_floor(bridge), 1)
-
-    def test_daemon_floor_takes_max_with_delete_channel(self):
-        bridge = self._bridge(
-            **{"daemon.connection.reservation": "1", "upsert.connection.reservation": "3"}
-        )
-        bridge.options[informix_module._CONNECTION_CHANNEL_OPTION] = "delete"
-        bridge.options[informix_module._DAEMON_SLOT_MARKER_OPTION] = "true"
-        # Delete daemon floors at max(upsert reservation 3, daemon reservation 1) = 3.
-        self.assertEqual(self._captured_floor(bridge), 3)
 
     def test_reservation_at_slot_count_rejected(self):
         # Eagerly validated in the connector constructor (0 <= reservation < slot_count).
@@ -13672,7 +13582,7 @@ class DaemonReaderFactoryMarkerTests(unittest.TestCase):
         return connector
 
     def test_cdc_reader_factory_sets_daemon_marker(self):
-        reader = self._connector()._shared_cdc_reader_factory("upsert")()
+        reader = self._connector()._shared_cdc_reader_factory()()
         self.assertEqual(reader.options.get(informix_module._DAEMON_SLOT_MARKER_OPTION), "true")
 
     def test_cdc_reader_factory_drops_inherited_attempt_budget(self):
@@ -13681,7 +13591,7 @@ class DaemonReaderFactoryMarkerTests(unittest.TestCase):
         # the end of the queue.
         connector = self._connector()
         connector.options[informix_module._CONNECTION_ATTEMPT_BUDGET_OPTION] = "0.8"
-        reader = connector._shared_cdc_reader_factory("upsert")()
+        reader = connector._shared_cdc_reader_factory()()
         self.assertIsNone(reader.options.get(informix_module._CONNECTION_ATTEMPT_BUDGET_OPTION))
 
     def test_snapshot_drain_reader_factory_sets_snapshot_daemon_marker(self):
@@ -14285,7 +14195,7 @@ class SnapshotScanOptionTests(unittest.TestCase):
 
 class FairSlotQueueWiringTests(unittest.TestCase):
     """_acquire_connection_slot enqueues a fair-queue ticket, waits its turn, and
-    always drops the ticket -- unless the kill-switch reverts to the raw race."""
+    always drops the ticket."""
 
     def setUp(self):
         self._lakebase = _OfflineLakebase().install(self)
@@ -14326,19 +14236,39 @@ class FairSlotQueueWiringTests(unittest.TestCase):
         self.addCleanup(self._stop_heartbeat, bridge)
         self.assertIsNotNone(captured["ticket_id"])
 
-    def test_kill_switch_passes_no_ticket(self):
-        bridge = self._bridge(**{"connection.fair.queue.enabled": "false"})
-        captured = {"ticket_id": "unset"}
-        real = informix_module.acquire_slot
+    def test_reaped_ticket_is_re_enqueued(self):
+        # A ticket reaped during a stall can never win, so the sweep takes a fresh one and
+        # drops that one when it wins.
+        bridge = self._bridge()
+        real_enqueue = informix_module.enqueue_waiter
+        real_heartbeat = informix_module.heartbeat_waiter
+        real_dequeue = informix_module.dequeue_waiter
+        tickets = []
 
-        def spy(*args, **kwargs):
-            captured["ticket_id"] = kwargs.get("ticket_id")
-            return real(*args, **kwargs)
+        def enqueue(*args, **kwargs):
+            tickets.append(real_enqueue(*args, **kwargs))
+            return tickets[-1]
 
-        with mock.patch.object(informix_module, "acquire_slot", side_effect=spy):
+        def heartbeat(connection, namespace, ticket_id, **kwargs):
+            if len(tickets) == 1:
+                # Another waiter's reaper dropped this ticket during a stall.
+                self._lakebase.database.waiters.pop((namespace, ticket_id))
+            return real_heartbeat(connection, namespace, ticket_id, **kwargs)
+
+        with (
+            mock.patch.object(informix_module, "heartbeat_waiter", side_effect=heartbeat),
+            mock.patch.object(informix_module, "enqueue_waiter", side_effect=enqueue),
+            mock.patch.object(
+                informix_module, "dequeue_waiter", side_effect=real_dequeue
+            ) as dequeue,
+        ):
             bridge._acquire_connection_slot()
         self.addCleanup(self._stop_heartbeat, bridge)
-        self.assertIsNone(captured["ticket_id"])
+
+        self.assertEqual(len(tickets), 2)
+        self.assertIsNotNone(bridge._lakebase_slot)
+        dequeue.assert_called_once()
+        self.assertEqual(dequeue.call_args.args[2], tickets[1])
 
     def test_successful_acquire_dequeues_its_ticket(self):
         bridge = self._bridge()
@@ -14379,17 +14309,10 @@ class FairSlotQueueWiringTests(unittest.TestCase):
         self.addCleanup(self._stop_heartbeat, bridge)
         return captured
 
-    def test_round_robin_is_the_default_policy(self):
+    def test_acquire_rotates_by_requester_class(self):
         captured = self._captured_acquire_kwargs(self._bridge())
-        self.assertEqual(captured.get("policy"), "round_robin")
         self.assertEqual(captured.get("waiter_class"), informix_module._SLOT_CLASS_CONSUMER)
         self.assertEqual(captured.get("num_classes"), informix_module._SLOT_CLASS_COUNT)
-
-    def test_policy_option_can_select_fifo(self):
-        captured = self._captured_acquire_kwargs(
-            self._bridge(**{"connection.fair.queue.policy": "fifo"})
-        )
-        self.assertEqual(captured.get("policy"), "fifo")
 
     def test_waiter_class_reflects_the_slot_markers(self):
         self.assertEqual(
@@ -14481,20 +14404,6 @@ class CdcDaemonSlotLivenessTests(unittest.TestCase):
                 bridge._acquire_connection_slot(budget_seconds=0.0)
 
         self.assertIn("wedged", str(caught.exception))
-
-    def test_kill_switch_reverts_to_the_plain_deadline(self):
-        bridge = self._bridge(**{"cdc.shared.slot.liveness.enabled": "false"})
-
-        with (
-            mock.patch.object(informix_module, "acquire_slot", return_value=None),
-            mock.patch.object(informix_module, "pool_progress_token") as token,
-            mock.patch.object(informix_module.random, "uniform", return_value=0),
-        ):
-            with self.assertRaises(informix_module.ConnectionCapacityUnavailable) as caught:
-                bridge._acquire_connection_slot(budget_seconds=0.0)
-
-        token.assert_not_called()
-        self.assertNotIn("wedged", str(caught.exception))
 
 
 class ConnectionStartupJitterTests(unittest.TestCase):
@@ -14643,20 +14552,6 @@ class SnapshotDrainSlotLivenessTests(unittest.TestCase):
 
         self.assertIn("wedged", str(caught.exception))
         pinged.assert_not_called()  # no turnover -> no liveness ping
-
-    def test_kill_switch_reverts_to_the_plain_deadline(self):
-        bridge = self._bridge(**{"snapshot.drain.slot.liveness.enabled": "false"})
-
-        with (
-            mock.patch.object(informix_module, "acquire_slot", return_value=None),
-            mock.patch.object(informix_module, "pool_progress_token") as token,
-            mock.patch.object(informix_module.random, "uniform", return_value=0),
-        ):
-            with self.assertRaises(informix_module.ConnectionCapacityUnavailable) as caught:
-                bridge._acquire_connection_slot(budget_seconds=0.0)
-
-        token.assert_not_called()  # liveness off -> the token is never polled
-        self.assertNotIn("wedged", str(caught.exception))
 
     def test_non_drain_reader_never_polls_the_token(self):
         # A consumer read (no drain marker) keeps the plain hard deadline: it must fail its

@@ -892,12 +892,10 @@ _SCHEMA_STATEMENTS = (
     # Fair waiter queue: one row per reader currently blocked on a slot, carrying
     # its eligible band [floor, ceiling). ``ticket_id`` is a global monotonic
     # sequence, so a smaller ticket enqueued earlier -- acquisition consults it to
-    # give the oldest still-heartbeating waiter first claim on each slot (see
-    # _ACQUIRE_SLOT_FAIR), turning the raw race into per-slot FIFO. ``waiter_class``
-    # tags each ticket with its requester class so the round-robin policy
-    # (_ACQUIRE_SLOT_ROUND_ROBIN) can interleave classes rather than serve strictly by
-    # arrival; it defaults to 0 (the consumer class) so an un-tagged ticket behaves as
-    # before.
+    # rank live waiters for each slot (see _ACQUIRE_SLOT). ``waiter_class`` tags each
+    # ticket with its requester class so acquisition can rotate service across classes
+    # rather than serve strictly by arrival; it defaults to 0 (the consumer class) so an
+    # un-tagged ticket behaves as before.
     """
     CREATE TABLE IF NOT EXISTS slot_waiters (
         namespace    text        NOT NULL,
@@ -948,6 +946,9 @@ _SCHEMA_STATEMENTS = (
         PRIMARY KEY (namespace)
     )
     """,
+    # reserved_deletes held a delete-channel slot reservation the connector no longer
+    # has. Older connector versions sharing a namespace still write it, so it stays;
+    # this one always writes 0.
     """
     CREATE TABLE IF NOT EXISTS conn_limits (
         namespace        text        PRIMARY KEY,
@@ -1357,96 +1358,35 @@ class LakebaseState:
 # half-applied claim. ``epoch`` increments on every claim and becomes the fencing
 # token: a holder that stalls past its lease and wakes up later cannot renew or
 # release, because its epoch no longer matches.
-_ACQUIRE_SLOT = """
-UPDATE conn_slots SET owner = %(owner)s, epoch = epoch + 1,
-                      scope = %(scope)s, renewed_at = now()
-WHERE (namespace, slot_id) = (
-    SELECT namespace, slot_id FROM conn_slots
-    WHERE namespace = %(namespace)s
-      AND slot_id >= %(floor)s
-      AND slot_id < %(ceiling)s
-      AND (owner IS NULL OR renewed_at < now() - make_interval(secs => %(lease)s))
-    ORDER BY slot_id
-    FOR UPDATE SKIP LOCKED
-    LIMIT 1
-)
-RETURNING slot_id, epoch
-"""
-
-# Renewal is guarded on (owner, epoch): a zombie's heartbeat is rejected rather
-# than silently extending a lease its successor now owns. A caller that gets no
-# row has provably lost the slot and must stop using its connection.
-_HEARTBEAT_SLOT = """
-UPDATE conn_slots SET renewed_at = now()
-WHERE namespace = %(namespace)s AND slot_id = %(slot_id)s
-  AND owner = %(owner)s AND epoch = %(epoch)s
-RETURNING slot_id
-"""
-
-# Release carries the same guard, for a sharper reason: without it a zombie's
-# late release would free a slot its successor legitimately holds, over-issuing
-# capacity. On the Volume this hazard is what the mutating- marker guarded.
-_RELEASE_SLOT = """
-UPDATE conn_slots SET owner = NULL, scope = NULL, renewed_at = NULL
-WHERE namespace = %(namespace)s AND slot_id = %(slot_id)s
-  AND owner = %(owner)s AND epoch = %(epoch)s
-RETURNING slot_id
-"""
-
-# Fair acquisition: the same claim as _ACQUIRE_SLOT, but a slot is eligible only when
-# no *older, still-heartbeating* waiter is also eligible for it. That makes acquisition
-# first-come-first-served per slot -- the oldest waiter in a band always has priority --
-# so no waiter is lapped indefinitely under contention. Ordering is per slot rather than
-# global: the band predicate (w.floor <= slot < w.ceiling) means an older delete-channel
-# waiter reserved to high slots does not block a younger consumer from a low slot it could
-# never use, so there is no cross-band head-of-line blocking. The CAS (SKIP LOCKED + epoch)
-# is unchanged, so capacity is still exact: a rare ordering inversion under a read race
-# costs at most one extra sweep, never an over-issued slot.
-_ACQUIRE_SLOT_FAIR = """
-UPDATE conn_slots SET owner = %(owner)s, epoch = epoch + 1,
-                      scope = %(scope)s, renewed_at = now()
-WHERE (namespace, slot_id) = (
-    SELECT s.namespace, s.slot_id FROM conn_slots s
-    WHERE s.namespace = %(namespace)s
-      AND s.slot_id >= %(floor)s
-      AND s.slot_id < %(ceiling)s
-      AND (s.owner IS NULL OR s.renewed_at < now() - make_interval(secs => %(lease)s))
-      AND NOT EXISTS (
-          SELECT 1 FROM slot_waiters w
-          WHERE w.namespace = %(namespace)s
-            AND w.ticket_id < %(ticket_id)s
-            AND w.floor <= s.slot_id AND s.slot_id < w.ceiling
-            AND w.heartbeat_at >= now() - make_interval(secs => %(waiter_ttl)s)
-      )
-    ORDER BY s.slot_id
-    FOR UPDATE SKIP LOCKED
-    LIMIT 1
-)
-RETURNING slot_id, epoch
-"""
-
-# Round-robin acquisition: same claim and same CAS as _ACQUIRE_SLOT_FAIR, but the order in
-# which waiters are served rotates across requester *classes* instead of going by arrival.
-# A per-namespace cursor (slot_rr_cursor) records the class served last; ``rot`` ranks each
-# live waiter's class by cyclic distance *after* that cursor -- MOD(class - last - 1, N) --
-# so the class next in rotation has rot 0 and is served first, then the next, wrapping
-# around. One class per grant, in rotation, so a class gets a turn every N grants no matter
-# how many tickets another class holds. That is what a rank-within-class scheme cannot do:
-# because a served waiter dequeues, the next same-class ticket would inherit rank 0 and the
-# high-volume class would keep winning; the cursor rotates past a class once it is served,
-# so a burst of consumer tickets cannot crowd out the few CDC-daemon tickets. Within the
-# chosen class the oldest ticket wins (ticket_id tiebreak); empty classes are skipped for
-# free since only live waiters appear in ``live``. The ``live`` CTE drops tickets that
-# stopped heartbeating so a dead ticket cannot block a slot even between reaper sweeps. As
-# with the FIFO variant this ordering is advisory: FOR UPDATE SKIP LOCKED + the epoch CAS
-# serialise the actual grant, so a stale cursor or a read race costs at most one extra
-# sweep, never an over-issued slot. The winner advances the cursor to its own class (see
-# _ADVANCE_RR_CURSOR) in the same transaction as the claim.
+#
+# Every claim goes through the fair waiter queue: a slot is eligible only when no live
+# waiter ranked ahead of this one is also eligible for it, so no waiter is lapped
+# indefinitely under contention. Ordering is per slot rather than global: the band
+# predicate (w.floor <= slot < w.ceiling) means an older waiter reserved to high slots does
+# not block a younger one from a low slot it could never use, so there is no cross-band
+# head-of-line blocking.
+#
+# Waiters are ranked by requester *class* in rotation, then by age. A per-namespace cursor
+# (slot_rr_cursor) records the class served last; ``rot`` ranks each live waiter's class by
+# cyclic distance *after* that cursor -- MOD(class - last - 1, N) -- so the class next in
+# rotation has rot 0 and is served first, then the next, wrapping around. One class per
+# grant, in rotation, so a class gets a turn every N grants no matter how many tickets
+# another class holds. That is what serving by arrival cannot do: because a served waiter
+# dequeues, the next same-class ticket would inherit the head and the high-volume class
+# would keep winning; the cursor rotates past a class once it is served, so a burst of
+# consumer tickets cannot crowd out the few CDC-daemon tickets. Within the chosen class the
+# oldest ticket wins (ticket_id tiebreak); empty classes are skipped for free since only
+# live waiters appear in ``live``. The ``live`` CTE drops tickets that stopped heartbeating
+# so a dead ticket cannot block a slot even between reaper sweeps, and a caller whose own
+# ticket is stale (``me`` empty) wins nothing until it heartbeats again. The ordering is
+# advisory: FOR UPDATE SKIP LOCKED + the epoch CAS serialise the actual grant, so a stale
+# cursor or a read race costs at most one extra sweep, never an over-issued slot. The
+# winner advances the cursor to its own class (see _ADVANCE_RR_CURSOR) in the same
+# transaction as the claim.
 #
 # ``num_classes`` is the rotation modulus (the count of distinct classes); ``1`` makes rot
-# uniformly 0 and degrades this to FIFO-by-ticket, which is the safe default for a caller
-# that does not classify its waiters.
-_ACQUIRE_SLOT_ROUND_ROBIN = """
+# uniformly 0, so waiters are served strictly by ticket age.
+_ACQUIRE_SLOT = """
 WITH cur AS (
     SELECT COALESCE(
         (SELECT last_class FROM slot_rr_cursor WHERE namespace = %(namespace)s), -1
@@ -1482,6 +1422,26 @@ WHERE (namespace, slot_id) = (
     LIMIT 1
 )
 RETURNING slot_id, epoch
+"""
+
+# Renewal is guarded on (owner, epoch): a zombie's heartbeat is rejected rather
+# than silently extending a lease its successor now owns. A caller that gets no
+# row has provably lost the slot and must stop using its connection.
+_HEARTBEAT_SLOT = """
+UPDATE conn_slots SET renewed_at = now()
+WHERE namespace = %(namespace)s AND slot_id = %(slot_id)s
+  AND owner = %(owner)s AND epoch = %(epoch)s
+RETURNING slot_id
+"""
+
+# Release carries the same guard, for a sharper reason: without it a zombie's
+# late release would free a slot its successor legitimately holds, over-issuing
+# capacity. On the Volume this hazard is what the mutating- marker guarded.
+_RELEASE_SLOT = """
+UPDATE conn_slots SET owner = NULL, scope = NULL, renewed_at = NULL
+WHERE namespace = %(namespace)s AND slot_id = %(slot_id)s
+  AND owner = %(owner)s AND epoch = %(epoch)s
+RETURNING slot_id
 """
 
 # The winner stamps the cursor with its own class so the next grant rotates to the class
@@ -1539,34 +1499,28 @@ def acquire_slot(
     owner: str,
     *,
     slot_count: int,
+    ticket_id: int,
     floor: int = 0,
     scope: str | None = None,
     lease_seconds: float = 120.0,
-    ticket_id: int | None = None,
     waiter_ttl: float = _DEFAULT_WAITER_TTL_SECONDS,
-    policy: str = "fifo",
     waiter_class: int = 0,
     num_classes: int = 1,
 ) -> ConnectionSlot | None:
     # Docstring: Claim one slot, or return ``None`` when every eligible slot is busy.
     #
-    # ``floor`` implements the upsert reservation: the delete channel passes the
-    # reserved count so it can never claim a low slot, which is what makes the
-    # reservation a guarantee rather than a preference. ``slot_count`` bounds the
-    # ceiling, so lowering the configured limit takes effect immediately even
-    # though surplus rows are deliberately left in place.
+    # ``floor`` keeps a reader off the low slots: the CDC daemon and the snapshot drain
+    # pass their reservations so they can never claim a slot kept for consumer reads,
+    # which is what makes a reservation a guarantee rather than a preference.
+    # ``slot_count`` bounds the ceiling, so lowering the configured limit takes effect
+    # immediately even though surplus rows are deliberately left in place.
     #
-    # ``ticket_id`` opts into the fair queue: pass the id returned by
-    # ``enqueue_waiter`` (with the same ``waiter_ttl`` used to heartbeat it) and the
-    # claim yields any slot an earlier-ordered, still-heartbeating waiter is also
-    # eligible for, so this caller waits its turn. Omit it (the default) for the raw
-    # first-come race. ``policy`` selects how the queue orders waiters: ``"fifo"``
-    # (default) serves strictly by arrival (``_ACQUIRE_SLOT_FAIR``); ``"round_robin"``
-    # interleaves requester classes so ticket volume in one class cannot crowd out
-    # another (``_ACQUIRE_SLOT_ROUND_ROBIN``). Both only matter when ``ticket_id`` is set.
+    # ``ticket_id`` is this caller's place in the fair queue: the id returned by
+    # ``enqueue_waiter``, heartbeated with the same ``waiter_ttl``. The claim yields any
+    # slot a waiter ranked ahead of it is also eligible for, so this caller waits its turn.
     # ``waiter_class`` is this caller's class (matching the ticket) and ``num_classes`` the
-    # rotation modulus; on a round-robin win the cursor is advanced to ``waiter_class`` in
-    # the same transaction as the claim.
+    # rotation modulus; on a win the cursor is advanced to ``waiter_class`` in the same
+    # transaction as the claim.
 
     parameters = {
         "owner": owner,
@@ -1575,20 +1529,14 @@ def acquire_slot(
         "floor": max(0, floor),
         "ceiling": slot_count,
         "lease": float(lease_seconds),
+        "ticket_id": int(ticket_id),
+        "waiter_ttl": float(waiter_ttl),
+        "num_classes": max(1, int(num_classes)),
     }
-    round_robin = ticket_id is not None and policy == "round_robin"
-    if ticket_id is None:
-        statement = _ACQUIRE_SLOT
-    else:
-        statement = _ACQUIRE_SLOT_ROUND_ROBIN if round_robin else _ACQUIRE_SLOT_FAIR
-        parameters["ticket_id"] = int(ticket_id)
-        parameters["waiter_ttl"] = float(waiter_ttl)
-        if round_robin:
-            parameters["num_classes"] = max(1, int(num_classes))
     with connection.cursor() as cursor:
-        cursor.execute(statement, parameters)
+        cursor.execute(_ACQUIRE_SLOT, parameters)
         row = cursor.fetchone()
-        if row is not None and round_robin:
+        if row is not None:
             # Advance the rotation cursor to this class inside the same transaction as the
             # claim, so the next grant rotates past it. Best-effort ordering only -- a lost
             # advance under a race just repeats a class, never over-issues a slot.
@@ -1614,10 +1562,9 @@ def enqueue_waiter(
     # Docstring: Register this caller as a slot waiter and return its queue ticket.
     #
     # The ticket records the eligible band [floor, ceiling); acquisition consults it
-    # so an earlier-ordered waiter in the same band is served first. ``waiter_class``
-    # tags the ticket with its requester class for the round-robin policy (it is inert
-    # under FIFO); it defaults to 0, the consumer class. Commit it before waiting so
-    # other waiters' connections can see it.
+    # so a waiter ranked ahead in the same band is served first. ``waiter_class`` tags
+    # the ticket with its requester class for the rotation; it defaults to 0, the
+    # consumer class. Commit it before waiting so other waiters' connections can see it.
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -1635,23 +1582,28 @@ def enqueue_waiter(
     return int(row[0])
 
 
-def heartbeat_waiter(connection: Any, namespace: str, ticket_id: int, *, waiter_ttl: float) -> None:
+def heartbeat_waiter(connection: Any, namespace: str, ticket_id: int, *, waiter_ttl: float) -> bool:
     # Docstring: Renew this waiter's ticket and reap any whose owner stopped heartbeating.
     #
     # Folding the reap into the heartbeat keeps the queue self-cleaning: a crashed or
     # timed-out waiter's ticket ages out and is dropped by the next live heartbeat, so
-    # it never blocks the queue and no separate GC pass is needed.
+    # it never blocks the queue and no separate GC pass is needed. Returns False when
+    # the ticket no longer exists (it was reaped after a stall longer than
+    # ``waiter_ttl``): acquisition only ever grants to a live ticket, so the caller must
+    # enqueue a fresh one.
 
     with connection.cursor() as cursor:
         cursor.execute(
             _HEARTBEAT_WAITER,
             {"namespace": namespace, "ticket_id": int(ticket_id)},
         )
+        renewed = cursor.fetchone() is not None
         cursor.execute(
             _REAP_WAITERS,
             {"namespace": namespace, "waiter_ttl": float(waiter_ttl)},
         )
     connection.commit()
+    return renewed
 
 
 def dequeue_waiter(connection: Any, namespace: str, ticket_id: int) -> None:
@@ -1850,10 +1802,10 @@ def read_backlog_hints(
 
 _WRITE_LIMIT = """
 INSERT INTO conn_limits (namespace, max_connections, reserved_deletes, version, updated_at)
-VALUES (%(namespace)s, %(max_connections)s, %(reserved)s, %(version)s, now())
+VALUES (%(namespace)s, %(max_connections)s, 0, %(version)s, now())
 ON CONFLICT (namespace) DO UPDATE
    SET max_connections = EXCLUDED.max_connections,
-       reserved_deletes = EXCLUDED.reserved_deletes,
+       reserved_deletes = 0,
        version = EXCLUDED.version,
        updated_at = now()
 """
@@ -1863,7 +1815,6 @@ def publish_connection_limit(
     connection: Any,
     namespace: str,
     max_connections: int,
-    reserved_deletes: int,
     version: int,
 ) -> None:
     # Docstring: Publish the agreed capacity configuration for a namespace.
@@ -1874,7 +1825,6 @@ def publish_connection_limit(
             {
                 "namespace": namespace,
                 "max_connections": int(max_connections),
-                "reserved": int(reserved_deletes),
                 "version": int(version),
             },
         )
@@ -1887,7 +1837,7 @@ def read_connection_limit(connection: Any, namespace: str) -> dict[str, int] | N
     with connection.cursor() as cursor:
         cursor.execute(
             """
-            SELECT max_connections, reserved_deletes, version
+            SELECT max_connections, version
             FROM conn_limits WHERE namespace = %(namespace)s
             """,
             {"namespace": namespace},
@@ -1899,8 +1849,7 @@ def read_connection_limit(connection: Any, namespace: str) -> dict[str, int] | N
         return None
     return {
         "max_connections": int(row[0]),
-        "reserved_deletes": int(row[1]),
-        "version": int(row[2]),
+        "version": int(row[1]),
     }
 
 

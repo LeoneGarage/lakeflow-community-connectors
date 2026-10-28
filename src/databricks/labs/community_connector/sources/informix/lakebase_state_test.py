@@ -79,12 +79,9 @@ class _FakeCursor:
         if "INSERT INTO conn_slots" in text:
             self._seed_slots(args)
             return
-        # Round-robin acquisition leads with a CTE, so it does not start with the plain
-        # ``UPDATE conn_slots``; route both to _acquire, which honours the statement's
-        # own ordering clauses.
-        if text.startswith("WITH cur AS") or text.startswith(
-            "UPDATE conn_slots SET owner = %(owner)s"
-        ):
+        # Acquisition leads with a CTE; _acquire honours the statement's own ordering
+        # clauses.
+        if text.startswith("WITH cur AS"):
             self._acquire(args, text)
             return
         if "INSERT INTO slot_rr_cursor" in text:
@@ -228,13 +225,9 @@ class _FakeCursor:
         bounded_below = "slot_id >= %(floor)s" in text
         bounded_above = "slot_id < %(ceiling)s" in text
         expires = "renewed_at < now() - make_interval(secs => %(lease)s)" in text
-        # The fair variant carries the NOT EXISTS over slot_waiters: a slot is
-        # eligible only when no earlier-ordered, still-heartbeating waiter is also
-        # eligible for it. The round-robin variant orders by (rank-within-class, class,
-        # ticket) rather than by arrival; the FIFO variant orders by ticket alone. Model
-        # both so a dropped clause changes behaviour here as it would in Postgres.
-        round_robin = "slot_rr_cursor" in text
-        fair = "slot_waiters" in text and not round_robin
+        # The queue's NOT EXISTS over the live waiters, ranked by the rotation cursor:
+        # a slot is eligible only when no waiter ranked ahead is also eligible for it.
+        queued = "slot_rr_cursor" in text
         now = self._database.now()
         with self._database.lock:
             eligible = sorted(
@@ -251,20 +244,7 @@ class _FakeCursor:
                     )
                 )
             )
-            if fair:
-                ttl = float(args["waiter_ttl"])
-                eligible = [
-                    slot_id
-                    for slot_id in eligible
-                    if not any(
-                        ns == args["namespace"]
-                        and ticket < args["ticket_id"]
-                        and waiter["floor"] <= slot_id < waiter["ceiling"]
-                        and now - waiter["heartbeat_at"] <= ttl
-                        for (ns, ticket), waiter in self._database.waiters.items()
-                    )
-                ]
-            elif round_robin:
+            if queued:
                 eligible = self._round_robin_eligible(args, eligible, now)
             if not eligible:
                 return
@@ -283,7 +263,7 @@ class _FakeCursor:
     def _round_robin_eligible(self, args: dict, eligible: list, now: float) -> list:
         """Filter ``eligible`` to the slots this ticket may claim under round-robin.
 
-        Mirrors _ACQUIRE_SLOT_ROUND_ROBIN: read the namespace rotation cursor
+        Mirrors _ACQUIRE_SLOT: read the namespace rotation cursor
         (``last_class``, default -1), rank each live waiter's class by cyclic distance
         after it -- rot = (class - last - 1) mod N -- key it (rot, ticket), and keep a
         slot only when no live waiter with a *lower* key has a band covering it. So the
@@ -449,7 +429,6 @@ class _FakeCursor:
         with self._database.lock:
             self._database.limits[args["namespace"]] = {
                 "max_connections": int(args["max_connections"]),
-                "reserved_deletes": int(args["reserved"]),
                 "version": int(args["version"]),
             }
 
@@ -457,7 +436,7 @@ class _FakeCursor:
         with self._database.lock:
             row = self._database.limits.get(args["namespace"])
             if row is not None:
-                self._result = [(row["max_connections"], row["reserved_deletes"], row["version"])]
+                self._result = [(row["max_connections"], row["version"])]
 
     # -- state_records ------------------------------------------------------
 
@@ -605,9 +584,23 @@ class LakebaseSlotTests(unittest.TestCase):
         lakebase_state.seed_slots(self.connection, "ns", 16)
 
     def acquire(self, owner: str, **kwargs):
+        # Claim as the connector does: queue a ticket, try once, then drop the ticket so
+        # it cannot hold back the next claim.
         parameters = {"slot_count": 16, "lease_seconds": 120.0}
         parameters.update(kwargs)
-        return lakebase_state.acquire_slot(self.connection, "ns", owner, **parameters)
+        ticket = lakebase_state.enqueue_waiter(
+            self.connection,
+            "ns",
+            owner,
+            floor=parameters.get("floor", 0),
+            ceiling=parameters["slot_count"],
+        )
+        try:
+            return lakebase_state.acquire_slot(
+                self.connection, "ns", owner, ticket_id=ticket, **parameters
+            )
+        finally:
+            lakebase_state.dequeue_waiter(self.connection, "ns", ticket)
 
     def test_schema_indexes_state_gc_access_paths(self):
         schema = "\n".join(lakebase_state._SCHEMA_STATEMENTS)
@@ -864,23 +857,23 @@ class LakebaseLimitTests(unittest.TestCase):
         lakebase_state.ensure_schema(self.connection)
 
     def test_limit_round_trips(self):
-        lakebase_state.publish_connection_limit(self.connection, "ns", 16, 4, 1)
+        lakebase_state.publish_connection_limit(self.connection, "ns", 16, 1)
 
         self.assertEqual(
             lakebase_state.read_connection_limit(self.connection, "ns"),
-            {"max_connections": 16, "reserved_deletes": 4, "version": 1},
+            {"max_connections": 16, "version": 1},
         )
 
     def test_absent_limit_is_none(self):
         self.assertIsNone(lakebase_state.read_connection_limit(self.connection, "ns"))
 
     def test_republished_limit_replaces_the_previous_value(self):
-        lakebase_state.publish_connection_limit(self.connection, "ns", 16, 4, 1)
-        lakebase_state.publish_connection_limit(self.connection, "ns", 8, 2, 1)
+        lakebase_state.publish_connection_limit(self.connection, "ns", 16, 1)
+        lakebase_state.publish_connection_limit(self.connection, "ns", 8, 1)
 
         self.assertEqual(
             lakebase_state.read_connection_limit(self.connection, "ns"),
-            {"max_connections": 8, "reserved_deletes": 2, "version": 1},
+            {"max_connections": 8, "version": 1},
         )
 
 
@@ -1889,7 +1882,7 @@ class LakebaseCredentialCaptureTests(unittest.TestCase):
 
 
 class LakebaseWaiterQueueTests(unittest.TestCase):
-    """The fair slot queue: per-slot FIFO layered over the raw acquire race."""
+    """The fair slot queue with one requester class: per slot, waiters are served by age."""
 
     def setUp(self) -> None:
         self.database = _FakeDatabase()
@@ -1901,9 +1894,10 @@ class LakebaseWaiterQueueTests(unittest.TestCase):
 
     def _occupy(self, namespace: str, count: int, *, floor: int = 0, slot_count: int) -> None:
         for index in range(count):
-            slot = lakebase_state.acquire_slot(
-                self.connection, namespace, f"filler{index}", slot_count=slot_count, floor=floor
-            )
+            owner = f"filler{index}"
+            ticket = self._enqueue(namespace, owner, floor=floor, ceiling=slot_count)
+            slot = self._fair_acquire(namespace, owner, ticket, slot_count=slot_count, floor=floor)
+            lakebase_state.dequeue_waiter(self.connection, namespace, ticket)
             self.assertIsNotNone(slot)
 
     def _enqueue(self, namespace: str, owner: str, *, floor: int, ceiling: int) -> int:
@@ -1938,8 +1932,8 @@ class LakebaseWaiterQueueTests(unittest.TestCase):
         self.assertIsNotNone(self._fair_acquire("ns", "older", older, slot_count=1))
 
     def test_younger_waiter_takes_a_low_slot_the_older_cannot_use(self):
-        # Cross-band: an older delete-channel waiter reserved to slot >= 2 must not
-        # block a younger consumer from the only free low slot (0) it could use.
+        # Cross-band: an older waiter reserved to slot >= 2 must not block a younger one
+        # from the only free low slot (0) it could use.
         self._seed("ns", 3)
         self._occupy("ns", 2, floor=1, slot_count=3)  # take slots 1 and 2, leave 0 free
         older_high = self._enqueue("ns", "delete", floor=2, ceiling=3)
@@ -1951,14 +1945,40 @@ class LakebaseWaiterQueueTests(unittest.TestCase):
         self.assertEqual(slot.slot_id, 0)
 
     def test_stale_waiter_ticket_stops_blocking(self):
-        # An older waiter that stopped heartbeating past the TTL is ignored, so a
-        # live younger waiter is not starved by a crashed predecessor.
+        # An older waiter that stopped heartbeating past the TTL is ignored, so a live
+        # younger waiter that kept heartbeating is not starved by a crashed predecessor.
         self._seed("ns", 1)
         self._enqueue("ns", "dead", floor=0, ceiling=1)
         younger = self._enqueue("ns", "live", floor=0, ceiling=1)
         self.database.advance(lakebase_state._DEFAULT_WAITER_TTL_SECONDS + 1.0)
+        self.assertTrue(
+            lakebase_state.heartbeat_waiter(
+                self.connection,
+                "ns",
+                younger,
+                waiter_ttl=lakebase_state._DEFAULT_WAITER_TTL_SECONDS,
+            )
+        )
 
         self.assertIsNotNone(self._fair_acquire("ns", "live", younger, slot_count=1))
+
+    def test_heartbeat_reports_a_reaped_ticket(self):
+        # A ticket reaped after a stall past the TTL is gone: its heartbeat says so, and
+        # it can no longer win even a free slot -- the case the connector re-enqueues for.
+        self._seed("ns", 1)
+        ttl = lakebase_state._DEFAULT_WAITER_TTL_SECONDS
+        stalled = self._enqueue("ns", "a", floor=0, ceiling=1)
+        self.database.advance(ttl + 1.0)
+        live = self._enqueue("ns", "b", floor=0, ceiling=1)
+        self.assertTrue(
+            lakebase_state.heartbeat_waiter(self.connection, "ns", live, waiter_ttl=ttl)
+        )  # reaps ``stalled``
+
+        self.assertFalse(
+            lakebase_state.heartbeat_waiter(self.connection, "ns", stalled, waiter_ttl=ttl)
+        )
+        lakebase_state.dequeue_waiter(self.connection, "ns", live)
+        self.assertIsNone(self._fair_acquire("ns", "a", stalled, slot_count=1))
 
     def test_heartbeat_reaps_stale_tickets(self):
         self._seed("ns", 1)
@@ -2004,8 +2024,8 @@ class LakebaseWaiterQueueTests(unittest.TestCase):
 
 
 class LakebaseRoundRobinQueueTests(unittest.TestCase):
-    """The round-robin policy: service rotates across requester classes so a
-    high-volume class cannot crowd out a low-volume one by ticket count."""
+    """Service rotates across requester classes so a high-volume class cannot crowd out a
+    low-volume one by ticket count."""
 
     CONSUMER = 0
     SNAPSHOT_DAEMON = 1
@@ -2033,7 +2053,6 @@ class LakebaseRoundRobinQueueTests(unittest.TestCase):
             slot_count=slot_count,
             floor=floor,
             ticket_id=ticket_id,
-            policy="round_robin",
             waiter_class=waiter_class,
             num_classes=self.NUM_CLASSES,
         )

@@ -2082,12 +2082,10 @@ def register_lakeflow_source(spark):
         # Fair waiter queue: one row per reader currently blocked on a slot, carrying
         # its eligible band [floor, ceiling). ``ticket_id`` is a global monotonic
         # sequence, so a smaller ticket enqueued earlier -- acquisition consults it to
-        # give the oldest still-heartbeating waiter first claim on each slot (see
-        # _ACQUIRE_SLOT_FAIR), turning the raw race into per-slot FIFO. ``waiter_class``
-        # tags each ticket with its requester class so the round-robin policy
-        # (_ACQUIRE_SLOT_ROUND_ROBIN) can interleave classes rather than serve strictly by
-        # arrival; it defaults to 0 (the consumer class) so an un-tagged ticket behaves as
-        # before.
+        # rank live waiters for each slot (see _ACQUIRE_SLOT). ``waiter_class`` tags each
+        # ticket with its requester class so acquisition can rotate service across classes
+        # rather than serve strictly by arrival; it defaults to 0 (the consumer class) so an
+        # un-tagged ticket behaves as before.
         """
         CREATE TABLE IF NOT EXISTS slot_waiters (
             namespace    text        NOT NULL,
@@ -2138,6 +2136,9 @@ def register_lakeflow_source(spark):
             PRIMARY KEY (namespace)
         )
         """,
+        # reserved_deletes held a delete-channel slot reservation the connector no longer
+        # has. Older connector versions sharing a namespace still write it, so it stays;
+        # this one always writes 0.
         """
         CREATE TABLE IF NOT EXISTS conn_limits (
             namespace        text        PRIMARY KEY,
@@ -2547,96 +2548,35 @@ def register_lakeflow_source(spark):
     # half-applied claim. ``epoch`` increments on every claim and becomes the fencing
     # token: a holder that stalls past its lease and wakes up later cannot renew or
     # release, because its epoch no longer matches.
-    _ACQUIRE_SLOT = """
-    UPDATE conn_slots SET owner = %(owner)s, epoch = epoch + 1,
-                          scope = %(scope)s, renewed_at = now()
-    WHERE (namespace, slot_id) = (
-        SELECT namespace, slot_id FROM conn_slots
-        WHERE namespace = %(namespace)s
-          AND slot_id >= %(floor)s
-          AND slot_id < %(ceiling)s
-          AND (owner IS NULL OR renewed_at < now() - make_interval(secs => %(lease)s))
-        ORDER BY slot_id
-        FOR UPDATE SKIP LOCKED
-        LIMIT 1
-    )
-    RETURNING slot_id, epoch
-    """
-
-    # Renewal is guarded on (owner, epoch): a zombie's heartbeat is rejected rather
-    # than silently extending a lease its successor now owns. A caller that gets no
-    # row has provably lost the slot and must stop using its connection.
-    _HEARTBEAT_SLOT = """
-    UPDATE conn_slots SET renewed_at = now()
-    WHERE namespace = %(namespace)s AND slot_id = %(slot_id)s
-      AND owner = %(owner)s AND epoch = %(epoch)s
-    RETURNING slot_id
-    """
-
-    # Release carries the same guard, for a sharper reason: without it a zombie's
-    # late release would free a slot its successor legitimately holds, over-issuing
-    # capacity. On the Volume this hazard is what the mutating- marker guarded.
-    _RELEASE_SLOT = """
-    UPDATE conn_slots SET owner = NULL, scope = NULL, renewed_at = NULL
-    WHERE namespace = %(namespace)s AND slot_id = %(slot_id)s
-      AND owner = %(owner)s AND epoch = %(epoch)s
-    RETURNING slot_id
-    """
-
-    # Fair acquisition: the same claim as _ACQUIRE_SLOT, but a slot is eligible only when
-    # no *older, still-heartbeating* waiter is also eligible for it. That makes acquisition
-    # first-come-first-served per slot -- the oldest waiter in a band always has priority --
-    # so no waiter is lapped indefinitely under contention. Ordering is per slot rather than
-    # global: the band predicate (w.floor <= slot < w.ceiling) means an older delete-channel
-    # waiter reserved to high slots does not block a younger consumer from a low slot it could
-    # never use, so there is no cross-band head-of-line blocking. The CAS (SKIP LOCKED + epoch)
-    # is unchanged, so capacity is still exact: a rare ordering inversion under a read race
-    # costs at most one extra sweep, never an over-issued slot.
-    _ACQUIRE_SLOT_FAIR = """
-    UPDATE conn_slots SET owner = %(owner)s, epoch = epoch + 1,
-                          scope = %(scope)s, renewed_at = now()
-    WHERE (namespace, slot_id) = (
-        SELECT s.namespace, s.slot_id FROM conn_slots s
-        WHERE s.namespace = %(namespace)s
-          AND s.slot_id >= %(floor)s
-          AND s.slot_id < %(ceiling)s
-          AND (s.owner IS NULL OR s.renewed_at < now() - make_interval(secs => %(lease)s))
-          AND NOT EXISTS (
-              SELECT 1 FROM slot_waiters w
-              WHERE w.namespace = %(namespace)s
-                AND w.ticket_id < %(ticket_id)s
-                AND w.floor <= s.slot_id AND s.slot_id < w.ceiling
-                AND w.heartbeat_at >= now() - make_interval(secs => %(waiter_ttl)s)
-          )
-        ORDER BY s.slot_id
-        FOR UPDATE SKIP LOCKED
-        LIMIT 1
-    )
-    RETURNING slot_id, epoch
-    """
-
-    # Round-robin acquisition: same claim and same CAS as _ACQUIRE_SLOT_FAIR, but the order in
-    # which waiters are served rotates across requester *classes* instead of going by arrival.
-    # A per-namespace cursor (slot_rr_cursor) records the class served last; ``rot`` ranks each
-    # live waiter's class by cyclic distance *after* that cursor -- MOD(class - last - 1, N) --
-    # so the class next in rotation has rot 0 and is served first, then the next, wrapping
-    # around. One class per grant, in rotation, so a class gets a turn every N grants no matter
-    # how many tickets another class holds. That is what a rank-within-class scheme cannot do:
-    # because a served waiter dequeues, the next same-class ticket would inherit rank 0 and the
-    # high-volume class would keep winning; the cursor rotates past a class once it is served,
-    # so a burst of consumer tickets cannot crowd out the few CDC-daemon tickets. Within the
-    # chosen class the oldest ticket wins (ticket_id tiebreak); empty classes are skipped for
-    # free since only live waiters appear in ``live``. The ``live`` CTE drops tickets that
-    # stopped heartbeating so a dead ticket cannot block a slot even between reaper sweeps. As
-    # with the FIFO variant this ordering is advisory: FOR UPDATE SKIP LOCKED + the epoch CAS
-    # serialise the actual grant, so a stale cursor or a read race costs at most one extra
-    # sweep, never an over-issued slot. The winner advances the cursor to its own class (see
-    # _ADVANCE_RR_CURSOR) in the same transaction as the claim.
+    #
+    # Every claim goes through the fair waiter queue: a slot is eligible only when no live
+    # waiter ranked ahead of this one is also eligible for it, so no waiter is lapped
+    # indefinitely under contention. Ordering is per slot rather than global: the band
+    # predicate (w.floor <= slot < w.ceiling) means an older waiter reserved to high slots does
+    # not block a younger one from a low slot it could never use, so there is no cross-band
+    # head-of-line blocking.
+    #
+    # Waiters are ranked by requester *class* in rotation, then by age. A per-namespace cursor
+    # (slot_rr_cursor) records the class served last; ``rot`` ranks each live waiter's class by
+    # cyclic distance *after* that cursor -- MOD(class - last - 1, N) -- so the class next in
+    # rotation has rot 0 and is served first, then the next, wrapping around. One class per
+    # grant, in rotation, so a class gets a turn every N grants no matter how many tickets
+    # another class holds. That is what serving by arrival cannot do: because a served waiter
+    # dequeues, the next same-class ticket would inherit the head and the high-volume class
+    # would keep winning; the cursor rotates past a class once it is served, so a burst of
+    # consumer tickets cannot crowd out the few CDC-daemon tickets. Within the chosen class the
+    # oldest ticket wins (ticket_id tiebreak); empty classes are skipped for free since only
+    # live waiters appear in ``live``. The ``live`` CTE drops tickets that stopped heartbeating
+    # so a dead ticket cannot block a slot even between reaper sweeps, and a caller whose own
+    # ticket is stale (``me`` empty) wins nothing until it heartbeats again. The ordering is
+    # advisory: FOR UPDATE SKIP LOCKED + the epoch CAS serialise the actual grant, so a stale
+    # cursor or a read race costs at most one extra sweep, never an over-issued slot. The
+    # winner advances the cursor to its own class (see _ADVANCE_RR_CURSOR) in the same
+    # transaction as the claim.
     #
     # ``num_classes`` is the rotation modulus (the count of distinct classes); ``1`` makes rot
-    # uniformly 0 and degrades this to FIFO-by-ticket, which is the safe default for a caller
-    # that does not classify its waiters.
-    _ACQUIRE_SLOT_ROUND_ROBIN = """
+    # uniformly 0, so waiters are served strictly by ticket age.
+    _ACQUIRE_SLOT = """
     WITH cur AS (
         SELECT COALESCE(
             (SELECT last_class FROM slot_rr_cursor WHERE namespace = %(namespace)s), -1
@@ -2672,6 +2612,26 @@ def register_lakeflow_source(spark):
         LIMIT 1
     )
     RETURNING slot_id, epoch
+    """
+
+    # Renewal is guarded on (owner, epoch): a zombie's heartbeat is rejected rather
+    # than silently extending a lease its successor now owns. A caller that gets no
+    # row has provably lost the slot and must stop using its connection.
+    _HEARTBEAT_SLOT = """
+    UPDATE conn_slots SET renewed_at = now()
+    WHERE namespace = %(namespace)s AND slot_id = %(slot_id)s
+      AND owner = %(owner)s AND epoch = %(epoch)s
+    RETURNING slot_id
+    """
+
+    # Release carries the same guard, for a sharper reason: without it a zombie's
+    # late release would free a slot its successor legitimately holds, over-issuing
+    # capacity. On the Volume this hazard is what the mutating- marker guarded.
+    _RELEASE_SLOT = """
+    UPDATE conn_slots SET owner = NULL, scope = NULL, renewed_at = NULL
+    WHERE namespace = %(namespace)s AND slot_id = %(slot_id)s
+      AND owner = %(owner)s AND epoch = %(epoch)s
+    RETURNING slot_id
     """
 
     # The winner stamps the cursor with its own class so the next grant rotates to the class
@@ -2729,34 +2689,28 @@ def register_lakeflow_source(spark):
         owner: str,
         *,
         slot_count: int,
+        ticket_id: int,
         floor: int = 0,
         scope: str | None = None,
         lease_seconds: float = 120.0,
-        ticket_id: int | None = None,
         waiter_ttl: float = _DEFAULT_WAITER_TTL_SECONDS,
-        policy: str = "fifo",
         waiter_class: int = 0,
         num_classes: int = 1,
     ) -> ConnectionSlot | None:
         # Docstring: Claim one slot, or return ``None`` when every eligible slot is busy.
         #
-        # ``floor`` implements the upsert reservation: the delete channel passes the
-        # reserved count so it can never claim a low slot, which is what makes the
-        # reservation a guarantee rather than a preference. ``slot_count`` bounds the
-        # ceiling, so lowering the configured limit takes effect immediately even
-        # though surplus rows are deliberately left in place.
+        # ``floor`` keeps a reader off the low slots: the CDC daemon and the snapshot drain
+        # pass their reservations so they can never claim a slot kept for consumer reads,
+        # which is what makes a reservation a guarantee rather than a preference.
+        # ``slot_count`` bounds the ceiling, so lowering the configured limit takes effect
+        # immediately even though surplus rows are deliberately left in place.
         #
-        # ``ticket_id`` opts into the fair queue: pass the id returned by
-        # ``enqueue_waiter`` (with the same ``waiter_ttl`` used to heartbeat it) and the
-        # claim yields any slot an earlier-ordered, still-heartbeating waiter is also
-        # eligible for, so this caller waits its turn. Omit it (the default) for the raw
-        # first-come race. ``policy`` selects how the queue orders waiters: ``"fifo"``
-        # (default) serves strictly by arrival (``_ACQUIRE_SLOT_FAIR``); ``"round_robin"``
-        # interleaves requester classes so ticket volume in one class cannot crowd out
-        # another (``_ACQUIRE_SLOT_ROUND_ROBIN``). Both only matter when ``ticket_id`` is set.
+        # ``ticket_id`` is this caller's place in the fair queue: the id returned by
+        # ``enqueue_waiter``, heartbeated with the same ``waiter_ttl``. The claim yields any
+        # slot a waiter ranked ahead of it is also eligible for, so this caller waits its turn.
         # ``waiter_class`` is this caller's class (matching the ticket) and ``num_classes`` the
-        # rotation modulus; on a round-robin win the cursor is advanced to ``waiter_class`` in
-        # the same transaction as the claim.
+        # rotation modulus; on a win the cursor is advanced to ``waiter_class`` in the same
+        # transaction as the claim.
 
         parameters = {
             "owner": owner,
@@ -2765,20 +2719,14 @@ def register_lakeflow_source(spark):
             "floor": max(0, floor),
             "ceiling": slot_count,
             "lease": float(lease_seconds),
+            "ticket_id": int(ticket_id),
+            "waiter_ttl": float(waiter_ttl),
+            "num_classes": max(1, int(num_classes)),
         }
-        round_robin = ticket_id is not None and policy == "round_robin"
-        if ticket_id is None:
-            statement = _ACQUIRE_SLOT
-        else:
-            statement = _ACQUIRE_SLOT_ROUND_ROBIN if round_robin else _ACQUIRE_SLOT_FAIR
-            parameters["ticket_id"] = int(ticket_id)
-            parameters["waiter_ttl"] = float(waiter_ttl)
-            if round_robin:
-                parameters["num_classes"] = max(1, int(num_classes))
         with connection.cursor() as cursor:
-            cursor.execute(statement, parameters)
+            cursor.execute(_ACQUIRE_SLOT, parameters)
             row = cursor.fetchone()
-            if row is not None and round_robin:
+            if row is not None:
                 # Advance the rotation cursor to this class inside the same transaction as the
                 # claim, so the next grant rotates past it. Best-effort ordering only -- a lost
                 # advance under a race just repeats a class, never over-issues a slot.
@@ -2804,10 +2752,9 @@ def register_lakeflow_source(spark):
         # Docstring: Register this caller as a slot waiter and return its queue ticket.
         #
         # The ticket records the eligible band [floor, ceiling); acquisition consults it
-        # so an earlier-ordered waiter in the same band is served first. ``waiter_class``
-        # tags the ticket with its requester class for the round-robin policy (it is inert
-        # under FIFO); it defaults to 0, the consumer class. Commit it before waiting so
-        # other waiters' connections can see it.
+        # so a waiter ranked ahead in the same band is served first. ``waiter_class`` tags
+        # the ticket with its requester class for the rotation; it defaults to 0, the
+        # consumer class. Commit it before waiting so other waiters' connections can see it.
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -2825,23 +2772,28 @@ def register_lakeflow_source(spark):
         return int(row[0])
 
 
-    def heartbeat_waiter(connection: Any, namespace: str, ticket_id: int, *, waiter_ttl: float) -> None:
+    def heartbeat_waiter(connection: Any, namespace: str, ticket_id: int, *, waiter_ttl: float) -> bool:
         # Docstring: Renew this waiter's ticket and reap any whose owner stopped heartbeating.
         #
         # Folding the reap into the heartbeat keeps the queue self-cleaning: a crashed or
         # timed-out waiter's ticket ages out and is dropped by the next live heartbeat, so
-        # it never blocks the queue and no separate GC pass is needed.
+        # it never blocks the queue and no separate GC pass is needed. Returns False when
+        # the ticket no longer exists (it was reaped after a stall longer than
+        # ``waiter_ttl``): acquisition only ever grants to a live ticket, so the caller must
+        # enqueue a fresh one.
 
         with connection.cursor() as cursor:
             cursor.execute(
                 _HEARTBEAT_WAITER,
                 {"namespace": namespace, "ticket_id": int(ticket_id)},
             )
+            renewed = cursor.fetchone() is not None
             cursor.execute(
                 _REAP_WAITERS,
                 {"namespace": namespace, "waiter_ttl": float(waiter_ttl)},
             )
         connection.commit()
+        return renewed
 
 
     def dequeue_waiter(connection: Any, namespace: str, ticket_id: int) -> None:
@@ -3040,10 +2992,10 @@ def register_lakeflow_source(spark):
 
     _WRITE_LIMIT = """
     INSERT INTO conn_limits (namespace, max_connections, reserved_deletes, version, updated_at)
-    VALUES (%(namespace)s, %(max_connections)s, %(reserved)s, %(version)s, now())
+    VALUES (%(namespace)s, %(max_connections)s, 0, %(version)s, now())
     ON CONFLICT (namespace) DO UPDATE
        SET max_connections = EXCLUDED.max_connections,
-           reserved_deletes = EXCLUDED.reserved_deletes,
+           reserved_deletes = 0,
            version = EXCLUDED.version,
            updated_at = now()
     """
@@ -3053,7 +3005,6 @@ def register_lakeflow_source(spark):
         connection: Any,
         namespace: str,
         max_connections: int,
-        reserved_deletes: int,
         version: int,
     ) -> None:
         # Docstring: Publish the agreed capacity configuration for a namespace.
@@ -3064,7 +3015,6 @@ def register_lakeflow_source(spark):
                 {
                     "namespace": namespace,
                     "max_connections": int(max_connections),
-                    "reserved": int(reserved_deletes),
                     "version": int(version),
                 },
             )
@@ -3077,7 +3027,7 @@ def register_lakeflow_source(spark):
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT max_connections, reserved_deletes, version
+                SELECT max_connections, version
                 FROM conn_limits WHERE namespace = %(namespace)s
                 """,
                 {"namespace": namespace},
@@ -3089,8 +3039,7 @@ def register_lakeflow_source(spark):
             return None
         return {
             "max_connections": int(row[0]),
-            "reserved_deletes": int(row[1]),
-            "version": int(row[2]),
+            "version": int(row[1]),
         }
 
 
@@ -5813,13 +5762,9 @@ def register_lakeflow_source(spark):
     # stage the table and publish its manifest, then serves the staged pages exactly as a
     # resumed snapshot does. At most K drains run at once in a process, and each claims its
     # slot above its own floor (see _snapshot_daemon_connection_reservation), so the lowest
-    # slots stay with consumer reads. ``snapshot.shared.session=false``, which drained on
-    # the microbatch thread, and its ``snapshot.connection.reservation`` floor are gone: the
-    # first is rejected with a message saying what to do, the second ignored with a warning.
-    _SNAPSHOT_SHARED_SESSION_OPTION = "snapshot.shared.session"
+    # slots stay with consumer reads.
     _SNAPSHOT_READER_THREADS_OPTION = "snapshot.reader.threads"
     _DEFAULT_SNAPSHOT_READER_THREADS = 1
-    _SNAPSHOT_RESERVATION_OPTION = "snapshot.connection.reservation"
     # Isolation level for the monolithic ``snapshot.mode=initial`` full-table snapshot. A
     # table option: the isolation trade-off is per table, not per connection. Maps a small
     # validated token to a fixed SQL clause (so the value can never be SQL-injected). The
@@ -5955,11 +5900,6 @@ def register_lakeflow_source(spark):
     # Idle back-off for a snapshot-drain worker with no queued jobs, so it does not busy-spin.
     # Also the granularity at which the consumer's liveness watchdog re-checks for progress.
     _SNAPSHOT_DRAIN_IDLE_SECONDS = 1.0
-    # Master switch for the drain worker's slot-wait liveness watchdog (default on). When on,
-    # a drain worker blocked acquiring its connection slot resets its deadline as long as the
-    # pool keeps recycling slots (turnover), and only gives up once the pool is genuinely
-    # wedged; when off it falls back to the plain ``connection.wait.timeout.seconds`` deadline.
-    _SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION = "snapshot.drain.slot.liveness.enabled"
     # Extra grace the consumer's drain watchdog waits beyond the worker's slot-wait window, so
     # a wedged pool surfaces the worker's precise ConnectionCapacityUnavailable (recorded when
     # the worker gives up) rather than the consumer's generic "appears stalled" racing it out.
@@ -6006,18 +5946,6 @@ def register_lakeflow_source(spark):
     # counter is persisted in offsets under its historical name.
     _SCHEMA_NODE_FALLBACK_RETRIES = 5
     _DEFAULT_MAX_CONCURRENT_CONNECTIONS = 16
-    # Slots reserved for the upsert channel, which the delete channel may not claim.
-    # A floor rather than a partition: upserts may still use every unreserved slot,
-    # so an idle delete channel strands nothing. Both channels replay the same log
-    # range, so their throughput needs are symmetric and reserving only chooses which
-    # channel falls behind. Upsert starvation merely slows an update, but a delete
-    # reader held back until its checkpoint predates log retention forces a
-    # re-snapshot, so this defaults to 0 (no reservation) and is opt-in.
-    _DEFAULT_UPSERT_CONNECTION_RESERVATION = 0
-    # The framework strips ``isDeleteFlow`` before it reaches the connector, so the
-    # reader publishes the channel to its own bridge through this private option --
-    # the same mechanism ``_informix.bypass.connection.capacity`` already uses.
-    _CONNECTION_CHANNEL_OPTION = "_informix.connection.channel"
     # Slots the background daemons (sharded CDC readers, the snapshot drain pool) may not
     # claim, guaranteeing them to consumer bootstrap/snapshot/incremental reads. Unlike a
     # consumer read, a daemon never releases per microbatch (a busy CDC shard re-reads in a
@@ -6030,16 +5958,6 @@ def register_lakeflow_source(spark):
     # Private marker set on a daemon reader's options so its lazy slot acquisition applies the
     # daemon reservation floor. Set by the CDC reader factory only.
     _DAEMON_SLOT_MARKER_OPTION = "_informix.daemon.slot"
-    # Master switch (default on) for the CDC shard daemon's slot-wait liveness watchdog. When
-    # on, a shard daemon blocked acquiring its slot keeps its queue ticket and resets its
-    # deadline as long as the pool keeps recycling slots (turnover), giving the round-robin
-    # rotation time to reach it, and gives up only once the pool is genuinely wedged (no
-    # turnover for a whole window) -- at which point it degrades to consumer fallback reads.
-    # When off it falls back to the plain ``connection.wait.timeout.seconds`` deadline. This
-    # is the companion to round-robin: RR bounds the daemon's wait in rounds, but a round is
-    # paid in slot turnover, so the daemon must hold its ticket long enough for those rounds
-    # to happen rather than fail fast and re-queue at the back.
-    _DAEMON_SLOT_LIVENESS_OPTION = "cdc.shared.slot.liveness.enabled"
     # Private marker for the snapshot-drain daemon reader. Unlike the CDC daemon (deferrable,
     # floored highest), a drain is bootstrap work that must make progress to unblock its
     # append-only consumer, so it is floored *below* the CDC daemon -- into a band the CDC
@@ -6086,19 +6004,11 @@ def register_lakeflow_source(spark):
     _LAKEBASE_SWEEP_MAX_SECONDS = 2.0
     # Fair slot queue: a waiter enqueues a ticket so acquisition is first-come per slot
     # rather than a raw race, which prevents an unlucky reader being lapped indefinitely
-    # under contention. On by default; the kill-switch reverts to the raw race without a
-    # redeploy if the queue ever misbehaves on a live pipeline.
-    _CONNECTION_FAIR_QUEUE_OPTION = "connection.fair.queue.enabled"
-    # How the fair queue orders waiters. ``fifo`` serves strictly by arrival; ``round_robin``
-    # (the default) interleaves requester classes so a high-volume class (many consumer
-    # bootstrap/fallback tickets) cannot crowd out a low-volume one (the few CDC-daemon
-    # tickets) by ticket count alone -- each class is served once per rotation. The class is
-    # derived from the private slot markers already on a reader's options (see
-    # _connection_waiter_class). ``fifo`` remains available as a kill-switch.
-    _CONNECTION_FAIR_QUEUE_POLICY_OPTION = "connection.fair.queue.policy"
-    _CONNECTION_FAIR_QUEUE_POLICY_FIFO = "fifo"
-    _CONNECTION_FAIR_QUEUE_POLICY_ROUND_ROBIN = "round_robin"
-    _DEFAULT_CONNECTION_FAIR_QUEUE_POLICY = _CONNECTION_FAIR_QUEUE_POLICY_ROUND_ROBIN
+    # under contention. The queue interleaves requester classes so a high-volume class (many
+    # consumer bootstrap/fallback tickets) cannot crowd out a low-volume one (the few
+    # CDC-daemon tickets) by ticket count alone -- each class is served once per rotation.
+    # The class is derived from the private slot markers already on a reader's options (see
+    # _connection_waiter_class).
     # Requester classes for the round-robin policy's rotation. The value is only a
     # within-round tiebreak -- every class is still served once per round -- so the ordering
     # among them does not starve any class. Consumer work is class 0 so that, all else equal,
@@ -7171,25 +7081,6 @@ def register_lakeflow_source(spark):
                 )
                 return None
 
-        def _connection_channel_is_delete(self) -> bool:
-            return self.options.get(_CONNECTION_CHANNEL_OPTION) == "delete"
-
-        def _upsert_connection_reservation(self, slot_count: int) -> int:
-            reservation = int(
-                self.options.get(
-                    "upsert.connection.reservation",
-                    str(_DEFAULT_UPSERT_CONNECTION_RESERVATION),
-                )
-            )
-            if not 0 <= reservation < slot_count:
-                # At slot_count the delete channel could never claim a slot at all,
-                # which starves it permanently rather than merely throttling it.
-                raise ValueError(
-                    "Option 'upsert.connection.reservation' must be >= 0 and < "
-                    f"max.concurrent.connections ({slot_count})"
-                )
-            return reservation
-
         def _daemon_connection_reservation(self, slot_count: int) -> int:
             reservation = int(
                 self.options.get(
@@ -7288,8 +7179,7 @@ def register_lakeflow_source(spark):
                     str(_DEFAULT_MAX_CONCURRENT_CONNECTIONS),
                 )
             )
-            reservation = self._upsert_connection_reservation(slot_count)
-            floor = reservation if self._connection_channel_is_delete() else 0
+            floor = 0
             # The sharded CDC daemon draws from the same pool but, unlike a consumer read,
             # never releases per microbatch: a busy CDC shard re-reads in a tight loop. With
             # ``cdc.shared.reader.threads`` threads on each of two channels, it can pin every
@@ -7322,54 +7212,59 @@ def register_lakeflow_source(spark):
             # claim. Seeding is idempotent and only ever adds rows.
             seed_slots(connection, namespace, slot_count)
             publish_connection_limit(
-                connection, namespace, slot_count, reservation, _CONNECTION_LIMIT_CONFIG_VERSION
+                connection, namespace, slot_count, _CONNECTION_LIMIT_CONFIG_VERSION
             )
             owner = f"{secrets.token_hex(16)}"
             scope = self.options.get("_informix.pipeline.scope") or None
             deadline = time.monotonic() + connection_wait_timeout
-            # Slot-wait liveness (the two daemon roles, default on). A daemon is not a consumer
-            # microbatch: it must not fail merely because the pool is *full* -- only when it is
-            # *wedged*. So its deadline is a liveness watchdog keyed on pool turnover: as long as
-            # slots keep being claimed (the token advances -- other work is completing and
-            # recycling capacity), reset the deadline; give up only after a whole window with zero
-            # turnover. The snapshot drain additionally pings its waiting consumer each turnover.
-            # The CDC shard daemon uses the same watchdog so it holds its queue ticket long enough
-            # for the round-robin rotation to reach it -- a round is paid in turnover, not
-            # wall-clock -- rather than failing fast on a short budget and re-queuing at the back;
-            # on a genuine wedge it gives up and its consumers degrade to direct reads. Other
-            # callers keep the plain deadline (a consumer that cannot get a slot should fail its
+            # Slot-wait liveness (the two daemon roles). A daemon is not a consumer microbatch: it must
+            # not fail merely because the pool is *full* -- only when it is *wedged*. So its deadline is
+            # a liveness watchdog keyed on pool turnover: as long as slots keep being claimed (the token
+            # advances -- other work is completing and recycling capacity), reset the deadline; give up
+            # only after a whole window with zero turnover. The snapshot drain additionally pings its
+            # waiting consumer each turnover. The CDC shard daemon uses the same watchdog so it holds
+            # its queue ticket long enough for the round-robin rotation to reach it -- a round is paid
+            # in turnover, not wall-clock -- rather than failing fast on a short budget and re-queuing
+            # at the back; on a genuine wedge it gives up and its consumers degrade to direct reads.
+            # Other callers keep the plain deadline (a consumer that cannot get a slot should fail its
             # microbatch and retry, not wait out a backfill).
-            liveness = (
-                is_snapshot_daemon
-                and _option_bool(self.options, _SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION, True)
-            ) or (is_cdc_daemon and _option_bool(self.options, _DAEMON_SLOT_LIVENESS_OPTION, True))
+            liveness = is_snapshot_daemon or is_cdc_daemon
             progress_token = pool_progress_token(connection, namespace) if liveness else None
-            # Fair queue (default on): enqueue a ticket so acquisition waits its turn instead of
-            # a raw race, then heartbeat it each sweep and drop it the moment we win or give up.
-            # The ticket carries this reader's requester class so the round-robin policy can
-            # interleave classes; the policy option chooses round-robin (default) or FIFO. The
-            # kill-switch (_CONNECTION_FAIR_QUEUE_OPTION off) falls back to the unticketed race.
-            fair = _option_bool(self.options, _CONNECTION_FAIR_QUEUE_OPTION, True)
-            ticket_id = (
-                enqueue_waiter(
-                    connection,
-                    namespace,
-                    owner,
-                    floor=floor,
-                    ceiling=slot_count,
-                    waiter_class=self._connection_waiter_class(),
-                )
-                if fair
-                else None
+            # Fair queue: enqueue a ticket so acquisition waits its turn instead of a raw race,
+            # then heartbeat it each sweep and drop it the moment we win or give up. The ticket
+            # carries this reader's requester class so the round-robin policy can interleave
+            # classes.
+            ticket_id = enqueue_waiter(
+                connection,
+                namespace,
+                owner,
+                floor=floor,
+                ceiling=slot_count,
+                waiter_class=self._connection_waiter_class(),
             )
             try:
                 while True:
-                    if ticket_id is not None:
-                        # Renew our place and reap any crashed/timed-out waiters so a dead
-                        # ticket cannot block us; a lost state connection here is transient,
-                        # so let it surface and be retried by the normal reconnect path.
-                        heartbeat_waiter(
-                            connection, namespace, ticket_id, waiter_ttl=_LAKEBASE_WAITER_TTL_SECONDS
+                    # Renew our place and reap any crashed/timed-out waiters so a dead ticket
+                    # cannot block us; a lost state connection here is transient, so let it
+                    # surface and be retried by the normal reconnect path. If our own ticket
+                    # was reaped (a stall longer than the waiter TTL between two sweeps), take
+                    # a fresh one: acquisition grants only to a live ticket, so sweeping on with
+                    # a dead one could never win. The new ticket joins the back of its class's
+                    # rotation, which is the fair outcome for a waiter that went dark.
+                    if not heartbeat_waiter(
+                        connection, namespace, ticket_id, waiter_ttl=_LAKEBASE_WAITER_TTL_SECONDS
+                    ):
+                        logging.getLogger(__name__).warning(
+                            "Informix connection-slot waiter ticket %s was reaped; re-enqueuing",
+                            ticket_id,
+                        )
+                        ticket_id = enqueue_waiter(
+                            connection,
+                            namespace,
+                            owner,
+                            floor=floor,
+                            ceiling=slot_count,
+                            waiter_class=self._connection_waiter_class(),
                         )
                     slot = acquire_slot(
                         connection,
@@ -7381,10 +7276,6 @@ def register_lakeflow_source(spark):
                         lease_seconds=_CONNECTION_SLOT_LEASE_SECONDS,
                         ticket_id=ticket_id,
                         waiter_ttl=_LAKEBASE_WAITER_TTL_SECONDS,
-                        policy=self.options.get(
-                            _CONNECTION_FAIR_QUEUE_POLICY_OPTION,
-                            _DEFAULT_CONNECTION_FAIR_QUEUE_POLICY,
-                        ),
                         waiter_class=self._connection_waiter_class(),
                         num_classes=_SLOT_CLASS_COUNT,
                     )
@@ -7432,13 +7323,12 @@ def register_lakeflow_source(spark):
                 # Drop our ticket whether we won, timed out, or errored -- a lingering ticket
                 # would wrongly hold back younger waiters until it aged out. Best-effort: a
                 # dequeue failure must never mask a successful acquire or the real timeout.
-                if ticket_id is not None:
-                    try:
-                        dequeue_waiter(connection, namespace, ticket_id)
-                    except Exception:  # noqa: BLE001 - ticket ages out via the reaper anyway
-                        logging.getLogger(__name__).debug(
-                            "snapshot slot waiter dequeue failed", exc_info=True
-                        )
+                try:
+                    dequeue_waiter(connection, namespace, ticket_id)
+                except Exception:  # noqa: BLE001 - ticket ages out via the reaper anyway
+                    logging.getLogger(__name__).debug(
+                        "snapshot slot waiter dequeue failed", exc_info=True
+                    )
 
         def _heartbeat_connection_slot(
             self,
@@ -11789,14 +11679,7 @@ def register_lakeflow_source(spark):
         value = options.get(_SHARED_CDC_SESSION_OPTION, _SHARED_CDC_SESSION_HOST).strip().lower()
         if value in (_SHARED_CDC_SESSION_HOST, _SHARED_CDC_SESSION_PROCESS):
             return value
-        # The values sharing used to accept say what to set instead.
-        if value in {"0", "false", "no"}:
-            hint = "can no longer be turned off; remove it (host, the default) or set 'process'"
-        elif value in {"1", "true", "yes"}:
-            hint = f"no longer accepts '{value}'; set 'process', which it meant, or remove it (host)"
-        else:
-            hint = "must be 'host' or 'process'"
-        raise ValueError(f"Option '{_SHARED_CDC_SESSION_OPTION}' {hint}")
+        raise ValueError(f"Option '{_SHARED_CDC_SESSION_OPTION}' must be 'host' or 'process'")
 
 
     class _HostShardEndpoints:
@@ -12865,30 +12748,10 @@ def register_lakeflow_source(spark):
             # checked on first read, deep inside a running flow).
             _option_bool(options, "snapshot.incremental.blocking", True)
             _shared_cdc_mode(options)
-            if not _option_bool(options, _SNAPSHOT_SHARED_SESSION_OPTION, True):
-                raise ValueError(
-                    f"Option '{_SNAPSHOT_SHARED_SESSION_OPTION}' can no longer be turned off; "
-                    "remove it (snapshots always drain in the drain pool)"
-                )
-            _option_bool(options, _CONNECTION_FAIR_QUEUE_OPTION, True)
-            _option_bool(options, _SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION, True)
-            _option_bool(options, _DAEMON_SLOT_LIVENESS_OPTION, True)
             # Validate the .unl / HPL DELIMITED field format eagerly (single-character
             # delimiter and optionally-empty escape, which must differ), rather than only
             # on the first file-source read deep inside a running flow.
             _validate_unl_field_format(options)
-            queue_policy = options.get(
-                _CONNECTION_FAIR_QUEUE_POLICY_OPTION, _DEFAULT_CONNECTION_FAIR_QUEUE_POLICY
-            )
-            if queue_policy not in (
-                _CONNECTION_FAIR_QUEUE_POLICY_FIFO,
-                _CONNECTION_FAIR_QUEUE_POLICY_ROUND_ROBIN,
-            ):
-                raise ValueError(
-                    f"Option '{_CONNECTION_FAIR_QUEUE_POLICY_OPTION}' must be "
-                    f"'{_CONNECTION_FAIR_QUEUE_POLICY_FIFO}' or "
-                    f"'{_CONNECTION_FAIR_QUEUE_POLICY_ROUND_ROBIN}'"
-                )
             _option_bool(options, _PROMOTE_UNIQUE_INDEX_OPTION, True)
             _option_bool(options, _SNAPSHOT_STAGING_PIPELINE_OPTION, True)
             _option_bool(options, _PARTITIONED_STREAM_OPTION, True)
@@ -12932,27 +12795,6 @@ def register_lakeflow_source(spark):
                     str(_DEFAULT_MAX_CONCURRENT_CONNECTIONS),
                 )
             )
-            reservation = int(
-                options.get(
-                    "upsert.connection.reservation",
-                    str(_DEFAULT_UPSERT_CONNECTION_RESERVATION),
-                )
-            )
-            # Reject rather than clamp: at slot_count the delete channel could never
-            # claim a slot, starving it permanently instead of throttling it.
-            if not 0 <= reservation < slot_count:
-                raise ValueError(
-                    "Option 'upsert.connection.reservation' must be >= 0 and < "
-                    f"max.concurrent.connections ({slot_count})"
-                )
-            # It did nothing under the default drain pool either, so a spec that still
-            # carries it keeps working.
-            if _SNAPSHOT_RESERVATION_OPTION in options:
-                logging.getLogger(__name__).warning(
-                    "Option '%s' is no longer used (snapshots always drain in the drain pool); "
-                    "remove it from the pipeline spec",
-                    _SNAPSHOT_RESERVATION_OPTION,
-                )
             daemon_reservation = int(
                 options.get(
                     _DAEMON_RESERVATION_OPTION,
@@ -14045,29 +13887,12 @@ def register_lakeflow_source(spark):
                 return iter(()), self._schema_node_fallback_offset(start_offset)
             replaying = self._replay_stop_lsn(table_options) is not None
             replay_wait_budget = self._replay_connection_wait_budget(table_options)
-            # Declare the channel before anything can connect. The slot is taken by
-            # the first call that reaches _ensure_connected -- which is the schema
-            # refresh, well before read_changes -- so setting this any later would
-            # let the first acquisition land outside the delete channel's band.
-            previous_channel = self.options.get(_CONNECTION_CHANNEL_OPTION)
-            self.options[_CONNECTION_CHANNEL_OPTION] = "delete"
-            try:
-                with contextlib.ExitStack() as stack:
-                    stack.enter_context(
-                        self._capacity_attempt(
-                            start_offset,
-                            replaying=replaying,
-                            replay_wait_budget=replay_wait_budget,
-                        )
-                    )
-                    return self._read_table_deletes_attempt(
-                        table_name, start_offset, effective_start, table_options, snapshot_mode
-                    )
-            finally:
-                if previous_channel is None:
-                    self.options.pop(_CONNECTION_CHANNEL_OPTION, None)
-                else:
-                    self.options[_CONNECTION_CHANNEL_OPTION] = previous_channel
+            with self._capacity_attempt(
+                start_offset, replaying=replaying, replay_wait_budget=replay_wait_budget
+            ):
+                return self._read_table_deletes_attempt(
+                    table_name, start_offset, effective_start, table_options, snapshot_mode
+                )
 
         def _read_table_deletes_attempt(
             self,
@@ -18518,8 +18343,6 @@ def register_lakeflow_source(spark):
             # the drain must count against the same connection budget so
             # ``snapshot.reader.threads`` bounds the slots it holds.
             reader_options = dict(self.options)
-            # Already warned about on the consumer; a daemon reader's copy must not repeat it.
-            reader_options.pop(_SNAPSHOT_RESERVATION_OPTION, None)
             # The drain runs on a daemon thread and holds its slot for the whole scan, but it
             # is bootstrap work that must finish to unblock its consumer. Floor it one band
             # below the CDC daemon (not at the CDC floor), so a saturated CDC daemon cannot
@@ -18615,15 +18438,12 @@ def register_lakeflow_source(spark):
             )
             return max(1, slot_count // 4)
 
-        def _shared_cdc_reader_factory(self, channel: str) -> Callable[[], "InformixLakeflowConnect"]:
+        def _shared_cdc_reader_factory(self) -> Callable[[], "InformixLakeflowConnect"]:
             # The daemon reader gets its OWN options copy: the connector mutates options
-            # mid-read (channel, capacity hints), so a shared dict would race. It reads
+            # mid-read (capacity hints), so a shared dict would race. It reads
             # through its bridge and _read_changes_with_reconnect, never _read_stream, so it
             # can't recurse into the shards.
             reader_options = dict(self.options)
-            # Already warned about on the consumer; a daemon reader's copy must not repeat it.
-            reader_options.pop(_SNAPSHOT_RESERVATION_OPTION, None)
-            reader_options[_CONNECTION_CHANNEL_OPTION] = channel
             # The shard reads on a daemon thread, so floor its slot above the daemon
             # reservation to leave headroom for consumer bootstrap reads.
             reader_options[_DAEMON_SLOT_MARKER_OPTION] = "true"
@@ -18661,7 +18481,7 @@ def register_lakeflow_source(spark):
                     self.options.get("cdc.shared.state.wait.seconds", str(_SHARED_STATE_WAIT_SECONDS))
                 ),
             }
-            reader_factory = self._shared_cdc_reader_factory(channel)
+            reader_factory = self._shared_cdc_reader_factory()
             if _shared_cdc_mode(self.options) == _SHARED_CDC_SESSION_HOST:
                 view = _host_shard_poll(
                     key,
@@ -19365,9 +19185,8 @@ def register_lakeflow_source(spark):
                     # the deadline would occupy a slot for the whole wait while doing
                     # no source work -- and the upsert reader it is waiting for needs
                     # a slot of its own to publish (current_lsn above). Because both
-                    # channels can claim every slot when upsert.connection.reservation
-                    # is 0 (the default), enough waiting delete readers hold the entire
-                    # pool and the publication can never happen: a genuine deadlock,
+                    # channels can claim every slot, enough waiting delete readers hold
+                    # the entire pool and the publication can never happen: a genuine deadlock,
                     # broken only by this deadline expiring and failing the flow.
                     #
                     # Yield instead, exactly as the other two non-owner coordination
