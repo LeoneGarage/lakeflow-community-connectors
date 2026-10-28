@@ -5896,13 +5896,10 @@ def register_lakeflow_source(spark):
     _APPEND_DELETE_TOMBSTONES_OPTION = "append.delete.tombstones"
     # Sharded daemon-reader CDC (see _shared_cdc_mode). ``cdc.shared.session=host``, the
     # default, shares each shard between the flow processes on one host through a leader
-    # process (see the host-shared shards block after _shared_cdc_shard); ``true`` (or
-    # ``process``) shares the shards only within one process; ``false`` opts out, in which
-    # case every CDC-capable table runs its own Informix CDC session per poll -- one
-    # connection slot and a full opensess/startcapture/activatesess/endcapture cycle each
-    # microbatch, per table.
+    # process (see the host-shared shards block after _shared_cdc_shard); ``process`` shares
+    # the shards only within one process.
     #
-    # When on, the tables are partitioned into K shards (``cdc.shared.reader.threads``,
+    # The tables are partitioned into K shards (``cdc.shared.reader.threads``,
     # default a quarter of ``max.concurrent.connections``, at least 1). A bounded
     # pool of K driver-resident daemon threads -- one per shard -- each holds a single
     # shared CDC session multiplexing just its shard's subset of tables, reads the log
@@ -5952,20 +5949,14 @@ def register_lakeflow_source(spark):
     # Snapshot-drain fairness. An ``initial``-mode snapshot drains the whole table through
     # one REPEATABLE READ transaction, holding one connection slot for the entire scan; with
     # many tables this can consume every slot and starve the streaming/CDC readers waiting
-    # for one. Two strategies, selected by ``snapshot.shared.session``:
-    #
-    #   true (default) -- Model C, a bounded daemon pool. The drain moves off the microbatch
-    #   thread onto ``snapshot.reader.threads`` (K) driver-resident daemon workers; the
-    #   consumer waits (holding no slot) for the daemon to stage the table and publish its
-    #   manifest, then serves the staged pages exactly as a resumed snapshot does. At most K
-    #   drains run at once, so at most K slots are held by snapshots -- keep
-    #   K < max.concurrent.connections and a floor always remains for streaming readers.
-    #
-    #   false -- Model A, a reservation floor. A snapshot-phase read acquires its slot above
-    #   ``snapshot.connection.reservation``, so that many low slots are guaranteed reachable
-    #   by non-snapshot readers and can never all be held by drains at once. Off by default
-    #   (reservation 0), so this mode bounds the starvation only once the reservation is set;
-    #   cheap, and it leaves the drain on the microbatch thread.
+    # for one. So the drain moves off the microbatch thread onto ``snapshot.reader.threads``
+    # (K) driver-resident daemon workers: the consumer waits (holding no slot) for a worker to
+    # stage the table and publish its manifest, then serves the staged pages exactly as a
+    # resumed snapshot does. At most K drains run at once in a process, and each claims its
+    # slot above its own floor (see _snapshot_daemon_connection_reservation), so the lowest
+    # slots stay with consumer reads. ``snapshot.shared.session=false``, which drained on
+    # the microbatch thread, and its ``snapshot.connection.reservation`` floor are gone: the
+    # first is rejected with a message saying what to do, the second ignored with a warning.
     _SNAPSHOT_SHARED_SESSION_OPTION = "snapshot.shared.session"
     _SNAPSHOT_READER_THREADS_OPTION = "snapshot.reader.threads"
     _DEFAULT_SNAPSHOT_READER_THREADS = 1
@@ -6102,10 +6093,6 @@ def register_lakeflow_source(spark):
         "committed_read_last_committed": "COMMITTED READ LAST COMMITTED",
         "repeatable_read": "REPEATABLE READ",
     }
-    # Private per-read marker: set on a reader's options while it performs a snapshot-phase
-    # read, so the lazy slot acquisition can apply the reservation floor. Mirrors how the
-    # channel and attempt-budget options are threaded to the bridge.
-    _SNAPSHOT_DRAIN_MARKER_OPTION = "_informix.snapshot.drain"
     # Idle back-off for a snapshot-drain worker with no queued jobs, so it does not busy-spin.
     # Also the granularity at which the consumer's liveness watchdog re-checks for progress.
     _SNAPSHOT_DRAIN_IDLE_SECONDS = 1.0
@@ -6169,14 +6156,6 @@ def register_lakeflow_source(spark):
     # reader held back until its checkpoint predates log retention forces a
     # re-snapshot, so this defaults to 0 (no reservation) and is opt-in.
     _DEFAULT_UPSERT_CONNECTION_RESERVATION = 0
-    # Slots a snapshot-phase (Model A) read may not claim, guaranteeing them to the
-    # streaming/CDC readers so a long initial drain cannot starve them. Same floor mechanism
-    # as the upsert reservation. The configured default is 0, but in Model A a 0 (unset) is
-    # interpreted as floor(max.concurrent.connections / 3), rounded up to at least 1 whenever
-    # the pool has 2+ slots (0 only for a single-slot pool, which cannot spare one) -- so a
-    # long inline drain leaves streaming readers about two-thirds of the pool without any
-    # tuning; set a positive value to override, and Model C (the default) ignores it entirely.
-    _DEFAULT_SNAPSHOT_CONNECTION_RESERVATION = 0
     # The framework strips ``isDeleteFlow`` before it reaches the connector, so the
     # reader publishes the channel to its own bridge through this private option --
     # the same mechanism ``_informix.bypass.connection.capacity`` already uses.
@@ -6269,9 +6248,9 @@ def register_lakeflow_source(spark):
     _SLOT_CLASS_CONSUMER = 0
     _SLOT_CLASS_SNAPSHOT_DAEMON = 1
     _SLOT_CLASS_CDC_DAEMON = 2
-    _SLOT_CLASS_SNAPSHOT_CONSUMER = 3
-    # The rotation modulus for the round-robin policy: the number of distinct classes above,
-    # so the cursor cycles through exactly them.
+    # The rotation modulus for the round-robin policy. Class 3 was the drain on a consumer's
+    # own thread, now gone; the modulus still counts it so that connectors of either version
+    # sharing one endpoint rotate alike, and the rotation only ranks classes with waiters.
     _SLOT_CLASS_COUNT = 4
     # A ticket stays authoritative for this long without a heartbeat. A waiter heartbeats
     # every sweep (<= _LAKEBASE_SWEEP_MAX_SECONDS), so this is many sweeps of slack for a
@@ -7432,32 +7411,6 @@ def register_lakeflow_source(spark):
                 )
             return reservation
 
-        def _snapshot_connection_reservation(self, slot_count: int) -> int:
-            reservation = int(
-                self.options.get(
-                    _SNAPSHOT_RESERVATION_OPTION,
-                    str(_DEFAULT_SNAPSHOT_CONNECTION_RESERVATION),
-                )
-            )
-            if not 0 <= reservation < slot_count:
-                # At slot_count a snapshot drain could never claim a slot at all, which
-                # deadlocks the drain rather than merely deferring it behind streams.
-                raise ValueError(
-                    f"Option '{_SNAPSHOT_RESERVATION_OPTION}' must be >= 0 and < "
-                    f"max.concurrent.connections ({slot_count})"
-                )
-            # Model A with an unset/zero reservation reserves a third of the pool by default,
-            # so a long inline drain always leaves the streaming/CDC readers roughly
-            # two-thirds of capacity rather than potentially every slot. Reserve at least one
-            # slot whenever the pool can spare one (>= 2 slots), rounding floor(slot_count/3)
-            # up to 1; clamp to slot_count - 1 so a single-slot pool reserves 0 -- reserving
-            # its only slot would floor the drain out of every slot and deadlock it.
-            if reservation == 0 and not _option_bool(
-                self.options, _SNAPSHOT_SHARED_SESSION_OPTION, True
-            ):
-                return min(max(1, slot_count // 3), slot_count - 1)
-            return reservation
-
         def _daemon_connection_reservation(self, slot_count: int) -> int:
             reservation = int(
                 self.options.get(
@@ -7539,8 +7492,6 @@ def register_lakeflow_source(spark):
                 return _SLOT_CLASS_SNAPSHOT_DAEMON
             if self.options.get(_DAEMON_SLOT_MARKER_OPTION) == "true":
                 return _SLOT_CLASS_CDC_DAEMON
-            if self.options.get(_SNAPSHOT_DRAIN_MARKER_OPTION) == "true":
-                return _SLOT_CLASS_SNAPSHOT_CONSUMER
             return _SLOT_CLASS_CONSUMER
 
         def _acquire_connection_slot(self, budget_seconds: float | None = None) -> None:
@@ -7560,17 +7511,11 @@ def register_lakeflow_source(spark):
             )
             reservation = self._upsert_connection_reservation(slot_count)
             floor = reservation if self._connection_channel_is_delete() else 0
-            # Model A: a snapshot-phase read holds its slot for the whole drain, so push it
-            # above the snapshot reservation, leaving those low slots reachable by the
-            # streaming/CDC readers. Only when the daemon pool (Model C) is off -- in shared
-            # mode the daemon bounds concurrency instead and this marker is never set.
-            if self.options.get(_SNAPSHOT_DRAIN_MARKER_OPTION) == "true":
-                floor = max(floor, self._snapshot_connection_reservation(slot_count))
             # The sharded CDC daemon draws from the same pool but, unlike a consumer read,
             # never releases per microbatch: a busy CDC shard re-reads in a tight loop. With
-            # its default thread count equal to the pool size and two channels, it can pin
-            # every slot and starve a fresh consumer bootstrap read (which then times out and
-            # fails the query). Floor it above the daemon reservation so those low slots stay
+            # ``cdc.shared.reader.threads`` threads on each of two channels, it can pin every
+            # slot and starve a fresh consumer bootstrap read (which then times out and fails
+            # the query). Floor it above the daemon reservation so those low slots stay
             # reachable by consumer reads.
             is_cdc_daemon = self.options.get(_DAEMON_SLOT_MARKER_OPTION) == "true"
             if is_cdc_daemon:
@@ -12158,7 +12103,6 @@ def register_lakeflow_source(spark):
     # which its subscribers cover again from their own checkpoints, as after a restart.
     _SHARED_CDC_SESSION_HOST = "host"
     _SHARED_CDC_SESSION_PROCESS = "process"
-    _SHARED_CDC_SESSION_OFF = "off"
     # How long a follower waits to connect to the leader, or for it to answer one poll,
     # before reading directly.
     _HOST_SHARD_REPLY_SECONDS = 60.0
@@ -12168,24 +12112,22 @@ def register_lakeflow_source(spark):
 
 
     def _shared_cdc_mode(options: dict[str, str]) -> str:
-        # Docstring: ``cdc.shared.session`` as host (the default), process, or off.
+        # Docstring: ``cdc.shared.session`` as host (the default) or process.
         #
-        # ``true`` keeps its old meaning, one shard registry per process; ``host`` shares the
-        # shards between the flow processes on one host.
+        # ``host`` shares the shards between the flow processes on one host; ``process``
+        # keeps one shard registry per process.
 
-        value = options.get(_SHARED_CDC_SESSION_OPTION)
-        if value is None:
-            return _SHARED_CDC_SESSION_HOST
-        normalized = value.strip().lower()
-        if normalized == _SHARED_CDC_SESSION_HOST:
-            return _SHARED_CDC_SESSION_HOST
-        if normalized in {"1", "true", "yes", _SHARED_CDC_SESSION_PROCESS}:
-            return _SHARED_CDC_SESSION_PROCESS
-        if normalized in {"0", "false", "no"}:
-            return _SHARED_CDC_SESSION_OFF
-        raise ValueError(
-            f"Option '{_SHARED_CDC_SESSION_OPTION}' must be one of: host, true (or process), false"
-        )
+        value = options.get(_SHARED_CDC_SESSION_OPTION, _SHARED_CDC_SESSION_HOST).strip().lower()
+        if value in (_SHARED_CDC_SESSION_HOST, _SHARED_CDC_SESSION_PROCESS):
+            return value
+        # The values sharing used to accept say what to set instead.
+        if value in {"0", "false", "no"}:
+            hint = "can no longer be turned off; remove it (host, the default) or set 'process'"
+        elif value in {"1", "true", "yes"}:
+            hint = f"no longer accepts '{value}'; set 'process', which it meant, or remove it (host)"
+        else:
+            hint = "must be 'host' or 'process'"
+        raise ValueError(f"Option '{_SHARED_CDC_SESSION_OPTION}' {hint}")
 
 
     class _HostShardEndpoints:
@@ -13033,8 +12975,8 @@ def register_lakeflow_source(spark):
         # Docstring: Daemon loop: pull one drain job, run the inline snapshot drain under a private
         # reader (staging pages and publishing the manifest durably), then close the reader to
         # release its slot. A failure is recorded on the job so the waiting consumer re-raises
-        # and its next microbatch re-subscribes -- the same recover-by-restart the inline drain
-        # already relies on.
+        # and its next microbatch re-subscribes, recovering by restart: with no manifest, the
+        # table drains again.
 
         logger = logging.getLogger(__name__)
         while True:
@@ -13056,8 +12998,8 @@ def register_lakeflow_source(spark):
                     # Each staged page resets the consumer's liveness watchdog, so a big table
                     # that keeps making progress never trips it while a wedged drain does.
                     reader._drain_progress = lambda: pool.report_progress(job_key)
-                    # shared mode is off on the copy, so this drains inline and returns the
-                    # staged page-0 result; the daemon ignores the rows -- it only needs the
+                    # The reader is marked as a drain worker, so this drains inline and returns
+                    # the staged page-0 result; the daemon ignores the rows -- it only needs the
                     # durable manifest the drain publishes as a side effect.
                     reader._read_snapshot(
                         job["table"],
@@ -13241,7 +13183,7 @@ def register_lakeflow_source(spark):
             # Startup jitter is a float (fractional seconds), validated here rather than in the
             # integer loop above; 0 disables it.
             _validate_nonneg_float_option(options, _CONNECTION_STARTUP_JITTER_OPTION)
-            # Shared-reader thread count defaults to the connection budget, so it is
+            # Shared-reader thread count defaults to a quarter of the connection budget, so it is
             # validated here rather than in the static-default loop above.
             if _SHARED_CDC_THREADS_OPTION in options and int(options[_SHARED_CDC_THREADS_OPTION]) < 1:
                 raise ValueError(f"Option '{_SHARED_CDC_THREADS_OPTION}' must be >= 1")
@@ -13253,8 +13195,12 @@ def register_lakeflow_source(spark):
             # Validate boolean capacity options eagerly (they are otherwise only
             # checked on first read, deep inside a running flow).
             _option_bool(options, "snapshot.incremental.blocking", True)
-            shared_cdc_enabled = _shared_cdc_mode(options) != _SHARED_CDC_SESSION_OFF
-            _option_bool(options, _SNAPSHOT_SHARED_SESSION_OPTION, True)
+            _shared_cdc_mode(options)
+            if not _option_bool(options, _SNAPSHOT_SHARED_SESSION_OPTION, True):
+                raise ValueError(
+                    f"Option '{_SNAPSHOT_SHARED_SESSION_OPTION}' can no longer be turned off; "
+                    "remove it (snapshots always drain in the drain pool)"
+                )
             _option_bool(options, _CONNECTION_FAIR_QUEUE_OPTION, True)
             _option_bool(options, _SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION, True)
             _option_bool(options, _DAEMON_SLOT_LIVENESS_OPTION, True)
@@ -13276,30 +13222,7 @@ def register_lakeflow_source(spark):
                 )
             _option_bool(options, _PROMOTE_UNIQUE_INDEX_OPTION, True)
             _option_bool(options, _SNAPSHOT_STAGING_PIPELINE_OPTION, True)
-            partitioned_enabled = _option_bool(options, _PARTITIONED_STREAM_OPTION, True)
-            # Fail closed on the unsafe partitioned-mode combination. Partitioned
-            # streaming routes every non-page-serve (CDC / incremental / append /
-            # delete) microbatch through a single embedded partition whose rows are
-            # recomputed from the committed start offset if Spark replays an
-            # uncommitted batch. That recompute is only deterministic when the shared
-            # CDC session is on -- its peek-don't-pop reads return the same rows for a
-            # committed start -- whereas a live per-table CDC session re-read is not,
-            # and can duplicate or drop CDC rows on replay. stream.partitioned is on by
-            # default, so any config that turns the shared session off MUST also set
-            # stream.partitioned=false; otherwise construction fails fast here rather
-            # than corrupt data silently. There is no silent fallback.
-            if partitioned_enabled and not shared_cdc_enabled:
-                raise ValueError(
-                    f"Option '{_PARTITIONED_STREAM_OPTION}=true' (the default) requires a shared "
-                    f"CDC session ('{_SHARED_CDC_SESSION_OPTION}=host', the default, or 'true'). "
-                    "Partitioned streaming recomputes "
-                    "an embedded CDC microbatch from its committed start offset when Spark "
-                    "replays an uncommitted batch, which is only deterministic with the "
-                    "shared CDC session's idempotent reads; with the shared session off, a "
-                    "live per-table re-read can duplicate or drop CDC rows on replay. "
-                    f"Set '{_SHARED_CDC_SESSION_OPTION}' to 'host' or 'true', or set "
-                    f"'{_PARTITIONED_STREAM_OPTION}=false'."
-                )
+            _option_bool(options, _PARTITIONED_STREAM_OPTION, True)
             staging_transport = (
                 str(
                     options.get(_SNAPSHOT_STAGING_TRANSPORT_OPTION, _DEFAULT_SNAPSHOT_STAGING_TRANSPORT)
@@ -13353,18 +13276,13 @@ def register_lakeflow_source(spark):
                     "Option 'upsert.connection.reservation' must be >= 0 and < "
                     f"max.concurrent.connections ({slot_count})"
                 )
-            snapshot_reservation = int(
-                options.get(
+            # It did nothing under the default drain pool either, so a spec that still
+            # carries it keeps working.
+            if _SNAPSHOT_RESERVATION_OPTION in options:
+                logging.getLogger(__name__).warning(
+                    "Option '%s' is no longer used (snapshots always drain in the drain pool); "
+                    "remove it from the pipeline spec",
                     _SNAPSHOT_RESERVATION_OPTION,
-                    str(_DEFAULT_SNAPSHOT_CONNECTION_RESERVATION),
-                )
-            )
-            # Reject rather than clamp: at slot_count a snapshot drain could never claim a
-            # slot, deadlocking the drain instead of merely deferring it behind streams.
-            if not 0 <= snapshot_reservation < slot_count:
-                raise ValueError(
-                    f"Option '{_SNAPSHOT_RESERVATION_OPTION}' must be >= 0 and < "
-                    f"max.concurrent.connections ({slot_count})"
                 )
             daemon_reservation = int(
                 options.get(
@@ -13794,27 +13712,12 @@ def register_lakeflow_source(spark):
             )
             replaying = self._replay_stop_lsn(table_options) is not None
             replay_wait_budget = self._replay_connection_wait_budget(table_options)
-            # Model A only, and only for the monolithic full-table drain -- the `initial` /
-            # `initial_only` read that holds one connection for the whole scan. That is the
-            # sole reader that can starve streaming readers, so only it takes the reservation
-            # floor. Everything else releases its slot after each microbatch: a keyed table's
-            # default `incremental` / `auto_snapshot` snapshot reads a bounded chunk per
-            # microbatch and frees the slot between them, and stream/CDC reads are one bounded
-            # poll each -- none of them hold long enough to starve anyone, so they may freely
-            # borrow the reserved slots (floor 0). In shared mode (Model C) the daemon bounds
-            # drain concurrency instead, so no read takes this floor.
-            reserve_snapshot_slot = (
-                not self._snapshot_shared_enabled()
-                and snapshot_mode in ("initial", "initial_only")
-                and effective_start.get("phase") != "stream"
-            )
             with contextlib.ExitStack() as stack:
                 stack.enter_context(
                     self._capacity_attempt(
                         start_offset,
                         replaying=replaying,
                         replay_wait_budget=replay_wait_budget,
-                        reserve_snapshot_slot=reserve_snapshot_slot,
                     )
                 )
                 return self._read_table_attempt(
@@ -14081,8 +13984,7 @@ def register_lakeflow_source(spark):
 
             if not self._partitioned_stream_enabled():
                 return False
-            # A partitioned-on + shared-CDC-off config cannot be constructed (__init__
-            # fails fast on it), so no shared-session check is needed here.
+            # Shared CDC is always on, so no shared-session check is needed here.
             try:
                 table = self._table(table_name, self.options)
                 return bool(_cdc_capable(table) or self._append_only_table(table, self.options))
@@ -14985,7 +14887,6 @@ def register_lakeflow_source(spark):
             *,
             replaying: bool = False,
             replay_wait_budget: float | None = None,
-            reserve_snapshot_slot: bool = False,
         ):
             # Docstring: Publish this read's acquisition budget and rank, then restore both.
             #
@@ -15011,15 +14912,10 @@ def register_lakeflow_source(spark):
             )
             previous = self.options.get(_CONNECTION_ATTEMPT_BUDGET_OPTION)
             previous_rank = self.options.get(_CONNECTION_ATTEMPT_RANK_OPTION)
-            previous_drain = self.options.get(_SNAPSHOT_DRAIN_MARKER_OPTION)
             if budget is not None:
                 self.options[_CONNECTION_ATTEMPT_BUDGET_OPTION] = repr(budget)
             if rank > 0:
                 self.options[_CONNECTION_ATTEMPT_RANK_OPTION] = str(rank)
-            # Marks the lazy slot acquisition as a snapshot-phase read so it applies the
-            # Model A reservation floor. Set only when the daemon pool is off (see caller).
-            if reserve_snapshot_slot:
-                self.options[_SNAPSHOT_DRAIN_MARKER_OPTION] = "true"
             try:
                 yield
             finally:
@@ -15031,10 +14927,6 @@ def register_lakeflow_source(spark):
                     self.options.pop(_CONNECTION_ATTEMPT_RANK_OPTION, None)
                 else:
                     self.options[_CONNECTION_ATTEMPT_RANK_OPTION] = previous_rank
-                if previous_drain is None:
-                    self.options.pop(_SNAPSHOT_DRAIN_MARKER_OPTION, None)
-                else:
-                    self.options[_SNAPSHOT_DRAIN_MARKER_OPTION] = previous_drain
 
         def _capacity_retry_offset(self, start_offset: dict) -> dict:
             # Docstring: Yield an empty continuous batch when no connection slot is free.
@@ -17518,12 +17410,12 @@ def register_lakeflow_source(spark):
                             pipeline_scope,
                         )
                     return self._staged_snapshot_result(table, pipeline_scope, schema_id, manifest, 0)
-                if self._snapshot_shared_enabled():
-                    # Model C: hand the long drain to the bounded daemon pool. Free this
-                    # reader's connection slot first so the wait holds none, then serve the
-                    # pages the daemon stages -- exactly as a resumed snapshot does. At most
-                    # ``snapshot.reader.threads`` drains run at once, so streaming readers
-                    # keep the remaining slots. ``_initial_lsn`` above already established
+                if not self._is_snapshot_drain_worker():
+                    # Hand the long drain to the bounded daemon pool. Free this reader's
+                    # connection slot first so the wait holds none, then serve the pages the
+                    # daemon stages -- exactly as a resumed snapshot does. At most
+                    # ``snapshot.reader.threads`` drains run at once in a process, so streaming
+                    # readers keep the remaining slots. ``_initial_lsn`` above already established
                     # the durable boundary; the daemon reads it rather than redoing it.
                     self._release_worker_connection()
                     manifest = self._drain_via_snapshot_daemon(
@@ -17543,8 +17435,7 @@ def register_lakeflow_source(spark):
                             pipeline_scope,
                         )
                     return self._staged_snapshot_result(table, pipeline_scope, schema_id, manifest, 0)
-                # Model A: drain inline below. The reservation floor applied at slot
-                # acquisition keeps low slots reachable by streaming readers throughout.
+                # A drain worker drains inline below, on the slot floor of its band.
                 max_rows = self._table_int_option(options, "snapshot.max.rows", 0, minimum=0)
                 expected_columns = {column.name for column in table.columns}
                 page_count = 0
@@ -17603,7 +17494,7 @@ def register_lakeflow_source(spark):
                     row_count += len(page_rows)
                     # A staged page is forward progress: reset the drain pool's liveness
                     # watchdog so a large-but-progressing drain is never mistaken for a stall.
-                    # No-op on a non-daemon (inline Model A) drain, which sets no callback.
+                    # No-op when no pool set the callback.
                     if self._drain_progress is not None:
                         self._drain_progress()
 
@@ -18954,9 +18845,6 @@ def register_lakeflow_source(spark):
                     time.sleep(delay)
                     attempt += 1
 
-        def _shared_cdc_enabled(self) -> bool:
-            return _shared_cdc_mode(self.options) != _SHARED_CDC_SESSION_OFF
-
         def _snapshot_cursor_scan(self, options: dict[str, str]) -> bool:
             # Docstring: Whether ``snapshot.scan=cursor`` asks for an unordered one-pass snapshot.
             #
@@ -18990,26 +18878,27 @@ def register_lakeflow_source(spark):
                     f"{sorted(_SNAPSHOT_ISOLATION_SQL)}; got {token!r}"
                 ) from None
 
-        def _snapshot_shared_enabled(self) -> bool:
-            return _option_bool(self.options, _SNAPSHOT_SHARED_SESSION_OPTION, True)
+        def _is_snapshot_drain_worker(self) -> bool:
+            # Docstring: Whether this reader is a drain-pool worker, which drains its table inline.
+
+            return self.options.get(_SNAPSHOT_DAEMON_SLOT_MARKER_OPTION) == "true"
 
         def _snapshot_reader_thread_count(self) -> int:
             return _resolve_snapshot_reader_threads(self.options)
 
         def _snapshot_drain_reader_factory(self) -> Callable[[], "InformixLakeflowConnect"]:
-            # The daemon worker gets its OWN options copy with shared mode cleared, so its
-            # ``_read_snapshot`` drains inline (Model A path) rather than recursing back into
-            # the pool. Capacity accounting is left intact -- the drain must count against the
-            # same connection budget so ``snapshot.reader.threads`` bounds the slots it holds.
+            # The daemon worker gets its OWN options copy. Capacity accounting is left intact --
+            # the drain must count against the same connection budget so
+            # ``snapshot.reader.threads`` bounds the slots it holds.
             reader_options = dict(self.options)
-            reader_options[_SNAPSHOT_SHARED_SESSION_OPTION] = "false"
-            # The inline drain reader is never partitioned (it drains via _read_snapshot);
-            # pin it off so it stays valid even if this connector runs shared CDC off.
-            reader_options[_PARTITIONED_STREAM_OPTION] = "false"
+            # Already warned about on the consumer; a daemon reader's copy must not repeat it.
+            reader_options.pop(_SNAPSHOT_RESERVATION_OPTION, None)
             # The drain runs on a daemon thread and holds its slot for the whole scan, but it
             # is bootstrap work that must finish to unblock its consumer. Floor it one band
             # below the CDC daemon (not at the CDC floor), so a saturated CDC daemon cannot
-            # starve it -- it always has slots the CDC daemon is locked out of.
+            # starve it -- it always has slots the CDC daemon is locked out of. The marker also
+            # makes the worker's ``_read_snapshot`` drain inline rather than recurse into the
+            # pool (see _is_snapshot_drain_worker).
             reader_options[_SNAPSHOT_DAEMON_SLOT_MARKER_OPTION] = "true"
             # The worker waits for its slot using its own ``connection.wait.timeout.seconds`` as
             # a *per-turnover* window, not a hard cap: it resets every time the pool claims a slot
@@ -19101,14 +18990,13 @@ def register_lakeflow_source(spark):
 
         def _shared_cdc_reader_factory(self, channel: str) -> Callable[[], "InformixLakeflowConnect"]:
             # The daemon reader gets its OWN options copy: the connector mutates options
-            # mid-read (channel, capacity hints), so a shared dict would race. Shared mode
-            # is cleared on the copy so the reader never recurses into this path.
+            # mid-read (channel, capacity hints), so a shared dict would race. It reads
+            # through its bridge and _read_changes_with_reconnect, never _read_stream, so it
+            # can't recurse into the shards.
             reader_options = dict(self.options)
+            # Already warned about on the consumer; a daemon reader's copy must not repeat it.
+            reader_options.pop(_SNAPSHOT_RESERVATION_OPTION, None)
             reader_options[_CONNECTION_CHANNEL_OPTION] = channel
-            reader_options[_SHARED_CDC_SESSION_OPTION] = "false"
-            # This inline daemon reader must not itself be partitioned; clearing the shared
-            # session above would otherwise trip the partitioned+shared-off construction guard.
-            reader_options[_PARTITIONED_STREAM_OPTION] = "false"
             # The shard reads on a daemon thread, so floor its slot above the daemon
             # reservation to leave headroom for consumer bootstrap reads.
             reader_options[_DAEMON_SLOT_MARKER_OPTION] = "true"
@@ -19173,15 +19061,11 @@ def register_lakeflow_source(spark):
         def _read_stream(self, table: Table, start: dict, options: dict[str, str], deletes: bool):
             checkpoint = _validated_offset(start)
             pipeline_scope = self._pipeline_scope()
-            # In shared-session mode a daemon reader owns this shard's Informix I/O: it
-            # supplies the schema, log bounds, and change records, so a steady-state poll
-            # touches Informix for nothing. A None view (daemon not ready yet, or a schema
-            # transition in flight) transparently falls back to the direct-read path below.
-            shared_view = None
-            if self._shared_cdc_enabled():
-                shared_view = self._shared_cdc_snapshot(
-                    table, checkpoint, options, deletes, pipeline_scope
-                )
+            # A daemon reader owns this shard's Informix I/O: it supplies the schema, log
+            # bounds, and change records, so a steady-state poll touches Informix for
+            # nothing. A None view (daemon not ready yet, or a schema transition in flight)
+            # transparently falls back to the direct-read path below.
+            shared_view = self._shared_cdc_snapshot(table, checkpoint, options, deletes, pipeline_scope)
             if shared_view is not None:
                 table = shared_view.table
             else:

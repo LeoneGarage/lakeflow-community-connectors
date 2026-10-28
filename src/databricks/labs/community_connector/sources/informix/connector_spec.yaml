@@ -216,25 +216,22 @@ connection:
       type: string
       required: false
       description: >
-        Selects one of two drain strategies for an `initial`-mode snapshot, both of
-        which stop the full-table drain from starving streaming readers while it holds a
-        connection slot for the whole scan. Default true
-        (the off-thread drain): the drain moves off the microbatch thread onto a bounded pool of
-        `snapshot.reader.threads` daemon workers; the consumer waits, holding no
-        slot, for the daemon to stage the table and publish its manifest, then serves
-        the staged pages. At most `snapshot.reader.threads` drains hold a slot at
-        once, so keep that count below max.concurrent.connections to leave a floor for
-        streaming readers. Set false (the inline drain): the drain runs on the
-        microbatch thread but acquires its slot above `snapshot.connection.reservation`,
-        so those low slots stay reachable by the streaming/CDC readers.
+        Always on: an `initial`-mode snapshot's full-table drain runs on a bounded pool of
+        `snapshot.reader.threads` daemon workers, off the microbatch thread, so it can't
+        starve streaming readers while it holds a connection slot for the whole scan. The
+        consumer waits, holding no slot, for a worker to stage the table and publish its
+        manifest, then serves the staged pages. Each worker claims its slot one band below
+        the CDC daemon's floor, so the lowest slots stay with consumer reads. The pool
+        belongs to one Python process, and serverless SDP runs each flow in its own, so its
+        bound applies per flow. Accepts true; false, which drained on the microbatch
+        thread, is rejected with a message saying to remove it.
 
     - name: snapshot.reader.threads
       type: string
       required: false
       description: >
-        Off-thread drain only (`snapshot.shared.session=true`): the number of daemon workers
-        that drain `initial` snapshots concurrently, which is also the ceiling on
-        connection slots snapshots can hold at once. Minimum 1. Default one below the
+        The number of daemon workers that drain `initial` snapshots concurrently, which
+        is also the ceiling on connection slots one process's snapshots can hold at once. Minimum 1. Default one below the
         CDC-daemon reservation -- max(1, daemon.connection.reservation - 1), where the
         reservation is itself about a third of the pool. Keeping it strictly below the
         reservation guarantees the snapshot-drain floor (daemon.connection.reservation -
@@ -253,22 +250,9 @@ connection:
       type: string
       required: false
       description: >
-        Inline drain only (`snapshot.shared.session=false`): connection slots that the
-        monolithic full-table drain (`snapshot.mode` `initial` or `initial_only`, which
-        holds one connection for the whole scan) may not claim, guaranteeing them to the
-        streaming/CDC readers so a long drain cannot starve them. Only that drain is held
-        off these slots -- keyed tables' default `incremental`/`auto_snapshot` snapshots
-        and stream/CDC reads release their slot after each microbatch, so they never
-        starve anyone and borrow the reserved slots freely. Range 0 through
-        max.concurrent.connections - 1. Default 0, which for the inline drain is interpreted as
-        one third of the pool -- floor(max.concurrent.connections / 3), rounded up to at
-        least 1 whenever the pool has 2 or more slots (0 only for a single-slot pool,
-        which cannot spare one) -- so a long inline drain leaves streaming readers about
-        two-thirds of capacity without any tuning. Set a positive value to override that
-        default. A floor rather than a partition -- beyond the reserved
-        slots the drain competes for all remaining capacity -- so it bounds the
-        starvation without slowing the drain. Independent of `snapshot.reader.threads`,
-        which governs the off-thread drain.
+        No longer used: it reserved slots from the drain on the microbatch thread
+        (snapshot.shared.session=false), which is gone. Setting it logs a warning and is
+        ignored.
 
     - name: daemon.connection.reservation
       type: string
@@ -279,8 +263,9 @@ connection:
         bootstrap/snapshot/incremental reads. Unlike a consumer read, a daemon never
         releases its slot per microbatch -- a busy CDC shard re-reads in a tight loop
         and a drain holds its slot for the whole scan -- so without this the daemons can
-        pin every slot (the CDC daemon's thread count defaults to the pool size and it
-        shards two channels) and a fresh bootstrap read times out and fails the query.
+        pin every slot (each of the CDC daemon's two channels runs
+        cdc.shared.reader.threads threads, a quarter of the pool by default) and a fresh
+        bootstrap read times out and fails the query.
         Range 0 through max.concurrent.connections - 1. Default 0, interpreted as one
         third of the pool -- floor(max.concurrent.connections / 3), rounded up to at
         least 1 whenever the pool has 2 or more slots (0 only for a single-slot pool,
@@ -1026,8 +1011,8 @@ connection:
       required: false
       description: >
         Maximum seconds a reader waits for per-table initialization state.
-        Default `300`; minimum `1`. In shared-session mode this also bounds how long
-        a shard retains a subscriber after its last poll before dropping it. In a
+        Default `300`; minimum `1`. It also bounds how long a shard retains a
+        subscriber after its last poll before dropping it. In a
         triggered update it also bounds how long a delete reader waits for its upsert
         reader's schema transition before failing.
 
@@ -1035,26 +1020,25 @@ connection:
       type: string
       required: false
       description: >
-        Sharded daemon-reader CDC: `host` (the default), `true` (or `process`), or
-        `false` to opt out (each CDC-capable table then runs its own Informix CDC session
-        per poll). Serverless SDP runs each streaming flow's reader in its own process, so
-        `true` keeps shards per process; `host` shares them between the flow processes on
-        one host through a leader process elected by a lock file and reached over a Unix
-        socket, which another process takes over when the leader exits. When on, tables
-        are partitioned
+        Sharded daemon-reader CDC, always on: `host` (the default) or `process`.
+        Serverless SDP runs each streaming flow's reader in its own process, so `process`
+        keeps shards per process; `host` shares them between the flow processes on one host
+        through a leader process elected by a lock file and reached over a Unix socket,
+        which another process takes over when the leader exits. Tables are partitioned
         into K shards; a bounded pool of K driver-resident daemon threads each hold a
         single shared CDC session multiplexing their shard's tables and fan the changes
         out in memory, so concurrent CDC sessions drop from ~N to K and reads run in
-        parallel across the K threads. Accepts `host`, `true`/`process` (or `1`/`yes`),
-        or `false` (or `0`/`no`).
+        parallel across the K threads. Accepts `host` or `process`; the earlier values
+        `true` (now `process`) and `false` (sharing can no longer be turned off) are
+        rejected with a message saying what to set.
         Note: each shard's log-retention floor tracks that shard's slowest table.
 
     - name: cdc.shared.reader.threads
       type: string
       required: false
       description: >
-        Number of shards / daemon reader threads (K) per channel when
-        a shared session (`cdc.shared.session` `host` or `true`). Default = `max(1, max.concurrent.connections // 4)`;
+        Number of shards / daemon reader threads (K) per channel.
+        Default = `max(1, max.concurrent.connections // 4)`;
         minimum `1`. The upsert and delete channels shard independently, so K threads mean
         up to 2K daemon connection slots; the default keeps that near half the pool, leaving
         room for consumer bootstrap and the snapshot drain (the previous default of
@@ -1066,8 +1050,8 @@ connection:
       type: string
       required: false
       description: >
-        Per-table cap on buffered-but-unconsumed transactions in a shard
-        (`cdc.shared.session` `host` or `true`). When a shard's slowest buffer reaches it, that
+        Per-table cap on buffered-but-unconsumed transactions in a shard. When a shard's
+        slowest buffer reaches it, that
         shard's daemon defers new reads (throttle to the slowest reader) until the
         backlog drains, bounding driver memory. Default `200000`; minimum `1`.
 

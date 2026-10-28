@@ -546,6 +546,32 @@ class _OfflineLakebase:
         lakebase_state.seed_slots(self._connect(), namespace, slot_count)
 
 
+def _no_shared_cdc_view(*_args, **_kwargs):
+    """Stand-in for _shared_cdc_snapshot: the shard has no view, so the poll reads directly."""
+    return None
+
+
+def _read_cdc_directly(connector):
+    """Keep a connector's CDC polls off the shared shards, whose daemon would build its own
+    bridge: each poll reads directly through the injected one, as a poll does while its
+    shard has no view yet."""
+    connector._shared_cdc_snapshot = _no_shared_cdc_view
+    return connector
+
+
+def _snapshot_drain_worker_stand_in():
+    """Stand-in for _is_snapshot_drain_worker: this connector drains its own snapshots."""
+    return True
+
+
+def _drain_snapshots_inline(connector):
+    """Drain a connector's snapshots on the connector itself, through its injected bridge,
+    as a drain-pool worker does, instead of handing them to a pool worker that would build
+    its own bridge."""
+    connector._is_snapshot_drain_worker = _snapshot_drain_worker_stand_in
+    return connector
+
+
 class LakeflowContractTests(unittest.TestCase):
     def setUp(self):
         self._shared_state = tempfile.TemporaryDirectory()
@@ -554,7 +580,7 @@ class LakeflowContractTests(unittest.TestCase):
     def tearDown(self):
         self._shared_state.cleanup()
 
-    def connector(self, bridge=None, **options):
+    def connector(self, bridge=None, *, shared_cdc=False, **options):
         scope_label = str(options.pop("registration_scope", "test-pipeline"))
         connector = InformixLakeflowConnect(
             {
@@ -567,23 +593,21 @@ class LakeflowContractTests(unittest.TestCase):
                 # strategy. Incremental is the production default; tests that
                 # exercise it override snapshot.mode explicitly.
                 "snapshot.mode": "initial",
-                # Sharded CDC and the shared snapshot-drain pool are the production
-                # defaults, but these per-table contract tests inject a bridge directly,
-                # so pin both off: they exercise the direct/inline read path and must not
-                # spawn a background daemon (which builds its own bridge and would attempt
-                # a real connection). Shared-mode tests opt in explicitly.
-                "cdc.shared.session": "false",
-                "snapshot.shared.session": "false",
-                # Partitioned streaming (on by default) requires the shared CDC session,
-                # so a shared-off config must pin it off too or construction fails fast.
-                # Partitioned-reader tests opt in explicitly (shared on + partitioned on).
+                # Sharded CDC and the snapshot-drain pool are always on, but these
+                # per-table contract tests inject a bridge directly and must not spawn a
+                # background daemon (which builds its own bridge and would attempt a real
+                # connection): snapshots drain on this connector (see
+                # _drain_snapshots_inline) and CDC polls read directly (see
+                # _read_cdc_directly). Shared-CDC tests opt in explicitly.
+                # Partitioned-reader tests opt in explicitly.
                 "stream.partitioned": "false",
                 **options,
             }
         )
         connector.set_registration_scope(hashlib.sha256(scope_label.encode()).hexdigest()[:32])
         connector._bridge_instance = bridge or FakeBridge()
-        return connector
+        _drain_snapshots_inline(connector)
+        return connector if shared_cdc else _read_cdc_directly(connector)
 
     def test_close_releases_bridge_connection_and_capacity_slot(self):
         bridge = FakeBridge()
@@ -1094,8 +1118,6 @@ class LakeflowContractTests(unittest.TestCase):
                     "database": "demo",
                     "snapshot.staging.location": staging,
                     "lakebase.password": "test-state-password",
-                    "cdc.shared.session": "false",
-                    "snapshot.shared.session": "false",
                     "stream.partitioned": "false",
                 }
             )
@@ -5015,12 +5037,11 @@ class LakeflowContractTests(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def _partitioned_connector(self, bridge=None, **options):
-        """A connector configured for the partitioned reader: both stream.partitioned
-        and cdc.shared.session on (the base connector pins both off). The unsafe
-        partitioned + shared-off combination fails construction, so partitioned-reader
-        tests must enable the shared session too."""
-        opts = {"stream.partitioned": "true", "cdc.shared.session": "true", **options}
-        return self.connector(bridge, **opts)
+        """A connector configured for the partitioned reader, with its CDC polls going
+        through process-local shards, which leave no files behind (the base connector
+        reads directly)."""
+        opts = {"stream.partitioned": "true", "cdc.shared.session": "process", **options}
+        return self.connector(bridge, shared_cdc=True, **opts)
 
     def _drive_partitioned_snapshot(self, connector, table_name="app.orders", options=None):
         """Drive the partitioned reader through the snapshot, mirroring Spark's cycle.
@@ -5047,11 +5068,11 @@ class LakeflowContractTests(unittest.TestCase):
         return served, offsets
 
     def test_partitioned_reader_is_gated_by_the_option(self):
-        # On for a keyed (CDC-capable) table when partitioned + shared CDC are both on;
-        # off suppresses it so the framework falls back to simpleStreamReader.
+        # On for a keyed (CDC-capable) table when stream.partitioned is on; off
+        # suppresses it so the framework falls back to simpleStreamReader.
         on = self._partitioned_connector()
         self.assertTrue(on.is_partitioned("app.orders"))
-        off = self.connector(**{"stream.partitioned": "false", "cdc.shared.session": "true"})
+        off = self.connector(**{"stream.partitioned": "false"})
         self.assertFalse(off.is_partitioned("app.orders"))
 
     def test_partitioned_pages_per_batch_must_be_positive(self):
@@ -5344,38 +5365,6 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(served, [row])
         self.assertIsInstance(served[0]["amount"], Decimal)
         self.assertEqual(served[0]["blob"], b"\x00\xffdata")
-
-    def test_partitioned_requires_shared_cdc_session(self):
-        # F2/F4: partitioned mode recomputes an embedded CDC microbatch from its committed
-        # start on a Spark replay, which is only deterministic with the shared CDC session
-        # on. stream.partitioned is on by DEFAULT, so any shared-off config -- whether
-        # partitioned is set explicitly or left defaulted -- fails fast at construction
-        # (no silent fallback). Construct directly to bypass the base helper, which pins
-        # both options off.
-        base = {
-            "database": "demo",
-            "snapshot.staging.location": self._shared_state.name,
-            "lakebase.password": "test-state-password",
-        }
-        # Explicit partitioned=true + shared off -> raises with an explanatory message.
-        with self.assertRaises(ValueError) as ctx:
-            InformixLakeflowConnect(
-                {**base, "stream.partitioned": "true", "cdc.shared.session": "false"}
-            )
-        message = str(ctx.exception)
-        self.assertIn("stream.partitioned", message)
-        self.assertIn("cdc.shared.session", message)
-        # DEFAULTED partitioned (on) + explicit shared off -> ALSO raises (always-throw).
-        with self.assertRaises(ValueError):
-            InformixLakeflowConnect({**base, "cdc.shared.session": "false"})
-        # Safe combinations construct fine.
-        InformixLakeflowConnect(
-            {**base, "stream.partitioned": "false", "cdc.shared.session": "false"}
-        )
-        InformixLakeflowConnect(
-            {**base, "stream.partitioned": "true", "cdc.shared.session": "true"}
-        )
-        InformixLakeflowConnect(base)  # both default on -> valid
 
     def test_partitioned_malformed_snapshot_offset_falls_back_to_embedded(self):
         # A malformed snapshot-phase offset (here: missing the required `version`, so
@@ -10817,17 +10806,15 @@ class IncrementalSnapshotTests(unittest.TestCase):
                 "database": "demo",
                 "snapshot.staging.location": self._shared_state.name,
                 "lakebase.password": "test-state-password",
-                # Pin the direct/inline path (see LakeflowContractTests.connector): these
-                # tests inject a bridge directly and must not start a daemon reader.
-                "cdc.shared.session": "false",
-                "snapshot.shared.session": "false",
+                # Read directly and drain inline (see LakeflowContractTests.connector):
+                # these tests inject a bridge directly and must not start a daemon reader.
                 "stream.partitioned": "false",
                 **options,
             }
         )
         connector.set_registration_scope(hashlib.sha256(scope_label.encode()).hexdigest()[:32])
         connector._bridge_instance = bridge or FakeBridge()
-        return connector
+        return _drain_snapshots_inline(_read_cdc_directly(connector))
 
     def _drain(self, connector, options, start=None):
         """Read microbatches until the incremental block clears; return all rows."""
@@ -11777,15 +11764,13 @@ class SnapshotReconnectTests(unittest.TestCase):
                 "snapshot.staging.location": self._shared_state.name,
                 "lakebase.password": "test-state-password",
                 # Inject the bridge directly; keep the daemon readers off.
-                "cdc.shared.session": "false",
-                "snapshot.shared.session": "false",
                 "stream.partitioned": "false",
                 **options,
             }
         )
         connector.set_registration_scope(hashlib.sha256(b"reconnect-pipeline").hexdigest()[:32])
         connector._bridge_instance = bridge or FakeBridge()
-        return connector
+        return _drain_snapshots_inline(_read_cdc_directly(connector))
 
     def _drain(self, connector, options):
         """Read microbatches until the incremental block clears; return all rows."""
@@ -11926,13 +11911,11 @@ class LakebaseStateReconnectTests(unittest.TestCase):
                 "database": "demo",
                 "snapshot.staging.location": self._shared_state.name,
                 "lakebase.password": "test-state-password",
-                "cdc.shared.session": "false",
-                "snapshot.shared.session": "false",
                 "stream.partitioned": "false",
             }
         )
         connector.set_registration_scope(hashlib.sha256(b"lakebase-reconnect").hexdigest()[:32])
-        return connector
+        return _drain_snapshots_inline(_read_cdc_directly(connector))
 
     def _instrument(self, connector, *, closed_after_drop=True):
         """Wire a counting reset that mimics the real one (drops the handle)."""
@@ -12905,34 +12888,31 @@ class HostSharedCdcTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         return sent
 
-    def test_the_option_defaults_to_host_and_keeps_true_and_false(self):
+    def test_the_option_is_host_by_default_or_process(self):
         mode = informix_module._shared_cdc_mode
         self.assertEqual(mode({}), "host")
-        for value, expected in (
-            ("host", "host"),
-            (" HOST ", "host"),
-            ("true", "process"),
-            ("1", "process"),
-            ("yes", "process"),
-            ("process", "process"),
-            ("false", "off"),
-            ("0", "off"),
-            ("no", "off"),
-        ):
+        for value, expected in (("host", "host"), (" HOST ", "host"), ("process", "process"),
+                                ("Process", "process")):
             with self.subTest(value=value):
                 self.assertEqual(mode({"cdc.shared.session": value}), expected)
-        with self.assertRaisesRegex(ValueError, "host, true"):
-            mode({"cdc.shared.session": "maybe"})
+        for values, message in (
+            (("false", "0", "no"), "can no longer be turned off"),
+            (("true", "1", "yes"), "set 'process', which it meant"),
+            (("maybe",), "must be 'host' or 'process'"),
+        ):
+            for value in values:
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(ValueError, message):
+                        mode({"cdc.shared.session": value})
 
-    def test_host_counts_as_shared_for_the_partitioned_reader(self):
+    def test_shared_cdc_cannot_be_turned_off(self):
         options = {
             "database": "demo",
             "snapshot.staging.location": self._shared_state.name,
             "lakebase.password": "test-state-password",
         }
-        connector = InformixLakeflowConnect(dict(options))
-        self.assertTrue(connector._shared_cdc_enabled())
-        with self.assertRaisesRegex(ValueError, "requires a shared CDC session"):
+        InformixLakeflowConnect(dict(options))  # partitioned by default, shared by host
+        with self.assertRaisesRegex(ValueError, "can no longer be turned off"):
             InformixLakeflowConnect({**options, "cdc.shared.session": "false"})
 
     def test_a_view_crosses_processes_as_plain_data(self):
@@ -13258,23 +13238,11 @@ class SharedCdcOptionTests(unittest.TestCase):
                 "database": "demo",
                 "snapshot.staging.location": self._shared_state.name,
                 "lakebase.password": "test-state-password",
-                # Shared-off tests override cdc.shared.session; pin partitioned off so
-                # that override does not trip the partitioned + shared-off guard.
-                "stream.partitioned": "false",
                 **options,
             }
         )
         connector._bridge_instance = FakeBridge()
         return connector
-
-    def test_shared_session_defaults_on(self):
-        self.assertTrue(self._connector()._shared_cdc_enabled())
-
-    def test_shared_session_can_be_disabled(self):
-        self.assertFalse(self._connector(**{"cdc.shared.session": "false"})._shared_cdc_enabled())
-
-    def test_shared_session_enables(self):
-        self.assertTrue(self._connector(**{"cdc.shared.session": "true"})._shared_cdc_enabled())
 
     def test_thread_count_defaults_to_quarter_of_pool(self):
         # Per-channel threads default to a quarter of the pool: with both channels sharded
@@ -13364,7 +13332,7 @@ class SharedCdcConsumerSeamTests(unittest.TestCase):
                 "database": "demo",
                 "snapshot.staging.location": self._shared_state.name,
                 "lakebase.password": "test-state-password",
-                "cdc.shared.session": "true",
+                "cdc.shared.session": "process",
             }
         )
         connector.set_registration_scope(hashlib.sha256(b"shared").hexdigest()[:32])
@@ -13515,27 +13483,16 @@ class SnapshotFairnessOptionTests(unittest.TestCase):
                 "database": "demo",
                 "snapshot.staging.location": self._shared_state.name,
                 "lakebase.password": "test-state-password",
-                # Shared-off tests override cdc.shared.session; pin partitioned off so
-                # that override does not trip the partitioned + shared-off guard.
-                "stream.partitioned": "false",
                 **options,
             }
         )
         connector._bridge_instance = FakeBridge()
         return connector
 
-    def test_shared_session_defaults_on(self):
-        self.assertTrue(self._connector()._snapshot_shared_enabled())
-
-    def test_shared_session_can_disable(self):
-        self.assertFalse(
-            self._connector(**{"snapshot.shared.session": "false"})._snapshot_shared_enabled()
-        )
-
-    def test_shared_session_can_enable(self):
-        self.assertTrue(
-            self._connector(**{"snapshot.shared.session": "true"})._snapshot_shared_enabled()
-        )
+    def test_shared_session_cannot_be_turned_off(self):
+        self._connector(**{"snapshot.shared.session": "true"})  # still accepted
+        with self.assertRaisesRegex(ValueError, "can no longer be turned off; remove it"):
+            self._connector(**{"snapshot.shared.session": "false"})
 
     def test_reader_threads_default_is_one_below_the_daemon_reservation(self):
         # The default sits one below the CDC-daemon reservation so the snapshot-drain
@@ -13584,28 +13541,18 @@ class SnapshotFairnessOptionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._connector(**{"snapshot.shared.session": "maybe"})
 
-    def test_reservation_at_slot_count_rejected(self):
-        with self.assertRaises(ValueError):
-            self._connector(
-                **{"snapshot.connection.reservation": "8", "max.concurrent.connections": "8"}
-            )
+    def test_snapshot_reservation_is_ignored_with_a_warning(self):
+        with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
+            self._connector(**{"snapshot.connection.reservation": "3"})
+        self.assertIn("'snapshot.connection.reservation' is no longer used", logs.output[0])
 
-    def test_reservation_below_slot_count_accepted(self):
-        # Construction validates 0 <= reservation < slot_count; a valid value does not
-        # raise. The floor it produces is asserted in SnapshotReservationFloorTests.
-        self._connector(
-            **{"snapshot.connection.reservation": "3", "max.concurrent.connections": "8"}
-        )
+class SnapshotDrainWorkerFloorTests(unittest.TestCase):
+    """A drain-pool worker claims its slot one band below the CDC daemon's floor, so a busy
+    CDC daemon cannot starve it, and every other reader drains through the pool.
 
-
-class SnapshotReservationFloorTests(unittest.TestCase):
-    """Model A: a snapshot-phase read claims its slot above the reservation, so the low
-    slots stay reachable by the streaming/CDC readers.
-
-    The slot floor is computed in the bridge's ``_acquire_connection_slot`` (the bridge
-    shares the connector's ``options`` dict, so the drain marker the connector sets is
-    visible there), so these exercise a real bridge with ``acquire_slot`` stubbed to
-    capture the floor before any lease is taken.
+    The slot floor is computed in the bridge's ``_acquire_connection_slot``, so these
+    exercise a real bridge with ``acquire_slot`` stubbed to capture the floor before any
+    lease is taken.
     """
 
     def setUp(self):
@@ -13644,80 +13591,48 @@ class SnapshotReservationFloorTests(unittest.TestCase):
                 bridge._acquire_connection_slot()
         return seen["floor"]
 
-    def test_marker_applies_reservation_floor(self):
-        bridge = self._bridge(**{"snapshot.connection.reservation": "3"})
-        bridge.options[informix_module._SNAPSHOT_DRAIN_MARKER_OPTION] = "true"
-        self.assertEqual(self._captured_floor(bridge), 3)
+    def test_a_drain_worker_floors_one_band_below_the_cdc_daemon(self):
+        worker = {informix_module._SNAPSHOT_DAEMON_SLOT_MARKER_OPTION: "true"}
+        daemon = {informix_module._DAEMON_SLOT_MARKER_OPTION: "true"}
+        for pool, worker_floor, daemon_floor in (("16", 1, 5), ("8", 1, 2)):
+            with self.subTest(pool=pool):
+                size = {"max.concurrent.connections": pool}
+                self.assertEqual(self._captured_floor(self._bridge(**size, **worker)), worker_floor)
+                self.assertEqual(self._captured_floor(self._bridge(**size, **daemon)), daemon_floor)
+                self.assertEqual(self._captured_floor(self._bridge(**size)), 0)
 
-    def test_no_marker_keeps_zero_floor(self):
-        bridge = self._bridge(**{"snapshot.connection.reservation": "3"})
-        self.assertEqual(self._captured_floor(bridge), 0)
-
-    def test_marker_takes_max_of_delete_and_snapshot_floors(self):
-        bridge = self._bridge(
-            **{
-                "snapshot.connection.reservation": "2",
-                "upsert.connection.reservation": "5",
+    def test_only_a_pool_worker_drains_inline(self):
+        connector = InformixLakeflowConnect(
+            {
+                "database": "demo",
+                "snapshot.staging.location": self._shared_state.name,
+                "lakebase.password": "test-state-password",
             }
         )
-        bridge.options[informix_module._CONNECTION_CHANNEL_OPTION] = "delete"
-        bridge.options[informix_module._SNAPSHOT_DRAIN_MARKER_OPTION] = "true"
-        # Delete channel floors at the upsert reservation (5); the snapshot floor (2) is
-        # lower, so the higher of the two wins.
-        self.assertEqual(self._captured_floor(bridge), 5)
+        worker = connector._snapshot_drain_reader_factory()()
+        self.assertFalse(connector._is_snapshot_drain_worker())
+        self.assertTrue(worker._is_snapshot_drain_worker())
+        self.assertNotIn("snapshot.shared.session", worker.options)
 
-    def test_zero_reservation_defaults_to_a_third_in_model_a(self):
-        # Model A (shared session off) with an unset reservation reserves a third of the
-        # pool: floor(9 / 3) = 3.
-        bridge = self._bridge(
-            **{"snapshot.shared.session": "false", "max.concurrent.connections": "9"}
-        )
-        bridge.options[informix_module._SNAPSHOT_DRAIN_MARKER_OPTION] = "true"
-        self.assertEqual(self._captured_floor(bridge), 3)
-
-    def test_zero_reservation_not_derived_when_shared_session_on(self):
-        # The third-of-the-pool default is Model A only; with shared session on, a zero
-        # reservation stays zero (Model C bounds drains by its thread count instead).
-        bridge = self._bridge(
-            **{"snapshot.shared.session": "true", "max.concurrent.connections": "9"}
-        )
-        bridge.options[informix_module._SNAPSHOT_DRAIN_MARKER_OPTION] = "true"
-        self.assertEqual(self._captured_floor(bridge), 0)
-
-    def test_zero_reservation_rounds_up_to_one_on_small_pools(self):
-        # floor(n / 3) is 0 for a 2-, 3-, or 4-slot pool, but at least one slot is
-        # reserved whenever the pool can spare one.
-        for slot_count in (2, 3, 4):
-            bridge = self._bridge(
-                **{
-                    "snapshot.shared.session": "false",
-                    "max.concurrent.connections": str(slot_count),
+    def test_a_stale_reservation_warns_once_per_flow_not_per_daemon_reader(self):
+        with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
+            connector = InformixLakeflowConnect(
+                {
+                    "database": "demo",
+                    "snapshot.staging.location": self._shared_state.name,
+                    "lakebase.password": "test-state-password",
+                    "snapshot.connection.reservation": "3",
                 }
             )
-            bridge.options[informix_module._SNAPSHOT_DRAIN_MARKER_OPTION] = "true"
-            self.assertEqual(self._captured_floor(bridge), 1, f"slot_count={slot_count}")
-
-    def test_zero_reservation_stays_zero_on_single_slot_pool(self):
-        # A single-slot pool cannot spare one: reserving its only slot would floor the
-        # drain out of every slot and deadlock it, so the derived reservation is 0.
-        bridge = self._bridge(
-            **{"snapshot.shared.session": "false", "max.concurrent.connections": "1"}
-        )
-        bridge.options[informix_module._SNAPSHOT_DRAIN_MARKER_OPTION] = "true"
-        self.assertEqual(self._captured_floor(bridge), 0)
-
-    def test_explicit_reservation_overrides_the_third_default(self):
-        # A positive value is honoured verbatim even in Model A.
-        bridge = self._bridge(
-            **{
-                "snapshot.shared.session": "false",
-                "snapshot.connection.reservation": "2",
-                "max.concurrent.connections": "9",
-            }
-        )
-        bridge.options[informix_module._SNAPSHOT_DRAIN_MARKER_OPTION] = "true"
-        self.assertEqual(self._captured_floor(bridge), 2)
-
+            readers = [
+                connector._snapshot_drain_reader_factory()(),
+                connector._shared_cdc_reader_factory("upsert")(),
+                connector._shared_cdc_reader_factory("delete")(),
+            ]
+        stale = [line for line in logs.output if "snapshot.connection.reservation" in line]
+        self.assertEqual(len(stale), 1)
+        for reader in readers:
+            self.assertNotIn("snapshot.connection.reservation", reader.options)
 
 class DaemonReservationFloorTests(unittest.TestCase):
     """A background daemon (sharded CDC, snapshot drain pool) claims its slot above the
@@ -13903,101 +13818,8 @@ class DaemonReaderFactoryMarkerTests(unittest.TestCase):
         self.assertIsNone(reader.options.get(informix_module._CONNECTION_ATTEMPT_BUDGET_OPTION))
 
 
-class SnapshotDrainMarkerTests(unittest.TestCase):
-    """The connector sets the drain marker (Model A) around a snapshot-phase read and
-    restores it afterward, so the bridge applies the reservation floor only then."""
-
-    def setUp(self):
-        self._shared_state = tempfile.TemporaryDirectory()
-        self._lakebase = _OfflineLakebase().install(self)
-
-    def tearDown(self):
-        self._shared_state.cleanup()
-
-    def _connector(self, **options):
-        connector = InformixLakeflowConnect(
-            {
-                "database": "demo",
-                "snapshot.staging.location": self._shared_state.name,
-                "lakebase.password": "test-state-password",
-                "snapshot.mode": "initial",
-                "cdc.shared.session": "false",
-                "stream.partitioned": "false",
-                # Model A by default here; the shared-mode marker test overrides this.
-                "snapshot.shared.session": "false",
-                **options,
-            }
-        )
-        connector.set_registration_scope(hashlib.sha256(b"marker").hexdigest()[:32])
-        connector._bridge_instance = FakeBridge()
-        return connector
-
-    def test_snapshot_phase_read_sets_marker_during_read(self):
-        connector = self._connector()
-        seen = {}
-        original = connector._refresh_table_schema
-
-        def spy(table, fingerprint):
-            seen.setdefault(
-                "marker",
-                connector.options.get(informix_module._SNAPSHOT_DRAIN_MARKER_OPTION),
-            )
-            return original(table, fingerprint)
-
-        connector._refresh_table_schema = spy
-        connector.read_table("app.orders", {}, {})
-        self.assertEqual(seen["marker"], "true")
-
-    def test_marker_restored_after_read(self):
-        connector = self._connector()
-        connector.read_table("app.orders", {}, {})
-        self.assertNotIn(informix_module._SNAPSHOT_DRAIN_MARKER_OPTION, connector.options)
-
-    def test_shared_mode_read_does_not_set_marker(self):
-        # In shared mode the daemon bounds concurrency, so the consumer takes no floor.
-        connector = self._connector(**{"snapshot.shared.session": "true"})
-        connector._drain_via_snapshot_daemon = lambda *a, **k: (_ for _ in ()).throw(
-            AssertionError("should not reach the daemon in this marker check")
-        )
-        seen = {}
-        original = connector._refresh_table_schema
-
-        def spy(table, fingerprint):
-            seen.setdefault(
-                "marker",
-                connector.options.get(informix_module._SNAPSHOT_DRAIN_MARKER_OPTION),
-            )
-            return original(table, fingerprint)
-
-        connector._refresh_table_schema = spy
-        try:
-            connector.read_table("app.orders", {}, {})
-        except AssertionError:
-            pass  # the daemon stub fired after the schema refresh; the marker check ran
-        self.assertIsNone(seen.get("marker"))
-
-    def test_incremental_keyed_read_does_not_set_marker(self):
-        # A keyed table's default incremental snapshot reads a bounded chunk per
-        # microbatch and frees the slot between them, so it is never floored -- it
-        # borrows the reserved slots freely. Only the monolithic initial drain is floored.
-        connector = self._connector(**{"snapshot.mode": "incremental"})
-        seen = {}
-        original = connector._table
-
-        def spy(name, opts):
-            seen.setdefault(
-                "marker",
-                connector.options.get(informix_module._SNAPSHOT_DRAIN_MARKER_OPTION),
-            )
-            return original(name, opts)
-
-        connector._table = spy
-        connector.read_table("app.orders", {}, {})
-        self.assertIsNone(seen.get("marker"))
-
-
 class SnapshotDrainPoolTests(unittest.TestCase):
-    """The bounded pool that runs Model C drains off the microbatch thread."""
+    """The bounded pool that runs snapshot drains off the microbatch thread."""
 
     def test_submit_dedups_and_queues_once(self):
         pool = _SnapshotDrainPool()
@@ -14181,8 +14003,8 @@ class SnapshotDrainPoolTests(unittest.TestCase):
 
 
 class SnapshotDaemonSeamTests(unittest.TestCase):
-    """Model C end to end: the consumer frees its slot, a daemon worker drains and stages
-    the table, and the consumer serves the staged pages."""
+    """The drain pool end to end: the consumer frees its slot, a daemon worker drains and
+    stages the table, and the consumer serves the staged pages."""
 
     def setUp(self):
         self._shared_state = tempfile.TemporaryDirectory()
@@ -14197,7 +14019,6 @@ class SnapshotDaemonSeamTests(unittest.TestCase):
             "snapshot.staging.location": self._shared_state.name,
             "lakebase.password": "test-state-password",
             "snapshot.mode": "initial",
-            "cdc.shared.session": "false",
             "stream.partitioned": "false",
             **extra,
         }
@@ -14209,13 +14030,13 @@ class SnapshotDaemonSeamTests(unittest.TestCase):
         scope_hex = hashlib.sha256(os.urandom(16)).hexdigest()[:32]
 
         def fake_factory():
-            reader = InformixLakeflowConnect(self._options(**{"snapshot.shared.session": "false"}))
+            reader = InformixLakeflowConnect(self._options())
             reader.set_registration_scope(scope_hex)
             reader._bridge_instance = FakeBridge()
-            return reader
+            return _drain_snapshots_inline(reader)
 
         consumer = InformixLakeflowConnect(
-            self._options(**{"snapshot.shared.session": "true", "snapshot.reader.threads": "1"})
+            self._options(**{"snapshot.reader.threads": "1"})
         )
         consumer.set_registration_scope(scope_hex)
         consumer._bridge_instance = FakeBridge()
@@ -14245,13 +14066,13 @@ class SnapshotDaemonSeamTests(unittest.TestCase):
         # When a prior drain already published the manifest, the shared-mode consumer
         # serves it directly and never enqueues a daemon job.
         scope_hex = hashlib.sha256(os.urandom(16)).hexdigest()[:32]
-        # The primer drains inline (Model A) to pre-publish the manifest without a daemon.
-        primer = InformixLakeflowConnect(self._options(**{"snapshot.shared.session": "false"}))
+        # The primer drains inline to pre-publish the manifest without a daemon.
+        primer = _drain_snapshots_inline(InformixLakeflowConnect(self._options()))
         primer.set_registration_scope(scope_hex)
         primer._bridge_instance = FakeBridge()
         primer.read_table("app.orders", {}, {})
 
-        consumer = InformixLakeflowConnect(self._options(**{"snapshot.shared.session": "true"}))
+        consumer = InformixLakeflowConnect(self._options())
         consumer.set_registration_scope(scope_hex)
         consumer._bridge_instance = FakeBridge()
 
@@ -14273,13 +14094,13 @@ class SnapshotDaemonSeamTests(unittest.TestCase):
         scope_hex = hashlib.sha256(os.urandom(16)).hexdigest()[:32]
 
         def fake_factory():
-            reader = InformixLakeflowConnect(self._options(**{"snapshot.shared.session": "false"}))
+            reader = InformixLakeflowConnect(self._options())
             reader.set_registration_scope(scope_hex)
             reader._bridge_instance = FakeBridge()
-            return reader
+            return _drain_snapshots_inline(reader)
 
         consumer = InformixLakeflowConnect(
-            self._options(**{"snapshot.shared.session": "true", "snapshot.reader.threads": "1"})
+            self._options(**{"snapshot.reader.threads": "1"})
         )
         consumer.set_registration_scope(scope_hex)
         consumer._bridge_instance = FakeBridge()
@@ -14329,8 +14150,6 @@ class SnapshotIsolationOptionTests(unittest.TestCase):
                 "snapshot.staging.location": self._shared_state.name,
                 "lakebase.password": "test-state-password",
                 "snapshot.mode": "initial",
-                "snapshot.shared.session": "false",
-                "cdc.shared.session": "false",
                 "stream.partitioned": "false",
                 **options,
             }
@@ -14339,7 +14158,7 @@ class SnapshotIsolationOptionTests(unittest.TestCase):
         # classes run under two file paths in one process, so a fixed scope would collide.
         connector.set_registration_scope(hashlib.sha256(os.urandom(16)).hexdigest()[:32])
         connector._bridge_instance = FakeBridge()
-        return connector
+        return _drain_snapshots_inline(_read_cdc_directly(connector))
 
     def test_defaults_to_last_committed(self):
         self.assertEqual(self._connector()._snapshot_isolation({}), "COMMITTED READ LAST COMMITTED")
@@ -14430,8 +14249,6 @@ class SnapshotScanOptionTests(unittest.TestCase):
                 "snapshot.staging.location": self._shared_state.name,
                 "lakebase.password": "test-state-password",
                 "snapshot.mode": "initial",
-                "snapshot.shared.session": "false",
-                "cdc.shared.session": "false",
                 "stream.partitioned": "false",
                 **options,
             }
@@ -14439,7 +14256,7 @@ class SnapshotScanOptionTests(unittest.TestCase):
         # Unique scope per connector so staged snapshot state never leaks between cases.
         connector.set_registration_scope(hashlib.sha256(os.urandom(16)).hexdigest()[:32])
         connector._bridge_instance = bridge or FakeBridge()
-        return connector
+        return _drain_snapshots_inline(_read_cdc_directly(connector))
 
     @staticmethod
     def _keyless_bridge():
@@ -14690,12 +14507,6 @@ class FairSlotQueueWiringTests(unittest.TestCase):
                 **{informix_module._SNAPSHOT_DAEMON_SLOT_MARKER_OPTION: "true"}
             )._connection_waiter_class(),
             informix_module._SLOT_CLASS_SNAPSHOT_DAEMON,
-        )
-        self.assertEqual(
-            self._bridge(
-                **{informix_module._SNAPSHOT_DRAIN_MARKER_OPTION: "true"}
-            )._connection_waiter_class(),
-            informix_module._SLOT_CLASS_SNAPSHOT_CONSUMER,
         )
 
 
@@ -16711,15 +16522,13 @@ class _TableOptionTestCase(unittest.TestCase):
                 "snapshot.staging.location": self._shared_state.name,
                 "lakebase.password": "test-state-password",
                 "snapshot.mode": "initial",
-                "cdc.shared.session": "false",
-                "snapshot.shared.session": "false",
                 "stream.partitioned": "false",
                 **extra,
             }
         )
         connector.set_registration_scope(hashlib.sha256(b"test-pipeline").hexdigest()[:32])
         connector._bridge_instance = bridge
-        return connector
+        return _drain_snapshots_inline(_read_cdc_directly(connector))
 
     def stream(self, bridge, options):
         """Snapshot app.orders and return the connector with its stream checkpoint."""
