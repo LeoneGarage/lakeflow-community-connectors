@@ -740,11 +740,6 @@ class WorkspaceFilesApi:
             return b""
         return self._request("GET", volume_path, byte_range=(start, end - 1)) or b""
 
-    def delete(self, volume_path: str) -> None:
-        # Docstring: Delete ``volume_path`` if it exists; a 404 is tolerated.
-
-        self._request("DELETE", volume_path, tolerate_missing=True)
-
     def _request(
         self,
         method: str,
@@ -752,7 +747,6 @@ class WorkspaceFilesApi:
         *,
         data: bytes | None = None,
         overwrite: bool = False,
-        tolerate_missing: bool = False,
         byte_range: tuple[int, int] | None = None,
     ) -> bytes | None:
         quoted = urllib.parse.quote(volume_path, safe="/")
@@ -774,8 +768,6 @@ class WorkspaceFilesApi:
                 ) as response:
                     return response.read()
             except urllib.error.HTTPError as error:
-                if error.code == 404 and tolerate_missing:
-                    return None
                 if error.code < 500 and error.code != 429:
                     detail = error.read().decode("utf-8", "replace")[:400]
                     raise WorkspaceHttpError(

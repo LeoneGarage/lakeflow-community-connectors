@@ -531,48 +531,6 @@ class _FakeCursor:
             if stored is not None:
                 self._result = [(stored,)]
 
-    def _delete_scoped_records(self, args: dict) -> None:
-        key_prefix = args["record_key_pattern"][:-1]
-        scope_prefix = args["pipeline_scope_pattern"][:-1]
-        with self._database.lock:
-            deleted = []
-            for key, raw in list(self._database.records.items()):
-                namespace, record_key = key
-                record = json.loads(raw)
-                scope = record.get("scope")
-                if (
-                    namespace == args["namespace"]
-                    and record_key.startswith(key_prefix)
-                    and isinstance(scope, str)
-                    and scope.startswith(scope_prefix)
-                    and scope != args["current_scope"]
-                    and (args["retained_scope"] is None or scope != args["retained_scope"])
-                ):
-                    deleted.append((record_key,))
-                    del self._database.records[key]
-            self._result = deleted
-
-    def _delete_removed_table_records(self, args: dict) -> None:
-        scope_prefix = args["pipeline_scope_pattern"][:-1]
-        active = set(args["active_table_keys"])
-        with self._database.lock:
-            deleted = []
-            for key, raw in list(self._database.records.items()):
-                namespace, record_key = key
-                parts = record_key.split("/")
-                scope = json.loads(raw).get("scope")
-                if (
-                    namespace == args["namespace"]
-                    and len(parts) > 1
-                    and parts[1] not in active
-                    and isinstance(scope, str)
-                    and scope.startswith(scope_prefix)
-                ):
-                    deleted.append((record_key,))
-                    del self._database.records[key]
-            self._result = deleted
-
-
 class _FakeDatabase:
     """Shared state behind every fake connection, with a controllable clock."""
 
@@ -2378,16 +2336,6 @@ class WorkspaceFilesApiTests(unittest.TestCase):
         self.assertEqual(captured["data"], b"payload")
         self.assertEqual(captured["auth"], "Bearer dapi-token")
         self.assertEqual(captured["ctype"], "application/octet-stream")
-
-    def test_delete_tolerates_missing(self):
-        def fake_urlopen(request, timeout=None):
-            raise lakebase_state.urllib.error.HTTPError(
-                request.full_url, 404, "not found", {}, None
-            )
-
-        client, _ = self._client()
-        with mock.patch.object(lakebase_state.urllib.request, "urlopen", fake_urlopen):
-            client.delete("/Volumes/c/s/v/gone")  # must not raise
 
     def test_client_error_raises_workspace_http_error(self):
         def fake_urlopen(request, timeout=None):

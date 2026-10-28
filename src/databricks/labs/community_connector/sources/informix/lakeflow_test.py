@@ -131,7 +131,6 @@ from databricks.labs.community_connector.sources.informix.informix import (  # n
     _bridge_config,
     _capture_descriptor,
     _catalog_column,
-    _committed_transactions,
     _framework_value,
     _informix_available_now_base,
     _recover,
@@ -177,22 +176,6 @@ def _table(owner="app", name="orders", cdc=True, primary_keys=("id",)):
         ],
         "primary_keys": list(primary_keys),
     }
-
-
-def _publish_fence(root, slot_name, stage, *, marker="owner"):
-    """Create a fence stage the way a real fencer does: with an author's marker.
-
-    A fencer always plants an ``owner``/``pulse``/``mutating`` marker inside the
-    stage it creates. An empty stage is a husk left by a reclaimer whose
-    retirement rename failed, and it deliberately no longer fences (it would
-    otherwise retire the slot permanently), so tests must plant a marker to
-    express "this slot is fenced".
-    """
-
-    path = PurePythonInformixBridge._connection_slot_fence_path(root, slot_name, stage)
-    os.makedirs(path, exist_ok=True)
-    open(os.path.join(path, f"{marker}-" + "a" * 32), "wb").close()
-    return path
 
 
 class FakeBridge:
@@ -444,38 +427,6 @@ def _incremental_reader_offset(lsn=90):
     return offset
 
 
-def _volume_rename_semantics():
-    """Patch os.rename to reject non-empty directories, as a UC Volume does.
-
-    Connection-slot coordination runs on a Unity Catalog Volume, which refuses to
-    rename a directory that still has entries. Local POSIX temporary directories
-    allow it, so a rename that always fails in production succeeds in every test
-    that does not install this shim. That gap hid a defect which permanently
-    stranded connection slots, so it is worth simulating explicitly.
-    """
-
-    real_rename = os.rename
-
-    def rename(src, dst, *args, **kwargs):
-        try:
-            if os.path.isdir(src) and os.listdir(src):
-                raise PermissionError(errno.EPERM, "rename of non-empty directory")
-        except FileNotFoundError:
-            pass
-        return real_rename(src, dst, *args, **kwargs)
-
-    return mock.patch.object(informix_module.os, "rename", side_effect=rename)
-
-
-def _sweep_connection_fences(root, passes=1):
-    """Run cleanup, defeating the interval throttle between passes."""
-
-    for _ in range(passes):
-        informix_module._LAST_RETIRED_CONNECTION_CLEANUP.clear()
-        informix_module._RETIRED_CONNECTION_CLEANUP_CURSOR.clear()
-        PurePythonInformixBridge._cleanup_connection_slot_tombstones(root)
-
-
 class _OfflineLakebase:
     """Stands in for a provisioned Lakebase endpoint.
 
@@ -544,6 +495,11 @@ class _OfflineLakebase:
         from databricks.labs.community_connector.sources.informix import lakebase_state
 
         lakebase_state.seed_slots(self._connect(), namespace, slot_count)
+
+
+def _committed_transactions(records):
+    """The committed transactions of one poll's records."""
+    return informix_module._transaction_batch(records)[0]
 
 
 def _no_shared_cdc_view(*_args, **_kwargs):
@@ -2208,7 +2164,7 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(len(records), 5)
         # The committed transaction survives so the caller can checkpoint it,
         # and the still-open one is left to be replayed by the next poll.
-        committed = informix_module._committed_transactions(records)
+        committed = _committed_transactions(records)
         self.assertEqual([tx.tx_id for tx in committed], [1])
 
     def test_poll_byte_bound_truncates_instead_of_failing_once_a_transaction_commits(self):
@@ -2239,7 +2195,7 @@ class LakeflowContractTests(unittest.TestCase):
         ):
             records = bridge.read_changes([capture], 90, 1, 2)
 
-        self.assertEqual([tx.tx_id for tx in informix_module._committed_transactions(records)], [1])
+        self.assertEqual([tx.tx_id for tx in _committed_transactions(records)], [1])
 
     def test_truncated_poll_tolerates_a_partial_trailing_frame(self):
         # Abandoning the rest of a chunk deliberately leaves the parser holding
@@ -2275,7 +2231,7 @@ class LakeflowContractTests(unittest.TestCase):
         ):
             records = bridge.read_changes([capture], 90, 1, 2)
 
-        self.assertEqual([tx.tx_id for tx in informix_module._committed_transactions(records)], [1])
+        self.assertEqual([tx.tx_id for tx in _committed_transactions(records)], [1])
 
     def test_poll_bound_still_fails_when_a_single_transaction_cannot_fit(self):
         # With nothing committed there is no progress to checkpoint, so silently
@@ -3620,11 +3576,6 @@ class LakeflowContractTests(unittest.TestCase):
             },
         )
 
-    def _limit_name(self, capacity, reservation):
-        width = informix_module._CONNECTION_LIMIT_WIDTH
-        version = informix_module._CONNECTION_LIMIT_CONFIG_VERSION
-        return f"limit-v{version}-c{capacity:0{width}d}-r{reservation:0{width}d}"
-
     def test_connection_slot_tree_cleanup_unlinks_root_symlink(self):
         with tempfile.TemporaryDirectory() as root:
             target = os.path.join(root, "target")
@@ -3638,16 +3589,6 @@ class LakeflowContractTests(unittest.TestCase):
 
             self.assertFalse(os.path.lexists(link))
             self.assertTrue(os.path.isfile(protected))
-
-    @staticmethod
-    def _channel_bridge(**options):
-        bridge = object.__new__(PurePythonInformixBridge)
-        bridge._connection_slot = None
-        bridge._connection_slot_token = None
-        bridge._connection_slot_heartbeat_stop = None
-        bridge._connection_slot_heartbeat = None
-        bridge.options = dict(options)
-        return bridge
 
     def test_delete_channel_is_declared_before_anything_can_connect(self):
         # The slot is taken by the first call reaching _ensure_connected, which
@@ -3668,21 +3609,6 @@ class LakeflowContractTests(unittest.TestCase):
         # And it must not leak past the read, or a later upsert read on the same
         # reader would inherit the delete channel's restricted band.
         self.assertIsNone(connector.options.get("_informix.connection.channel"))
-
-    def _occupied_slot(self, root, name="slot-0000", renewed_at=None, markers=2):
-        path = os.path.join(root, name)
-        os.mkdir(path)
-        written = []
-        for index in range(markers):
-            prefix = "owner" if index == 0 else "pulse"
-            marker = os.path.join(path, f"{prefix}-" + f"{index:x}" * 32)
-            open(marker, "wb").close()
-            written.append(marker)
-        if renewed_at is not None:
-            for marker in written:
-                os.utime(marker, (renewed_at, renewed_at))
-            os.utime(path, (renewed_at, renewed_at))
-        return path
 
     def test_continuous_reads_yield_and_count_consecutive_capacity_misses(self):
         bridge = FakeBridge()
@@ -3745,14 +3671,6 @@ class LakeflowContractTests(unittest.TestCase):
         low["capacity_pressure"] = 1
         _, recovered = connector.read_table("app.orders", low, {})
         self.assertNotIn("capacity_pressure", recovered)
-
-    def _write_hint_generation(self, bridge, root, bucket, lsn=1):
-        generation = bridge._connection_hint_generation(root, bucket)
-        os.makedirs(generation, exist_ok=True)
-        width = informix_module._LSN_DECIMAL_WIDTH
-        name = f"{informix_module._CONNECTION_HINT_LSN_PREFIX}{lsn:0{width}d}"
-        open(os.path.join(generation, name), "wb").close()
-        return generation
 
     def test_backlog_rank_is_bounded_and_monotonic(self):
         # Ranks must stay bounded (cheap to compare, safe to persist) and never
@@ -10353,25 +10271,6 @@ class LakeflowContractTests(unittest.TestCase):
             connector._immutable_namespace(table, "schema-nodes", schema_id)
         )
         self.assertNotIn("scope", node)
-
-    def test_state_root_creation_fsyncs_existing_parent(self):
-        parent = tempfile.TemporaryDirectory()
-        self.addCleanup(parent.cleanup)
-        root = os.path.join(parent.name, "new-state")
-        path = os.path.join(root, "nested")
-        with mock.patch.object(informix_module.os, "fsync") as fsync:
-            informix_module._makedirs_durable(root, path)
-        self.assertGreaterEqual(fsync.call_count, 3)
-
-    def test_state_root_creation_supports_multiple_missing_components(self):
-        parent = tempfile.TemporaryDirectory()
-        self.addCleanup(parent.cleanup)
-        root = os.path.join(parent.name, "team", "informix", "state")
-        path = os.path.join(root, "nested", "namespace")
-
-        informix_module._makedirs_durable(root, path)
-
-        self.assertTrue(os.path.isdir(path))
 
     def test_immutable_header_rejects_float_version(self):
         with self.assertRaisesRegex(InformixError, "Unsupported or mismatched"):

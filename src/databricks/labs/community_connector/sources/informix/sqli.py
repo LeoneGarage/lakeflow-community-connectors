@@ -84,7 +84,6 @@ SQ_ASCMISC_60 = 116
 SQ_ASCEOT = 127
 LO_READ = 0
 LO_READ_WITH_SEEK = 1
-LO_WRITE = 2
 TRANSFER_BUFFER_SIZE = 32000
 SQLI_PROTOCOL = 60
 INTERNAL_VERSION = 316
@@ -203,10 +202,6 @@ class _DeadlineReader:
         self._stream.close()
 
 
-# Backward-compatible precise name used by callers from the first pure port.
-SqliAuthenticationNotImplemented = SqliUnsupportedAuthentication
-
-
 class ConnectionState(Enum):
     NEW = auto()
     SOCKET_OPEN = auto()
@@ -244,26 +239,6 @@ class ResultDescription:
     statement_id: int
     tuple_size: int
     columns: tuple[ResultColumn, ...]
-
-
-class CdcTransport(Protocol):
-    def execute(
-        self, sql: str, parameters: tuple = (), max_result_bytes: int | None = None
-    ) -> list[tuple]: ...
-
-    def execute_command(self, sql: str) -> None: ...
-
-    def execute_pages(
-        self,
-        sql: str,
-        parameters: tuple,
-        page_size: int,
-        page_consumer: Callable[[list[dict[str, object]]], None],
-    ) -> None: ...
-
-    def read_lodata(self, descriptor: int, requested: int) -> bytes: ...
-
-    def close(self) -> None: ...
 
 
 class AuthenticationProvider(Protocol):
@@ -326,19 +301,6 @@ def encode_bind(values: tuple[TypedBind, ...], encoding: str = "utf-8") -> bytes
     return out.getvalue()
 
 
-def decode_pam_challenge(payload: bytes, encoding: str = "utf-8") -> tuple[int, str]:
-    stream = io.BytesIO(payload)
-    message_type, length = read_smallint(stream), read_smallint(stream)
-    if length < 0 or length > 512:
-        raise SqliUnsupportedAuthentication("PAM challenge exceeds noninteractive bound")
-    raw = read_exact(stream, length)
-    if length & 1:
-        read_exact(stream, 1)
-    if stream.read(1):
-        raise SqliProtocolError("PAM challenge has trailing bytes")
-    return message_type, raw.decode(encoding)
-
-
 def encode_pam_response(response: str, encoding: str = "utf-8") -> bytes:
     raw = response.encode(encoding)
     if len(raw) > 512:
@@ -366,23 +328,6 @@ def parse_redirect_detail(detail: str, allowlist: set[tuple[str, int]]) -> tuple
     if not server or not host or not 1 <= port <= 65535 or (host, port) not in allowlist:
         raise SqliUnsupportedAuthentication("redirect target is not explicitly allow-listed")
     return server, host, port
-
-
-def materialize_blob_chunks(
-    chunks: list[bytes], per_value_limit: int, remaining_batch_bytes: int
-) -> bytes:
-    output = bytearray()
-    limit = min(per_value_limit, remaining_batch_bytes)
-    for payload in chunks:
-        if len(payload) < 2:
-            raise SqliProtocolError("truncated TEXT/BYTE chunk")
-        size = struct.unpack_from(">h", payload)[0]
-        if size < 0 or len(payload) != 2 + size + (size & 1):
-            raise SqliProtocolError("invalid TEXT/BYTE chunk length or padding")
-        if len(output) + size > limit:
-            raise SqliProtocolError("TEXT/BYTE materialization exceeds configured bound")
-        output.extend(payload[2 : 2 + size])
-    return bytes(output)
 
 
 def encode_char(value: str | bytes, encoding: str = "utf-8") -> bytes:
@@ -427,32 +372,6 @@ def read_session_packet(stream: BinaryIO, maximum: int = 0xFFFF) -> tuple[int, i
     if flags not in {0, 0x1000}:
         raise SqliProtocolError(f"unsupported session-layer flags 0x{flags:04x}")
     return sl_type, protocol, read_exact(stream, total - 6)
-
-
-def decode_asc_response(packet: bytes) -> bytes:
-    # Docstring: Validate accept/reject/redirect session state and ASC binary markers.
-    #
-    # Returns the undecoded capability body for an accepted connection. Its full
-    # field layout is intentionally left to the forthcoming DecodeAscBinary port.
-
-    sl_type, protocol, payload = read_session_packet(io.BytesIO(packet))
-    if protocol != SQLI_PROTOCOL:
-        raise SqliProtocolError(f"server selected unsupported SQLI protocol {protocol}")
-    if sl_type == 13:
-        raise SqliRedirect("unparsed redirect")
-    if sl_type == 3:
-        raise SqliSessionRejected(
-            "Informix rejected the SQLI session before returning a diagnostic; "
-            "inspect the server log (connection exhaustion commonly reports SQLCODE -25571)"
-        )
-    if sl_type != 2:
-        raise SqliProtocolError(f"unexpected ASC session-layer type {sl_type}")
-    if len(payload) < 4:
-        raise SqliProtocolError("truncated ASC accepted body")
-    assoc, binary = struct.unpack_from(">hh", payload)
-    if (assoc, binary) != (SQ_ASSOC, SQ_ASCBINARY):
-        raise SqliProtocolError(f"invalid ASC accepted markers {(assoc, binary)}")
-    return payload[4:]
 
 
 def decode_asc_accept(packet: bytes, encoding: str = "utf-8") -> AscAccept:
@@ -560,6 +479,7 @@ def encode_normal_auth_prefix(
     #
     # Password bytes are plaintext; callers must place this packet inside TLS.
 
+    del database  # part of the public signature; the prefix does not carry it
     out = io.BytesIO()
     out.write(struct.pack(">hhi", SQ_ASSOC, SQ_ASCBINARY, 61))
     out.write(encode_asc_char(b"IEEEM\0"))
@@ -802,40 +722,6 @@ def encode_lodata_read(descriptor: int, requested: int) -> bytes:
     return struct.pack(
         ">hhhih", SQ_LODATA, LO_READ, wire_descriptor, requested, TRANSFER_BUFFER_SIZE
     )
-
-
-def decode_lodata_response(payload: bytes, target: BinaryIO | None = None) -> bytes:
-    if len(payload) < 6:
-        raise SqliProtocolError("truncated SQ_LODATA response")
-    operation, size = struct.unpack_from(">hi", payload)
-    if operation not in {LO_READ, LO_READ_WITH_SEEK}:
-        raise SqliProtocolError(f"unexpected SQ_LODATA response operation {operation}")
-    if size < 0:
-        raise SqliProtocolError(f"SQ_LODATA server/ISAM error {size}")
-    if size == 0:
-        if payload[6:] != b"\0\0":
-            raise SqliProtocolError("zero-length SQ_LODATA response lacks its terminator")
-        return b""
-    cursor = 6
-    data = bytearray()
-    while len(data) < size:
-        if cursor + 2 > len(payload):
-            raise SqliProtocolError("truncated SQ_LODATA chunk length")
-        chunk_size = struct.unpack_from(">h", payload, cursor)[0]
-        cursor += 2
-        if chunk_size <= 0 or len(data) + chunk_size > size:
-            raise SqliProtocolError(f"invalid SQ_LODATA chunk size {chunk_size}")
-        padded = chunk_size + (chunk_size & 1)
-        if cursor + padded > len(payload):
-            raise SqliProtocolError("truncated SQ_LODATA chunk")
-        data.extend(payload[cursor : cursor + chunk_size])
-        cursor += padded
-    if cursor != len(payload):
-        raise SqliProtocolError("SQ_LODATA response has trailing bytes")
-    decoded = bytes(data)
-    if target is not None:
-        target.write(decoded)
-    return decoded
 
 
 def read_exact(stream: BinaryIO, size: int) -> bytes:
@@ -1116,20 +1002,6 @@ _NON_ROW_STATEMENTS = frozenset(
 )
 
 
-def _typed_bind(value: object) -> TypedBind:
-    if isinstance(value, TypedBind):
-        return value
-    if isinstance(value, bool):
-        return TypedBind(2, int(value))
-    if isinstance(value, int):
-        return TypedBind(2 if -(1 << 31) <= value < (1 << 31) else 52, value)
-    if isinstance(value, str):
-        return TypedBind(13, value)
-    if value is None:
-        raise TypeError("SQL NULL requires an internal TypedBind with an explicit native type")
-    raise TypeError(f"unsupported internal bind value {type(value).__name__}")
-
-
 def _decode_result_value(
     data: bytes,
     column: ResultColumn,
@@ -1248,7 +1120,7 @@ def _decode_result_value_raw(
     raise SqliDescriptorNotImplemented(f"ordinary Informix result type {kind} is unsupported")
 
 
-def _fixed_result_size(column: ResultColumn, remaining: bytes) -> int:
+def _fixed_result_size(column: ResultColumn) -> int:
     kind = column.type_code & 0xFF
     widths = {
         1: 2,
@@ -2037,7 +1909,7 @@ class InformixSqliClient:
                     raise SqliProtocolError("truncated complex variable tuple")
                 limit = start + 5 + struct.unpack_from(">i", payload, start + 1)[0]
             elif variable_layout:
-                limit = start + _fixed_result_size(column, payload[start:])
+                limit = start + _fixed_result_size(column)
             else:
                 limit = (
                     description.columns[index + 1].position
@@ -2137,7 +2009,6 @@ __all__ = [
     "AscAccept",
     "datetime_order_preserving_cast",
     "AuthenticationProvider",
-    "CdcTransport",
     "ConnectionState",
     "InformixSqliClient",
     "PasswordAuthenticationProvider",
@@ -2150,9 +2021,6 @@ __all__ = [
     "TypedBind",
     "decode_char",
     "decode_asc_accept",
-    "decode_asc_response",
-    "decode_lodata_response",
-    "decode_pam_challenge",
     "encode_asc_environment",
     "encode_asc_char",
     "encode_asc_tail",
@@ -2173,7 +2041,6 @@ __all__ = [
     "encode_secondary_info",
     "encode_session_packet",
     "encode_simple_command",
-    "materialize_blob_chunks",
     "parse_redirect_detail",
     "read_session_packet",
 ]

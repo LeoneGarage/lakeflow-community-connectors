@@ -45,9 +45,6 @@ from databricks.labs.community_connector.sources.informix.sqli import (
     _fixed_result_size,
     _statement_keyword,
     decode_asc_accept,
-    decode_asc_response,
-    decode_lodata_response,
-    decode_pam_challenge,
     encode_asc_char,
     encode_asc_environment,
     encode_bind,
@@ -66,7 +63,6 @@ from databricks.labs.community_connector.sources.informix.sqli import (
     encode_session_packet,
     encode_simple_command,
     encode_variable_fetch,
-    materialize_blob_chunks,
     parse_redirect_detail,
     read_session_packet,
 )
@@ -415,7 +411,7 @@ class FrameTests(unittest.TestCase):
         # NCHAR differs from CHAR only in collating by locale: it is fixed width and blank
         # padded in the database code set on the SQLI wire (type 15) and in CDC images.
         result = ResultColumn("value", 0, 15, 0, 5)
-        self.assertEqual(_fixed_result_size(result, b"ab   "), 5)
+        self.assertEqual(_fixed_result_size(result), 5)
         self.assertEqual(_decode_result_value(b"ab   ", result, "utf-8"), "ab")
         column = ColumnDescriptor("value", "NCHAR", length=5)
         self.assertEqual(decode_value(memoryview(b"ab   "), column), ("ab", 5))
@@ -493,7 +489,7 @@ class IntervalTests(unittest.TestCase):
                 decoded = decode_value(memoryview(raw + b"\xff"), column)
                 self.assertEqual(decoded, (expected, len(raw)))
                 result = ResultColumn("i", 0, 14, 0, qualifier)
-                self.assertEqual(_fixed_result_size(result, raw), len(raw))
+                self.assertEqual(_fixed_result_size(result), len(raw))
                 self.assertEqual(_decode_result_value(raw, result, "utf-8"), expected)
 
     def test_interval_layouts(self):
@@ -530,19 +526,6 @@ class LoDataTests(unittest.TestCase):
         self.assertEqual(
             encode_lodata_read(9, 32000), struct.pack(">hhhih", 97, 0, 9, 32000, 32000)
         )
-
-    def test_verified_response_body(self):
-        payload = struct.pack(">hih", 0, 3, 3) + b"abc\0"
-        self.assertEqual(decode_lodata_response(payload), b"abc")
-        self.assertEqual(decode_lodata_response(struct.pack(">hih", 0, 0, 0)), b"")
-
-    def test_response_rejects_direction_and_all_negative_sizes(self):
-        for operation in (2, 3, -1):
-            with self.assertRaises(SqliProtocolError):
-                decode_lodata_response(struct.pack(">hih", operation, 0, 0))
-        for operation in (0, 1, 2, 3):
-            with self.assertRaises(SqliProtocolError):
-                decode_lodata_response(struct.pack(">hi", operation, -1))
 
 
 class SqliPacketTests(unittest.TestCase):
@@ -734,8 +717,6 @@ class SqliPacketTests(unittest.TestCase):
         self.assertTrue(encoded.endswith(struct.pack(">hhh", 0, -1, 0)))
 
     def test_pam_static_frames_and_bounds(self):
-        challenge = struct.pack(">hh", 1, 4) + b"PIN?"
-        self.assertEqual(decode_pam_challenge(challenge), (1, "PIN?"))
         self.assertEqual(encode_pam_response("1234"), struct.pack(">hh", 130, 4) + b"1234\0\x0c")
         with self.assertRaises(SqliUnsupportedAuthentication):
             encode_pam_response("x" * 513)
@@ -805,7 +786,7 @@ class SqliPacketTests(unittest.TestCase):
         with self.assertRaises(SqliUnsupportedAuthentication):
             client._authenticate_pam(float("inf"))
 
-    def test_redirect_allowlist_and_blob_chunk_bounds(self):
+    def test_redirect_allowlist(self):
         self.assertEqual(
             parse_redirect_detail("redirect:x:srv:db.example:9089", {("db.example", 9089)}),
             ("srv", "db.example", 9089),
@@ -815,10 +796,6 @@ class SqliPacketTests(unittest.TestCase):
         for unsafe in ("label=srv|db.example|service", "label=srv|db.example|9089|extra"):
             with self.assertRaises(SqliUnsupportedAuthentication):
                 parse_redirect_detail(unsafe, {("db.example", 9089)})
-        chunks = [struct.pack(">h", 3) + b"abc\0", struct.pack(">h", 2) + b"de"]
-        self.assertEqual(materialize_blob_chunks(chunks, 8, 8), b"abcde")
-        with self.assertRaises(SqliProtocolError):
-            materialize_blob_chunks(chunks, 4, 8)
 
     def test_redirect_resolution_is_stable_and_private_requires_ip_allowlist(self):
         client = InformixSqliClient(
@@ -1156,15 +1133,9 @@ class SqliPacketTests(unittest.TestCase):
             (accepted.version, accepted.cap_1, accepted.cap_2, accepted.cap_3), ("316", 1, 2, 3)
         )
 
-    def test_accept_and_redirect_states(self):
-        accepted = encode_session_packet(2, struct.pack(">hh", 100, 101) + b"caps")
-        self.assertEqual(decode_asc_response(accepted), b"caps")
-        with self.assertRaisesRegex(SqliSessionRejected, "server log"):
-            decode_asc_response(encode_session_packet(3, b""))
+    def test_rejected_session_points_at_the_server_log(self):
         with self.assertRaisesRegex(SqliSessionRejected, "server log"):
             decode_asc_accept(encode_session_packet(3, b""))
-        with self.assertRaises(SqliUnsupportedAuthentication):
-            decode_asc_response(encode_session_packet(13, b"redirect"))
 
     def test_live_initresp_metadata_tail_is_bounded_by_asceot(self):
         fixed = (

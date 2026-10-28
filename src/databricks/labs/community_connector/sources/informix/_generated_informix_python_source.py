@@ -1930,11 +1930,6 @@ def register_lakeflow_source(spark):
                 return b""
             return self._request("GET", volume_path, byte_range=(start, end - 1)) or b""
 
-        def delete(self, volume_path: str) -> None:
-            # Docstring: Delete ``volume_path`` if it exists; a 404 is tolerated.
-
-            self._request("DELETE", volume_path, tolerate_missing=True)
-
         def _request(
             self,
             method: str,
@@ -1942,7 +1937,6 @@ def register_lakeflow_source(spark):
             *,
             data: bytes | None = None,
             overwrite: bool = False,
-            tolerate_missing: bool = False,
             byte_range: tuple[int, int] | None = None,
         ) -> bytes | None:
             quoted = urllib.parse.quote(volume_path, safe="/")
@@ -1964,8 +1958,6 @@ def register_lakeflow_source(spark):
                     ) as response:
                         return response.read()
                 except urllib.error.HTTPError as error:
-                    if error.code == 404 and tolerate_missing:
-                        return None
                     if error.code < 500 and error.code != 429:
                         detail = error.read().decode("utf-8", "replace")[:400]
                         raise WorkspaceHttpError(
@@ -3615,7 +3607,6 @@ def register_lakeflow_source(spark):
     SQ_ASCEOT = 127
     LO_READ = 0
     LO_READ_WITH_SEEK = 1
-    LO_WRITE = 2
     TRANSFER_BUFFER_SIZE = 32000
     SQLI_PROTOCOL = 60
     INTERNAL_VERSION = 316
@@ -3734,10 +3725,6 @@ def register_lakeflow_source(spark):
             self._stream.close()
 
 
-    # Backward-compatible precise name used by callers from the first pure port.
-    SqliAuthenticationNotImplemented = SqliUnsupportedAuthentication
-
-
     class ConnectionState(Enum):
         NEW = auto()
         SOCKET_OPEN = auto()
@@ -3775,26 +3762,6 @@ def register_lakeflow_source(spark):
         statement_id: int
         tuple_size: int
         columns: tuple[ResultColumn, ...]
-
-
-    class CdcTransport(Protocol):
-        def execute(
-            self, sql: str, parameters: tuple = (), max_result_bytes: int | None = None
-        ) -> list[tuple]: ...
-
-        def execute_command(self, sql: str) -> None: ...
-
-        def execute_pages(
-            self,
-            sql: str,
-            parameters: tuple,
-            page_size: int,
-            page_consumer: Callable[[list[dict[str, object]]], None],
-        ) -> None: ...
-
-        def read_lodata(self, descriptor: int, requested: int) -> bytes: ...
-
-        def close(self) -> None: ...
 
 
     class AuthenticationProvider(Protocol):
@@ -3857,19 +3824,6 @@ def register_lakeflow_source(spark):
         return out.getvalue()
 
 
-    def decode_pam_challenge(payload: bytes, encoding: str = "utf-8") -> tuple[int, str]:
-        stream = io.BytesIO(payload)
-        message_type, length = read_smallint(stream), read_smallint(stream)
-        if length < 0 or length > 512:
-            raise SqliUnsupportedAuthentication("PAM challenge exceeds noninteractive bound")
-        raw = read_exact(stream, length)
-        if length & 1:
-            read_exact(stream, 1)
-        if stream.read(1):
-            raise SqliProtocolError("PAM challenge has trailing bytes")
-        return message_type, raw.decode(encoding)
-
-
     def encode_pam_response(response: str, encoding: str = "utf-8") -> bytes:
         raw = response.encode(encoding)
         if len(raw) > 512:
@@ -3897,23 +3851,6 @@ def register_lakeflow_source(spark):
         if not server or not host or not 1 <= port <= 65535 or (host, port) not in allowlist:
             raise SqliUnsupportedAuthentication("redirect target is not explicitly allow-listed")
         return server, host, port
-
-
-    def materialize_blob_chunks(
-        chunks: list[bytes], per_value_limit: int, remaining_batch_bytes: int
-    ) -> bytes:
-        output = bytearray()
-        limit = min(per_value_limit, remaining_batch_bytes)
-        for payload in chunks:
-            if len(payload) < 2:
-                raise SqliProtocolError("truncated TEXT/BYTE chunk")
-            size = struct.unpack_from(">h", payload)[0]
-            if size < 0 or len(payload) != 2 + size + (size & 1):
-                raise SqliProtocolError("invalid TEXT/BYTE chunk length or padding")
-            if len(output) + size > limit:
-                raise SqliProtocolError("TEXT/BYTE materialization exceeds configured bound")
-            output.extend(payload[2 : 2 + size])
-        return bytes(output)
 
 
     def encode_char(value: str | bytes, encoding: str = "utf-8") -> bytes:
@@ -3958,32 +3895,6 @@ def register_lakeflow_source(spark):
         if flags not in {0, 0x1000}:
             raise SqliProtocolError(f"unsupported session-layer flags 0x{flags:04x}")
         return sl_type, protocol, read_exact(stream, total - 6)
-
-
-    def decode_asc_response(packet: bytes) -> bytes:
-        # Docstring: Validate accept/reject/redirect session state and ASC binary markers.
-        #
-        # Returns the undecoded capability body for an accepted connection. Its full
-        # field layout is intentionally left to the forthcoming DecodeAscBinary port.
-
-        sl_type, protocol, payload = read_session_packet(io.BytesIO(packet))
-        if protocol != SQLI_PROTOCOL:
-            raise SqliProtocolError(f"server selected unsupported SQLI protocol {protocol}")
-        if sl_type == 13:
-            raise SqliRedirect("unparsed redirect")
-        if sl_type == 3:
-            raise SqliSessionRejected(
-                "Informix rejected the SQLI session before returning a diagnostic; "
-                "inspect the server log (connection exhaustion commonly reports SQLCODE -25571)"
-            )
-        if sl_type != 2:
-            raise SqliProtocolError(f"unexpected ASC session-layer type {sl_type}")
-        if len(payload) < 4:
-            raise SqliProtocolError("truncated ASC accepted body")
-        assoc, binary = struct.unpack_from(">hh", payload)
-        if (assoc, binary) != (SQ_ASSOC, SQ_ASCBINARY):
-            raise SqliProtocolError(f"invalid ASC accepted markers {(assoc, binary)}")
-        return payload[4:]
 
 
     def decode_asc_accept(packet: bytes, encoding: str = "utf-8") -> AscAccept:
@@ -4091,6 +4002,7 @@ def register_lakeflow_source(spark):
         #
         # Password bytes are plaintext; callers must place this packet inside TLS.
 
+        del database  # part of the public signature; the prefix does not carry it
         out = io.BytesIO()
         out.write(struct.pack(">hhi", SQ_ASSOC, SQ_ASCBINARY, 61))
         out.write(encode_asc_char(b"IEEEM\0"))
@@ -4333,40 +4245,6 @@ def register_lakeflow_source(spark):
         return struct.pack(
             ">hhhih", SQ_LODATA, LO_READ, wire_descriptor, requested, TRANSFER_BUFFER_SIZE
         )
-
-
-    def decode_lodata_response(payload: bytes, target: BinaryIO | None = None) -> bytes:
-        if len(payload) < 6:
-            raise SqliProtocolError("truncated SQ_LODATA response")
-        operation, size = struct.unpack_from(">hi", payload)
-        if operation not in {LO_READ, LO_READ_WITH_SEEK}:
-            raise SqliProtocolError(f"unexpected SQ_LODATA response operation {operation}")
-        if size < 0:
-            raise SqliProtocolError(f"SQ_LODATA server/ISAM error {size}")
-        if size == 0:
-            if payload[6:] != b"\0\0":
-                raise SqliProtocolError("zero-length SQ_LODATA response lacks its terminator")
-            return b""
-        cursor = 6
-        data = bytearray()
-        while len(data) < size:
-            if cursor + 2 > len(payload):
-                raise SqliProtocolError("truncated SQ_LODATA chunk length")
-            chunk_size = struct.unpack_from(">h", payload, cursor)[0]
-            cursor += 2
-            if chunk_size <= 0 or len(data) + chunk_size > size:
-                raise SqliProtocolError(f"invalid SQ_LODATA chunk size {chunk_size}")
-            padded = chunk_size + (chunk_size & 1)
-            if cursor + padded > len(payload):
-                raise SqliProtocolError("truncated SQ_LODATA chunk")
-            data.extend(payload[cursor : cursor + chunk_size])
-            cursor += padded
-        if cursor != len(payload):
-            raise SqliProtocolError("SQ_LODATA response has trailing bytes")
-        decoded = bytes(data)
-        if target is not None:
-            target.write(decoded)
-        return decoded
 
 
     def read_exact(stream: BinaryIO, size: int) -> bytes:
@@ -4647,20 +4525,6 @@ def register_lakeflow_source(spark):
     )
 
 
-    def _typed_bind(value: object) -> TypedBind:
-        if isinstance(value, TypedBind):
-            return value
-        if isinstance(value, bool):
-            return TypedBind(2, int(value))
-        if isinstance(value, int):
-            return TypedBind(2 if -(1 << 31) <= value < (1 << 31) else 52, value)
-        if isinstance(value, str):
-            return TypedBind(13, value)
-        if value is None:
-            raise TypeError("SQL NULL requires an internal TypedBind with an explicit native type")
-        raise TypeError(f"unsupported internal bind value {type(value).__name__}")
-
-
     def _decode_result_value(
         data: bytes,
         column: ResultColumn,
@@ -4779,7 +4643,7 @@ def register_lakeflow_source(spark):
         raise SqliDescriptorNotImplemented(f"ordinary Informix result type {kind} is unsupported")
 
 
-    def _fixed_result_size(column: ResultColumn, remaining: bytes) -> int:
+    def _fixed_result_size(column: ResultColumn) -> int:
         kind = column.type_code & 0xFF
         widths = {
             1: 2,
@@ -5568,7 +5432,7 @@ def register_lakeflow_source(spark):
                         raise SqliProtocolError("truncated complex variable tuple")
                     limit = start + 5 + struct.unpack_from(">i", payload, start + 1)[0]
                 elif variable_layout:
-                    limit = start + _fixed_result_size(column, payload[start:])
+                    limit = start + _fixed_result_size(column)
                 else:
                     limit = (
                         description.columns[index + 1].position
@@ -5668,7 +5532,6 @@ def register_lakeflow_source(spark):
         "AscAccept",
         "datetime_order_preserving_cast",
         "AuthenticationProvider",
-        "CdcTransport",
         "ConnectionState",
         "InformixSqliClient",
         "PasswordAuthenticationProvider",
@@ -5681,9 +5544,6 @@ def register_lakeflow_source(spark):
         "TypedBind",
         "decode_char",
         "decode_asc_accept",
-        "decode_asc_response",
-        "decode_lodata_response",
-        "decode_pam_challenge",
         "encode_asc_environment",
         "encode_asc_char",
         "encode_asc_tail",
@@ -5704,7 +5564,6 @@ def register_lakeflow_source(spark):
         "encode_secondary_info",
         "encode_session_packet",
         "encode_simple_command",
-        "materialize_blob_chunks",
         "parse_redirect_detail",
         "read_session_packet",
     ]
@@ -6146,7 +6005,6 @@ def register_lakeflow_source(spark):
     # covers the window in which the delete reader would otherwise find nothing. The
     # counter is persisted in offsets under its historical name.
     _SCHEMA_NODE_FALLBACK_RETRIES = 5
-    _HEAD_LEASE_SECONDS = 120.0
     _DEFAULT_MAX_CONCURRENT_CONNECTIONS = 16
     # Slots reserved for the upsert channel, which the delete channel may not claim.
     # A floor rather than a partition: upserts may still use every unreserved slot,
@@ -6287,19 +6145,6 @@ def register_lakeflow_source(spark):
 
 
     _CONNECTION_LIMIT_CONFIG_VERSION = 1
-    _CONNECTION_LIMIT_WIDTH = 5
-    # The three fence lifecycle stages, as fixed child names under
-    # ``fences/<slot>/``. They are distinct names because they legitimately
-    # coexist: a reclaimer holds ``fencing`` while it renames the displaced slot to
-    # ``expired``, and ``expired`` is later renamed to ``fenced`` for quarantine.
-    # Collapsing them onto one name would make those renames collide with the live
-    # reservation and wedge the slot permanently.
-    _CONNECTION_FENCE_RESERVATION = "fencing"
-    _CONNECTION_FENCE_TOMBSTONE = "expired"
-    _CONNECTION_FENCE_QUARANTINE = "fenced"
-    # How many older generations a waiter will fall back to, so one missed
-    # publication (the holder crashed mid-write) does not blind every waiter.
-    _CONNECTION_HINT_STALE_BUCKETS = 2
     # Freshness comes from the *bucket* encoded in the generation directory name, never
     # from file mtime and no longer from a timestamp stored inside a record. A Volume
     # surfaces a transient sub-second mtime for 1-3s after a mutation, so mtime cannot
@@ -6308,21 +6153,6 @@ def register_lakeflow_source(spark):
     # the stored ``at`` field provided. A waiter walks back a bounded number of buckets
     # from its own current one, so the bucket distance *is* the age, in quanta.
     _CONNECTION_HINT_MAX_AGE_SECONDS = 45.0
-    # The hint payload is the log position, and it is carried in a marker *filename*
-    # rather than in file contents:
-    #
-    #     hints/gen-<bucket>/lsn-<20-digit-zero-padded>
-    #
-    # Reading it is then a single ``listdir`` of a directory holding one small entry --
-    # no open(2), no read(2), no gzip, no JSON parse. This matters because UC Volume FUSE
-    # commits a large read-ahead window per *open file handle* regardless of how few bytes
-    # are actually read (ES-1604921/ES-1614902), so the cheapest content read is no
-    # content read. It also removes the partial-record hazard the write-then-rename dance
-    # existed to avoid: a name either exists in full or does not exist.
-    #
-    # Zero-padded to a fixed width so the name is fixed-length and lexically ordered,
-    # matching _LSN_DECIMAL_WIDTH used elsewhere for the same reason.
-    _CONNECTION_HINT_LSN_PREFIX = "lsn-"
     # Ranks are bounded so the value is cheap to compare and safe to persist in an
     # offset. Eight log-scaled levels span the whole plausible backlog range.
     _CONNECTION_BACKLOG_RANK_LEVELS = 8
@@ -6334,11 +6164,6 @@ def register_lakeflow_source(spark):
     # one busy read dominate: a genuinely backlogged flow truncates every read, while
     # a flow that truncated once and then drained falls straight back to zero.
     _CONNECTION_BACKLOG_TRUNCATION_LEVELS = 4
-    _CONNECTION_FENCE_STAGES = (
-        _CONNECTION_FENCE_RESERVATION,
-        _CONNECTION_FENCE_TOMBSTONE,
-        _CONNECTION_FENCE_QUARANTINE,
-    )
     _SHARED_STATE_ACCESS_MAX_RETRIES = 200
     # Consecutive dropped-mount yields a continuous flow tolerates before failing.
     #
@@ -6542,22 +6367,11 @@ def register_lakeflow_source(spark):
     # roughly half a minute in total -- long enough to ride out a blip, short enough
     # that a genuine outage still surfaces as a failed flow rather than a silent hang.
     _SHARED_STATE_MOUNT_RETRY_MAX_SECONDS = 8.0
-    _METADATA_SESSION_IDLE_SECONDS = 1.0
     # Bound on cached per-table registration lookups shared across reader instances
     # in one process. Entries are single resolved tables (keyed by source identity +
     # exposed name), so this can be generous -- a pipeline registers one entry per
     # configured table.
     _MAX_REGISTRATION_TABLE_CACHES = 512
-    _LAST_CANDIDATE_CLEANUP: dict[str, float] = {}
-    _LAST_RETIRED_CONNECTION_CLEANUP: dict[str, float] = {}
-    _RETIRED_CONNECTION_CLEANUP_CURSOR: dict[str, str] = {}
-    # Newest observed lease renewal per slot path, keyed absolutely so slots of
-    # different endpoints cannot collide. Process-local and purely an optimisation:
-    # see _connection_slot_held for why a cached renewal is safe to trust and what
-    # it deliberately does not cover. Bounded because a long-lived worker may sweep
-    # several endpoints over its lifetime; slot paths per endpoint are already
-    # bounded by max.concurrent.connections.
-    _CONNECTION_SLOT_LEASE_OBSERVED: dict[str, float] = {}
     _INFORMIX_REGISTRATION_CONTEXT: dict[str, Any] = {"scope": None}
 
 
@@ -6584,22 +6398,6 @@ def register_lakeflow_source(spark):
 
 
     _STATE_VALIDATION_COORDINATOR = _StateValidationCoordinator()
-
-
-    class _ConnectionMaintenanceCoordinator:
-        # Docstring: Throttle best-effort connection artifact cleanup per worker process.
-
-        def __init__(self) -> None:
-            self.lock = threading.Lock()
-            self.last_started: dict[str, float] = {}
-            self.running: set[str] = set()
-
-        def __getstate__(self) -> dict[str, object]:
-            return {}
-
-        def __setstate__(self, state: dict[str, object]) -> None:
-            del state
-            self.__init__()
 
 
     def _sleep_with_backoff(deadline: float, delay: float) -> float:
@@ -7309,21 +7107,6 @@ def register_lakeflow_source(spark):
             # Docstring: Namespace every row by the Informix endpoint sharing the capacity.
 
             return hashlib.sha256(self._connection_identity().encode()).hexdigest()[:24]
-
-        @staticmethod
-        def _revocation_name(path: str) -> str:
-            # Docstring: Return the revocation marker name for one artifact.
-            #
-            # Nested fence stages share basenames across slots (every slot has a
-            # ``fencing`` child), so the marker must include the slot to stay unique;
-            # deriving it from the basename alone would let one slot's revocation
-            # appear to revoke every other slot's same-stage fence.
-
-            base = os.path.basename(path)
-            if base in _CONNECTION_FENCE_STAGES:
-                slot = os.path.basename(os.path.dirname(path))
-                return f"revoked-{slot}-{base}"
-            return f"revoked-{base}"
 
         def _connection_hints_enabled(self) -> bool:
             return self.options.get("connection.backlog.hint.enabled", "true") != "false"
@@ -10214,8 +9997,6 @@ def register_lakeflow_source(spark):
         "HASH": ((*_VALUE_KINDS, "other"), (), "string", False),
         "NULLIFY": ((*_VALUE_KINDS, "other"), (), "same", False),
     }
-    # Functions on numbers whose result keeps an integer input an integer.
-    _INTEGRAL_FUNCTIONS = frozenset({"ABS", "MOD", "ROUND", "TRUNC"})
 
 
     def _expression_text(operand: str | tuple) -> str:
@@ -11260,51 +11041,6 @@ def register_lakeflow_source(spark):
                 os.close(descriptor)
 
 
-    def _namespace_storage_now(namespace_descriptor: int) -> float | None:
-        # Docstring: Return a storage-assigned wall clock for lease decisions, or None.
-        #
-        # Writes and removes a short-lived probe file, reading its storage-assigned
-        # mtime so lease comparisons use the filesystem's clock rather than a possibly
-        # skewed worker clock. Returns None when the probe cannot be written.
-
-        probe = f".now-{secrets.token_hex(8)}"
-        try:
-            descriptor = os.open(
-                probe,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                mode=0o600,
-                dir_fd=namespace_descriptor,
-            )
-        except OSError:
-            return None
-        try:
-            now = os.fstat(descriptor).st_mtime
-        finally:
-            os.close(descriptor)
-            try:
-                os.unlink(probe, dir_fd=namespace_descriptor)
-            except OSError:
-                pass
-        return now
-
-
-    def _fsync_directory_path(path: str) -> None:
-        try:
-            descriptor = os.open(path, os.O_RDONLY)
-        except OSError as error:
-            if error.errno in {errno.EINVAL, errno.ENOTSUP, errno.EACCES}:
-                return
-            raise
-        try:
-            try:
-                os.fsync(descriptor)
-            except OSError as error:
-                if error.errno not in {errno.EINVAL, errno.ENOTSUP}:
-                    raise
-        finally:
-            os.close(descriptor)
-
-
     def _dropped_mount_error(error: BaseException) -> OSError | None:
         # Docstring: Return the ENOTCONN in ``error``'s cause chain, if a dropped mount caused it.
         #
@@ -11418,69 +11154,6 @@ def register_lakeflow_source(spark):
                 raise
         finally:
             os.close(directory)
-
-
-    def _makedirs_durable(root: str, path: str) -> None:
-        if os.path.commonpath((root, path)) != root:
-            raise InformixError(f"Informix shared-state path escapes '{root}': '{path}'")
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            descriptor = os.open(root, flags)
-        except OSError as error:
-            if error.errno in {errno.ELOOP, errno.ENOTDIR}:
-                raise InformixError(
-                    f"Informix shared-state root traverses symlink or non-directory: '{root}'"
-                ) from error
-            if error.errno != errno.ENOENT:
-                raise
-            parts = root.split(os.sep)
-            if len(parts) >= 5 and parts[1] == "Volumes":
-                anchor = os.path.join(os.sep, *parts[1:5])
-            else:
-                anchor = os.path.dirname(root)
-                while not os.path.isdir(anchor):
-                    parent = os.path.dirname(anchor)
-                    if parent == anchor:
-                        raise InformixError(
-                            f"Cannot find an existing parent for shared-state root '{root}'"
-                        )
-                    anchor = parent
-            descriptor = os.open(anchor, flags)
-            root_parts = tuple(
-                part for part in os.path.relpath(root, anchor).split(os.sep) if part != "."
-            )
-        else:
-            root_parts = ()
-        path_parts = tuple(part for part in os.path.relpath(path, root).split(os.sep) if part != ".")
-        try:
-            for part in (*root_parts, *path_parts):
-                try:
-                    child = os.open(part, flags, dir_fd=descriptor)
-                except FileNotFoundError:
-                    try:
-                        os.mkdir(part, mode=0o700, dir_fd=descriptor)
-                    except FileExistsError:
-                        pass
-                    os.fsync(descriptor)
-                    child = os.open(part, flags, dir_fd=descriptor)
-                except OSError as error:
-                    if error.errno in {errno.ELOOP, errno.ENOTDIR}:
-                        raise InformixError(
-                            "Informix shared-state path traverses symlink or "
-                            f"non-directory: '{path}'"
-                        ) from error
-                    raise
-                os.close(descriptor)
-                descriptor = child
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-
-
-    def _cleanup_bucket_number(name: str) -> int | None:
-        if re.fullmatch(r"[0-9]{1,20}", name) is None:
-            return None
-        return int(name)
 
 
     def _redirect_allowlist(value: str) -> frozenset[tuple[str, int]]:
@@ -13336,7 +13009,6 @@ def register_lakeflow_source(spark):
             self._staging_workspace_host = ""
             self._registration_scope: str | None = _INFORMIX_REGISTRATION_CONTEXT["scope"]
             self._metadata_session_lock = threading.RLock()
-            self._metadata_release_timer: threading.Timer | None = None
             self._metadata_session_generation = 0
             # Set by a snapshot-drain worker to a callback that reports a staged page to the
             # pool, resetting the consumer's liveness watchdog. None on a normal reader.
@@ -13427,10 +13099,6 @@ def register_lakeflow_source(spark):
                 executor.shutdown(wait=False)
             with self._metadata_session_lock:
                 self._metadata_session_generation += 1
-                timer = self._metadata_release_timer
-                self._metadata_release_timer = None
-                if timer is not None:
-                    timer.cancel()
                 bridge = self._bridge_instance
                 if bridge is None:
                     return
@@ -13474,7 +13142,6 @@ def register_lakeflow_source(spark):
             state = self.__dict__.copy()
             state["_bridge_instance"] = None
             state["_metadata_session_lock"] = None
-            state["_metadata_release_timer"] = None
             # Driver-only; never ship materialized embedded rows to a worker. The worker
             # gets its rows from the partition descriptor, not from this cache.
             state["_partition_embedded_rows"] = {}
@@ -13487,32 +13154,9 @@ def register_lakeflow_source(spark):
         def __setstate__(self, state: dict[str, Any]) -> None:
             self.__dict__.update(state)
             self._metadata_session_lock = threading.RLock()
-            self._metadata_release_timer = None
 
         def _begin_metadata_session(self) -> None:
             self._metadata_session_generation += 1
-            timer = self._metadata_release_timer
-            self._metadata_release_timer = None
-            if timer is not None:
-                timer.cancel()
-
-        def _defer_metadata_session_release(self) -> None:
-            generation = self._metadata_session_generation
-            timer = threading.Timer(
-                _METADATA_SESSION_IDLE_SECONDS,
-                self._finish_metadata_session,
-                args=(generation,),
-            )
-            timer.daemon = True
-            self._metadata_release_timer = timer
-            timer.start()
-
-        def _finish_metadata_session(self, generation: int) -> None:
-            with self._metadata_session_lock:
-                if generation != self._metadata_session_generation:
-                    return
-                self._metadata_release_timer = None
-                self._release_worker_connection()
 
         @property
         def _bridge(self) -> InformixBridge:
@@ -13822,7 +13466,7 @@ def register_lakeflow_source(spark):
                                 f"snapshot.mode={snapshot_mode} requires a CDC-capable table; "
                                 f"'{table.exposed_name}' is snapshot-only"
                             )
-                        result = self._read_snapshot_only(table, effective_start, table_options)
+                        result = self._read_snapshot_only(table, table_options)
                     elif snapshot_mode == "recovery" and (
                         not effective_start or effective_start.get("phase") != "stream"
                     ):
@@ -13857,7 +13501,7 @@ def register_lakeflow_source(spark):
                         self._cleanup_completed_snapshot_stage(table, effective_start)
                         result = (iter(()), dict(effective_start))
                     elif snapshot_mode == "cdc_only" and not effective_start:
-                        result = self._read_cdc_only(table, table_options)
+                        result = self._read_cdc_only(table)
                     elif (
                         snapshot_mode == "auto_snapshot"
                         and effective_start.get("phase") == "stream"
@@ -15894,7 +15538,7 @@ def register_lakeflow_source(spark):
                 self._write_handoff_token(table, effective_start, _HANDOFF_CHANNEL_DELETE)
             return iter(()), dict(effective_start)
 
-        def _read_cdc_only(self, table: Table, options: dict[str, str]) -> tuple[Iterator[dict], dict]:
+        def _read_cdc_only(self, table: Table) -> tuple[Iterator[dict], dict]:
             # Docstring: Establish a schema-safe CDC boundary without reading existing rows.
 
             pipeline_scope = self._pipeline_scope()
@@ -16736,13 +16380,6 @@ def register_lakeflow_source(spark):
                 )
             return rows, end
 
-        @staticmethod
-        def _datetime_primary_key(table: Table) -> bool:
-            return any(
-                column.name in table.primary_keys and column.type_name == "DATETIME"
-                for column in table.columns
-            )
-
         def _incremental_datetime_chunk_exprs(
             self, table: Table, options: dict[str, str]
         ) -> tuple[dict[str, str], bool]:
@@ -17131,7 +16768,7 @@ def register_lakeflow_source(spark):
             # the committed cursor, because rows inserted into that range since the
             # original read can push it beyond a single page -- and stopping short is
             # the truncation this bound exists to prevent.
-            for fetch in range(_REPLAY_MAX_CHUNK_FETCHES):
+            for _ in range(_REPLAY_MAX_CHUNK_FETCHES):
                 # Ask for one row more than the page keeps, so "the page filled" and
                 # "rows remain" are distinguishable rather than inferred: the same
                 # probe the blocking consistent_snapshot loop uses.
@@ -18648,7 +18285,7 @@ def register_lakeflow_source(spark):
                 pipeline_scope,
             )
 
-        def _read_snapshot_only(self, table: Table, start: dict | None, options: dict[str, str]):
+        def _read_snapshot_only(self, table: Table, options: dict[str, str]):
             _ensure_materializable(table, options)
             table = self._refresh_table_schema(table, None)
             fingerprint = _schema_fingerprint(table)
@@ -20163,7 +19800,7 @@ def register_lakeflow_source(spark):
             identity = self._native_table_state_identity(exposed)
             if identity is None:
                 return True
-            native_identity, connection_key, table_key = identity
+            _, connection_key, table_key = identity
             record_key = "/".join(
                 (
                     connection_key,
@@ -20720,17 +20357,13 @@ def register_lakeflow_source(spark):
                 raise InformixError(f"Immutable schema-node table mismatch for '{table.exposed_name}'")
 
         @staticmethod
-        def _immutable_lsn(record: dict[str, object], field: str, context: str) -> int:
+        def _immutable_lsn(record: dict[str, object], name: str, context: str) -> int:
             try:
-                return _strict_lsn(record.get(field), field)
+                return _strict_lsn(record.get(name), name)
             except (TypeError, ValueError) as error:
                 raise InformixError(
-                    f"Invalid {field} in Informix immutable record for {context}"
+                    f"Invalid {name} in Informix immutable record for {context}"
                 ) from error
-
-        @staticmethod
-        def _fsync_directory(path: str) -> None:
-            _fsync_directory_path(path)
 
         def _table_map(self, refresh: bool = False) -> dict[str, Table]:
             if self._tables is None or not self._tables_complete or refresh:
@@ -20955,15 +20588,6 @@ def register_lakeflow_source(spark):
         ):
             raise ValueError(f"{name} must be an integer, not {value!r}")
         return int(value)
-
-
-    def _strict_timestamp(value: object, name: str) -> float:
-        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
-            raise ValueError(f"{name} must be a timestamp, not {value!r}")
-        result = float(value)
-        if not math.isfinite(result):
-            raise ValueError(f"{name} must be finite, not {value!r}")
-        return result
 
 
     def _strict_lsn(value: object, name: str) -> int:
@@ -21277,10 +20901,6 @@ def register_lakeflow_source(spark):
         if record["op"] not in {"TIMEOUT", "METADATA", "ERROR"}:
             record["tx_id"] = _tx_id(record)
         return record
-
-
-    def _committed_transactions(records: Sequence[dict[str, Any]]) -> list[CommittedTransaction]:
-        return _transaction_batch(records)[0]
 
 
     def _transaction_batch(
@@ -22102,91 +21722,6 @@ def register_lakeflow_source(spark):
             }
         )
         return result
-
-
-    def _validate_shaped_rows(
-        rows: list[dict[str, Any]],
-        table: Table,
-        options: dict[str, str],
-        *,
-        context: str,
-        primary_keys_only: bool = False,
-    ) -> None:
-        # Docstring: Reject values that the declared Spark schema cannot materialize.
-
-        columns = (
-            [column for column in table.columns if column.name in table.primary_keys]
-            if primary_keys_only
-            else table.columns
-        )
-        for row_index, row in enumerate(rows):
-            for column in columns:
-                value = row.get(column.name)
-                if value is None:
-                    if not column.nullable:
-                        raise InformixError(
-                            f"{context} row {row_index} has null for non-nullable column "
-                            f"'{column.name}'"
-                        )
-                    continue
-                spark_type = _spark_type(column, options)
-                valid = False
-                if isinstance(spark_type, IntegerType):
-                    valid = (
-                        isinstance(value, int)
-                        and not isinstance(value, bool)
-                        and -(1 << 31) <= value < 1 << 31
-                    )
-                elif isinstance(spark_type, LongType):
-                    valid = (
-                        isinstance(value, int)
-                        and not isinstance(value, bool)
-                        and -(1 << 63) <= value < 1 << 63
-                    )
-                elif isinstance(spark_type, (FloatType, DoubleType)):
-                    valid = isinstance(value, (int, float)) and not isinstance(value, bool)
-                elif isinstance(spark_type, DecimalType):
-                    if isinstance(value, Decimal) and value.is_finite():
-                        normalized = value.normalize()
-                        digits = len(normalized.as_tuple().digits)
-                        exponent = normalized.as_tuple().exponent
-                        integer_digits = max(digits + exponent, 0)
-                        fractional_digits = max(-exponent, 0)
-                        valid = (
-                            integer_digits <= spark_type.precision - spark_type.scale
-                            and fractional_digits <= spark_type.scale
-                        )
-                elif isinstance(spark_type, StringType):
-                    valid = isinstance(value, str)
-                elif isinstance(spark_type, DateType):
-                    if isinstance(value, str):
-                        try:
-                            date.fromisoformat(value)
-                            valid = True
-                        except ValueError:
-                            pass
-                elif isinstance(spark_type, TimestampType):
-                    if isinstance(value, str):
-                        try:
-                            parsed = datetime.fromisoformat(value)
-                            # A naive wall-clock value or an explicit UTC offset both
-                            # materialize cleanly. The connector attaches UTC to a year-1
-                            # DATETIME so PySpark's internal astimezone() does not overflow
-                            # on a value adjacent to datetime.min; a non-UTC offset never
-                            # originates here.
-                            offset = parsed.utcoffset()
-                            valid = offset is None or offset == timedelta(0)
-                        except ValueError:
-                            pass
-                elif isinstance(spark_type, BooleanType):
-                    valid = isinstance(value, bool)
-                elif isinstance(spark_type, BinaryType):
-                    valid = isinstance(value, (bytes, bytearray))
-                if not valid:
-                    raise InformixError(
-                        f"{context} row {row_index} value for column '{column.name}' "
-                        f"cannot materialize as {type(spark_type).__name__}"
-                    )
 
 
     def _log_lsn(uniqid: int, used_pages: int, *, page_start: bool = False) -> int:
