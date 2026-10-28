@@ -6145,13 +6145,9 @@ def register_lakeflow_source(spark):
 
 
     _CONNECTION_LIMIT_CONFIG_VERSION = 1
-    # Freshness comes from the *bucket* encoded in the generation directory name, never
-    # from file mtime and no longer from a timestamp stored inside a record. A Volume
-    # surfaces a transient sub-second mtime for 1-3s after a mutation, so mtime cannot
-    # distinguish a fresh hint from a stale one -- but the bucket is derived from the
-    # publisher's clock at publication and is immutable thereafter, which is exactly what
-    # the stored ``at`` field provided. A waiter walks back a bounded number of buckets
-    # from its own current one, so the bucket distance *is* the age, in quanta.
+    # How old a backlog hint may be before a waiter ignores it. Lakebase stamps each hint
+    # with its own clock when it is published and measures the age on that same clock when
+    # it is read, so clock skew between workers does not change it.
     _CONNECTION_HINT_MAX_AGE_SECONDS = 45.0
     # Ranks are bounded so the value is cheap to compare and safe to persist in an
     # offset. Eight log-scaled levels span the whole plausible backlog range.
@@ -13009,7 +13005,6 @@ def register_lakeflow_source(spark):
             self._staging_workspace_host = ""
             self._registration_scope: str | None = _INFORMIX_REGISTRATION_CONTEXT["scope"]
             self._metadata_session_lock = threading.RLock()
-            self._metadata_session_generation = 0
             # Set by a snapshot-drain worker to a callback that reports a staged page to the
             # pool, resetting the consumer's liveness watchdog. None on a normal reader.
             self._drain_progress: Callable[[], None] | None = None
@@ -13098,7 +13093,6 @@ def register_lakeflow_source(spark):
                 self._snapshot_cleanup_executor_instance = None
                 executor.shutdown(wait=False)
             with self._metadata_session_lock:
-                self._metadata_session_generation += 1
                 bridge = self._bridge_instance
                 if bridge is None:
                     return
@@ -13154,9 +13148,6 @@ def register_lakeflow_source(spark):
         def __setstate__(self, state: dict[str, Any]) -> None:
             self.__dict__.update(state)
             self._metadata_session_lock = threading.RLock()
-
-        def _begin_metadata_session(self) -> None:
-            self._metadata_session_generation += 1
 
         @property
         def _bridge(self) -> InformixBridge:
@@ -13223,7 +13214,6 @@ def register_lakeflow_source(spark):
 
         def read_table_metadata(self, table_name: str, table_options: dict[str, str]) -> dict:
             with self._metadata_session_lock:
-                self._begin_metadata_session()
                 previous_capacity_mode = self.options.get("_informix.bypass.connection.capacity")
                 self.options["_informix.bypass.connection.capacity"] = "true"
                 try:
