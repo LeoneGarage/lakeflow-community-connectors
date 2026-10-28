@@ -1035,13 +1035,18 @@ connection:
       type: string
       required: false
       description: >
-        Sharded daemon-reader CDC. Default `true`. Set `false` to opt out (each
-        CDC-capable table then runs its own Informix CDC session per poll). When on,
-        tables are partitioned
+        Sharded daemon-reader CDC: `host` (the default), `true` (or `process`), or
+        `false` to opt out (each CDC-capable table then runs its own Informix CDC session
+        per poll). Serverless SDP runs each streaming flow's reader in its own process, so
+        `true` keeps shards per process; `host` shares them between the flow processes on
+        one host through a leader process elected by a lock file and reached over a Unix
+        socket, which another process takes over when the leader exits. When on, tables
+        are partitioned
         into K shards; a bounded pool of K driver-resident daemon threads each hold a
         single shared CDC session multiplexing their shard's tables and fan the changes
         out in memory, so concurrent CDC sessions drop from ~N to K and reads run in
-        parallel across the K threads. Accepts `true`/`false` (or `1`/`yes`, `0`/`no`).
+        parallel across the K threads. Accepts `host`, `true`/`process` (or `1`/`yes`),
+        or `false` (or `0`/`no`).
         Note: each shard's log-retention floor tracks that shard's slowest table.
 
     - name: cdc.shared.reader.threads
@@ -1049,7 +1054,7 @@ connection:
       required: false
       description: >
         Number of shards / daemon reader threads (K) per channel when
-        `cdc.shared.session=true`. Default = `max(1, max.concurrent.connections // 4)`;
+        a shared session (`cdc.shared.session` `host` or `true`). Default = `max(1, max.concurrent.connections // 4)`;
         minimum `1`. The upsert and delete channels shard independently, so K threads mean
         up to 2K daemon connection slots; the default keeps that near half the pool, leaving
         room for consumer bootstrap and the snapshot drain (the previous default of
@@ -1062,7 +1067,7 @@ connection:
       required: false
       description: >
         Per-table cap on buffered-but-unconsumed transactions in a shard
-        (`cdc.shared.session=true`). When a shard's slowest buffer reaches it, that
+        (`cdc.shared.session` `host` or `true`). When a shard's slowest buffer reaches it, that
         shard's daemon defers new reads (throttle to the slowest reader) until the
         backlog drains, bounding driver memory. Default `200000`; minimum `1`.
 

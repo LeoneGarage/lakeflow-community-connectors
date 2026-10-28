@@ -13,6 +13,8 @@ import json
 import logging
 import os
 import pickle
+import shutil
+import socket
 import sys
 import tempfile
 import threading
@@ -12795,6 +12797,451 @@ class BatchedCatalogReadTests(unittest.TestCase):
         self.assertEqual(versions_queries, 2)
         # Two names, two queries each, and one unique-index query for the keyless table.
         self.assertEqual(len(bridge.transport.statements), 5)
+
+
+class HostSharedCdcTests(unittest.TestCase):
+    """cdc.shared.session=host (the default): the flow processes on one host share each
+    shard through a leader process, reached over a Unix socket and elected by a lock."""
+
+    KEY = ("namespace", "scope", "upsert", 0)
+    CONFIG = {"timeout_seconds": 5, "max_records": 256, "buffer_cap": 10, "subscriber_ttl": 300.0}
+
+    def setUp(self):
+        self._shared_state = tempfile.TemporaryDirectory()
+        self._lakebase = _OfflineLakebase().install(self)
+        self.directory = tempfile.mkdtemp(dir="/tmp")
+        self.addCleanup(shutil.rmtree, self.directory, True)
+        self.endpoints = []
+        self.addCleanup(self._close_endpoints)
+        self.table = Table.parse(_table(), "demo")
+        self.identity = self.table.native_identity
+        self.capture = _capture_descriptor(self.table)
+        self.shard = _SharedCdcShard()
+        patcher = mock.patch.object(
+            informix_module, "_shared_cdc_shard", lambda *a, **k: self.shard
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        self._shared_state.cleanup()
+
+    def _close_endpoints(self):
+        for endpoints in self.endpoints:
+            self._die(endpoints)
+
+    def process(self):
+        endpoints = informix_module._HostShardEndpoints(self.directory)
+        self.endpoints.append(endpoints)
+        return endpoints
+
+    @staticmethod
+    def _die(endpoints):
+        """What a leader process's exit does: its lock and listener go away, leaving the
+        socket file behind, as a killed process does; its serve threads hang up."""
+        for key, leading in list(endpoints.leading.items()):
+            del endpoints.leading[key]
+            socket_path = endpoints.paths(key)[1]
+            kept = socket_path + ".kept"
+            if os.path.exists(socket_path):
+                os.rename(socket_path, kept)
+            try:
+                leading["listener"].close()  # its finalizer would unlink the socket file
+            except OSError:
+                pass
+            if os.path.exists(kept):
+                os.rename(kept, socket_path)
+            os.close(leading["lock_fd"])
+        for connection in endpoints.clients.values():
+            connection.close()
+        endpoints.clients.clear()
+
+    def poll(self, endpoints, commit=0, floor=0):
+        return informix_module._host_shard_poll(
+            self.KEY,
+            lambda: None,
+            dict(self.CONFIG),
+            self.identity,
+            self.table,
+            self.capture,
+            commit,
+            floor,
+            endpoints=endpoints,
+        )
+
+    def cover(self, read_start=0, tx_id=5, lsn=100):
+        self.shard.ingest(
+            [
+                {"op": "BEGIN", "tx_id": tx_id, "lsn": lsn},
+                {
+                    "op": "INSERT",
+                    "tx_id": tx_id,
+                    "lsn": lsn + 1,
+                    "table": self.table.identity,
+                    "row": {"id": 7, "value": "g"},
+                },
+                {"op": "COMMIT", "tx_id": tx_id, "lsn": lsn + 2},
+                {"op": "TIMEOUT", "lsn": lsn + 3},
+            ],
+            {self.identity: self.table},
+            1,
+            lsn + 3,
+            read_start,
+        )
+
+    def requests(self):
+        """Record each follower poll's request and the transactions its reply carried."""
+        sent = []
+        original = informix_module._host_shard_request
+
+        def record(endpoints, key, request):
+            status, payload = original(endpoints, key, request)
+            carried = None if payload is None else [tx[0] for tx in payload["committed"]]
+            sent.append((request["after"], carried))
+            return status, payload
+
+        patcher = mock.patch.object(informix_module, "_host_shard_request", side_effect=record)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return sent
+
+    def test_the_option_defaults_to_host_and_keeps_true_and_false(self):
+        mode = informix_module._shared_cdc_mode
+        self.assertEqual(mode({}), "host")
+        for value, expected in (
+            ("host", "host"),
+            (" HOST ", "host"),
+            ("true", "process"),
+            ("1", "process"),
+            ("yes", "process"),
+            ("process", "process"),
+            ("false", "off"),
+            ("0", "off"),
+            ("no", "off"),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(mode({"cdc.shared.session": value}), expected)
+        with self.assertRaisesRegex(ValueError, "host, true"):
+            mode({"cdc.shared.session": "maybe"})
+
+    def test_host_counts_as_shared_for_the_partitioned_reader(self):
+        options = {
+            "database": "demo",
+            "snapshot.staging.location": self._shared_state.name,
+            "lakebase.password": "test-state-password",
+        }
+        connector = InformixLakeflowConnect(dict(options))
+        self.assertTrue(connector._shared_cdc_enabled())
+        with self.assertRaisesRegex(ValueError, "requires a shared CDC session"):
+            InformixLakeflowConnect({**options, "cdc.shared.session": "false"})
+
+    def test_a_view_crosses_processes_as_plain_data(self):
+        table = informix_module.replace(
+            self.table,
+            key_override=True,
+            key_wildcard=True,
+            key_wildcard_except=("value",),
+            column_selection=("exclude", ("extra",)),
+            column_renames=(("value", "label"),),
+            catalog_columns=self.table.columns,
+            unsupported_columns=(Column("doc", "TEXT"),),
+        )
+        record = {
+            "op": "INSERT",
+            "tx_id": 1,
+            "lsn": 11,
+            "table": table.identity,
+            "row": {
+                "id": 1,
+                "amount": Decimal("1.50"),
+                "day": date(2026, 1, 2),
+                "at": datetime(2026, 1, 2, 3, 4, 5),
+                "raw": b"x",
+                "none": None,
+                "flag": True,
+                "ratio": 0.5,
+            },
+        }
+        view = informix_module._SharedCdcSnapshot(
+            table=table,
+            fingerprint="f" * 64,
+            min_lsn=1,
+            current_lsn=20,
+            committed=[CommittedTransaction(1, 10, 12, 10, (record,), 1700000000)],
+            caught_up=True,
+            open_begin=None,
+            reached_lsn=13,
+        )
+        wired = pickle.loads(pickle.dumps(informix_module._wire_view(view)))
+        back = informix_module._unwire_view(wired)
+        for item in dataclasses.fields(table):
+            self.assertEqual(getattr(back.table, item.name), getattr(table, item.name), item.name)
+        self.assertEqual(_schema_fingerprint(back.table), _schema_fingerprint(table))
+        self.assertEqual(back.committed[0].records, (record,))
+        self.assertEqual(
+            (back.caught_up, back.reached_lsn, back.committed[0].commit_time),
+            (True, 13, 1700000000),
+        )
+
+    def test_the_first_process_leads_and_the_next_one_polls_it(self):
+        leader, follower = self.process(), self.process()
+
+        self.assertIsNone(self.poll(leader))
+        self.assertIn(self.KEY, leader.leading)
+        self.assertIsNone(self.poll(follower))  # subscribed remotely; not covered yet
+        self.assertNotIn(self.KEY, follower.leading)
+        self.assertIn(self.identity, self.shard.subscribers)
+        self.cover()
+
+        view = self.poll(follower)
+
+        self.assertEqual([tx.tx_id for tx in view.committed], [5])
+        self.assertEqual(view.committed[0].records[0]["row"], {"id": 7, "value": "g"})
+        self.assertEqual(view.fingerprint, _schema_fingerprint(self.table))
+        self.assertEqual(_schema_fingerprint(view.table), _schema_fingerprint(self.table))
+        self.assertTrue(view.caught_up)
+
+    def test_a_follower_takes_over_when_the_leader_process_is_gone(self):
+        leader, follower = self.process(), self.process()
+        self.poll(leader)
+        self.poll(follower)
+        self.cover()
+        self._die(leader)
+
+        view = self.poll(follower)
+
+        self.assertIn(self.KEY, follower.leading)
+        self.assertEqual([tx.tx_id for tx in view.committed], [5])
+        # And a third process now follows the new leader.
+        self.assertEqual([tx.tx_id for tx in self.poll(self.process()).committed], [5])
+
+    def test_an_unreachable_live_leader_leaves_the_follower_reading_directly(self):
+        leader, follower = self.process(), self.process()
+        self.poll(leader)
+        self.cover()
+        os.unlink(leader.paths(self.KEY)[1])
+
+        self.assertIsNone(self.poll(follower))
+        self.assertNotIn(self.KEY, follower.leading)
+
+    def test_a_poll_the_leader_refuses_is_read_directly(self):
+        leader, follower = self.process(), self.process()
+        self.poll(leader)
+        self.poll(follower)
+        self.cover()
+        with mock.patch.object(self.shard, "snapshot", side_effect=RuntimeError("boom")):
+            with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
+                self.assertIsNone(self.poll(follower))
+        self.assertIn("refused a poll", logs.output[0])
+        self.assertIsNotNone(self.poll(follower))  # the connection survives a refusal
+
+    def test_a_host_that_cannot_lock_shares_within_the_process(self):
+        endpoints = self.process()
+        with mock.patch("fcntl.flock", side_effect=PermissionError("flock not permitted")):
+            with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
+                self.assertIsNone(self.poll(endpoints))
+        self.assertIn("sharing within the process", logs.output[0])
+        self.cover()
+        self.assertEqual([tx.tx_id for tx in self.poll(endpoints).committed], [5])
+        self.assertNotIn(self.KEY, endpoints.leading)
+
+    def test_an_unusable_shard_directory_shares_within_the_process(self):
+        permissive = tempfile.mkdtemp(dir="/tmp")
+        self.addCleanup(shutil.rmtree, permissive, True)
+        os.chmod(permissive, 0o755)
+        for directory in ("/dev/null/informix-shards", permissive):
+            with self.subTest(directory=directory):
+                self.shard = _SharedCdcShard()
+                endpoints = informix_module._HostShardEndpoints(directory)
+                with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
+                    self.assertIsNone(self.poll(endpoints))
+                self.assertIn("sharing within the process", logs.output[0])
+                self.assertFalse(endpoints.leading)
+                self.cover()
+                self.assertEqual([tx.tx_id for tx in self.poll(endpoints).committed], [5])
+
+    def test_a_leader_that_stops_serving_cannot_hang_a_follower(self):
+        # A live process holds the lock and listens, but never accepts or handshakes.
+        import fcntl
+        import socket
+
+        follower = self.process()
+        lock_path, socket_path, key_path = follower.paths(self.KEY)
+        lock = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, lock)
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with open(key_path, "wb") as out:
+            out.write(b"k" * 32)
+        silent = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(silent.close)
+        silent.bind(socket_path)
+        silent.listen(8)
+
+        with mock.patch.object(informix_module, "_HOST_SHARD_REPLY_SECONDS", 0.3):
+            started = time.monotonic()
+            self.assertIsNone(self.poll(follower))
+            self.assertLess(time.monotonic() - started, 5)
+        self.assertFalse(follower.leading)
+        self.assertFalse(follower.clients)
+
+    def test_a_follower_is_sent_only_the_transactions_it_does_not_hold(self):
+        leader, follower = self.process(), self.process()
+        self.poll(leader)
+        self.poll(follower)
+        sent = self.requests()
+        self.cover()
+        self.assertEqual([tx.tx_id for tx in self.poll(follower).committed], [5])
+        self.cover(tx_id=6, lsn=110)
+
+        self.assertEqual([tx.tx_id for tx in self.poll(follower).committed], [5, 6])
+        self.assertEqual([tx.tx_id for tx in self.poll(follower, commit=102).committed], [6])
+        # A checkpoint moved back past what the follower holds starts over.
+        self.assertEqual([tx.tx_id for tx in self.poll(follower, commit=0).committed], [6])
+
+        self.assertEqual(sent, [(None, [5]), (102, [6]), (112, []), (None, [6])])
+
+    def test_a_reply_that_cannot_be_sent_ends_the_serve_thread_quietly(self):
+        self.shard.subscribe(self.identity, self.table, self.capture, 0, 0)
+        self.cover()
+        leader = self.process()
+        leader.leading[self.KEY] = {"reader_factory": lambda: None, "remote": set()}
+        self.addCleanup(leader.leading.pop, self.KEY, None)
+        ends = socket.socketpair(socket.AF_UNIX)
+        self.addCleanup(lambda: [end.close() for end in ends])
+        connection = mock.Mock()
+        connection.fileno.return_value = ends[0].fileno()
+        request = {
+            "config": dict(self.CONFIG),
+            "identity": self.identity,
+            "table": informix_module._wire_table(self.table),
+            "capture": self.capture,
+            "commit": 0,
+            "floor": 0,
+            "after": None,
+        }
+        connection.recv.side_effect = [request]
+        connection.send.side_effect = [TypeError("cannot pickle"), BrokenPipeError()]
+        with (
+            mock.patch("multiprocessing.connection.deliver_challenge"),
+            mock.patch("multiprocessing.connection.answer_challenge"),
+        ):
+            informix_module._host_shard_serve(leader, self.KEY, connection, b"k")
+        self.assertEqual(connection.send.call_args.args[0][0], "error")
+        connection.close.assert_called_once()
+
+    def test_a_malformed_poll_gets_an_error_reply_and_the_connection_stays(self):
+        leader = self.process()
+        leader.leading[self.KEY] = {"reader_factory": lambda: None, "remote": set()}
+        self.addCleanup(leader.leading.pop, self.KEY, None)
+        ends = socket.socketpair(socket.AF_UNIX)
+        self.addCleanup(lambda: [end.close() for end in ends])
+        connection = mock.Mock()
+        connection.fileno.return_value = ends[0].fileno()
+        connection.recv.side_effect = [{}, EOFError()]
+        with (
+            mock.patch("multiprocessing.connection.deliver_challenge"),
+            mock.patch("multiprocessing.connection.answer_challenge"),
+        ):
+            informix_module._host_shard_serve(leader, self.KEY, connection, b"k")
+        self.assertEqual(connection.send.call_args.args[0][0], "error")
+        self.assertEqual(connection.recv.call_count, 2)
+
+    def test_a_follower_that_stalls_cannot_pin_a_serve_thread(self):
+        import multiprocessing.connection
+
+        def serve(peer_writes):
+            ends = socket.socketpair(socket.AF_UNIX)
+            self.addCleanup(lambda: [end.close() for end in ends])
+            ends[1].sendall(peer_writes)
+            connection = multiprocessing.connection.Connection(os.dup(ends[0].fileno()))
+            thread = threading.Thread(
+                target=informix_module._host_shard_serve,
+                args=(leader, self.KEY, connection, b"k" * 32),
+                daemon=True,
+            )
+            thread.start()
+            thread.join(2)
+            return thread
+
+        leader = self.process()
+        leader.leading[self.KEY] = {"reader_factory": lambda: None, "remote": set()}
+        self.addCleanup(leader.leading.pop, self.KEY, None)
+        with mock.patch.object(informix_module, "_HOST_SHARD_REPLY_SECONDS", 0.3):
+            # Connected, then never answers the handshake.
+            self.assertFalse(serve(b"").is_alive())
+            with (
+                mock.patch("multiprocessing.connection.deliver_challenge"),
+                mock.patch("multiprocessing.connection.answer_challenge"),
+            ):
+                # Stalled half-way through sending a poll.
+                self.assertFalse(serve(b"\x00\x00").is_alive())
+                # Merely idle between polls: the connection is kept.
+                self.assertTrue(serve(b"").is_alive())
+
+    def test_a_leader_that_keeps_failing_to_accept_gives_the_shard_up(self):
+        leader, follower = self.process(), self.process()
+        self.poll(leader)
+        followed = "demo:informix.followed"
+        informix_module._host_shard_poll(
+            self.KEY, lambda: None, dict(self.CONFIG), followed, self.table, self.capture,
+            0, 0, endpoints=follower,
+        )
+        self.assertEqual(set(self.shard.subscribers), {self.identity, followed})
+        broken = mock.Mock()
+        broken.accept.side_effect = OSError(errno.EMFILE, "Too many open files")
+        with (
+            mock.patch.dict(informix_module._SHARED_CDC_SHARDS, {self.KEY: self.shard}),
+            mock.patch.object(informix_module.time, "sleep"),
+            self.assertLogs(informix_module.__name__, level="WARNING") as logs,
+        ):
+            informix_module._host_shard_accept(leader, self.KEY, broken, b"k")
+        self.assertIn("gave up", logs.output[-1])
+        self.assertEqual(broken.accept.call_count, informix_module._HOST_SHARD_ACCEPT_FAILURES)
+        self.assertNotIn(self.KEY, leader.leading)
+        # Only the leader's own subscriber is left; the successor reads the follower's.
+        self.assertEqual(set(self.shard.subscribers), {self.identity})
+        successor = self.process()
+        self.poll(successor)
+        self.assertIn(self.KEY, successor.leading)
+
+    def test_endpoints_never_serialize_their_locks_or_sockets(self):
+        leader = self.process()
+        self.poll(leader)
+        copy = pickle.loads(pickle.dumps(leader))
+        self.assertEqual((copy.leading, copy.clients, copy.unavailable), ({}, {}, None))
+
+    def test_a_consumer_reads_through_another_processes_leader(self):
+        bridge = FakeBridge()
+        connector = InformixLakeflowConnect(
+            {
+                "database": "demo",
+                "snapshot.staging.location": self._shared_state.name,
+                "lakebase.password": "test-state-password",
+                "stream.partitioned": "false",
+            }
+        )
+        connector.set_registration_scope(hashlib.sha256(b"host").hexdigest()[:32])
+        connector._bridge_instance = bridge
+        leader, follower = self.process(), self.process()
+        with mock.patch.object(informix_module, "_HOST_SHARD_ENDPOINTS", leader):
+            self.assertIsNone(
+                connector._shared_cdc_snapshot(
+                    self.table, _stream_offset(), {}, False, connector._pipeline_scope()
+                )
+            )
+        self.assertTrue(leader.leading)
+        self.shard.subscribe(self.identity, self.table, self.capture, 0, 0)
+        self.cover()
+        before = list(bridge.changes)
+
+        with mock.patch.object(informix_module, "_HOST_SHARD_ENDPOINTS", follower):
+            rows, _offset = connector._read_stream(self.table, _stream_offset(), {}, deletes=False)
+            rows = list(rows)
+
+        self.assertFalse(follower.leading)
+        self.assertEqual([row["id"] for row in rows], [7])
+        self.assertEqual(bridge.change_reads, [])
+        self.assertEqual(bridge.changes, before)
 
 
 class SharedCdcOptionTests(unittest.TestCase):

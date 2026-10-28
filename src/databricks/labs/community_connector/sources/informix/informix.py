@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import concurrent.futures
 import contextlib
+import dataclasses
 import errno
 import fnmatch
 import gzip
@@ -27,6 +28,7 @@ import re
 import secrets
 import stat
 import sys
+import tempfile
 import threading
 import time
 import zlib
@@ -289,13 +291,16 @@ _APPEND_INGESTION_OPTION = "append.only.ingestion"
 # deletes only through the separate delete flow and would merge a ``d`` row on the
 # upsert view as an upsert.
 _APPEND_DELETE_TOMBSTONES_OPTION = "append.delete.tombstones"
-# Sharded daemon-reader CDC, on by default. Set ``cdc.shared.session=false`` to opt out,
-# in which case every CDC-capable table runs its own Informix CDC session per poll -- one
+# Sharded daemon-reader CDC (see _shared_cdc_mode). ``cdc.shared.session=host``, the
+# default, shares each shard between the flow processes on one host through a leader
+# process (see the host-shared shards block after _shared_cdc_shard); ``true`` (or
+# ``process``) shares the shards only within one process; ``false`` opts out, in which
+# case every CDC-capable table runs its own Informix CDC session per poll -- one
 # connection slot and a full opensess/startcapture/activatesess/endcapture cycle each
 # microbatch, per table.
 #
-# On (the default), the tables are partitioned into K shards
-# (``cdc.shared.reader.threads``, default = ``max.concurrent.connections``). A bounded
+# When on, the tables are partitioned into K shards (``cdc.shared.reader.threads``,
+# default a quarter of ``max.concurrent.connections``, at least 1). A bounded
 # pool of K driver-resident daemon threads -- one per shard -- each holds a single
 # shared CDC session multiplexing just its shard's subset of tables, reads the log
 # once, and fans the assembled transactions out to per-table in-memory buffers. The
@@ -6538,6 +6543,478 @@ def _shared_cdc_shard(
         return shard
 
 
+# Host-shared shards (cdc.shared.session=host, the default). Serverless SDP runs each
+# streaming flow's driver-side reader in its own Python process, all in one container on
+# the driver host, so a process-local shard serves only its own flow's table and every
+# flow opens its own CDC session. In host mode the first process to lock a shard's lock
+# file leads it: it runs the shard and its reader thread exactly as process mode does,
+# and serves the other flow processes' polls over a Unix socket in the local temp
+# directory. A follower that can't reach the leader tries to take the lock, which the
+# kernel releases when the leader's process exits, and otherwise reads directly for that
+# poll, as any flow does while its shard isn't ready. A new leader starts an empty shard,
+# which its subscribers cover again from their own checkpoints, as after a restart.
+_SHARED_CDC_SESSION_HOST = "host"
+_SHARED_CDC_SESSION_PROCESS = "process"
+_SHARED_CDC_SESSION_OFF = "off"
+# How long a follower waits to connect to the leader, or for it to answer one poll,
+# before reading directly.
+_HOST_SHARD_REPLY_SECONDS = 60.0
+# Consecutive accept failures after which a leader gives its shard up to another process.
+_HOST_SHARD_ACCEPT_FAILURES = 8
+_HOST_SHARD_TABLE_COLUMN_FIELDS = ("columns", "catalog_columns", "unsupported_columns")
+
+
+def _shared_cdc_mode(options: dict[str, str]) -> str:
+    # Docstring: ``cdc.shared.session`` as host (the default), process, or off.
+    #
+    # ``true`` keeps its old meaning, one shard registry per process; ``host`` shares the
+    # shards between the flow processes on one host.
+
+    value = options.get(_SHARED_CDC_SESSION_OPTION)
+    if value is None:
+        return _SHARED_CDC_SESSION_HOST
+    normalized = value.strip().lower()
+    if normalized == _SHARED_CDC_SESSION_HOST:
+        return _SHARED_CDC_SESSION_HOST
+    if normalized in {"1", "true", "yes", _SHARED_CDC_SESSION_PROCESS}:
+        return _SHARED_CDC_SESSION_PROCESS
+    if normalized in {"0", "false", "no"}:
+        return _SHARED_CDC_SESSION_OFF
+    raise ValueError(
+        f"Option '{_SHARED_CDC_SESSION_OPTION}' must be one of: host, true (or process), false"
+    )
+
+
+class _HostShardEndpoints:
+    # Docstring: This process's part in each host-shared shard: the lock and listener of a
+    # shard it leads, or its connection to the leader of one it follows.
+    #
+    # Never serialized: a worker that unpickles a reader starts with no roles of its own.
+
+    def __init__(self, directory: str | None = None) -> None:
+        self.lock = threading.Lock()
+        self.directory = directory
+        # key -> {"lock_fd", "listener", "reader_factory", "remote"}: "remote" holds the
+        # identities served over the socket, evicted from the shard if it is given up.
+        self.leading: dict[tuple, dict[str, Any]] = {}
+        self.clients: dict[tuple, Any] = {}
+        self.client_locks: dict[tuple, threading.Lock] = {}
+        # (key, identity) -> (checkpoint commit LSN, transactions) a follower holds from
+        # its earlier polls, so the leader sends each transaction only once.
+        self.mirrors: dict[tuple, tuple[int, tuple]] = {}
+        # Set when this process can't lock or serve a shard at all, so it shares in
+        # process mode instead of reading directly on every poll.
+        self.unavailable: str | None = None
+
+    def __getstate__(self) -> dict[str, object]:
+        return {}
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        del state
+        self.__init__()
+
+    def paths(self, key: tuple) -> tuple[str, str, str]:
+        # Docstring: The shard's (lock, socket, auth key) paths, short enough for AF_UNIX.
+        #
+        # Whoever can write the directory could serve forged CDC rows, so one that isn't
+        # this user's alone raises, which turns host sharing off in this process.
+
+        directory = self.directory or os.path.join(
+            tempfile.gettempdir(), f"informix-cdc-shards-{os.getuid()}"
+        )
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        info = os.lstat(directory)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise PermissionError(f"{directory} is not a directory only this user can access")
+        digest = hashlib.sha256(repr(key).encode()).hexdigest()[:24]
+        base = os.path.join(directory, digest)
+        return f"{base}.lock", f"{base}.sock", f"{base}.key"
+
+
+_HOST_SHARD_ENDPOINTS = _HostShardEndpoints()
+
+
+def _wire_table(table: Table) -> dict[str, Any]:
+    # Docstring: ``table`` as plain data. The merged deployment defines Table inside a
+    # function, so it can't be pickled by name between processes; Table(**fields) rebuilds it.
+
+    data = {}
+    for item in dataclasses.fields(table):
+        value = getattr(table, item.name)
+        if item.name in _HOST_SHARD_TABLE_COLUMN_FIELDS:
+            value = [dataclasses.asdict(column) for column in value]
+        data[item.name] = value
+    return data
+
+
+def _unwire_table(data: dict[str, Any]) -> Table:
+    fields = dict(data)
+    for name in _HOST_SHARD_TABLE_COLUMN_FIELDS:
+        fields[name] = tuple(Column(**column) for column in fields[name])
+    return Table(**fields)
+
+
+def _wire_view(view: "_SharedCdcSnapshot") -> dict[str, Any]:
+    # Docstring: A shard view as plain data; its records already are (decoded CDC values).
+
+    return {
+        "table": _wire_table(view.table),
+        "fingerprint": view.fingerprint,
+        "min_lsn": view.min_lsn,
+        "current_lsn": view.current_lsn,
+        "committed": [
+            (tx.tx_id, tx.begin_lsn, tx.commit_lsn, tx.restart_lsn, tx.records, tx.commit_time)
+            for tx in view.committed
+        ],
+        "caught_up": view.caught_up,
+        "open_begin": view.open_begin,
+        "reached_lsn": view.reached_lsn,
+    }
+
+
+def _unwire_view(data: dict[str, Any]) -> "_SharedCdcSnapshot":
+    return _SharedCdcSnapshot(
+        table=_unwire_table(data["table"]),
+        fingerprint=data["fingerprint"],
+        min_lsn=data["min_lsn"],
+        current_lsn=data["current_lsn"],
+        committed=[CommittedTransaction(*tx) for tx in data["committed"]],
+        caught_up=data["caught_up"],
+        open_begin=data["open_begin"],
+        reached_lsn=data["reached_lsn"],
+    )
+
+
+def _host_shard_local_poll(key, reader_factory, config, identity, table, capture, commit, floor):
+    # Docstring: Subscribe to and read this process's own shard, as process mode does.
+
+    shard = _shared_cdc_shard(key, reader_factory=reader_factory, **config)
+    shard.subscribe(identity, table, capture, commit, floor)
+    return shard.snapshot(identity, commit)
+
+
+def _host_shard_socket_timeouts(sock) -> None:
+    # Docstring: Bound each blocking send and receive on ``sock`` by the reply timeout.
+    #
+    # Kernel timeouts rather than ``socket.settimeout``, which would make the descriptor
+    # non-blocking, which Connection's reads don't expect.
+
+    import socket
+    import struct
+
+    seconds = _HOST_SHARD_REPLY_SECONDS
+    timeval = struct.pack("ll", int(seconds), int(seconds % 1 * 1_000_000))
+    sock.setblocking(True)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVTIMEO, timeval)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, timeval)
+
+
+def _host_shard_serve(
+    endpoints: _HostShardEndpoints, key: tuple, connection, authkey: bytes
+) -> None:
+    # Docstring: Authenticate one follower, then answer its polls until it disconnects.
+    #
+    # The handshake runs here, not in the accept thread, so a follower that stalls in
+    # it holds up only itself. The handshake and each message are bounded like the
+    # follower's; the wait for its next poll is not, as a follower may poll rarely.
+
+    import multiprocessing.connection
+    import socket
+
+    try:
+        try:
+            # A duplicate descriptor shares the socket, and so its options.
+            with socket.fromfd(connection.fileno(), socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                _host_shard_socket_timeouts(sock)
+            multiprocessing.connection.deliver_challenge(connection, authkey)
+            multiprocessing.connection.answer_challenge(connection, authkey)
+        except Exception:  # noqa: BLE001 - a failed or broken handshake
+            return
+        while True:
+            try:
+                connection.poll(None)
+                request = connection.recv()
+            except (EOFError, OSError):
+                return
+            leading = endpoints.leading.get(key)
+            if leading is None:
+                # No longer this process's shard: hang up, so the follower takes over.
+                return
+            try:
+                leading["remote"].add(request["identity"])
+                view = _host_shard_local_poll(
+                    key,
+                    leading["reader_factory"],
+                    request["config"],
+                    request["identity"],
+                    _unwire_table(request["table"]),
+                    request["capture"],
+                    request["commit"],
+                    request["floor"],
+                )
+                after = request.get("after")
+                if view is not None and after is not None:
+                    # The follower already holds every transaction up to ``after``.
+                    view = replace(
+                        view, committed=[tx for tx in view.committed if tx.commit_lsn > after]
+                    )
+                reply = ("ok", None if view is None else _wire_view(view))
+            except Exception as error:  # noqa: BLE001 - the follower reads directly instead
+                reply = ("error", f"{type(error).__name__}: {error}"[:500])
+            try:
+                try:
+                    connection.send(reply)
+                except (OSError, ValueError):
+                    raise
+                except Exception as error:  # noqa: BLE001 - e.g. a value that doesn't pickle
+                    connection.send(("error", f"{type(error).__name__}: {error}"[:500]))
+            except (OSError, ValueError):
+                return
+    finally:
+        with contextlib.suppress(OSError):
+            connection.close()
+
+
+def _host_shard_accept(
+    endpoints: _HostShardEndpoints, key: tuple, listener, authkey: bytes
+) -> None:
+    # Docstring: Accept followers while this process leads the shard.
+    #
+    # Accept failing again and again (out of descriptors, say) gives the shard up:
+    # the socket goes while the lock is still held, so it can't remove a successor's,
+    # then the lock, so another process can lead.
+
+    failures = 0
+    while True:
+        try:
+            connection = listener.accept()
+        except Exception as error:  # noqa: BLE001 - retried, then the shard is given up
+            if key not in endpoints.leading:
+                return
+            failures += 1
+            logging.getLogger(__name__).warning(
+                "Host-shared CDC shard %s-%s could not accept a follower (%s)",
+                key[-2],
+                key[-1],
+                error,
+            )
+            if failures < _HOST_SHARD_ACCEPT_FAILURES:
+                time.sleep(min(5.0, 0.05 * 2**failures))
+                continue
+            with endpoints.lock:
+                leading = endpoints.leading.pop(key, None)
+            if leading is not None:
+                with contextlib.suppress(OSError):
+                    leading["listener"].close()
+                os.close(leading["lock_fd"])
+                # The successor reads the followers' tables now; keep only this
+                # process's own subscribers rather than reading them twice until the TTL.
+                shard = _SHARED_CDC_SHARDS.get(key)
+                for identity in list(leading["remote"]) if shard is not None else ():
+                    shard.evict(identity)
+                logging.getLogger(__name__).warning(
+                    "Process %s gave up host-shared CDC shard %s-%s", os.getpid(), key[-2], key[-1]
+                )
+            return
+        failures = 0
+        if key not in endpoints.leading:
+            connection.close()
+            return
+        threading.Thread(
+            target=_host_shard_serve,
+            args=(endpoints, key, connection, authkey),
+            daemon=True,
+            name=f"informix-host-shard-serve-{key[-2]}-{key[-1]}",
+        ).start()
+
+
+def _host_shard_try_lead(
+    endpoints: _HostShardEndpoints, key: tuple, reader_factory, config: dict[str, Any]
+) -> bool:
+    # Docstring: Lead the shard if no other process holds its lock; True when this one does.
+    #
+    # The auth key is written before the listener exists, and only a process holding the
+    # lock replaces the socket, so a stale socket file of a dead leader is never live.
+    # An error other than the lock being taken -- an unusable directory included --
+    # marks host sharing unavailable here, so this process shares within itself.
+
+    import fcntl
+    import multiprocessing.connection
+
+    with endpoints.lock:
+        if key in endpoints.leading:
+            return True
+        if endpoints.unavailable:
+            return False
+        descriptor = None
+        try:
+            lock_path, socket_path, key_path = endpoints.paths(key)
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(descriptor)
+                return False
+            authkey = secrets.token_bytes(32)
+            staged = f"{key_path}.{secrets.token_hex(8)}"
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW
+            with open(os.open(staged, flags, 0o600), "wb") as out:
+                out.write(authkey)
+            os.replace(staged, key_path)
+            if os.path.lexists(socket_path):
+                os.unlink(socket_path)
+            # Followers connect all at once when an update starts: queue them.
+            listener = multiprocessing.connection.Listener(
+                socket_path, family="AF_UNIX", backlog=128
+            )
+        except OSError as error:
+            if descriptor is not None:
+                os.close(descriptor)
+            endpoints.unavailable = f"{type(error).__name__}: {error}"
+            logging.getLogger(__name__).warning(
+                "Host-shared CDC shards are unavailable in process %s (%s); sharing within "
+                "the process instead",
+                os.getpid(),
+                endpoints.unavailable,
+            )
+            return False
+        endpoints.leading[key] = {
+            "lock_fd": descriptor,
+            "listener": listener,
+            "reader_factory": reader_factory,
+            "remote": set(),
+        }
+    _shared_cdc_shard(key, reader_factory=reader_factory, **config)
+    threading.Thread(
+        target=_host_shard_accept,
+        args=(endpoints, key, listener, authkey),
+        daemon=True,
+        name=f"informix-host-shard-{key[-2]}-{key[-1]}",
+    ).start()
+    logging.getLogger(__name__).info(
+        "Process %s leads host-shared CDC shard %s-%s", os.getpid(), key[-2], key[-1]
+    )
+    return True
+
+
+def _host_shard_request(endpoints: _HostShardEndpoints, key: tuple, request: dict[str, Any]):
+    # Docstring: Send one poll to the shard's leader over this process's connection to it.
+    #
+    # Connecting, the handshake and every send and receive time out, so a leader that
+    # holds its lock but stops serving can't hang the poll.
+
+    import multiprocessing.connection
+    import socket
+
+    with endpoints.lock:
+        guard = endpoints.client_locks.setdefault(key, threading.Lock())
+    with guard:
+        connection = endpoints.clients.get(key)
+        if connection is None:
+            _lock_path, socket_path, key_path = endpoints.paths(key)
+            with open(key_path, "rb") as handle:
+                authkey = handle.read()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                _host_shard_socket_timeouts(sock)
+                sock.connect(socket_path)
+                connection = multiprocessing.connection.Connection(sock.detach())
+            try:
+                multiprocessing.connection.answer_challenge(connection, authkey)
+                multiprocessing.connection.deliver_challenge(connection, authkey)
+            except BaseException:
+                connection.close()
+                raise
+            endpoints.clients[key] = connection
+        try:
+            connection.send(request)
+            if not connection.poll(_HOST_SHARD_REPLY_SECONDS):
+                raise TimeoutError("the host shard leader did not answer the poll")
+            return connection.recv()
+        except BaseException:
+            endpoints.clients.pop(key, None)
+            try:
+                connection.close()
+            except OSError:
+                pass
+            raise
+
+
+def _host_shard_poll(
+    key,
+    reader_factory,
+    config,
+    identity,
+    table,
+    capture,
+    commit,
+    floor,
+    endpoints: _HostShardEndpoints | None = None,
+):
+    # Docstring: A host-shared shard's view for one consumer poll, or None to read directly.
+    #
+    # Leads the shard when nobody does, polls the leader otherwise, and takes over when
+    # the leader is gone. Where the host can't share at all, shares within the process.
+
+    endpoints = _HOST_SHARD_ENDPOINTS if endpoints is None else endpoints
+    local = (key, reader_factory, config, identity, table, capture, commit, floor)
+    # The leader sends only transactions after those this follower holds from earlier
+    # polls, so each crosses the socket once. A checkpoint moved back past them, or a
+    # poll without a view, starts over with the whole buffer; leading drops them.
+    held_commit, held = endpoints.mirrors.pop((key, identity), (commit, ()))
+    if key in endpoints.leading or endpoints.unavailable:
+        return _host_shard_local_poll(*local)
+    if (
+        key not in endpoints.clients
+        and _host_shard_try_lead(endpoints, key, reader_factory, config)
+    ) or endpoints.unavailable:
+        return _host_shard_local_poll(*local)
+    if held_commit > commit:
+        held = ()
+    request = {
+        "config": config,
+        "identity": identity,
+        "table": _wire_table(table),
+        "capture": capture,
+        "commit": commit,
+        "floor": floor,
+        "after": held[-1].commit_lsn if held else None,
+    }
+    try:
+        status, payload = _host_shard_request(endpoints, key, request)
+    except (OSError, EOFError, TimeoutError, ValueError) as error:
+        if _host_shard_try_lead(endpoints, key, reader_factory, config) or endpoints.unavailable:
+            return _host_shard_local_poll(*local)
+        logging.getLogger(__name__).debug(
+            "Host-shared CDC shard %s-%s leader unreachable (%s); reading directly",
+            key[-2],
+            key[-1],
+            error,
+        )
+        return None
+    except Exception as error:  # noqa: BLE001 - e.g. a failed auth handshake
+        logging.getLogger(__name__).debug(
+            "Host-shared CDC shard %s-%s poll failed (%s); reading directly",
+            key[-2],
+            key[-1],
+            error,
+        )
+        return None
+    if status != "ok":
+        logging.getLogger(__name__).warning(
+            "Host-shared CDC shard %s-%s leader refused a poll (%s); reading directly",
+            key[-2],
+            key[-1],
+            payload,
+        )
+        return None
+    if payload is None:
+        return None
+    view = _unwire_view(payload)
+    committed = [tx for tx in held if tx.commit_lsn > commit] + view.committed
+    endpoints.mirrors[(key, identity)] = (commit, tuple(committed))
+    return replace(view, committed=committed)
+
+
 def _table_id(table: Table) -> int | None:
     # Docstring: The Informix table ID a catalog read recorded as ``table.incarnation``.
 
@@ -7173,7 +7650,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # Validate boolean capacity options eagerly (they are otherwise only
         # checked on first read, deep inside a running flow).
         _option_bool(options, "snapshot.incremental.blocking", True)
-        shared_cdc_enabled = _option_bool(options, _SHARED_CDC_SESSION_OPTION, True)
+        shared_cdc_enabled = _shared_cdc_mode(options) != _SHARED_CDC_SESSION_OFF
         _option_bool(options, _SNAPSHOT_SHARED_SESSION_OPTION, True)
         _option_bool(options, _CONNECTION_FAIR_QUEUE_OPTION, True)
         _option_bool(options, _SNAPSHOT_DRAIN_SLOT_LIVENESS_OPTION, True)
@@ -7210,13 +7687,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # than corrupt data silently. There is no silent fallback.
         if partitioned_enabled and not shared_cdc_enabled:
             raise ValueError(
-                f"Option '{_PARTITIONED_STREAM_OPTION}=true' (the default) requires "
-                f"'{_SHARED_CDC_SESSION_OPTION}=true'. Partitioned streaming recomputes "
+                f"Option '{_PARTITIONED_STREAM_OPTION}=true' (the default) requires a shared "
+                f"CDC session ('{_SHARED_CDC_SESSION_OPTION}=host', the default, or 'true'). "
+                "Partitioned streaming recomputes "
                 "an embedded CDC microbatch from its committed start offset when Spark "
                 "replays an uncommitted batch, which is only deterministic with the "
                 "shared CDC session's idempotent reads; with the shared session off, a "
                 "live per-table re-read can duplicate or drop CDC rows on replay. "
-                f"Enable '{_SHARED_CDC_SESSION_OPTION}=true', or set "
+                f"Set '{_SHARED_CDC_SESSION_OPTION}' to 'host' or 'true', or set "
                 f"'{_PARTITIONED_STREAM_OPTION}=false'."
             )
         staging_transport = (
@@ -12874,7 +13352,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 attempt += 1
 
     def _shared_cdc_enabled(self) -> bool:
-        return _option_bool(self.options, _SHARED_CDC_SESSION_OPTION, True)
+        return _shared_cdc_mode(self.options) != _SHARED_CDC_SESSION_OFF
 
     def _snapshot_cursor_scan(self, options: dict[str, str]) -> bool:
         # Docstring: Whether ``snapshot.scan=cursor`` asks for an unordered one-pass snapshot.
@@ -13053,22 +13531,34 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         capture = _capture_descriptor(table, _client_encoding(self.options))
         checkpoint_commit = int(checkpoint["commit_lsn"])
         floor = int(checkpoint.get("begin_lsn") or checkpoint["commit_lsn"])
-        shard = _shared_cdc_shard(
-            key,
-            reader_factory=self._shared_cdc_reader_factory(channel),
-            timeout_seconds=self._table_int_option(options, "cdc.timeout", 5, minimum=1),
-            max_records=self._table_int_option(
+        config = {
+            "timeout_seconds": self._table_int_option(options, "cdc.timeout", 5, minimum=1),
+            "max_records": self._table_int_option(
                 options, "cdc.max.records", _DEFAULT_CDC_MAX_RECORDS, minimum=1, maximum=256
             ),
-            buffer_cap=int(
+            "buffer_cap": int(
                 self.options.get(_SHARED_CDC_BUFFER_OPTION, str(_DEFAULT_SHARED_CDC_BUFFER))
             ),
-            subscriber_ttl=float(
+            "subscriber_ttl": float(
                 self.options.get("cdc.shared.state.wait.seconds", str(_SHARED_STATE_WAIT_SECONDS))
             ),
-        )
-        shard.subscribe(table.native_identity, table, capture, checkpoint_commit, floor)
-        view = shard.snapshot(table.native_identity, checkpoint_commit)
+        }
+        reader_factory = self._shared_cdc_reader_factory(channel)
+        if _shared_cdc_mode(self.options) == _SHARED_CDC_SESSION_HOST:
+            view = _host_shard_poll(
+                key,
+                reader_factory,
+                config,
+                table.native_identity,
+                table,
+                capture,
+                checkpoint_commit,
+                floor,
+            )
+        else:
+            shard = _shared_cdc_shard(key, reader_factory=reader_factory, **config)
+            shard.subscribe(table.native_identity, table, capture, checkpoint_commit, floor)
+            view = shard.snapshot(table.native_identity, checkpoint_commit)
         if view is None:
             return None
         # A fingerprint mismatch means a schema transition is in flight; defer to the
