@@ -4,32 +4,32 @@
    "name": "ds_summary",
    "displayName": "Latest run summary",
    "queryLines": [
-    "WITH latest AS ( SELECT run_id FROM events WHERE kind = 'start' AND message NOT LIKE '%smoke=True%' ",
-    "ORDER BY run_id DESC LIMIT 1) , ev AS (SELECT e.* FROM events e JOIN latest USING (run_id)), ",
-    "cy AS (SELECT c.* FROM cycles c JOIN latest USING (run_id)) SELECT l.run_id, (SELECT min(at) ",
-    "FROM ev) AS started_at, CAST(regexp_extract((SELECT max(message) FROM ev WHERE kind = 'start'), ",
-    "': ([0-9]+) cycles', 1) AS INT) AS cycles_planned, (SELECT count(*) FROM cy) AS cycles_done, ",
-    "(SELECT count_if(verdict = 'MATCH') FROM cy) AS matched, (SELECT count_if(verdict <> 'MATCH') ",
-    "FROM cy) AS mismatched, (SELECT count_if(extra_run) FROM cy) AS extra_runs, (SELECT count(*) ",
-    "FROM ev WHERE kind = 'ended' AND message LIKE '%FAILED') AS failed_updates, (SELECT max(cycle) ",
-    "FROM ev) AS current_cycle, (SELECT max(at) FROM ev) AS last_event_at, (SELECT max_by(message, ",
-    "at) FROM ev) AS last_event, round((unix_timestamp(current_timestamp()) - unix_timestamp((SELECT ",
-    "max(at) FROM ev))) / 60, 1) AS minutes_since_last_event, CASE WHEN (SELECT count(*) FROM ev ",
-    "WHERE kind = 'summary') > 0 THEN 'Finished' WHEN unix_timestamp(current_timestamp()) - unix_timestamp((SELECT ",
-    "max(at) FROM ev)) > 1800 THEN 'No events for 30+ min: check the job run' ELSE 'Running' END ",
-    "AS status FROM latest l "
+    "WITH latest AS ( SELECT run_id FROM main.informix_cycles.events WHERE kind = 'start' AND message ",
+    "NOT LIKE '%smoke=True%' ORDER BY run_id DESC LIMIT 1) , ev AS (SELECT e.* FROM main.informix_cycles.events ",
+    "e JOIN latest USING (run_id)), cy AS (SELECT c.* FROM main.informix_cycles.cycles c JOIN latest ",
+    "USING (run_id)) SELECT l.run_id, (SELECT min(at) FROM ev) AS started_at, CAST(regexp_extract((SELECT ",
+    "max(message) FROM ev WHERE kind = 'start'), ': ([0-9]+) cycles', 1) AS INT) AS cycles_planned, ",
+    "(SELECT count(*) FROM cy) AS cycles_done, (SELECT count_if(verdict = 'MATCH') FROM cy) AS matched, ",
+    "(SELECT count_if(verdict <> 'MATCH') FROM cy) AS mismatched, (SELECT count_if(extra_run) FROM ",
+    "cy) AS extra_runs, (SELECT count(*) FROM ev WHERE kind = 'ended' AND message LIKE '%FAILED') ",
+    "AS failed_updates, (SELECT max(cycle) FROM ev) AS current_cycle, (SELECT max(at) FROM ev) AS ",
+    "last_event_at, (SELECT max_by(message, at) FROM ev) AS last_event, round((unix_timestamp(current_timestamp()) ",
+    "- unix_timestamp((SELECT max(at) FROM ev))) / 60, 1) AS minutes_since_last_event, CASE WHEN ",
+    "(SELECT count(*) FROM ev WHERE kind = 'summary') > 0 THEN 'Finished' WHEN unix_timestamp(current_timestamp()) ",
+    "- unix_timestamp((SELECT max(at) FROM ev)) > 1800 THEN 'No events for 30+ min: check the job ",
+    "run' ELSE 'Running' END AS status FROM latest l "
    ]
   },
   {
    "name": "ds_cycles",
    "displayName": "Latest run cycles",
    "queryLines": [
-    "WITH latest AS ( SELECT run_id FROM events WHERE kind = 'start' AND message NOT LIKE '%smoke=True%' ",
-    "ORDER BY run_id DESC LIMIT 1) SELECT c.cycle, concat('Cycle ', c.cycle) AS cycle_label, c.verdict, ",
-    "c.extra_run, st.cycle_started_at, c.at AS finished_at, round((unix_timestamp(c.at) - unix_timestamp(st.cycle_started_at)) ",
-    "/ 60, 1) AS minutes, CAST(regexp_extract(c.first_count, 'TOTAL ([0-9]+) ([0-9]+) ([-+]?[0-9]+) ",
-    "([0-9]+)', 3) AS BIGINT) AS first_count_diff, CAST(regexp_extract(c.first_count, 'TOTAL ([0-9]+) ",
-    "([0-9]+) ([-+]?[0-9]+) ([0-9]+)', 4) AS INT) AS first_tables_differing, CAST(regexp_extract(c.final_count, ",
+    "WITH latest AS ( SELECT run_id FROM main.informix_cycles.events WHERE kind = 'start' AND message ",
+    "NOT LIKE '%smoke=True%' ORDER BY run_id DESC LIMIT 1) SELECT c.cycle, concat('Cycle ', c.cycle) ",
+    "AS cycle_label, c.verdict, c.extra_run, st.cycle_started_at, c.at AS finished_at, round((unix_timestamp(c.at) ",
+    "- unix_timestamp(st.cycle_started_at)) / 60, 1) AS minutes, CAST(regexp_extract(c.first_count, ",
+    "'TOTAL ([0-9]+) ([0-9]+) ([-+]?[0-9]+) ([0-9]+)', 3) AS BIGINT) AS first_count_diff, CAST(regexp_extract(c.first_count, ",
+    "'TOTAL ([0-9]+) ([0-9]+) ([-+]?[0-9]+) ([0-9]+)', 4) AS INT) AS first_tables_differing, CAST(regexp_extract(c.final_count, ",
     "'TOTAL ([0-9]+) ([0-9]+) ([-+]?[0-9]+) ([0-9]+)', 3) AS BIGINT) AS final_count_diff, CAST(regexp_extract(c.final_count, ",
     "'TOTAL ([0-9]+) ([0-9]+) ([-+]?[0-9]+) ([0-9]+)', 4) AS INT) AS final_tables_differing, CAST(regexp_extract(c.final_count, ",
     "'TOTAL ([0-9]+) ([0-9]+) ([-+]?[0-9]+) ([0-9]+)', 1) AS BIGINT) AS informix_rows, CAST(regexp_extract(c.final_count, ",
@@ -39,38 +39,38 @@
     "1) AS BIGINT) AS mismatched_rows, CAST(regexp_extract(c.data_compare, 'duplicate_source_keys=([0-9]+)', ",
     "1) AS BIGINT) + CAST(regexp_extract(c.data_compare, 'duplicate_destination_keys=([0-9]+)', ",
     "1) AS BIGINT) AS duplicate_keys, nullif(regexp_extract(c.data_compare, 'tables with differences: ",
-    "(.*)$', 1), '') AS tables_with_differences FROM cycles c JOIN latest l ON l.run_id = c.run_id ",
-    "LEFT JOIN (SELECT run_id, cycle, min(at) AS cycle_started_at FROM events WHERE kind = 'cycle' ",
-    "AND message LIKE 'cycle % starting' GROUP BY run_id, cycle) st ON st.run_id = c.run_id AND ",
-    "st.cycle = c.cycle ORDER BY c.cycle "
+    "(.*)$', 1), '') AS tables_with_differences FROM main.informix_cycles.cycles c JOIN latest l ",
+    "ON l.run_id = c.run_id LEFT JOIN (SELECT run_id, cycle, min(at) AS cycle_started_at FROM main.informix_cycles.events ",
+    "WHERE kind = 'cycle' AND message LIKE 'cycle % starting' GROUP BY run_id, cycle) st ON st.run_id ",
+    "= c.run_id AND st.cycle = c.cycle ORDER BY c.cycle "
    ]
   },
   {
    "name": "ds_updates",
    "displayName": "Latest run pipeline updates",
    "queryLines": [
-    "WITH latest AS ( SELECT run_id FROM events WHERE kind = 'start' AND message NOT LIKE '%smoke=True%' ",
-    "ORDER BY run_id DESC LIMIT 1) , s AS (SELECT run_id, cycle, at AS started_at, regexp_extract(message, ",
-    "'^(run [0-9]+|extra run):', 1) AS run_label, regexp_extract(message, 'started (.+) update ', ",
-    "1) AS update_type, regexp_extract(message, '([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', ",
-    "1) AS update_id FROM events WHERE kind = 'started'), x AS (SELECT run_id, at AS ended_at, regexp_extract(message, ",
-    "'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', 1) AS update_id, regexp_extract(message, ",
-    "'(COMPLETED|FAILED|CANCELED)$', 1) AS final_state, message LIKE '%ended before%' AS ended_early ",
-    "FROM events WHERE kind = 'ended') SELECT s.cycle, concat('Cycle ', s.cycle) AS cycle_label, ",
-    "s.run_label, s.update_type, s.update_id, s.started_at, x.ended_at, coalesce(x.final_state, ",
-    "'RUNNING') AS state, coalesce(x.ended_early, false) AS ended_early, round((unix_timestamp(coalesce(x.ended_at, ",
-    "current_timestamp())) - unix_timestamp(s.started_at)) / 60, 1) AS minutes FROM s JOIN latest ",
-    "l ON l.run_id = s.run_id LEFT JOIN x ON x.run_id = s.run_id AND x.update_id = s.update_id ORDER ",
-    "BY s.started_at "
+    "WITH latest AS ( SELECT run_id FROM main.informix_cycles.events WHERE kind = 'start' AND message ",
+    "NOT LIKE '%smoke=True%' ORDER BY run_id DESC LIMIT 1) , s AS (SELECT run_id, cycle, at AS started_at, ",
+    "regexp_extract(message, '^(run [0-9]+|extra run):', 1) AS run_label, regexp_extract(message, ",
+    "'started (.+) update ', 1) AS update_type, regexp_extract(message, '([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', ",
+    "1) AS update_id FROM main.informix_cycles.events WHERE kind = 'started'), x AS (SELECT run_id, ",
+    "at AS ended_at, regexp_extract(message, '([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', ",
+    "1) AS update_id, regexp_extract(message, '(COMPLETED|FAILED|CANCELED)$', 1) AS final_state, ",
+    "message LIKE '%ended before%' AS ended_early FROM main.informix_cycles.events WHERE kind = ",
+    "'ended') SELECT s.cycle, concat('Cycle ', s.cycle) AS cycle_label, s.run_label, s.update_type, ",
+    "s.update_id, s.started_at, x.ended_at, coalesce(x.final_state, 'RUNNING') AS state, coalesce(x.ended_early, ",
+    "false) AS ended_early, round((unix_timestamp(coalesce(x.ended_at, current_timestamp())) - unix_timestamp(s.started_at)) ",
+    "/ 60, 1) AS minutes FROM s JOIN latest l ON l.run_id = s.run_id LEFT JOIN x ON x.run_id = s.run_id ",
+    "AND x.update_id = s.update_id ORDER BY s.started_at "
    ]
   },
   {
    "name": "ds_events",
    "displayName": "Latest run events",
    "queryLines": [
-    "WITH latest AS ( SELECT run_id FROM events WHERE kind = 'start' AND message NOT LIKE '%smoke=True%' ",
-    "ORDER BY run_id DESC LIMIT 1) SELECT e.at, e.cycle, e.kind, e.message FROM events e JOIN latest ",
-    "l ON l.run_id = e.run_id ORDER BY e.at DESC "
+    "WITH latest AS ( SELECT run_id FROM main.informix_cycles.events WHERE kind = 'start' AND message ",
+    "NOT LIKE '%smoke=True%' ORDER BY run_id DESC LIMIT 1) SELECT e.at, e.cycle, e.kind, e.message ",
+    "FROM main.informix_cycles.events e JOIN latest l ON l.run_id = e.run_id ORDER BY e.at DESC "
    ]
   },
   {
@@ -79,14 +79,15 @@
    "queryLines": [
     "WITH r AS (SELECT run_id, min(at) AS started_at, max(at) AS last_event_at, max(CASE WHEN kind ",
     "= 'start' THEN message END) AS start_message, count_if(kind = 'summary') > 0 AS finished FROM ",
-    "events GROUP BY run_id), c AS (SELECT run_id, count(*) AS cycles_done, count_if(verdict = 'MATCH') ",
-    "AS matched, count_if(verdict <> 'MATCH') AS mismatched, count_if(extra_run) AS extra_runs FROM ",
-    "cycles GROUP BY run_id) SELECT r.run_id, r.started_at, r.last_event_at, CASE WHEN r.start_message ",
-    "LIKE '%smoke=True%' THEN 'smoke' ELSE 'full' END AS run_type, CAST(regexp_extract(r.start_message, ",
-    "': ([0-9]+) cycles', 1) AS INT) AS cycles_planned, coalesce(c.cycles_done, 0) AS cycles_done, ",
-    "coalesce(c.matched, 0) AS matched, coalesce(c.mismatched, 0) AS mismatched, coalesce(c.extra_runs, ",
-    "0) AS extra_runs, CASE WHEN r.finished THEN 'Finished' ELSE 'Not finished' END AS status FROM ",
-    "r LEFT JOIN c ON c.run_id = r.run_id ORDER BY r.run_id DESC "
+    "main.informix_cycles.events GROUP BY run_id), c AS (SELECT run_id, count(*) AS cycles_done, ",
+    "count_if(verdict = 'MATCH') AS matched, count_if(verdict <> 'MATCH') AS mismatched, count_if(extra_run) ",
+    "AS extra_runs FROM main.informix_cycles.cycles GROUP BY run_id) SELECT r.run_id, r.started_at, ",
+    "r.last_event_at, CASE WHEN r.start_message LIKE '%smoke=True%' THEN 'smoke' ELSE 'full' END ",
+    "AS run_type, CAST(regexp_extract(r.start_message, ': ([0-9]+) cycles', 1) AS INT) AS cycles_planned, ",
+    "coalesce(c.cycles_done, 0) AS cycles_done, coalesce(c.matched, 0) AS matched, coalesce(c.mismatched, ",
+    "0) AS mismatched, coalesce(c.extra_runs, 0) AS extra_runs, CASE WHEN r.finished THEN 'Finished' ",
+    "ELSE 'Not finished' END AS status FROM r LEFT JOIN c ON c.run_id = r.run_id ORDER BY r.run_id ",
+    "DESC "
    ]
   },
   {
@@ -107,10 +108,10 @@
     "1) AS BIGINT) AS mismatched_rows, CAST(regexp_extract(c.data_compare, 'duplicate_source_keys=([0-9]+)', ",
     "1) AS BIGINT) + CAST(regexp_extract(c.data_compare, 'duplicate_destination_keys=([0-9]+)', ",
     "1) AS BIGINT) AS duplicate_keys, nullif(regexp_extract(c.data_compare, 'tables with differences: ",
-    "(.*)$', 1), '') AS tables_with_differences FROM cycles c LEFT JOIN (SELECT run_id, cycle, min(at) ",
-    "AS cycle_started_at FROM events WHERE kind = 'cycle' AND message LIKE 'cycle % starting' GROUP ",
-    "BY run_id, cycle) st ON st.run_id = c.run_id AND st.cycle = c.cycle ORDER BY c.run_id DESC, ",
-    "c.cycle "
+    "(.*)$', 1), '') AS tables_with_differences FROM main.informix_cycles.cycles c LEFT JOIN (SELECT ",
+    "run_id, cycle, min(at) AS cycle_started_at FROM main.informix_cycles.events WHERE kind = 'cycle' ",
+    "AND message LIKE 'cycle % starting' GROUP BY run_id, cycle) st ON st.run_id = c.run_id AND ",
+    "st.cycle = c.cycle ORDER BY c.run_id DESC, c.cycle "
    ]
   }
  ],
