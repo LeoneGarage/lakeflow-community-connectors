@@ -142,7 +142,7 @@
       "name": "subtitle",
       "multilineTextboxSpec": {
        "lines": [
-        "Each cycle restarts the Informix container, then runs informix-pipeline as a triggered full refresh, a triggered update and 5 continuous updates of 5 minutes. It compares counts (with one extra 8-minute continuous run if they differ), then compares the data. From job *Informix cycles*; times are UTC."
+        "Each cycle restarts the Informix container, then runs informix-pipeline as a triggered full refresh and a triggered update of 5 minutes each, 3 continuous updates of 5 minutes and one of 10 minutes. It compares counts (with one extra 8-minute continuous run if they differ), then compares the data. From job *Informix cycles*; times are UTC."
        ]
       }
      },

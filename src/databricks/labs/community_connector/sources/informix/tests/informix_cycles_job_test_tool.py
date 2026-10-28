@@ -1,18 +1,19 @@
 # Databricks notebook source
 # Informix restart/run/compare cycles as a Databricks Job (serverless), so they run with no
 # laptop attached. Each cycle: restart the demo Informix container and wait for its CDC
-# workload; run informix-pipeline as a triggered full refresh, a triggered update and N
-# continuous updates of RUN_MINUTES each; compare counts, and if they differ run one more
-# continuous update of EXTRA_MINUTES and compare again; then compare the data.
+# workload; run informix-pipeline as a triggered full refresh and a triggered update of
+# RUN_MINUTES each, N continuous updates of RUN_MINUTES each and one more of FINAL_MINUTES;
+# compare counts, and if they differ run one more continuous update of EXTRA_MINUTES and
+# compare again; then compare the data.
 #
 # Every pipeline start and end, each cycle's verdict and the final summary go to the run's
 # output and to main.informix_cycles.events / main.informix_cycles.cycles. The Informix side
 # goes through AWS SSM on the demo host, with keys from the informix-cycles secret scope;
 # the compare tools staged next to this notebook do the Informix work exactly as on a laptop.
 #
-# Parameters: cycles, run_minutes, continuous_runs, extra_minutes, and smoke=true, which
-# checks AWS, SSM, the pipeline API, both compares and the event tables without restarting
-# the container or running the pipeline.
+# Parameters: cycles, run_minutes, continuous_runs, final_minutes (0 skips the final run),
+# extra_minutes, and smoke=true, which checks AWS, SSM, the pipeline API, both compares and
+# the event tables without restarting the container or running the pipeline.
 
 # COMMAND ----------
 import datetime as dt
@@ -25,12 +26,14 @@ import time
 
 dbutils.widgets.text("cycles", "5")
 dbutils.widgets.text("run_minutes", "5")
-dbutils.widgets.text("continuous_runs", "5")
+dbutils.widgets.text("continuous_runs", "3")
+dbutils.widgets.text("final_minutes", "10")
 dbutils.widgets.text("extra_minutes", "8")
 dbutils.widgets.dropdown("smoke", "false", ["false", "true"])
 CYCLES = int(dbutils.widgets.get("cycles"))
 RUN_SECONDS = int(float(dbutils.widgets.get("run_minutes")) * 60)
 CONTINUOUS_RUNS = int(dbutils.widgets.get("continuous_runs"))
+FINAL_SECONDS = int(float(dbutils.widgets.get("final_minutes")) * 60)
 EXTRA_SECONDS = int(float(dbutils.widgets.get("extra_minutes")) * 60)
 SMOKE = dbutils.widgets.get("smoke") == "true"
 
@@ -72,7 +75,8 @@ event(
     0,
     "start",
     f"run {RUN_ID}: {CYCLES} cycles, {CONTINUOUS_RUNS} continuous runs of "
-    f"{RUN_SECONDS // 60} min, extra run {EXTRA_SECONDS // 60} min, smoke={SMOKE}",
+    f"{RUN_SECONDS // 60} min, final run {FINAL_SECONDS // 60} min, "
+    f"extra run {EXTRA_SECONDS // 60} min, smoke={SMOKE}",
 )
 
 # COMMAND ----------
@@ -298,6 +302,13 @@ def pipeline_runs(cycle):
         update_id = start_update(cycle, f"run {run}")
         event(cycle, "started", f"run {run}: started continuous update {update_id}")
         run_for(cycle, f"run {run}", update_id, RUN_SECONDS)
+    if FINAL_SECONDS:
+        run = 3 + CONTINUOUS_RUNS
+        minutes = FINAL_SECONDS // 60
+        event(cycle, "starting", f"run {run}: starting continuous update ({minutes} min)")
+        update_id = start_update(cycle, f"run {run}")
+        event(cycle, "started", f"run {run}: started continuous update {update_id}")
+        run_for(cycle, f"run {run}", update_id, FINAL_SECONDS)
 
 
 def extra_run(cycle):
