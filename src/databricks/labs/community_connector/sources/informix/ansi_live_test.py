@@ -123,9 +123,7 @@ class ScalarTypesLiveTest(unittest.TestCase):
                 )
                 self._assert_scalar_types(snapshot_row, scalar_columns, expected)
 
-            padded_bridge = PurePythonInformixBridge(
-                {**options, "padVarchar": "true"}
-            )
+            padded_bridge = PurePythonInformixBridge({**options, "padVarchar": "true"})
             padded_rows = padded_bridge.snapshot_page(identity, columns, (), None, 100)
             for expected in (expected_snapshot, expected_null_snapshot):
                 padded_row = self._matching_row(padded_rows, expected)
@@ -142,17 +140,20 @@ class ScalarTypesLiveTest(unittest.TestCase):
                 bridge.transport.execute_command("COMMIT WORK")
 
             mutation_sql = self._required_option(options, "scalar.types.mutation.sql")
-            null_mutation_sql = self._required_option(
-                options, "scalar.types.null.mutation.sql"
-            )
+            null_mutation_sql = self._required_option(options, "scalar.types.null.mutation.sql")
             cleanup_sql = self._required_option(options, "scalar.types.cleanup.sql")
             expected_cdc = self._json_object_option(options, "scalar.types.expected.cdc")
-            expected_null_cdc = self._json_object_option(
-                options, "scalar.types.expected.null.cdc"
-            )
+            expected_null_cdc = self._json_object_option(options, "scalar.types.expected.null.cdc")
             table = Table.parse(raw_table, options["database"])
             writer = PurePythonInformixBridge(options)
+            # The writes below go straight to the transport, which the bridge only opens
+            # on its first own operation.
+            writer._ensure_connected()
             self._run_insert_smoke(writer, options)
+            # Full-row logging is enabled once, as the connector does at bootstrap:
+            # enabling it again before the second mutation stalled the demo server's CDC
+            # log reader (each call logs a DDR_SET), so later reads start at a boundary.
+            bridge.prepare_initial_capture([table.native_identity])
             for option_name, sql, expected, require_null in (
                 ("scalar.types.expected.cdc", mutation_sql, expected_cdc, False),
                 (
@@ -172,7 +173,7 @@ class ScalarTypesLiveTest(unittest.TestCase):
                         option_name,
                         _client_encoding(options),
                     )
-                start_lsn = bridge.prepare_initial_capture([table.native_identity])
+                start_lsn = bridge.boundary_lsn()
                 self._execute_committed(writer, sql)
                 records = bridge.read_changes(
                     [_capture_descriptor(table, _client_encoding(options))],
@@ -321,9 +322,7 @@ class ScalarTypesLiveTest(unittest.TestCase):
                     raise RuntimeError("duplicate fixture key")
 
         transport = Transport()
-        bridge = type(
-            "Bridge", (), {"transport": transport, "config": {"database": "demo"}}
-        )()
+        bridge = type("Bridge", (), {"transport": transport, "config": {"database": "demo"}})()
         with self.assertRaisesRegex(RuntimeError, "duplicate fixture key"):
             self._run_insert_smoke(
                 bridge,
@@ -378,9 +377,7 @@ class ScalarTypesLiveTest(unittest.TestCase):
         self._require_boundary_values(boundary, columns, "boundary", "utf-8")
         self._require_null_scalar(nulls, columns, "nulls")
         with self.assertRaisesRegex(AssertionError, "signed INT8 extreme"):
-            self._require_boundary_values(
-                {**boundary, "int8_value": 1}, columns, "bad", "utf-8"
-            )
+            self._require_boundary_values({**boundary, "int8_value": 1}, columns, "bad", "utf-8")
         with self.assertRaisesRegex(AssertionError, "every nullable scalar"):
             self._require_null_scalar({**nulls, "lvarchar_value": "x"}, columns, "bad")
         latin_columns = {**columns, "LVARCHAR": {**columns["LVARCHAR"], "length": 1}}
@@ -394,9 +391,7 @@ class ScalarTypesLiveTest(unittest.TestCase):
     def test_matching_row_compares_declared_datetime_precision_semantically(self):
         row = {"value": datetime(2026, 7, 21, 12, 34, 56, 123450)}
 
-        self.assertIs(
-            self._matching_row([row], {"value": "2026-07-21T12:34:56.12345"}), row
-        )
+        self.assertIs(self._matching_row([row], {"value": "2026-07-21T12:34:56.12345"}), row)
 
     @staticmethod
     def _required_option(options: dict[str, str], name: str) -> str:
@@ -415,8 +410,7 @@ class ScalarTypesLiveTest(unittest.TestCase):
     @classmethod
     def _contains_values(cls, row: dict[str, object], expected: dict[str, object]) -> bool:
         return all(
-            key in row and cls._values_equal(row[key], value)
-            for key, value in expected.items()
+            key in row and cls._values_equal(row[key], value) for key, value in expected.items()
         )
 
     @classmethod
@@ -426,8 +420,10 @@ class ScalarTypesLiveTest(unittest.TestCase):
                 return actual == datetime.fromisoformat(expected)
             except ValueError:
                 return False
-        if isinstance(actual, date) and not isinstance(actual, datetime) and isinstance(
-            expected, str
+        if (
+            isinstance(actual, date)
+            and not isinstance(actual, datetime)
+            and isinstance(expected, str)
         ):
             try:
                 return actual == date.fromisoformat(expected)
@@ -503,9 +499,7 @@ class ScalarTypesLiveTest(unittest.TestCase):
             if source_type == "INT8" and value not in {-(1 << 63), (1 << 63) - 1}:
                 raise AssertionError(f"{option_name}.{name} must be a signed INT8 extreme")
             if source_type == "SERIAL8" and (
-                not isinstance(value, int)
-                or isinstance(value, bool)
-                or not 1 <= value < (1 << 63)
+                not isinstance(value, int) or isinstance(value, bool) or not 1 <= value < (1 << 63)
             ):
                 raise AssertionError(
                     f"{option_name}.{name} must be a positive generated SERIAL8 value"
@@ -544,9 +538,7 @@ class ScalarTypesLiveTest(unittest.TestCase):
             value = row.get(name)
             if expected[name] is None:
                 if value is not None:
-                    raise AssertionError(
-                        f"live scalar value {name} ({source_type}) should be null"
-                    )
+                    raise AssertionError(f"live scalar value {name} ({source_type}) should be null")
                 continue
             if value is None:
                 raise AssertionError(f"live scalar value {name} ({source_type}) is null")
@@ -562,8 +554,7 @@ class ScalarTypesLiveTest(unittest.TestCase):
                 valid = isinstance(value, datetime if start == 0 and end >= 4 else str)
             if not valid:
                 raise AssertionError(
-                    f"live scalar value {name} ({source_type}) has type "
-                    f"{type(value).__name__}"
+                    f"live scalar value {name} ({source_type}) has type " f"{type(value).__name__}"
                 )
 
     @staticmethod
