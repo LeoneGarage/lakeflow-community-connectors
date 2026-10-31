@@ -8162,6 +8162,49 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(len(list(rows)), 2)
         self.assertIsNone(connector._staging_files_api)
 
+    def _rejecting_transport_read(self, transport):
+        # A keyless initial read whose first page PUT gets a 401 nothing can recover.
+        class _RejectedFilesApi:
+            rejected = False
+
+            def __init__(self, host, provider):
+                pass
+
+            def put(self, path, data):
+                self.rejected = True  # revoked, and the starting credential expired
+                raise informix_module.WorkspaceHttpError("PUT failed with HTTP 401", 401)
+
+        def _fake_provider(*_a, **_k):
+            provider = mock.Mock()
+            provider.bearer.return_value = "tok"
+            return provider
+
+        with (
+            mock.patch.object(informix_module, "WorkspaceFilesApi", _RejectedFilesApi),
+            mock.patch.object(informix_module, "StagingCredentialProvider", _fake_provider),
+        ):
+            connector, _ = self._keyless_connector(
+                **{
+                    "snapshot.staging.transport": transport,
+                    "lakebase.workspace.host": "https://ws",
+                    "lakebase.workspace.token": "boot",
+                }
+            )
+            options = dict(self.APPEND, **{"snapshot.mode": "initial"})
+            rows, _ = connector.read_table("app.orders", {}, options)
+            return connector, list(rows)
+
+    def test_auto_transport_moves_to_fuse_after_an_unrecoverable_401(self):
+        connector, rows = self._rejecting_transport_read("auto")
+
+        # The rejected page and the rest were staged over FUSE.
+        self.assertEqual(len(rows), 2)
+        self.assertIsNone(connector._staging_files_api)
+
+    def test_rest_transport_keeps_failing_on_an_unrecoverable_401(self):
+        with self.assertRaises(informix_module.WorkspaceHttpError):
+            self._rejecting_transport_read("rest")
+
     def test_rest_transport_hard_fails_when_token_unavailable(self):
         def _unavailable_provider(*_a, **_k):
             provider = mock.Mock()

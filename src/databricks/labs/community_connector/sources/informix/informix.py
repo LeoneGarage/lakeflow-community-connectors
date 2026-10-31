@@ -218,6 +218,9 @@ _DEFAULT_SNAPSHOT_READ_TIMEOUT_SECONDS = 300
 # control-plane calls more room than the 30s default without adopting the much
 # larger snapshot read budget.
 _DEFAULT_CDC_READ_TIMEOUT_SECONDS = 60
+# How long a bridge leaves DBINFO('utc_current') alone after the source answered it with an
+# error, before asking again; until then snapshot rows carry a NULL commit time.
+_UTC_TIME_REPROBE_SECONDS = 600.0
 _DEFAULT_MAX_RECORDS_PER_BATCH = 10000
 # Informix's own per-session ceiling, passed straight to cdc_opensess. Each poll
 # pays a connection slot plus a full CDC session open/activate/close, so a small
@@ -6313,9 +6316,6 @@ _SHARED_CDC_SESSION_PROCESS = "process"
 # How long a follower waits to connect to the leader, or for it to answer one poll,
 # before reading directly.
 _HOST_SHARD_REPLY_SECONDS = 60.0
-# How long a bridge leaves DBINFO('utc_current') alone after the source answered it with an
-# error, before asking again; until then snapshot rows carry a NULL commit time.
-_UTC_TIME_REPROBE_SECONDS = 600.0
 # Consecutive accept failures after which a leader gives its shard up to another process.
 _HOST_SHARD_ACCEPT_FAILURES = 8
 _HOST_SHARD_TABLE_COLUMN_FIELDS = ("columns", "catalog_columns", "unsupported_columns")
@@ -7500,6 +7500,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # FUSE mount; a WorkspaceFilesApi means the Files REST API. See _staging_transport.
         self._staging_transport_resolved = False
         self._staging_files_api: WorkspaceFilesApi | None = None
+        self._staging_rest_required = False
         self._staging_workspace_host = ""
         self._registration_scope: str | None = _INFORMIX_REGISTRATION_CONTEXT["scope"]
         self._metadata_session_lock = threading.RLock()
@@ -10149,7 +10150,21 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # workspace falls back at resolution time rather than mid-drain.
 
         if self._staging_transport_resolved:
-            return self._staging_files_api
+            files_api = self._staging_files_api
+            if (
+                files_api is not None
+                and getattr(files_api, "rejected", False)
+                and not self._staging_rest_required
+            ):
+                # The token was rejected and nothing could mint a successor (the
+                # reader's starting credential lasts about an hour): stage over FUSE
+                # from now on, as when no token could be minted at all.
+                logging.getLogger(__name__).warning(
+                    "The snapshot-staging token was rejected and can't be replaced; "
+                    "snapshot staging uses the FUSE transport from now on"
+                )
+                self._staging_files_api = files_api = None
+            return files_api
         self._staging_transport_resolved = True
         mode = (
             str(
@@ -10160,6 +10175,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             .strip()
             .lower()
         )
+        self._staging_rest_required = mode == "rest"
         if mode == "fuse":
             return None
         provider = self._build_staging_credential_provider(required=mode == "rest")
@@ -10286,8 +10302,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # single overwrite PUT is sufficient -- no candidate/atomic-rename fence is
             # needed (a page's content is a pure function of its committed rows, so a
             # re-published page is byte-identical). Reads still go through FUSE.
-            files_api.put(os.path.join(namespace, page_name, "data.json.gz"), compressed)
-            return
+            try:
+                files_api.put(os.path.join(namespace, page_name, "data.json.gz"), compressed)
+                return
+            except WorkspaceHttpError as error:
+                # A 401 nothing could recover moves an ``auto`` transport to FUSE, which
+                # writes this page too; ``rest`` keeps failing.
+                if error.status_code != 401 or self._staging_transport() is not None:
+                    raise
         # No filesystem capability probe: the exclusive-create and atomic-rename
         # guarantees it checked were needed by the head-election protocol, which
         # Postgres now performs. Writing a page needs only ordinary directory

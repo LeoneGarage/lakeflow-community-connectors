@@ -707,6 +707,9 @@ class StagingCredentialProvider:
         self._token: str | None = None
         self._token_id = ""
         self._minted_at = 0.0
+        # Set when a token was rejected and nothing could mint a successor, so an
+        # ``auto`` staging transport can fall back to FUSE; cleared by the next mint.
+        self.rejected = False
 
     def bearer(self) -> str:
         with self._lock:
@@ -731,10 +734,17 @@ class StagingCredentialProvider:
         # A rejected token can't mint its successor, so the carried bootstrap credential
         # mints it, and a failure (that credential has expired too) propagates. Only
         # the token that was rejected is replaced: another thread may already have.
+        # A failure also drops the rejected token, so a later ``bearer()`` mints afresh
+        # instead of resending it, and marks the credential ``rejected``.
 
         with self._lock:
             if self._token == rejected:
-                self._mint(self._bootstrap_token)
+                try:
+                    self._mint(self._bootstrap_token)
+                except BaseException:
+                    self._token = None
+                    self.rejected = True
+                    raise
             return self._token or ""
 
     def _mint(self, minting_token: str) -> None:
@@ -748,6 +758,7 @@ class StagingCredentialProvider:
         self._token = token
         self._token_id = token_id
         self._minted_at = self._clock()
+        self.rejected = False
         lifetime = min(self._lifetime_seconds, granted) if granted else self._lifetime_seconds
         self._refresh_after = lifetime * _STAGING_TOKEN_REFRESH_FRACTION
         # Durability/rotation with the new token: store the secret and revoke this
@@ -792,6 +803,12 @@ class WorkspaceFilesApi:
         if end <= start:
             return b""
         return self._request("GET", volume_path, byte_range=(start, end - 1)) or b""
+
+    @property
+    def rejected(self) -> bool:
+        # Docstring: Whether the credential's token was rejected and couldn't be replaced.
+
+        return getattr(self._credential, "rejected", False) is True
 
     def _refreshed(self, rejected: str) -> bool:
         # Docstring: Whether the credential replaced a rejected token; False when it can't (an

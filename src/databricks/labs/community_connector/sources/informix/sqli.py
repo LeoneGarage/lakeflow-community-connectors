@@ -1761,6 +1761,8 @@ class InformixSqliClient:
         if self._input is None:
             raise SqliProtocolError("SQLI input is unavailable")
         rows, exhausted = [], False
+        # Fixed for the whole result, so decided once per batch rather than per tuple.
+        variable_layout = None
         while True:
             code = read_smallint(self._input)
             if code in {SQ_EOT, SQ_EXIT}:
@@ -1772,7 +1774,9 @@ class InformixSqliClient:
             elif code == 14:
                 if description is None:
                     raise SqliProtocolError("SQ_TUPLE arrived before SQ_DESCRIBE")
-                rows.append(self._read_tuple(description))
+                if variable_layout is None:
+                    variable_layout = self._variable_tuples(description)
+                rows.append(self._read_tuple(description, variable_layout))
             elif code == SQ_ERR:
                 error = self._read_error()
                 if error[0] == 100:
@@ -1865,7 +1869,9 @@ class InformixSqliClient:
             raise SqliProtocolError("result column positions are not monotonic")
         return ResultDescription(statement_type, statement_id, tuple_size, columns)
 
-    def _read_tuple(self, description: ResultDescription) -> dict[str, object]:
+    def _read_tuple(
+        self, description: ResultDescription, variable_layout: bool | None = None
+    ) -> dict[str, object]:
         if self._input is None:
             raise SqliProtocolError("SQLI input is unavailable")
         read_smallint(self._input)  # tuple warning
@@ -1877,7 +1883,8 @@ class InformixSqliClient:
         if size & 1:
             read_exact(self._input, 1)
         result = {}
-        variable_layout = self._variable_tuples(description)
+        if variable_layout is None:
+            variable_layout = self._variable_tuples(description)
         # A variable tuple carries its VARCHARs length-prefixed even under padVarchar.
         padded = self.pad_varchar and not variable_layout
         cursor = 0

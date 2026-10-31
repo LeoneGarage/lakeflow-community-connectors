@@ -2367,6 +2367,23 @@ class StagingCredentialProviderTests(unittest.TestCase):
         self.assertEqual(provider.refresh("dapi-1"), "dapi-2")
         self.assertEqual(len(api.create_tokens), 2)
 
+    def test_a_token_nothing_can_replace_is_dropped_and_reported(self):
+        # The starting credential lasts about an hour; after that a rejected token can't
+        # be replaced, and resending it would only repeat the 401.
+        api = _StagingTokenApi()
+        provider, _ = self._provider(api, clock=lambda: 0.0)
+        self.assertEqual(provider.bearer(), "dapi-1")
+        api.create_error = 401  # the bootstrap credential has expired too
+
+        with self.assertRaises(lakebase_state.WorkspaceHttpError):
+            provider.refresh("dapi-1")
+        self.assertTrue(provider.rejected)
+        self.assertTrue(lakebase_state.WorkspaceFilesApi("https://ws", provider).rejected)
+
+        api.create_error = None
+        self.assertEqual(provider.bearer(), "dapi-2")  # a fresh mint, not the old token
+        self.assertFalse(provider.rejected)
+
     def test_refresh_failure_keeps_the_current_token(self):
         api = _StagingTokenApi()
         now = {"t": 0.0}

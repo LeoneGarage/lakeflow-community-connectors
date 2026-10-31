@@ -1936,6 +1936,9 @@ def register_lakeflow_source(spark):
             self._token: str | None = None
             self._token_id = ""
             self._minted_at = 0.0
+            # Set when a token was rejected and nothing could mint a successor, so an
+            # ``auto`` staging transport can fall back to FUSE; cleared by the next mint.
+            self.rejected = False
 
         def bearer(self) -> str:
             with self._lock:
@@ -1960,10 +1963,17 @@ def register_lakeflow_source(spark):
             # A rejected token can't mint its successor, so the carried bootstrap credential
             # mints it, and a failure (that credential has expired too) propagates. Only
             # the token that was rejected is replaced: another thread may already have.
+            # A failure also drops the rejected token, so a later ``bearer()`` mints afresh
+            # instead of resending it, and marks the credential ``rejected``.
 
             with self._lock:
                 if self._token == rejected:
-                    self._mint(self._bootstrap_token)
+                    try:
+                        self._mint(self._bootstrap_token)
+                    except BaseException:
+                        self._token = None
+                        self.rejected = True
+                        raise
                 return self._token or ""
 
         def _mint(self, minting_token: str) -> None:
@@ -1977,6 +1987,7 @@ def register_lakeflow_source(spark):
             self._token = token
             self._token_id = token_id
             self._minted_at = self._clock()
+            self.rejected = False
             lifetime = min(self._lifetime_seconds, granted) if granted else self._lifetime_seconds
             self._refresh_after = lifetime * _STAGING_TOKEN_REFRESH_FRACTION
             # Durability/rotation with the new token: store the secret and revoke this
@@ -2021,6 +2032,12 @@ def register_lakeflow_source(spark):
             if end <= start:
                 return b""
             return self._request("GET", volume_path, byte_range=(start, end - 1)) or b""
+
+        @property
+        def rejected(self) -> bool:
+            # Docstring: Whether the credential's token was rejected and couldn't be replaced.
+
+            return getattr(self._credential, "rejected", False) is True
 
         def _refreshed(self, rejected: str) -> bool:
             # Docstring: Whether the credential replaced a rejected token; False when it can't (an
@@ -5364,6 +5381,8 @@ def register_lakeflow_source(spark):
             if self._input is None:
                 raise SqliProtocolError("SQLI input is unavailable")
             rows, exhausted = [], False
+            # Fixed for the whole result, so decided once per batch rather than per tuple.
+            variable_layout = None
             while True:
                 code = read_smallint(self._input)
                 if code in {SQ_EOT, SQ_EXIT}:
@@ -5375,7 +5394,9 @@ def register_lakeflow_source(spark):
                 elif code == 14:
                     if description is None:
                         raise SqliProtocolError("SQ_TUPLE arrived before SQ_DESCRIBE")
-                    rows.append(self._read_tuple(description))
+                    if variable_layout is None:
+                        variable_layout = self._variable_tuples(description)
+                    rows.append(self._read_tuple(description, variable_layout))
                 elif code == SQ_ERR:
                     error = self._read_error()
                     if error[0] == 100:
@@ -5468,7 +5489,9 @@ def register_lakeflow_source(spark):
                 raise SqliProtocolError("result column positions are not monotonic")
             return ResultDescription(statement_type, statement_id, tuple_size, columns)
 
-        def _read_tuple(self, description: ResultDescription) -> dict[str, object]:
+        def _read_tuple(
+            self, description: ResultDescription, variable_layout: bool | None = None
+        ) -> dict[str, object]:
             if self._input is None:
                 raise SqliProtocolError("SQLI input is unavailable")
             read_smallint(self._input)  # tuple warning
@@ -5480,7 +5503,8 @@ def register_lakeflow_source(spark):
             if size & 1:
                 read_exact(self._input, 1)
             result = {}
-            variable_layout = self._variable_tuples(description)
+            if variable_layout is None:
+                variable_layout = self._variable_tuples(description)
             # A variable tuple carries its VARCHARs length-prefixed even under padVarchar.
             padded = self.pad_varchar and not variable_layout
             cursor = 0
@@ -5756,6 +5780,9 @@ def register_lakeflow_source(spark):
     # control-plane calls more room than the 30s default without adopting the much
     # larger snapshot read budget.
     _DEFAULT_CDC_READ_TIMEOUT_SECONDS = 60
+    # How long a bridge leaves DBINFO('utc_current') alone after the source answered it with an
+    # error, before asking again; until then snapshot rows carry a NULL commit time.
+    _UTC_TIME_REPROBE_SECONDS = 600.0
     _DEFAULT_MAX_RECORDS_PER_BATCH = 10000
     # Informix's own per-session ceiling, passed straight to cdc_opensess. Each poll
     # pays a connection slot plus a full CDC session open/activate/close, so a small
@@ -11851,9 +11878,6 @@ def register_lakeflow_source(spark):
     # How long a follower waits to connect to the leader, or for it to answer one poll,
     # before reading directly.
     _HOST_SHARD_REPLY_SECONDS = 60.0
-    # How long a bridge leaves DBINFO('utc_current') alone after the source answered it with an
-    # error, before asking again; until then snapshot rows carry a NULL commit time.
-    _UTC_TIME_REPROBE_SECONDS = 600.0
     # Consecutive accept failures after which a leader gives its shard up to another process.
     _HOST_SHARD_ACCEPT_FAILURES = 8
     _HOST_SHARD_TABLE_COLUMN_FIELDS = ("columns", "catalog_columns", "unsupported_columns")
@@ -13038,6 +13062,7 @@ def register_lakeflow_source(spark):
             # FUSE mount; a WorkspaceFilesApi means the Files REST API. See _staging_transport.
             self._staging_transport_resolved = False
             self._staging_files_api: WorkspaceFilesApi | None = None
+            self._staging_rest_required = False
             self._staging_workspace_host = ""
             self._registration_scope: str | None = _INFORMIX_REGISTRATION_CONTEXT["scope"]
             self._metadata_session_lock = threading.RLock()
@@ -15687,7 +15712,21 @@ def register_lakeflow_source(spark):
             # workspace falls back at resolution time rather than mid-drain.
 
             if self._staging_transport_resolved:
-                return self._staging_files_api
+                files_api = self._staging_files_api
+                if (
+                    files_api is not None
+                    and getattr(files_api, "rejected", False)
+                    and not self._staging_rest_required
+                ):
+                    # The token was rejected and nothing could mint a successor (the
+                    # reader's starting credential lasts about an hour): stage over FUSE
+                    # from now on, as when no token could be minted at all.
+                    logging.getLogger(__name__).warning(
+                        "The snapshot-staging token was rejected and can't be replaced; "
+                        "snapshot staging uses the FUSE transport from now on"
+                    )
+                    self._staging_files_api = files_api = None
+                return files_api
             self._staging_transport_resolved = True
             mode = (
                 str(
@@ -15698,6 +15737,7 @@ def register_lakeflow_source(spark):
                 .strip()
                 .lower()
             )
+            self._staging_rest_required = mode == "rest"
             if mode == "fuse":
                 return None
             provider = self._build_staging_credential_provider(required=mode == "rest")
@@ -15824,8 +15864,14 @@ def register_lakeflow_source(spark):
                 # single overwrite PUT is sufficient -- no candidate/atomic-rename fence is
                 # needed (a page's content is a pure function of its committed rows, so a
                 # re-published page is byte-identical). Reads still go through FUSE.
-                files_api.put(os.path.join(namespace, page_name, "data.json.gz"), compressed)
-                return
+                try:
+                    files_api.put(os.path.join(namespace, page_name, "data.json.gz"), compressed)
+                    return
+                except WorkspaceHttpError as error:
+                    # A 401 nothing could recover moves an ``auto`` transport to FUSE, which
+                    # writes this page too; ``rest`` keeps failing.
+                    if error.status_code != 401 or self._staging_transport() is not None:
+                        raise
             # No filesystem capability probe: the exclusive-create and atomic-rename
             # guarantees it checked were needed by the head-election protocol, which
             # Postgres now performs. Writing a page needs only ordinary directory
