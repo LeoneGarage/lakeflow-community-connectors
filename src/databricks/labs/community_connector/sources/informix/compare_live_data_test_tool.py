@@ -495,9 +495,14 @@ def pipe_value(value: Any) -> str:
     )
 
 
+# The export runs dbaccess with no CLIENT_LOCALE, so it writes in the default client locale,
+# en_US.819: Latin-1, whatever the reader's own default encoding is.
+UNLOAD_ENCODING = "latin-1"
+
+
 def primary_key_counts(path: pathlib.Path) -> dict[str, int]:
     result = {}
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding=UNLOAD_ENCODING).splitlines():
         values = parse_unload_line(line)
         if not values:
             continue
@@ -515,7 +520,9 @@ def compare_table(
     destination_pipe: pathlib.Path,
 ) -> dict[str, Any]:
     source = []
-    for number, line in enumerate(iter_unload_records(source_file.read_text()), 1):
+    for number, line in enumerate(
+        iter_unload_records(source_file.read_text(encoding=UNLOAD_ENCODING)), 1
+    ):
         values = parse_unload_line(line)
         if len(values) != len(columns):
             raise RuntimeError(

@@ -1243,15 +1243,19 @@ class SqliPacketTests(unittest.TestCase):
 
         self.assertEqual(client._read_tuple(description), {"text": "hello", "enabled": True})
 
-    def test_padded_varchar_does_not_disable_lvarchar_envelope_walking(self):
+    def test_padded_varchar_beside_an_lvarchar_is_length_prefixed(self):
+        # A live server sends a tuple holding an LVARCHAR or BOOLEAN in the variable
+        # layout, VARCHARs length-prefixed, even under padVarchar; reading the VARCHAR
+        # as padded ran every later column out of the payload.
         payload = (
-            b"ab  "
+            b"\x02ab"
             + b"\x00"
             + struct.pack(">i", 5)
             + b"hello"
             + b"\x00"
             + struct.pack(">i", 1)
             + b"\x01"
+            + b"\x01z"
         )
         transcript = struct.pack(">hi", 0, len(payload)) + payload
         if len(payload) & 1:
@@ -1263,16 +1267,35 @@ class SqliPacketTests(unittest.TestCase):
             7,
             len(payload),
             (
-                ResultColumn("padded", 0, 13, 0, 4),
-                ResultColumn("text", 4, 43, 0, 100),
-                ResultColumn("enabled", 14, 45, 0, 1),
+                ResultColumn("label", 0, 13, 0, 10),
+                ResultColumn("text", 10, 43, 0, 100),
+                ResultColumn("enabled", 110, 45, 0, 1),
+                ResultColumn("note", 111, 13, 0, 10),
             ),
         )
 
         self.assertEqual(
             client._read_tuple(description),
-            {"padded": "ab", "text": "hello", "enabled": True},
+            {"label": "ab", "text": "hello", "enabled": True, "note": "z"},
         )
+
+    def test_fetch_and_decode_agree_on_the_tuple_layout(self):
+        # execute asks for the variable fetch exactly when _read_tuple expects it.
+        varchar = ResultColumn("label", 0, 13, 0, 10)
+        lvarchar = ResultColumn("text", 10, 40, 0, 100)
+        integer = ResultColumn("id", 0, 2, 0, 4)
+        for pad_varchar, columns, variable in (
+            (True, (varchar, lvarchar), True),
+            (True, (varchar, integer), False),
+            (False, (varchar, integer), True),
+            (False, (integer,), False),
+        ):
+            with self.subTest(pad_varchar=pad_varchar, columns=[c.name for c in columns]):
+                client = InformixSqliClient(
+                    "host", 9088, "db", "user", "password", pad_varchar=pad_varchar
+                )
+                description = ResultDescription(2, 7, 0, columns)
+                self.assertIs(client._variable_tuples(description), variable)
 
     def test_variable_tuple_positions_do_not_bound_runtime_envelopes(self):
         payload = (

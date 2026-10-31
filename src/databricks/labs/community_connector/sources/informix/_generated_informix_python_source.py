@@ -1791,12 +1791,15 @@ def register_lakeflow_source(spark):
 
     def mint_staging_token(
         api: _WorkspaceApi, pipeline_id: str, lifetime_seconds: int, update_id: str = ""
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, float | None]:
         # Docstring: Mint a personal access token for Files-API staging, tagged per pipeline update.
         #
-        # Returns ``(token_value, token_id)``. Raises :class:`StagingTokenUnavailable`
-        # when the workspace forbids token creation (HTTP 403) or rejects it as
-        # unsupported (HTTP 400), so the caller can fall back to FUSE rather than fail.
+        # Returns ``(token_value, token_id, granted_seconds)``: the lifetime the workspace
+        # granted, from the token's creation and expiry times, which a maximum-lifetime
+        # policy can make shorter than the one requested; ``None`` when it didn't say.
+        # Raises :class:`StagingTokenUnavailable` when the workspace forbids token creation
+        # (HTTP 403) or rejects it as unsupported (HTTP 400), so the caller can fall back
+        # to FUSE rather than fail.
 
         comment = staging_token_comment(pipeline_id, update_id)
         try:
@@ -1816,10 +1819,13 @@ def register_lakeflow_source(spark):
                 ) from error
             raise
         token_value = str(response.get("token_value") or "")
-        token_id = str((response.get("token_info") or {}).get("token_id") or "")
+        info = response.get("token_info") or {}
+        token_id = str(info.get("token_id") or "")
         if not token_value:
             raise StagingTokenUnavailable("token creation returned no token value")
-        return token_value, token_id
+        created, expires = int(info.get("creation_time") or 0), int(info.get("expiry_time") or 0)
+        granted = (expires - created) / 1000.0 if created > 0 and expires > created else None
+        return token_value, token_id, granted
 
 
     def revoke_stale_staging_tokens(
@@ -1901,7 +1907,9 @@ def register_lakeflow_source(spark):
         #
         # A first-mint :class:`StagingTokenUnavailable` propagates so the caller falls
         # back to FUSE; a later *refresh* failure keeps the still-valid current token
-        # rather than dropping a working credential.
+        # rather than dropping a working credential. The half-life is that of the lifetime
+        # the workspace granted, when shorter than the one requested, and a token the
+        # Files API rejects anyway is replaced through :meth:`refresh`.
 
         def __init__(
             self,
@@ -1946,8 +1954,20 @@ def register_lakeflow_source(spark):
                         )
                 return self._token or ""
 
+        def refresh(self, rejected: str) -> str:
+            # Docstring: Replace a token the Files API rejected (HTTP 401); returns the new bearer.
+            #
+            # A rejected token can't mint its successor, so the carried bootstrap credential
+            # mints it, and a failure (that credential has expired too) propagates. Only
+            # the token that was rejected is replaced: another thread may already have.
+
+            with self._lock:
+                if self._token == rejected:
+                    self._mint(self._bootstrap_token)
+                return self._token or ""
+
         def _mint(self, minting_token: str) -> None:
-            token, token_id = mint_staging_token(
+            token, token_id, granted = mint_staging_token(
                 _WorkspaceApi(self._host, minting_token),
                 self._pipeline_id,
                 self._lifetime_seconds,
@@ -1957,6 +1977,8 @@ def register_lakeflow_source(spark):
             self._token = token
             self._token_id = token_id
             self._minted_at = self._clock()
+            lifetime = min(self._lifetime_seconds, granted) if granted else self._lifetime_seconds
+            self._refresh_after = lifetime * _STAGING_TOKEN_REFRESH_FRACTION
             # Durability/rotation with the new token: store the secret and revoke this
             # provider's previous token and earlier updates' tokens. Both are best-effort
             # inside their helpers.
@@ -2000,6 +2022,22 @@ def register_lakeflow_source(spark):
                 return b""
             return self._request("GET", volume_path, byte_range=(start, end - 1)) or b""
 
+        def _refreshed(self, rejected: str) -> bool:
+            # Docstring: Whether the credential replaced a rejected token; False when it can't (an
+            # executor's fixed bearer) or the replacement failed, so the 401 stands.
+
+            refresh = getattr(self._credential, "refresh", None)
+            if refresh is None:
+                return False
+            try:
+                refresh(rejected)
+            except Exception:  # noqa: BLE001 - the 401 is the error to report
+                _LOGGER.warning(
+                    "Snapshot-staging token was rejected and could not be replaced", exc_info=True
+                )
+                return False
+            return True
+
         def _request(
             self,
             method: str,
@@ -2014,8 +2052,10 @@ def register_lakeflow_source(spark):
             if overwrite:
                 url += "?overwrite=true"
             last_error: Exception | None = None
+            refreshed = False
             for attempt in range(_FILES_API_ATTEMPTS):
-                headers = {"Authorization": f"Bearer {self._credential.bearer()}"}
+                bearer = self._credential.bearer()
+                headers = {"Authorization": f"Bearer {bearer}"}
                 if byte_range is not None:
                     # Inclusive, zero-based per RFC 9110; the Files API answers 206.
                     headers["Range"] = f"bytes={byte_range[0]}-{byte_range[1]}"
@@ -2028,6 +2068,11 @@ def register_lakeflow_source(spark):
                     ) as response:
                         return response.read()
                 except urllib.error.HTTPError as error:
+                    # An expired or revoked token: replace it once and retry at once.
+                    if error.code == 401 and not refreshed:
+                        refreshed = True
+                        if self._refreshed(bearer):
+                            continue
                     if error.code < 500 and error.code != 429:
                         detail = error.read().decode("utf-8", "replace")[:400]
                         raise WorkspaceHttpError(
@@ -5163,10 +5208,7 @@ def register_lakeflow_source(spark):
                         return rows
                     cursor_name = f"lc_{description.statement_id}"
                     binds = encode_bind(typed, self._encoding) if typed else b""
-                    variable = not self.pad_varchar and any(
-                        (column.type_code & 0xFF) in {13, 16, 40, 41, 43, 46}
-                        for column in description.columns
-                    )
+                    variable = self._variable_tuples(description)
                     if variable:
                         output_stream.write(
                             encode_cursor_open(
@@ -5252,10 +5294,7 @@ def register_lakeflow_source(spark):
                             page_consumer(pending)
                         return
                     cursor_name = f"lc_{description.statement_id}"
-                    variable = not self.pad_varchar and any(
-                        (column.type_code & 0xFF) in {13, 16, 40, 41, 43, 46}
-                        for column in description.columns
-                    )
+                    variable = self._variable_tuples(description)
                     if variable:
                         output_stream.write(
                             encode_cursor_open(
@@ -5441,22 +5480,17 @@ def register_lakeflow_source(spark):
             if size & 1:
                 read_exact(self._input, 1)
             result = {}
-            variable_layout = any(
-                (column.type_code & 0xFF) in {40, 41, 43, 46}
-                or (not self.pad_varchar and (column.type_code & 0xFF) in {13, 16})
-                for column in description.columns
-            )
+            variable_layout = self._variable_tuples(description)
+            # A variable tuple carries its VARCHARs length-prefixed even under padVarchar.
+            padded = self.pad_varchar and not variable_layout
             cursor = 0
             for index, column in enumerate(description.columns):
                 kind = _effective_result_kind(column)
                 start = cursor if variable_layout else column.position
                 if variable_layout and kind in {13, 16}:
-                    if self.pad_varchar:
-                        limit = start + column.encoded_length
-                    else:
-                        if start >= len(payload):
-                            raise SqliProtocolError("truncated variable VARCHAR tuple")
-                        limit = start + 1 + payload[start]
+                    if start >= len(payload):
+                        raise SqliProtocolError("truncated variable VARCHAR tuple")
+                    limit = start + 1 + payload[start]
                 elif variable_layout and kind in {40, 41, 43, 45, 46}:
                     if start + 5 > len(payload):
                         raise SqliProtocolError("truncated complex variable tuple")
@@ -5475,10 +5509,25 @@ def register_lakeflow_source(spark):
                         f"exceeds payload size {len(payload)}"
                     )
                 result[column.name] = _decode_result_value(
-                    payload[start:limit], column, self._encoding, self.pad_varchar, self.null_byte
+                    payload[start:limit], column, self._encoding, padded, self.null_byte
                 )
                 cursor = limit
             return result
+
+        def _variable_tuples(self, description: ResultDescription) -> bool:
+            # Docstring: Whether ``description``'s rows travel in the variable tuple layout.
+            #
+            # One answer for both the fetch request and the tuple decode. An LVARCHAR or
+            # opaque column (types 40, 41, 43, 46; BOOLEAN is one) always makes the layout
+            # variable, and its VARCHARs then come length-prefixed, padVarchar or not: a live
+            # server sent them so even for the fixed fetch, which the decode had read as
+            # padded. Otherwise VARCHARs make it variable unless padVarchar asks for padding.
+
+            return any(
+                (column.type_code & 0xFF) in {40, 41, 43, 46}
+                or (not self.pad_varchar and (column.type_code & 0xFF) in {13, 16})
+                for column in description.columns
+            )
 
         def read_lodata(self, descriptor: int, requested: int) -> bytes:
             input_stream, output_stream = self._require_open()
@@ -7290,7 +7339,8 @@ def register_lakeflow_source(spark):
             # Capacity is the row count, so the rows must exist before the first
             # claim. Seeding is idempotent and only ever adds rows, and both writes change
             # nothing until the limit does, so a bridge makes them once per limit rather
-            # than on every claim. A claim that gives up makes them again next time.
+            # than on every claim. Both commit before the claim, so a claim that gives up
+            # leaves them in place.
             seeded = (namespace, slot_count)
             if getattr(self, "_seeded_connection_limit", None) != seeded:
                 seed_slots(connection, namespace, slot_count)
@@ -7402,9 +7452,6 @@ def register_lakeflow_source(spark):
                             f"{connection_wait_timeout:g} seconds"
                         )
                     time.sleep(random.uniform(sweep_min, sweep_max))
-            except BaseException:
-                self._seeded_connection_limit = None
-                raise
             finally:
                 # Drop our ticket whether we won, timed out, or errored -- a lingering ticket
                 # would wrongly hold back younger waiters until it aged out. Best-effort: a
@@ -7651,10 +7698,15 @@ def register_lakeflow_source(spark):
                     finally:
                         self._connected = False
 
+        def _metadata_max_bytes(self) -> int | None:
+            # Docstring: ``metadata.max.bytes`` as a catalog query's result bound; ``0`` is unbounded.
+
+            return int(self.options.get("metadata.max.bytes", str(64 << 20))) or None
+
         @_serialized_sqli_operation
         def list_tables(self) -> list[dict[str, Any]]:
             self._ensure_connected()
-            maximum = int(self.options.get("metadata.max.bytes", str(64 << 20)))
+            maximum = self._metadata_max_bytes()
             columns = self.transport.execute(
                 "SELECT c.colname, c.coltype, c.collength, c.colno, t.tabid, "
                 "c.extended_id, x.name AS extended_name, x.owner AS extended_owner, "
@@ -7664,7 +7716,7 @@ def register_lakeflow_source(spark):
                 "WHERE t.tabtype = 'T' AND t.owner NOT MATCHES 'sys*' "
                 "AND t.tabname NOT MATCHES 'sys*' "
                 "ORDER BY t.owner, t.tabname, c.colno",
-                max_result_bytes=maximum or None,
+                max_result_bytes=maximum,
             )
             keys = self.transport.execute(
                 "SELECT i.part1,i.part2,i.part3,i.part4,i.part5,i.part6,i.part7,i.part8,"
@@ -7675,7 +7727,7 @@ def register_lakeflow_source(spark):
                 "WHERE t.tabtype='T' AND x.constrtype='P' "
                 "AND t.owner NOT MATCHES 'sys*' AND t.tabname NOT MATCHES 'sys*' "
                 "ORDER BY t.owner,t.tabname",
-                max_result_bytes=maximum or None,
+                max_result_bytes=maximum,
             )
             columns_by_table: dict[tuple[str, str], list[Any]] = {}
             for row in columns:
@@ -7723,7 +7775,7 @@ def register_lakeflow_source(spark):
             # the result no longer names a table.
 
             self._ensure_connected()
-            maximum = int(self.options.get("metadata.max.bytes", str(64 << 20))) or None
+            maximum = self._metadata_max_bytes()
             wanted = sorted({int(tabid) for tabid in tabids})
             versions: dict[int, tuple[str, str, int]] = {}
             for start in range(0, len(wanted), _CATALOG_BATCH):
@@ -7768,7 +7820,7 @@ def register_lakeflow_source(spark):
             # table of another owner is read and dropped. The UNIQUE-index query runs only for
             # the tables without a primary key, as in _describe_table.
 
-            maximum = int(self.options.get("metadata.max.bytes", str(64 << 20))) or None
+            maximum = self._metadata_max_bytes()
             wanted = set(tables)
             names = sorted({name for _, name in wanted})
             columns: dict[tuple[str, str], list[Any]] = {}
@@ -7902,7 +7954,7 @@ def register_lakeflow_source(spark):
                 "LEFT JOIN sysxtdtypes x ON x.extended_id = c.extended_id "
                 "WHERE t.tabtype = 'T' AND t.owner = ? AND t.tabname = ? ORDER BY c.colno",
                 (owner, name),
-                max_result_bytes=(int(self.options.get("metadata.max.bytes", str(64 << 20))) or None),
+                max_result_bytes=self._metadata_max_bytes(),
             )
             keys = self.transport.execute(
                 "SELECT i.part1,i.part2,i.part3,i.part4,i.part5,i.part6,i.part7,i.part8,"
@@ -7911,7 +7963,7 @@ def register_lakeflow_source(spark):
                 "JOIN sysindexes i ON x.idxname=i.idxname AND x.tabid=i.tabid "
                 "WHERE t.tabtype='T' AND x.constrtype='P' AND t.owner=? AND t.tabname=?",
                 (owner, name),
-                max_result_bytes=(int(self.options.get("metadata.max.bytes", str(64 << 20))) or None),
+                max_result_bytes=self._metadata_max_bytes(),
             )
             unique_indexes: list[Any] = []
             # No primary key: fall back to a UNIQUE index (see _select_unique_index_key). Only
@@ -7925,9 +7977,7 @@ def register_lakeflow_source(spark):
                     "FROM systables t JOIN sysindexes i ON t.tabid=i.tabid "
                     "WHERE t.tabtype='T' AND i.idxtype='U' AND t.owner=? AND t.tabname=?",
                     (owner, name),
-                    max_result_bytes=(
-                        int(self.options.get("metadata.max.bytes", str(64 << 20))) or None
-                    ),
+                    max_result_bytes=self._metadata_max_bytes(),
                 )
             return self._table_from_catalog_rows(owner, name, columns, keys, unique_indexes)
 
@@ -8041,7 +8091,7 @@ def register_lakeflow_source(spark):
                 "JOIN sysdefaults d ON d.tabid = c.tabid AND d.colno = c.colno "
                 "WHERE t.tabtype = 'T' AND t.owner = ? AND t.tabname = ?",
                 (owner, name),
-                max_result_bytes=(int(self.options.get("metadata.max.bytes", str(64 << 20))) or None),
+                max_result_bytes=self._metadata_max_bytes(),
             )
             wanted = set(columns)
             return sorted(
@@ -8053,6 +8103,7 @@ def register_lakeflow_source(spark):
                 }
             )
 
+        @_serialized_sqli_operation
         def key_index_directions(self, identity, columns):
             # Docstring: Return the per-column DESC flags of an index whose key columns exactly
             # match ``columns`` in order, or ``None`` if no index matches.
@@ -8069,7 +8120,7 @@ def register_lakeflow_source(spark):
             for identifier in (database, owner, name, *columns):
                 if not _IDENTIFIER.fullmatch(identifier):
                     raise InformixError(f"Unsafe key-index identifier {identifier!r}")
-            max_bytes = int(self.options.get("metadata.max.bytes", str(64 << 20))) or None
+            max_bytes = self._metadata_max_bytes()
             column_rows = self.transport.execute(
                 "SELECT c.colname, c.colno FROM systables t JOIN syscolumns c ON t.tabid = c.tabid "
                 "WHERE t.tabtype = 'T' AND t.owner = ? AND t.tabname = ?",
@@ -8151,7 +8202,7 @@ def register_lakeflow_source(spark):
             # Best-effort: a source that does not support ``DBINFO('utc_current')`` yields NULL
             # commit-time on snapshot rows rather than failing the read.
 
-            if getattr(self, "_utc_time_unsupported", False):
+            if time.monotonic() < getattr(self, "_utc_time_retry_at", 0.0):
                 return None
             self._ensure_connected()
             try:
@@ -8162,10 +8213,11 @@ def register_lakeflow_source(spark):
             except Exception as error:
                 # The failed statement poisoned the SQLI client: drop the transport, keeping
                 # the slot, so the next statement reconnects rather than failing on it. A
-                # source that answered but can't run the probe isn't asked again.
+                # source that answered with an error isn't asked again for a while: the
+                # error may mean it can't run the probe, or only a lock timeout.
                 self.reset_transport()
                 if not isinstance(error, (SqliTransportError, OSError)):
-                    self._utc_time_unsupported = True
+                    self._utc_time_retry_at = time.monotonic() + _UTC_TIME_REPROBE_SECONDS
                 return None
 
         @_serialized_sqli_operation
@@ -11799,6 +11851,9 @@ def register_lakeflow_source(spark):
     # How long a follower waits to connect to the leader, or for it to answer one poll,
     # before reading directly.
     _HOST_SHARD_REPLY_SECONDS = 60.0
+    # How long a bridge leaves DBINFO('utc_current') alone after the source answered it with an
+    # error, before asking again; until then snapshot rows carry a NULL commit time.
+    _UTC_TIME_REPROBE_SECONDS = 600.0
     # Consecutive accept failures after which a leader gives its shard up to another process.
     _HOST_SHARD_ACCEPT_FAILURES = 8
     _HOST_SHARD_TABLE_COLUMN_FIELDS = ("columns", "catalog_columns", "unsupported_columns")

@@ -1801,7 +1801,8 @@ class PurePythonInformixBridge:
         # Capacity is the row count, so the rows must exist before the first
         # claim. Seeding is idempotent and only ever adds rows, and both writes change
         # nothing until the limit does, so a bridge makes them once per limit rather
-        # than on every claim. A claim that gives up makes them again next time.
+        # than on every claim. Both commit before the claim, so a claim that gives up
+        # leaves them in place.
         seeded = (namespace, slot_count)
         if getattr(self, "_seeded_connection_limit", None) != seeded:
             seed_slots(connection, namespace, slot_count)
@@ -1913,9 +1914,6 @@ class PurePythonInformixBridge:
                         f"{connection_wait_timeout:g} seconds"
                     )
                 time.sleep(random.uniform(sweep_min, sweep_max))
-        except BaseException:
-            self._seeded_connection_limit = None
-            raise
         finally:
             # Drop our ticket whether we won, timed out, or errored -- a lingering ticket
             # would wrongly hold back younger waiters until it aged out. Best-effort: a
@@ -2162,10 +2160,15 @@ class PurePythonInformixBridge:
                 finally:
                     self._connected = False
 
+    def _metadata_max_bytes(self) -> int | None:
+        # Docstring: ``metadata.max.bytes`` as a catalog query's result bound; ``0`` is unbounded.
+
+        return int(self.options.get("metadata.max.bytes", str(64 << 20))) or None
+
     @_serialized_sqli_operation
     def list_tables(self) -> list[dict[str, Any]]:
         self._ensure_connected()
-        maximum = int(self.options.get("metadata.max.bytes", str(64 << 20)))
+        maximum = self._metadata_max_bytes()
         columns = self.transport.execute(
             "SELECT c.colname, c.coltype, c.collength, c.colno, t.tabid, "
             "c.extended_id, x.name AS extended_name, x.owner AS extended_owner, "
@@ -2175,7 +2178,7 @@ class PurePythonInformixBridge:
             "WHERE t.tabtype = 'T' AND t.owner NOT MATCHES 'sys*' "
             "AND t.tabname NOT MATCHES 'sys*' "
             "ORDER BY t.owner, t.tabname, c.colno",
-            max_result_bytes=maximum or None,
+            max_result_bytes=maximum,
         )
         keys = self.transport.execute(
             "SELECT i.part1,i.part2,i.part3,i.part4,i.part5,i.part6,i.part7,i.part8,"
@@ -2186,7 +2189,7 @@ class PurePythonInformixBridge:
             "WHERE t.tabtype='T' AND x.constrtype='P' "
             "AND t.owner NOT MATCHES 'sys*' AND t.tabname NOT MATCHES 'sys*' "
             "ORDER BY t.owner,t.tabname",
-            max_result_bytes=maximum or None,
+            max_result_bytes=maximum,
         )
         columns_by_table: dict[tuple[str, str], list[Any]] = {}
         for row in columns:
@@ -2234,7 +2237,7 @@ class PurePythonInformixBridge:
         # the result no longer names a table.
 
         self._ensure_connected()
-        maximum = int(self.options.get("metadata.max.bytes", str(64 << 20))) or None
+        maximum = self._metadata_max_bytes()
         wanted = sorted({int(tabid) for tabid in tabids})
         versions: dict[int, tuple[str, str, int]] = {}
         for start in range(0, len(wanted), _CATALOG_BATCH):
@@ -2279,7 +2282,7 @@ class PurePythonInformixBridge:
         # table of another owner is read and dropped. The UNIQUE-index query runs only for
         # the tables without a primary key, as in _describe_table.
 
-        maximum = int(self.options.get("metadata.max.bytes", str(64 << 20))) or None
+        maximum = self._metadata_max_bytes()
         wanted = set(tables)
         names = sorted({name for _, name in wanted})
         columns: dict[tuple[str, str], list[Any]] = {}
@@ -2413,7 +2416,7 @@ class PurePythonInformixBridge:
             "LEFT JOIN sysxtdtypes x ON x.extended_id = c.extended_id "
             "WHERE t.tabtype = 'T' AND t.owner = ? AND t.tabname = ? ORDER BY c.colno",
             (owner, name),
-            max_result_bytes=(int(self.options.get("metadata.max.bytes", str(64 << 20))) or None),
+            max_result_bytes=self._metadata_max_bytes(),
         )
         keys = self.transport.execute(
             "SELECT i.part1,i.part2,i.part3,i.part4,i.part5,i.part6,i.part7,i.part8,"
@@ -2422,7 +2425,7 @@ class PurePythonInformixBridge:
             "JOIN sysindexes i ON x.idxname=i.idxname AND x.tabid=i.tabid "
             "WHERE t.tabtype='T' AND x.constrtype='P' AND t.owner=? AND t.tabname=?",
             (owner, name),
-            max_result_bytes=(int(self.options.get("metadata.max.bytes", str(64 << 20))) or None),
+            max_result_bytes=self._metadata_max_bytes(),
         )
         unique_indexes: list[Any] = []
         # No primary key: fall back to a UNIQUE index (see _select_unique_index_key). Only
@@ -2436,9 +2439,7 @@ class PurePythonInformixBridge:
                 "FROM systables t JOIN sysindexes i ON t.tabid=i.tabid "
                 "WHERE t.tabtype='T' AND i.idxtype='U' AND t.owner=? AND t.tabname=?",
                 (owner, name),
-                max_result_bytes=(
-                    int(self.options.get("metadata.max.bytes", str(64 << 20))) or None
-                ),
+                max_result_bytes=self._metadata_max_bytes(),
             )
         return self._table_from_catalog_rows(owner, name, columns, keys, unique_indexes)
 
@@ -2552,7 +2553,7 @@ class PurePythonInformixBridge:
             "JOIN sysdefaults d ON d.tabid = c.tabid AND d.colno = c.colno "
             "WHERE t.tabtype = 'T' AND t.owner = ? AND t.tabname = ?",
             (owner, name),
-            max_result_bytes=(int(self.options.get("metadata.max.bytes", str(64 << 20))) or None),
+            max_result_bytes=self._metadata_max_bytes(),
         )
         wanted = set(columns)
         return sorted(
@@ -2564,6 +2565,7 @@ class PurePythonInformixBridge:
             }
         )
 
+    @_serialized_sqli_operation
     def key_index_directions(self, identity, columns):
         # Docstring: Return the per-column DESC flags of an index whose key columns exactly
         # match ``columns`` in order, or ``None`` if no index matches.
@@ -2580,7 +2582,7 @@ class PurePythonInformixBridge:
         for identifier in (database, owner, name, *columns):
             if not _IDENTIFIER.fullmatch(identifier):
                 raise InformixError(f"Unsafe key-index identifier {identifier!r}")
-        max_bytes = int(self.options.get("metadata.max.bytes", str(64 << 20))) or None
+        max_bytes = self._metadata_max_bytes()
         column_rows = self.transport.execute(
             "SELECT c.colname, c.colno FROM systables t JOIN syscolumns c ON t.tabid = c.tabid "
             "WHERE t.tabtype = 'T' AND t.owner = ? AND t.tabname = ?",
@@ -2662,7 +2664,7 @@ class PurePythonInformixBridge:
         # Best-effort: a source that does not support ``DBINFO('utc_current')`` yields NULL
         # commit-time on snapshot rows rather than failing the read.
 
-        if getattr(self, "_utc_time_unsupported", False):
+        if time.monotonic() < getattr(self, "_utc_time_retry_at", 0.0):
             return None
         self._ensure_connected()
         try:
@@ -2673,10 +2675,11 @@ class PurePythonInformixBridge:
         except Exception as error:
             # The failed statement poisoned the SQLI client: drop the transport, keeping
             # the slot, so the next statement reconnects rather than failing on it. A
-            # source that answered but can't run the probe isn't asked again.
+            # source that answered with an error isn't asked again for a while: the
+            # error may mean it can't run the probe, or only a lock timeout.
             self.reset_transport()
             if not isinstance(error, (SqliTransportError, OSError)):
-                self._utc_time_unsupported = True
+                self._utc_time_retry_at = time.monotonic() + _UTC_TIME_REPROBE_SECONDS
             return None
 
     @_serialized_sqli_operation
@@ -6310,6 +6313,9 @@ _SHARED_CDC_SESSION_PROCESS = "process"
 # How long a follower waits to connect to the leader, or for it to answer one poll,
 # before reading directly.
 _HOST_SHARD_REPLY_SECONDS = 60.0
+# How long a bridge leaves DBINFO('utc_current') alone after the source answered it with an
+# error, before asking again; until then snapshot rows carry a NULL commit time.
+_UTC_TIME_REPROBE_SECONDS = 600.0
 # Consecutive accept failures after which a leader gives its shard up to another process.
 _HOST_SHARD_ACCEPT_FAILURES = 8
 _HOST_SHARD_TABLE_COLUMN_FIELDS = ("columns", "catalog_columns", "unsupported_columns")

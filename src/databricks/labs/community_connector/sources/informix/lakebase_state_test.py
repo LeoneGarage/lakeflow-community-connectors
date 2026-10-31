@@ -24,6 +24,7 @@ import os
 import sys
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 from unittest import mock
@@ -521,6 +522,7 @@ class _FakeCursor:
             stored = self._database.records.get(key)
             if stored is not None:
                 self._result = [(stored,)]
+
 
 class _FakeDatabase:
     """Shared state behind every fake connection, with a controllable clock."""
@@ -2197,6 +2199,9 @@ class _StagingTokenApi:
         # was built with, so create-token calls can be attributed to a credential.
         self.auth_token: str | None = None
         self.create_tokens: list[str | None] = []
+        # The lifetime the workspace grants, as token_info creation/expiry times; None
+        # leaves them out, as a response may.
+        self.granted_seconds: int | None = None
 
     def request(self, method, path, body=None, tolerate_missing=False):
         self.calls.append((method, path, body))
@@ -2205,8 +2210,11 @@ class _StagingTokenApi:
             if self.create_error is not None:
                 raise lakebase_state.WorkspaceHttpError("nope", self.create_error)
             self._next_id += 1
-            token_id = f"tid-{self._next_id}"
-            return {"token_value": f"dapi-{self._next_id}", "token_info": {"token_id": token_id}}
+            info = {"token_id": f"tid-{self._next_id}"}
+            if self.granted_seconds is not None:
+                info["creation_time"] = 1_700_000_000_000
+                info["expiry_time"] = 1_700_000_000_000 + self.granted_seconds * 1000
+            return {"token_value": f"dapi-{self._next_id}", "token_info": info}
         if path == "/api/2.0/token/list":
             if self.list_error:
                 raise lakebase_state.LakebaseStateError("list failed")
@@ -2226,9 +2234,10 @@ class _StagingTokenApi:
 class StagingTokenTests(unittest.TestCase):
     def test_mint_sends_tagged_comment_and_lifetime(self):
         api = _StagingTokenApi()
-        value, token_id = lakebase_state.mint_staging_token(api, "pipe-1", 86400)
+        value, token_id, granted = lakebase_state.mint_staging_token(api, "pipe-1", 86400)
         self.assertEqual(value, "dapi-1")
         self.assertEqual(token_id, "tid-1")
+        self.assertIsNone(granted)
         method, path, body = api.calls[0]
         self.assertEqual((method, path), ("POST", "/api/2.0/token/create"))
         self.assertEqual(body["comment"], "informix-snapshot-staging:pipe-1")
@@ -2246,6 +2255,12 @@ class StagingTokenTests(unittest.TestCase):
         api.create_error = 500  # not a "disabled" signal
         with self.assertRaises(lakebase_state.WorkspaceHttpError):
             lakebase_state.mint_staging_token(api, "pipe-1", 86400)
+
+    def test_mint_reports_the_lifetime_the_workspace_granted(self):
+        api = _StagingTokenApi()
+        api.granted_seconds = 3600  # a maximum-lifetime policy capped the request
+        _, _, granted = lakebase_state.mint_staging_token(api, "pipe-1", 86400)
+        self.assertEqual(granted, 3600.0)
 
     def test_mint_tags_the_token_with_its_update(self):
         api = _StagingTokenApi()
@@ -2326,6 +2341,31 @@ class StagingCredentialProviderTests(unittest.TestCase):
         # The first mint used the bootstrap credential; the refresh mint used the
         # previous minted token, so no ambient identity is needed after startup.
         self.assertEqual(api.create_tokens, ["bootstrap-token", "dapi-1"])
+
+    def test_refresh_follows_a_shorter_granted_lifetime(self):
+        # Scheduled from the requested 86400 s, the refresh would come 11 hours after a
+        # one-hour token had expired.
+        api = _StagingTokenApi()
+        api.granted_seconds = 3600
+        now = {"t": 0.0}
+        provider, _ = self._provider(api, clock=lambda: now["t"], lifetime_seconds=86400)
+        self.assertEqual(provider.bearer(), "dapi-1")
+        now["t"] = 1799.0
+        self.assertEqual(provider.bearer(), "dapi-1")
+        now["t"] = 1800.0
+        self.assertEqual(provider.bearer(), "dapi-2")
+
+    def test_a_rejected_token_is_replaced_from_the_bootstrap_credential(self):
+        api = _StagingTokenApi()
+        provider, _ = self._provider(api, clock=lambda: 0.0)
+        self.assertEqual(provider.bearer(), "dapi-1")
+
+        self.assertEqual(provider.refresh("dapi-1"), "dapi-2")
+        # A rejected token can't mint its successor.
+        self.assertEqual(api.create_tokens, ["bootstrap-token", "bootstrap-token"])
+        # Another thread's rejection of the token already replaced mints nothing more.
+        self.assertEqual(provider.refresh("dapi-1"), "dapi-2")
+        self.assertEqual(len(api.create_tokens), 2)
 
     def test_refresh_failure_keeps_the_current_token(self):
         api = _StagingTokenApi()
@@ -2432,6 +2472,53 @@ class WorkspaceFilesApiTests(unittest.TestCase):
             with self.assertRaises(lakebase_state.WorkspaceHttpError) as ctx:
                 client.put("/Volumes/c/s/v/x", b"data")
         self.assertEqual(ctx.exception.status_code, 403)
+
+    def _unauthorized_then(self, outcomes):
+        # urlopen answering 401 for each "401" in outcomes, then a body for "ok".
+        calls = []
+
+        def fake_urlopen(request, timeout=None):
+            calls.append(request.headers.get("Authorization"))
+            if outcomes[len(calls) - 1] == "401":
+                raise lakebase_state.urllib.error.HTTPError(
+                    request.full_url, 401, "unauthorized", {}, io.BytesIO(b"expired")
+                )
+            return _FakeHttpResponse(b"body")
+
+        return fake_urlopen, calls
+
+    def test_a_401_replaces_the_token_once_and_retries(self):
+        provider = mock.Mock()
+        provider.bearer.side_effect = ["dapi-old", "dapi-new"]
+        client = lakebase_state.WorkspaceFilesApi("https://ws", provider)
+        fake_urlopen, calls = self._unauthorized_then(["401", "ok"])
+        with mock.patch.object(lakebase_state.urllib.request, "urlopen", fake_urlopen):
+            self.assertEqual(client.get("/Volumes/c/s/v/x"), b"body")
+        provider.refresh.assert_called_once_with("dapi-old")
+        self.assertEqual(calls, ["Bearer dapi-old", "Bearer dapi-new"])
+
+    def test_a_second_401_stands(self):
+        provider = mock.Mock()
+        provider.bearer.return_value = "dapi-token"
+        client = lakebase_state.WorkspaceFilesApi("https://ws", provider)
+        fake_urlopen, calls = self._unauthorized_then(["401", "401"])
+        with mock.patch.object(lakebase_state.urllib.request, "urlopen", fake_urlopen):
+            with self.assertRaises(lakebase_state.WorkspaceHttpError) as ctx:
+                client.get("/Volumes/c/s/v/x")
+        self.assertEqual(ctx.exception.status_code, 401)
+        provider.refresh.assert_called_once()
+        self.assertEqual(len(calls), 2)
+
+    def test_a_fixed_bearer_does_not_retry_a_401(self):
+        # An executor gets one bearer per batch and can't mint; the driver's next
+        # batch carries a fresh one.
+        credential = types.SimpleNamespace(bearer=lambda: "dapi-token")
+        client = lakebase_state.WorkspaceFilesApi("https://ws", credential)
+        fake_urlopen, calls = self._unauthorized_then(["401"])
+        with mock.patch.object(lakebase_state.urllib.request, "urlopen", fake_urlopen):
+            with self.assertRaises(lakebase_state.WorkspaceHttpError):
+                client.get("/Volumes/c/s/v/x")
+        self.assertEqual(len(calls), 1)
 
     def test_get_range_sends_inclusive_byte_range_header(self):
         captured = {}

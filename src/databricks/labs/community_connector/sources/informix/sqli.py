@@ -1605,10 +1605,7 @@ class InformixSqliClient:
                     return rows
                 cursor_name = f"lc_{description.statement_id}"
                 binds = encode_bind(typed, self._encoding) if typed else b""
-                variable = not self.pad_varchar and any(
-                    (column.type_code & 0xFF) in {13, 16, 40, 41, 43, 46}
-                    for column in description.columns
-                )
+                variable = self._variable_tuples(description)
                 if variable:
                     output_stream.write(
                         encode_cursor_open(
@@ -1694,10 +1691,7 @@ class InformixSqliClient:
                         page_consumer(pending)
                     return
                 cursor_name = f"lc_{description.statement_id}"
-                variable = not self.pad_varchar and any(
-                    (column.type_code & 0xFF) in {13, 16, 40, 41, 43, 46}
-                    for column in description.columns
-                )
+                variable = self._variable_tuples(description)
                 if variable:
                     output_stream.write(
                         encode_cursor_open(
@@ -1883,22 +1877,17 @@ class InformixSqliClient:
         if size & 1:
             read_exact(self._input, 1)
         result = {}
-        variable_layout = any(
-            (column.type_code & 0xFF) in {40, 41, 43, 46}
-            or (not self.pad_varchar and (column.type_code & 0xFF) in {13, 16})
-            for column in description.columns
-        )
+        variable_layout = self._variable_tuples(description)
+        # A variable tuple carries its VARCHARs length-prefixed even under padVarchar.
+        padded = self.pad_varchar and not variable_layout
         cursor = 0
         for index, column in enumerate(description.columns):
             kind = _effective_result_kind(column)
             start = cursor if variable_layout else column.position
             if variable_layout and kind in {13, 16}:
-                if self.pad_varchar:
-                    limit = start + column.encoded_length
-                else:
-                    if start >= len(payload):
-                        raise SqliProtocolError("truncated variable VARCHAR tuple")
-                    limit = start + 1 + payload[start]
+                if start >= len(payload):
+                    raise SqliProtocolError("truncated variable VARCHAR tuple")
+                limit = start + 1 + payload[start]
             elif variable_layout and kind in {40, 41, 43, 45, 46}:
                 if start + 5 > len(payload):
                     raise SqliProtocolError("truncated complex variable tuple")
@@ -1917,10 +1906,25 @@ class InformixSqliClient:
                     f"exceeds payload size {len(payload)}"
                 )
             result[column.name] = _decode_result_value(
-                payload[start:limit], column, self._encoding, self.pad_varchar, self.null_byte
+                payload[start:limit], column, self._encoding, padded, self.null_byte
             )
             cursor = limit
         return result
+
+    def _variable_tuples(self, description: ResultDescription) -> bool:
+        # Docstring: Whether ``description``'s rows travel in the variable tuple layout.
+        #
+        # One answer for both the fetch request and the tuple decode. An LVARCHAR or
+        # opaque column (types 40, 41, 43, 46; BOOLEAN is one) always makes the layout
+        # variable, and its VARCHARs then come length-prefixed, padVarchar or not: a live
+        # server sent them so even for the fixed fetch, which the decode had read as
+        # padded. Otherwise VARCHARs make it variable unless padVarchar asks for padding.
+
+        return any(
+            (column.type_code & 0xFF) in {40, 41, 43, 46}
+            or (not self.pad_varchar and (column.type_code & 0xFF) in {13, 16})
+            for column in description.columns
+        )
 
     def read_lodata(self, descriptor: int, requested: int) -> bytes:
         input_stream, output_stream = self._require_open()

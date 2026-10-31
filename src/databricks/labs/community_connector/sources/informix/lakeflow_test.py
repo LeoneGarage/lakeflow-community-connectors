@@ -12828,14 +12828,22 @@ class CurrentUtcTimeTests(unittest.TestCase):
         bridge._ensure_connected()
         return bridge
 
-    def test_an_unsupported_probe_resets_the_transport_and_is_not_repeated(self):
+    def test_a_refused_probe_resets_the_transport_and_waits_before_asking_again(self):
+        # The error may mean the source can't run the probe, or only a lock timeout, so
+        # it is asked again after a while rather than never.
         bridge = self._bridge(SqliProtocolError("Informix SQL error -217/0"))
+        now = {"t": 1000.0}
 
-        self.assertIsNone(bridge.current_utc_time())
-        self.assertFalse(bridge._connected)
-        bridge.transport.close.assert_called_once()
-        self.assertIsNone(bridge.current_utc_time())
-        bridge.transport.execute.assert_called_once()
+        with mock.patch.object(informix_module.time, "monotonic", lambda: now["t"]):
+            self.assertIsNone(bridge.current_utc_time())
+            self.assertFalse(bridge._connected)
+            bridge.transport.close.assert_called_once()
+            now["t"] += informix_module._UTC_TIME_REPROBE_SECONDS - 1
+            self.assertIsNone(bridge.current_utc_time())
+            bridge.transport.execute.assert_called_once()
+            now["t"] += 1
+            self.assertIsNone(bridge.current_utc_time())
+            self.assertEqual(bridge.transport.execute.call_count, 2)
 
     def test_a_dropped_connection_is_retried_on_the_next_probe(self):
         bridge = self._bridge(informix_module.SqliTransportError("truncated SQLI stream"))
@@ -12844,6 +12852,28 @@ class CurrentUtcTimeTests(unittest.TestCase):
         self.assertFalse(bridge._connected)
         self.assertIsNone(bridge.current_utc_time())
         self.assertEqual(bridge.transport.execute.call_count, 2)
+
+
+class KeyIndexDirectionsTests(unittest.TestCase):
+    def test_a_lost_lease_refuses_the_read_like_every_other_bridge_operation(self):
+        # Unserialized, the read raced the lease-loss shutdown and failed with a bare
+        # protocol error instead of the capacity error the retry handlers expect.
+        bridge = informix_module.PurePythonInformixBridge(
+            {
+                "hostname": "localhost",
+                "database": "demo",
+                "user": "informix",
+                "password": "secret",
+                "server": "demo_on",
+                "_informix.bypass.connection.capacity": "true",
+            }
+        )
+        bridge.transport = mock.Mock()
+        bridge._connection_lease_lost.set()
+
+        with self.assertRaises(informix_module.ConnectionCapacityUnavailable):
+            bridge.key_index_directions("demo.app.orders", ["id"])
+        bridge.transport.execute.assert_not_called()
 
 
 class HostSharedCdcTests(unittest.TestCase):
@@ -14502,6 +14532,23 @@ class FairSlotQueueWiringTests(unittest.TestCase):
 
         seed.assert_called_once()
         publish.assert_called_once()
+
+    def test_a_failed_claim_keeps_the_seeded_limit(self):
+        # Both writes commit before the claim, so a starved reader that gives up and
+        # comes straight back must not pay them again.
+        bridge = self._bridge(**{"connection.wait.timeout.seconds": "0"})
+        with mock.patch.object(
+            informix_module, "seed_slots", wraps=informix_module.seed_slots
+        ) as seed:
+            with (
+                mock.patch.object(informix_module, "acquire_slot", return_value=None),
+                self.assertRaises(informix_module.ConnectionCapacityUnavailable),
+            ):
+                bridge._acquire_connection_slot()
+            bridge._acquire_connection_slot()
+            self.addCleanup(bridge._release_connection_slot)
+
+        seed.assert_called_once()
 
     def test_successful_acquire_dequeues_its_ticket(self):
         bridge = self._bridge()

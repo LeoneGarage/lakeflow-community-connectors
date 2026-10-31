@@ -562,12 +562,15 @@ def staging_token_comment(pipeline_id: str, update_id: str = "") -> str:
 
 def mint_staging_token(
     api: _WorkspaceApi, pipeline_id: str, lifetime_seconds: int, update_id: str = ""
-) -> tuple[str, str]:
+) -> tuple[str, str, float | None]:
     # Docstring: Mint a personal access token for Files-API staging, tagged per pipeline update.
     #
-    # Returns ``(token_value, token_id)``. Raises :class:`StagingTokenUnavailable`
-    # when the workspace forbids token creation (HTTP 403) or rejects it as
-    # unsupported (HTTP 400), so the caller can fall back to FUSE rather than fail.
+    # Returns ``(token_value, token_id, granted_seconds)``: the lifetime the workspace
+    # granted, from the token's creation and expiry times, which a maximum-lifetime
+    # policy can make shorter than the one requested; ``None`` when it didn't say.
+    # Raises :class:`StagingTokenUnavailable` when the workspace forbids token creation
+    # (HTTP 403) or rejects it as unsupported (HTTP 400), so the caller can fall back
+    # to FUSE rather than fail.
 
     comment = staging_token_comment(pipeline_id, update_id)
     try:
@@ -587,10 +590,13 @@ def mint_staging_token(
             ) from error
         raise
     token_value = str(response.get("token_value") or "")
-    token_id = str((response.get("token_info") or {}).get("token_id") or "")
+    info = response.get("token_info") or {}
+    token_id = str(info.get("token_id") or "")
     if not token_value:
         raise StagingTokenUnavailable("token creation returned no token value")
-    return token_value, token_id
+    created, expires = int(info.get("creation_time") or 0), int(info.get("expiry_time") or 0)
+    granted = (expires - created) / 1000.0 if created > 0 and expires > created else None
+    return token_value, token_id, granted
 
 
 def revoke_stale_staging_tokens(
@@ -672,7 +678,9 @@ class StagingCredentialProvider:
     #
     # A first-mint :class:`StagingTokenUnavailable` propagates so the caller falls
     # back to FUSE; a later *refresh* failure keeps the still-valid current token
-    # rather than dropping a working credential.
+    # rather than dropping a working credential. The half-life is that of the lifetime
+    # the workspace granted, when shorter than the one requested, and a token the
+    # Files API rejects anyway is replaced through :meth:`refresh`.
 
     def __init__(
         self,
@@ -717,8 +725,20 @@ class StagingCredentialProvider:
                     )
             return self._token or ""
 
+    def refresh(self, rejected: str) -> str:
+        # Docstring: Replace a token the Files API rejected (HTTP 401); returns the new bearer.
+        #
+        # A rejected token can't mint its successor, so the carried bootstrap credential
+        # mints it, and a failure (that credential has expired too) propagates. Only
+        # the token that was rejected is replaced: another thread may already have.
+
+        with self._lock:
+            if self._token == rejected:
+                self._mint(self._bootstrap_token)
+            return self._token or ""
+
     def _mint(self, minting_token: str) -> None:
-        token, token_id = mint_staging_token(
+        token, token_id, granted = mint_staging_token(
             _WorkspaceApi(self._host, minting_token),
             self._pipeline_id,
             self._lifetime_seconds,
@@ -728,6 +748,8 @@ class StagingCredentialProvider:
         self._token = token
         self._token_id = token_id
         self._minted_at = self._clock()
+        lifetime = min(self._lifetime_seconds, granted) if granted else self._lifetime_seconds
+        self._refresh_after = lifetime * _STAGING_TOKEN_REFRESH_FRACTION
         # Durability/rotation with the new token: store the secret and revoke this
         # provider's previous token and earlier updates' tokens. Both are best-effort
         # inside their helpers.
@@ -771,6 +793,22 @@ class WorkspaceFilesApi:
             return b""
         return self._request("GET", volume_path, byte_range=(start, end - 1)) or b""
 
+    def _refreshed(self, rejected: str) -> bool:
+        # Docstring: Whether the credential replaced a rejected token; False when it can't (an
+        # executor's fixed bearer) or the replacement failed, so the 401 stands.
+
+        refresh = getattr(self._credential, "refresh", None)
+        if refresh is None:
+            return False
+        try:
+            refresh(rejected)
+        except Exception:  # noqa: BLE001 - the 401 is the error to report
+            _LOGGER.warning(
+                "Snapshot-staging token was rejected and could not be replaced", exc_info=True
+            )
+            return False
+        return True
+
     def _request(
         self,
         method: str,
@@ -785,8 +823,10 @@ class WorkspaceFilesApi:
         if overwrite:
             url += "?overwrite=true"
         last_error: Exception | None = None
+        refreshed = False
         for attempt in range(_FILES_API_ATTEMPTS):
-            headers = {"Authorization": f"Bearer {self._credential.bearer()}"}
+            bearer = self._credential.bearer()
+            headers = {"Authorization": f"Bearer {bearer}"}
             if byte_range is not None:
                 # Inclusive, zero-based per RFC 9110; the Files API answers 206.
                 headers["Range"] = f"bytes={byte_range[0]}-{byte_range[1]}"
@@ -799,6 +839,11 @@ class WorkspaceFilesApi:
                 ) as response:
                     return response.read()
             except urllib.error.HTTPError as error:
+                # An expired or revoked token: replace it once and retry at once.
+                if error.code == 401 and not refreshed:
+                    refreshed = True
+                    if self._refreshed(bearer):
+                        continue
                 if error.code < 500 and error.code != 429:
                     detail = error.read().decode("utf-8", "replace")[:400]
                     raise WorkspaceHttpError(
