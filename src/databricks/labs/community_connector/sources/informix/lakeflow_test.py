@@ -15,13 +15,14 @@ import os
 import pickle
 import shutil
 import socket
+import stat
 import sys
 import tempfile
 import threading
 import time
 import types
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from unittest import mock
 
@@ -480,10 +481,7 @@ class _OfflineLakebase:
         # between-tests reset, so tests that rely on cross-instance sharing within a
         # single test are unaffected.
         coordinator = informix_module._STATE_VALIDATION_COORDINATOR
-        coordinator.validated.clear()
-        coordinator.claims.clear()
         coordinator.table_caches.clear()
-        coordinator.connection_limits.clear()
         return self
 
     def _connect(self, _state=None):
@@ -1002,8 +1000,8 @@ class LakeflowContractTests(unittest.TestCase):
         coordinator = informix_module._STATE_VALIDATION_COORDINATOR
         restored = pickle.loads(pickle.dumps(coordinator))
 
-        self.assertFalse(restored.validated)
-        self.assertFalse(restored.claims)
+        self.assertFalse(restored.table_caches)
+        self.assertFalse(restored.unsupported_column_warnings)
 
     def test_generated_source_class_survives_cloudpickle_when_available(self):
         try:
@@ -12055,6 +12053,20 @@ class ConnectionSlotLeaseLossTests(unittest.TestCase):
         self.assertIsNone(bridge._connection_slot_heartbeat)
         self.assertIsNone(bridge._connection_slot_heartbeat_stop)
 
+    def test_release_forgets_the_slot(self):
+        # release_connection publishes a backlog hint only while a slot is held, so a
+        # released bridge must not still look like it holds one.
+        bridge = self._bridge()
+        bridge._connection_slot_heartbeat_stop = None
+        bridge._connection_slot_heartbeat = None
+        bridge._lakebase_slot = object()
+        bridge._lakebase_connection = lambda: mock.Mock()
+
+        with mock.patch.object(informix_module, "release_slot", return_value=True):
+            bridge._release_connection_slot()
+
+        self.assertIsNone(bridge._connection_slot)
+
     def test_release_stops_the_heartbeat_even_with_no_slot_held(self):
         # Ordering matters: the thread must be stopped before the early return for
         # an already-released slot, or a poisoned release leaks it.
@@ -12659,6 +12671,28 @@ class BatchedCatalogReadTests(unittest.TestCase):
         self.assertEqual(versions_queries, 2)
         # Two names, two queries each, and one unique-index query for the keyless table.
         self.assertEqual(len(bridge.transport.statements), 5)
+
+
+class HostShardEndpointPathTests(unittest.TestCase):
+    """The shard's socket path must fit AF_UNIX's sun_path, even under a long TMPDIR."""
+
+    def _paths(self, temp_dir):
+        private = os.stat_result((stat.S_IFDIR | 0o700, 0, 0, 0, os.getuid(), 0, 0, 0, 0, 0))
+        with (
+            mock.patch.object(informix_module.tempfile, "gettempdir", return_value=temp_dir),
+            mock.patch.object(informix_module.os, "makedirs"),
+            mock.patch.object(informix_module.os, "lstat", return_value=private),
+        ):
+            return informix_module._HostShardEndpoints().paths(("ns", "scope", "upsert", 0))
+
+    def test_a_short_temp_directory_is_used(self):
+        _, socket_path, _ = self._paths("/tmp")
+        self.assertTrue(socket_path.startswith(f"/tmp/informix-cdc-shards-{os.getuid()}/"))
+
+    def test_a_long_temp_directory_falls_back_to_tmp(self):
+        _, socket_path, _ = self._paths("/var/folders/" + "x" * 70 + "/T")
+        self.assertTrue(socket_path.startswith(f"/tmp/informix-cdc-shards-{os.getuid()}/"))
+        self.assertLessEqual(len(os.fsencode(socket_path)), 100)
 
 
 class HostSharedCdcTests(unittest.TestCase):
@@ -15162,6 +15196,48 @@ class UnloadHelperTests(unittest.TestCase):
         self.assertTrue(value("t", "BOOLEAN"))
         self.assertFalse(value("f", "BOOLEAN"))
         self.assertEqual(value("hello", "VARCHAR"), "hello")
+
+    def test_unload_value_renders_every_datetime_qualifier_as_the_live_decoders(self):
+        # The qualifier is Column.length: start field in bits 8-11, end in bits 0-3
+        # (YEAR=0, MONTH=2, DAY=4, HOUR=6, MINUTE=8, SECOND=10, FRACTION(n)=10+n).
+        value = informix_module._unload_value
+        self.assertEqual(
+            value("2024-05-15 10:30:00.12345", "DATETIME", 0x00F),
+            datetime(2024, 5, 15, 10, 30, 0, 123450),
+        )
+        self.assertEqual(value("2024-05-15", "DATETIME", 0x004), datetime(2024, 5, 15))
+        self.assertEqual(value("10:30:00", "DATETIME", 0x60A), "10:30:00")
+        self.assertEqual(value("10:30:00.123", "DATETIME", 0x60D), "10:30:00.123")
+        self.assertEqual(value("2024-05", "DATETIME", 0x002), "YEAR=2024:MONTH=05")
+        self.assertEqual(value("05-15", "DATETIME", 0x204), "MONTH=05:DAY=15")
+        self.assertEqual(value("15 10", "DATETIME", 0x406), "DAY=15:HOUR=10")
+        # Year 1 carries UTC, as the packed decoder's value does.
+        self.assertEqual(
+            value("0001-01-01 00:00:00", "DATETIME", 0x00A),
+            datetime(1, 1, 1, tzinfo=timezone.utc),
+        )
+        with self.assertRaisesRegex(Exception, "does not match its 6 TO 10 qualifier"):
+            value("10:30", "DATETIME", 0x60A)
+
+    def test_unload_value_drops_char_padding_like_the_live_decoders(self):
+        value = informix_module._unload_value
+        self.assertEqual(value("ab   ", "CHAR"), "ab")
+        self.assertEqual(value("ab   ", "NCHAR"), "ab")
+        self.assertEqual(value("ab   ", "VARCHAR"), "ab   ")
+
+    def test_a_unl_record_applies_the_null_byte_mode_before_the_row_filter(self):
+        columns = (
+            informix_module.Column(name="id", type_name="INTEGER"),
+            informix_module.Column(name="note", type_name="VARCHAR"),
+        )
+        table = informix_module.Table(
+            database="demo", owner="app", name="notes", columns=columns, primary_keys=("id",)
+        )
+        shape = informix_module._shape_unl_record
+        record = b"1|a\x00b|"
+        self.assertIsNone(shape(record, table, 100, {}, "utf-8")["note"])  # default: null
+        self.assertEqual(shape(record, table, 100, {}, "utf-8", null_byte="empty")["note"], "ab")
+        self.assertEqual(shape(record, table, 100, {}, "utf-8", null_byte="keep")["note"], "a\x00b")
 
     def test_unl_byte_splits_cover_every_record_exactly_once(self):
         # The correctness gate: splits must tile [0,size) with no gap/overlap, each split

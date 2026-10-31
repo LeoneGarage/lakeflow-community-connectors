@@ -47,7 +47,9 @@ from databricks.labs.community_connector.sources.informix.cdc_protocol import (
     CdcProtocolError,
     ColumnDescriptor,
     OpenTransactionRecords,
+    apply_null_byte,
     cdc_routine,
+    datetime_from_text,
     decode_frame,
     frame_log_file,
     interval_layout,
@@ -875,10 +877,7 @@ class _StateValidationCoordinator:
 
     def __init__(self) -> None:
         self.condition = threading.Condition()
-        self.validated: set[str] = set()
-        self.claims: dict[str, tuple[object, float]] = {}
         self.table_caches: dict[tuple[str, ...], "Table"] = {}
-        self.connection_limits: set[tuple[str, int]] = set()
         # (table identity, left-out column names) pairs already warned about, so a table
         # resolved on every read warns once per process rather than on each microbatch.
         self.unsupported_column_warnings: set[tuple[str, tuple[str, ...]]] = set()
@@ -1490,7 +1489,6 @@ class PurePythonInformixBridge:
         self._operation_lock = threading.RLock()
         self._connection_lease_lost = threading.Event()
         self._connection_slot: str | None = None
-        self._connection_slot_token: str | None = None
         self._connection_slot_heartbeat_stop: threading.Event | None = None
         self._connection_slot_heartbeat: threading.Thread | None = None
         # Optional callback the snapshot-drain reader installs so a worker blocked in
@@ -1870,7 +1868,6 @@ class PurePythonInformixBridge:
                 )
                 if slot is not None:
                     self._connection_slot = f"slot-{slot.slot_id:04d}"
-                    self._connection_slot_token = owner
                     self._lakebase_slot = slot
                     stop = threading.Event()
                     heartbeat = threading.Thread(
@@ -2009,6 +2006,8 @@ class PurePythonInformixBridge:
         if slot is None:
             return
         self._lakebase_slot = None
+        # release_connection publishes a backlog hint only while a slot is held.
+        self._connection_slot = None
         try:
             release_slot(self._lakebase_connection(), slot)
         except Exception:
@@ -6305,9 +6304,14 @@ class _HostShardEndpoints:
         # Whoever can write the directory could serve forged CDC rows, so one that isn't
         # this user's alone raises, which turns host sharing off in this process.
 
-        directory = self.directory or os.path.join(
-            tempfile.gettempdir(), f"informix-cdc-shards-{os.getuid()}"
-        )
+        directory = self.directory
+        if directory is None:
+            name = f"informix-cdc-shards-{os.getuid()}"
+            directory = os.path.join(tempfile.gettempdir(), name)
+            # A socket path must fit AF_UNIX's sun_path (104 bytes on macOS and BSD, 108 on
+            # Linux); a long TMPDIR would otherwise turn host sharing off. /tmp is short.
+            if len(os.fsencode(os.path.join(directory, "0" * 24 + ".sock"))) > 100:
+                directory = os.path.join("/tmp", name)
         os.makedirs(directory, mode=0o700, exist_ok=True)
         info = os.lstat(directory)
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
@@ -12379,6 +12383,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 escape=escape,
                 commit_time=commit_time,
                 predicate=predicate,
+                null_byte=_null_byte_mode(self.options),
             )
             for raw in raw_records
         )
@@ -12421,6 +12426,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     escape=escape,
                     commit_time=commit_time,
                     predicate=predicate,
+                    null_byte=_null_byte_mode(self.options),
                 )
                 if row is not None:
                     yield row
@@ -12490,6 +12496,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 escape=escape,
                 commit_time=commit_time,
                 predicate=predicate,
+                null_byte=_null_byte_mode(self.options),
             )
             if row is not None:
                 yield row
@@ -15686,18 +15693,25 @@ def _parse_unload_fields(
     return values
 
 
-def _unload_value(text: str, type_name: str) -> Any:
+def _unload_value(text: str, type_name: str, qualifier: int | None = None) -> Any:
     # Docstring: Convert one UNLOAD field to the Python value the live snapshot would yield.
     #
     # Keyed on the column's Informix ``type_name`` so ``_shape_snapshot`` (which
     # isoformats date/datetime and quantizes decimals) then produces a row
     # byte-identical to a live ``consistent_snapshot`` row. An empty field is NULL.
-    # Exotic/binary types and locale-sensitive date formats are best-effort and must
-    # be validated against the count/data-compare tool in live mode.
+    # ``qualifier`` is a DATETIME column's qualifier (``Column.length``): with it, every
+    # qualifier renders as the live and CDC decoders render it. Exotic/binary types and
+    # locale-sensitive date formats are best-effort and must be validated against the
+    # count/data-compare tool in live mode.
 
     if text == "":
         return None
     upper = type_name.upper()
+    if upper in {"CHAR", "NCHAR"}:
+        # The live decoders drop CHAR's blank padding; an extract may keep it.
+        return text.rstrip(" ")
+    if upper == "DATETIME" and qualifier is not None:
+        return datetime_from_text(text, qualifier)
     if upper in _UNLOAD_INT_TYPES:
         return int(text)
     if upper.startswith(("DECIMAL", "NUMERIC", "MONEY")):
@@ -16049,6 +16063,7 @@ def _shape_unl_record(
     escape: str = _UNL_DEFAULT_ESCAPE,
     commit_time: int | None = None,
     predicate: tuple | None = None,
+    null_byte: str = _DEFAULT_NULL_BYTE_MODE,
 ) -> dict[str, Any] | None:
     # Docstring: Parse, type-convert, and shape one UNLOAD / HPL DELIMITED record -- shared by both
     # serve paths.
@@ -16063,7 +16078,9 @@ def _shape_unl_record(
     # An extract holds every catalog column, so fields are matched positionally against
     # ``catalog_columns`` under a column selection and only the selected ones converted.
     # ``predicate`` is the table's row_filter from :func:`_row_filter_predicate`, built once
-    # per extract by the caller; a record it drops returns None.
+    # per extract by the caller; a record it drops returns None. ``null_byte`` is the
+    # connection's string.null.byte mode, applied as the live decoders apply it, before
+    # the filter sees the row.
 
     fields = _parse_unload_fields(
         raw.decode(encoding, "strict"), delimiter=delimiter, escape=escape
@@ -16077,7 +16094,10 @@ def _shape_unl_record(
         )
     position = {column.name: index for index, column in enumerate(catalog)}
     row = {
-        column.name: _unload_value(fields[position[column.name]], column.type_name)
+        column.name: apply_null_byte(
+            _unload_value(fields[position[column.name]], column.type_name, column.length),
+            null_byte,
+        )
         for column in table.columns
     }
     if predicate is not None and not _row_filter_matches(predicate, row):

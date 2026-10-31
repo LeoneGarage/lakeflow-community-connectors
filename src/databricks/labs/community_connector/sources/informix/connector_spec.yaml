@@ -35,8 +35,9 @@
 # Spark as timestamps; partial qualifiers are deterministic labeled strings and
 # never acquire a current date. INTERVAL lands as Informix's trimmed literal text
 # ("-12 13:14:15.016"), live-validated on Informix 14.10, and NCHAR as CHAR does. BYTE, TEXT,
-# BLOB, CLOB, and complex or opaque types lack end-to-end snapshot/CDC materialization and cause
-# an explicit metadata error. Unknown catalog types fail discovery rather than being decoded
+# BLOB, CLOB, and complex or opaque types lack end-to-end snapshot/CDC materialization, so a
+# column of one is left out of the table with a warning, as if exclude_columns listed it; a key
+# column of one fails the table. Unknown catalog types fail discovery rather than being decoded
 # speculatively. Ordinary TEXT/BYTE fetch framing has a bounded internal helper,
 # but content materialization and limits are not exposed by this connector.
 # Generated metadata, snapshot, and CDC lifecycle statements use a deliberately
@@ -619,9 +620,9 @@ connection:
         the destination. A column added to the source later stays out. Key columns
         must be listed, and so must any column row_filter uses. Every name must be a
         column of the table; after dropping a listed column at the source, take it
-        out of the list (no full refresh needed). Leaving out a column of an
-        unsupported type (BYTE, TEXT, BLOB, CLOB, collections) lets a
-        table be ingested, with its changes streamed, that would otherwise be rejected. Changing the selection on a running
+        out of the list (no full refresh needed). A column of an unsupported type
+        (BYTE, TEXT, BLOB, CLOB, collections) is left out by the connector anyway, with
+        a warning; naming one here fails the table. Changing the selection on a running
         table fails closed until a full refresh. Mutually exclusive with
         exclude_columns.
 
@@ -746,8 +747,8 @@ connection:
         Set `scd_type: APPEND_ONLY` on the same table so the destination appends
         rather than attempting a keyed merge; the connector cannot read scd_type
         itself because the spec parser strips it before options reach the connector.
-        A table with an unsupported column type is rejected unless column
-        selection leaves that column out. There is no delete channel: requesting one for an
+        A column of an unsupported type is left out with a warning, as on any
+        table. There is no delete channel: requesting one for an
         append-only table fails rather than returning empty forever.
 
     - name: append.delete.tombstones
@@ -797,7 +798,10 @@ connection:
         whole row is its identity -- for a keyless table whose rows are unique as a
         whole. Nullable columns join the wildcard key too, so the NULL behaviour
         above applies to every nullable column; on an append-only table with
-        snapshot.mode=cdc_only, its default, NULLs are harmless. The wildcard
+        snapshot.mode=cdc_only, its default, NULLs are harmless. "* except(c1, c2)"
+        keys on every column but the ones named, so an update that changes only
+        those columns updates the row in place; each name must be a column of the
+        table, matched ignoring case. The wildcard
         follows the schema: an appended column joins the key. For a table already
         streaming changes, a nullable column added without a default extends the
         key without a full refresh; a column added with a default, or while an

@@ -1100,6 +1100,20 @@ def register_lakeflow_source(spark):
             values[code] = int(digits[position : position + width])
             position += width
         fraction = digits[position:]
+        return _render_datetime(values, fraction, start, fraction_digits, digits), size
+
+
+    def _render_datetime(
+        values: dict[int, int], fraction: str, start: int, fraction_digits: int, source: str
+    ) -> datetime | str:
+        # Docstring: Validate DATETIME fields and render them as every decode path does.
+        #
+        # A qualifier holding year, month and day becomes a ``datetime``; an HOUR-anchored one
+        # the text ``HH:MM:SS[.f]``; any other the labelled ``MONTH=05:DAY=15`` form.
+        # ``source`` names the value in errors.
+
+        selected = sorted(values)
+        widths = {0: 4, 2: 2, 4: 2, 6: 2, 8: 2, 10: 2}
         ranges = {
             0: (1, 9999),
             2: (1, 12),
@@ -1111,7 +1125,7 @@ def register_lakeflow_source(spark):
         for code, value in values.items():
             minimum, maximum = ranges[code]
             if not minimum <= value <= maximum:
-                raise CdcProtocolError(f"invalid DATETIME field {code} value {value} in {digits}")
+                raise CdcProtocolError(f"invalid DATETIME field {code} value {value} in {source}")
         if 2 in values and 4 in values:
             maximum_day = {
                 1: 31,
@@ -1128,7 +1142,7 @@ def register_lakeflow_source(spark):
                 12: 31,
             }[values[2]]
             if values[4] > maximum_day:
-                raise CdcProtocolError(f"invalid DATETIME calendar fields {digits}")
+                raise CdcProtocolError(f"invalid DATETIME calendar fields {source}")
         if {0, 2, 4}.issubset(values):
             try:
                 decoded = datetime(
@@ -1141,7 +1155,7 @@ def register_lakeflow_source(spark):
                     int((fraction + "000000")[:6] or 0),
                 )
             except ValueError as exc:
-                raise CdcProtocolError(f"invalid DATETIME calendar fields {digits}") from exc
+                raise CdcProtocolError(f"invalid DATETIME calendar fields {source}") from exc
             # Year 1 (e.g. the 0001-01-01 00:00:00 sentinel) sits adjacent to
             # ``datetime.min``. PySpark converts a TimestampType value with
             # ``datetime.astimezone()``, which subtracts the session UTC offset and
@@ -1151,17 +1165,41 @@ def register_lakeflow_source(spark):
             # carries no timezone, so treating the wall clock as UTC preserves its value.
             if values[0] <= 1:
                 decoded = decoded.replace(tzinfo=timezone.utc)
-            return decoded, size
+            return decoded
         if start == 6:
             rendered = ":".join(f"{values[code]:0{widths[code]}d}" for code in selected)
             if fraction:
                 rendered += f".{fraction}"
-            return rendered, size
+            return rendered
         labels = {0: "YEAR", 2: "MONTH", 4: "DAY", 6: "HOUR", 8: "MINUTE", 10: "SECOND"}
         rendered = ":".join(f"{labels[code]}={values[code]:0{widths[code]}d}" for code in selected)
         if fraction:
             rendered += f":FRACTION({fraction_digits})={fraction}"
-        return rendered, size
+        return rendered
+
+
+    def datetime_from_text(text: str, qualifier: int) -> datetime | str:
+        # Docstring: The value the packed decoder yields, for a DATETIME written as its literal.
+        #
+        # UNLOAD and HPL write a DATETIME as its literal text in the column's qualifier
+        # ("2024-05-15 10:30:00.12345", "10:30:00", "05-15"); its digit groups are the
+        # qualifier's fields in order, then the fraction. Rendering them as _decode_datetime
+        # does keeps a file-sourced snapshot row identical to a live snapshot or CDC row.
+
+        start, end = (qualifier >> 8) & 0xF, qualifier & 0xF
+        codes = (0, 2, 4, 6, 8, 10)
+        if start not in codes or end not in {*codes, 11, 12, 13, 14, 15} or end < start:
+            raise UnsupportedCdcType(f"unsupported DATETIME qualifier {start} TO {end}")
+        selected = [code for code in codes if start <= code <= min(end, 10)]
+        fraction_digits = max(0, end - 10)
+        groups = re.findall(r"[0-9]+", text)
+        if len(groups) != len(selected) + (1 if fraction_digits else 0):
+            raise CdcProtocolError(
+                f"DATETIME text {text!r} does not match its {start} TO {end} qualifier"
+            )
+        values = {code: int(group) for code, group in zip(selected, groups)}
+        fraction = groups[-1][:fraction_digits].ljust(fraction_digits, "0") if fraction_digits else ""
+        return _render_datetime(values, fraction, start, fraction_digits, repr(text))
 
 
     # INTERVAL qualifier field codes: YEAR, MONTH | DAY, HOUR, MINUTE, SECOND, then
@@ -1263,6 +1301,7 @@ def register_lakeflow_source(spark):
         "ColumnDescriptor",
         "OpenTransactionRecords",
         "UnsupportedCdcType",
+        "datetime_from_text",
         "apply_null_byte",
         "decode_frame",
         "decode_interval",
@@ -6286,10 +6325,7 @@ def register_lakeflow_source(spark):
 
         def __init__(self) -> None:
             self.condition = threading.Condition()
-            self.validated: set[str] = set()
-            self.claims: dict[str, tuple[object, float]] = {}
             self.table_caches: dict[tuple[str, ...], "Table"] = {}
-            self.connection_limits: set[tuple[str, int]] = set()
             # (table identity, left-out column names) pairs already warned about, so a table
             # resolved on every read warns once per process rather than on each microbatch.
             self.unsupported_column_warnings: set[tuple[str, tuple[str, ...]]] = set()
@@ -6901,7 +6937,6 @@ def register_lakeflow_source(spark):
             self._operation_lock = threading.RLock()
             self._connection_lease_lost = threading.Event()
             self._connection_slot: str | None = None
-            self._connection_slot_token: str | None = None
             self._connection_slot_heartbeat_stop: threading.Event | None = None
             self._connection_slot_heartbeat: threading.Thread | None = None
             # Optional callback the snapshot-drain reader installs so a worker blocked in
@@ -7281,7 +7316,6 @@ def register_lakeflow_source(spark):
                     )
                     if slot is not None:
                         self._connection_slot = f"slot-{slot.slot_id:04d}"
-                        self._connection_slot_token = owner
                         self._lakebase_slot = slot
                         stop = threading.Event()
                         heartbeat = threading.Thread(
@@ -7420,6 +7454,8 @@ def register_lakeflow_source(spark):
             if slot is None:
                 return
             self._lakebase_slot = None
+            # release_connection publishes a backlog hint only while a slot is held.
+            self._connection_slot = None
             try:
                 release_slot(self._lakebase_connection(), slot)
             except Exception:
@@ -11716,9 +11752,14 @@ def register_lakeflow_source(spark):
             # Whoever can write the directory could serve forged CDC rows, so one that isn't
             # this user's alone raises, which turns host sharing off in this process.
 
-            directory = self.directory or os.path.join(
-                tempfile.gettempdir(), f"informix-cdc-shards-{os.getuid()}"
-            )
+            directory = self.directory
+            if directory is None:
+                name = f"informix-cdc-shards-{os.getuid()}"
+                directory = os.path.join(tempfile.gettempdir(), name)
+                # A socket path must fit AF_UNIX's sun_path (104 bytes on macOS and BSD, 108 on
+                # Linux); a long TMPDIR would otherwise turn host sharing off. /tmp is short.
+                if len(os.fsencode(os.path.join(directory, "0" * 24 + ".sock"))) > 100:
+                    directory = os.path.join("/tmp", name)
             os.makedirs(directory, mode=0o700, exist_ok=True)
             info = os.lstat(directory)
             if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
@@ -17790,6 +17831,7 @@ def register_lakeflow_source(spark):
                     escape=escape,
                     commit_time=commit_time,
                     predicate=predicate,
+                    null_byte=_null_byte_mode(self.options),
                 )
                 for raw in raw_records
             )
@@ -17832,6 +17874,7 @@ def register_lakeflow_source(spark):
                         escape=escape,
                         commit_time=commit_time,
                         predicate=predicate,
+                        null_byte=_null_byte_mode(self.options),
                     )
                     if row is not None:
                         yield row
@@ -17901,6 +17944,7 @@ def register_lakeflow_source(spark):
                     escape=escape,
                     commit_time=commit_time,
                     predicate=predicate,
+                    null_byte=_null_byte_mode(self.options),
                 )
                 if row is not None:
                     yield row
@@ -21097,18 +21141,25 @@ def register_lakeflow_source(spark):
         return values
 
 
-    def _unload_value(text: str, type_name: str) -> Any:
+    def _unload_value(text: str, type_name: str, qualifier: int | None = None) -> Any:
         # Docstring: Convert one UNLOAD field to the Python value the live snapshot would yield.
         #
         # Keyed on the column's Informix ``type_name`` so ``_shape_snapshot`` (which
         # isoformats date/datetime and quantizes decimals) then produces a row
         # byte-identical to a live ``consistent_snapshot`` row. An empty field is NULL.
-        # Exotic/binary types and locale-sensitive date formats are best-effort and must
-        # be validated against the count/data-compare tool in live mode.
+        # ``qualifier`` is a DATETIME column's qualifier (``Column.length``): with it, every
+        # qualifier renders as the live and CDC decoders render it. Exotic/binary types and
+        # locale-sensitive date formats are best-effort and must be validated against the
+        # count/data-compare tool in live mode.
 
         if text == "":
             return None
         upper = type_name.upper()
+        if upper in {"CHAR", "NCHAR"}:
+            # The live decoders drop CHAR's blank padding; an extract may keep it.
+            return text.rstrip(" ")
+        if upper == "DATETIME" and qualifier is not None:
+            return datetime_from_text(text, qualifier)
         if upper in _UNLOAD_INT_TYPES:
             return int(text)
         if upper.startswith(("DECIMAL", "NUMERIC", "MONEY")):
@@ -21460,6 +21511,7 @@ def register_lakeflow_source(spark):
         escape: str = _UNL_DEFAULT_ESCAPE,
         commit_time: int | None = None,
         predicate: tuple | None = None,
+        null_byte: str = _DEFAULT_NULL_BYTE_MODE,
     ) -> dict[str, Any] | None:
         # Docstring: Parse, type-convert, and shape one UNLOAD / HPL DELIMITED record -- shared by both
         # serve paths.
@@ -21474,7 +21526,9 @@ def register_lakeflow_source(spark):
         # An extract holds every catalog column, so fields are matched positionally against
         # ``catalog_columns`` under a column selection and only the selected ones converted.
         # ``predicate`` is the table's row_filter from :func:`_row_filter_predicate`, built once
-        # per extract by the caller; a record it drops returns None.
+        # per extract by the caller; a record it drops returns None. ``null_byte`` is the
+        # connection's string.null.byte mode, applied as the live decoders apply it, before
+        # the filter sees the row.
 
         fields = _parse_unload_fields(
             raw.decode(encoding, "strict"), delimiter=delimiter, escape=escape
@@ -21488,7 +21542,10 @@ def register_lakeflow_source(spark):
             )
         position = {column.name: index for index, column in enumerate(catalog)}
         row = {
-            column.name: _unload_value(fields[position[column.name]], column.type_name)
+            column.name: apply_null_byte(
+                _unload_value(fields[position[column.name]], column.type_name, column.length),
+                null_byte,
+            )
             for column in table.columns
         }
         if predicate is not None and not _row_filter_matches(predicate, row):

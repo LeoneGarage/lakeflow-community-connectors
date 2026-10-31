@@ -9,6 +9,7 @@ no row payload for a Python decoder to reconstruct.
 
 from __future__ import annotations
 
+import re
 import struct
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -469,6 +470,20 @@ def _decode_datetime(
         values[code] = int(digits[position : position + width])
         position += width
     fraction = digits[position:]
+    return _render_datetime(values, fraction, start, fraction_digits, digits), size
+
+
+def _render_datetime(
+    values: dict[int, int], fraction: str, start: int, fraction_digits: int, source: str
+) -> datetime | str:
+    # Docstring: Validate DATETIME fields and render them as every decode path does.
+    #
+    # A qualifier holding year, month and day becomes a ``datetime``; an HOUR-anchored one
+    # the text ``HH:MM:SS[.f]``; any other the labelled ``MONTH=05:DAY=15`` form.
+    # ``source`` names the value in errors.
+
+    selected = sorted(values)
+    widths = {0: 4, 2: 2, 4: 2, 6: 2, 8: 2, 10: 2}
     ranges = {
         0: (1, 9999),
         2: (1, 12),
@@ -480,7 +495,7 @@ def _decode_datetime(
     for code, value in values.items():
         minimum, maximum = ranges[code]
         if not minimum <= value <= maximum:
-            raise CdcProtocolError(f"invalid DATETIME field {code} value {value} in {digits}")
+            raise CdcProtocolError(f"invalid DATETIME field {code} value {value} in {source}")
     if 2 in values and 4 in values:
         maximum_day = {
             1: 31,
@@ -497,7 +512,7 @@ def _decode_datetime(
             12: 31,
         }[values[2]]
         if values[4] > maximum_day:
-            raise CdcProtocolError(f"invalid DATETIME calendar fields {digits}")
+            raise CdcProtocolError(f"invalid DATETIME calendar fields {source}")
     if {0, 2, 4}.issubset(values):
         try:
             decoded = datetime(
@@ -510,7 +525,7 @@ def _decode_datetime(
                 int((fraction + "000000")[:6] or 0),
             )
         except ValueError as exc:
-            raise CdcProtocolError(f"invalid DATETIME calendar fields {digits}") from exc
+            raise CdcProtocolError(f"invalid DATETIME calendar fields {source}") from exc
         # Year 1 (e.g. the 0001-01-01 00:00:00 sentinel) sits adjacent to
         # ``datetime.min``. PySpark converts a TimestampType value with
         # ``datetime.astimezone()``, which subtracts the session UTC offset and
@@ -520,17 +535,41 @@ def _decode_datetime(
         # carries no timezone, so treating the wall clock as UTC preserves its value.
         if values[0] <= 1:
             decoded = decoded.replace(tzinfo=timezone.utc)
-        return decoded, size
+        return decoded
     if start == 6:
         rendered = ":".join(f"{values[code]:0{widths[code]}d}" for code in selected)
         if fraction:
             rendered += f".{fraction}"
-        return rendered, size
+        return rendered
     labels = {0: "YEAR", 2: "MONTH", 4: "DAY", 6: "HOUR", 8: "MINUTE", 10: "SECOND"}
     rendered = ":".join(f"{labels[code]}={values[code]:0{widths[code]}d}" for code in selected)
     if fraction:
         rendered += f":FRACTION({fraction_digits})={fraction}"
-    return rendered, size
+    return rendered
+
+
+def datetime_from_text(text: str, qualifier: int) -> datetime | str:
+    # Docstring: The value the packed decoder yields, for a DATETIME written as its literal.
+    #
+    # UNLOAD and HPL write a DATETIME as its literal text in the column's qualifier
+    # ("2024-05-15 10:30:00.12345", "10:30:00", "05-15"); its digit groups are the
+    # qualifier's fields in order, then the fraction. Rendering them as _decode_datetime
+    # does keeps a file-sourced snapshot row identical to a live snapshot or CDC row.
+
+    start, end = (qualifier >> 8) & 0xF, qualifier & 0xF
+    codes = (0, 2, 4, 6, 8, 10)
+    if start not in codes or end not in {*codes, 11, 12, 13, 14, 15} or end < start:
+        raise UnsupportedCdcType(f"unsupported DATETIME qualifier {start} TO {end}")
+    selected = [code for code in codes if start <= code <= min(end, 10)]
+    fraction_digits = max(0, end - 10)
+    groups = re.findall(r"[0-9]+", text)
+    if len(groups) != len(selected) + (1 if fraction_digits else 0):
+        raise CdcProtocolError(
+            f"DATETIME text {text!r} does not match its {start} TO {end} qualifier"
+        )
+    values = {code: int(group) for code, group in zip(selected, groups)}
+    fraction = groups[-1][:fraction_digits].ljust(fraction_digits, "0") if fraction_digits else ""
+    return _render_datetime(values, fraction, start, fraction_digits, repr(text))
 
 
 # INTERVAL qualifier field codes: YEAR, MONTH | DAY, HOUR, MINUTE, SECOND, then
@@ -632,6 +671,7 @@ __all__ = [
     "ColumnDescriptor",
     "OpenTransactionRecords",
     "UnsupportedCdcType",
+    "datetime_from_text",
     "apply_null_byte",
     "decode_frame",
     "decode_interval",
