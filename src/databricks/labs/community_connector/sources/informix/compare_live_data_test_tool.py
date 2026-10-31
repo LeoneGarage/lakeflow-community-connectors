@@ -181,17 +181,26 @@ def wait_ssm(args: argparse.Namespace, command_id: str, timeout: int = 3600) -> 
     deadline = time.monotonic() + timeout
     previous_state = None
     while True:
-        raw = aws(
-            args,
-            "ssm",
-            "get-command-invocation",
-            "--command-id",
-            command_id,
-            "--instance-id",
-            args.instance_id,
-            "--output",
-            "json",
-        )
+        try:
+            raw = aws(
+                args,
+                "ssm",
+                "get-command-invocation",
+                "--command-id",
+                command_id,
+                "--instance-id",
+                args.instance_id,
+                "--output",
+                "json",
+            )
+        except RuntimeError as error:
+            # SSM can briefly answer InvocationDoesNotExist for a command it has just
+            # accepted. That is still pending, not a failure: it failed a cycles job run
+            # between a container restart and its first workload check.
+            if "InvocationDoesNotExist" not in str(error) or time.monotonic() >= deadline:
+                raise
+            time.sleep(2)
+            continue
         result = json.loads(raw)
         state = result["Status"]
         if state != previous_state:
