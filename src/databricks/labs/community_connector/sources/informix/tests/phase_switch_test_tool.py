@@ -3,51 +3,27 @@ import argparse, concurrent.futures, json, subprocess, time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+# Same tables and default warehouse as the count compare (run from the repo root).
+from count_compare_test_tool import TABLES, WAREHOUSE
+
 SYD = ZoneInfo("Australia/Sydney")
 UTC = ZoneInfo("UTC")
-TABLES = [
-    "archivefulfillment",
-    "tw060",
-    "tw060_ovhc",
-    "tw070",
-    "tw070d",
-    "tw101",
-    "tw101_ovhc",
-    "tw109",
-    "tw109_ovhc",
-    "tw110",
-    "tw110_ovhc",
-    "tw111",
-    "tw111d",
-    "tw142_forcedmerge",
-    "tw201",
-    "tw202",
-    "tw202d",
-    "tw205",
-    "tw208",
-    "tw214",
-    "tw221",
-    "tw221d",
-    "tw241",
-    "tw241_ovhc",
-    "tw295",
-    "tw301",
-    "tw303",
-    "tw304",
-    "tw316",
-    "tw316_ovhc",
-]
-WH = "8fff545079c359bb"
-_DEFAULT_RUN_START = "2026-08-03T19:52:28.251Z"  # last pipeline update creation_time
+PIPELINE_ID = "06fdbf02-06a2-491d-aaba-4cabd7b0d81f"  # informix-pipeline on demo1
 _ap = argparse.ArgumentParser(description="Informix snapshot/stream phase timing analysis")
 _ap.add_argument(
     "--run-start",
     dest="run_start",
-    default=_DEFAULT_RUN_START,
     help="UTC ISO timestamp of the pipeline start (create_update creation_time), "
-    "e.g. 2026-08-03T19:52:28.251Z. DESCRIBE HISTORY is filtered to writes at/after this.",
+    "e.g. 2026-08-03T19:52:28.251Z. DESCRIBE HISTORY is filtered to writes at/after this. "
+    "Defaults to the creation_time of informix-pipeline's newest update.",
 )
-RUN_START = _ap.parse_args().run_start
+_ap.add_argument(
+    "--warehouse-id",
+    default=WAREHOUSE,
+    help=f"SQL warehouse that runs the DESCRIBE HISTORY queries (default {WAREHOUSE}).",
+)
+_ARGS = _ap.parse_args()
+WH = _ARGS.warehouse_id
 # "large" commit = snapshot chunk. Default snapshot.page.size is large; CDC batches
 # are bounded by max.records.per.batch (small). Use a threshold well above CDC batch
 # size to separate chunk-writes from streamed changes.
@@ -76,6 +52,15 @@ def q(stmt):
     if st != "SUCCEEDED":
         raise RuntimeError(d["status"])
     return d.get("result", {}).get("data_array", [])
+
+
+def newest_update_start():
+    update = api("get", f"/api/2.0/pipelines/{PIPELINE_ID}/updates?max_results=1")["updates"][0]
+    started = datetime.fromtimestamp(int(update["creation_time"]) / 1000, UTC)
+    return started.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+RUN_START = _ARGS.run_start or newest_update_start()
 
 
 def rows_written(op, mj):

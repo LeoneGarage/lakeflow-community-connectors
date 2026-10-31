@@ -66,7 +66,7 @@ TABLES = [
     "tw901_claim_note",
 ]
 
-WAREHOUSE = "fdd50316baff6701"
+WAREHOUSE = "1a6fe9ed716571e0"  # demo1 Serverless Starter Warehouse
 
 
 def make_args(instance_id: str) -> argparse.Namespace:
