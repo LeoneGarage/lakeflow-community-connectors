@@ -15754,6 +15754,17 @@ def register_lakeflow_source(spark):
                     "the FUSE transport"
                 )
                 return None
+            except WorkspaceHttpError as error:
+                # A 401 here is the reader's starting credential expiring (it lasts about an
+                # hour, and every reader, a drain worker's included, mints its first token
+                # from it): stage over FUSE, as when token creation is forbidden.
+                if mode == "rest" or error.status_code != 401:
+                    raise
+                logging.getLogger(__name__).warning(
+                    "The credential that mints the snapshot-staging token was rejected; "
+                    "snapshot staging uses the FUSE transport"
+                )
+                return None
             self._staging_files_api = files_api
             return files_api
 

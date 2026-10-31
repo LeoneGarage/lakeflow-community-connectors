@@ -8205,6 +8205,38 @@ class LakeflowContractTests(unittest.TestCase):
         with self.assertRaises(informix_module.WorkspaceHttpError):
             self._rejecting_transport_read("rest")
 
+    def _expired_bootstrap_read(self, transport):
+        # A keyless initial read whose very first token mint answers 401: the reader's
+        # starting credential expired, as it does about an hour into an update.
+        def _expired_provider(*_a, **_k):
+            provider = mock.Mock()
+            provider.bearer.side_effect = informix_module.WorkspaceHttpError(
+                "POST token/create failed with HTTP 401", 401
+            )
+            return provider
+
+        with mock.patch.object(informix_module, "StagingCredentialProvider", _expired_provider):
+            connector, _ = self._keyless_connector(
+                **{
+                    "snapshot.staging.transport": transport,
+                    "lakebase.workspace.host": "https://ws",
+                    "lakebase.workspace.token": "boot",
+                }
+            )
+            options = dict(self.APPEND, **{"snapshot.mode": "initial"})
+            rows, _ = connector.read_table("app.orders", {}, options)
+            return connector, list(rows)
+
+    def test_auto_transport_uses_fuse_when_the_first_mint_gets_a_401(self):
+        connector, rows = self._expired_bootstrap_read("auto")
+
+        self.assertEqual(len(rows), 2)
+        self.assertIsNone(connector._staging_files_api)
+
+    def test_rest_transport_fails_when_the_first_mint_gets_a_401(self):
+        with self.assertRaises(informix_module.WorkspaceHttpError):
+            self._expired_bootstrap_read("rest")
+
     def test_rest_transport_hard_fails_when_token_unavailable(self):
         def _unavailable_provider(*_a, **_k):
             provider = mock.Mock()
