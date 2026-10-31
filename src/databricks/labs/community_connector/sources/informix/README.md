@@ -431,7 +431,7 @@ The fixture at `/Users/leon.eller/work/dev/informix-cdc` live-tests PAM against 
 
 ## Supported objects and naming
 
-The connector dynamically discovers all eligible base tables in the configured database, then applies optional filters. It excludes every table whose name or owner begins with `sys` (in any case), as Informix system objects, and everything in `syscdcv1`. That also leaves out a user table such as `system_config`, and any table owned by a login such as `sysadmin`; registering one fails with an error that names this rule. Views and other non-table objects are not exposed.
+The connector dynamically discovers every base table in the configured database, Informix's system catalog tables included, then applies optional filters. Nothing is left out by name or owner: the only objects Informix's CDC API documents as impossible to capture are views, temporary and other non-logged tables, and tables in a database without logging. Views and other non-table objects are not exposed; a non-logged (`RAW`) table is listed, but Informix refuses to capture it.
 
 Pipeline source names use `owner.table`, such as `informix.orders`. Filter patterns are case-sensitive shell-style patterns and can match:
 

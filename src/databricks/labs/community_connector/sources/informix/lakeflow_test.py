@@ -181,7 +181,7 @@ def _table(owner="app", name="orders", cdc=True, primary_keys=("id",)):
 
 class FakeBridge:
     def __init__(self):
-        self.tables = [_table(), _table("sysadmin", "hidden"), _table(name="audit")]
+        self.tables = [_table(), _table("sysadmin", "jobs"), _table(name="audit")]
         self.rows = [{"id": 1, "value": "a"}, {"id": 2, "value": "b"}]
         self.changes = []
         self.now, self.minimum = 90, 1
@@ -3562,6 +3562,47 @@ class LakeflowContractTests(unittest.TestCase):
         with self.assertRaisesRegex(InformixError, "metadata.max.bytes=1"):
             bridge.list_tables()
 
+    def test_discovery_keeps_catalog_and_sys_named_tables(self):
+        class MetadataTransport:
+            def __init__(self):
+                self.statements = []
+
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                self.statements.append(sql)
+                if "syscolumns" not in sql:
+                    return []
+                return [
+                    {
+                        "colname": "tabid",
+                        "coltype": 6,
+                        "collength": 4,
+                        "colno": 1,
+                        "tabid": tabid,
+                        "extended_id": 0,
+                        "extended_name": None,
+                        "extended_owner": None,
+                        "owner": owner,
+                        "tabname": name,
+                    }
+                    for tabid, owner, name in (
+                        (1, "informix", "systables"),
+                        (120, "sysadmin", "jobs"),
+                    )
+                ]
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.config = {"database": "demo"}
+        bridge.transport = MetadataTransport()
+
+        tables = bridge.list_tables()
+
+        self.assertEqual(
+            sorted((table["owner"], table["name"]) for table in tables),
+            [("informix", "systables"), ("sysadmin", "jobs")],
+        )
+        self.assertFalse(any("MATCHES" in sql for sql in bridge.transport.statements))
+
     def test_zero_metadata_byte_bound_skips_accounting(self):
         class MetadataTransport:
             def execute(self, sql, parameters=(), max_result_bytes=None):
@@ -4776,13 +4817,21 @@ class LakeflowContractTests(unittest.TestCase):
         with self.assertRaisesRegex(SqliSessionRejected, "rejected"):
             connector.read_table("app.orders", checkpoint, {})
 
-    def test_a_sys_table_is_refused_with_the_rule_named(self):
-        # Discovery hides names and owners starting with "sys"; a user who configures
-        # one by name should learn why rather than see a bare "unknown table".
-        connector = self.connector()
-        self.assertNotIn("sysadmin.hidden", connector.list_tables())
-        with self.assertRaisesRegex(ValueError, "starts with 'sys'"):
-            connector.get_table_schema("sysadmin.hidden", {})
+    def test_sys_named_and_sys_owned_tables_are_ordinary_tables(self):
+        # Informix's CDC API refuses only views, temporary and non-logged tables and
+        # unlogged databases, so a name or owner starting with "sys" hides nothing.
+        bridge = FakeBridge()
+        bridge.tables.append(_table(name="system_config"))
+        connector = self.connector(bridge)
+
+        tables = connector.list_tables()
+
+        self.assertIn("sysadmin.jobs", tables)
+        self.assertIn("app.system_config", tables)
+        self.assertEqual(connector.get_table_schema("sysadmin.jobs", {}).fields[0].name, "id")
+        self.assertEqual(
+            connector.read_table_metadata("app.system_config", {})["primary_keys"], ["id"]
+        )
 
     def test_qualified_source_table_maps_logical_to_owner_qualified_name(self):
         connector = self.connector()

@@ -7734,14 +7734,16 @@ def register_lakeflow_source(spark):
         def list_tables(self) -> list[dict[str, Any]]:
             self._ensure_connected()
             maximum = self._metadata_max_bytes()
+            # Every base table, the system catalog's included. Informix's CDC API refuses only
+            # views, temporary and non-logged tables and unlogged databases, so nothing else is
+            # left out by name or owner; tabtype 'T' already leaves views and synonyms out.
             columns = self.transport.execute(
                 "SELECT c.colname, c.coltype, c.collength, c.colno, t.tabid, "
                 "c.extended_id, x.name AS extended_name, x.owner AS extended_owner, "
                 "t.owner, t.tabname "
                 "FROM systables t JOIN syscolumns c ON t.tabid = c.tabid "
                 "LEFT JOIN sysxtdtypes x ON x.extended_id = c.extended_id "
-                "WHERE t.tabtype = 'T' AND t.owner NOT MATCHES 'sys*' "
-                "AND t.tabname NOT MATCHES 'sys*' "
+                "WHERE t.tabtype = 'T' "
                 "ORDER BY t.owner, t.tabname, c.colno",
                 max_result_bytes=maximum,
             )
@@ -7752,7 +7754,6 @@ def register_lakeflow_source(spark):
                 "FROM systables t JOIN sysconstraints x ON t.tabid=x.tabid "
                 "JOIN sysindexes i ON x.idxname=i.idxname AND x.tabid=i.tabid "
                 "WHERE t.tabtype='T' AND x.constrtype='P' "
-                "AND t.owner NOT MATCHES 'sys*' AND t.tabname NOT MATCHES 'sys*' "
                 "ORDER BY t.owner,t.tabname",
                 max_result_bytes=maximum,
             )
@@ -13350,9 +13351,9 @@ def register_lakeflow_source(spark):
 
         def _resolve_registration_table(self, exposed: str) -> Table:
             # Docstring: Resolve a single configured table by exposed ``owner.name`` via a
-            # targeted catalog query, applying the same eligibility and selection
-            # filters ``_table_map`` would. Only this one table is read and parsed, so
-            # an unrelated unsupported table elsewhere in the catalog cannot fail it.
+            # targeted catalog query, applying the same table filters ``_table_map`` would.
+            # Only this one table is read and parsed, so an unrelated unsupported table
+            # elsewhere in the catalog cannot fail it.
 
             parts = _split_identity(exposed)
             if len(parts) != 2 or not all(_IDENTIFIER.fullmatch(part) for part in parts):
@@ -13362,8 +13363,8 @@ def register_lakeflow_source(spark):
                 self._bridge.get_table(_join_identity(database, parts[0], parts[1])),
                 database,
             )
-            if not _eligible(table) or not self._selected(table):
-                raise _excluded_table_error(exposed, table)
+            if not self._selected(table):
+                raise ValueError(f"Unknown or excluded Informix table '{exposed}'")
             return table
 
         def _registration_table_cache_key(self) -> tuple[str, ...] | None:
@@ -20454,7 +20455,7 @@ def register_lakeflow_source(spark):
                 database = self.options.get("database", "")
                 for raw in self._bridge.list_tables():
                     table = Table.parse(raw, database)
-                    if _eligible(table) and self._selected(table):
+                    if self._selected(table):
                         if table.exposed_name in result:
                             raise InformixError(f"Duplicate exposed table name {table.exposed_name}")
                         result[table.exposed_name] = table
@@ -20481,8 +20482,8 @@ def register_lakeflow_source(spark):
                     self._bridge.get_table(_join_identity(database, parts[0], parts[1])),
                     database,
                 )
-                if not _eligible(table) or not self._selected(table):
-                    raise _excluded_table_error(exposed, table)
+                if not self._selected(table):
+                    raise ValueError(f"Unknown or excluded Informix table '{exposed}'")
                 if self._tables is None:
                     self._tables = {}
                 self._tables[exposed] = table
@@ -20689,27 +20690,6 @@ def register_lakeflow_source(spark):
 
     def _patterns(value: str | None) -> tuple[str, ...]:
         return tuple(part.strip() for part in (value or "").split(",") if part.strip())
-
-
-    def _eligible(table: Table) -> bool:
-        return not (
-            table.owner.lower().startswith("sys")
-            or table.name.lower().startswith("sys")
-            or table.database.lower() == "syscdcv1"
-        )
-
-
-    def _excluded_table_error(exposed: str, table: Table) -> ValueError:
-        # Docstring: The error for a configured table the connector won't read, naming the rule
-        # when the table is excluded as a system object rather than by the table filters.
-
-        if _eligible(table):
-            return ValueError(f"Unknown or excluded Informix table '{exposed}'")
-        return ValueError(
-            f"Unknown or excluded Informix table '{exposed}': a table whose name or owner "
-            "starts with 'sys', or any table in syscdcv1, is treated as an Informix system "
-            "object and never ingested"
-        )
 
 
     def _cdc_streamable(table: Table) -> bool:
