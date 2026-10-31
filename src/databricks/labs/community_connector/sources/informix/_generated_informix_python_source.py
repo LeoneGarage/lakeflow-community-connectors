@@ -15757,6 +15757,13 @@ def register_lakeflow_source(spark):
             self._staging_files_api = files_api
             return files_api
 
+        def _staging_fell_back(self, error: WorkspaceHttpError) -> bool:
+            # Docstring: Whether a Files API error was a 401 nothing could recover that moved an
+            # ``auto`` staging transport to FUSE, so the caller can redo its operation there.
+            # ``rest`` keeps its transport, and every other error stands.
+
+            return error.status_code == 401 and self._staging_transport() is None
+
         def _should_pipeline_staging(self, scan_keys: tuple[str, ...]) -> bool:
             # Docstring: Whether to overlap this drain's page fetch with the page upload.
             #
@@ -15868,9 +15875,8 @@ def register_lakeflow_source(spark):
                     files_api.put(os.path.join(namespace, page_name, "data.json.gz"), compressed)
                     return
                 except WorkspaceHttpError as error:
-                    # A 401 nothing could recover moves an ``auto`` transport to FUSE, which
-                    # writes this page too; ``rest`` keeps failing.
-                    if error.status_code != 401 or self._staging_transport() is not None:
+                    # After a 401 nothing could recover, FUSE writes this page too.
+                    if not self._staging_fell_back(error):
                         raise
             # No filesystem capability probe: the exclusive-create and atomic-rename
             # guarantees it checked were needed by the head-election protocol, which
@@ -17409,18 +17415,26 @@ def register_lakeflow_source(spark):
             # minted -- the whole point, since serverless FUSE caches an entire file to
             # local disk on first access, fatal for a large `.unl`. Falls back to a local
             # seek/read when REST is unavailable (offline tests, or a workspace that forbids
-            # token minting), mirroring ``snapshot.staging.transport=auto`` for writes.
-
-            files_api = self._staging_transport()
-            if files_api is not None:
-                return lambda offset, length: files_api.get_range(path, offset, offset + length)
+            # token minting), mirroring ``snapshot.staging.transport=auto`` for writes, and
+            # after a 401 nothing could recover. The transport is consulted on every read, so
+            # once it has moved to FUSE the reads still to come go there directly.
 
             def local(offset: int, length: int) -> bytes:
                 with open(path, "rb") as handle:
                     handle.seek(offset)
                     return handle.read(length)
 
-            return local
+            def read(offset: int, length: int) -> bytes:
+                files_api = self._staging_transport()
+                if files_api is not None:
+                    try:
+                        return files_api.get_range(path, offset, offset + length)
+                    except WorkspaceHttpError as error:
+                        if not self._staging_fell_back(error):
+                            raise
+                return local(offset, length)
+
+            return read
 
         def _resolve_unl_boundary_lsn(self, table_options: dict[str, str], source: str) -> int | None:
             # Docstring: Resolve the operator-supplied boundary LSN, or None to self-pin.
@@ -17478,15 +17492,20 @@ def register_lakeflow_source(spark):
             # Docstring: Read ``<source>/_manifest.json`` (small file, whole), or None if absent.
             #
             # Uses the Files REST API when a staging token is available (a 404 means absent),
-            # else a local read (a missing file means absent). A present-but-malformed
-            # manifest fails closed.
+            # else, or after a 401 nothing could recover, a local read (a missing file means
+            # absent). A present-but-malformed manifest fails closed.
 
             path = os.path.join(source, _SNAPSHOT_MANIFEST_NAME)
             files_api = self._staging_transport()
+            data = None
             try:
                 if files_api is not None:
-                    data = files_api.get(path)
-                else:
+                    try:
+                        data = files_api.get(path)
+                    except WorkspaceHttpError as error:
+                        if not self._staging_fell_back(error):
+                            raise
+                if data is None:
                     with open(path, "rb") as handle:
                         data = handle.read()
             except FileNotFoundError:

@@ -15814,6 +15814,50 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
             self.assertEqual(row[informix_module.COMMIT_LSN], informix_module._sortable_lsn(90))
             self.assertEqual(row[informix_module.CURSOR], informix_module._sortable_lsn(90))
 
+    def test_unl_source_moves_to_fuse_after_an_unrecoverable_401(self):
+        # Revoked token, expired starting credential: the ranged GETs and the manifest
+        # read redo themselves locally in the same serve rather than failing it.
+        source = self._source("1|alpha|\n2|beta|\n")
+
+        class _RejectedFilesApi:
+            rejected = False
+
+            def __init__(self, host, provider):
+                pass
+
+            def _reject(self, path):
+                self.rejected = True
+                raise informix_module.WorkspaceHttpError(f"GET {path} failed with HTTP 401", 401)
+
+            def get(self, path):
+                self._reject(path)
+
+            def get_range(self, path, start, end):
+                self._reject(path)
+
+        def _fake_provider(*_a, **_k):
+            provider = mock.Mock()
+            provider.bearer.return_value = "tok"
+            return provider
+
+        with (
+            mock.patch.object(informix_module, "WorkspaceFilesApi", _RejectedFilesApi),
+            mock.patch.object(informix_module, "StagingCredentialProvider", _fake_provider),
+        ):
+            connector = self.connector(
+                FakeBridge(),
+                **{
+                    "snapshot.staging.transport": "auto",
+                    "lakebase.workspace.host": "https://ws",
+                    "lakebase.workspace.token": "boot",
+                },
+            )
+            rows, _ = connector.read_table("app.orders", {}, {"snapshot.source": source})
+            rows = list(rows)
+
+        self.assertEqual([(row["id"], row["value"]) for row in rows], [(1, "alpha"), (2, "beta")])
+        self.assertIsNone(connector._staging_files_api)
+
     def test_unl_source_reads_files_in_name_order(self):
         source = self._source("1|alpha|\n", "2|beta|\n")
         rows, _ = self.connector(FakeBridge()).read_table(
