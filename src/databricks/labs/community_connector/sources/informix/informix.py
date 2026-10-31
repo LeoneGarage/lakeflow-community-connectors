@@ -94,6 +94,7 @@ from databricks.labs.community_connector.sources.informix.sqli import (
     InformixSqliClient,
     PasswordAuthenticationProvider,
     SqliProtocolError,
+    SqliTransportError,
     add_informix_exception_note,
     datetime_order_preserving_cast,
     informix_locale_encoding,
@@ -1528,7 +1529,9 @@ class PurePythonInformixBridge:
             # Before acquiring a slot -- a jittering reader holds nothing while it waits.
             self._apply_startup_jitter()
             bypass_capacity = self.options.get("_informix.bypass.connection.capacity") == "true"
-            if not bypass_capacity:
+            # A reconnect after reset_transport still holds its slot and heartbeat; claiming
+            # another would strand the first, renewed until the process exits.
+            if not bypass_capacity and getattr(self, "_lakebase_slot", None) is None:
                 budget = self.options.get(_CONNECTION_ATTEMPT_BUDGET_OPTION)
                 self._acquire_connection_slot(float(budget) if budget else None)
             try:
@@ -1796,12 +1799,17 @@ class PurePythonInformixBridge:
         sweep_max = _LAKEBASE_SWEEP_MAX_SECONDS * sweep_scale
         connection = self._lakebase_connection()
         # Capacity is the row count, so the rows must exist before the first
-        # claim. Seeding is idempotent and only ever adds rows.
-        seed_slots(connection, namespace, slot_count)
-        publish_connection_limit(
-            connection, namespace, slot_count, _CONNECTION_LIMIT_CONFIG_VERSION
-        )
-        owner = f"{secrets.token_hex(16)}"
+        # claim. Seeding is idempotent and only ever adds rows, and both writes change
+        # nothing until the limit does, so a bridge makes them once per limit rather
+        # than on every claim. A claim that gives up makes them again next time.
+        seeded = (namespace, slot_count)
+        if getattr(self, "_seeded_connection_limit", None) != seeded:
+            seed_slots(connection, namespace, slot_count)
+            publish_connection_limit(
+                connection, namespace, slot_count, _CONNECTION_LIMIT_CONFIG_VERSION
+            )
+            self._seeded_connection_limit = seeded
+        owner = secrets.token_hex(16)
         scope = self.options.get("_informix.pipeline.scope") or None
         deadline = time.monotonic() + connection_wait_timeout
         # Slot-wait liveness (the two daemon roles). A daemon is not a consumer microbatch: it must
@@ -1905,6 +1913,9 @@ class PurePythonInformixBridge:
                         f"{connection_wait_timeout:g} seconds"
                     )
                 time.sleep(random.uniform(sweep_min, sweep_max))
+        except BaseException:
+            self._seeded_connection_limit = None
+            raise
         finally:
             # Drop our ticket whether we won, timed out, or errored -- a lingering ticket
             # would wrongly hold back younger waiters until it aged out. Best-effort: a
@@ -2651,13 +2662,21 @@ class PurePythonInformixBridge:
         # Best-effort: a source that does not support ``DBINFO('utc_current')`` yields NULL
         # commit-time on snapshot rows rather than failing the read.
 
+        if getattr(self, "_utc_time_unsupported", False):
+            return None
         self._ensure_connected()
         try:
             row = self.transport.execute(
                 "SELECT DBINFO('utc_current') AS utc FROM sysmaster:sysdual"
             )[0]
             return int(_field(row, "utc", 0))
-        except Exception:
+        except Exception as error:
+            # The failed statement poisoned the SQLI client: drop the transport, keeping
+            # the slot, so the next statement reconnects rather than failing on it. A
+            # source that answered but can't run the probe isn't asked again.
+            self.reset_transport()
+            if not isinstance(error, (SqliTransportError, OSError)):
+                self._utc_time_unsupported = True
             return None
 
     @_serialized_sqli_operation
@@ -2788,10 +2807,14 @@ class PurePythonInformixBridge:
                     set_socket_timeout,
                     previous_socket_timeout,
                 )
-            # else: the socket is mid-read on a timed-out CDC session. Skip teardown --
-            # issuing it on a dead socket would only time out again, tripling this
-            # attempt's cost. validate_initial_lsn resets the transport and retries; the
-            # server reclaims the abandoned session on its own.
+            else:
+                # The socket is mid-read on a timed-out CDC session. Skip teardown --
+                # issuing it on a dead socket would only time out again, tripling this
+                # attempt's cost. validate_initial_lsn resets the transport and retries;
+                # the server reclaims the abandoned session on its own. The timeout is
+                # still put back: the client keeps it for every later connection.
+                if set_socket_timeout is not None and previous_socket_timeout is not None:
+                    set_socket_timeout(float(previous_socket_timeout))
 
     def _teardown_validation_session(
         self,
@@ -2908,14 +2931,17 @@ class PurePythonInformixBridge:
             return direction_aware and index < len(descending) and descending[index]
 
         def order_term(key: str) -> str:
-            return chunk_exprs.get(key, key)
+            # Names are validated, but one with "+" or "." must be sent delimited.
+            return chunk_exprs.get(key) or _sql_identifier(key)
 
         def order_clause(index: int, key: str) -> str:
             return f"{order_term(key)} DESC" if is_descending(index) else order_term(key)
 
         alias_names = [f"__chunk_{key}" for key in primary_keys if key in chunk_exprs]
-        projection = list(columns) + [
-            f"{chunk_exprs[key]} AS __chunk_{key}" for key in primary_keys if key in chunk_exprs
+        projection = [_sql_identifier(column) for column in columns] + [
+            f"{chunk_exprs[key]} AS {_sql_identifier(f'__chunk_{key}')}"
+            for key in primary_keys
+            if key in chunk_exprs
         ]
         window = f"SKIP {int(skip)} " if skip else ""
         # {+FIRST_ROWS(n)} asks the optimizer to stream the page in key order from
@@ -2938,19 +2964,17 @@ class PurePythonInformixBridge:
             validate_snapshot_arity(after, primary_keys)
             bound_after = list(after)
             if any(isinstance(value, str) for value in after):
-                table = self._describe_table(owner, name)
-                descriptors = {str(column["name"]): column for column in table["columns"]}
+                datetimes = self._datetime_qualifiers(owner, name)
                 for index, key in enumerate(primary_keys):
-                    descriptor = descriptors[key]
                     # DATETIME keys chunked by expression compare as strings, so
                     # they must not be rewritten into a native DATETIME literal.
                     if (
                         key not in chunk_exprs
-                        and descriptor["type_name"] == "DATETIME"
+                        and key in datetimes
                         and isinstance(bound_after[index], str)
                     ):
                         bound_after[index] = InformixDatetimeLiteral(
-                            bound_after[index], int(descriptor["length"])
+                            bound_after[index], datetimes[key]
                         )
             # Guarded leading-column seek bound. The OR-form keyset below is
             # frequently not recognized by the optimizer as an index range start,
@@ -3016,6 +3040,26 @@ class PurePythonInformixBridge:
             for row in rows
         ]
 
+    def _datetime_qualifiers(self, owner: str, name: str) -> dict[str, int]:
+        # Docstring: The table's DATETIME columns and their qualifiers, described once per bridge.
+        #
+        # A keyset page needs them to bind a string cursor value as a DATETIME literal.
+        # Describing the table on every page of a CHAR-keyed table cost catalog queries
+        # inside each page's transaction. The connector pages with key metadata it read
+        # when the snapshot began, so caching these adds no staleness of its own.
+
+        cache = getattr(self, "_datetime_qualifier_cache", None)
+        if cache is None:
+            cache = self._datetime_qualifier_cache = {}
+        if (owner, name) not in cache:
+            table = self._describe_table(owner, name)
+            cache[(owner, name)] = {
+                str(column["name"]): int(column["length"])
+                for column in table["columns"]
+                if column["type_name"] == "DATETIME"
+            }
+        return cache[(owner, name)]
+
     @contextlib.contextmanager
     def _repeatable_read_transaction(self, isolation: str = "REPEATABLE READ"):
         # Docstring: Run a snapshot transaction at ``isolation`` with the snapshot socket timeout.
@@ -3033,15 +3077,21 @@ class PurePythonInformixBridge:
         if isolation not in _SNAPSHOT_ISOLATION_SQL.values():
             raise InformixError(f"Unsupported snapshot isolation {isolation!r}")
         execute_command = getattr(self.transport, "execute_command", self.transport.execute)
-        ansi_rows = self.transport.execute(
-            "SELECT is_ansi FROM sysmaster:sysdatabases WHERE name = ?",
-            (self.config["database"],),
-        )
-        if len(ansi_rows) != 1:
-            raise InformixError(
-                f"Could not determine transaction mode for database " f"{self.config['database']!r}"
+        # A database's mode never changes, so a non-ANSI one is probed once. An ANSI one
+        # is probed every time: the probe opens the implicit transaction the COMMIT
+        # WORK below ends.
+        is_ansi = getattr(self, "_is_ansi_database", None)
+        if is_ansi is not False:
+            ansi_rows = self.transport.execute(
+                "SELECT is_ansi FROM sysmaster:sysdatabases WHERE name = ?",
+                (self.config["database"],),
             )
-        is_ansi = bool(int(_field(ansi_rows[0], "is_ansi", 0)))
+            if len(ansi_rows) != 1:
+                raise InformixError(
+                    "Could not determine transaction mode for database "
+                    f"{self.config['database']!r}"
+                )
+            is_ansi = self._is_ansi_database = bool(int(_field(ansi_rows[0], "is_ansi", 0)))
         if is_ansi:
             # The catalog SELECT starts an implicit transaction in an ANSI
             # database. End it before establishing the snapshot isolation.
@@ -3161,11 +3211,15 @@ class PurePythonInformixBridge:
                 table_ref, list(primary_keys), snapshot_filter, list(key_descending or [])
             )
         select_terms = [
-            f"{chunk_exprs[key]} AS __chunk_{key}" if key in chunk_exprs else key
+            f"{chunk_exprs[key]} AS {_sql_identifier(f'__chunk_{key}')}"
+            if key in chunk_exprs
+            else _sql_identifier(key)
             for key in primary_keys
         ]
         result_names = [f"__chunk_{key}" if key in chunk_exprs else key for key in primary_keys]
-        order = ",".join(f"{chunk_exprs.get(key, key)} DESC" for key in primary_keys)
+        order = ",".join(
+            f"{chunk_exprs.get(key) or _sql_identifier(key)} DESC" for key in primary_keys
+        )
         # {+FIRST_ROWS(1)} steers the optimizer to minimize time-to-first-row so a
         # DESC ordering is served by an index read (row 1 returns immediately)
         # rather than a full scan + top-sort. It is a `{+ }` comment, so a server
@@ -3217,15 +3271,16 @@ class PurePythonInformixBridge:
                 predicates = [f"({snapshot_filter})"] if snapshot_filter else []
                 params: list[Any] = []
                 for previous in range(index):
-                    predicates.append(f"{primary_keys[previous]} = ?")
+                    predicates.append(f"{_sql_identifier(primary_keys[previous])} = ?")
                     params.append(resolved[previous])
                 where = f" WHERE {' AND '.join(predicates)}" if predicates else ""
                 # The last value in paging order is the min of a DESC column, the
                 # max of an ASC one; fetch it by ordering opposite the index.
                 fetch_order = "ASC" if index < len(descending) and descending[index] else "DESC"
+                term = _sql_identifier(key)
                 sql = (
-                    f"SELECT {{+FIRST_ROWS(1)}} FIRST 1 {key} "
-                    f"FROM {table_ref}{where} ORDER BY {key} {fetch_order}"
+                    f"SELECT {{+FIRST_ROWS(1)}} FIRST 1 {term} "
+                    f"FROM {table_ref}{where} ORDER BY {term} {fetch_order}"
                 )
                 rows = self.transport.execute(sql, tuple(params))
                 if not rows:
@@ -3298,9 +3353,9 @@ class PurePythonInformixBridge:
 
         # Informix SQLI does not expose parameter binding, so keyset pagination
         # must render continuation values as SQL literals. Some valid partial
-        # DATETIME values are rejected when parsed back by Informix (-1263).
-        # Within this snapshot transaction, positional pagination is stable and
-        # avoids converting DATETIME keys back into SQL.
+        # DATETIME values are rejected when parsed back by Informix (-1263), and a
+        # float key has no exact literal. Within this snapshot transaction,
+        # positional pagination is stable and avoids converting such keys back into SQL.
         positional_pagination = bool(datetime_primary_key)
 
         self._ensure_connected()
@@ -3343,7 +3398,7 @@ class PurePythonInformixBridge:
                     page_index += 1
 
                 execute_pages(
-                    f"SELECT {','.join(columns)} "
+                    f"SELECT {','.join(_sql_identifier(column) for column in columns)} "
                     f"FROM {database}:{_sql_identifier(owner)}.{_sql_identifier(name)}"
                     + (f" WHERE ({snapshot_filter})" if snapshot_filter else ""),
                     (),
@@ -3595,11 +3650,13 @@ class PurePythonInformixBridge:
                     )
                 except Exception as error:  # preserve an active CDC failure
                     cleanup_errors.append(error)
-                if set_socket_timeout is not None and previous_socket_timeout is not None:
-                    try:
-                        set_socket_timeout(float(previous_socket_timeout))
-                    except Exception as error:
-                        cleanup_errors.append(error)
+            # Put the timeout back after a lost lease too: the client keeps it for every
+            # later connection, so a skipped restore made it the new default.
+            if set_socket_timeout is not None and previous_socket_timeout is not None:
+                try:
+                    set_socket_timeout(float(previous_socket_timeout))
+                except Exception as error:
+                    cleanup_errors.append(error)
             active_error = sys.exc_info()[1]
             if cleanup_errors:
                 if active_error is None:
@@ -7737,7 +7794,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             database,
         )
         if not _eligible(table) or not self._selected(table):
-            raise ValueError(f"Unknown or excluded Informix table '{exposed}'")
+            raise _excluded_table_error(exposed, table)
         return table
 
     def _registration_table_cache_key(self) -> tuple[str, ...] | None:
@@ -7781,14 +7838,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         )
         replaying = self._replay_stop_lsn(table_options) is not None
         replay_wait_budget = self._replay_connection_wait_budget(table_options)
-        with contextlib.ExitStack() as stack:
-            stack.enter_context(
-                self._capacity_attempt(
-                    start_offset,
-                    replaying=replaying,
-                    replay_wait_budget=replay_wait_budget,
-                )
-            )
+        with self._capacity_attempt(
+            start_offset, replaying=replaying, replay_wait_budget=replay_wait_budget
+        ):
             return self._read_table_attempt(
                 table_name, start_offset, effective_start, table_options, snapshot_mode
             )
@@ -10158,7 +10210,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 raise
             return None
         self._staging_workspace_host = host
-        pipeline_id = (self._pipeline_scope().split("_@_", 1)[0] or "default").strip()
+        pipeline_id, _, update_id = self._pipeline_scope().partition("_@_")
+        pipeline_id = pipeline_id.strip() or "default"
         lifetime = self._table_int_option(
             self.options,
             _SNAPSHOT_STAGING_TOKEN_LIFETIME_OPTION,
@@ -10172,6 +10225,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             lifetime_seconds=lifetime,
             secret_scope=_SNAPSHOT_STAGING_SECRET_SCOPE,
             secret_key=pipeline_id,
+            update_id=update_id.strip(),
         )
 
     def _publish_snapshot_stage_page(
@@ -10804,12 +10858,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # rows.
 
         if any(
-            column.name in table.primary_keys and column.type_name == "INTERVAL"
+            column.name in table.primary_keys
+            and (column.type_name == "INTERVAL" or column.type_name in _FLOAT_KEY_TYPES)
             for column in table.columns
         ):
             # An INTERVAL key has no order-preserving string cast (a sign and an
-            # unpadded leading field), so it is copied by the blocking snapshot, whose
-            # positional paging never renders a key back into SQL.
+            # unpadded leading field), and a float key has no exact literal for the keyset
+            # bound, so either is copied by the blocking snapshot, whose positional paging
+            # never renders a key back into SQL.
             return {}, False
         datetime_keys = [
             column
@@ -10827,7 +10883,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             return {}, False
         exprs: dict[str, str] = {}
         for column in datetime_keys:
-            expr = datetime_order_preserving_cast(column.name, int(column.length or 0))
+            expr = datetime_order_preserving_cast(
+                _sql_identifier(column.name), int(column.length or 0)
+            )
             if expr is None:
                 return {}, False
             exprs[column.name] = expr
@@ -10922,8 +10980,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         if not viable:
             logging.getLogger(__name__).info(
                 "Informix incremental snapshot for '%s' falling back to the blocking "
-                "consistent snapshot because a DATETIME or INTERVAL primary-key column "
-                "cannot be chunked as an order-preserving string",
+                "consistent snapshot because a DATETIME, INTERVAL or floating-point "
+                "primary-key column cannot be chunked by an exact key bound",
                 table.exposed_name,
             )
             return self._read_snapshot(
@@ -14804,7 +14862,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 database,
             )
             if not _eligible(table) or not self._selected(table):
-                raise ValueError(f"Unknown or excluded Informix table '{exposed}'")
+                raise _excluded_table_error(exposed, table)
             if self._tables is None:
                 self._tables = {}
             self._tables[exposed] = table
@@ -15021,6 +15079,19 @@ def _eligible(table: Table) -> bool:
     )
 
 
+def _excluded_table_error(exposed: str, table: Table) -> ValueError:
+    # Docstring: The error for a configured table the connector won't read, naming the rule
+    # when the table is excluded as a system object rather than by the table filters.
+
+    if _eligible(table):
+        return ValueError(f"Unknown or excluded Informix table '{exposed}'")
+    return ValueError(
+        f"Unknown or excluded Informix table '{exposed}': a table whose name or owner "
+        "starts with 'sys', or any table in syscdcv1, is treated as an Informix system "
+        "object and never ingested"
+    )
+
+
 def _cdc_streamable(table: Table) -> bool:
     # Docstring: Report whether Informix can capture this table's changes at all.
     #
@@ -15082,7 +15153,11 @@ def _unsupported_column(column: Column) -> bool:
 
 # Key types whose values Informix doesn't reliably parse back from a SQL literal, so a
 # snapshot keyed on one pages by position within its transaction instead.
-_LITERAL_UNSAFE_KEY_TYPES = frozenset({"DATETIME", "INTERVAL"})
+# Key types whose values can't be rendered back into SQL as exact keyset literals, so a
+# snapshot pages them by position instead: partial DATETIME and INTERVAL literals don't
+# all parse back, and a float has no exact decimal literal (nor any rendering at all).
+_FLOAT_KEY_TYPES = frozenset({"FLOAT", "SMALLFLOAT"})
+_LITERAL_UNSAFE_KEY_TYPES = frozenset({"DATETIME", "INTERVAL", *_FLOAT_KEY_TYPES})
 
 
 def _datetime_qualifier_supported(qualifier: int) -> bool:

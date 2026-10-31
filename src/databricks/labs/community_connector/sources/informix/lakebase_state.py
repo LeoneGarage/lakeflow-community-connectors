@@ -158,7 +158,8 @@ _DEFAULT_PROVISION_TIMEOUT_SECONDS = 180.0
 # personal access token is minted from the driver-captured credential, carried to the
 # reader in _CAPTURED_WORKSPACE, and thereafter refreshed by the still-valid token
 # minting its own successor -- no ambient identity is needed after the first mint.
-# Each token is tagged with the pipeline id so a restart can revoke its predecessors.
+# Each token is tagged with the pipeline id and update id, so a mint can revoke the tokens of
+# the pipeline's earlier updates while leaving those its sibling flow processes hold.
 STAGING_TOKEN_COMMENT_PREFIX = "informix-snapshot-staging:"
 _DEFAULT_STAGING_TOKEN_LIFETIME_SECONDS = 86400
 # Refresh at half-life: a token minted with lifetime L is replaced after L/2, so a
@@ -552,16 +553,23 @@ class StagingTokenUnavailable(RuntimeError):
     pass
 
 
+def staging_token_comment(pipeline_id: str, update_id: str = "") -> str:
+    # Docstring: The comment a staging token carries: its pipeline, and its update when known.
+
+    comment = f"{STAGING_TOKEN_COMMENT_PREFIX}{pipeline_id}"
+    return f"{comment}:{update_id}" if update_id else comment
+
+
 def mint_staging_token(
-    api: _WorkspaceApi, pipeline_id: str, lifetime_seconds: int
+    api: _WorkspaceApi, pipeline_id: str, lifetime_seconds: int, update_id: str = ""
 ) -> tuple[str, str]:
-    # Docstring: Mint a personal access token for Files-API staging, tagged per pipeline.
+    # Docstring: Mint a personal access token for Files-API staging, tagged per pipeline update.
     #
     # Returns ``(token_value, token_id)``. Raises :class:`StagingTokenUnavailable`
     # when the workspace forbids token creation (HTTP 403) or rejects it as
     # unsupported (HTTP 400), so the caller can fall back to FUSE rather than fail.
 
-    comment = f"{STAGING_TOKEN_COMMENT_PREFIX}{pipeline_id}"
+    comment = staging_token_comment(pipeline_id, update_id)
     try:
         response = (
             api.request(
@@ -585,14 +593,23 @@ def mint_staging_token(
     return token_value, token_id
 
 
-def revoke_stale_staging_tokens(api: _WorkspaceApi, pipeline_id: str, keep_token_id: str) -> None:
-    # Docstring: Delete this pipeline's previously-minted staging tokens, keeping the current one.
+def revoke_stale_staging_tokens(
+    api: _WorkspaceApi, pipeline_id: str, update_id: str, predecessor_id: str = ""
+) -> None:
+    # Docstring: Delete the pipeline's staging tokens from earlier updates, and the caller's own
+    # predecessor.
+    #
+    # Every flow process of an update mints its own token under that update's comment
+    # and stages with it, so those are left alone: revoking them failed the siblings'
+    # next Files-API call with a 401. Without an update id the update's tokens can't be
+    # told from earlier ones, so only the predecessor goes.
     #
     # Best-effort: listing or deleting may fail (e.g. the identity cannot manage
     # tokens it did not create), and an orphaned token expires on its own, so a
     # failure here is logged and swallowed rather than blocking startup.
 
-    comment = f"{STAGING_TOKEN_COMMENT_PREFIX}{pipeline_id}"
+    pipeline_comment = staging_token_comment(pipeline_id)
+    current = staging_token_comment(pipeline_id, update_id)
     try:
         listing = api.request("GET", "/api/2.0/token/list") or {}
     except LakebaseStateError:
@@ -600,7 +617,13 @@ def revoke_stale_staging_tokens(api: _WorkspaceApi, pipeline_id: str, keep_token
         return
     for info in listing.get("token_infos") or []:
         token_id = str(info.get("token_id") or "")
-        if info.get("comment") == comment and token_id and token_id != keep_token_id:
+        comment = str(info.get("comment") or "")
+        earlier = (
+            bool(update_id)
+            and comment != current
+            and (comment == pipeline_comment or comment.startswith(f"{pipeline_comment}:"))
+        )
+        if token_id and (earlier or token_id == predecessor_id):
             try:
                 api.request("POST", "/api/2.0/token/delete", {"token_id": token_id})
             except LakebaseStateError:
@@ -642,7 +665,8 @@ class StagingCredentialProvider:
     # credential). Every later refresh, at half-life, uses the *current minted
     # token* to mint its successor, so no ambient identity is needed after startup
     # (the reader process has none). Each mint also refreshes the durable secret and
-    # revokes this pipeline's older tokens. Refresh is lazy -- checked on each
+    # revokes this provider's previous token and the pipeline's earlier updates' tokens
+    # (see revoke_stale_staging_tokens). Refresh is lazy -- checked on each
     # ``bearer()`` call -- so there is no background thread to manage; page writes
     # call ``bearer()`` often enough to refresh well within the half-life.
     #
@@ -660,10 +684,12 @@ class StagingCredentialProvider:
         secret_scope: str | None = None,
         secret_key: str | None = None,
         clock: Any = time.monotonic,
+        update_id: str = "",
     ) -> None:
         self._host = host.rstrip("/")
         self._bootstrap_token = bootstrap_token
         self._pipeline_id = pipeline_id
+        self._update_id = update_id
         self._lifetime_seconds = max(_STAGING_TOKEN_MIN_LIFETIME_SECONDS, int(lifetime_seconds))
         self._refresh_after = self._lifetime_seconds * _STAGING_TOKEN_REFRESH_FRACTION
         self._secret_scope = secret_scope
@@ -693,17 +719,22 @@ class StagingCredentialProvider:
 
     def _mint(self, minting_token: str) -> None:
         token, token_id = mint_staging_token(
-            _WorkspaceApi(self._host, minting_token), self._pipeline_id, self._lifetime_seconds
+            _WorkspaceApi(self._host, minting_token),
+            self._pipeline_id,
+            self._lifetime_seconds,
+            self._update_id,
         )
+        predecessor_id = self._token_id
         self._token = token
         self._token_id = token_id
         self._minted_at = self._clock()
-        # Durability/rotation with the new token: store the secret and revoke the
-        # tokens this pipeline minted before. Both are best-effort inside their helpers.
+        # Durability/rotation with the new token: store the secret and revoke this
+        # provider's previous token and earlier updates' tokens. Both are best-effort
+        # inside their helpers.
         new_api = _WorkspaceApi(self._host, token)
         if self._secret_scope and self._secret_key:
             store_staging_secret(new_api, self._secret_scope, self._secret_key, token)
-        revoke_stale_staging_tokens(new_api, self._pipeline_id, token_id)
+        revoke_stale_staging_tokens(new_api, self._pipeline_id, self._update_id, predecessor_id)
 
 
 class WorkspaceFilesApi:
@@ -805,6 +836,21 @@ def _quoted_identifier(connection: Any, name: str) -> str:
     return str(row[0])
 
 
+def _quoted_literal(connection: Any, value: str) -> str:
+    # Docstring: Return ``value`` quoted by the server as a Postgres string literal.
+    #
+    # For the role password: CREATE/ALTER ROLE is a utility statement, which takes no
+    # bind parameters under psycopg 3's server-side binding (psycopg2 interpolates on
+    # the client, so it never noticed). The error never echoes the value.
+
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT quote_literal(%s)", (value,))
+        row = cursor.fetchone()
+    if not row or not row[0]:
+        raise LakebaseStateError("could not quote the Lakebase role password")
+    return str(row[0])
+
+
 def ensure_login_role(admin_connection: Any, database: str, user: str, password: str) -> str:
     # Docstring: Create the password login role, or reset its password if it exists.
     #
@@ -824,6 +870,7 @@ def ensure_login_role(admin_connection: Any, database: str, user: str, password:
 
     identifier = _quoted_identifier(admin_connection, user)
     database_identifier = _quoted_identifier(admin_connection, database)
+    password_literal = _quoted_literal(admin_connection, password)
     with admin_connection.cursor() as cursor:
         # The Python lock in LakebaseState.provision() is process-local, while a
         # Lakeflow pipeline starts one Python worker per flow. Serialize the
@@ -841,7 +888,7 @@ def ensure_login_role(admin_connection: Any, database: str, user: str, password:
         # validation forever with an error indistinguishable from a bad password.
         verb = "ALTER" if exists else "CREATE"
         try:
-            cursor.execute(f"{verb} ROLE {identifier} WITH LOGIN PASSWORD %s", (password,))
+            cursor.execute(f"{verb} ROLE {identifier} WITH LOGIN PASSWORD {password_literal}")
         except Exception as error:
             sqlstate = getattr(error, "sqlstate", None) or getattr(error, "pgcode", None)
             constraint = getattr(getattr(error, "diag", None), "constraint_name", None)

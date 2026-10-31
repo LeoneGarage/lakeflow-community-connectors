@@ -1322,49 +1322,44 @@ class InformixSqliClient:
             "IFX_UPDDESC": "1",
             "NODEFDAC": "no",
         }
-        try:
-            request = encode_normal_auth_request(
-                self.user,
-                self.password,
-                server,
-                self.database,
-                properties,
-                self._encoding,
-            )
-            self._output.write(request)
-            self._output.flush()
-            self.state = ConnectionState.ASC_SENT
-            header = read_exact(self._input, 6)
-            total = struct.unpack_from(">H", header)[0]
-            response = header + read_exact(self._input, total - 6)
-            self.asc_accept = decode_asc_accept(response, self._encoding)
-            self.state = ConnectionState.ACCEPTED
-            self._output.write(encode_protocol_offer())
-            self._output.flush()
-            self.server_protocols = self._read_protocol_offer()
-            self.remove_64k_limit = bool(self.server_protocols[7] & 0x02)
-            self.large_tuple_size = bool(self.server_protocols[8] & 0x04)
-            self.long_row_id = bool(self.server_protocols[8] & 0x02)
-            self.bigint_supported = _protocol_feature(self.server_protocols, 54)
-            pam_advertised = _protocol_feature(self.server_protocols, 44)
-            if self.authentication_mode == "pam":
-                if not pam_advertised:
-                    raise SqliUnsupportedAuthentication(
-                        "PAM requested but server did not advertise it"
-                    )
-                self._authenticate_pam(deadline)
-            self._output.write(encode_secondary_info(properties, self._encoding))
-            self._output.flush()
-            self._read_status_group()
-            self.state = ConnectionState.AUTHENTICATED
-            self._output.write(encode_dbopen(self.database, self._encoding))
-            self._output.flush()
-            self._read_status_group(require_done=True)
-            if isinstance(self._input, _DeadlineReader):
-                self._input.finish()
-            self.state = ConnectionState.DATABASE_OPEN
-        except SqliRedirect:
-            raise
+        request = encode_normal_auth_request(
+            self.user,
+            self.password,
+            server,
+            self.database,
+            properties,
+            self._encoding,
+        )
+        self._output.write(request)
+        self._output.flush()
+        self.state = ConnectionState.ASC_SENT
+        header = read_exact(self._input, 6)
+        total = struct.unpack_from(">H", header)[0]
+        response = header + read_exact(self._input, total - 6)
+        self.asc_accept = decode_asc_accept(response, self._encoding)
+        self.state = ConnectionState.ACCEPTED
+        self._output.write(encode_protocol_offer())
+        self._output.flush()
+        self.server_protocols = self._read_protocol_offer()
+        self.remove_64k_limit = bool(self.server_protocols[7] & 0x02)
+        self.large_tuple_size = bool(self.server_protocols[8] & 0x04)
+        self.long_row_id = bool(self.server_protocols[8] & 0x02)
+        self.bigint_supported = _protocol_feature(self.server_protocols, 54)
+        pam_advertised = _protocol_feature(self.server_protocols, 44)
+        if self.authentication_mode == "pam":
+            if not pam_advertised:
+                raise SqliUnsupportedAuthentication("PAM requested but server did not advertise it")
+            self._authenticate_pam(deadline)
+        self._output.write(encode_secondary_info(properties, self._encoding))
+        self._output.flush()
+        self._read_status_group()
+        self.state = ConnectionState.AUTHENTICATED
+        self._output.write(encode_dbopen(self.database, self._encoding))
+        self._output.flush()
+        self._read_status_group(require_done=True)
+        if isinstance(self._input, _DeadlineReader):
+            self._input.finish()
+        self.state = ConnectionState.DATABASE_OPEN
 
     def _authenticate_pam(self, deadline: float) -> None:
         if self._input is None or self._output is None or self.authentication_provider is None:

@@ -156,6 +156,10 @@ class _FakeCursor:
             name = args[0] if isinstance(args, tuple) else args["name"]
             self._result = [('"' + str(name).replace('"', '""') + '"',)]
             return
+        if text.startswith("SELECT quote_literal"):
+            value = args[0] if isinstance(args, tuple) else args["value"]
+            self._result = [("'" + str(value).replace("'", "''") + "'",)]
+            return
         if text.startswith("SELECT pg_advisory_xact_lock"):
             self._connection.acquire_role_advisory_lock()
             return
@@ -196,7 +200,15 @@ class _FakeCursor:
                 "Route it through quote_ident rather than interpolating it."
             )
         name = head[1:-1].replace('""', '"')
-        password = args[0] if isinstance(args, tuple) else args["password"]
+        # Utility statements take no bind parameters under psycopg 3's server-side
+        # binding ("syntax error at or near $1"), so the password must arrive as a
+        # literal the server quoted.
+        if args:
+            raise AssertionError("CREATE/ALTER ROLE was sent bind parameters")
+        literal = text.split(" PASSWORD ", 1)[1].strip()
+        if not (literal.startswith("'") and literal.endswith("'")):
+            raise AssertionError(f"role password was not quoted by the server: {literal!r}")
+        password = literal[1:-1].replace("''", "'")
         creating = text.startswith("CREATE ROLE")
         with self._database.lock:
             if creating and name in self._database.roles:
@@ -1349,8 +1361,11 @@ class LakebaseLoginRoleTests(unittest.TestCase):
             DuplicateRoleError(),
         ]
 
-        with mock.patch.object(
-            lakebase_state, "_quoted_identifier", side_effect=['"informix_state_user"', '"db"']
+        with (
+            mock.patch.object(
+                lakebase_state, "_quoted_identifier", side_effect=['"informix_state_user"', '"db"']
+            ),
+            mock.patch.object(lakebase_state, "_quoted_literal", return_value="'pw'"),
         ):
             action = lakebase_state.ensure_login_role(connection, "db", "informix_state_user", "pw")
 
@@ -1381,6 +1396,13 @@ class LakebaseLoginRoleTests(unittest.TestCase):
             self.database.roles[lakebase_state.STATE_ROLE]["password"],
             "shared-password",
         )
+
+    def test_password_is_quoted_by_the_server_not_bound(self):
+        lakebase_state.ensure_login_role(
+            self.connection, "databricks_postgres", lakebase_state.STATE_ROLE, "it's-%s-$1"
+        )
+
+        self.assertEqual(self.database.roles[lakebase_state.STATE_ROLE]["password"], "it's-%s-$1")
 
     def test_role_name_is_quoted_by_the_server_not_interpolated(self):
         lakebase_state.ensure_login_role(self.connection, "databricks_postgres", 'weird"name', "pw")
@@ -2225,21 +2247,44 @@ class StagingTokenTests(unittest.TestCase):
         with self.assertRaises(lakebase_state.WorkspaceHttpError):
             lakebase_state.mint_staging_token(api, "pipe-1", 86400)
 
-    def test_revoke_removes_only_this_pipelines_stale_tokens(self):
+    def test_mint_tags_the_token_with_its_update(self):
+        api = _StagingTokenApi()
+        lakebase_state.mint_staging_token(api, "pipe-1", 86400, update_id="upd-2")
+        self.assertEqual(api.calls[0][2]["comment"], "informix-snapshot-staging:pipe-1:upd-2")
+
+    def test_revoke_removes_earlier_updates_and_the_predecessor_only(self):
+        # Every flow process of an update holds its own token under the update's
+        # comment; revoking those failed the siblings' next Files-API call with a 401.
         api = _StagingTokenApi()
         api.token_infos = [
-            {"token_id": "keep", "comment": "informix-snapshot-staging:pipe-1"},
-            {"token_id": "stale", "comment": "informix-snapshot-staging:pipe-1"},
-            {"token_id": "other-pipeline", "comment": "informix-snapshot-staging:pipe-2"},
+            {"token_id": "mine", "comment": "informix-snapshot-staging:pipe-1:upd-2"},
+            {"token_id": "previous", "comment": "informix-snapshot-staging:pipe-1:upd-2"},
+            {"token_id": "sibling", "comment": "informix-snapshot-staging:pipe-1:upd-2"},
+            {"token_id": "earlier", "comment": "informix-snapshot-staging:pipe-1:upd-1"},
+            {"token_id": "untagged", "comment": "informix-snapshot-staging:pipe-1"},
+            {"token_id": "other-pipeline", "comment": "informix-snapshot-staging:pipe-2:upd-1"},
+            {"token_id": "prefix-pipeline", "comment": "informix-snapshot-staging:pipe-10:upd-1"},
             {"token_id": "unrelated", "comment": "someone else"},
         ]
-        lakebase_state.revoke_stale_staging_tokens(api, "pipe-1", keep_token_id="keep")
-        self.assertEqual(api.deleted, ["stale"])
+        lakebase_state.revoke_stale_staging_tokens(
+            api, "pipe-1", "upd-2", predecessor_id="previous"
+        )
+        self.assertEqual(api.deleted, ["previous", "earlier", "untagged"])
+
+    def test_revoke_without_an_update_removes_only_the_predecessor(self):
+        # With no update id the update's own tokens can't be told from earlier ones.
+        api = _StagingTokenApi()
+        api.token_infos = [
+            {"token_id": "previous", "comment": "informix-snapshot-staging:pipe-1"},
+            {"token_id": "sibling", "comment": "informix-snapshot-staging:pipe-1"},
+        ]
+        lakebase_state.revoke_stale_staging_tokens(api, "pipe-1", "", predecessor_id="previous")
+        self.assertEqual(api.deleted, ["previous"])
 
     def test_revoke_swallows_list_failure(self):
         api = _StagingTokenApi()
         api.list_error = True
-        lakebase_state.revoke_stale_staging_tokens(api, "pipe-1", keep_token_id="keep")
+        lakebase_state.revoke_stale_staging_tokens(api, "pipe-1", "upd-2", predecessor_id="x")
         self.assertEqual(api.deleted, [])
 
 
@@ -2298,17 +2343,37 @@ class StagingCredentialProviderTests(unittest.TestCase):
         with self.assertRaises(lakebase_state.StagingTokenUnavailable):
             provider.bearer()
 
-    def test_mint_stores_secret_and_revokes_prior(self):
+    def test_mint_stores_secret_and_revokes_earlier_updates(self):
         api = _StagingTokenApi()
         api.token_infos = [
-            {"token_id": "old", "comment": "informix-snapshot-staging:pipe-1"},
+            {"token_id": "old", "comment": "informix-snapshot-staging:pipe-1:upd-1"},
+            {"token_id": "sibling", "comment": "informix-snapshot-staging:pipe-1:upd-2"},
         ]
         provider, _ = self._provider(
-            api, clock=lambda: 0.0, secret_scope="informix", secret_key="pipe-1"
+            api,
+            clock=lambda: 0.0,
+            secret_scope="informix",
+            secret_key="pipe-1",
+            update_id="upd-2",
         )
         provider.bearer()
         self.assertIn(("informix", "pipe-1", "dapi-1"), api.secrets)
         self.assertEqual(api.deleted, ["old"])
+
+    def test_refresh_revokes_its_own_previous_token_but_no_sibling(self):
+        api = _StagingTokenApi()
+        now = {"t": 0.0}
+        provider, _ = self._provider(
+            api, clock=lambda: now["t"], lifetime_seconds=1000, update_id="upd-2"
+        )
+        provider.bearer()
+        api.token_infos = [
+            {"token_id": "tid-1", "comment": "informix-snapshot-staging:pipe-1:upd-2"},
+            {"token_id": "sibling", "comment": "informix-snapshot-staging:pipe-1:upd-2"},
+        ]
+        now["t"] = 500.0
+        self.assertEqual(provider.bearer(), "dapi-2")
+        self.assertEqual(api.deleted, ["tid-1"])
 
 
 class _FakeHttpResponse:

@@ -1240,6 +1240,20 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(connector._incremental_datetime_chunk_exprs(table, {}), ({}, False))
         self.assertIn("INTERVAL", informix_module._LITERAL_UNSAFE_KEY_TYPES)
 
+    def test_a_float_key_is_copied_by_the_blocking_snapshot(self):
+        # A keyset bound renders the last key into SQL, and a float has no exact literal
+        # (the renderer raises TypeError on one), so a float key pages by position.
+        for type_name in ("FLOAT", "SMALLFLOAT"):
+            with self.subTest(type_name=type_name):
+                raw = _table()
+                raw["columns"][0] = {"name": "id", "type_name": type_name}
+                table = Table.parse(raw, "demo")
+                connector = self.connector(FakeBridge())
+                self.assertEqual(
+                    connector._incremental_datetime_chunk_exprs(table, {}), ({}, False)
+                )
+                self.assertIn(type_name, informix_module._LITERAL_UNSAFE_KEY_TYPES)
+
     def test_catalog_enables_implemented_scalar_cdc_types(self):
         for type_id in (17, 18, 43):
             with self.subTest(type_id=type_id):
@@ -1742,6 +1756,42 @@ class LakeflowContractTests(unittest.TestCase):
         bridge = object.__new__(PurePythonInformixBridge)
         bridge.options = {}
         bridge.transport = transport
+        capture = {
+            "identity": "demo:app.orders",
+            "logical_identity": "demo.app.orders",
+            "columns": ["id"],
+            "descriptors": [{"name": "id", "type_name": "INTEGER"}],
+        }
+
+        with (
+            mock.patch.object(informix_module, "CdcFrameParser", RecordParser),
+            mock.patch.object(
+                informix_module, "decode_frame", side_effect=lambda frame, labels, **_: dict(frame)
+            ),
+        ):
+            bridge.read_changes([capture], 90, 60, 2)
+
+        self.assertEqual(transport.timeouts, [65.0, 30.0])
+
+    def test_native_poll_restores_socket_timeout_after_a_lost_lease(self):
+        # A lost lease skips the session teardown, but the raised timeout must still be
+        # put back: the client keeps it for every later connection.
+        class TimedTransport(FakeCdcTransport):
+            def __init__(self):
+                super().__init__([[{"op": "TIMEOUT", "lsn": 100}]])
+                self.socket_timeout = 30.0
+                self.timeouts = []
+
+            def set_socket_timeout(self, timeout):
+                self.socket_timeout = timeout
+                self.timeouts.append(timeout)
+
+        transport = TimedTransport()
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.transport = transport
+        bridge._connection_lease_lost = threading.Event()
+        bridge._connection_lease_lost.set()
         capture = {
             "identity": "demo:app.orders",
             "logical_identity": "demo.app.orders",
@@ -2462,6 +2512,9 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(transport.activate_attempts, 3)  # two timeouts, then success
         self.assertEqual(reset_calls, [True, True])  # one transport reset per timed-out attempt
         self.assertEqual(transport.endcapture_calls, 1)  # teardown only on the succeeding attempt
+        # A timed-out attempt still puts the timeout back; the client keeps it for every
+        # later connection, so the raised one must not become the default.
+        self.assertEqual(transport.socket_timeout, 30.0)
 
     def test_initial_lsn_validation_reraises_an_exhausted_primary_timeout(self):
         # If the primary calls keep timing out past the retry budget, validate_initial_lsn
@@ -3038,6 +3091,59 @@ class LakeflowContractTests(unittest.TestCase):
             "SELECT {+FIRST_ROWS(2)} SKIP 10000 FIRST 2 event_time FROM demo:app.events "
             "ORDER BY event_time",
         )
+
+    def test_snapshot_bridge_delimits_column_and_key_names_that_need_it(self):
+        # "+" and "." pass validation but are not undelimited identifiers: sent bare,
+        # "a.b" would read column b of a table a.
+        class SnapshotTransport:
+            def __init__(self):
+                self.sql = None
+
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                self.sql = sql
+                return []
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.transport = SnapshotTransport()
+
+        bridge.snapshot_page("demo.app.events", ["a.b", "c+d"], ["a.b"], [7], 2)
+
+        self.assertEqual(
+            bridge.transport.sql,
+            'SELECT {+FIRST_ROWS(2)} FIRST 2 "a.b","c+d" FROM demo:app.events '
+            'WHERE "a.b" >= ? AND (("a.b" > ?)) ORDER BY "a.b"',
+        )
+
+    def test_snapshot_pages_describe_the_table_once(self):
+        # A string cursor value is checked against the key's type; describing the table
+        # for it on every page cost catalog queries inside each page's transaction.
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.transport = mock.Mock(spec=["execute"])
+        bridge.transport.execute.return_value = []
+        described = {"columns": [{"name": "code", "type_name": "CHAR", "length": 8}]}
+        with mock.patch.object(bridge, "_describe_table", return_value=described) as describe:
+            for after in (["a"], ["b"]):
+                bridge.snapshot_page("demo.app.codes", ["code"], ["code"], after, 2)
+
+        describe.assert_called_once_with("app", "codes")
+
+    def test_a_non_ansi_database_is_probed_once(self):
+        for is_ansi, probes in ((0, 1), (1, 2)):
+            with self.subTest(is_ansi=is_ansi):
+                bridge = object.__new__(PurePythonInformixBridge)
+                bridge.options = {}
+                bridge.config = {"database": "demo"}
+                bridge.transport = mock.Mock(spec=["execute", "execute_command"])
+                bridge.transport.execute.return_value = [{"is_ansi": is_ansi}]
+                for _ in range(2):
+                    with bridge._repeatable_read_transaction():
+                        pass
+
+                # An ANSI database keeps its probe: it opens the implicit transaction
+                # that the following COMMIT WORK ends.
+                self.assertEqual(bridge.transport.execute.call_count, probes)
 
     def test_sql_identifier_delimits_only_when_needed(self):
         # Valid undelimited names (incl. accented under en_US.819) stay bare;
@@ -4669,6 +4775,14 @@ class LakeflowContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(SqliSessionRejected, "rejected"):
             connector.read_table("app.orders", checkpoint, {})
+
+    def test_a_sys_table_is_refused_with_the_rule_named(self):
+        # Discovery hides names and owners starting with "sys"; a user who configures
+        # one by name should learn why rather than see a bare "unknown table".
+        connector = self.connector()
+        self.assertNotIn("sysadmin.hidden", connector.list_tables())
+        with self.assertRaisesRegex(ValueError, "starts with 'sys'"):
+            connector.get_table_schema("sysadmin.hidden", {})
 
     def test_qualified_source_table_maps_logical_to_owner_qualified_name(self):
         connector = self.connector()
@@ -12695,6 +12809,43 @@ class HostShardEndpointPathTests(unittest.TestCase):
         self.assertLessEqual(len(os.fsencode(socket_path)), 100)
 
 
+class CurrentUtcTimeTests(unittest.TestCase):
+    """A failed time probe poisons the SQLI client, so the bridge must reconnect after it."""
+
+    def _bridge(self, error):
+        bridge = informix_module.PurePythonInformixBridge(
+            {
+                "hostname": "localhost",
+                "database": "demo",
+                "user": "informix",
+                "password": "secret",
+                "server": "demo_on",
+                "_informix.bypass.connection.capacity": "true",
+            }
+        )
+        bridge.transport = mock.Mock()
+        bridge.transport.execute.side_effect = error
+        bridge._ensure_connected()
+        return bridge
+
+    def test_an_unsupported_probe_resets_the_transport_and_is_not_repeated(self):
+        bridge = self._bridge(SqliProtocolError("Informix SQL error -217/0"))
+
+        self.assertIsNone(bridge.current_utc_time())
+        self.assertFalse(bridge._connected)
+        bridge.transport.close.assert_called_once()
+        self.assertIsNone(bridge.current_utc_time())
+        bridge.transport.execute.assert_called_once()
+
+    def test_a_dropped_connection_is_retried_on_the_next_probe(self):
+        bridge = self._bridge(informix_module.SqliTransportError("truncated SQLI stream"))
+
+        self.assertIsNone(bridge.current_utc_time())
+        self.assertFalse(bridge._connected)
+        self.assertIsNone(bridge.current_utc_time())
+        self.assertEqual(bridge.transport.execute.call_count, 2)
+
+
 class HostSharedCdcTests(unittest.TestCase):
     """cdc.shared.session=host (the default): the flow processes on one host share each
     shard through a leader process, reached over a Unix socket and elected by a lock."""
@@ -12804,8 +12955,12 @@ class HostSharedCdcTests(unittest.TestCase):
     def test_the_option_is_host_by_default_or_process(self):
         mode = informix_module._shared_cdc_mode
         self.assertEqual(mode({}), "host")
-        for value, expected in (("host", "host"), (" HOST ", "host"), ("process", "process"),
-                                ("Process", "process")):
+        for value, expected in (
+            ("host", "host"),
+            (" HOST ", "host"),
+            ("process", "process"),
+            ("Process", "process"),
+        ):
             with self.subTest(value=value):
                 self.assertEqual(mode({"cdc.shared.session": value}), expected)
         for value in ("false", "true", "maybe"):
@@ -13071,8 +13226,15 @@ class HostSharedCdcTests(unittest.TestCase):
         self.poll(leader)
         followed = "demo:informix.followed"
         informix_module._host_shard_poll(
-            self.KEY, lambda: None, dict(self.CONFIG), followed, self.table, self.capture,
-            0, 0, endpoints=follower,
+            self.KEY,
+            lambda: None,
+            dict(self.CONFIG),
+            followed,
+            self.table,
+            self.capture,
+            0,
+            0,
+            endpoints=follower,
         )
         self.assertEqual(set(self.shard.subscribers), {self.identity, followed})
         broken = mock.Mock()
@@ -13486,6 +13648,7 @@ class SnapshotDrainWorkerFloorTests(unittest.TestCase):
         self.assertFalse(connector._is_snapshot_drain_worker())
         self.assertTrue(worker._is_snapshot_drain_worker())
 
+
 class DaemonReservationFloorTests(unittest.TestCase):
     """A background daemon (sharded CDC, snapshot drain pool) claims its slot above the
     daemon reservation, so the low slots stay reachable by consumer bootstrap reads that
@@ -13878,9 +14041,7 @@ class SnapshotDaemonSeamTests(unittest.TestCase):
             reader._bridge_instance = FakeBridge()
             return _drain_snapshots_inline(reader)
 
-        consumer = InformixLakeflowConnect(
-            self._options(**{"snapshot.reader.threads": "1"})
-        )
+        consumer = InformixLakeflowConnect(self._options(**{"snapshot.reader.threads": "1"}))
         consumer.set_registration_scope(scope_hex)
         consumer._bridge_instance = FakeBridge()
         # Give the daemon a fake-bridge reader factory sharing this test's offline state
@@ -13942,9 +14103,7 @@ class SnapshotDaemonSeamTests(unittest.TestCase):
             reader._bridge_instance = FakeBridge()
             return _drain_snapshots_inline(reader)
 
-        consumer = InformixLakeflowConnect(
-            self._options(**{"snapshot.reader.threads": "1"})
-        )
+        consumer = InformixLakeflowConnect(self._options(**{"snapshot.reader.threads": "1"}))
         consumer.set_registration_scope(scope_hex)
         consumer._bridge_instance = FakeBridge()
         consumer._snapshot_drain_reader_factory = lambda: fake_factory
@@ -14303,6 +14462,46 @@ class FairSlotQueueWiringTests(unittest.TestCase):
         self.assertIsNotNone(bridge._lakebase_slot)
         dequeue.assert_called_once()
         self.assertEqual(dequeue.call_args.args[2], tickets[1])
+
+    def test_reconnect_after_reset_keeps_the_held_slot(self):
+        # reset_transport keeps the slot for an in-place retry. A reconnect that claimed
+        # another would leave the first one's heartbeat renewing it until the process
+        # exits, and every such retry would strand one more slot.
+        bridge = self._bridge(**{"max.concurrent.connections": "2"})
+        bridge.transport = mock.Mock()
+        real = informix_module.acquire_slot
+        with mock.patch.object(informix_module, "acquire_slot", side_effect=real) as acquire:
+            bridge._ensure_connected()
+            self.addCleanup(bridge._release_connection_slot)
+            slot, heartbeat = bridge._lakebase_slot, bridge._connection_slot_heartbeat
+            bridge.reset_transport()
+            bridge._ensure_connected()
+
+        self.assertEqual(acquire.call_count, 1)
+        self.assertEqual(bridge.transport.connect.call_count, 2)
+        self.assertIs(bridge._lakebase_slot, slot)
+        self.assertIs(bridge._connection_slot_heartbeat, heartbeat)
+        self.assertTrue(heartbeat.is_alive())
+
+    def test_a_bridge_seeds_its_slots_once_per_limit(self):
+        bridge = self._bridge()
+        with (
+            mock.patch.object(
+                informix_module, "seed_slots", wraps=informix_module.seed_slots
+            ) as seed,
+            mock.patch.object(
+                informix_module,
+                "publish_connection_limit",
+                wraps=informix_module.publish_connection_limit,
+            ) as publish,
+        ):
+            bridge._acquire_connection_slot()
+            bridge._release_connection_slot()
+            bridge._acquire_connection_slot()
+            self.addCleanup(bridge._release_connection_slot)
+
+        seed.assert_called_once()
+        publish.assert_called_once()
 
     def test_successful_acquire_dequeues_its_ticket(self):
         bridge = self._bridge()
