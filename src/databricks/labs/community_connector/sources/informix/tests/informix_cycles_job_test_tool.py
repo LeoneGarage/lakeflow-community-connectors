@@ -4,7 +4,8 @@
 # workload; run informix-pipeline as a triggered full refresh and a triggered update of
 # RUN_MINUTES each, N continuous updates of RUN_MINUTES each and one more of FINAL_MINUTES;
 # compare counts, and if they differ run one more continuous update of EXTRA_MINUTES and
-# compare again; then compare the data.
+# compare again; then compare the data. The full refresh runs past RUN_MINUTES when the
+# keyless tables (DRAIN_TABLES) have not drained by then, so their snapshots never restart.
 #
 # Every pipeline start and end, each cycle's verdict and the final summary go to the run's
 # output and to main.informix_cycles.events / main.informix_cycles.cycles. The Informix side
@@ -44,6 +45,10 @@ SCHEMA = "main.informix_cycles"
 EVENTS = f"{SCHEMA}.events"
 RESULTS = f"{SCHEMA}.cycles"
 TERMINAL = {"COMPLETED", "FAILED", "CANCELED"}
+# Keyless tables whose one-pass snapshot restarts from its first row if the full-refresh
+# run stops mid-drain: that run stops at RUN_MINUTES if both have drained by then, and
+# otherwise waits until they have.
+DRAIN_TABLES = ("tw900_member_tag", "tw901_claim_note")
 RUN_ID = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 spark.conf.set("spark.sql.session.timeZone", "UTC")
@@ -228,7 +233,41 @@ def stop_update(cycle, label, update_id):
     return state
 
 
-def run_for(cycle, label, update_id, seconds, from_creation=True):
+def undrained():
+    # A full refresh empties every target before the update runs, and a drained table's
+    # pages are served only after its drain finishes, so a target with rows has drained.
+    pending = []
+    for table in DRAIN_TABLES:
+        try:
+            rows = spark.sql(f"SELECT COUNT(*) c FROM {TARGET}.`{table}`").first()["c"]
+        except Exception:  # noqa: BLE001 - a target not created yet has not drained
+            rows = 0
+        if not rows:
+            pending.append(table)
+    return pending
+
+
+def wait_for_drains(cycle, label, update_id, start, state):
+    # Past RUN_MINUTES, keep the full-refresh run going until both keyless tables have
+    # drained: stopping it mid-drain would make the next run start their snapshots over.
+    pending = undrained() if state == "RUNNING" else list(DRAIN_TABLES)
+    if pending:
+        event(cycle, "draining", f"{label}: waiting for {', '.join(pending)} to drain")
+    while pending and state not in TERMINAL:
+        time.sleep(15)
+        state = update_info(update_id)["state"]
+        if state == "RUNNING":
+            pending = undrained()
+    if pending and state in TERMINAL:
+        # An update that ended between two polls may have drained without one seeing it.
+        pending = undrained()
+    if not pending:
+        minutes = (time.time() - start) / 60
+        event(cycle, "drained", f"{label}: {', '.join(DRAIN_TABLES)} drained by {minutes:.1f} min")
+    return state
+
+
+def run_for(cycle, label, update_id, seconds, from_creation=True, until_drained=False):
     info = update_info(update_id)
     start = int(info["creation_time"]) / 1000 if from_creation else time.time()
     deadline = start + seconds
@@ -236,11 +275,14 @@ def run_for(cycle, label, update_id, seconds, from_creation=True):
     while time.time() < deadline and state not in TERMINAL:
         time.sleep(15)
         state = update_info(update_id)["state"]
-    minutes = seconds // 60
+    if until_drained and state not in TERMINAL:
+        state = wait_for_drains(cycle, label, update_id, start, state)
+    minutes = round((time.time() - start) / 60, 1)
     if state in TERMINAL:
-        event(
-            cycle, "ended", f"{label}: update {update_id} ended before {minutes} minutes: {state}"
-        )
+        # "ended before" marks an early end for the dashboard; a full-refresh run waiting
+        # for the drains can also end by itself after RUN_MINUTES.
+        when = f"before {seconds // 60}" if time.time() < deadline else f"after {minutes}"
+        event(cycle, "ended", f"{label}: update {update_id} ended {when} minutes: {state}")
         return state
     event(
         cycle, "stopping", f"{label}: stopping update {update_id} after {minutes} minutes ({state})"
@@ -281,7 +323,7 @@ def pipeline_runs(cycle):
         event(cycle, "starting", f"run {run}: starting {kind} update")
         update_id = start_update(cycle, f"run {run}", full_refresh)
         event(cycle, "started", f"run {run}: started {kind} update {update_id}")
-        run_for(cycle, f"run {run}", update_id, RUN_SECONDS)
+        run_for(cycle, f"run {run}", update_id, RUN_SECONDS, until_drained=full_refresh)
     before = latest_update()
     event(
         cycle, "starting", "run 3: starting continuous update (switching to continuous starts it)"

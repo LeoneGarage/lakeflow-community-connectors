@@ -69,6 +69,11 @@ DEFAULT_TABLES = (
     "tw304",
     "tw316",
     "tw316_ovhc",
+    # Keyless: tw900_member_tag is keyed on the whole row in informix-pipeline, and
+    # tw901_claim_note is a change log of an insert-only table, so its target holds the
+    # table's rows (the compare ignores the _informix_* columns).
+    "tw900_member_tag",
+    "tw901_claim_note",
 )
 INTERNAL_COLUMNS = {
     "_informix_change_lsn",
