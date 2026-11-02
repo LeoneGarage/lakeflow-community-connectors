@@ -11,9 +11,9 @@ scans `*.py`).
 
 | File | Purpose |
 | --- | --- |
-| `count_compare_test_tool.py` | Row-count comparison, Informix (SSM→dbaccess) vs pipeline tables. `--json-out <path>` emits per-table counts for dashboard ingestion; `--warehouse-id <id>` picks the SQL warehouse for the pipeline-side counts. |
-| `phase_switch_test_tool.py` | Snapshot→stream timing: pipeline start → last incremental-snapshot chunk write, per table. `--run-start <utc>` (default: informix-pipeline's newest update), `--warehouse-id <id>`. Uses the count compare's table list. |
-| `informix_cycles_job_test_tool.py` | Databricks **Job notebook** behind the demo1 job `Informix cycles`: each cycle restarts the demo Informix container, runs informix-pipeline as a triggered full refresh, a triggered update and continuous updates, then compares counts and data. Results land in `main.informix_cycles.events` and `main.informix_cycles.cycles`. `smoke=true` checks everything without restarting the container or running the pipeline. |
+| `count_compare_test_tool.py` | Row-count comparison, Informix (SSM→dbaccess) vs pipeline tables. `--json-out <path>` emits per-table counts for dashboard ingestion; `--warehouse-id <id>` picks the SQL warehouse for the pipeline-side counts (default: the workspace's only warehouse, or its Serverless Starter Warehouse) and `--profile` the Databricks CLI profile (default `demo1`). |
+| `phase_switch_test_tool.py` | Snapshot→stream timing: pipeline start → last incremental-snapshot chunk write, per table. `--run-start <utc>` (default: the pipeline's newest update), `--pipeline-id <id>` (default: the pipeline named informix-pipeline), `--warehouse-id <id>` and `--profile`, defaulting as in the count compare. Uses the count compare's table list. |
+| `informix_cycles_job_test_tool.py` | Databricks **Job notebook** behind the demo1 job `Informix cycles`: each cycle restarts the demo Informix container, runs informix-pipeline as a triggered full refresh, a triggered update and continuous updates, then compares counts and data. Results land in `main.informix_cycles.events` and `main.informix_cycles.cycles`. `smoke=true` checks everything without restarting the container or running the pipeline. It finds the pipeline by name (`pipeline_name`, default informix-pipeline) and compares the catalog and schema that pipeline writes to, so a recreated pipeline or workspace needs no edit. |
 | `cycles_dashboard.json` | Serialized AI/BI dashboard definition over the two cycles tables: the latest run's status, cycle results and pipeline updates, and a page across all runs. |
 | `keyless_star_probe_test_tool.py` | Live end-to-end probe of keyless tables keyed with `primary.keys: "*"`: SCD1, SCD2 and change-log destinations through DML and schema changes (see below). |
 
@@ -45,7 +45,7 @@ DECIMAL(14,2) to DECIMAL(10,2) (must fail, then a full refresh recovers).
 
 ```bash
 .venv/bin/python src/databricks/labs/community_connector/sources/informix/tests/\
-keyless_star_probe_test_tool.py --warehouse-id 1a6fe9ed716571e0 \
+keyless_star_probe_test_tool.py [--warehouse-id <id>] \
   [--mode continuous|triggered] [--start-phase N] [--end-phase N] [--keep] \
   [--report out.json]
 ```

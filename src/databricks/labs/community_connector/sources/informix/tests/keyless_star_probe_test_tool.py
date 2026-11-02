@@ -68,8 +68,11 @@ table, and the probe recreates its tables as the phase found them.
 Usage (from the repo root, with the repo virtualenv):
 
     .venv/bin/python src/databricks/labs/community_connector/sources/informix/tests/\
-keyless_star_probe_test_tool.py --warehouse-id <id> [--start-phase N] [--end-phase N] \
+keyless_star_probe_test_tool.py [--warehouse-id <id>] [--start-phase N] [--end-phase N] \
 [--keep] [--report out.json]
+
+Without ``--warehouse-id`` it uses the workspace's only SQL warehouse, or its Serverless
+Starter Warehouse.
 
 ``--start-phase N`` replays the earlier phases on the model alone, builds the tables
 in that state, checks a full refresh of them, and starts at phase N.
@@ -1155,8 +1158,10 @@ class Probe:
         if list(self.ddl) != self.model.columns:
             raise RuntimeError(f"saved columns {list(self.ddl)} != model {self.model.columns}")
         if ddl_changed:
-            log(f"STALL {stall}; the phase changed the tables' DDL, so restarting the "
-                "Informix container (it rebuilds testdb)")
+            log(
+                f"STALL {stall}; the phase changed the tables' DDL, so restarting the "
+                "Informix container (it rebuilds testdb)"
+            )
             self.ifx.restart()
             self.create_tables(self.model.source)
         else:
@@ -1585,8 +1590,12 @@ def _diff(expected: collections.Counter, actual: collections.Counter) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--warehouse-id", required=True, help="SQL warehouse for destination reads")
-    parser.add_argument("--profile", default="demo1", help="Databricks CLI profile")
+    parser.add_argument(
+        "--warehouse-id",
+        help="SQL warehouse for destination reads (default: the workspace's only warehouse, "
+        "or its Serverless Starter Warehouse)",
+    )
+    parser.add_argument("--profile", default=CC.PROFILE, help="Databricks CLI profile")
     parser.add_argument("--connection", default="informix", help="Unity Catalog connection")
     parser.add_argument("--catalog", default="main")
     parser.add_argument("--schema", default="keyless_star_probe")
@@ -1615,6 +1624,7 @@ def main() -> int:
     cli = parser.parse_args()
     if cli.end_phase < cli.start_phase:
         parser.error("--end-phase is before --start-phase")
+    cli.warehouse_id = CC.resolve_warehouse(cli.profile, cli.warehouse_id)
     return Probe(cli).run()
 
 

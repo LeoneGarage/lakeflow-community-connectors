@@ -13,8 +13,10 @@
 # the compare tools staged next to this notebook do the Informix work exactly as on a laptop.
 #
 # Parameters: cycles, run_minutes, continuous_runs, final_minutes (0 skips the final run),
-# extra_minutes, and smoke=true, which checks AWS, SSM, the pipeline API, both compares and
-# the event tables without restarting the container or running the pipeline.
+# extra_minutes, pipeline_name (default informix-pipeline), and smoke=true, which checks
+# AWS, SSM, the pipeline API, both compares and the event tables without restarting the
+# container or running the pipeline. The pipeline is found by name and its tables in the
+# catalog and schema it writes to, so a recreated pipeline or workspace needs no edit.
 
 # COMMAND ----------
 import datetime as dt
@@ -31,15 +33,15 @@ dbutils.widgets.text("continuous_runs", "3")
 dbutils.widgets.text("final_minutes", "10")
 dbutils.widgets.text("extra_minutes", "8")
 dbutils.widgets.dropdown("smoke", "false", ["false", "true"])
+dbutils.widgets.text("pipeline_name", "informix-pipeline")
 CYCLES = int(dbutils.widgets.get("cycles"))
 RUN_SECONDS = int(float(dbutils.widgets.get("run_minutes")) * 60)
 CONTINUOUS_RUNS = int(dbutils.widgets.get("continuous_runs"))
 FINAL_SECONDS = int(float(dbutils.widgets.get("final_minutes")) * 60)
 EXTRA_SECONDS = int(float(dbutils.widgets.get("extra_minutes")) * 60)
 SMOKE = dbutils.widgets.get("smoke") == "true"
+PIPELINE_NAME = dbutils.widgets.get("pipeline_name")
 
-PIPELINE_ID = "06fdbf02-06a2-491d-aaba-4cabd7b0d81f"
-TARGET = "members.connector_bronze"
 SCOPE = "informix-cycles"
 SCHEMA = "main.informix_cycles"
 EVENTS = f"{SCHEMA}.events"
@@ -145,8 +147,21 @@ def ssm(command, timeout=600):
 # The pipeline, through the REST API as this job's run-as user.
 from databricks.sdk import WorkspaceClient  # noqa: E402
 
-API = WorkspaceClient().api_client
+WORKSPACE = WorkspaceClient()
+API = WORKSPACE.api_client
+_named = [
+    p.pipeline_id
+    for p in WORKSPACE.pipelines.list_pipelines(filter=f"name LIKE '{PIPELINE_NAME}'")
+    if p.name == PIPELINE_NAME
+]
+if len(_named) != 1:
+    raise RuntimeError(f"expected one pipeline named {PIPELINE_NAME}, found {len(_named)}")
+PIPELINE_ID = _named[0]
 BASE = f"/api/2.0/pipelines/{PIPELINE_ID}"
+_spec = API.do("GET", BASE)["spec"]
+# The destination the pipeline writes to; older pipelines name the schema `target`.
+TARGET = f"{_spec['catalog']}.{_spec.get('schema') or _spec['target']}"
+event(0, "pipeline", f"pipeline {PIPELINE_NAME} {PIPELINE_ID} writes to {TARGET}")
 
 
 def _call(method, path, body=None, attempts=6, delay=10):
@@ -389,7 +404,16 @@ def data_compare(cycle):
     output = pathlib.Path(f"/tmp/informix-cycles/{RUN_ID}/c{cycle}")
     output.mkdir(parents=True, exist_ok=True)
     argv = sys.argv
-    sys.argv = ["compare_live_data_test_tool", "--output", str(output)]
+    catalog, schema = TARGET.split(".")
+    sys.argv = [
+        "compare_live_data_test_tool",
+        "--output",
+        str(output),
+        "--catalog",
+        catalog,
+        "--schema",
+        schema,
+    ]
     try:
         CMP.main()
     finally:

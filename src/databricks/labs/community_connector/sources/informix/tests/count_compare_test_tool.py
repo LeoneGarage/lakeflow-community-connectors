@@ -66,7 +66,53 @@ TABLES = [
     "tw901_claim_note",
 ]
 
-WAREHOUSE = "1a6fe9ed716571e0"  # demo1 Serverless Starter Warehouse
+PROFILE = "demo1"  # Databricks CLI profile of the demo workspace
+PIPELINE_NAME = "informix-pipeline"
+STARTER_WAREHOUSE = "Serverless Starter Warehouse"
+
+
+def _databricks_json(profile: str, *command: str):
+    done = subprocess.run(
+        ["databricks", *command, "--profile", profile, "-o", "json"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(done.stdout or "null")
+
+
+def resolve_warehouse(profile: str = PROFILE, warehouse_id: str | None = None) -> str:
+    """The given warehouse, else the workspace's only one or its Serverless Starter
+    Warehouse, so the tools need no edit when the workspace is recreated."""
+    if warehouse_id:
+        return warehouse_id
+    warehouses = _databricks_json(profile, "warehouses", "list") or []
+    starter = [w for w in warehouses if w.get("name") == STARTER_WAREHOUSE]
+    for candidates in (warehouses, starter):
+        if len(candidates) == 1:
+            return candidates[0]["id"]
+    names = ", ".join(f"{w.get('name')} ({w.get('id')})" for w in warehouses) or "none"
+    raise SystemExit(
+        f"Can't choose a SQL warehouse on profile {profile} (found: {names}); pass --warehouse-id"
+    )
+
+
+def resolve_pipeline(
+    profile: str = PROFILE, name: str = PIPELINE_NAME, pipeline_id: str | None = None
+) -> str:
+    """The given pipeline, else the one pipeline named ``name`` on the workspace."""
+    if pipeline_id:
+        return pipeline_id
+    found = _databricks_json(
+        profile, "pipelines", "list-pipelines", "--filter", f"name LIKE '{name}'"
+    )
+    matches = [p["pipeline_id"] for p in found or [] if p.get("name") == name]
+    if len(matches) != 1:
+        raise SystemExit(
+            f"Expected one pipeline named {name} on profile {profile}, found {len(matches)}; "
+            "pass --pipeline-id"
+        )
+    return matches[0]
 
 
 def make_args(instance_id: str) -> argparse.Namespace:
@@ -122,7 +168,7 @@ def informix_counts(args: argparse.Namespace) -> dict[str, int]:
     return counts
 
 
-def databricks_count(table: str, warehouse_id: str = WAREHOUSE) -> tuple[str, int]:
+def databricks_count(table: str, warehouse_id: str, profile: str = PROFILE) -> tuple[str, int]:
     payload = {
         "warehouse_id": warehouse_id,
         "wait_timeout": "50s",
@@ -135,7 +181,7 @@ def databricks_count(table: str, warehouse_id: str = WAREHOUSE) -> tuple[str, in
             "post",
             "/api/2.0/sql/statements",
             "--profile",
-            "demo1",
+            profile,
             "--json",
             json.dumps(payload),
         ],
@@ -161,10 +207,14 @@ def main() -> int:
     )
     _p.add_argument(
         "--warehouse-id",
-        default=WAREHOUSE,
-        help=f"SQL warehouse that runs the pipeline-side COUNT(*) queries (default {WAREHOUSE}).",
+        help="SQL warehouse that runs the pipeline-side COUNT(*) queries (default: the "
+        f"workspace's only warehouse, or its {STARTER_WAREHOUSE}).",
+    )
+    _p.add_argument(
+        "--profile", default=PROFILE, help=f"Databricks CLI profile (default {PROFILE})."
     )
     _cli = _p.parse_args()
+    warehouse_id = resolve_warehouse(_cli.profile, _cli.warehouse_id)
 
     # The sandbox SSO profile is not logged in here, but the ambient default AWS
     # credentials (account 332745928618) can see the informix-cdc host. Patch the
@@ -196,7 +246,9 @@ def main() -> int:
     # Run both sides concurrently: Informix as one SSM job, Databricks as a pool.
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(TABLES) + 1) as ex:
         inf_future = ex.submit(informix_counts, args)
-        dbx_futures = {ex.submit(databricks_count, t, _cli.warehouse_id): t for t in TABLES}
+        dbx_futures = {
+            ex.submit(databricks_count, t, warehouse_id, _cli.profile): t for t in TABLES
+        }
         dbx: dict[str, int] = {}
         for f in concurrent.futures.as_completed(dbx_futures):
             t, c = f.result()

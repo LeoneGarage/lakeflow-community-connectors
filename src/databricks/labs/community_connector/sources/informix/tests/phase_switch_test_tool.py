@@ -3,12 +3,18 @@ import argparse, concurrent.futures, json, subprocess, time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-# Same tables and default warehouse as the count compare (run from the repo root).
-from count_compare_test_tool import TABLES, WAREHOUSE
+# Same tables, profile, pipeline and warehouse lookups as the count compare (run from
+# the repo root).
+from count_compare_test_tool import (
+    PIPELINE_NAME,
+    PROFILE,
+    TABLES,
+    resolve_pipeline,
+    resolve_warehouse,
+)
 
 SYD = ZoneInfo("Australia/Sydney")
 UTC = ZoneInfo("UTC")
-PIPELINE_ID = "06fdbf02-06a2-491d-aaba-4cabd7b0d81f"  # informix-pipeline on demo1
 _ap = argparse.ArgumentParser(description="Informix snapshot/stream phase timing analysis")
 _ap.add_argument(
     "--run-start",
@@ -19,11 +25,16 @@ _ap.add_argument(
 )
 _ap.add_argument(
     "--warehouse-id",
-    default=WAREHOUSE,
-    help=f"SQL warehouse that runs the DESCRIBE HISTORY queries (default {WAREHOUSE}).",
+    help="SQL warehouse that runs the DESCRIBE HISTORY queries (default: the workspace's "
+    "only warehouse, or its Serverless Starter Warehouse).",
 )
+_ap.add_argument(
+    "--pipeline-id", help=f"Pipeline to time (default: the one named {PIPELINE_NAME})."
+)
+_ap.add_argument("--profile", default=PROFILE, help=f"Databricks CLI profile (default {PROFILE}).")
 _ARGS = _ap.parse_args()
-WH = _ARGS.warehouse_id
+WH = resolve_warehouse(_ARGS.profile, _ARGS.warehouse_id)
+PIPELINE_ID = resolve_pipeline(_ARGS.profile, pipeline_id=_ARGS.pipeline_id)
 # "large" commit = snapshot chunk. Default snapshot.page.size is large; CDC batches
 # are bounded by max.records.per.batch (small). Use a threshold well above CDC batch
 # size to separate chunk-writes from streamed changes.
@@ -31,7 +42,7 @@ CHUNK_MIN = 500
 
 
 def api(m, p, pl=None):
-    a = ["databricks", "api", m, p, "--profile", "demo1"]
+    a = ["databricks", "api", m, p, "--profile", _ARGS.profile]
     if pl is not None:
         a += ["--json", json.dumps(pl)]
     return json.loads(subprocess.run(a, capture_output=True, text=True, check=True).stdout)
