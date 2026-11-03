@@ -2206,13 +2206,41 @@ class PurePythonInformixBridge:
         keys_by_table = {
             (str(_field(row, "owner", 16)), str(_field(row, "tabname", 17))): [row] for row in keys
         }
+        # A table without a primary key is keyed by a UNIQUE index here too, as
+        # _describe_table keys it: the connector caches these tables, so a later read of
+        # one must see the key a direct lookup would.
+        unique_by_table: dict[tuple[str, str], list[Any]] = {}
+        if _option_bool(self.options, _PROMOTE_UNIQUE_INDEX_OPTION, True) and any(
+            table not in keys_by_table for table in columns_by_table
+        ):
+            for row in self.transport.execute(
+                "SELECT i.idxname,i.part1,i.part2,i.part3,i.part4,i.part5,i.part6,i.part7,"
+                "i.part8,i.part9,i.part10,i.part11,i.part12,i.part13,i.part14,i.part15,"
+                "i.part16,t.owner,t.tabname "
+                "FROM systables t JOIN sysindexes i ON t.tabid=i.tabid "
+                "WHERE t.tabtype='T' AND i.idxtype='U' "
+                "ORDER BY t.owner,t.tabname",
+                max_result_bytes=maximum,
+            ):
+                table = (str(_field(row, "owner", 17)), str(_field(row, "tabname", 18)))
+                if table not in keys_by_table:
+                    unique_by_table.setdefault(table, []).append(row)
         result = []
         retained_bytes = (
-            _deep_size(result) + _deep_size(columns) + _deep_size(keys) if maximum else 0
+            _deep_size(result)
+            + _deep_size(columns)
+            + _deep_size(keys)
+            + _deep_size(unique_by_table)
+            if maximum
+            else 0
         )
         for (owner, name), table_columns in columns_by_table.items():
             table = self._table_from_catalog_rows(
-                owner, name, table_columns, keys_by_table.get((owner, name), [])
+                owner,
+                name,
+                table_columns,
+                keys_by_table.get((owner, name), []),
+                unique_by_table.get((owner, name), []),
             )
             if maximum:
                 retained_bytes += _deep_size(table)
@@ -7205,6 +7233,9 @@ def _run_snapshot_drain_worker(pool: _SnapshotDrainPool) -> None:
         if job is not None and factory is not None:
             try:
                 reader = factory()
+                # The consumer's scope, not whatever this process's registration context
+                # holds: staging tokens and stage paths are both keyed by it.
+                reader.set_registration_scope(job["pipeline_scope"])
                 # Each staged page resets the consumer's liveness watchdog, so a big table
                 # that keeps making progress never trips it while a wedged drain does.
                 reader._drain_progress = lambda: pool.report_progress(job_key)
@@ -12528,6 +12559,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         predicate = _row_filter_predicate(table, self._source_encoding(options))
         for path in files:
             size = os.path.getsize(path)
+            if not size:
+                # An empty table unloads to an empty file; a ranged read of it fails (416).
+                continue
             read_chunk = self._unl_read_chunk(path)
             if _unl_file_is_gzip(read_chunk):
                 records = _iter_gzip_unl_records(read_chunk, size, escape=escape_byte)
@@ -12644,6 +12678,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         splits: list[tuple[str, int, int, bool]] = []
         for path in self._list_unl_files(source, table.exposed_name):
             size = os.path.getsize(path)
+            if not size:
+                # No records to split, and a ranged read of an empty file fails (416).
+                continue
             read_chunk = self._unl_read_chunk(path)
             if _unl_file_is_gzip(read_chunk):
                 # Gzip is not seekable, so the whole compressed file is one split.
@@ -12677,14 +12714,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         all_splits = self._unl_all_splits(table, table_options)
         end_split = min(start_split + window, len(all_splits))
         columns = [_partition_column(column) for column in table.catalog_columns or table.columns]
-        files_api = self._staging_transport()
-        token = files_api._credential.bearer() if files_api is not None else None
-        host = files_api._host if files_api is not None else None
         encoding = _client_encoding(self.options)
         delimiter, escape = self._unl_field_format(table_options)
         commit_time = self._resolve_unl_commit_time(
             self._table_snapshot_source(table_options) or ""
         )
+        # Resolved after the manifest read, so a token that read found rejected (moving
+        # ``auto`` to the mount) isn't handed to the executors.
+        files_api = self._staging_transport()
+        token = files_api._credential.bearer() if files_api is not None else None
+        host = files_api._host if files_api is not None else None
         descriptors: list[dict] = []
         for path, start_byte, end_byte, is_gzip in all_splits[start_split:end_split]:
             descriptor = {

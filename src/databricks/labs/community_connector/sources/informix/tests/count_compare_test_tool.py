@@ -16,6 +16,7 @@ import re
 import subprocess
 import sys
 import time
+from typing import Any
 
 sys.path.insert(0, "src")
 try:
@@ -115,6 +116,30 @@ def resolve_pipeline(
     return matches[0]
 
 
+def resolve_target(profile: str = PROFILE, pipeline_id: str | None = None) -> str:
+    """The ``catalog.schema`` the pipeline writes to; older pipelines name it ``target``."""
+    spec = _databricks_json(profile, "pipelines", "get", pipeline_id or resolve_pipeline(profile))[
+        "spec"
+    ]
+    return f"{spec['catalog']}.{spec.get('schema') or spec['target']}"
+
+
+def run_statement(profile: str, warehouse_id: str, statement: str) -> list[list[Any]]:
+    """One statement's rows, polling while the warehouse is still starting or running it."""
+    body = {"warehouse_id": warehouse_id, "wait_timeout": "50s", "statement": statement}
+    result = _databricks_json(
+        profile, "api", "post", "/api/2.0/sql/statements", "--json", json.dumps(body)
+    )
+    while result["status"]["state"] in ("PENDING", "RUNNING"):
+        time.sleep(3)
+        result = _databricks_json(
+            profile, "api", "get", f"/api/2.0/sql/statements/{result['statement_id']}"
+        )
+    if result["status"]["state"] != "SUCCEEDED":
+        raise RuntimeError(f"{statement}: {result['status']}")
+    return result.get("result", {}).get("data_array", [])
+
+
 def make_args(instance_id: str) -> argparse.Namespace:
     a = argparse.Namespace()
     a.aws_profile = "aws-sandbox-field-eng_databricks-sandbox-admin"
@@ -168,32 +193,11 @@ def informix_counts(args: argparse.Namespace) -> dict[str, int]:
     return counts
 
 
-def databricks_count(table: str, warehouse_id: str, profile: str = PROFILE) -> tuple[str, int]:
-    payload = {
-        "warehouse_id": warehouse_id,
-        "wait_timeout": "50s",
-        "statement": f"SELECT COUNT(*) FROM members.connector_bronze.{table}",
-    }
-    raw = subprocess.run(
-        [
-            "databricks",
-            "api",
-            "post",
-            "/api/2.0/sql/statements",
-            "--profile",
-            profile,
-            "--json",
-            json.dumps(payload),
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    d = json.loads(raw)
-    state = d.get("status", {}).get("state")
-    if state != "SUCCEEDED":
-        raise RuntimeError(f"{table}: {state} {d.get('status',{}).get('error')}")
-    return table, int(d["result"]["data_array"][0][0])
+def databricks_count(
+    table: str, warehouse_id: str, target: str, profile: str = PROFILE
+) -> tuple[str, int]:
+    rows = run_statement(profile, warehouse_id, f"SELECT COUNT(*) FROM {target}.`{table}`")
+    return table, int(rows[0][0])
 
 
 def main() -> int:
@@ -211,10 +215,17 @@ def main() -> int:
         f"workspace's only warehouse, or its {STARTER_WAREHOUSE}).",
     )
     _p.add_argument(
+        "--pipeline-id",
+        help=f"Pipeline whose tables to count (default: the one named {PIPELINE_NAME}).",
+    )
+    _p.add_argument(
         "--profile", default=PROFILE, help=f"Databricks CLI profile (default {PROFILE})."
     )
     _cli = _p.parse_args()
     warehouse_id = resolve_warehouse(_cli.profile, _cli.warehouse_id)
+    target = resolve_target(
+        _cli.profile, resolve_pipeline(_cli.profile, pipeline_id=_cli.pipeline_id)
+    )
 
     # The sandbox SSO profile is not logged in here, but the ambient default AWS
     # credentials (account 332745928618) can see the informix-cdc host. Patch the
@@ -247,7 +258,7 @@ def main() -> int:
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(TABLES) + 1) as ex:
         inf_future = ex.submit(informix_counts, args)
         dbx_futures = {
-            ex.submit(databricks_count, t, warehouse_id, _cli.profile): t for t in TABLES
+            ex.submit(databricks_count, t, warehouse_id, target, _cli.profile): t for t in TABLES
         }
         dbx: dict[str, int] = {}
         for f in concurrent.futures.as_completed(dbx_futures):
@@ -256,7 +267,10 @@ def main() -> int:
         inf = inf_future.result()
     elapsed = time.monotonic() - t0
 
-    print(f"\nCompared {len(TABLES)} tables in {elapsed:.1f}s " f"(instance {instance_id[:12]})\n")
+    print(
+        f"\nCompared {len(TABLES)} tables in {elapsed:.1f}s "
+        f"(instance {instance_id[:12]}, target {target})\n"
+    )
     print(f"{'table':22} {'informix':>12} {'pipeline':>12} {'diff':>10}  status")
     print("-" * 72)
     mism = 0

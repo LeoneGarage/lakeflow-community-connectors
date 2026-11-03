@@ -282,10 +282,12 @@ connection:
       description: >
         Comma-separated exact `host:numeric-port` destinations permitted for
         redirects; service names, wildcards, and omitted ports are rejected.
-        A hostname must resolve to exactly one stable address. If that address
-        is private, loopback, link-local, multicast, or otherwise non-public,
-        its exact `IP:numeric-port` must also be listed. Each redirected socket
-        starts a fresh login and revalidates TLS against the redirected hostname.
+        Every address an allowed hostname resolves to is validated and pinned for
+        the connection attempt, and the addresses are tried in turn only after a
+        transport failure. If any address is private, loopback, link-local,
+        multicast, or otherwise non-public, its exact `IP:numeric-port` must also
+        be listed. Each redirected socket starts a fresh login and revalidates TLS
+        against the redirected hostname.
 
     - name: redirect.max
       type: string

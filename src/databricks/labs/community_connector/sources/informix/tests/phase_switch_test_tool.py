@@ -10,6 +10,7 @@ from count_compare_test_tool import (
     PROFILE,
     TABLES,
     resolve_pipeline,
+    resolve_target,
     resolve_warehouse,
 )
 
@@ -35,6 +36,7 @@ _ap.add_argument("--profile", default=PROFILE, help=f"Databricks CLI profile (de
 _ARGS = _ap.parse_args()
 WH = resolve_warehouse(_ARGS.profile, _ARGS.warehouse_id)
 PIPELINE_ID = resolve_pipeline(_ARGS.profile, pipeline_id=_ARGS.pipeline_id)
+TARGET = resolve_target(_ARGS.profile, PIPELINE_ID)
 # "large" commit = snapshot chunk. Default snapshot.page.size is large; CDC batches
 # are bounded by max.records.per.batch (small). Use a threshold well above CDC batch
 # size to separate chunk-writes from streamed changes.
@@ -94,7 +96,7 @@ def rows_written(op, mj):
 
 def analyze(t):
     hist = q(
-        f"SELECT timestamp, operation, operationMetrics FROM (DESCRIBE HISTORY members.connector_bronze.`{t}`) WHERE timestamp >= '{RUN_START}' ORDER BY timestamp"
+        f"SELECT timestamp, operation, operationMetrics FROM (DESCRIBE HISTORY {TARGET}.`{t}`) WHERE timestamp >= '{RUN_START}' ORDER BY timestamp"
     )
     last_chunk_ts = None
     max_chunk = 0

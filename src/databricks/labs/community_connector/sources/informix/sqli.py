@@ -1922,13 +1922,14 @@ class InformixSqliClient:
         # Docstring: Whether ``description``'s rows travel in the variable tuple layout.
         #
         # One answer for both the fetch request and the tuple decode. An LVARCHAR or
-        # opaque column (types 40, 41, 43, 46; BOOLEAN is one) always makes the layout
-        # variable, and its VARCHARs then come length-prefixed, padVarchar or not: a live
-        # server sent them so even for the fixed fetch, which the decode had read as
-        # padded. Otherwise VARCHARs make it variable unless padVarchar asks for padding.
+        # opaque column (types 40, 41, 43, 46; BOOLEAN is one, also typed 45) always makes
+        # the layout variable, and its VARCHARs then come length-prefixed, padVarchar or
+        # not: a live server sent them so even for the fixed fetch, which the decode had
+        # read as padded. Otherwise VARCHARs make it variable unless padVarchar asks for
+        # padding. The kinds match the ones _read_tuple reads as variable envelopes.
 
         return any(
-            (column.type_code & 0xFF) in {40, 41, 43, 46}
+            (column.type_code & 0xFF) in {40, 41, 43, 45, 46}
             or (not self.pad_varchar and (column.type_code & 0xFF) in {13, 16})
             for column in description.columns
         )

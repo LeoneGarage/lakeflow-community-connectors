@@ -53,7 +53,7 @@ The CDC session is established with these calls, in this order:
    )
    ```
 
-   The `*` projection is resolved through `SELECT FIRST 1 * FROM database:owner.table` and result metadata before registration. BYTE, TEXT, fixed/variable UDT, unknown, and complex columns are excluded from the CDC column descriptor; those values are emitted as unavailable placeholders rather than decoded from the stream. The label-to-table mapping is connector state. A TRUNCATE record is anomalous: its table label is read from `userId`, not the normal `label` field.
+   The `*` projection is resolved through `SELECT FIRST 1 * FROM database:owner.table` and result metadata before registration. BYTE, TEXT, fixed/variable UDT, unknown, and complex columns are excluded from the CDC column descriptor and left out of the table's schema, with a warning; a key column of such a type fails the table instead, since rows can't be matched without it. The label-to-table mapping is connector state. A TRUNCATE record is anomalous: its table label is read from `userId`, not the normal `label` field.
 
 5. Activate from a 64-bit sequence position:
 

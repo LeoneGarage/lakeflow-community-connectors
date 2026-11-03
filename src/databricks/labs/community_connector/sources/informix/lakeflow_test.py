@@ -14049,6 +14049,9 @@ class SnapshotDrainPoolTests(unittest.TestCase):
         class _SlowReader:
             _drain_progress = None
 
+            def set_registration_scope(self, scope):
+                pass
+
             def _read_snapshot(self, *args, **kwargs):
                 for _ in range(6):  # 0.3s total, longer than the 0.1s idle window
                     time.sleep(0.05)
@@ -14071,10 +14074,15 @@ class SnapshotDrainPoolTests(unittest.TestCase):
         calls = {}
 
         class _FakeReader:
+            def set_registration_scope(self, scope):
+                calls["scope"] = scope
+
             def _read_snapshot(
                 self, table, start, options, *, pipeline_scope_override, allow_keyless
             ):
                 calls["read"] = (table, start, pipeline_scope_override, allow_keyless)
+                # The drain's own staging (token, stage paths) resolves the job's scope.
+                calls["scope_at_read"] = calls.get("scope")
 
             def close(self):
                 calls["closed"] = True
@@ -14089,12 +14097,16 @@ class SnapshotDrainPoolTests(unittest.TestCase):
         )
         self.assertTrue(pool.wait(("k",), 2.0))
         self.assertEqual(calls["read"], ("T", None, "scope", True))
+        self.assertEqual(calls["scope_at_read"], "scope")
         self.assertTrue(calls["closed"])
 
     def test_worker_surfaces_failure_to_waiter(self):
         pool = _SnapshotDrainPool()
 
         class _BoomReader:
+            def set_registration_scope(self, scope):
+                pass
+
             def _read_snapshot(self, *args, **kwargs):
                 raise InformixError("drain failed")
 
@@ -15071,6 +15083,59 @@ class UniqueIndexPrimaryKeyPromotionTests(unittest.TestCase):
         self.assertEqual(table["primary_keys"], [])
         self.assertFalse(any("idxtype='U'" in sql for sql in seen))  # not even queried
 
+    def test_discovery_promotes_unique_index_like_describe(self):
+        # list_tables seeds the connector's table cache, so a table keyed only by a UNIQUE
+        # index must come back keyed exactly as _describe_table keys it; a table with a
+        # primary key keeps it, and the option off skips the index query.
+        def parts(*colnos):
+            return {f"part{i + 1}": (colnos[i] if i < len(colnos) else 0) for i in range(16)}
+
+        seen = []
+
+        class CatalogTransport:
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                seen.append(sql)
+                if "syscolumns" in sql:
+                    return [
+                        {
+                            "colname": column,
+                            "coltype": 258,
+                            "collength": 4,
+                            "colno": colno,
+                            "tabid": tabid,
+                            "extended_id": 0,
+                            "extended_name": None,
+                            "extended_owner": None,
+                            "owner": "app",
+                            "tabname": name,
+                        }
+                        for tabid, name in ((7, "codes"), (8, "orders"))
+                        for column, colno in (("id", 1), ("code", 2))
+                    ]
+                if "constrtype='P'" in sql:
+                    return [{**parts(1), "owner": "app", "tabname": "orders"}]
+                if "idxtype='U'" in sql:
+                    return [
+                        {"idxname": "u_code", **parts(2), "owner": "app", "tabname": name}
+                        for name in ("codes", "orders")
+                    ]
+                return []
+
+        for options, codes_key in (
+            ({}, ["code"]),
+            ({"primary.key.from.unique.index": "false"}, []),
+        ):
+            with self.subTest(options=options):
+                seen.clear()
+                bridge = object.__new__(PurePythonInformixBridge)
+                bridge.options = options
+                bridge.config = {"database": "demo"}
+                bridge.transport = CatalogTransport()
+                tables = {table["name"]: table for table in bridge.list_tables()}
+                self.assertEqual(tables["codes"]["primary_keys"], codes_key)
+                self.assertEqual(tables["orders"]["primary_keys"], ["id"])
+                self.assertIs(any("idxtype='U'" in sql for sql in seen), bool(codes_key))
+
 
 class NullableIndexPromotionTests(unittest.TestCase):
     """A UNIQUE index with a nullable column is normally rejected as a key. The per-table
@@ -15788,6 +15853,32 @@ class UnloadHelperTests(unittest.TestCase):
             )
         )
         self.assertEqual(records, [b"1|a|", b"2|b|", b"3|c|", b"4|d|"])
+
+
+class _MountFilesApi:
+    """A Files REST client serving the mount's bytes, as the staging transport would. A
+    ranged read of an empty file is refused (416), as object storage refuses it."""
+
+    _host = "https://ws"
+    rejected = False
+
+    class _credential:
+        @staticmethod
+        def bearer():
+            return "dapi-batch-token"
+
+    def get(self, path):
+        if not os.path.exists(path):
+            raise informix_module.WorkspaceHttpError(f"{path} missing", 404)
+        with open(path, "rb") as handle:
+            return handle.read()
+
+    def get_range(self, path, start, end):
+        if not os.path.getsize(path):
+            raise informix_module.WorkspaceHttpError(f"{path}: range not satisfiable", 416)
+        with open(path, "rb") as handle:
+            handle.seek(start)
+            return handle.read(end - start)
 
 
 class UnloadSnapshotSourceTests(LakeflowContractTests):
@@ -16682,33 +16773,14 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
         source = self._source("1|a|\n2|b|\n")
         options = {"snapshot.source": source}
 
-        class _MountFiles:
-            # A REST transport that serves the mount's bytes, so planning reads work.
-            _host = "https://ws"
-            rejected = False
-
-            class _credential:
-                @staticmethod
-                def bearer():
-                    return "dapi-batch-token"
-
-            def get(self, path):
-                if not os.path.exists(path):
-                    raise informix_module.WorkspaceHttpError(f"{path} missing", 404)
-                with open(path, "rb") as handle:
-                    return handle.read()
-
-            def get_range(self, path, start, end):
-                with open(path, "rb") as handle:
-                    handle.seek(start)
-                    return handle.read(end - start)
-
         for required, expected in ((False, True), (True, False)):
             with self.subTest(rest_required=required):
                 connector = self.connector(FakeBridge())
                 table = connector._table("app.orders", options)
                 connector._staging_rest_required = required
-                with mock.patch.object(connector, "_staging_transport", return_value=_MountFiles()):
+                with mock.patch.object(
+                    connector, "_staging_transport", return_value=_MountFilesApi()
+                ):
                     descriptors = connector._unl_split_descriptors(
                         table, options, 90, start_split=0, window=8
                     )
@@ -16722,6 +16794,43 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
             )
         self.assertTrue(descriptors)
         self.assertFalse(any("fuse_fallback" in d or "token" in d for d in descriptors))
+
+    def test_unl_split_descriptors_drop_a_token_the_manifest_read_found_rejected(self):
+        # The manifest read can find the token rejected and move ``auto`` to the mount; the
+        # descriptors built after it then carry no token for the executors to retry.
+        source = self._source("1|a|\n")
+        options = {"snapshot.source": source}
+        files = _MountFilesApi()
+        transport = {"api": files}
+
+        def rejecting_get(path):
+            transport["api"] = None  # as _staging_transport does once nothing can replace it
+            raise informix_module.WorkspaceHttpError("token rejected", 401)
+
+        files.get = rejecting_get
+        connector = self.connector(FakeBridge())
+        table = connector._table("app.orders", options)
+        with mock.patch.object(
+            connector, "_staging_transport", side_effect=lambda: transport["api"]
+        ):
+            descriptors = connector._unl_split_descriptors(
+                table, options, 90, start_split=0, window=8
+            )
+        self.assertTrue(descriptors)
+        self.assertFalse(any("token" in d for d in descriptors))
+
+    def test_unl_empty_files_are_skipped_without_a_ranged_read(self):
+        # An empty table unloads to an empty file, and a ranged GET of an empty object is
+        # refused (416): the serial serve and the split plan both skip it unread.
+        source = self._source("", "1|a|\n2|b|\n")
+        options = {"snapshot.source": source}
+        connector = self.connector(FakeBridge())
+        with mock.patch.object(connector, "_staging_transport", return_value=_MountFilesApi()):
+            rows, _offset = connector.read_table("app.orders", {}, options)
+            served = [(row["id"], row["value"]) for row in rows]
+            splits = connector._unl_all_splits(connector._table("app.orders", options), options)
+        self.assertEqual(served, [(1, "a"), (2, "b")])
+        self.assertEqual([os.path.basename(split[0]) for split in splits], ["part-001.unl"])
 
     def test_unl_snapshot_serve_gate_excludes_delete_flow(self):
         options = {"snapshot.source": "/vol/x"}

@@ -1284,8 +1284,11 @@ class SqliPacketTests(unittest.TestCase):
         varchar = ResultColumn("label", 0, 13, 0, 10)
         lvarchar = ResultColumn("text", 10, 40, 0, 100)
         integer = ResultColumn("id", 0, 2, 0, 4)
+        # A BOOLEAN typed 45 reads as a variable envelope, as the opaque 41 one does.
+        boolean = ResultColumn("enabled", 4, 45, 0, 1)
         for pad_varchar, columns, variable in (
             (True, (varchar, lvarchar), True),
+            (True, (integer, boolean), True),
             (True, (varchar, integer), False),
             (False, (varchar, integer), True),
             (False, (integer,), False),
