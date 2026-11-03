@@ -15589,6 +15589,27 @@ class UnloadHelperTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "does not match its 6 TO 10 qualifier"):
             value("10:30", "DATETIME", 0x60A)
 
+    def test_unload_value_rejects_datetime_text_off_its_literal_shape(self):
+        # Each field must follow its literal separator, and the fraction can't hold more
+        # digits than the qualifier, as the packed decoder refuses: such text fails rather
+        # than parsing as the nearest value.
+        value = informix_module._unload_value
+        for text, qualifier in (
+            ("-2024-05-15", 0x004),
+            ("2024/05/15", 0x004),
+            ("2024-05-15T10:30:00", 0x00A),
+            ("10-30-00", 0x60A),
+            ("123-05", 0x204),
+        ):
+            with self.subTest(text=text):
+                with self.assertRaisesRegex(Exception, "does not match its"):
+                    value(text, "DATETIME", qualifier)
+        with self.assertRaisesRegex(Exception, "carries more precision than its 6 TO 13"):
+            value("10:30:00.1234", "DATETIME", 0x60D)
+        # A shorter fraction pads with zeros, and surrounding blanks are ignored.
+        self.assertEqual(value("10:30:00.1", "DATETIME", 0x60D), "10:30:00.100")
+        self.assertEqual(value(" 2024-05-15 ", "DATETIME", 0x004), datetime(2024, 5, 15))
+
     def test_unload_value_drops_char_padding_like_the_live_decoders(self):
         value = informix_module._unload_value
         self.assertEqual(value("ab   ", "CHAR"), "ab")
@@ -16596,6 +16617,111 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
         with mock.patch.object(lakebase_state.urllib.request, "urlopen", fake_urlopen):
             rows = list(self.connector(FakeBridge()).read_partition("app.orders", partition, {}))
         self.assertEqual([(r["id"], r["value"]) for r in rows], [(3, "x"), (4, "y")])
+
+    def _rejected_split(self, fuse_fallback: bool | None) -> tuple[dict, list]:
+        # A split whose batch token the Files API now rejects (HTTP 401); the file is also
+        # on the mount, as a Volume is. ``calls`` records each REST attempt.
+        import io
+        import urllib.error
+
+        source = self._source("7|hi|\n8|yo|\n")
+        path = os.path.join(source, "part-000.unl")
+        partition = {
+            "kind": "unl_split",
+            "path": path,
+            "start_byte": 0,
+            "end_byte": os.path.getsize(path),
+            "columns": [
+                {"name": "id", "type_name": "INTEGER"},
+                {"name": "value", "type_name": "VARCHAR"},
+            ],
+            "snapshot_lsn": 90,
+            "exposed_name": "app.orders",
+            "encoding": "iso8859-1",
+            "token": "dapi-revoked-token",
+            "host": "https://ws",
+        }
+        if fuse_fallback is not None:
+            partition["fuse_fallback"] = fuse_fallback
+        calls: list = []
+
+        def rejecting_urlopen(request, timeout=None):
+            calls.append(request.get_header("Range"))
+            raise urllib.error.HTTPError(
+                request.full_url, 401, "Unauthorized", {}, io.BytesIO(b"expired")
+            )
+
+        from databricks.labs.community_connector.sources.informix import lakebase_state
+
+        patcher = mock.patch.object(lakebase_state.urllib.request, "urlopen", rejecting_urlopen)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return partition, calls
+
+    def test_unl_split_reads_through_the_mount_after_a_401_under_auto(self):
+        # The batch token can be revoked or expire after planning, and an executor can't
+        # replace it: under ``auto`` the split's reads move to the mount after one try.
+        partition, calls = self._rejected_split(fuse_fallback=True)
+        with self.assertLogs(informix_module.__name__, "WARNING") as logs:
+            rows = list(self.connector(FakeBridge()).read_partition("app.orders", partition, {}))
+        self.assertEqual([(r["id"], r["value"]) for r in rows], [(7, "hi"), (8, "yo")])
+        self.assertEqual(len(calls), 1)
+        self.assertIn("reading the split through the FUSE mount", "\n".join(logs.output))
+
+    def test_unl_split_401_fails_under_rest_and_without_the_flag(self):
+        # ``rest`` keeps its transport, and a descriptor without the flag stays strict.
+        for fuse_fallback in (False, None):
+            with self.subTest(fuse_fallback=fuse_fallback):
+                partition, _calls = self._rejected_split(fuse_fallback)
+                with self.assertRaisesRegex(Exception, "HTTP 401"):
+                    list(self.connector(FakeBridge()).read_partition("app.orders", partition, {}))
+
+    def test_unl_split_descriptors_flag_the_fuse_fallback_by_transport_mode(self):
+        # The driver records whether the executor may fall back: yes under ``auto``, no
+        # under ``rest``; with no token there is nothing to fall back from.
+        source = self._source("1|a|\n2|b|\n")
+        options = {"snapshot.source": source}
+
+        class _MountFiles:
+            # A REST transport that serves the mount's bytes, so planning reads work.
+            _host = "https://ws"
+            rejected = False
+
+            class _credential:
+                @staticmethod
+                def bearer():
+                    return "dapi-batch-token"
+
+            def get(self, path):
+                if not os.path.exists(path):
+                    raise informix_module.WorkspaceHttpError(f"{path} missing", 404)
+                with open(path, "rb") as handle:
+                    return handle.read()
+
+            def get_range(self, path, start, end):
+                with open(path, "rb") as handle:
+                    handle.seek(start)
+                    return handle.read(end - start)
+
+        for required, expected in ((False, True), (True, False)):
+            with self.subTest(rest_required=required):
+                connector = self.connector(FakeBridge())
+                table = connector._table("app.orders", options)
+                connector._staging_rest_required = required
+                with mock.patch.object(connector, "_staging_transport", return_value=_MountFiles()):
+                    descriptors = connector._unl_split_descriptors(
+                        table, options, 90, start_split=0, window=8
+                    )
+                self.assertTrue(descriptors)
+                self.assertTrue(all(d["fuse_fallback"] is expected for d in descriptors))
+        connector = self.connector(FakeBridge())
+        table = connector._table("app.orders", options)
+        with mock.patch.object(connector, "_staging_transport", return_value=None):
+            descriptors = connector._unl_split_descriptors(
+                table, options, 90, start_split=0, window=8
+            )
+        self.assertTrue(descriptors)
+        self.assertFalse(any("fuse_fallback" in d or "token" in d for d in descriptors))
 
     def test_unl_snapshot_serve_gate_excludes_delete_flow(self):
         options = {"snapshot.source": "/vol/x"}

@@ -38,6 +38,21 @@ from datetime import date, datetime, timezone
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal, InvalidOperation, localcontext
 from typing import Any, Callable, Iterable, Iterator, Protocol, Sequence
 
+from pyspark.sql.types import (
+    BinaryType,
+    BooleanType,
+    DateType,
+    DecimalType,
+    DoubleType,
+    FloatType,
+    IntegerType,
+    LongType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampType,
+)
+
 from databricks.labs.community_connector.interface import LakeflowConnect
 from databricks.labs.community_connector.interface.supports_partition import (
     SupportsPartitionedStream,
@@ -57,13 +72,13 @@ from databricks.labs.community_connector.sources.informix.cdc_protocol import (
     validate_snapshot_arity,
 )
 from databricks.labs.community_connector.sources.informix.lakebase_state import (
+    _DEFAULT_STAGING_TOKEN_LIFETIME_SECONDS,
+    _STAGING_TOKEN_MIN_LIFETIME_SECONDS,
     LakebaseState,
     StagingCredentialProvider,
     StagingTokenUnavailable,
     WorkspaceFilesApi,
     WorkspaceHttpError,
-    _DEFAULT_STAGING_TOKEN_LIFETIME_SECONDS,
-    _STAGING_TOKEN_MIN_LIFETIME_SECONDS,
     _workspace_credentials,
     acquire_slot,
     capture_workspace_credentials,
@@ -74,15 +89,15 @@ from databricks.labs.community_connector.sources.informix.lakebase_state import 
     dequeue_waiter,
     enqueue_waiter,
     get_cdc_handoff,
-    put_cdc_handoff,
     heartbeat_slot,
     heartbeat_waiter,
+    pool_progress_token,
     publish_backlog_hint,
     publish_connection_limit,
     publish_maximum_lsn_state_record,
     publish_minimum_lsn_state_record,
     publish_state_record,
-    pool_progress_token,
+    put_cdc_handoff,
     read_backlog_hints,
     read_state_record,
     release_slot,
@@ -98,20 +113,6 @@ from databricks.labs.community_connector.sources.informix.sqli import (
     add_informix_exception_note,
     datetime_order_preserving_cast,
     informix_locale_encoding,
-)
-from pyspark.sql.types import (
-    BinaryType,
-    BooleanType,
-    DateType,
-    DecimalType,
-    DoubleType,
-    FloatType,
-    IntegerType,
-    LongType,
-    StringType,
-    StructField,
-    StructType,
-    TimestampType,
 )
 
 CURSOR = "_informix_change_lsn"
@@ -1202,7 +1203,7 @@ def _informix_available_now_base(base: type, spark_session: Any | None = None) -
 try:
     # This name is local to register_lakeflow_source() after merging; globals()
     # cannot see it. In a normal package import it is intentionally undefined.
-    _generated_trigger_base = SupportsTriggerAvailableNow  # type: ignore[name-defined]  # noqa: F821
+    _generated_trigger_base = SupportsTriggerAvailableNow  # type: ignore[name-defined] # noqa: F821
 except NameError:
     _generated_trigger_base = None
 else:
@@ -9725,7 +9726,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             add_informix_exception_note(primary_error, str(contract_error))
             return
         try:
-            release()
+            release()  # pylint: disable=not-callable
         except Exception as cleanup_error:
             if primary_error is None:
                 raise
@@ -11658,7 +11659,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             )
             page_consumer = pipeline.submit if pipeline is not None else stage_page
             try:
-                snapshot_lsn, rows = consistent_snapshot(
+                snapshot_lsn, rows = consistent_snapshot(  # pylint: disable=not-callable
                     table.identity,
                     [c.name for c in table.columns],
                     scan_keys,
@@ -11775,7 +11776,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         if getter is None:
             return None
         try:
-            value = getter()
+            value = getter()  # pylint: disable=not-callable
         except Exception:
             return None
         return int(value) if value is not None else None
@@ -12711,6 +12712,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             if token and host:
                 descriptor["token"] = token
                 descriptor["host"] = host
+                # An executor can't replace a rejected token, so under ``auto`` it reads
+                # the split through the mount instead, as the driver would.
+                descriptor["fuse_fallback"] = not self._staging_rest_required
             descriptors.append(descriptor)
         return descriptors
 
@@ -14031,7 +14035,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 f"its {_PRIMARY_KEYS_OPTION}='{_PRIMARY_KEYS_WILDCARD}' key cannot grow to "
                 "include them; run a full refresh"
             )
-        with_default = lookup(current.identity, added)
+        with_default = lookup(current.identity, added)  # pylint: disable=not-callable
         if with_default:
             raise InformixError(
                 f"Column(s) {', '.join(with_default)} were added to '{current.exposed_name}' "
@@ -15704,10 +15708,11 @@ def _coerce_variable_decimal_value(
         ) from error
     digits = quantized.as_tuple()
     integer_digits = max(len(digits.digits) + digits.exponent, 0)
-    if integer_digits > (precision or 0) - (scale or 0):
+    allowed_digits = (precision or 0) - (scale or 0)
+    if integer_digits > allowed_digits:
         raise InformixError(
             f"column '{column.name}' value {format(value, 'f')} exceeds decimal("
-            f"{precision},{scale}) (integer digits {integer_digits} > {(precision or 0) - (scale or 0)})"
+            f"{precision},{scale}) (integer digits {integer_digits} > {allowed_digits})"
         )
     return quantized
 
@@ -16127,21 +16132,40 @@ def _unl_split_read_chunk(partition: dict) -> Callable[[int, int], bytes]:
     # Ranged GET over the Files REST API when the descriptor carries a token+host
     # (executors have no ambient workspace credential, so the driver passes one per
     # batch); otherwise a local seek/read -- the same fallback shape as the driver's
-    # ``_unl_read_chunk``, used offline or when no token could be minted.
+    # ``_unl_read_chunk``, used offline or when no token could be minted. The batch's
+    # token can be revoked or expire after planning; under ``auto`` (``fuse_fallback``) a
+    # 401 then moves this split's remaining reads to the mount, while ``rest`` fails.
 
     token = partition.get("token")
     host = partition.get("host")
     path = partition["path"]
-    if token and host:
-        files_api = WorkspaceFilesApi(host, _StaticStagingCredential(token))
-        return lambda offset, length: files_api.get_range(path, offset, offset + length)
 
     def local(offset: int, length: int) -> bytes:
         with open(path, "rb") as handle:
             handle.seek(offset)
             return handle.read(length)
 
-    return local
+    if not (token and host):
+        return local
+    files_api: WorkspaceFilesApi | None = WorkspaceFilesApi(host, _StaticStagingCredential(token))
+
+    def read(offset: int, length: int) -> bytes:
+        nonlocal files_api
+        if files_api is not None:
+            try:
+                return files_api.get_range(path, offset, offset + length)
+            except WorkspaceHttpError as error:
+                if error.status_code != 401 or not partition.get("fuse_fallback"):
+                    raise
+                logging.getLogger(__name__).warning(
+                    "The snapshot-staging token for %s was rejected; reading the split "
+                    "through the FUSE mount",
+                    path,
+                )
+                files_api = None
+        return local(offset, length)
+
+    return read
 
 
 def _partition_column(column: Column) -> dict[str, Any]:

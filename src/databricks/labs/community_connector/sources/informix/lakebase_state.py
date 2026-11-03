@@ -595,7 +595,7 @@ def mint_staging_token(
     if not token_value:
         raise StagingTokenUnavailable("token creation returned no token value")
     created, expires = int(info.get("creation_time") or 0), int(info.get("expiry_time") or 0)
-    granted = (expires - created) / 1000.0 if created > 0 and expires > created else None
+    granted = (expires - created) / 1000.0 if expires > created > 0 else None
     return token_value, token_id, granted
 
 

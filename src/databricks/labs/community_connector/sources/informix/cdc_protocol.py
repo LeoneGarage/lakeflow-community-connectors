@@ -552,9 +552,11 @@ def datetime_from_text(text: str, qualifier: int) -> datetime | str:
     # Docstring: The value the packed decoder yields, for a DATETIME written as its literal.
     #
     # UNLOAD and HPL write a DATETIME as its literal text in the column's qualifier
-    # ("2024-05-15 10:30:00.12345", "10:30:00", "05-15"); its digit groups are the
-    # qualifier's fields in order, then the fraction. Rendering them as _decode_datetime
-    # does keeps a file-sourced snapshot row identical to a live snapshot or CDC row.
+    # ("2024-05-15 10:30:00.12345", "10:30:00", "05-15"): the qualifier's fields in order,
+    # each after its literal separator, then ".fraction". Rendering them as
+    # _decode_datetime does keeps a file-sourced snapshot row identical to a live snapshot
+    # or CDC row. Text in any other shape, or with more fraction digits than the qualifier
+    # holds, fails rather than being read as the nearest value.
 
     start, end = (qualifier >> 8) & 0xF, qualifier & 0xF
     codes = (0, 2, 4, 6, 8, 10)
@@ -562,14 +564,29 @@ def datetime_from_text(text: str, qualifier: int) -> datetime | str:
         raise UnsupportedCdcType(f"unsupported DATETIME qualifier {start} TO {end}")
     selected = [code for code in codes if start <= code <= min(end, 10)]
     fraction_digits = max(0, end - 10)
-    groups = re.findall(r"[0-9]+", text)
-    if len(groups) != len(selected) + (1 if fraction_digits else 0):
+    pattern = "".join(
+        ("" if code == start else _DATETIME_TEXT_SEPARATORS[code])
+        + ("([0-9]{1,4})" if code == 0 else "([0-9]{1,2})")
+        for code in selected
+    ) + (r"\.([0-9]+)" if fraction_digits else "")
+    match = re.fullmatch(pattern, text.strip())
+    if match is None:
         raise CdcProtocolError(
             f"DATETIME text {text!r} does not match its {start} TO {end} qualifier"
         )
+    groups = match.groups()
     values = {code: int(group) for code, group in zip(selected, groups)}
-    fraction = groups[-1][:fraction_digits].ljust(fraction_digits, "0") if fraction_digits else ""
+    fraction = groups[-1] if fraction_digits else ""
+    if len(fraction) > fraction_digits:
+        raise CdcProtocolError(
+            f"DATETIME text {text!r} carries more precision than its {start} TO {end} qualifier"
+        )
+    fraction = fraction.ljust(fraction_digits, "0")
     return _render_datetime(values, fraction, start, fraction_digits, repr(text))
+
+
+# The separator a DATETIME literal writes before each field after its first.
+_DATETIME_TEXT_SEPARATORS = {2: "-", 4: "-", 6: " ", 8: ":", 10: ":"}
 
 
 # INTERVAL qualifier field codes: YEAR, MONTH | DAY, HOUR, MINUTE, SECOND, then

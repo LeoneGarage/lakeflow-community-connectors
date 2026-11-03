@@ -434,7 +434,7 @@ upsert and delete readers to reconverge after cancellation or retry.
 
 ## Dynamic table and schema discovery
 
-Use Informix catalog metadata (via catalog queries) to discover all base `TABLE` objects in the configured database. Exclude Informix system catalogs (`sys*` owners/tables), views, synonyms, sequences, and `syscdcv1` internals. Apply include/exclude patterns after normalizing each identity to `database.owner.table`. Expose a stable Lakeflow table name; the least ambiguous choice is `owner.table`, while retaining `database` and `owner` in `table_options` or an internal lookup.
+Use Informix catalog metadata (via catalog queries) to discover all base `TABLE` objects in the configured database, the system catalog's tables included: nothing is left out by name or owner. Views, synonyms and sequences are not base tables and are not exposed. The CDC API documents only views, temporary and other non-logged tables, and tables in an unlogged database as impossible to capture, and Informix's own error reports those. Apply include/exclude patterns after normalizing each identity to `database.owner.table`. Expose a stable Lakeflow table name; the least ambiguous choice is `owner.table`, while retaining `database` and `owner` in `table_options` or an internal lookup.
 
 For each table discover, in ordinal order:
 

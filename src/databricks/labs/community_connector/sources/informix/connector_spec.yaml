@@ -383,8 +383,10 @@ connection:
         disconnects that recur under sustained write frequency; it requires the workspace
         to allow personal-access-token creation for the pipeline's identity. `auto` (the
         default) uses `rest` when a token can be minted and falls back to `fuse` when the
-        workspace forbids token creation. Only page *writes* use this transport; reads
-        and cleanup still use the mount. One of `auto`, `rest`, `fuse`.
+        workspace forbids token creation or the reader's starting credential has expired
+        (it lasts about an hour, and each reader mints its first token from it). Page
+        *writes* and `snapshot.source` (`.unl`) reads use this transport; page reads and
+        cleanup use the mount. One of `auto`, `rest`, `fuse`.
 
     - name: snapshot.staging.token.lifetime.seconds
       type: string

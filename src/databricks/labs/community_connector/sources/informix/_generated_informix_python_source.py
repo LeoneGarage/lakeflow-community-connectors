@@ -1182,9 +1182,11 @@ def register_lakeflow_source(spark):
         # Docstring: The value the packed decoder yields, for a DATETIME written as its literal.
         #
         # UNLOAD and HPL write a DATETIME as its literal text in the column's qualifier
-        # ("2024-05-15 10:30:00.12345", "10:30:00", "05-15"); its digit groups are the
-        # qualifier's fields in order, then the fraction. Rendering them as _decode_datetime
-        # does keeps a file-sourced snapshot row identical to a live snapshot or CDC row.
+        # ("2024-05-15 10:30:00.12345", "10:30:00", "05-15"): the qualifier's fields in order,
+        # each after its literal separator, then ".fraction". Rendering them as
+        # _decode_datetime does keeps a file-sourced snapshot row identical to a live snapshot
+        # or CDC row. Text in any other shape, or with more fraction digits than the qualifier
+        # holds, fails rather than being read as the nearest value.
 
         start, end = (qualifier >> 8) & 0xF, qualifier & 0xF
         codes = (0, 2, 4, 6, 8, 10)
@@ -1192,14 +1194,29 @@ def register_lakeflow_source(spark):
             raise UnsupportedCdcType(f"unsupported DATETIME qualifier {start} TO {end}")
         selected = [code for code in codes if start <= code <= min(end, 10)]
         fraction_digits = max(0, end - 10)
-        groups = re.findall(r"[0-9]+", text)
-        if len(groups) != len(selected) + (1 if fraction_digits else 0):
+        pattern = "".join(
+            ("" if code == start else _DATETIME_TEXT_SEPARATORS[code])
+            + ("([0-9]{1,4})" if code == 0 else "([0-9]{1,2})")
+            for code in selected
+        ) + (r"\.([0-9]+)" if fraction_digits else "")
+        match = re.fullmatch(pattern, text.strip())
+        if match is None:
             raise CdcProtocolError(
                 f"DATETIME text {text!r} does not match its {start} TO {end} qualifier"
             )
+        groups = match.groups()
         values = {code: int(group) for code, group in zip(selected, groups)}
-        fraction = groups[-1][:fraction_digits].ljust(fraction_digits, "0") if fraction_digits else ""
+        fraction = groups[-1] if fraction_digits else ""
+        if len(fraction) > fraction_digits:
+            raise CdcProtocolError(
+                f"DATETIME text {text!r} carries more precision than its {start} TO {end} qualifier"
+            )
+        fraction = fraction.ljust(fraction_digits, "0")
         return _render_datetime(values, fraction, start, fraction_digits, repr(text))
+
+
+    # The separator a DATETIME literal writes before each field after its first.
+    _DATETIME_TEXT_SEPARATORS = {2: "-", 4: "-", 6: " ", 8: ":", 10: ":"}
 
 
     # INTERVAL qualifier field codes: YEAR, MONTH | DAY, HOUR, MINUTE, SECOND, then
@@ -1824,7 +1841,7 @@ def register_lakeflow_source(spark):
         if not token_value:
             raise StagingTokenUnavailable("token creation returned no token value")
         created, expires = int(info.get("creation_time") or 0), int(info.get("expiry_time") or 0)
-        granted = (expires - created) / 1000.0 if created > 0 and expires > created else None
+        granted = (expires - created) / 1000.0 if expires > created > 0 else None
         return token_value, token_id, granted
 
 
@@ -6764,7 +6781,7 @@ def register_lakeflow_source(spark):
     try:
         # This name is local to register_lakeflow_source() after merging; globals()
         # cannot see it. In a normal package import it is intentionally undefined.
-        _generated_trigger_base = SupportsTriggerAvailableNow  # type: ignore[name-defined]  # noqa: F821
+        _generated_trigger_base = SupportsTriggerAvailableNow  # type: ignore[name-defined] # noqa: F821
     except NameError:
         _generated_trigger_base = None
     else:
@@ -15287,7 +15304,7 @@ def register_lakeflow_source(spark):
                 add_informix_exception_note(primary_error, str(contract_error))
                 return
             try:
-                release()
+                release()  # pylint: disable=not-callable
             except Exception as cleanup_error:
                 if primary_error is None:
                     raise
@@ -17220,7 +17237,7 @@ def register_lakeflow_source(spark):
                 )
                 page_consumer = pipeline.submit if pipeline is not None else stage_page
                 try:
-                    snapshot_lsn, rows = consistent_snapshot(
+                    snapshot_lsn, rows = consistent_snapshot(  # pylint: disable=not-callable
                         table.identity,
                         [c.name for c in table.columns],
                         scan_keys,
@@ -17337,7 +17354,7 @@ def register_lakeflow_source(spark):
             if getter is None:
                 return None
             try:
-                value = getter()
+                value = getter()  # pylint: disable=not-callable
             except Exception:
                 return None
             return int(value) if value is not None else None
@@ -18273,6 +18290,9 @@ def register_lakeflow_source(spark):
                 if token and host:
                     descriptor["token"] = token
                     descriptor["host"] = host
+                    # An executor can't replace a rejected token, so under ``auto`` it reads
+                    # the split through the mount instead, as the driver would.
+                    descriptor["fuse_fallback"] = not self._staging_rest_required
                 descriptors.append(descriptor)
             return descriptors
 
@@ -19593,7 +19613,7 @@ def register_lakeflow_source(spark):
                     f"its {_PRIMARY_KEYS_OPTION}='{_PRIMARY_KEYS_WILDCARD}' key cannot grow to "
                     "include them; run a full refresh"
                 )
-            with_default = lookup(current.identity, added)
+            with_default = lookup(current.identity, added)  # pylint: disable=not-callable
             if with_default:
                 raise InformixError(
                     f"Column(s) {', '.join(with_default)} were added to '{current.exposed_name}' "
@@ -21266,10 +21286,11 @@ def register_lakeflow_source(spark):
             ) from error
         digits = quantized.as_tuple()
         integer_digits = max(len(digits.digits) + digits.exponent, 0)
-        if integer_digits > (precision or 0) - (scale or 0):
+        allowed_digits = (precision or 0) - (scale or 0)
+        if integer_digits > allowed_digits:
             raise InformixError(
                 f"column '{column.name}' value {format(value, 'f')} exceeds decimal("
-                f"{precision},{scale}) (integer digits {integer_digits} > {(precision or 0) - (scale or 0)})"
+                f"{precision},{scale}) (integer digits {integer_digits} > {allowed_digits})"
             )
         return quantized
 
@@ -21689,21 +21710,40 @@ def register_lakeflow_source(spark):
         # Ranged GET over the Files REST API when the descriptor carries a token+host
         # (executors have no ambient workspace credential, so the driver passes one per
         # batch); otherwise a local seek/read -- the same fallback shape as the driver's
-        # ``_unl_read_chunk``, used offline or when no token could be minted.
+        # ``_unl_read_chunk``, used offline or when no token could be minted. The batch's
+        # token can be revoked or expire after planning; under ``auto`` (``fuse_fallback``) a
+        # 401 then moves this split's remaining reads to the mount, while ``rest`` fails.
 
         token = partition.get("token")
         host = partition.get("host")
         path = partition["path"]
-        if token and host:
-            files_api = WorkspaceFilesApi(host, _StaticStagingCredential(token))
-            return lambda offset, length: files_api.get_range(path, offset, offset + length)
 
         def local(offset: int, length: int) -> bytes:
             with open(path, "rb") as handle:
                 handle.seek(offset)
                 return handle.read(length)
 
-        return local
+        if not (token and host):
+            return local
+        files_api: WorkspaceFilesApi | None = WorkspaceFilesApi(host, _StaticStagingCredential(token))
+
+        def read(offset: int, length: int) -> bytes:
+            nonlocal files_api
+            if files_api is not None:
+                try:
+                    return files_api.get_range(path, offset, offset + length)
+                except WorkspaceHttpError as error:
+                    if error.status_code != 401 or not partition.get("fuse_fallback"):
+                        raise
+                    logging.getLogger(__name__).warning(
+                        "The snapshot-staging token for %s was rejected; reading the split "
+                        "through the FUSE mount",
+                        path,
+                    )
+                    files_api = None
+            return local(offset, length)
+
+        return read
 
 
     def _partition_column(column: Column) -> dict[str, Any]:
