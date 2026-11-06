@@ -5233,9 +5233,222 @@ class LakeflowContractTests(unittest.TestCase):
             served.extend(connector.read_partition("app.orders", part, {}))
 
         bridge.get_table.assert_not_called()
-        # Page 0 (id 1) was served via the embedded bootstrap; this fan-out covers
+        # Page 0 (id 1) was served by the bootstrap microbatch; this fan-out covers
         # pages 1..3, which hold ids 2, 3, 4.
         self.assertEqual([row["id"] for row in served], [2, 3, 4])
+
+    def _served(self, connector, partitions):
+        # Each descriptor crosses to the executor as JSON, as the framework sends it.
+        return [
+            row
+            for part in partitions
+            for row in connector.read_partition("app.orders", json.loads(json.dumps(part)), {})
+        ]
+
+    def test_partitioned_bootstrap_serves_page_zero_from_the_stage(self):
+        # The first microbatch drains the snapshot and serves page 0. Page 0 reaches the
+        # executor as a staged-page partition like every later page, not as rows embedded
+        # in the descriptor, which the executor parses whole: a wide table's page passed
+        # serverless's 1 GB Python limit that way. The driver keeps no decoded rows for it.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 4)]
+        connector = self._partitioned_connector(bridge, **{"snapshot.page.size": "2"})
+
+        end = connector.latest_offset("app.orders", {}, {})
+        self.assertEqual((end["phase"], end["snapshot"]["page_index"]), ("snapshot", 1))
+        self.assertEqual(connector._partition_embedded_rows, {})
+        partitions = connector.get_partitions("app.orders", {}, {}, end)
+
+        self.assertEqual([(p["kind"], p["page_index"]) for p in partitions], [("page", 0)])
+        self.assertEqual([row["id"] for row in self._served(connector, partitions)], [1, 2])
+
+    def test_partitioned_bootstrap_replan_serves_page_zero_without_a_read(self):
+        # Spark re-plans an uncommitted first microbatch after a driver restart or a retried
+        # update, including one an earlier connector version logged with page 0 embedded.
+        # Its offsets alone identify the page, so a fresh reader under the new update's scope
+        # serves it from the stage the offsets name, and reads nothing.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 4)]
+        first = self._partitioned_connector(
+            bridge, registration_scope="failed-update", **{"snapshot.page.size": "2"}
+        )
+        end = first.latest_offset("app.orders", {}, {})
+
+        restarted = self._partitioned_connector(
+            bridge, registration_scope="retried-update", **{"snapshot.page.size": "2"}
+        )
+        self.assertNotEqual(restarted._pipeline_scope(), end["pipeline_scope"])
+        with mock.patch.object(restarted, "_read_upserts") as read_table:
+            partitions = restarted.get_partitions("app.orders", {}, {}, end)
+
+        read_table.assert_not_called()
+        self.assertEqual([(p["kind"], p["page_index"]) for p in partitions], [("page", 0)])
+        self.assertEqual([row["id"] for row in self._served(restarted, partitions)], [1, 2])
+
+    def test_a_new_update_finishes_a_failed_first_microbatch_from_the_stage(self):
+        # An update drained the whole snapshot to the stage, logged its first microbatch,
+        # and failed before committing it. A later update (a new scope) re-runs that batch
+        # from the logged offsets and serves every staged page without reading the source
+        # table again.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 6)]
+        options = {"snapshot.page.size": "2", "stream.partitioned.snapshot.pages.per.batch": "2"}
+        failed = self._partitioned_connector(bridge, registration_scope="failed", **options)
+        start, end = {}, failed.latest_offset("app.orders", {}, {})
+
+        resumed = self._partitioned_connector(bridge, registration_scope="resumed", **options)
+        served = []
+        with mock.patch.object(
+            bridge, "consistent_snapshot", wraps=bridge.consistent_snapshot
+        ) as source_reads:
+            for _ in range(10):
+                served.extend(
+                    self._served(resumed, resumed.get_partitions("app.orders", {}, start, end))
+                )
+                if end["phase"] == "stream":
+                    break
+                start, end = end, resumed.latest_offset("app.orders", {}, end)
+        self._flush_snapshot_cleanup(resumed)
+
+        source_reads.assert_not_called()
+        self.assertEqual([row["id"] for row in served], [1, 2, 3, 4, 5])
+        self.assertEqual(end["pipeline_scope"], failed._pipeline_scope())
+
+    def test_partitioned_bootstrap_of_a_one_page_snapshot_serves_the_page(self):
+        # A snapshot that fits in one page goes straight to the stream phase; that first
+        # microbatch's only page is served from the stage too.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 4)]
+        connector = self._partitioned_connector(bridge)
+
+        end = connector.latest_offset("app.orders", {}, {})
+        self.assertEqual(end["phase"], "stream")
+        partitions = connector.get_partitions("app.orders", {}, {}, end)
+
+        self.assertEqual([(p["kind"], p["page_index"]) for p in partitions], [("page", 0)])
+        self.assertEqual([row["id"] for row in self._served(connector, partitions)], [1, 2, 3])
+
+    def test_partitioned_bootstrap_without_a_staged_snapshot_stays_embedded(self):
+        # A first microbatch that stages nothing (cdc_only starts at the current log
+        # position) has no page to serve and keeps the embedded path.
+        connector = self._partitioned_connector(**{"snapshot.mode": "cdc_only"})
+
+        end = connector.latest_offset("app.orders", {}, {})
+        partitions = connector.get_partitions("app.orders", {}, {}, end)
+
+        self.assertEqual([p["kind"] for p in partitions], ["embedded"])
+
+    def _bootstrap_end(self, connector):
+        # The first microbatch's end offset, counting the staged pages read meanwhile.
+        with mock.patch.object(
+            connector,
+            "_read_staged_page_payload_for",
+            wraps=connector._read_staged_page_payload_for,
+        ) as page_reads:
+            end = connector.latest_offset("app.orders", {}, {})
+            partitions = connector.get_partitions("app.orders", {}, {}, end)
+        return end, partitions, page_reads.call_count
+
+    def _serial_bootstrap_end(self, bridge):
+        # The simple reader's first end offset over the same staged snapshot (same scope).
+        serial = self.connector(bridge, registration_scope="shared", **{"snapshot.page.size": "2"})
+        return serial.read_table("app.orders", {}, {})[1]
+
+    def test_partitioned_bootstrap_reads_no_page_on_the_driver(self):
+        # Page 0 is read once, by the executor. The first microbatch's end offset comes
+        # from the manifest the drain published and matches the simple reader's byte for
+        # byte, so a reader-class swap resumes in place.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 4)]
+        connector = self._partitioned_connector(
+            bridge, registration_scope="shared", **{"snapshot.page.size": "2"}
+        )
+
+        end, partitions, driver_reads = self._bootstrap_end(connector)
+
+        self.assertEqual(driver_reads, 0)
+        self.assertEqual([(p["kind"], p["page_index"]) for p in partitions], [("page", 0)])
+        self.assertEqual(json.dumps(end), json.dumps(self._serial_bootstrap_end(bridge)))
+        self.assertEqual([row["id"] for row in self._served(connector, partitions)], [1, 2])
+
+    def test_partitioned_bootstrap_over_an_older_manifest_reads_only_the_boundary(self):
+        # A manifest an earlier connector version published has no first_upper_pk: the
+        # driver reads page 0's header for the boundary cursor, but still decodes no rows,
+        # and the page is served from an executor.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 4)]
+        connector = self._partitioned_connector(
+            bridge, registration_scope="shared", **{"snapshot.page.size": "2"}
+        )
+        publish = connector._publish_snapshot_stage_manifest
+
+        with mock.patch.object(
+            connector,
+            "_publish_snapshot_stage_manifest",
+            side_effect=lambda *args: publish(*args[:6]),
+        ):
+            end, partitions, driver_reads = self._bootstrap_end(connector)
+
+        self.assertEqual(driver_reads, 1)
+        self.assertEqual(connector._partition_embedded_rows, {})
+        self.assertEqual([(p["kind"], p["page_index"]) for p in partitions], [("page", 0)])
+        self.assertEqual(json.dumps(end), json.dumps(self._serial_bootstrap_end(bridge)))
+
+    def test_a_drain_worker_returns_page_zero_unread(self):
+        # A drain worker only needs the manifest its drain publishes, so the page-0 serve
+        # that ends its drain reads nothing back; the rows are still there if iterated.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 4)]
+        worker = self.connector(bridge, **{"snapshot.page.size": "2"})
+        worker._defer_staged_rows = True
+        table = worker._table("app.orders", {})
+
+        with mock.patch.object(
+            worker, "_read_staged_page_payload_for", wraps=worker._read_staged_page_payload_for
+        ) as page_reads:
+            rows, end = worker._read_snapshot(table, None, {})
+            self.assertEqual(page_reads.call_count, 0)
+            self.assertEqual([row["id"] for row in rows], [1, 2])
+
+        self.assertEqual(end["snapshot"]["page_index"], 1)
+
+    def test_partitioned_small_embedded_batch_is_sized_in_one_call(self):
+        # An embedded batch under the bound is measured with one json.dumps of the whole
+        # batch, not one per row, and stays a single partition.
+        connector = self._partitioned_connector()
+        start = {"phase": "stream", "commit_lsn": "5"}
+        end = {"phase": "stream", "commit_lsn": "6"}
+        rows = [{"id": i, "value": f"v{i}"} for i in range(5)]
+        with (
+            mock.patch.object(connector, "_read_upserts", return_value=(iter(rows), end)),
+            mock.patch.object(informix_module.json, "dumps", wraps=json.dumps) as dumps,
+        ):
+            connector.latest_offset("app.orders", {}, start)
+            partitions = connector.get_partitions("app.orders", {}, start, end)
+
+        serialized = [call.args[0] for call in dumps.call_args_list]
+        self.assertEqual(len(partitions), 1)
+        self.assertIn(rows, serialized)
+        self.assertFalse([value for value in serialized if value in rows])
+
+    def test_partitioned_embedded_batch_is_split_into_bounded_partitions(self):
+        # The executor parses an embedded descriptor whole, so a large embedded batch is
+        # split across partitions of bounded row text, every row once and in order. A row
+        # larger than the bound still travels, alone.
+        connector = self._partitioned_connector()
+        start = {"phase": "stream", "commit_lsn": "5"}
+        end = {"phase": "stream", "commit_lsn": "6"}
+        rows = [{"id": i, "value": "x" * 40} for i in range(7)] + [{"id": 7, "value": "y" * 400}]
+        limit = 3 * len(json.dumps(rows[0]))
+        with (
+            mock.patch.object(informix_module, "_MAX_EMBEDDED_PARTITION_BYTES", limit),
+            mock.patch.object(connector, "_read_upserts", return_value=(iter(rows), end)),
+        ):
+            connector.latest_offset("app.orders", {}, start)
+            partitions = connector.get_partitions("app.orders", {}, start, end)
+
+        self.assertEqual([len(p["rows"]) for p in partitions], [3, 3, 1, 1])
+        self.assertEqual(self._served(connector, partitions), rows)
 
     def test_partitioned_embedded_path_matches_read_table(self):
         # A non-page-serve microbatch (stream phase) yields a single embedded

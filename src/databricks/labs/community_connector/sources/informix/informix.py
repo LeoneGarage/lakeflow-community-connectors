@@ -321,15 +321,21 @@ _APPEND_DELETE_TOMBSTONES_OPTION = "append.delete.tombstones"
 # SupportsPartitionedStream contract so Spark uses the partitioned DataSourceStreamReader.
 # Its one win is the staged-snapshot page-serve phase: instead of serving one page per
 # microbatch on the driver, a microbatch spans up to `stream.partitioned.snapshot.pages.
-# per.batch` pages, each read+decoded on a separate Spark executor. Every other phase
-# (staging bootstrap, the live CDC/incremental stream, transitions, deletes) degrades to a
-# single driver-computed partition whose rows are embedded in the descriptor -- byte-for-
-# byte the current output, just wrapped. Both readers persist the connector's bare offset
-# dict, so flipping this option and restarting resumes an existing checkpoint in place (no
-# full refresh); serverless SDP was verified to resume across the reader-class swap.
+# per.batch` pages, each read+decoded on a separate Spark executor; the first microbatch,
+# which drains the snapshot to the stage, serves its page 0 the same way. Every other phase
+# (the live CDC/incremental stream, transitions, deletes) degrades to driver-computed rows
+# embedded in the descriptor -- byte-for-byte the current output, just wrapped, and split
+# across partitions of bounded size when large. Both readers persist the connector's bare
+# offset dict, so flipping this option and restarting resumes an existing checkpoint in place
+# (no full refresh); serverless SDP was verified to resume across the reader-class swap.
 _PARTITIONED_STREAM_OPTION = "stream.partitioned"
 _PARTITIONED_SNAPSHOT_PAGES_PER_BATCH_OPTION = "stream.partitioned.snapshot.pages.per.batch"
 _DEFAULT_PARTITIONED_SNAPSHOT_PAGES_PER_BATCH = 8
+# An embedded partition reaches the executor as one JSON document that the framework parses
+# whole, at about seven times its text in Python objects, under serverless's 1 GB Python
+# memory limit. A larger embedded microbatch is split across partitions of at most this
+# much row text each.
+_MAX_EMBEDDED_PARTITION_BYTES = 16 << 20
 # The framework tags a delete-channel reader's options with this key (see
 # sparkpds/lakeflow_datasource.py). The partitioned reader reads it to route the embedded
 # path to read_table_deletes rather than read_table; the delete channel never page-serves.
@@ -7241,7 +7247,9 @@ def _run_snapshot_drain_worker(pool: _SnapshotDrainPool) -> None:
                 reader._drain_progress = lambda: pool.report_progress(job_key)
                 # The reader is marked as a drain worker, so this drains inline and returns
                 # the staged page-0 result; the daemon ignores the rows -- it only needs the
-                # durable manifest the drain publishes as a side effect.
+                # durable manifest the drain publishes as a side effect -- so page 0 is
+                # returned unread.
+                reader._defer_staged_rows = True
                 reader._read_snapshot(
                     job["table"],
                     None,
@@ -7329,6 +7337,26 @@ class _AsyncStagePipeline:
         if self._started:
             self._queue.put(None)
             self._thread.join()
+
+
+class _DeferredStagedPage:
+    # Docstring: A staged page's rows, read from the stage only once iterated.
+    #
+    # ``page_batch`` is the page-serve tuple (see _snapshot_page_batch) the partitioned
+    # reader uses to serve the page from an executor, so the driver never reads it.
+
+    def __init__(self, read: Callable[[], Iterator[dict]], page_batch: tuple) -> None:
+        self.page_batch = page_batch
+        self._read = read
+        self._rows: Iterator[dict] | None = None
+
+    def __iter__(self) -> "_DeferredStagedPage":
+        return self
+
+    def __next__(self) -> dict:
+        if self._rows is None:
+            self._rows = self._read()
+        return next(self._rows)
 
 
 class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
@@ -7540,6 +7568,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # Set by a snapshot-drain worker to a callback that reports a staged page to the
         # pool, resetting the consumer's liveness watchdog. None on a normal reader.
         self._drain_progress: Callable[[], None] | None = None
+        # Set while a first microbatch's staged page 0 may be served from an executor (see
+        # _staged_snapshot_result): the serve then returns its rows unread.
+        self._defer_staged_rows = False
         # Consumed-page cleanup runs off the serve path on a background pool, and a
         # per-stream high-water mark (keyed by scope/schema/snapshot_lsn) makes it
         # incremental: each microbatch schedules only the pages newly advanced past,
@@ -7563,6 +7594,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # Values are codec-encoded (JSON-safe) rows -- the exact descriptor payload
         # get_partitions emits and read_partition decodes; see _encode_embedded_rows.
         self._partition_embedded_rows: dict[str, list[Any]] = {}
+        # The same bridge for a first microbatch that serves staged page 0 from an
+        # executor: its page-serve tuple, so get_partitions needs no manifest read.
+        self._partition_page_batches: dict[str, tuple] = {}
         # Driver-only gzip record-window state (see _UNL_GZIP_RECORDS_OPTION): the open
         # record iterator for the gzip file being served, as [key, next_record_index,
         # iterator], and the last window read, so a repeated latest_offset for the same
@@ -7594,6 +7628,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             self._snapshot_cleanup_watermark.clear()
             self._snapshot_schema_refreshed_at.clear()
             self._partition_embedded_rows.clear()
+            self._partition_page_batches.clear()
             self._unl_gzip_reader = None
             self._unl_gzip_window_memo = None
             self._retention_swept.clear()
@@ -8093,13 +8128,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     # ------------------------------------------------------------------
     # Default on (see _PARTITIONED_STREAM_OPTION). Only the staged-snapshot
     # page-serve phase fans out: a microbatch spans up to pages-per-batch staged
-    # pages, each read+decoded on its own Spark executor via read_partition. Every
-    # other phase (bootstrap, live CDC/incremental stream, transitions, deletes)
-    # is a single embedded partition whose rows the driver computed via read_table
-    # / read_table_deletes -- byte-for-byte the simple reader's output, just
-    # wrapped. The delicate phase machine (read_table, _read_stream, _read_snapshot,
-    # transitions, _recover) is reused verbatim; only its (rows, offset) output is
-    # reshaped into the partitioned contract.
+    # pages, each read+decoded on its own Spark executor via read_partition, and so
+    # is the bootstrap microbatch's page 0. Every other phase (live CDC/incremental
+    # stream, transitions, deletes) is embedded partitions whose rows the driver
+    # computed via read_table / read_table_deletes -- byte-for-byte the simple
+    # reader's output, just wrapped. The delicate phase machine (read_table,
+    # _read_stream, _read_snapshot, transitions, _recover) is reused verbatim; only
+    # its (rows, offset) output is reshaped into the partitioned contract.
 
     def _partitioned_stream_enabled(self) -> bool:
         return _option_bool(self.options, _PARTITIONED_STREAM_OPTION, True)
@@ -8215,6 +8250,49 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         end_page = min(start_page + self._partitioned_pages_per_batch(), page_count)
         return (stage_scope, schema_id, snapshot_lsn, start_page, end_page, page_count)
 
+    def _bootstrap_page_batch(
+        self, table: Table, effective_start: dict, end_offset: dict, table_options: dict[str, str]
+    ) -> tuple[str, str, int, int, int, int] | None:
+        # Docstring: Resolve a table's first microbatch as a serve of staged page 0, else None.
+        #
+        # The first microbatch drains the snapshot to the stage, then serves page 0 from it:
+        # an immutable page an executor can stream like every later page. Embedded in the
+        # descriptor instead, the executor parses the whole page at once, which passes
+        # serverless's 1 GB Python limit for a wide table. Recognised from the (start, end)
+        # pair alone, so a batch re-planned after a driver restart is served the same way:
+        # an empty start, and the end _staged_snapshot_result emits after page 0 of the
+        # manifest pinned at that LSN. Same tuple as _snapshot_page_batch.
+
+        if effective_start or not end_offset or "incremental" in end_offset:
+            return None
+        if self._is_delete_flow() or self._table_migration(table_options):
+            return None
+        try:
+            end = _validated_offset(end_offset)
+        except Exception:  # pylint: disable=broad-except
+            return None
+        lsn = int(end["commit_lsn"])
+        # _staged_snapshot_result pins every LSN of either end at the snapshot boundary.
+        if {int(end["begin_lsn"]), int(end["change_lsn"])} != {lsn}:
+            return None
+        if end.get("tx_id") is not None:
+            return None
+        if end["phase"] == "snapshot":
+            snapshot = end.get("snapshot")
+            if "stage_scope" in end or not isinstance(snapshot, dict):
+                return None
+            if snapshot.get("page_index") != 1 or int(end.get("snapshot_lsn", -1)) != lsn:
+                return None
+        scope, schema_id = str(end["pipeline_scope"]), str(end["schema_id"])
+        manifest = self._read_snapshot_stage_manifest(table, scope, schema_id)
+        if manifest is None or int(manifest["snapshot_lsn"]) != lsn:
+            return None
+        page_count = int(manifest["page_count"])
+        # A snapshot-phase end leaves pages to serve; a stream end served the only page.
+        if (page_count > 1) != (end["phase"] == "snapshot") or page_count < 1:
+            return None
+        return (scope, schema_id, lsn, 0, 1, page_count)
+
     def _embedded_read(
         self, table_name: str, start_offset: dict, table_options: dict[str, str]
     ) -> tuple[Iterator[dict], dict]:
@@ -8248,7 +8326,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         batch = self._snapshot_page_batch(table, effective_start, table_options)
         if batch is not None:
             return self._snapshot_page_batch_offset(table, effective_start, batch)
-        rows, next_offset = self._embedded_read(table_name, start_offset, table_options)
+        self._defer_staged_rows = not effective_start
+        try:
+            rows, next_offset = self._embedded_read(table_name, start_offset, table_options)
+        finally:
+            self._defer_staged_rows = False
         # F1: cache the JSON-safe encoded rows (they are the descriptor payload).
         # F6: keep only this microbatch's entry, so a latest_offset call Spark never
         # follows with get_partitions (speculative discovery, or an empty start==end
@@ -8256,6 +8338,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # because partitioned mode requires the shared CDC session, whose reads are
         # idempotent for a committed start.
         self._partition_embedded_rows.clear()
+        self._partition_page_batches.clear()
+        if isinstance(rows, _DeferredStagedPage):
+            # get_partitions serves page 0 from the stage, so the driver never reads it.
+            self._partition_page_batches[self._partition_offset_key(start_offset)] = rows.page_batch
+            return next_offset
         self._partition_embedded_rows[self._partition_offset_key(start_offset)] = (
             self._encode_embedded_rows(rows)
         )
@@ -8388,7 +8475,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                         stop_record=end_record if end_split == start_split else None,
                     )
                     encoded = self._encode_embedded_rows(rows)
-                return [self._embedded_descriptor(table, encoded)]
+                return self._embedded_descriptors(table, encoded)
             # The window is whatever latest_offset logged: up to pages-per-batch splits,
             # ending early before a gzip split that is served in record windows.
             return self._unl_split_descriptors(
@@ -8398,7 +8485,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 start_split=start_split,
                 window=end_split - start_split,
             )
-        batch = self._snapshot_page_batch(table, effective_start, table_options)
+        batch = (
+            self._snapshot_page_batch(table, effective_start, table_options)
+            or self._partition_page_batches.pop(self._partition_offset_key(start_offset), None)
+            or self._bootstrap_page_batch(table, effective_start, end_offset or {}, table_options)
+        )
         if batch is not None:
             scope, schema_id, snapshot_lsn, start_page, end_page, _ = batch
             return [
@@ -8429,7 +8520,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 table_name, start_offset or {}, end_offset or {}, table_options
             )
             encoded = self._encode_embedded_rows(rows)
-        return [self._embedded_descriptor(table, encoded)]
+        return self._embedded_descriptors(table, encoded)
 
     def _replay_embedded_range(
         self, table_name: str, start: dict, end: dict, table_options: dict[str, str]
@@ -8506,6 +8597,23 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
 
     def _embedded_descriptor(self, table: Table, encoded) -> dict[str, Any]:
         return {"kind": "embedded", "rows": encoded, **self._transform_descriptor_fields(table)}
+
+    def _embedded_descriptors(self, table: Table, encoded: list[Any]) -> list[dict[str, Any]]:
+        # Docstring: An embedded microbatch as descriptors of at most
+        # _MAX_EMBEDDED_PARTITION_BYTES of row JSON each, in row order.
+
+        if len(json.dumps(encoded)) <= _MAX_EMBEDDED_PARTITION_BYTES:
+            return [self._embedded_descriptor(table, encoded)]
+        chunks: list[list[Any]] = [[]]
+        size = 0
+        for row in encoded:
+            row_size = len(json.dumps(row))
+            if chunks[-1] and size + row_size > _MAX_EMBEDDED_PARTITION_BYTES:
+                chunks.append([])
+                size = 0
+            chunks[-1].append(row)
+            size += row_size
+        return [self._embedded_descriptor(table, chunk) for chunk in chunks]
 
     def _read_partition_rows(
         self, partition: dict, table_options: dict[str, str]
@@ -10310,7 +10418,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         page_index: int,
         rows: list[dict[str, Any]],
         lower_pk: list[Any] | None,
-    ) -> None:
+    ) -> Any:
+        # Docstring: Stage one page; returns the encoded upper_pk its header records.
+
         namespace = os.path.join(
             self._snapshot_stage_namespace(table, pipeline_scope, schema_id),
             "runs",
@@ -10355,7 +10465,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # re-published page is byte-identical). Reads still go through FUSE.
             try:
                 files_api.put(os.path.join(namespace, page_name, "data.json.gz"), compressed)
-                return
+                return body["upper_pk"]
             except WorkspaceHttpError as error:
                 # After a 401 nothing could recover, FUSE writes this page too.
                 if not self._staging_fell_back(error):
@@ -10409,6 +10519,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     candidate,
                     exc_info=True,
                 )
+        return body["upper_pk"]
 
     def _read_staged_page_payload(
         self,
@@ -10811,10 +10922,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         snapshot_lsn: int,
         page_count: int,
         row_count: int,
+        first_upper_pk: str | None = None,
     ) -> dict[str, Any]:
+        # first_upper_pk is page 0's header upper_pk as sorted-key JSON text, so the first
+        # microbatch's end offset can be built without reading the page. Text, because the
+        # jsonb column reorders nested keys and the offset must match the page's byte for byte.
+        recorded = {} if first_upper_pk is None else {"first_upper_pk": first_upper_pk}
         self._publish_immutable_head(
             self._snapshot_manifest_namespace(table, pipeline_scope, schema_id),
             {
+                **recorded,
                 "created_at": time.time(),
                 "page_count": page_count,
                 "row_count": row_count,
@@ -10856,14 +10973,36 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             raise InformixError(
                 f"Invalid staged snapshot page index {page_index} for " f"'{table.exposed_name}'"
             )
-        # Stream the page: the header (all fields except rows) is parsed and
-        # integrity-verified eagerly, and rows are yielded one at a time by the
-        # returned generator, so the whole-page object graph is never materialized.
-        header, rows = self._stream_staged_page(
-            table, stage_scope, schema_id, snapshot_lsn, page_index
-        )
-        if _strict_lsn(header.get("snapshot_lsn"), "snapshot_lsn") != snapshot_lsn:
-            raise InformixError(f"Staged snapshot boundary mismatch for '{table.exposed_name}'")
+
+        def read_page() -> tuple[dict[str, Any], Iterator[dict[str, Any]]]:
+            # Stream the page: the header (all fields except rows) is parsed and
+            # integrity-verified eagerly, and rows are yielded one at a time by the
+            # returned generator, so the whole-page object graph is never materialized.
+            header, rows = self._stream_staged_page(
+                table, stage_scope, schema_id, snapshot_lsn, page_index
+            )
+            if _strict_lsn(header.get("snapshot_lsn"), "snapshot_lsn") != snapshot_lsn:
+                raise InformixError(f"Staged snapshot boundary mismatch for '{table.exposed_name}'")
+            return header, rows
+
+        if self._defer_staged_rows and page_index == 0:
+            # The caller (the partitioned reader's first microbatch, or a drain worker)
+            # needs only the end offset; page 0 is read here only if its rows are iterated
+            # after all. The boundary cursor comes from the manifest, or from the page
+            # header for a manifest an earlier connector version published; a one-page
+            # snapshot needs neither.
+            recorded = manifest.get("first_upper_pk")
+            if page_count == 1:
+                header = {}
+            elif isinstance(recorded, str):
+                header = {"upper_pk": json.loads(recorded)}
+            else:
+                header = read_page()[0]
+            rows = _DeferredStagedPage(
+                lambda: read_page()[1], (stage_scope, schema_id, snapshot_lsn, 0, 1, page_count)
+            )
+        else:
+            header, rows = read_page()
         # The shared reader replays a batch from its start offset. Receiving
         # page_index=N as that start means Spark has advanced beyond every page
         # below N; retries continue from N, so those earlier immutable pages are
@@ -11623,6 +11762,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             row_count = 0
             shaped_bytes = 0
             previous_upper_pk: list[Any] | None = None
+            first_upper_pk: str | None = None
             max_bytes = self._table_int_option(options, "snapshot.max.bytes", 0, minimum=0)
             # Capture the source's UTC time once, at drain start, and bake it into every
             # staged page's `r` rows as their commit time -- so the whole snapshot shares one
@@ -11634,7 +11774,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 page_index: int,
                 page_rows: list[dict[str, Any]],
             ) -> None:
-                nonlocal page_count, row_count, shaped_bytes, previous_upper_pk
+                nonlocal page_count, row_count, shaped_bytes, previous_upper_pk, first_upper_pk
                 if not page_rows:
                     return
                 for index, row in enumerate(page_rows):
@@ -11661,7 +11801,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                         raise InformixError(
                             f"Initial shaped snapshot exceeds " f"snapshot.max.bytes={max_bytes}"
                         )
-                self._publish_snapshot_stage_page(
+                upper_pk = self._publish_snapshot_stage_page(
                     table,
                     pipeline_scope,
                     schema_id,
@@ -11670,6 +11810,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     shaped,
                     previous_upper_pk,
                 )
+                if page_index == 0:
+                    first_upper_pk = json.dumps(upper_pk, allow_nan=False, sort_keys=True)
                 previous_upper_pk = [page_rows[-1][key] for key in table.primary_keys]
                 page_count = max(page_count, page_index + 1)
                 row_count += len(page_rows)
@@ -11759,6 +11901,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 snapshot_lsn,
                 page_count,
                 row_count,
+                first_upper_pk,
             )
             if page_count == 0:
                 return iter(()), _offset(

@@ -354,9 +354,11 @@ connection:
         enabled, the staged-snapshot page-serve phase fans out -- a microbatch spans up
         to `stream.partitioned.snapshot.pages.per.batch` immutable staged pages, each
         read and decoded on a separate Spark executor rather than one page per microbatch
-        on the driver. Every other phase (staging bootstrap, the live CDC/incremental
-        stream, snapshot->CDC transitions, deletes) is a single driver-computed partition
-        whose rows are byte-for-byte the current output, just wrapped. Applies only to
+        on the driver; the first microbatch, which stages the snapshot, serves its
+        first page the same way. Every other phase (the live CDC/incremental stream,
+        snapshot->CDC transitions, deletes) is computed on the driver, its rows
+        byte-for-byte the current output, just wrapped, in partitions of at most 16 MiB
+        of row JSON each. Applies only to
         tables with a bounded staged-snapshot->stream lifecycle (keyed CDC tables and
         append-only tables); snapshot-only tables always use the simple reader. Both
         readers persist the same offset, so flipping this and restarting resumes an
