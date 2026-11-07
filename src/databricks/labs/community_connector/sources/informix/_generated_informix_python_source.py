@@ -7642,7 +7642,12 @@ def register_lakeflow_source(spark):
             # release_connection publishes a backlog hint only while a slot is held.
             self._connection_slot = None
             try:
-                release_slot(self._lakebase_connection(), slot)
+                try:
+                    release_slot(self._lakebase_connection(), slot)
+                except connection_lost_error_types():
+                    # Reaped while the read ran (the lease heartbeat has its own connection):
+                    # psycopg now reports it closed, so this reopens it.
+                    release_slot(self._lakebase_connection(), slot)
             except Exception:
                 # Releasing is best effort: the lease expires on its own, so a failed
                 # release costs one slot for one lease period rather than a stranded

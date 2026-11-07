@@ -14969,6 +14969,31 @@ class FairSlotQueueWiringTests(unittest.TestCase):
 
                 self.assertEqual(bridge._acquire_connection_slot.call_count, 1 + retried)
 
+    def test_a_slot_is_released_over_a_reopened_state_connection(self):
+        # The lease heartbeat has its own connection, so the bridge's sits idle through a
+        # long read and can be reaped by the time the slot is released. The release
+        # reopens it rather than leaving the slot held until its lease expires.
+        import psycopg2
+
+        bridge = self._bridge()
+        bridge._lakebase_slot = slot = object()
+        bridge._lakebase_conn = reaped = mock.Mock(closed=0)
+        released = []
+
+        def release(connection, released_slot):
+            if connection is reaped:
+                reaped.closed = 2  # what psycopg reports once a query on it fails
+                raise psycopg2.OperationalError("SSL SYSCALL error: EOF detected")
+            released.append(released_slot)
+
+        with (
+            mock.patch.object(informix_module, "release_slot", side_effect=release),
+            self.assertNoLogs(informix_module.__name__, level="WARNING"),
+        ):
+            bridge._release_connection_slot()
+
+        self.assertEqual(released, [slot])
+
     def test_reconnect_after_reset_keeps_the_held_slot(self):
         # reset_transport keeps the slot for an in-place retry. A reconnect that claimed
         # another would leave the first one's heartbeat renewing it until the process
