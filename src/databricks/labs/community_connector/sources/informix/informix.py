@@ -356,6 +356,25 @@ _SHARED_CDC_IDLE_POLL_SECONDS = 1.0
 # Tables per batched catalog query (table_versions, get_tables), well inside the SQLI
 # limit of 1024 bind values a statement.
 _CATALOG_BATCH = 500
+# Pieces of the catalog queries, each spelled once and assembled where a query runs: a
+# table's columns, its primary key's index, and its UNIQUE indexes, each with an optional
+# select-list tail in place of the braces, and an index's 16 key parts.
+_INDEX_PARTS = ",".join(f"i.part{number}" for number in range(1, 17))
+_CATALOG_COLUMNS_SQL = (
+    "SELECT c.colname, c.coltype, c.collength, c.colno, t.tabid, c.extended_id, "
+    "x.name AS extended_name, x.owner AS extended_owner{} FROM systables t "
+    "JOIN syscolumns c ON t.tabid = c.tabid "
+    "LEFT JOIN sysxtdtypes x ON x.extended_id = c.extended_id WHERE t.tabtype = 'T'"
+)
+_PRIMARY_KEY_SQL = (
+    "SELECT " + _INDEX_PARTS + "{} FROM systables t JOIN sysconstraints x ON t.tabid=x.tabid "
+    "JOIN sysindexes i ON x.idxname=i.idxname AND x.tabid=i.tabid "
+    "WHERE t.tabtype='T' AND x.constrtype='P'"
+)
+_UNIQUE_INDEX_SQL = (
+    "SELECT i.idxname," + _INDEX_PARTS + "{} FROM systables t JOIN sysindexes i "
+    "ON t.tabid=i.tabid WHERE t.tabtype='T' AND i.idxtype='U'"
+)
 # Snapshot-drain fairness. An ``initial``-mode snapshot drains the whole table through
 # one REPEATABLE READ transaction, holding one connection slot for the entire scan; with
 # many tables this can consume every slot and starve the streaming/CDC readers waiting
@@ -1543,7 +1562,18 @@ class PurePythonInformixBridge:
             # another would strand the first, renewed until the process exits.
             if not bypass_capacity and getattr(self, "_lakebase_slot", None) is None:
                 budget = self.options.get(_CONNECTION_ATTEMPT_BUDGET_OPTION)
-                self._acquire_connection_slot(float(budget) if budget else None)
+                budget = float(budget) if budget else None
+                try:
+                    self._acquire_connection_slot(budget)
+                except connection_lost_error_types():
+                    # Lakebase reaped the state connection while this bridge sat idle
+                    # between reads, which psycopg reports only once a query fails:
+                    # reopen it and claim again. A live connection's error is real.
+                    connection = getattr(self, "_lakebase_conn", None)
+                    if connection is not None and not connection.closed:
+                        raise
+                    self._lakebase_conn = None
+                    self._acquire_connection_slot(budget)
             try:
                 self._connect_transport()
                 self._connected = True
@@ -1675,7 +1705,10 @@ class PurePythonInformixBridge:
         except Exception:
             with _lakebase_waiter_lock():
                 # Drop a connection that may be broken so the next read reopens.
-                _LAKEBASE_WAITER_CONNECTION.pop(namespace, None)
+                broken = _LAKEBASE_WAITER_CONNECTION.pop(namespace, None)
+            if broken is not None:
+                with contextlib.suppress(Exception):
+                    broken.close()
             logging.getLogger(__name__).debug(
                 "Informix Lakebase backlog hint read failed", exc_info=True
             )
@@ -2183,23 +2216,12 @@ class PurePythonInformixBridge:
         # views, temporary and non-logged tables and unlogged databases, so nothing else is
         # left out by name or owner; tabtype 'T' already leaves views and synonyms out.
         columns = self.transport.execute(
-            "SELECT c.colname, c.coltype, c.collength, c.colno, t.tabid, "
-            "c.extended_id, x.name AS extended_name, x.owner AS extended_owner, "
-            "t.owner, t.tabname "
-            "FROM systables t JOIN syscolumns c ON t.tabid = c.tabid "
-            "LEFT JOIN sysxtdtypes x ON x.extended_id = c.extended_id "
-            "WHERE t.tabtype = 'T' "
-            "ORDER BY t.owner, t.tabname, c.colno",
+            _CATALOG_COLUMNS_SQL.format(", t.owner, t.tabname")
+            + " ORDER BY t.owner, t.tabname, c.colno",
             max_result_bytes=maximum,
         )
         keys = self.transport.execute(
-            "SELECT i.part1,i.part2,i.part3,i.part4,i.part5,i.part6,i.part7,i.part8,"
-            "i.part9,i.part10,i.part11,i.part12,i.part13,i.part14,i.part15,i.part16,"
-            "t.owner,t.tabname "
-            "FROM systables t JOIN sysconstraints x ON t.tabid=x.tabid "
-            "JOIN sysindexes i ON x.idxname=i.idxname AND x.tabid=i.tabid "
-            "WHERE t.tabtype='T' AND x.constrtype='P' "
-            "ORDER BY t.owner,t.tabname",
+            _PRIMARY_KEY_SQL.format(",t.owner,t.tabname") + " ORDER BY t.owner,t.tabname",
             max_result_bytes=maximum,
         )
         columns_by_table: dict[tuple[str, str], list[Any]] = {}
@@ -2220,12 +2242,7 @@ class PurePythonInformixBridge:
             table not in keys_by_table for table in columns_by_table
         ):
             for row in self.transport.execute(
-                "SELECT i.idxname,i.part1,i.part2,i.part3,i.part4,i.part5,i.part6,i.part7,"
-                "i.part8,i.part9,i.part10,i.part11,i.part12,i.part13,i.part14,i.part15,"
-                "i.part16,t.owner,t.tabname "
-                "FROM systables t JOIN sysindexes i ON t.tabid=i.tabid "
-                "WHERE t.tabtype='T' AND i.idxtype='U' "
-                "ORDER BY t.owner,t.tabname",
+                _UNIQUE_INDEX_SQL.format(",t.owner,t.tabname") + " ORDER BY t.owner,t.tabname",
                 max_result_bytes=maximum,
             ):
                 table = (str(_field(row, "owner", 17)), str(_field(row, "tabname", 18)))
@@ -2344,23 +2361,13 @@ class PurePythonInformixBridge:
         for start in range(0, len(names), _CATALOG_BATCH):
             batch = names[start : start + _CATALOG_BATCH]
             rows_by_table(
-                "SELECT c.colname, c.coltype, c.collength, c.colno, t.tabid, "
-                "c.extended_id, x.name AS extended_name, x.owner AS extended_owner, "
-                "t.owner, t.tabname "
-                "FROM systables t JOIN syscolumns c ON t.tabid = c.tabid "
-                "LEFT JOIN sysxtdtypes x ON x.extended_id = c.extended_id "
-                "WHERE t.tabtype = 'T'",
+                _CATALOG_COLUMNS_SQL.format(", t.owner, t.tabname"),
                 batch,
                 8,
                 columns,
             )
             rows_by_table(
-                "SELECT i.part1,i.part2,i.part3,i.part4,i.part5,i.part6,i.part7,i.part8,"
-                "i.part9,i.part10,i.part11,i.part12,i.part13,i.part14,i.part15,i.part16,"
-                "t.owner,t.tabname "
-                "FROM systables t JOIN sysconstraints x ON t.tabid=x.tabid "
-                "JOIN sysindexes i ON x.idxname=i.idxname AND x.tabid=i.tabid "
-                "WHERE t.tabtype='T' AND x.constrtype='P'",
+                _PRIMARY_KEY_SQL.format(",t.owner,t.tabname"),
                 batch,
                 16,
                 keys,
@@ -2369,11 +2376,7 @@ class PurePythonInformixBridge:
         if keyless and _option_bool(self.options, _PROMOTE_UNIQUE_INDEX_OPTION, True):
             for start in range(0, len(keyless), _CATALOG_BATCH):
                 rows_by_table(
-                    "SELECT i.idxname,i.part1,i.part2,i.part3,i.part4,i.part5,i.part6,i.part7,"
-                    "i.part8,i.part9,i.part10,i.part11,i.part12,i.part13,i.part14,i.part15,"
-                    "i.part16,t.owner,t.tabname "
-                    "FROM systables t JOIN sysindexes i ON t.tabid=i.tabid "
-                    "WHERE t.tabtype='T' AND i.idxtype='U'",
+                    _UNIQUE_INDEX_SQL.format(",t.owner,t.tabname"),
                     keyless[start : start + _CATALOG_BATCH],
                     17,
                     unique_indexes,
@@ -2449,20 +2452,12 @@ class PurePythonInformixBridge:
 
     def _describe_table(self, owner: str, name: str) -> dict[str, Any]:
         columns = self.transport.execute(
-            "SELECT c.colname, c.coltype, c.collength, c.colno, t.tabid, "
-            "c.extended_id, x.name AS extended_name, x.owner AS extended_owner "
-            "FROM systables t JOIN syscolumns c ON t.tabid = c.tabid "
-            "LEFT JOIN sysxtdtypes x ON x.extended_id = c.extended_id "
-            "WHERE t.tabtype = 'T' AND t.owner = ? AND t.tabname = ? ORDER BY c.colno",
+            _CATALOG_COLUMNS_SQL.format("") + " AND t.owner = ? AND t.tabname = ? ORDER BY c.colno",
             (owner, name),
             max_result_bytes=self._metadata_max_bytes(),
         )
         keys = self.transport.execute(
-            "SELECT i.part1,i.part2,i.part3,i.part4,i.part5,i.part6,i.part7,i.part8,"
-            "i.part9,i.part10,i.part11,i.part12,i.part13,i.part14,i.part15,i.part16 "
-            "FROM systables t JOIN sysconstraints x ON t.tabid=x.tabid "
-            "JOIN sysindexes i ON x.idxname=i.idxname AND x.tabid=i.tabid "
-            "WHERE t.tabtype='T' AND x.constrtype='P' AND t.owner=? AND t.tabname=?",
+            _PRIMARY_KEY_SQL.format("") + " AND t.owner=? AND t.tabname=?",
             (owner, name),
             max_result_bytes=self._metadata_max_bytes(),
         )
@@ -2473,10 +2468,7 @@ class PurePythonInformixBridge:
         # can break ties on it deterministically.
         if not keys and _option_bool(self.options, _PROMOTE_UNIQUE_INDEX_OPTION, True):
             unique_indexes = self.transport.execute(
-                "SELECT i.idxname,i.part1,i.part2,i.part3,i.part4,i.part5,i.part6,i.part7,"
-                "i.part8,i.part9,i.part10,i.part11,i.part12,i.part13,i.part14,i.part15,i.part16 "
-                "FROM systables t JOIN sysindexes i ON t.tabid=i.tabid "
-                "WHERE t.tabtype='T' AND i.idxtype='U' AND t.owner=? AND t.tabname=?",
+                _UNIQUE_INDEX_SQL.format("") + " AND t.owner=? AND t.tabname=?",
                 (owner, name),
                 max_result_bytes=self._metadata_max_bytes(),
             )
@@ -2632,9 +2624,7 @@ class PurePythonInformixBridge:
             int(_field(row, "colno", 1)): str(_field(row, "colname", 0)) for row in column_rows
         }
         index_rows = self.transport.execute(
-            "SELECT i.part1,i.part2,i.part3,i.part4,i.part5,i.part6,i.part7,i.part8,"
-            "i.part9,i.part10,i.part11,i.part12,i.part13,i.part14,i.part15,i.part16 "
-            "FROM systables t JOIN sysindexes i ON t.tabid = i.tabid "
+            f"SELECT {_INDEX_PARTS} FROM systables t JOIN sysindexes i ON t.tabid = i.tabid "
             "WHERE t.tabtype = 'T' AND t.owner = ? AND t.tabname = ?",
             (owner, name),
             max_result_bytes=max_bytes,
@@ -4075,6 +4065,14 @@ def _snapshot_filter(options: dict[str, str]) -> str | None:
         raise ValueError(
             "Option 'snapshot.filter' must be one SQL predicate without comments or semicolons"
         )
+    # Outside its quoted literals, a predicate must not open an Informix {...} comment,
+    # leave a quote open, or hold a ? the connector would bind its own keyset values to.
+    bare = re.sub(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"", "", predicate)
+    if any(character in bare for character in "{}?'\""):
+        raise ValueError(
+            "Option 'snapshot.filter' cannot hold a {...} comment, a ? placeholder, or an "
+            "unclosed quote outside its quoted literals"
+        )
     return predicate
 
 
@@ -4747,7 +4745,7 @@ def _hash_number_text(value: int | float | Decimal) -> str:
     # ("1.50").
 
     if isinstance(value, float):
-        if value != value or value in (float("inf"), float("-inf")):
+        if not math.isfinite(value):
             return repr(value)
         value = Decimal(repr(value))
     elif isinstance(value, int):
@@ -4829,14 +4827,21 @@ def _apply_function(name: str, value: Any, literals: list, context: dict) -> Any
             # Informix truncates both operands to integers; the sign follows the dividend.
             whole = number.to_integral_value(rounding=ROUND_DOWN)
             result = whole % Decimal(literals[0]).to_integral_value(rounding=ROUND_DOWN)
-            return result if isinstance(value, Decimal) else int(result)
         else:
             digits = int(literals[0]) if literals else 0
             result = number.quantize(
                 Decimal(1).scaleb(-digits),
                 rounding=ROUND_HALF_UP if name == "ROUND" else ROUND_DOWN,
             )
-    return int(result) if isinstance(value, int) and not isinstance(value, bool) else result
+            # Negative digits leave a positive exponent (1.2E+4): write it out in full.
+            result = result.quantize(Decimal(1)) if digits < 0 else result
+    # Back in the type the column's values arrive as, which the schema declares: a
+    # variable-scale DECIMAL can arrive as a float or a fixed-point string.
+    if isinstance(value, str):
+        return format(result, "f")
+    if isinstance(value, float):
+        return float(result)
+    return result if isinstance(value, Decimal) else int(result)
 
 
 _STRING_FUNCTION_NAMES = frozenset(
@@ -6114,6 +6119,16 @@ class _SharedCdcShard:
     def subscribe(self, identity, table, capture, checkpoint_commit_lsn, floor_lsn):
         with self.condition:
             existing = self.subscribers.get(identity)
+            if existing is not None and existing["capture"] != capture:
+                # The table's columns changed (its consumer moved to a new schema): what
+                # was buffered under the old capture lacks the new columns, so drop it and
+                # treat the table as new, re-read from its floor under the new capture.
+                self.buffers.pop(identity, None)
+                self.cursors.pop(identity, None)
+                existing = None
+                # And read the table's catalog entry at the daemon's next cycle, not the
+                # next scheduled check.
+                self.catalog.force_check()
             entry = {
                 "table": table,
                 "capture": capture,
@@ -6210,12 +6225,14 @@ class _SharedCdcShard:
         for store in (self.buffers, self.cursors, self.schema, self.open_begins):
             store.pop(identity, None)
 
-    def ingest(self, raw, schema_map, min_lsn, current_lsn, read_start):
+    def ingest(self, raw, schema_map, min_lsn, current_lsn, read_start, captures=None):
         # Docstring: Assemble one read's records into transactions, fan them out per table, and
         # publish the coherent snapshot. Returns whether the shard is caught up.
         #
         # ``schema_map`` names the tables the read captured and ``read_start`` the LSN
         # it was activated at; together they record which subscribers it covered.
+        # ``captures`` maps each to the capture the read used: a subscriber that has
+        # re-subscribed with another since gets nothing from this read.
 
         buffer = TransactionBuffer()
         committed = []
@@ -6230,9 +6247,14 @@ class _SharedCdcShard:
                 committed.append(done)
         committed.sort(key=lambda tx: (tx.commit_lsn, tx.tx_id))
         with self.condition:
+            stale = {
+                identity
+                for identity, capture in (captures or {}).items()
+                if (self.subscribers.get(identity) or {}).get("capture") != capture
+            }
             for tx in committed:
                 for identity, sub in self.subscribers.items():
-                    if tx.commit_lsn <= self.cursors.get(identity, 0):
+                    if identity in stale or tx.commit_lsn <= self.cursors.get(identity, 0):
                         continue
                     if any(_record_matches(record, sub["table"]) for record in tx.records):
                         self.buffers.setdefault(identity, deque()).append(tx)
@@ -6241,7 +6263,7 @@ class _SharedCdcShard:
             # below its floor: from then on its buffer holds everything above the floor.
             for identity in schema_map:
                 entry = self.subscribers.get(identity)
-                if entry is None:
+                if entry is None or identity in stale:
                     continue
                 previous = entry.get("covered_from")
                 entry["covered_from"] = (
@@ -6836,7 +6858,8 @@ class _ShardCatalog:
     # the next read. A bridge without table_versions re-reads every table at each check,
     # and one without get_tables reads them one at a time.
     #
-    # Used by the shard's daemon thread alone, so it needs no lock.
+    # Used by the shard's daemon thread alone, so it needs no lock; a consumer only ever
+    # calls force_check, a single assignment.
 
     def __init__(self) -> None:
         # identity -> (systables.version, or None when unknown, and the catalog table)
@@ -7005,17 +7028,17 @@ def _run_shared_cdc_shard(shard: _SharedCdcShard) -> None:
                     with shard.condition:
                         shard.condition.wait(timeout=_SHARED_CDC_IDLE_POLL_SECONDS)
                     continue
-                captures = [subscribers[identity]["capture"] for identity in schema_map]
+                captures = {identity: subscribers[identity]["capture"] for identity in schema_map}
                 min_lsn = reader._bridge.minimum_lsn()
                 current_lsn = reader._bridge.current_lsn()
                 raw = reader._read_changes_with_reconnect(
-                    captures,
+                    list(captures.values()),
                     restart,
                     shard.timeout_seconds,
                     shard.max_records,
                     table=subscribers[next(iter(schema_map))]["table"],
                 )
-                caught_up = shard.ingest(raw, schema_map, min_lsn, current_lsn, restart)
+                caught_up = shard.ingest(raw, schema_map, min_lsn, current_lsn, restart, captures)
             except Exception:  # noqa: BLE001 - surfaced by degrading to direct reads
                 logger.warning(
                     "Shared CDC shard read failed; consumers fall back to direct reads "
@@ -7659,6 +7682,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         if executor is not None:
             self._snapshot_cleanup_executor_instance = None
             executor.shutdown(wait=False)
+        self._reset_lakebase_connection()
         with self._metadata_session_lock:
             bridge = self._bridge_instance
             if bridge is None:
@@ -7675,8 +7699,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             finally:
                 # Never retain a closed or partially closed bridge.  The bridge's
                 # release path also stops its lease heartbeat and frees its
-                # connector-managed connection-capacity slot.
+                # connector-managed connection-capacity slot; its own Lakebase
+                # connection, which serves slot operations, closes with it.
                 self._bridge_instance = None
+                self._reset_lakebase_connection(bridge)
 
     def __enter__(self) -> "InformixLakeflowConnect":
         return self
@@ -7710,6 +7736,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # neither belongs on a worker.
         state["_unl_gzip_reader"] = None
         state["_unl_gzip_window_memo"] = None
+        # close() dropped the Lakebase connection; the provisioned state and the Files
+        # API client hold an API session and a lock, so a worker resolves its own.
+        state["_lakebase_state"] = None
+        state["_staging_files_api"] = None
+        state["_staging_transport_resolved"] = False
+        state["_partition_page_batches"] = {}
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
@@ -7843,16 +7875,18 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         coordinator = _STATE_VALIDATION_COORDINATOR
         cache_key = (*key, exposed)
         with coordinator.condition:
+            # Held across the catalog lookup on purpose: concurrent registrations of one
+            # table share a single lookup instead of each querying Informix.
             table = coordinator.table_caches.get(cache_key)
             if table is None:
                 table = self._resolve_registration_table(exposed)
                 coordinator.table_caches[cache_key] = table
                 while len(coordinator.table_caches) > _MAX_REGISTRATION_TABLE_CACHES:
                     del coordinator.table_caches[next(iter(coordinator.table_caches))]
-            if self._tables is None:
-                self._tables = {}
-            self._tables[exposed] = table
-            return self._apply_table_options(table, table_options)
+        if self._tables is None:
+            self._tables = {}
+        self._tables[exposed] = table
+        return self._apply_table_options(table, table_options)
 
     def _resolve_registration_table(self, exposed: str) -> Table:
         # Docstring: Resolve a single configured table by exposed ``owner.name`` via a
@@ -7888,6 +7922,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             self.options.get("database", "").strip().casefold(),
             self.options.get("table.include.list", self.options.get("tables", "")),
             self.options.get("table.exclude.list", ""),
+            # Discovery keys a table by its unique index only when this is on.
+            self.options.get(_PROMOTE_UNIQUE_INDEX_OPTION, ""),
         )
 
     def read_table(
@@ -8005,6 +8041,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                         elif self._offset_is_incremental_reader(effective_start):
                             result = self._read_incremental(table, effective_start, table_options)
                         else:
+                            # An initial snapshot staged pages, as a keyed one does below.
+                            self._cleanup_completed_snapshot_stage(table, effective_start)
                             result = self._read_stream(
                                 table, effective_start, table_options, deletes=False
                             )
@@ -8569,7 +8607,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 "hash_key": key.encode("utf-8") if key else None,
                 "encoding": self._source_encoding(table_options),
                 "columns": columns,
-                "options": {**self.options, **table_options},
+                # The table options alone, as the schema reads them (see _number_for_column).
+                "options": table_options,
             }
             rows = _transformed_rows(rows, transforms, context)
         return _renamed_rows(rows, _column_renames(table_options))
@@ -9874,8 +9913,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 f"Releasing the Informix worker connection also failed: {cleanup_error}",
             )
 
-    def _reset_lakebase_connection(self) -> None:
+    def _reset_lakebase_connection(self, owner: Any = None) -> None:
         # Docstring: Drop the cached Lakebase state connection so the next use reopens fresh.
+        #
+        # ``owner`` is whose connection to drop: this connector's by default, or a
+        # discarded bridge's.
         #
         # A psycopg connection left open across a long, idle wait -- worse, left
         # idle inside the implicit read transaction that a bare SELECT starts --
@@ -9886,8 +9928,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # state, so it closes the connection here and lets the post-wait manifest
         # read reopen a guaranteed-live one.
 
-        connection = getattr(self, "_lakebase_conn", None)
-        self._lakebase_conn = None
+        owner = self if owner is None else owner
+        connection = getattr(owner, "_lakebase_conn", None)
+        owner._lakebase_conn = None
         if connection is not None:
             try:
                 connection.close()
@@ -12447,7 +12490,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             )
         if driver_window:
             limit = self._table_int_option(table_options, _UNL_GZIP_RECORDS_OPTION, 0, minimum=0)
-            window_rows, exhausted = self._read_unl_gzip_window(
+            window_rows, exhausted, read = self._read_unl_gzip_window(
                 table,
                 table_options,
                 snapshot_lsn,
@@ -12458,7 +12501,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             if exhausted:
                 end_split, end_record = start_split + 1, 0
             else:
-                end_split, end_record = start_split, start_record + len(window_rows)
+                end_split, end_record = start_split, start_record + read
         else:
             end_split = self._unl_executor_window_end(table_options, splits, start_split)
             end_record = 0
@@ -12567,12 +12610,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         split: tuple[str, int, int, bool],
         start_record: int,
         limit: int | None,
-    ) -> tuple[list[dict[str, Any]], bool]:
+    ) -> tuple[list[dict[str, Any]], bool, int]:
         # Docstring: Read up to ``limit`` records (None: the rest) of a gzip split from
         # ``start_record``.
         #
-        # Returns the shaped rows and whether the file is now exhausted -- a short window, or
-        # an empty one when the previous window ended exactly at the last record. The open
+        # Returns the shaped rows, whether the file is now exhausted -- a short window, or
+        # an empty one when the previous window ended exactly at the last record -- and how
+        # many records the window read. That count, not the rows, positions the next window:
+        # a row_filter can drop records, so a window may hold fewer rows than it read. The open
         # record iterator is kept between microbatches, so consecutive windows decompress the
         # file once; a window that does not continue it (a restart, or a different file)
         # reopens the file and skips ``start_record`` records. A repeated request for the
@@ -12605,7 +12650,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         rows = self._shape_unl_records(table, table_options, snapshot_lsn, raw_records)
         reader[1] = start_record + len(raw_records)
         self._unl_gzip_reader = None if exhausted else reader
-        result = (rows, exhausted)
+        result = (rows, exhausted, len(raw_records))
         self._unl_gzip_window_memo = (memo_key, result)
         return result
 
@@ -12628,13 +12673,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         limit = None if stop_record is None else stop_record - start_record
         if limit is not None and limit <= 0:
             return []
-        rows, _exhausted = self._read_unl_gzip_window(
+        rows, _exhausted, read = self._read_unl_gzip_window(
             table, table_options, snapshot_lsn, split, start_record, limit
         )
-        if limit is not None and len(rows) != limit:
+        if limit is not None and read != limit:
             raise InformixError(
                 f"gzip snapshot file {split[0]} for '{table.exposed_name}' ended after "
-                f"{start_record + len(rows)} records, short of the {stop_record} the logged "
+                f"{start_record + read} records, short of the {stop_record} the logged "
                 "microbatch covers; the extract changed under a running snapshot -- run a "
                 "full refresh"
             )
@@ -17403,7 +17448,8 @@ def _validated_offset(offset: dict[str, Any]) -> dict[str, Any]:
         if "snapshot_lsn" not in result or _strict_lsn(result["snapshot_lsn"], "snapshot_lsn") < 0:
             raise ValueError("Informix snapshot offset has an invalid snapshot_lsn")
         if any(
-            values[key] != _strict_lsn(result["snapshot_lsn"], "snapshot_lsn") for key in values
+            value != _strict_lsn(result["snapshot_lsn"], "snapshot_lsn")
+            for value in values.values()
         ):
             raise ValueError(
                 "Informix snapshot offset requires snapshot_lsn, begin_lsn, "

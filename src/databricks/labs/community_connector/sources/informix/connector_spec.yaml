@@ -585,7 +585,8 @@ connection:
         `decimal(p,s)` (`DecimalType(p,s)`). Default `decimal(38,18)`. Values
         whose integer part exceeds the chosen `decimal(p,s)` or the 64-bit range
         of `integer` fail with a clear error. Explicit fixed-scale `DECIMAL(p,s)`
-        columns are unaffected and remain `DecimalType(p,s)`.
+        columns are unaffected and remain `DecimalType(p,s)`. Set it per table: a
+        connection-level value is not used.
 
     - name: decimal.variable.column.type
       type: string
@@ -709,7 +710,8 @@ connection:
         both the snapshot and the change stream. A keyed table de-duplicates these
         by primary key; a KEYLESS table cannot, so it may emit DUPLICATE rows. Set
         `repeatable_read` to restore the exactly-once, table-locking behavior.
-        Tokens are case- and whitespace-insensitive; unknown values are rejected.
+        Tokens are case- and whitespace-insensitive; unknown values are rejected. Set
+        it per table: a connection-level value is not used.
 
     - name: snapshot.scan
       type: string
@@ -877,6 +879,7 @@ connection:
     - name: lakebase.workspace.token
       type: string
       required: false
+      secret: true
       description: >
         Override the bearer token used for Lakebase control-plane calls. Normally
         resolved automatically alongside `lakebase.workspace.host`; set explicitly
@@ -924,6 +927,7 @@ connection:
     - name: lakebase.password
       type: string
       required: true
+      secret: true
       description: >
         Password for `informix_state_user`, the long-lived Postgres role that all
         state access authenticates as. Required, because it is the credential the
@@ -954,6 +958,7 @@ connection:
     - name: lakebase.admin_password
       type: string
       required: false
+      secret: true
       description: >
         Password for `lakebase.admin_user`. Optional: when unset, the admin role
         authenticates with a short-lived OAuth credential minted for the

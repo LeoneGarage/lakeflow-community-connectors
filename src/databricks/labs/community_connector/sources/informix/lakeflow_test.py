@@ -996,6 +996,35 @@ class LakeflowContractTests(unittest.TestCase):
         sleep.assert_called_once_with(0.25)
         self.assertEqual(next_delay, 2.0)
 
+    def test_a_used_connector_pickles_and_close_drops_its_lakebase_connections(self):
+        # Spark may serialize a reader after it touched Lakebase: the live connection and
+        # the provisioned state hold sockets and locks, so neither travels. close(), run
+        # for every discarded private reader, closes the connector's connection and its
+        # bridge's.
+        connector = self.connector()
+        connector.read_table("app.orders", {}, {})
+        own = connector._lakebase_conn
+        bridge = connector._bridge
+        bridge._lakebase_conn = bridge_connection = mock.Mock(closed=False)
+
+        restored = pickle.loads(pickle.dumps(connector))
+
+        self.assertIsNotNone(own)
+        self.assertIsNone(restored._lakebase_state)
+        self.assertIsNone(connector._lakebase_conn)
+        self.assertTrue(own.closed)
+        bridge_connection.close.assert_called_once_with()
+
+    def test_registration_cache_key_tracks_unique_index_promotion(self):
+        # Discovery keys a table by a unique index only while this option is on, so two
+        # readers that differ in it must not share a cached registration table.
+        keys = set()
+        for extra in ({}, {"primary.key.from.unique.index": "false"}):
+            connector = self.connector(**extra)
+            connector.options.update(hostname="informix.example", server="ol_informix")
+            keys.add(connector._registration_table_cache_key())
+        self.assertEqual(len(keys), 2)
+
     def test_shared_state_validation_module_state_is_pickle_safe(self):
         coordinator = informix_module._STATE_VALIDATION_COORDINATOR
         restored = pickle.loads(pickle.dumps(coordinator))
@@ -3067,6 +3096,22 @@ class LakeflowContractTests(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "one SQL predicate"),
             ):
                 informix_module._snapshot_filter({"snapshot.filter": predicate})
+
+    def test_snapshot_filter_rejects_brace_comments_placeholders_and_open_quotes(self):
+        # Outside its quoted literals, an Informix {...} comment could swallow the keyset
+        # bound after the predicate, and a ? or an open quote would shift the connector's
+        # own bind values. Inside a literal, all three are just text.
+        for predicate in ("status = 'A' { all }", "id > ?", "name = 'O''Brien"):
+            with (
+                self.subTest(predicate=predicate),
+                self.assertRaisesRegex(ValueError, "outside its quoted literals"),
+            ):
+                informix_module._snapshot_filter({"snapshot.filter": predicate})
+        for predicate in ("note = '{draft}'", "code = 'a?b'", "name = 'O''Brien'"):
+            with self.subTest(predicate=predicate):
+                self.assertEqual(
+                    informix_module._snapshot_filter({"snapshot.filter": predicate}), predicate
+                )
 
     def test_snapshot_bridge_supports_positional_pagination(self):
         class SnapshotTransport:
@@ -8300,6 +8345,24 @@ class LakeflowContractTests(unittest.TestCase):
             "snapshot.max.rows must default to unlimited",
         )
 
+    def test_a_completed_append_snapshot_stage_is_removed_once_it_streams(self):
+        # An append-only table's initial snapshot stages its pages like a keyed one, so the
+        # first stream read after it removes the stage instead of leaving it to the sweep.
+        connector, bridge = self._keyless_connector(registration_scope="append-stage-cleanup")
+        options = dict(self.APPEND, **{"snapshot.mode": "initial"})
+        rows, stream_end = connector.read_table("app.orders", {}, options)
+        list(rows)
+        stage = connector._snapshot_stage_namespace(
+            Table.parse(bridge.tables[0], "demo"),
+            connector._pipeline_scope(stream_end),
+            str(stream_end["schema_id"]),
+        )
+        self.assertTrue(os.path.isdir(stage))
+
+        connector.read_table("app.orders", stream_end, options)
+
+        self.assertFalse(os.path.exists(stage))
+
     def test_keyless_initial_snapshot_uses_its_own_page_size_default(self):
         # A keyless initial drain has no seek cursor and stages whole pages, so it
         # defaults to a larger page than keyed keyset paging.
@@ -12770,6 +12833,47 @@ class SharedCdcShardTests(unittest.TestCase):
         shard.ingest([{"op": "TIMEOUT", "lsn": 701}], {self.id_a: self.table_a}, 1, 701, 500)
         self.assertIsNotNone(shard.snapshot(self.id_a, 500))
 
+    def _widened_capture(self):
+        # The capture after the table gained a column.
+        capture = _capture_descriptor(self.table_a)
+        return {**capture, "columns": [*capture["columns"], "added"]}
+
+    def test_a_new_capture_drops_what_the_old_one_buffered(self):
+        # Transactions buffered under the old capture lack the new column. A consumer that
+        # re-subscribes with the new capture must not be served them: the table is
+        # re-read from its floor under the new capture before it gets a view again.
+        shard = _SharedCdcShard()
+        shard.subscribe(self.id_a, self.table_a, _capture_descriptor(self.table_a), 0, 0)
+        shard.ingest(self._two_table_stream(), {self.id_a: self.table_a}, 1, 106, 0)
+        self.assertEqual([tx.tx_id for tx in shard.snapshot(self.id_a, 0).committed], [1])
+        shard.catalog.next_check = 60.0
+
+        widened = self._widened_capture()
+        shard.subscribe(self.id_a, self.table_a, widened, 0, 0)
+
+        self.assertIsNone(shard.snapshot(self.id_a, 0))
+        self.assertEqual((list(shard.buffers[self.id_a]), shard.shared_restart), ([], 0))
+        self.assertEqual(shard.catalog.next_check, 0.0)  # its catalog entry is read next
+        shard.ingest(
+            self._two_table_stream(), {self.id_a: self.table_a}, 1, 106, 0, {self.id_a: widened}
+        )
+        self.assertEqual([tx.tx_id for tx in shard.snapshot(self.id_a, 0).committed], [1])
+
+    def test_a_read_under_a_replaced_capture_buffers_nothing(self):
+        # A read that started under the old capture and finishes after the consumer
+        # re-subscribed with a new one neither buffers for it nor covers it.
+        shard = _SharedCdcShard()
+        old = _capture_descriptor(self.table_a)
+        shard.subscribe(self.id_a, self.table_a, old, 0, 0)
+        shard.subscribe(self.id_a, self.table_a, self._widened_capture(), 0, 0)
+
+        shard.ingest(
+            self._two_table_stream(), {self.id_a: self.table_a}, 1, 106, 0, {self.id_a: old}
+        )
+
+        self.assertEqual(list(shard.buffers[self.id_a]), [])
+        self.assertIsNone(shard.snapshot(self.id_a, 0))
+
     def test_a_ttl_evicted_subscriber_must_be_covered_again(self):
         shard = _SharedCdcShard()
         shard.subscriber_ttl = 0.0
@@ -14842,6 +14946,29 @@ class FairSlotQueueWiringTests(unittest.TestCase):
         dequeue.assert_called_once()
         self.assertEqual(dequeue.call_args.args[2], tickets[1])
 
+    def test_a_reaped_state_connection_is_reopened_for_the_next_claim(self):
+        # Lakebase reaps an idle connection, and psycopg says so only when a query fails.
+        # A bridge idle between reads reopens it and claims again rather than failing the
+        # read; an error on a connection that is still open is real and propagates.
+        import psycopg2
+
+        reaped = psycopg2.OperationalError("SSL SYSCALL error: EOF detected")
+        for closed, retried in ((2, True), (0, False)):
+            with self.subTest(closed=closed):
+                bridge = self._bridge()
+                bridge.transport = mock.Mock()
+                bridge._lakebase_conn = mock.Mock(closed=closed)
+                bridge._acquire_connection_slot = mock.Mock(side_effect=[reaped, None])
+
+                if retried:
+                    bridge._ensure_connected()
+                    self.assertIsNone(bridge._lakebase_conn)
+                else:
+                    with self.assertRaises(psycopg2.OperationalError):
+                        bridge._ensure_connected()
+
+                self.assertEqual(bridge._acquire_connection_slot.call_count, 1 + retried)
+
     def test_reconnect_after_reset_keeps_the_held_slot(self):
         # reset_transport keeps the slot for an in-place retry. A reconnect that claimed
         # another would leave the first one's heartbeat renewing it until the process
@@ -16367,6 +16494,42 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
             [self._position(end) for _, end in batches],
             [("snapshot", 0, 2), ("snapshot", 0, 4), ("stream", None, 0)],
         )
+
+    def test_gzip_record_windows_advance_by_records_read_under_a_row_filter(self):
+        # A row_filter drops records, so a window can hold fewer rows than it read, or none.
+        # The next window starts after every record this one read: none is served twice,
+        # and a window the filter empties still moves the serve on rather than ending it.
+        source = self._gzip_source(self._FIVE_RECORDS)
+        for row_filter, expected in (("id <> 2", [1, 3, 4, 5]), ("id > 2", [3, 4, 5])):
+            with self.subTest(row_filter=row_filter):
+                options = {
+                    "snapshot.source": source,
+                    "snapshot.gzip.records.per.batch": "2",
+                    "row_filter": row_filter,
+                }
+
+                # Its own scope: the filter is part of the schema the scope's records pin.
+                connector = self.connector(FakeBridge(), registration_scope=row_filter)
+                rows, batches, _ = self._serve(connector, options)
+
+                self.assertEqual([row["id"] for row in rows], expected)
+                self.assertEqual(
+                    [self._position(end) for _, end in batches],
+                    [("snapshot", 0, 2), ("snapshot", 0, 4), ("stream", None, 0)],
+                )
+
+    def test_a_replayed_gzip_window_counts_the_records_a_filter_dropped(self):
+        # Replaying records [0, 2) under a filter that drops one returns the one row left;
+        # only a file holding fewer records than the window fails closed.
+        source = self._gzip_source(self._FIVE_RECORDS)
+        options = {"snapshot.source": source, "row_filter": "id <> 2"}
+        connector = self.connector(FakeBridge())
+        table = connector._table("app.orders", options)
+        split = connector._unl_all_splits(table, options)[0]
+
+        rows = connector._replay_unl_gzip_window(table, options, 90, split, 0, stop_record=2)
+
+        self.assertEqual([row["id"] for row in rows], [1])
 
     def test_gzip_record_windows_keep_one_decompressor_across_batches(self):
         source = self._gzip_source(self._FIVE_RECORDS)
@@ -18829,6 +18992,34 @@ class ColumnTransformTests(_TableOptionTestCase):
         self.assertEqual(str(number(Decimal("7"), money, {})), "7.00")
         bigint = column({"name": "n", "type_name": "BIGINT"})
         self.assertIs(type(number(Decimal("7"), bigint, {})), int)
+
+    def test_numeric_transforms_return_the_type_their_column_arrives_as(self):
+        # The schema keeps the column's type, so ROUND, TRUNC, ABS and MOD hand back the
+        # value in the type it arrived as: a variable-scale DECIMAL delivered as a string
+        # stays a fixed-point string, one delivered as a double stays a float.
+        apply = informix_module._apply_function
+        self.assertEqual(apply("ROUND", "12345.67", [-3], {}), "12000")
+        self.assertEqual(apply("TRUNC", "0.000000123456", [9], {}), "0.000000123")
+        self.assertEqual(apply("ABS", "-0.0000001", [], {}), "0.0000001")
+        self.assertEqual(apply("ROUND", 2.25, [1], {}), 2.3)
+        self.assertIs(type(apply("MOD", 7.5, [2], {})), float)
+        self.assertEqual(apply("ROUND", 12345, [-2], {}), 12300)
+        # Negative digits write the result out in full, not as 1.2E+4.
+        self.assertEqual(str(apply("ROUND", Decimal("12345.67"), [-3], {})), "12000")
+
+    def test_an_nvl_fallback_ignores_a_connection_level_decimal_type_as_the_schema_does(self):
+        # decimal.variable.type is a table option: the schema and the decoded values ignore
+        # a connection-level setting, so an NVL fallback must too, or it lands as a string
+        # in a decimal column.
+        connector = self.connector(_ProjectingBridge(), **{"decimal.variable.type": "string"})
+        column = informix_module.Column.parse(
+            {"name": "extra", "type_name": "DECIMAL", "precision": 16, "scale": 255}
+        )
+        options = {"transform_columns": '{"extra": "NVL(extra, 0)"}'}
+
+        rows = list(connector._output_rows(iter([{"extra": None}]), options, lambda: [column]))
+
+        self.assertIsInstance(rows[0]["extra"], Decimal)
 
     def test_an_executor_types_the_fallback_from_the_descriptor(self):
         options = {"transform_columns": '{"extra": "NVL(extra, 0)"}'}

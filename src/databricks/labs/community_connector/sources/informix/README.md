@@ -126,6 +126,8 @@ rather than start from an unrelated position.
 | `lakebase.suspend.timeout.seconds` | No | `60` | Idle seconds before the endpoint scales to zero compute. Applied only at project creation, because the API accepts it solely through a project's `default_endpoint_settings` and never retroactively. |
 | `lakebase.provision.timeout.seconds` | No | `180` | Absolute deadline for project/endpoint provisioning and for waiting on concurrent provisioning. |
 | `lakebase.database` | No | `databricks_postgres` | Postgres database holding the state tables. |
+| `lakebase.workspace.host` | No | resolved | Workspace host for Lakebase control-plane calls (project and endpoint provisioning). Normally resolved from the pipeline's driver credential, `DATABRICKS_HOST`, or the Databricks SDK; set it only when none of those is available. |
+| `lakebase.workspace.token` | No | resolved | Bearer token for those control-plane calls, resolved alongside `lakebase.workspace.host`. Set it only when the ambient credential cannot be resolved. |
 | `state.gc.retention.days` | No | `30` | Age in days after which unreferenced per-table state records (activity markers for pipelines that no longer read the table) become eligible for best-effort garbage collection; minimum `1`. |
 | `state.gc.interval.hours` | No | `24` | Minimum hours between garbage-collection sweeps for a table, and the window within which a reader touches its activity marker; must be `> 0`. |
 | `state.gc.drop.unused.projects` | No | `false` | Whether to also drop Lakebase projects unused within `state.gc.project.retention.days`. Accepts `true` or `false`. |
@@ -427,7 +429,7 @@ A secret-free redirect configuration shape is:
 
 GSS/Kerberos, private-server authentication, and automatic server-name or locale discovery remain unsupported. PAM has live integration coverage. Redirect parsing, multi-address validation and transport failover, reconnect state, limits, and loop detection have deterministic protocol-test coverage, but the current redirect fixture does not provide a TLS listener and therefore is not live redirect coverage. Serverless Lakeflow Connect execution over an Informix TLS listener has been validated separately.
 
-The fixture at `/Users/leon.eller/work/dev/informix-cdc` live-tests PAM against an Informix listener at `localhost:9090`. Its deterministic redirect responder on `localhost:9191` is plaintext and can be exercised only with the explicit `encrypt=false` opt-in; production redirect validation should use TLS or an independently trusted private network, with every destination explicitly allow-listed. Client-side `sqlhosts` failover is not redirect coverage. Fixture credentials are disposable test data and are intentionally not repeated here.
+The Informix test fixture (the separate `informix-cdc` repository) live-tests PAM against an Informix listener at `localhost:9090`. Its deterministic redirect responder on `localhost:9191` is plaintext and can be exercised only with the explicit `encrypt=false` opt-in; production redirect validation should use TLS or an independently trusted private network, with every destination explicitly allow-listed. Client-side `sqlhosts` failover is not redirect coverage. Fixture credentials are disposable test data and are intentionally not repeated here.
 
 ## Supported objects and naming
 
@@ -439,7 +441,7 @@ Pipeline source names use `owner.table`, such as `informix.orders`. Filter patte
 - `owner.table`
 - `database:owner.table`
 
-Include filtering runs before exclusion filtering. Identifiers are limited to a letter or underscore followed by letters, digits, `_`, or `$`.
+Include filtering runs before exclusion filtering. Identifiers are limited to a letter or underscore followed by letters, digits, `_`, `$`, `+`, or `.`; a name with `+` or `.` is sent as a delimited (double-quoted) identifier.
 
 ### CDC type support
 
@@ -1066,7 +1068,7 @@ Full definitions are in [Connection parameters](#connection-parameters).
 }
 ```
 
-Supported source-specific table options are `qualified_source_table`, `decimal.variable.type`, `decimal.variable.column.type`, `snapshot.mode`, `snapshot.source`, `snapshot.boundary.lsn`, `snapshot.split.bytes`, `snapshot.unl.delimiter`, `snapshot.unl.escape`, `snapshot.page.size`, `keyless.snapshot.page.size`, `snapshot.filter`, `row_filter`, `include_columns`, `exclude_columns`, `rename_columns`, `transform_columns`, `snapshot.isolation`, `snapshot.max.rows`, `snapshot.max.bytes`, `max.records.per.batch`, `cdc.timeout`, and `cdc.max.records`. `qualified_source_table` maps the pipeline's logical table name to an Informix `owner.table` name. Standard destination, SCD, key, sequence, and clustering options remain available.
+Supported source-specific table options are `qualified_source_table`, `decimal.variable.type`, `decimal.variable.column.type`, `snapshot.mode`, `snapshot.source`, `snapshot.boundary.lsn`, `snapshot.split.bytes`, `snapshot.gzip.records.per.batch`, `snapshot.unl.delimiter`, `snapshot.unl.escape`, `snapshot.page.size`, `keyless.snapshot.page.size`, `snapshot.filter`, `row_filter`, `include_columns`, `exclude_columns`, `rename_columns`, `transform_columns`, `snapshot.isolation`, `snapshot.scan`, `snapshot.max.rows`, `snapshot.max.bytes`, `append.only.ingestion`, `append.delete.tombstones`, `max.records.per.batch`, `cdc.timeout`, `cdc.max.records`, `primary.keys`, `allow.nullable.index`, and `table.migration`. `qualified_source_table` maps the pipeline's logical table name to an Informix `owner.table` name. Standard destination, SCD, key, sequence, and clustering options remain available.
 
 ### Column selection
 

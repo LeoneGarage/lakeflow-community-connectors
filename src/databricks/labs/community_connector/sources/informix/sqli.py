@@ -1341,9 +1341,11 @@ class InformixSqliClient:
         self._output.write(encode_protocol_offer())
         self._output.flush()
         self.server_protocols = self._read_protocol_offer()
-        self.remove_64k_limit = bool(self.server_protocols[7] & 0x02)
-        self.large_tuple_size = bool(self.server_protocols[8] & 0x04)
-        self.long_row_id = bool(self.server_protocols[8] & 0x02)
+        # Bytes 7 and 8 (0x02; 0x04 and 0x02) in _protocol_feature's numbering, which treats
+        # an offer too short to carry them as not offering them.
+        self.remove_64k_limit = _protocol_feature(self.server_protocols, 62)
+        self.large_tuple_size = _protocol_feature(self.server_protocols, 69)
+        self.long_row_id = _protocol_feature(self.server_protocols, 70)
         self.bigint_supported = _protocol_feature(self.server_protocols, 54)
         pam_advertised = _protocol_feature(self.server_protocols, 44)
         if self.authentication_mode == "pam":

@@ -350,7 +350,7 @@ and `snapshot.reader.threads`).
 
 The per-table `snapshot.mode` option supports `incremental` (default), `initial`,
 `initial_only`, `cdc_only`, `auto_snapshot`, and `recovery`. `initial`
-snapshots only without a checkpoint. `initial_only` completes snapshot pages but
+takes a snapshot only when the table has no checkpoint yet. `initial_only` completes snapshot pages but
 does not subsequently poll CDC. `cdc_only` publishes the current schema and LSN
 as a completed zero-row snapshot so both channels begin at the same future-only
 boundary. `auto_snapshot` uses the incremental PK-chunked strategy, derives a
@@ -466,9 +466,9 @@ Informix TRUNCATE has no row keys. It cannot be represented faithfully by `read_
 
 ## Delete and tombstone behavior
 
-A native DELETE contains the before-image. A delete envelope contains `before=<old row>`, `after=null`, `op=d`. Tombstone records with a null value are not required or generated.
+A native DELETE contains the before-image. A delete envelope contains `before=<old row>`, `after=null`, `op=d`. Kafka-style tombstones (a record with a null value) are not required or generated. The `d` rows the append path writes, which the options call tombstones, are different: each carries the full before-image.
 
-Lakeflow requires the delete record, not the Kafka tombstone. Do not generate or expose tombstones. A null payload is not a delete and must not advance the delete channel. Full-row logging and a primary/message key are required to construct reliable deletion rows.
+Lakeflow requires the delete record, not the Kafka tombstone. Do not generate or expose null-value tombstones. A null payload is not a delete and must not advance the delete channel. Full-row logging and a primary/message key are required to construct reliable deletion rows.
 
 ## What can be ported to Python
 
@@ -505,7 +505,7 @@ The implementation targets the Informix SQLI wire protocol and native CDC framin
 - Preserve backpressure with bounded decoded-record/transaction buffers. A single large transaction can exceed the configured row batch and memory budget; fail explicitly rather than split before COMMIT.
 - Low traffic returns unchanged offsets after CDC timeout. The idle protocol does not require heartbeats.
 - If retained logs no longer contain `begin_lsn`, resnapshot; resuming from `commit_lsn` can lose interleaved open transactions.
-- Do not claim support for TRUNCATE, unsupported UDT/complex/LOB payloads, PK-less tables, or online DDL until their explicit behavior is implemented and tested.
+- Do not claim support for TRUNCATE, unsupported UDT/complex/LOB payloads, or online DDL until their explicit behavior is implemented and tested. An `ALTER TABLE` needs full-row logging disabled and writes quiesced, as described above. Tables without a primary key are supported through append-only ingestion, `primary.keys`, or a promoted unique index.
 
 ## PAM authentication and connection redirects
 

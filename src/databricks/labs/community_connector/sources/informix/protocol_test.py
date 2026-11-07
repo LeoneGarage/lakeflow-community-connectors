@@ -1065,6 +1065,27 @@ class SqliPacketTests(unittest.TestCase):
             client._connect_once("host", 9088, "server", float("inf"))
         create_context.assert_not_called()
 
+    def test_a_short_protocol_offer_reads_as_offering_nothing(self):
+        # The offer reader accepts vectors from 5 bytes, so the session flags read from
+        # bytes 7 and 8 must treat a shorter offer as not offering them, not index past it.
+        module = "databricks.labs.community_connector.sources.informix.sqli"
+        client = InformixSqliClient(
+            "host", 9088, "db", "user", "secret", server_name="server", tls=False
+        )
+        with (
+            patch("socket.create_connection", return_value=Mock()),
+            patch(f"{module}.read_exact", side_effect=lambda _, n: b"\x00\x06\x00\x00\x00\x00"[:n]),
+            patch(f"{module}.decode_asc_accept", return_value=Mock()),
+            patch.object(InformixSqliClient, "_read_protocol_offer", return_value=b"\xff" * 5),
+            patch(f"{module}.encode_secondary_info", side_effect=RuntimeError("offer read")),
+            self.assertRaisesRegex(RuntimeError, "offer read"),
+        ):
+            client._connect_once("host", 9088, "server", float("inf"))
+        self.assertEqual(
+            (client.remove_64k_limit, client.large_tuple_size, client.long_row_id),
+            (False, False, False),
+        )
+
     def test_session_header_round_trip(self):
         packet = encode_session_packet(1, b"request")
         self.assertEqual(read_session_packet(io.BytesIO(packet)), (1, 60, b"request"))
