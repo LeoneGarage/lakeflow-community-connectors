@@ -5317,6 +5317,26 @@ class LakeflowContractTests(unittest.TestCase):
         ):
             self.assertFalse(connector.is_partitioned("app.orders"))
 
+    def test_a_dropped_mount_under_a_page_serve_plan_is_not_wrapped(self):
+        # Planning a page-serve batch reads the boundary page off the Volume mount. A dropped
+        # mount surfaces as the OSError it is, not wrapped in an InformixError, so the
+        # dropped-mount handling that classifies OSErrors sees it.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 6)]
+        # Two pages a batch, so the batch ends mid-snapshot and reads its boundary page.
+        options = {"snapshot.page.size": "1", "stream.partitioned.snapshot.pages.per.batch": "2"}
+        connector = self._partitioned_connector(bridge, **options)
+        first = connector.latest_offset("app.orders", {}, {})
+        dropped = OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+
+        with (
+            mock.patch.object(informix_module, "_open_state_file", side_effect=dropped),
+            self.assertRaises(OSError) as raised,
+        ):
+            connector.latest_offset("app.orders", {}, first)
+
+        self.assertIs(raised.exception, dropped)
+
     def test_partitioned_bootstrap_serves_page_zero_from_the_stage(self):
         # The first microbatch drains the snapshot and serves page 0. Page 0 reaches the
         # executor as a staged-page partition like every later page, not as rows embedded
@@ -16926,6 +16946,17 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
         connector = self.connector(FakeBridge(), registration_scope="unload-short-record")
         with self.assertRaisesRegex(InformixError, "has 1 fields but the table has 2"):
             list(connector.read_table("app.orders", {}, unload)[0])
+
+    def test_a_unl_serve_gives_back_the_session_its_boundary_pin_opened(self):
+        # The file serve plans its batches without a read, so it must give back the session
+        # the first batch's boundary pin opened rather than hold its slot to the stream phase.
+        connector = self.connector(FakeBridge())
+        options = {"snapshot.source": self._source("1|alpha|\n2|beta|\n")}
+        with mock.patch.object(connector, "_release_worker_connection") as release:
+            end = connector.latest_offset("app.orders", options, {})
+            self.assertEqual(release.call_count, 1)
+            connector.get_partitions("app.orders", options, {}, end)
+        self.assertEqual(release.call_count, 2)
 
     def test_a_unl_cutover_seeds_from_the_token_not_the_extract(self):
         # Under table.migration the partitioned reader must not serve the .unl extract: the

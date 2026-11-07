@@ -8373,10 +8373,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 self._partition_embedded_rows[self._partition_offset_key(start_offset)] = (
                     self._encode_embedded_rows(window_rows)
                 )
+            # The file and page serves plan without a read, which would have given back the
+            # session the .unl boundary pin or an uncached catalog lookup opened.
+            self._release_worker_connection()
             return end
         batch = self._snapshot_page_batch(table, effective_start, table_options)
         if batch is not None:
-            return self._snapshot_page_batch_offset(table, effective_start, batch)
+            end = self._snapshot_page_batch_offset(table, effective_start, batch)
+            self._release_worker_connection()
+            return end
         self._defer_staged_rows = not effective_start
         try:
             rows, next_offset = self._embedded_read(table_name, start_offset, table_options)
@@ -8481,6 +8486,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         if start_offset == end_offset:
             return []
         table = self._table(table_name, table_options)
+        # Planning needs no source session: give back any the lookup opened (an embedded
+        # replay below takes its own).
+        self._release_worker_connection()
         effective_start = self._effective_start_offset(start_offset or {})
         if self._unl_snapshot_serve(table_options, effective_start):
             # File source: fan this microbatch's split window across executors -- one
@@ -10635,6 +10643,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 with gzip.GzipFile(fileobj=raw_handle, mode="rb") as handle:
                     payload = handle.read(_MAX_SNAPSHOT_STAGE_PAGE_BYTES + 1)
         except (OSError, EOFError) as error:
+            if _dropped_mount_error(error) is not None:
+                raise  # unwrapped, so a read's dropped-mount retry sees it
             raise InformixError(
                 f"Cannot read staged snapshot page {page_index} for " f"'{exposed_name}'"
             ) from error
@@ -12076,6 +12086,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 name for name in os.listdir(source) if name.endswith((".unl", ".unl.gz"))
             )
         except OSError as error:
+            if _dropped_mount_error(error) is not None:
+                raise  # unwrapped, so a read's dropped-mount retry sees it
             raise InformixError(
                 f"snapshot.source '{source}' for '{exposed_name}' is not readable"
             ) from error
