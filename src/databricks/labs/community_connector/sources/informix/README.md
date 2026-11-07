@@ -55,6 +55,7 @@ The pure-Python protocol implementation has completed authentication, query, dis
 - Transaction logging enabled for the source database. Retained logical logs must extend back to the oldest connector checkpoint.
 - The Informix CDC API installed by an administrator. Run `$INFORMIXDIR/etc/syscdcv1.sql` (commonly with `dbaccess sysadmin`) to create the `syscdcv1` database and `cdc_*` routines.
 - A normal username/password account that can read source catalog metadata and selected tables, use the required `syscdcv1` routines, and enable full-row logging. The validated reference setup grants DBA-level access to `syscdcv1`.
+- The connector's message text deployed with its source. It is kept in `informix_messages.json`, next to `informix.py` and the merged `_generated_informix_python_source.py`, rather than in the code Spark ships to each worker, and each worker reads it from there. A deployment of this folder (a Git folder or the connector's wheel) includes it; one that copies only the merged file must copy it too, or messages are reported by number.
 - The exact `INFORMIXSERVER` value. `DB_LOCALE` defaults to `en_US.819` and `CLIENT_LOCALE` defaults to `en_US.utf8`; override either when the source requires another locale because the connector does not discover them.
 
 The connector enables full-row logging for captured tables and leaves it enabled when a finite poll ends, avoiding capture gaps between polls. Ensure this operational change is acceptable on the source system.

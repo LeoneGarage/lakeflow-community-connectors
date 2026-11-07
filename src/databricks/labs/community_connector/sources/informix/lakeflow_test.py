@@ -1025,6 +1025,60 @@ class LakeflowContractTests(unittest.TestCase):
             keys.add(connector._registration_table_cache_key())
         self.assertEqual(len(keys), 2)
 
+    def test_each_message_call_matches_its_template_and_comment(self):
+        # informix.py's messages live in informix_messages.json, out of the pickled source.
+        # Each _m(index, ...) call passes the values its template has fields for, every
+        # template is used, and the comment above the call shows that template.
+        import ast
+        import string
+
+        path = informix_module.__file__
+        with open(path, encoding="utf-8") as handle:
+            source = handle.read()
+        lines = source.splitlines()
+        with open(informix_module._m.path, encoding="utf-8") as handle:
+            templates = json.load(handle)
+        used = set()
+        statements = [node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.stmt)]
+        for call in ast.walk(ast.parse(source)):
+            if not (isinstance(call, ast.Call) and getattr(call.func, "id", None) == "_m"):
+                continue
+            index = call.args[0].value
+            used.add(index)
+            fields = [
+                f for _, f, _, _ in string.Formatter().parse(templates[index]) if f is not None
+            ]
+            with self.subTest(index=index, line=call.lineno):
+                self.assertEqual(len(call.args) - 1, len(fields))
+                statement = max(
+                    (s for s in statements if s.lineno <= call.lineno <= s.end_lineno),
+                    key=lambda s: (s.lineno, s.col_offset),
+                )
+                block, number = [], statement.lineno - 2
+                while lines[number].strip().startswith("#"):
+                    block.insert(0, lines[number].strip()[1:].strip())
+                    if block[0].startswith(f"{index}: "):
+                        break
+                    number -= 1
+                comment = " ".join(block)
+                self.assertTrue(comment.startswith(f"{index}: "), comment[:80])
+                self.assertEqual(comment.split(), f"{index}: {templates[index]}".split())
+        self.assertEqual(used, set(range(len(templates))))
+
+    def test_messages_pickle_as_their_path_and_survive_a_missing_file(self):
+        # A used message table pickles as its path alone, so the text never rides along with
+        # the class; a table that cannot be read still describes the error it was asked for.
+        messages = informix_module._m.__class__()
+        unused = pickle.dumps(messages)
+        messages(0, *range(10))  # loads every template
+        self.assertIsNotNone(messages.templates)
+
+        self.assertEqual(pickle.dumps(messages), unused)
+        restored = pickle.loads(unused)
+        self.assertIsNone(restored.templates)
+        restored.path = os.path.join(self._shared_state.name, "missing.json")
+        self.assertEqual(restored(7, "x"), "Informix message 7 ('x',)")
+
     def test_shared_state_validation_module_state_is_pickle_safe(self):
         coordinator = informix_module._STATE_VALIDATION_COORDINATOR
         restored = pickle.loads(pickle.dumps(coordinator))
