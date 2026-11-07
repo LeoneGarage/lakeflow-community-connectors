@@ -1299,6 +1299,44 @@ class LakebaseProjectNamingTests(unittest.TestCase):
         api.request.assert_any_call("DELETE", "/api/2.0/postgres/projects/informix-state-old")
         connection.close.assert_called_once()
 
+    def test_a_deleted_project_is_skipped_and_a_failed_delete_does_not_fail_the_read(self):
+        # A deleted project lingers in the list with no endpoint; waiting for one would block
+        # the read that runs the GC. A delete that fails is skipped like any other candidate.
+        lakebase_state.LakebaseState._project_gc_checked.clear()
+        state = lakebase_state.LakebaseState({}, "current")
+        api = mock.MagicMock()
+        api.request.side_effect = [
+            {
+                "projects": [
+                    {"name": "projects/informix-state-gone", "delete_time": "2026-11-01T00:00:00Z"},
+                    {"name": "projects/informix-state-old"},
+                ]
+            },
+            RuntimeError("delete refused"),
+        ]
+        state._api_client = mock.Mock(return_value=api)
+        connection = mock.MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = (1, 1, 1.0)
+        state._open = mock.Mock(return_value=connection)
+        state._admin_user = mock.Mock(return_value="admin")
+
+        with (
+            mock.patch.object(
+                lakebase_state,
+                "_endpoint_facts",
+                return_value={"endpoint": "endpoint", "host": "host"},
+            ) as facts,
+            mock.patch.object(lakebase_state, "generate_credential", return_value="token"),
+            mock.patch.object(lakebase_state.time, "time", return_value=100_000_000),
+            self.assertLogs(lakebase_state.__name__, level="WARNING"),
+        ):
+            deleted = state.collect_unused_projects(90, 24)
+
+        self.assertEqual(deleted, 0)
+        self.assertEqual([call.args[1] for call in facts.call_args_list], ["informix-state-old"])
+        connection.close.assert_called_once()
+
 
 class LakebaseLoginRoleTests(unittest.TestCase):
     """Provisioning of the static password role.

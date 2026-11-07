@@ -2063,9 +2063,13 @@ class PurePythonInformixBridge:
         try:
             try:
                 release_slot(self._lakebase_connection(), slot)
-            except connection_lost_error_types():
-                # Reaped while the read ran (the lease heartbeat has its own connection):
-                # psycopg now reports it closed, so this reopens it.
+            except Exception:  # pylint: disable=broad-except
+                # Reaped while the read ran (the lease heartbeat has its own connection), or
+                # left in a failed transaction by the advisory backlog-hint write: release
+                # over a fresh one.
+                stale, self._lakebase_conn = getattr(self, "_lakebase_conn", None), None
+                with contextlib.suppress(Exception):
+                    stale.close()
                 release_slot(self._lakebase_connection(), slot)
         except Exception:
             # Releasing is best effort: the lease expires on its own, so a failed
@@ -6148,7 +6152,12 @@ class _SharedCdcShard:
                 "covered_from": None if existing is None else existing.get("covered_from"),
             }
             self.subscribers[identity] = entry
-            self.buffers.setdefault(identity, deque())
+            # Drop what the consumer has durably consumed, as a view does. A consumer on
+            # direct reads (the shard not ready, or the table not yet covered) gets no view,
+            # so without this its buffer could reach the cap and stop the shard reading.
+            buf = self.buffers.setdefault(identity, deque())
+            while buf and buf[0].commit_lsn <= checkpoint_commit_lsn:
+                buf.popleft()
             # Lower the shared read cursor to admit a newly subscribed or lagging
             # table's history. It only moves backward here; the daemon advances it
             # forward as it reads, but never past the floor of a table it has not yet
@@ -7761,24 +7770,32 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             self._bridge_instance = factory(self.options)
         return self._bridge_instance
 
-    def list_tables(self) -> list[str]:
-        previous_capacity_mode = self.options.get("_informix.bypass.connection.capacity")
+    @contextlib.contextmanager
+    def _metadata_access(self) -> Iterator[None]:
+        # Docstring: Bypass connection capacity for a catalog lookup, then give the session back.
+        #
+        # Registration and reader setup read only metadata. Queued for a slot behind running
+        # reads they would stall startup, and a wait that gave up would fail it.
+
+        previous = self.options.get("_informix.bypass.connection.capacity")
         self.options["_informix.bypass.connection.capacity"] = "true"
         try:
-            return sorted(self._table_map())
+            yield
         finally:
             try:
                 self._release_worker_connection()
             finally:
-                if previous_capacity_mode is None:
+                if previous is None:
                     self.options.pop("_informix.bypass.connection.capacity", None)
                 else:
-                    self.options["_informix.bypass.connection.capacity"] = previous_capacity_mode
+                    self.options["_informix.bypass.connection.capacity"] = previous
+
+    def list_tables(self) -> list[str]:
+        with self._metadata_access():
+            return sorted(self._table_map())
 
     def get_table_schema(self, table_name: str, table_options: dict[str, str]) -> StructType:
-        previous_capacity_mode = self.options.get("_informix.bypass.connection.capacity")
-        self.options["_informix.bypass.connection.capacity"] = "true"
-        try:
+        with self._metadata_access():
             table = self._registration_table(table_name, table_options)
             _ensure_materializable(table, table_options)
             renames = dict(table.column_renames or ())
@@ -7807,60 +7824,40 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 )
             )
             return StructType(fields)
-        finally:
-            try:
-                self._release_worker_connection()
-            finally:
-                if previous_capacity_mode is None:
-                    self.options.pop("_informix.bypass.connection.capacity", None)
-                else:
-                    self.options["_informix.bypass.connection.capacity"] = previous_capacity_mode
 
     def read_table_metadata(self, table_name: str, table_options: dict[str, str]) -> dict:
-        with self._metadata_session_lock:
-            previous_capacity_mode = self.options.get("_informix.bypass.connection.capacity")
-            self.options["_informix.bypass.connection.capacity"] = "true"
-            try:
-                table = self._registration_table(table_name, table_options)
-                _ensure_materializable(table, table_options)
-                # Only consulted on the append path (tombstones) or at snapshot time
-                # (scan), but validated for every table so a malformed value fails at
-                # registration rather than on a later read.
-                self._append_delete_tombstones(table_options)
-                self._snapshot_cursor_scan(table_options)
-                if self._append_only_table(table, table_options):
-                    # Report a cursor even though no primary key is exposed: the
-                    # cursor is what makes the framework treat this as an
-                    # incremental stream. Without it the flow would re-read the
-                    # whole table into an append target every microbatch and
-                    # accumulate duplicates without bound.
-                    result = {
-                        "primary_keys": [],
-                        "cursor_field": CURSOR,
-                        "ingestion_type": "append",
-                    }
-                elif not _cdc_capable(table):
-                    result = {
-                        "primary_keys": [],
-                        "cursor_field": None,
-                        "ingestion_type": "snapshot",
-                    }
-                else:
-                    renames = dict(table.column_renames or ())
-                    result = {
-                        "primary_keys": [renames.get(key, key) for key in table.primary_keys],
-                        "cursor_field": CURSOR,
-                        "ingestion_type": "cdc_with_deletes",
-                    }
-            except BaseException:
-                self._release_worker_connection()
-                raise
-            finally:
-                if previous_capacity_mode is None:
-                    self.options.pop("_informix.bypass.connection.capacity", None)
-                else:
-                    self.options["_informix.bypass.connection.capacity"] = previous_capacity_mode
-            self._release_worker_connection()
+        with self._metadata_session_lock, self._metadata_access():
+            table = self._registration_table(table_name, table_options)
+            _ensure_materializable(table, table_options)
+            # Only consulted on the append path (tombstones) or at snapshot time
+            # (scan), but validated for every table so a malformed value fails at
+            # registration rather than on a later read.
+            self._append_delete_tombstones(table_options)
+            self._snapshot_cursor_scan(table_options)
+            if self._append_only_table(table, table_options):
+                # Report a cursor even though no primary key is exposed: the
+                # cursor is what makes the framework treat this as an
+                # incremental stream. Without it the flow would re-read the
+                # whole table into an append target every microbatch and
+                # accumulate duplicates without bound.
+                result = {
+                    "primary_keys": [],
+                    "cursor_field": CURSOR,
+                    "ingestion_type": "append",
+                }
+            elif not _cdc_capable(table):
+                result = {
+                    "primary_keys": [],
+                    "cursor_field": None,
+                    "ingestion_type": "snapshot",
+                }
+            else:
+                renames = dict(table.column_renames or ())
+                result = {
+                    "primary_keys": [renames.get(key, key) for key in table.primary_keys],
+                    "cursor_field": CURSOR,
+                    "ingestion_type": "cdc_with_deletes",
+                }
             return result
 
     def _registration_table(self, table_name: str, table_options: dict[str, str]) -> Table:
@@ -8036,14 +8033,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     # Append-only has exactly two states: establish the boundary once,
                     # then stream. _read_stream needs no primary key, so a key-less
                     # table follows the identical CDC path from here on.
-                    if effective_start and effective_start.get("phase") == "stream":
-                        if migration:
-                            result = self._append_migration_record_and_stop(table, effective_start)
+                    if effective_start and migration:
+                        # Whatever the phase: a capture parks it and a committed seed drops
+                        # the token. A seed from a keyed capture can be mid-snapshot.
+                        result = self._append_migration_record_and_stop(table, effective_start)
+                    elif effective_start and effective_start.get("phase") == "stream":
                         # After Restore, a handoff seed can carry an in-flight incremental
                         # copy (phase=="stream" with an "incremental" block, only ever from a
                         # keyed capture that was mid-copy); continue the copy from its cursor
                         # rather than treating it as pure CDC, or the un-copied rows are lost.
-                        elif self._offset_is_incremental_reader(effective_start):
+                        if self._offset_is_incremental_reader(effective_start):
                             result = self._read_incremental(table, effective_start, table_options)
                         else:
                             # An initial snapshot staged pages, as a keyed one does below.
@@ -8223,11 +8222,20 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
 
         if not self._partitioned_stream_enabled():
             return False
-        # Shared CDC is always on, so no shared-session check is needed here.
+        # Shared CDC is always on, so no shared-session check is needed here. The lookup is
+        # the registration one, outside connection capacity: queued for a slot among a
+        # starting pipeline's flows, a wait that gave up would leave the table on the simple
+        # reader for the whole stream.
         try:
-            table = self._table(table_name, self.options)
+            with self._metadata_access():
+                table = self._registration_table(table_name, self.options)
             return bool(_cdc_capable(table) or self._append_only_table(table, self.options))
         except Exception:  # pylint: disable=broad-except
+            logging.getLogger(__name__).warning(
+                "Informix reads '%s' with the simple stream reader: its table lookup failed",
+                table_name,
+                exc_info=True,
+            )
             return False
 
     def _snapshot_page_batch(
@@ -12046,7 +12054,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # takes the ordinary CDC path. A ``.unl`` table never stages pages, so a
         # snapshot-phase offset here is always a ``.unl`` split window (never a staged page).
 
-        if self._is_delete_flow():
+        if self._is_delete_flow() or self._table_migration(table_options):
+            # A cutover seeds from the parked token, never from the extract.
             return False
         if self._table_snapshot_source(table_options) is None:
             return False
@@ -16011,6 +16020,7 @@ def _parse_unload_fields(
     *,
     delimiter: str = _UNL_DEFAULT_DELIMITER,
     escape: str = _UNL_DEFAULT_ESCAPE,
+    fields: int | None = None,
 ) -> list[str]:
     # Docstring: Split one UNLOAD / HPL DELIMITED record into raw field strings.
     #
@@ -16038,7 +16048,9 @@ def _parse_unload_fields(
             value = []
         else:
             value.append(character)
-    if value:
+    # Short of ``fields``, an empty final field is real: HPL writes no trailing delimiter,
+    # so a NULL last column leaves the record ending in a delimiter, as UNLOAD's does.
+    if value or (fields is not None and len(values) < fields):
         values.append("".join(value))
     return values
 
@@ -16451,10 +16463,13 @@ def _shape_unl_record(
     # connection's string.null.byte mode, applied as the live decoders apply it, before
     # the filter sees the row.
 
-    fields = _parse_unload_fields(
-        raw.decode(encoding, "strict"), delimiter=delimiter, escape=escape
-    )
     catalog = table.catalog_columns or table.columns
+    # Only an HPL extract (its own delimiter) can end a full record in the delimiter: with
+    # UNLOAD's every record does, so a record short of a column must still fail below.
+    expected = None if delimiter == _UNL_DEFAULT_DELIMITER else len(catalog)
+    fields = _parse_unload_fields(
+        raw.decode(encoding, "strict"), delimiter=delimiter, escape=escape, fields=expected
+    )
     if len(fields) != len(catalog):
         name = exposed_name if exposed_name is not None else table.exposed_name
         raise InformixError(

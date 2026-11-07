@@ -47,8 +47,9 @@
 # CDC-capable tables receive a deterministic primary-key snapshot followed by
 # CDC from the pre-snapshot high-water LSN. Delivery is at-least-once and a
 # transaction is never split. INSERT/UPDATE rows and DELETE before-images use
-# independently checkpointed channels. Types without ordinary SQLI snapshot
-# materialization fail metadata discovery rather than using snapshot-only mode.
+# independently checkpointed channels. A column of a type without ordinary SQLI
+# snapshot materialization is left out (a key column of one fails the table) rather
+# than the table falling back to snapshot-only mode.
 # TRUNCATE is unsupported by Lakeflow's
 # row-delete contract and fails explicitly. Expired log retention requires a
 # resnapshot. Capture-capable PK-less tables use incremental append-only CDC by
@@ -1269,4 +1270,4 @@ connection:
 
 # Exact per-table overrides consumed by the connector. `qualified_source_table` maps a
 # pipeline table to a dynamically discovered exposed name (`owner.table`).
-external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,rename_columns,transform_columns,snapshot.isolation,snapshot.scan,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"
+external_options_allowlist: "qualified_source_table,decimal.variable.type,decimal.variable.column.type,snapshot.mode,snapshot.source,snapshot.boundary.lsn,snapshot.split.bytes,snapshot.gzip.records.per.batch,snapshot.unl.delimiter,snapshot.unl.escape,snapshot.page.size,keyless.snapshot.page.size,snapshot.filter,row_filter,include_columns,exclude_columns,rename_columns,transform_columns,snapshot.isolation,snapshot.scan,snapshot.incremental.datetime.as.string,snapshot.max.rows,snapshot.max.bytes,append.only.ingestion,append.delete.tombstones,max.records.per.batch,cdc.timeout,cdc.max.records,primary.keys,allow.nullable.index,table.migration"

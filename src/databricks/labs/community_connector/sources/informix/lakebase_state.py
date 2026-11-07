@@ -1371,9 +1371,13 @@ class LakebaseState:
             project_id = name.rsplit("/", 1)[-1]
             if not project_id.startswith(_AUTO_PROJECT_PREFIX) or project_id == self._project_id:
                 continue
+            if (project or {}).get("delete_time"):
+                # A deleted project lingers in the list with no endpoint to wait for.
+                continue
             connection = None
             try:
-                facts = _endpoint_facts(api, project_id)
+                # A candidate is read on a live read's path: wait briefly, not for provisioning.
+                facts = _endpoint_facts(api, project_id, deadline=time.monotonic() + 60)
                 token = generate_credential(api, facts["endpoint"])
                 connection = self._open(facts, self._admin_user(), token)
                 with connection.cursor() as cursor:
@@ -1392,6 +1396,11 @@ class LakebaseState:
                     continue
                 if float(last_used) >= time.time() - retention_days * 86400:
                     continue
+                connection.close()
+                connection = None
+                api.await_operation(
+                    api.request("DELETE", f"/api/2.0/postgres/projects/{project_id}")
+                )
             except Exception:
                 _LOGGER.warning(
                     "Skipping Lakebase project GC candidate %s", project_id, exc_info=True
@@ -1400,8 +1409,6 @@ class LakebaseState:
             finally:
                 if connection is not None:
                     connection.close()
-            operation = api.request("DELETE", f"/api/2.0/postgres/projects/{project_id}")
-            api.await_operation(operation)
             LakebaseState._provisioned.pop(project_id, None)
             deleted += 1
         return deleted

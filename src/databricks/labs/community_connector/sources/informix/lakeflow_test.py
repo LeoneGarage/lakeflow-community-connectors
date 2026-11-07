@@ -5290,6 +5290,33 @@ class LakeflowContractTests(unittest.TestCase):
             for row in connector.read_partition("app.orders", json.loads(json.dumps(part)), {})
         ]
 
+    def test_is_partitioned_looks_the_table_up_outside_capacity_and_releases_it(self):
+        # Reader setup asks for metadata only: queued for a capacity slot among a starting
+        # pipeline's flows, a wait that gave up would leave the table on the simple reader
+        # for the whole stream. A lookup that fails anyway says so.
+        connector = self._partitioned_connector()
+        seen = []
+        lookup = connector._registration_table
+
+        def registration_table(name, options):
+            seen.append(connector.options.get("_informix.bypass.connection.capacity"))
+            return lookup(name, options)
+
+        with (
+            mock.patch.object(connector, "_registration_table", side_effect=registration_table),
+            mock.patch.object(connector, "_release_worker_connection") as release,
+        ):
+            self.assertTrue(connector.is_partitioned("app.orders"))
+
+        self.assertEqual(seen, ["true"])
+        self.assertNotIn("_informix.bypass.connection.capacity", connector.options)
+        release.assert_called_once_with()
+        with (
+            mock.patch.object(connector, "_registration_table", side_effect=InformixError("down")),
+            self.assertLogs(informix_module.__name__, level="WARNING"),
+        ):
+            self.assertFalse(connector.is_partitioned("app.orders"))
+
     def test_partitioned_bootstrap_serves_page_zero_from_the_stage(self):
         # The first microbatch drains the snapshot and serves page 0. Page 0 reaches the
         # executor as a staged-page partition like every later page, not as rows embedded
@@ -6576,6 +6603,27 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(seed["phase"], "stream")
         self.assertEqual(seed["commit_lsn"], "125")
         self.assertTrue(seed.get("handoff_seeded"))
+
+    def test_migration_on_an_append_flow_mid_snapshot_records_and_stops(self):
+        # Under table.migration an append flow records and stops whatever its phase: a keyed
+        # capture can park mid-snapshot, so its cutover seed is a snapshot-phase offset.
+        # Capturing one parks it, and once the seed has committed the token is dropped.
+        bridge = FakeBridge()
+        _, mid = self.connector(bridge, **{"snapshot.page.size": "1"}).read_table(
+            "app.orders", {}, {}
+        )
+        self.assertEqual(mid["phase"], "snapshot")
+        append_migrate = {"table.migration": "true", "append.only.ingestion": "true"}
+
+        rows, parked = self.connector(bridge).read_table("app.orders", mid, append_migrate)
+
+        self.assertEqual(list(rows), [])
+        self.assertEqual(parked["snapshot"], mid["snapshot"])
+        ((_, token),) = self._lakebase.database.handoff.items()
+        self.assertEqual(json.loads(token["offset_json"])["phase"], "snapshot")
+        seed = dict(parked, handoff_seeded=True)
+        self.connector(bridge).read_table("app.orders", seed, append_migrate)
+        self.assertEqual(self._lakebase.database.handoff, {})
 
     def test_handoff_cutover_seeds_from_parked_offset_without_snapshot(self):
         bridge = FakeBridge()
@@ -12313,7 +12361,7 @@ class LakebaseStateReconnectTests(unittest.TestCase):
 
         resets = {"n": 0}
 
-        def fake_reset():
+        def fake_reset(_owner=None):
             resets["n"] += 1
             connector._lakebase_conn = None
 
@@ -12832,6 +12880,20 @@ class SharedCdcShardTests(unittest.TestCase):
         self.assertEqual(shard.shared_restart, 500)  # clamped back to the uncovered floor
         shard.ingest([{"op": "TIMEOUT", "lsn": 701}], {self.id_a: self.table_a}, 1, 701, 500)
         self.assertIsNotNone(shard.snapshot(self.id_a, 500))
+
+    def test_a_resubscribe_trims_what_the_consumer_has_consumed(self):
+        # A consumer on direct reads (here the shard is not ready) gets no view, so only its
+        # re-subscribes trim its buffer; a full buffer would otherwise stop the shard reading.
+        shard = _SharedCdcShard()
+        capture = _capture_descriptor(self.table_a)
+        shard.subscribe(self.id_a, self.table_a, capture, 0, 0)
+        shard.ingest(self._two_table_stream(), {self.id_a: self.table_a}, 1, 106, 0)
+        shard.mark_unready()
+
+        shard.subscribe(self.id_a, self.table_a, capture, 102, 102)
+
+        self.assertIsNone(shard.snapshot(self.id_a, 102))
+        self.assertEqual(list(shard.buffers[self.id_a]), [])
 
     def _widened_capture(self):
         # The capture after the table gained a column.
@@ -14594,11 +14656,11 @@ class SnapshotDaemonSeamTests(unittest.TestCase):
         seen = []
         original_reset = consumer._reset_lakebase_connection
 
-        def spy_reset():
+        def spy_reset(owner=None):
             # Capture the connection cached at reset time (the manifest probe opened one)
             # and confirm the reset actually closes and clears it.
             seen.append(getattr(consumer, "_lakebase_conn", None))
-            return original_reset()
+            return original_reset(owner)
 
         consumer._reset_lakebase_connection = spy_reset
 
@@ -14975,24 +15037,33 @@ class FairSlotQueueWiringTests(unittest.TestCase):
         # reopens it rather than leaving the slot held until its lease expires.
         import psycopg2
 
-        bridge = self._bridge()
-        bridge._lakebase_slot = slot = object()
-        bridge._lakebase_conn = reaped = mock.Mock(closed=0)
-        released = []
+        # The advisory backlog-hint write can also leave the connection open but in a
+        # failed transaction, which a release over it would fail on in the same way.
+        failures = (
+            (psycopg2.OperationalError("SSL SYSCALL error: EOF detected"), 2),
+            (psycopg2.InternalError("current transaction is aborted"), 0),
+        )
+        for error, closed_after in failures:
+            with self.subTest(error=type(error).__name__):
+                bridge = self._bridge()
+                bridge._lakebase_slot = slot = object()
+                bridge._lakebase_conn = stale = mock.Mock(closed=0)
+                released = []
 
-        def release(connection, released_slot):
-            if connection is reaped:
-                reaped.closed = 2  # what psycopg reports once a query on it fails
-                raise psycopg2.OperationalError("SSL SYSCALL error: EOF detected")
-            released.append(released_slot)
+                def release(connection, released_slot, stale=stale, error=error):
+                    if connection is stale:
+                        stale.closed = closed_after  # what psycopg reports after the failure
+                        raise error
+                    released.append(released_slot)
 
-        with (
-            mock.patch.object(informix_module, "release_slot", side_effect=release),
-            self.assertNoLogs(informix_module.__name__, level="WARNING"),
-        ):
-            bridge._release_connection_slot()
+                with (
+                    mock.patch.object(informix_module, "release_slot", side_effect=release),
+                    self.assertNoLogs(informix_module.__name__, level="WARNING"),
+                ):
+                    bridge._release_connection_slot()
 
-        self.assertEqual(released, [slot])
+                self.assertEqual(released, [slot])
+                stale.close.assert_called_once_with()
 
     def test_reconnect_after_reset_keeps_the_held_slot(self):
         # reset_transport keeps the slot for an in-place retry. A reconnect that claimed
@@ -16842,6 +16913,27 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
         self.assertEqual([(r["id"], r["value"]) for r in rows], [(1, "alpha"), (2, "beta")])
         for row in rows:
             self.assertEqual(row[informix_module.OP], "r")
+
+    def test_unl_hpl_record_with_a_null_last_column_keeps_it(self):
+        # HPL writes no trailing delimiter, so a NULL last column leaves the record ending in
+        # the delimiter, as an UNLOAD record always does. With HPL's own delimiter that is
+        # the empty field; with UNLOAD's, a record one field short still fails closed.
+        source = self._source("1\talpha\n2\t\n")
+        options = {"snapshot.source": source, "snapshot.unl.delimiter": "\t"}
+        rows, _ = self.connector(FakeBridge()).read_table("app.orders", {}, options)
+        self.assertEqual([(r["id"], r["value"]) for r in rows], [(1, "alpha"), (2, None)])
+        unload = {"snapshot.source": self._source("1|alpha|\n2|\n")}
+        connector = self.connector(FakeBridge(), registration_scope="unload-short-record")
+        with self.assertRaisesRegex(InformixError, "has 1 fields but the table has 2"):
+            list(connector.read_table("app.orders", {}, unload)[0])
+
+    def test_a_unl_cutover_seeds_from_the_token_not_the_extract(self):
+        # Under table.migration the partitioned reader must not serve the .unl extract: the
+        # cutover seeds from the parked token, as a staged snapshot's does.
+        connector = self.connector(FakeBridge())
+        options = {"snapshot.source": self._source("1|alpha|\n"), "snapshot.mode": "initial"}
+        self.assertTrue(connector._unl_snapshot_serve(options, {}))
+        self.assertFalse(connector._unl_snapshot_serve({**options, "table.migration": "true"}, {}))
 
     def test_unl_hpl_custom_delimiter_partitioned_fan_out_matches_serial(self):
         # The delimiter rides each unl_split descriptor, so the executor path parses an
