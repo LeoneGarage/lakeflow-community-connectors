@@ -5542,6 +5542,21 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertIs(raised.exception, dropped)
         self.assertEqual(opens.call_count, informix_module._TRANSIENT_VOLUME_IN_PROCESS_ATTEMPTS)
 
+    def test_an_embedded_replay_is_not_retried_by_the_plan(self):
+        # get_partitions' embedded replay is a real read with its own dropped-mount handling
+        # (a replay fails rather than return fewer rows), so the plan's in-place retry,
+        # meant for the staged-page and .unl serves, leaves it alone.
+        connector = self._partitioned_connector()
+        dropped = OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+        with (
+            mock.patch.object(connector, "_replay_embedded_range", side_effect=dropped) as replay,
+            mock.patch.object(informix_module.time, "sleep") as slept,
+            self.assertRaises(OSError),
+        ):
+            connector.get_partitions("app.orders", {}, _stream_offset(90), _stream_offset(95))
+        replay.assert_called_once()
+        slept.assert_not_called()
+
     def test_offset_planning_skips_the_lookup_where_nothing_is_served(self):
         # A delete flow or a stream-phase offset never page-serves, so latest_offset goes
         # straight to the embedded read: a catalog lookup there would take a connection slot
@@ -17240,6 +17255,39 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
             self.assertEqual(release.call_count, 1)
             connector.get_partitions("app.orders", options, {}, end)
         self.assertEqual(release.call_count, 2)
+
+    def test_a_dropped_mount_under_a_unl_partition_plan_is_retried_in_place(self):
+        # get_partitions lists and splits the extract off the Volume mount. Spark has logged
+        # the batch's end, so a dropped mount is retried in place, and one that stays down
+        # fails the batch with the OSError it is, for Spark to plan again.
+        connector = self.connector(FakeBridge())
+        options = {"snapshot.source": self._source("1|alpha|\n2|beta|\n")}
+        end = connector.latest_offset("app.orders", options, {})
+        expected = connector.get_partitions("app.orders", options, {}, end)
+        dropped = OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+        real_list = connector._list_unl_files
+        failures = [dropped, dropped]
+
+        def flaky(*args, **kwargs):
+            if failures:
+                raise failures.pop()
+            return real_list(*args, **kwargs)
+
+        with (
+            mock.patch.object(connector, "_list_unl_files", side_effect=flaky),
+            mock.patch.object(informix_module.time, "sleep") as slept,
+        ):
+            self.assertEqual(connector.get_partitions("app.orders", options, {}, end), expected)
+        self.assertEqual(slept.call_count, 2)
+
+        with (
+            mock.patch.object(connector, "_list_unl_files", side_effect=dropped) as listed,
+            mock.patch.object(informix_module.time, "sleep"),
+            self.assertRaises(OSError) as raised,
+        ):
+            connector.get_partitions("app.orders", options, {}, end)
+        self.assertIs(raised.exception, dropped)
+        self.assertEqual(listed.call_count, informix_module._TRANSIENT_VOLUME_IN_PROCESS_ATTEMPTS)
 
     def test_a_unl_serve_that_fails_to_plan_still_gives_back_its_session(self):
         # The boundary pin has opened a session by the time a bad extract fails the plan; the

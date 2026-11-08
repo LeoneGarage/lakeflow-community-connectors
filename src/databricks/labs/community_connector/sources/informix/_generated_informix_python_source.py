@@ -13978,8 +13978,7 @@ def register_lakeflow_source(spark):
             # ``.unl`` boundary pin opened is given back whether planning succeeds or fails. A
             # delete flow or a stream-phase offset never serves, so it skips the lookup, which
             # for a delete reader would take a slot its upsert reader may need. A dropped Volume
-            # mount is retried in place: returning the start offset instead would end a
-            # triggered update early, so the last attempt's error fails the batch.
+            # mount is retried in place (_plan_with_mount_retry).
 
             unl = self._unl_snapshot_serve(table_options, effective_start)
             if not unl and (
@@ -13988,28 +13987,46 @@ def register_lakeflow_source(spark):
                 or effective_start.get("phase") not in (None, "snapshot")
             ):
                 return None
-            for attempt_index in range(_TRANSIENT_VOLUME_IN_PROCESS_ATTEMPTS):
+
+            def plan() -> dict | None:
+                with self._metadata_access():
+                    table = self._table(table_name, table_options)
+                    if not unl:
+                        batch = self._snapshot_page_batch(table, effective_start, table_options)
+                        if batch is None:
+                            return None
+                        return self._snapshot_page_batch_offset(table, effective_start, batch)
+                    # File source: serve the extract as a window of splits per microbatch. Leaving
+                    # the embedded cache untouched steers the following get_partitions to the
+                    # unl_split fan-out instead of the driver-side embedded path. A gzip record
+                    # window is the exception: its rows were read here on the driver, so they are
+                    # cached for get_partitions exactly as an embedded read's are.
+                    end, rows = self._unl_snapshot_offset(table, table_options, effective_start)
+                    if rows is not None:
+                        self._partition_embedded_rows.clear()
+                        self._partition_embedded_rows[self._partition_offset_key(start_offset)] = (
+                            self._encode_embedded_rows(rows)
+                        )
+                    return end
+
+            return self._plan_with_mount_retry(plan)
+
+        @staticmethod
+        def _plan_with_mount_retry(  # pylint: disable=inconsistent-return-statements
+            plan: Callable[..., Any], *args: Any
+        ) -> Any:
+            # Docstring: Plan a staged-page or ``.unl`` microbatch, retrying a dropped mount in place.
+            #
+            # The plan reads the manifest, staged pages and extract files (and, for a ``.unl``
+            # boundary pin, the log bounds), so running it again is safe. It cannot answer a
+            # dropped Volume mount with an empty batch: returning the start offset from
+            # latest_offset would end a triggered update early, and get_partitions must serve
+            # the range latest_offset logged. So it tries again with backoff, and the last
+            # attempt's error fails the batch, which Spark plans again from the same offsets.
+
+            for attempt_index in itertools.count():
                 try:
-                    with self._metadata_access():
-                        table = self._table(table_name, table_options)
-                        if not unl:
-                            batch = self._snapshot_page_batch(table, effective_start, table_options)
-                            if batch is None:
-                                return None
-                            return self._snapshot_page_batch_offset(table, effective_start, batch)
-                        # File source: serve the extract as a window of splits per microbatch.
-                        # Leaving the embedded cache untouched steers the following
-                        # get_partitions to the unl_split fan-out instead of the driver-side
-                        # embedded path. A gzip record window is the exception: its rows were
-                        # read here on the driver, so they are cached for get_partitions exactly
-                        # as an embedded read's are.
-                        end, rows = self._unl_snapshot_offset(table, table_options, effective_start)
-                        if rows is not None:
-                            self._partition_embedded_rows.clear()
-                            self._partition_embedded_rows[self._partition_offset_key(start_offset)] = (
-                                self._encode_embedded_rows(rows)
-                            )
-                        return end
+                    return plan(*args)
                 except Exception as error:  # pylint: disable=broad-except
                     transient = isinstance(error, SharedStateAccessUnavailable) or _dropped_mount_error(
                         error
@@ -14018,7 +14035,6 @@ def register_lakeflow_source(spark):
                         raise
                     delay = min(0.25 * (2**attempt_index), _TRANSIENT_VOLUME_IN_PROCESS_MAX_SECONDS)
                     time.sleep(random.uniform(delay / 2, delay))
-            return None
 
         def latest_offset(
             self,
@@ -14121,25 +14137,20 @@ def register_lakeflow_source(spark):
                 end["stage_scope"] = stage_scope
             return _with_backlog_streak(end, effective_start, True)
 
-        def get_partitions(
+        def _served_partitions(
             self,
-            table_name: str,
+            table: Table,
             table_options: dict[str, str],
-            start_offset: dict | None = None,
-            end_offset: dict | None = None,
-        ) -> Sequence[dict]:
-            if start_offset is None and end_offset is None:
-                # Batch read. Not partitioned here -- raising makes LakeflowBatchReader
-                # fall back to read_table (a single non-partitioned batch).
-                # 175: Informix does not support partitioned batch reads
-                raise NotImplementedError(_m(175))
-            if start_offset == end_offset:
-                return []
-            table = self._table(table_name, table_options)
-            # Planning needs no source session: give back any the lookup opened (an embedded
-            # replay below takes its own).
-            self._release_worker_connection()
-            effective_start = self._effective_start_offset(start_offset or {})
+            start_offset: dict | None,
+            end_offset: dict | None,
+            effective_start: dict,
+        ) -> list[dict] | None:
+            # Docstring: The partitions of a ``.unl`` split window or staged page batch, else None.
+            #
+            # Run through _plan_with_mount_retry: like latest_offset's plan it reads only the
+            # Volume and Lakebase, so a dropped mount is retried in place. The embedded replay in
+            # get_partitions stays outside, as a real read that handles the mount itself.
+
             if self._unl_snapshot_serve(table_options, effective_start):
                 # File source: fan this microbatch's split window across executors -- one
                 # unl_split descriptor per byte split in [start_split, start_split+window). The
@@ -14214,6 +14225,32 @@ def register_lakeflow_source(spark):
                     }
                     for page_index in range(start_page, end_page)
                 ]
+            return None
+
+        def get_partitions(
+            self,
+            table_name: str,
+            table_options: dict[str, str],
+            start_offset: dict | None = None,
+            end_offset: dict | None = None,
+        ) -> Sequence[dict]:
+            if start_offset is None and end_offset is None:
+                # Batch read. Not partitioned here -- raising makes LakeflowBatchReader
+                # fall back to read_table (a single non-partitioned batch).
+                # 175: Informix does not support partitioned batch reads
+                raise NotImplementedError(_m(175))
+            if start_offset == end_offset:
+                return []
+            table = self._table(table_name, table_options)
+            # Planning needs no source session: give back any the lookup opened (an embedded
+            # replay below takes its own).
+            self._release_worker_connection()
+            effective_start = self._effective_start_offset(start_offset or {})
+            served = self._plan_with_mount_retry(
+                self._served_partitions, table, table_options, start_offset, end_offset, effective_start
+            )
+            if served is not None:
+                return served
             encoded = self._partition_embedded_rows.pop(self._partition_offset_key(start_offset), None)
             if encoded is None:
                 # F2: a cache miss (Spark re-planning an uncommitted batch after a driver
