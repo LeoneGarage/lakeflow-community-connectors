@@ -6597,6 +6597,19 @@ def register_lakeflow_source(spark):
     )
 
 
+    def _snapshot_position(offset: Any) -> tuple | None:
+        # Docstring: Where a snapshot-phase offset points: (snapshot LSN, page, record); else None.
+
+        if not isinstance(offset, dict) or offset.get("phase") != "snapshot":
+            return None
+        position = offset.get("snapshot") or {}
+        return (
+            str(offset.get("snapshot_lsn")),
+            int(position.get("page_index", 0)),
+            int(position.get("record_index", 0)),
+        )
+
+
     def _replay_between_offsets(start, end, read, options, connector_options):
         # Docstring: Replay ``[start, end)`` by reading to ``end`` and stopping there.
         #
@@ -6638,6 +6651,11 @@ def register_lakeflow_source(spark):
         if stop is None:
             # 1: Informix cannot replay an offset range whose end has no commit_lsn
             raise InformixError(_m(1))
+        end_position = _snapshot_position(end)
+        if end_position is not None and _snapshot_position(start) == end_position:
+            # A snapshot range that served nothing (a retry yield at one page): reading would
+            # serve that page, which the batch did not hold.
+            return iter(())
         # The first incremental range starts at {} and still emits a chunk. Bound it
         # whenever either side identifies an in-progress copy; a start-side block with
         # no end-side block is the final range and is represented by JSON null below.
@@ -6692,10 +6710,23 @@ def register_lakeflow_source(spark):
                     continue
                 record_parts.append(records)
                 if isinstance(reached, dict) and reached.get("commit_lsn") is not None:
+                    position = _snapshot_position(reached)
+                    if position is not None and (
+                        end_position is None
+                        or (position[0] == end_position[0] and position[1:] < end_position[1:])
+                    ):
+                        # The simple reader serves a staged snapshot a page per read, and a batch
+                        # the partitioned reader logged can span several: read on to its end.
+                        replay_start = reached
+                        continue
                     if (
                         isinstance(replay_start, dict)
-                        and replay_start.get("commit_lsn") is not None
-                        and int(replay_start["commit_lsn"]) < int(reached["commit_lsn"]) < int(stop)
+                        and (
+                            # An initial range starts from no position (a copy's first batch).
+                            replay_start.get("commit_lsn") is None
+                            or int(replay_start["commit_lsn"]) < int(reached["commit_lsn"])
+                        )
+                        and int(reached["commit_lsn"]) < int(stop)
                     ):
                         # One poll can go idle short of the committed end; the original
                         # read then advanced across the quiet log in several batches.
@@ -13701,7 +13732,11 @@ def register_lakeflow_source(spark):
                 try:
                     table = self._table(table_name, table_options)
                     migration = self._table_migration(table_options)
-                    if not migration:
+                    if not migration and self._replay_stop_lsn(table_options) is None:
+                        # A replay is skipped too: an initial range starts from no offset, so
+                        # it would retain no scope and drop the one Spark's logged end names.
+                        # The read that follows from that end cleans up, keeping it.
+                        #
                         # Skip obsolete-scope cleanup for the whole migration window. On a
                         # same-pipeline relocation the *capturing* flow's scope looks like an
                         # ordinary previous update, and the cutover-seed read (empty checkpoint,
@@ -15574,6 +15609,7 @@ def register_lakeflow_source(spark):
             high_water = self._initial_lsn(table, owner=False, wait=False, scope=scope)
             if high_water is None:
                 return None
+            self._schema_transition_waits.pop((table.identity, "resnapshot"), None)
             schema_id = self._snapshot_schema_ids[(scope, table.identity)]
             return {
                 **_offset(high_water, high_water, high_water, None, "stream", table, schema_id, scope),
@@ -15590,18 +15626,37 @@ def register_lakeflow_source(spark):
             # publishes on its read. Until it has, this yields a retry offset at the same
             # position: an unchanged offset reads as a drained source, which would end a
             # triggered update with no seed, and a later update's scope never gets one. A
-            # replayed wait stays where it was.
+            # replayed wait stays where it was; a replayed move to the boundary lands on it.
 
             checkpoint = _validated_offset(start_offset)
             replay_stop = self._replay_stop_lsn(table_options)
             if replay_stop is not None and replay_stop <= int(checkpoint["commit_lsn"]):
                 return iter(()), dict(start_offset)
+            if replay_stop is not None:
+                # From an expired checkpoint this reader only waits in place or moves to the
+                # resnapshot boundary, a batch with no rows. Replayed in a later update, that
+                # boundary is under the earlier update's scope, so a lookup here never finds it:
+                # land on the logged end instead. A batch read before the log expired under a
+                # stopped pipeline held deletes that are gone from the log either way.
+                # 426: Informix delete channel for '{}' replays a batch from expired checkpoint LSN
+                # {} by landing on its logged end {} without reading: such a batch moved the channel
+                # to the resnapshot boundary and held no rows, unless the log expired while the
+                # pipeline was stopped, in which case the deletes it read are no longer in the log
+                logging.getLogger(__name__).warning(
+                    _m(426, table.exposed_name, checkpoint["commit_lsn"], replay_stop)
+                )
+                position = str(replay_stop)
+                return iter(()), {
+                    **checkpoint,
+                    "commit_lsn": position,
+                    "change_lsn": position,
+                    "begin_lsn": position,
+                    "tx_id": None,
+                }
             seed = self._resnapshot_delete_seed(table, self._resnapshot_scope(table, checkpoint))
             if seed is not None:
                 return iter(()), seed
-            if replay_stop is not None:
-                return iter(()), dict(start_offset)
-            return iter(()), self._trigger_boundary_retry_offset(start_offset)
+            return iter(()), self._resnapshot_retry_offset(table, start_offset)
 
         def _read_table_deletes(
             self,
@@ -15671,7 +15726,7 @@ def register_lakeflow_source(spark):
                     # until then yield a retry that does not run out, as a checkpointed reader of
                     # an expired position does (_read_resnapshotted_deletes).
                     seed = self._resnapshot_delete_seed(table, self._pipeline_scope())
-                    return iter(()), seed or self._trigger_boundary_retry_offset(bootstrap_offset)
+                    return iter(()), seed or self._resnapshot_retry_offset(table, bootstrap_offset)
                 floor_state = self._read_delete_snapshot_floor(table, schema_id, fingerprint)
                 floor = floor_state[0] if floor_state else None
                 bootstrap_lsn = high_water
@@ -17247,11 +17302,18 @@ def register_lakeflow_source(spark):
             # The stream reader may return a freshly built offset that drops the
             # incremental block; the schema it used is authoritative for chunking.
             live = self._refresh_table_schema(table, None)
-            if end.get("schema_fingerprint") != _schema_fingerprint(live):
+            if (
+                end.get("schema_fingerprint") != _schema_fingerprint(live)
+                and self._replay_stop_lsn(options) is None
+            ):
                 # A step to a generation the live layout has moved past reads nothing under it
                 # (see _read_stream), so the copy keeps its cursor until a read reaches the live
                 # schema: a chunk read now would land rows under columns that are not current.
-                return iter(output), {**end, "incremental": incremental}
+                # A replay reads the chunk its batch read, under the live layout, to the cursor
+                # Spark logged (none past a metadata-only step, whose cursor did not move).
+                return iter(output), _with_backlog_streak(
+                    {**end, "incremental": incremental}, checkpoint, True
+                )
             table = live
             if not incremental["done"]:
                 chunk_rows, incremental = self._next_incremental_chunk(table, incremental, options)
@@ -20190,6 +20252,36 @@ def register_lakeflow_source(spark):
             self._validate_immutable_record_header(record, "schema-rejection", table.exposed_name)
             return str(record.get("error") or "no reason was recorded")
 
+        def _triggered_wait_exceeded(self, key: tuple) -> int | None:
+            # Docstring: The wait limit once a triggered reader has waited past it on ``key``.
+            #
+            # Measured from the first yield of the wait, at cdc.shared.state.wait.seconds; None
+            # for a continuous update, which fails as a whole once the flow it waits on fails.
+
+            if not self._trigger_available_now:
+                return None
+            started = self._schema_transition_waits.setdefault(key, time.monotonic())
+            limit = int(
+                self.options.get("cdc.shared.state.wait.seconds", str(_SHARED_STATE_WAIT_SECONDS))
+            )
+            return limit if time.monotonic() - started >= limit else None
+
+        def _resnapshot_retry_offset(self, table: Table, start_offset: dict) -> dict:
+            # Docstring: Yield while the upsert reader publishes the update's resnapshot boundary.
+            #
+            # Bounded in a triggered update, which ends only when every flow has: the upsert
+            # reader's flow may have failed, or its own checkpoint is still retained while this
+            # reader's is not, and then no boundary comes.
+
+            limit = self._triggered_wait_exceeded((table.identity, "resnapshot"))
+            if limit is not None:
+                # 427: The upsert reader has not published a resnapshot boundary for '{}' in {}
+                # seconds, so this update cannot finish: its flow has most likely failed (see its
+                # error), or its checkpoint is still retained while the delete channel's is not, which
+                # needs a full refresh
+                raise InformixError(_m(427, table.exposed_name, limit))
+            return self._trigger_boundary_retry_offset(start_offset)
+
         def _ensure_schema_transition_wait_bounded(
             self, table: Table, checkpoint_schema_id: str
         ) -> None:
@@ -20202,15 +20294,8 @@ def register_lakeflow_source(spark):
             # cdc.shared.state.wait.seconds from the first yield. A healthy upsert reader
             # publishes on its first read after the change.
 
-            if not self._trigger_available_now:
-                return
-            started = self._schema_transition_waits.setdefault(
-                (table.identity, checkpoint_schema_id), time.monotonic()
-            )
-            limit = int(
-                self.options.get("cdc.shared.state.wait.seconds", str(_SHARED_STATE_WAIT_SECONDS))
-            )
-            if time.monotonic() - started >= limit:
+            limit = self._triggered_wait_exceeded((table.identity, checkpoint_schema_id))
+            if limit is not None:
                 # 307: The upsert reader has not published the schema transition for '{}' in {} seconds,
                 # so this update cannot finish. Its flow has most likely failed: see its error, fix the
                 # cause, and restart the pipeline

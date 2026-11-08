@@ -424,5 +424,7 @@
 "Informix offset has an invalid schema_transition_retry_count",
 "Informix file snapshot of '{}' is part-way through a serve in split windows, which only stream.partitioned=true can continue; set it back to true until the snapshot has finished, and no full refresh is needed",
 "Informix offset has an invalid update_fingerprint",
-"Informix schema history for '{}' returns to node {} without reaching the live layout; run a full refresh"
+"Informix schema history for '{}' returns to node {} without reaching the live layout; run a full refresh",
+"Informix delete channel for '{}' replays a batch from expired checkpoint LSN {} by landing on its logged end {} without reading: such a batch moved the channel to the resnapshot boundary and held no rows, unless the log expired while the pipeline was stopped, in which case the deletes it read are no longer in the log",
+"The upsert reader has not published a resnapshot boundary for '{}' in {} seconds, so this update cannot finish: its flow has most likely failed (see its error), or its checkpoint is still retained while the delete channel's is not, which needs a full refresh"
 ]

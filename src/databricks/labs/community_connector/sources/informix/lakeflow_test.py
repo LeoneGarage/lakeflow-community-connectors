@@ -5470,6 +5470,70 @@ class LakeflowContractTests(unittest.TestCase):
 
                 self.assertEqual([p["page_index"] for p in partitions], list(logged))
 
+    def test_an_initial_snapshot_replay_in_a_new_update_keeps_the_logged_manifest(self):
+        # The first batch of a staged snapshot is replayed after a restart. A replay starts
+        # from no offset, so it looks like a fresh read and would clean up the earlier
+        # update's state, but Spark goes on from the end it logged, whose pages live there.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 4)]
+        pipeline = "11111111-1111-1111-1111-111111111111"
+
+        def connector(update):
+            reader = self.connector(bridge, **{"snapshot.page.size": "1"})
+            reader.set_registration_scope(f"{pipeline}_@_{update}")
+            return reader
+
+        first = connector("22222222-2222-2222-2222-222222222222")
+        _, end = first.read_table("app.orders", {}, {})
+        self.assertEqual(end["phase"], "snapshot")
+        restarted = connector("33333333-3333-3333-3333-333333333333")
+        replay_options = {}
+        cleanup = informix_module.delete_obsolete_scoped_state_records
+        with mock.patch.object(
+            informix_module, "delete_obsolete_scoped_state_records", wraps=cleanup
+        ) as deletes:
+            list(
+                informix_module._replay_between_offsets(
+                    {},
+                    end,
+                    lambda offset: restarted.read_table("app.orders", offset, replay_options),
+                    replay_options,
+                    restarted.options,
+                )
+            )
+            # Every cleanup keeps the scope Spark's logged end names.
+            for call in deletes.call_args_list:
+                self.assertEqual(call.args[5], end["pipeline_scope"])
+            rows, _ = restarted.read_table("app.orders", end, {})
+
+        self.assertEqual([row["id"] for row in rows], [2])
+
+    def test_a_simple_reader_replay_of_a_multi_page_batch_serves_every_page(self):
+        # stream.partitioned switched off while a batch of several staged pages is
+        # uncommitted: the simple reader replays it a page per read, so the replay keeps
+        # reading until it reaches the page Spark logged instead of stopping after one.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 7)]
+        options = {"snapshot.page.size": "1", "stream.partitioned.snapshot.pages.per.batch": "3"}
+        partitioned = self._partitioned_connector(bridge, registration_scope="toggle", **options)
+        first = partitioned.latest_offset("app.orders", {}, {})
+        second = partitioned.latest_offset("app.orders", {}, first)
+        logged = range(first["snapshot"]["page_index"], second["snapshot"]["page_index"])
+        simple = self.connector(bridge, registration_scope="toggle", **{"snapshot.page.size": "1"})
+        replay_options = {}
+
+        replayed = list(
+            informix_module._replay_between_offsets(
+                first,
+                second,
+                lambda offset: simple.read_table("app.orders", offset, replay_options),
+                replay_options,
+                simple.options,
+            )
+        )
+
+        self.assertEqual([row["id"] for row in replayed], [page + 1 for page in logged])
+
     def test_partitioned_snapshot_matches_the_serial_serve(self):
         # The partitioned drive yields exactly the rows a serial read_table drive
         # yields, in the same order -- the fan-out changes only how pages are read.
@@ -6647,6 +6711,27 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(seeded["commit_lsn"], "150")
         self.assertNotIn("trigger_boundary_retry_count", seeded)
 
+    def test_a_triggered_delete_reader_waits_for_a_resnapshot_boundary_only_so_long(self):
+        # A triggered update ends only when every flow has. A delete reader of an expired
+        # checkpoint waiting for a resnapshot boundary that never comes (the upsert flow
+        # failed, or its own checkpoint is still retained) fails once the wait passes
+        # cdc.shared.state.wait.seconds rather than yield forever.
+        bridge = FakeBridge()
+        bridge.minimum = 91
+        bridge.now = 150
+        checkpoint = _stream_offset(90)
+        checkpoint["pipeline_scope"] = "f" * 32
+        connector = self.connector(bridge, **{"cdc.shared.state.wait.seconds": "5"})
+        connector._trigger_available_now = True
+        options = {"snapshot.mode": "auto_snapshot"}
+        _, waiting = connector.read_table_deletes("app.orders", checkpoint, options)
+        self.assertEqual(waiting["commit_lsn"], checkpoint["commit_lsn"])
+        table = connector._table("app.orders", {})
+        connector._schema_transition_waits[(table.identity, "resnapshot")] -= 10
+
+        with self.assertRaisesRegex(InformixError, "resnapshot boundary for .* in 5 seconds"):
+            connector.read_table_deletes("app.orders", waiting, options)
+
     def test_an_auto_snapshot_resnapshot_seeds_a_delete_flow_that_never_checkpointed(self):
         # The upsert reader published the update's channel start at its expired checkpoint
         # before auto_snapshot replaced it; the lowest start wins, so the record keeps naming
@@ -6753,6 +6838,81 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(copied["schema_fingerprint"], live)
         self.assertTrue(list(rows))
 
+    def test_a_replay_of_a_copy_step_that_read_a_chunk_reads_it_after_a_later_change(self):
+        # A copy batch stepped to a new schema and read a chunk under it, then another
+        # column was added before the batch committed. Replayed, the step is one the live
+        # layout moved past, but the batch read a chunk: the replay reads it, under the live
+        # layout, to the committed cursor.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 5)]
+        options = {"snapshot.mode": "incremental", "snapshot.page.size": "1"}
+
+        def connector(scope):
+            return self.connector(bridge, registration_scope=scope)
+
+        _, start = connector("update-a").read_table("app.orders", {}, dict(options))
+        bridge.tables[0]["columns"].append({"name": "b", "type_name": "INTEGER", "nullable": True})
+        bridge.rows = [dict(row, b=None) for row in bridge.rows]
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+        rows, end = connector("update-b").read_table("app.orders", start, dict(options))
+        original = [row["id"] for row in rows]
+        self.assertNotEqual(end["incremental"]["last_pk"], start["incremental"]["last_pk"])
+        bridge.tables[0]["columns"].append({"name": "c", "type_name": "INTEGER", "nullable": True})
+        bridge.rows = [dict(row, c=None) for row in bridge.rows]
+        bridge.now = 140
+
+        replayed = connector("update-c")._replay_embedded_range(
+            "app.orders", start, end, dict(options)
+        )
+
+        self.assertEqual([row["id"] for row in replayed], original)
+
+    def test_an_initial_copy_replay_keeps_polling_change_data_a_poll_left_short(self):
+        # The copy's first batch read changes after its boundary along with chunk 0. Its
+        # replay starts from no offset, and a first poll short of the logged end keeps
+        # polling from where it stopped, as a replay from a position does.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 5)]
+        options = {"snapshot.mode": "incremental", "snapshot.page.size": "1"}
+        changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 100},
+            {
+                "op": "INSERT",
+                "tx_id": 7,
+                "lsn": 101,
+                "table": "demo:app.orders",
+                "row": {"id": 7, "value": "g"},
+            },
+            {"op": "COMMIT", "tx_id": 7, "lsn": 102},
+            {"op": "BEGIN", "tx_id": 8, "lsn": 104},
+            {
+                "op": "INSERT",
+                "tx_id": 8,
+                "lsn": 105,
+                "table": "demo:app.orders",
+                "row": {"id": 8, "value": "h"},
+            },
+            {"op": "COMMIT", "tx_id": 8, "lsn": 106},
+            {"op": "TIMEOUT", "lsn": 110},
+        ]
+        bridge.changes = changes
+        connector = self.connector(bridge)
+        rows, end = connector.read_table("app.orders", {}, dict(options))
+        original = sorted(row["id"] for row in rows)
+        self.assertEqual(end["commit_lsn"], "106")
+        short = changes[:3] + [{"op": "TIMEOUT", "lsn": 103}]
+        polls = []
+
+        def read_changes(tables, start_lsn, timeout_seconds, max_records):
+            polls.append(start_lsn)
+            return list(short if len(polls) == 1 else changes)
+
+        with mock.patch.object(bridge, "read_changes", side_effect=read_changes):
+            replayed = list(connector._replay_embedded_range("app.orders", {}, end, dict(options)))
+
+        self.assertEqual(sorted(row["id"] for row in replayed), original)
+
     def test_a_chunked_replay_keeps_polling_change_data_a_poll_left_short(self):
         # An incremental batch read its changes and a chunk. Replayed, its first change poll
         # stops short of the committed end (a direct poll caps what the shared reader had
@@ -6808,6 +6968,49 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(len(polls), 2)
         # The second poll starts at the committed cursor and reads no chunk.
         self.assertEqual(chunks.call_count, 1)
+
+    def test_an_auto_snapshot_delete_reseed_replayed_in_a_later_update_lands_on_its_end(self):
+        # The delete reader moved its expired checkpoint to the resnapshot boundary, and the
+        # pipeline stopped before that batch committed. The next update replays it: the
+        # boundary is under the earlier update's scope, where a lookup from this update never
+        # looks, so the replay lands on the logged end without reading, and says so.
+        bridge = FakeBridge()
+        bridge.minimum = 91
+        bridge.now = 150
+        checkpoint = _stream_offset(90)
+        checkpoint["pipeline_scope"] = "f" * 32
+        options = {"snapshot.mode": "auto_snapshot", "snapshot.page.size": "1"}
+        _, upsert = self.connector(bridge, registration_scope="u1").read_table(
+            "app.orders", checkpoint, dict(options)
+        )
+        _, seed = self.connector(bridge, registration_scope="u1").read_table_deletes(
+            "app.orders", checkpoint, dict(options)
+        )
+        self.assertEqual(seed["commit_lsn"], "150")
+        bridge.now = 170
+        self.connector(bridge, registration_scope="u2").read_table(
+            "app.orders", upsert, dict(options)
+        )
+        replaying = self.connector(bridge, registration_scope="u2")
+        replay_options = dict(options)
+
+        with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
+            rows = list(
+                informix_module._replay_between_offsets(
+                    checkpoint,
+                    seed,
+                    lambda offset: replaying.read_table_deletes(
+                        "app.orders", offset, replay_options
+                    ),
+                    replay_options,
+                    replaying.options,
+                )
+            )
+
+        self.assertEqual(rows, [])
+        self.assertTrue(any("landing on its logged end 150" in line for line in logs.output))
+        _, after = replaying.read_table_deletes("app.orders", seed, dict(options))
+        self.assertEqual(after["commit_lsn"], "150")
 
     def test_snapshot_mode_auto_snapshot_starts_incrementally_without_checkpoint(self):
         bridge = FakeBridge()
