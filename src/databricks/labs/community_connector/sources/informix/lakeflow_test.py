@@ -5629,6 +5629,40 @@ class LakeflowContractTests(unittest.TestCase):
                     connector.latest_offset("app.orders", {}, start)
                 lookup.assert_not_called()
 
+    def test_a_restored_seed_served_from_its_pages_drops_the_cutover_tokens(self):
+        # A seed taken mid-snapshot is served by the page plan after Restore, not by the
+        # read path that drops the tokens the cutover left; the plan must drop them, once.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 6)]
+        options = {"snapshot.page.size": "1", "stream.partitioned.snapshot.pages.per.batch": "2"}
+        connector = self._partitioned_connector(bridge, **options)
+        first = connector.latest_offset("app.orders", {}, {})
+
+        with mock.patch.object(connector, "_drop_orphaned_handoff_tokens") as drop:
+            end = connector.latest_offset("app.orders", {}, dict(first, handoff_seeded=True))
+            connector.latest_offset("app.orders", {}, end)
+
+        drop.assert_called_once()
+        self.assertNotIn("handoff_seeded", end)
+
+    def test_a_snapshot_finished_in_a_later_update_cleans_the_stage_it_started_in(self):
+        # Offsets keep the scope that staged the pages, so the first stream read cleans that
+        # stage, not one under the current update's scope, which holds nothing.
+        connector = self.connector(FakeBridge(), registration_scope="later-update")
+        table = connector._table("app.orders", {})
+        offset = _stream_offset()  # written under the earlier update's scope
+        self.assertNotEqual(offset["pipeline_scope"], connector._pipeline_scope())
+        staged = connector._snapshot_stage_namespace(
+            table, offset["pipeline_scope"], offset["schema_id"]
+        )
+
+        with mock.patch.object(
+            informix_module.PurePythonInformixBridge, "_remove_connection_slot_tree"
+        ) as remove:
+            connector._cleanup_completed_snapshot_stage(table, offset)
+
+        self.assertEqual(remove.call_args.args[0], staged)
+
     def test_a_page_serve_plan_bypasses_capacity_and_gives_back_its_session(self):
         # The serve plans from metadata, like registration: it must not queue behind running
         # reads for a slot, and it gives the session back even when planning fails.
@@ -5677,22 +5711,26 @@ class LakeflowContractTests(unittest.TestCase):
 
     def test_a_replanned_first_batch_of_an_empty_table_serves_nothing_new(self):
         # The drain of an empty table publishes a page_count 0 manifest and a stream end. A
-        # driver restarted before that batch commits re-plans it with no cache: the replay
-        # finds the same manifest and serves nothing, rather than a fresh snapshot of rows
-        # inserted since, which CDC from the boundary delivers.
-        empty = FakeBridge()
-        empty.rows = []
-        end = self._partitioned_connector(empty).latest_offset("app.orders", {}, {})
-        self.assertEqual(end["phase"], "stream")
-        bridge = FakeBridge()
-        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 8)]
-        restarted = self._partitioned_connector(bridge, **{"snapshot.page.size": "2"})
+        # batch re-planned with no cache, in the same update or a retried one, is that
+        # manifest's empty serve: not a replay, which in a new update would snapshot rows
+        # inserted since afresh while CDC from the boundary delivers them as well.
+        for scope in ("failed-update", "retried-update"):
+            with self.subTest(scope=scope):
+                empty = FakeBridge()
+                empty.rows = []
+                first = self._partitioned_connector(empty, registration_scope="failed-update")
+                end = first.latest_offset("app.orders", {}, {})
+                self.assertEqual(end["phase"], "stream")
+                bridge = FakeBridge()
+                bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 8)]
+                restarted = self._partitioned_connector(
+                    bridge, registration_scope=scope, **{"snapshot.page.size": "2"}
+                )
 
-        partitions = restarted.get_partitions("app.orders", {}, {}, end)
+                partitions = restarted.get_partitions("app.orders", {}, {}, end)
 
-        served = [r for p in partitions for r in restarted.read_partition("app.orders", p, {})]
-        self.assertEqual(served, [])
-        self.assertEqual(bridge.snapshot_calls, [])
+                self.assertEqual(partitions, [])
+                self.assertEqual(bridge.snapshot_calls, [])
 
     def test_partitioned_bootstrap_replan_serves_page_zero_without_a_read(self):
         # Spark re-plans an uncommitted first microbatch after a driver restart or a retried
@@ -7366,6 +7404,17 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(initialized["commit_lsn"], "90")
 
+    def test_the_delete_channel_check_reads_append_and_key_options_as_the_read_does(self):
+        # Append-only for the whole connection has no delete channel to wait for, with or
+        # without a cached table, and a primary.keys naming a column the table does not
+        # ingest fails at once with the read path's error, not after waiting.
+        appended = self.connector(FakeBridge(), **{"append.only.ingestion": "true"})
+        self.assertTrue(appended._upsert_channel_start_exists("app.orders", {}))
+        keyed = self.connector(FakeBridge())
+        keyed.list_tables()
+        with self.assertRaisesRegex(InformixError, "names column.s. not present.*missing"):
+            keyed._upsert_channel_start_exists("app.orders", {"primary.keys": "missing"})
+
     def test_a_keyless_table_keyed_by_an_option_waits_for_its_upsert_channel(self):
         # primary.keys gives a physically keyless table a key, and with it a delete channel:
         # its delete reader must find the upsert reader's channel start in Lakebase before
@@ -7641,6 +7690,37 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(lagging_b["commit_lsn"], checkpoint_b["commit_lsn"])
         self.assertEqual(lagging_c["schema_fingerprint"], checkpoint_c["schema_fingerprint"])
         self.assertEqual(lagging_c["commit_lsn"], checkpoint_c["commit_lsn"])
+
+    def test_a_lagging_wildcard_key_reader_takes_a_drop_and_an_add_one_step_at_a_time(self):
+        # The README's rule for a whole-row key: drop one column, run the pipeline, then add
+        # another. A reader still at the first generation must follow the recorded steps,
+        # each one change, rather than be refused because the two together are both.
+        bridge = FakeBridge()
+        bridge.tables[0]["columns"].append(
+            {"name": "dropped", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.rows = [dict(row, dropped=None) for row in bridge.rows]
+        options = {"primary.keys": "*", "snapshot.mode": "initial"}
+
+        def read(scope, checkpoint):
+            connector = self.connector(bridge, registration_scope=scope)
+            return connector.read_table("app.orders", checkpoint, dict(options))[1]
+
+        checkpoint_a = read("update-a", {})
+        bridge.tables[0]["columns"].pop()
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+        checkpoint_b = read("update-b", checkpoint_a)
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 140
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 140}]
+        read("update-c", checkpoint_b)
+
+        lagging = read("update-d", checkpoint_a)
+
+        self.assertEqual(lagging["schema_fingerprint"], checkpoint_b["schema_fingerprint"])
 
     def test_future_immutable_schema_transition_fails_closed(self):
         bridge = FakeBridge()
@@ -13296,6 +13376,86 @@ class SharedCdcShardTests(unittest.TestCase):
         shard.ingest(stream, {self.id_a: self.table_a}, 1, 106, 0)
         self.assertEqual([tx.tx_id for tx in shard.snapshot(self.id_a, 0).committed], [1])
 
+    def _table_a_tx(self, tx_id, lsn):
+        # One transaction on table a: BEGIN at lsn, its insert, COMMIT at lsn + 2.
+        return [
+            {"op": "BEGIN", "tx_id": tx_id, "lsn": lsn},
+            {
+                "op": "INSERT",
+                "tx_id": tx_id,
+                "lsn": lsn + 1,
+                "table": self.table_a.identity,
+                "row": {"id": tx_id, "value": "a"},
+            },
+            {"op": "COMMIT", "tx_id": tx_id, "lsn": lsn + 2},
+        ]
+
+    def test_a_read_in_flight_when_a_table_starts_over_leaves_it_alone(self):
+        # A read activated above the floor of a table that started over while it ran cannot
+        # cover that table. Delivering it the read's transactions would move its cursor past
+        # the older ones the covering read from its floor then brings, and lose them.
+        shard = _SharedCdcShard()
+        capture = _capture_descriptor(self.table_a)
+        tables = {self.id_a: self.table_a}
+        shard.subscribe(self.id_a, self.table_a, capture, 0, 0)
+        shard.ingest(self._table_a_tx(1, 100) + [{"op": "TIMEOUT", "lsn": 110}], tables, 1, 110, 0)
+        shard.subscribe(self.id_a, self.table_a, capture, 102, 102)
+        shard.subscribe(self.id_a, self.table_a, capture, 0, 0)  # starts over mid-read
+
+        shard.ingest(
+            self._table_a_tx(3, 300) + [{"op": "TIMEOUT", "lsn": 310}], tables, 1, 310, 200
+        )
+
+        self.assertIsNone(shard.snapshot(self.id_a, 0))
+        covering = self._table_a_tx(1, 100) + self._table_a_tx(3, 300)
+        shard.ingest(covering + [{"op": "TIMEOUT", "lsn": 310}], tables, 1, 310, 0)
+        self.assertEqual([tx.tx_id for tx in shard.snapshot(self.id_a, 0).committed], [1, 3])
+
+    def test_a_floor_moved_back_starts_the_table_over(self):
+        # An open transaction older than the consumer's floor may never have been
+        # assembled, and the cursor would skip it once a read from the lower floor does.
+        shard = _SharedCdcShard()
+        capture = _capture_descriptor(self.table_a)
+        shard.subscribe(self.id_a, self.table_a, capture, 102, 102)
+        shard.ingest(self._table_a_tx(3, 300), {self.id_a: self.table_a}, 1, 310, 102)
+        self.assertIsNotNone(shard.snapshot(self.id_a, 102))
+
+        shard.subscribe(self.id_a, self.table_a, capture, 102, 50)
+
+        self.assertIsNone(shard.snapshot(self.id_a, 102))
+        self.assertEqual(shard.shared_restart, 50)
+        # The read from the lower floor assembles transaction 2, begun at 60 and committed
+        # at 250, below the cursor transaction 3 left; the consumer must get it.
+        older = [
+            {"op": "BEGIN", "tx_id": 2, "lsn": 60},
+            {
+                "op": "INSERT",
+                "tx_id": 2,
+                "lsn": 61,
+                "table": self.table_a.identity,
+                "row": {"id": 2, "value": "a"},
+            },
+            {"op": "COMMIT", "tx_id": 2, "lsn": 250},
+        ]
+        shard.ingest(older + self._table_a_tx(3, 300), {self.id_a: self.table_a}, 1, 310, 50)
+        self.assertEqual([tx.tx_id for tx in shard.snapshot(self.id_a, 102).committed], [2, 3])
+
+    def test_a_view_reports_a_log_position_no_older_than_its_commits(self):
+        # The daemon samples current_lsn before its read, which can commit into the next
+        # logical log. A consumer that took those commits must not read as being ahead of
+        # the log (a false reinitialized-log failure), and one that moved past the shard by
+        # a direct read gets no view at all.
+        shard = _SharedCdcShard()
+        shard.subscribe(self.id_a, self.table_a, _capture_descriptor(self.table_a), 0, 0)
+        sampled, begin = (1 << 32) | 50, (2 << 32) | 10
+        raw = self._table_a_tx(1, begin) + [{"op": "TIMEOUT", "lsn": begin + 5}]
+        shard.ingest(raw, {self.id_a: self.table_a}, 1, sampled, 0)
+
+        view = shard.snapshot(self.id_a, 0)
+
+        self.assertEqual(view.current_lsn, begin + 5)
+        self.assertIsNone(shard.snapshot(self.id_a, begin + 100))
+
     def test_a_resubscribe_trims_what_the_consumer_has_consumed(self):
         # A consumer on direct reads (here the shard is not ready) gets no view, so only its
         # re-subscribes trim its buffer; a full buffer would otherwise stop the shard reading.
@@ -17266,6 +17426,24 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
 
     # Added and removed files are separate tests: each needs its own pinned manifest, and
     # cases within one test share the pipeline scope the manifest is keyed by.
+    def test_a_file_added_before_a_later_update_resumes_is_caught(self):
+        # A pipeline stopped mid-serve resumes in a new update, with a new registration
+        # scope. The extract pin lives under the scope the serve started in, so the check
+        # looks there instead of re-pinning whatever files are there now.
+        source = self._source(self._THREE_RECORDS)
+        options = {"snapshot.source": source, "snapshot.split.bytes": "1"}
+        end = self._first_batch(options)
+        with open(os.path.join(source, "part-001.unl"), "w") as handle:
+            handle.write("4|d|\n")
+        resumed = self.connector(
+            FakeBridge(),
+            registration_scope="next-update",
+            **{"stream.partitioned.snapshot.pages.per.batch": "1"},
+        )
+
+        with self.assertRaisesRegex(InformixError, "added part-001.unl"):
+            resumed.latest_offset("app.orders", options, end)
+
     def test_an_added_file_is_caught_on_resume(self):
         source = self._source(self._THREE_RECORDS)
         options = {"snapshot.source": source, "snapshot.split.bytes": "1"}

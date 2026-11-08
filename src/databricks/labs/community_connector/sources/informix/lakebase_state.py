@@ -1362,8 +1362,15 @@ class LakebaseState:
         if now - self._project_gc_checked.get(cache_key, float("-inf")) < interval_hours * 3600:
             return 0
         self._project_gc_checked[cache_key] = now
-        api = self._api_client()
-        response = api.request("GET", "/api/2.0/postgres/projects") or {}
+        # Housekeeping on the read path, run a day apart by default: a listing that fails
+        # (the reader's workspace token can have expired by then) skips this sweep rather
+        # than failing the read, as a failed project below is skipped too.
+        try:
+            api = self._api_client()
+            response = api.request("GET", "/api/2.0/postgres/projects") or {}
+        except Exception:
+            _LOGGER.warning("Skipping Lakebase project GC: listing projects failed", exc_info=True)
+            return 0
         projects = response if isinstance(response, list) else response.get("projects", [])
         deleted = 0
         for project in projects:

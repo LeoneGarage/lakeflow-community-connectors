@@ -2609,8 +2609,15 @@ def register_lakeflow_source(spark):
             if now - self._project_gc_checked.get(cache_key, float("-inf")) < interval_hours * 3600:
                 return 0
             self._project_gc_checked[cache_key] = now
-            api = self._api_client()
-            response = api.request("GET", "/api/2.0/postgres/projects") or {}
+            # Housekeeping on the read path, run a day apart by default: a listing that fails
+            # (the reader's workspace token can have expired by then) skips this sweep rather
+            # than failing the read, as a failed project below is skipped too.
+            try:
+                api = self._api_client()
+                response = api.request("GET", "/api/2.0/postgres/projects") or {}
+            except Exception:
+                _LOGGER.warning("Skipping Lakebase project GC: listing projects failed", exc_info=True)
+                return 0
             projects = response if isinstance(response, list) else response.get("projects", [])
             deleted = 0
             for project in projects:
@@ -11771,11 +11778,13 @@ def register_lakeflow_source(spark):
                     # And read the table's catalog entry at the daemon's next cycle, not the
                     # next scheduled check.
                     self.catalog.force_check()
-                elif existing is not None and checkpoint_commit_lsn < existing["checkpoint"]:
-                    # The checkpoint moved back (a consumer replaying from an earlier commit):
-                    # the buffer already dropped what lies above the new one and the cursor
-                    # would skip re-reading it, so start the table over from its floor, on
-                    # direct reads until the shard covers it again.
+                elif existing is not None and (
+                    checkpoint_commit_lsn < existing["checkpoint"] or floor_lsn < existing["floor"]
+                ):
+                    # The checkpoint or floor moved back (a consumer replaying from an earlier
+                    # commit, or an open transaction older than its floor): the buffer may lack
+                    # what lies above the new floor and the cursor would skip re-reading it, so
+                    # start the table over from its floor, on direct reads until covered again.
                     self.buffers.pop(identity, None)
                     self.cursors.pop(identity, None)
                     existing = None
@@ -11834,6 +11843,10 @@ def register_lakeflow_source(spark):
                     return None
                 table = self.schema.get(identity)
                 if table is None or self.min_lsn is None or self.current_lsn is None:
+                    return None
+                if self.current_lsn < checkpoint_commit_lsn:
+                    # The consumer moved on by a direct read past the shard's last read: its log
+                    # position would look reinitialized (284) or behind a trigger boundary (295).
                     return None
                 buf = self.buffers.get(identity)
                 if buf is None:
@@ -11907,6 +11920,14 @@ def register_lakeflow_source(spark):
                     for identity, capture in (captures or {}).items()
                     if (self.subscribers.get(identity) or {}).get("capture") != capture
                 }
+                # A subscriber started over (or joined) while this read was in flight, with a
+                # floor below where the read began, gets nothing from it: a partial delivery
+                # would move its cursor past the transactions the covering read must add.
+                stale |= {
+                    identity
+                    for identity, sub in self.subscribers.items()
+                    if not self._covered(sub) and read_start > sub["floor"]
+                }
                 for tx in committed:
                     for identity, sub in self.subscribers.items():
                         if identity in stale or tx.commit_lsn <= self.cursors.get(identity, 0):
@@ -11961,7 +11982,12 @@ def register_lakeflow_source(spark):
                 self.open_begins = open_begins
                 self.schema = dict(schema_map)
                 self.min_lsn = min_lsn
-                self.current_lsn = current_lsn
+                # current_lsn was sampled before the read, which can then reach further, into the
+                # next logical log: a view must not report a log position older than the commits
+                # it hands out, or a consumer that took them reads as being ahead of the log.
+                self.current_lsn = max(
+                    current_lsn, reached or 0, committed[-1].commit_lsn if committed else 0
+                )
                 self.caught_up = timed_out and not buffer.open
                 self.reached_lsn = reached if self.caught_up else None
                 self.ready = True
@@ -13331,6 +13357,21 @@ def register_lakeflow_source(spark):
                 raise InformixError(_m(168))
             return scope
 
+        def _offset_scopes(self, offset: dict[str, Any]) -> tuple[str, str]:
+            # Docstring: The scope an offset was written under, and the one its staged state is in.
+            #
+            # A snapshot resumed in a later update finds its manifest, pages and extract pin under
+            # the scope that wrote them, which _cleanup_previous_update_scopes keeps; a legacy
+            # offset without one falls back to the registration scope. A handoff relocation's
+            # state stays under the capturing flow's scope, carried on stage_scope.
+            flow = offset.get("pipeline_scope")
+            if not isinstance(flow, str) or _PIPELINE_SCOPE.fullmatch(flow) is None:
+                flow = self._pipeline_scope(offset)
+            stage = offset.get("stage_scope")
+            if not isinstance(stage, str) or _PIPELINE_SCOPE.fullmatch(stage) is None:
+                stage = flow
+            return flow, stage
+
         def prepare_for_trigger_available_now(self) -> None:
             # Docstring: Freeze stream high-water marks when Spark selects AvailableNow.
 
@@ -13911,9 +13952,7 @@ def register_lakeflow_source(spark):
             schema_id = str(checkpoint["schema_id"])
             snapshot_lsn = int(checkpoint["snapshot_lsn"])
             start_page = int(snapshot["page_index"])
-            flow_scope = checkpoint.get("pipeline_scope")
-            if not isinstance(flow_scope, str) or _PIPELINE_SCOPE.fullmatch(flow_scope) is None:
-                flow_scope = self._pipeline_scope(checkpoint)
+            stage_scope = self._offset_scopes(checkpoint)[1]
             # Staged pages live under the scope that created them. For a handoff relocation
             # that is the *capturing* flow's scope, carried on stage_scope while the offset's
             # own pipeline_scope is already the new flow's; otherwise stage_scope == the
@@ -13921,9 +13960,6 @@ def register_lakeflow_source(spark):
             # scope -- it drives the manifest read, the page reads (driver + executor), and
             # consumed-page cleanup. The emitted offset's scope is resolved separately from
             # the checkpoint in _snapshot_page_batch_offset.
-            stage_scope = checkpoint.get("stage_scope")
-            if not isinstance(stage_scope, str) or _PIPELINE_SCOPE.fullmatch(stage_scope) is None:
-                stage_scope = flow_scope
             manifest = self._read_snapshot_stage_manifest(table, stage_scope, schema_id)
             if manifest is None or int(manifest["snapshot_lsn"]) != snapshot_lsn:
                 return None
@@ -13971,10 +14007,12 @@ def register_lakeflow_source(spark):
             if manifest is None or int(manifest["snapshot_lsn"]) != lsn:
                 return None
             page_count = int(manifest["page_count"])
-            # A snapshot-phase end leaves pages to serve; a stream end served the only page.
-            if (page_count > 1) != (end["phase"] == "snapshot") or page_count < 1:
+            # A snapshot-phase end leaves pages to serve; a stream end served the only page, or
+            # none for an empty table. Recognising that here keeps a re-plan in a later update
+            # from falling through to a replay, which would snapshot the table afresh.
+            if (page_count > 1) != (end["phase"] == "snapshot") or page_count < 0:
                 return None
-            return (scope, schema_id, lsn, 0, 1, page_count)
+            return (scope, schema_id, lsn, 0, min(1, page_count), page_count)
 
         def _embedded_read(
             self, table_name: str, start_offset: dict, table_options: dict[str, str]
@@ -14011,6 +14049,12 @@ def register_lakeflow_source(spark):
             def plan() -> dict | None:
                 with self._metadata_access():
                     table = self._table(table_name, table_options)
+                    if effective_start.get("handoff_seeded"):
+                        # The first post-Restore read of a seed taken mid-snapshot is served
+                        # here, not by _read_table_attempt, so drop the cutover's tokens here.
+                        self._drop_orphaned_handoff_tokens(
+                            table, [_HANDOFF_CHANNEL_UPSERT, _HANDOFF_CHANNEL_DELETE]
+                        )
                     if not unl:
                         batch = self._snapshot_page_batch(table, effective_start, table_options)
                         if batch is None:
@@ -14112,9 +14156,7 @@ def register_lakeflow_source(spark):
             # The flow owns its own scope for the emitted offsets; stage_scope (where the
             # staged pages physically live) drives only the page reads and cleanup, and is
             # carried forward on the non-terminal offset until the snapshot completes.
-            flow_scope = effective_start.get("pipeline_scope")
-            if not isinstance(flow_scope, str) or _PIPELINE_SCOPE.fullmatch(flow_scope) is None:
-                flow_scope = self._pipeline_scope(effective_start)
+            flow_scope = self._offset_scopes(effective_start)[0]
             # Pages below this batch's first page are committed -- schedule their async
             # cleanup under the scope that stores them, exactly as the serial serve does.
             self._cleanup_consumed_snapshot_stage_pages(
@@ -14194,7 +14236,9 @@ def register_lakeflow_source(spark):
                 self._verify_unl_extract(
                     table,
                     table_options,
-                    self._pipeline_scope(end_checkpoint),
+                    # Where the serve pinned the extract: the start's scopes, or for the first
+                    # window the end's, written by the latest_offset that pinned it.
+                    self._offset_scopes(effective_start or end_checkpoint)[1],
                     str(end_checkpoint["schema_id"]),
                     snapshot_lsn,
                     window_paths,
@@ -15992,7 +16036,9 @@ def register_lakeflow_source(spark):
 
         def _cleanup_completed_snapshot_stage(self, table: Table, checkpoint: dict[str, Any]) -> None:
             validated = _validated_offset(checkpoint)
-            scope = self._pipeline_scope(validated)
+            # The scope that staged the pages: a snapshot finished in a later update than it
+            # started keeps the starting update's scope on its offsets.
+            scope = self._offset_scopes(validated)[1]
             schema_id = str(validated["schema_id"])
             path = self._snapshot_stage_namespace(table, scope, schema_id)
             if path in self._cleaned_snapshot_stages:
@@ -17375,19 +17421,11 @@ def register_lakeflow_source(spark):
                 # where the update-scoped initialization record establishes a fresh boundary
                 # and re-snapshots. A legacy offset without a stored scope falls back to the
                 # registration scope (the prior behaviour).
-                pipeline_scope = checkpoint.get("pipeline_scope")
-                if (
-                    not isinstance(pipeline_scope, str)
-                    or _PIPELINE_SCOPE.fullmatch(pipeline_scope) is None
-                ):
-                    pipeline_scope = self._pipeline_scope(checkpoint)
                 # For a handoff relocation the pages live under the *capturing* flow's scope,
                 # carried on stage_scope; the offset's own pipeline_scope is already the new
                 # flow's. stage_scope drives the manifest and page reads; pipeline_scope drives
                 # the emitted offsets. Absent stage_scope, the two coincide (unchanged).
-                stage_scope = checkpoint.get("stage_scope")
-                if not isinstance(stage_scope, str) or _PIPELINE_SCOPE.fullmatch(stage_scope) is None:
-                    stage_scope = pipeline_scope
+                pipeline_scope, stage_scope = self._offset_scopes(checkpoint)
                 high_water = int(checkpoint["snapshot_lsn"])
                 schema_id = str(checkpoint["schema_id"])
                 manifest = self._read_snapshot_stage_manifest(table, stage_scope, schema_id)
@@ -18129,7 +18167,7 @@ def register_lakeflow_source(spark):
             # empty extract transitions to the stream phase immediately.
 
             if not effective_start:
-                pipeline_scope = self._pipeline_scope()
+                pipeline_scope = pin_scope = self._pipeline_scope()
                 table, schema_id, snapshot_lsn = self._pin_unl_boundary(
                     table, table_options, pipeline_scope
                 )
@@ -18137,7 +18175,10 @@ def register_lakeflow_source(spark):
                 expected_fingerprint = None
             else:
                 checkpoint = _validated_offset(effective_start)
-                pipeline_scope = self._pipeline_scope(checkpoint)
+                # The serve keeps the scopes it started under, as a staged one does: its extract
+                # pin lives there, and in a later update the registration scope has none, which
+                # would re-pin whatever files are there now instead of failing on a change.
+                pipeline_scope, pin_scope = self._offset_scopes(checkpoint)
                 schema_id = str(checkpoint["schema_id"])
                 snapshot_lsn = int(checkpoint["snapshot_lsn"])
                 start_split, start_record = _unl_position(checkpoint)
@@ -18154,7 +18195,7 @@ def register_lakeflow_source(spark):
                 self._verify_unl_extract(
                     table,
                     table_options,
-                    pipeline_scope,
+                    pin_scope,
                     schema_id,
                     snapshot_lsn,
                     self._unl_window_paths(table_options, splits, start_split, driver_window),
@@ -18211,6 +18252,8 @@ def register_lakeflow_source(spark):
             if end_record:
                 snapshot["record_index"] = end_record
             end.update({"snapshot_lsn": str(snapshot_lsn), "snapshot": snapshot})
+            if pin_scope != pipeline_scope:
+                end["stage_scope"] = pin_scope
             return end, window_rows
 
         def _unl_executor_window_end(
@@ -19668,14 +19711,19 @@ def register_lakeflow_source(spark):
                     # 299: Immutable schema node identity mismatch for '{}'
                     raise InformixError(_m(299, table.exposed_name))
                 previous_table = _table_from_schema_state(previous, table.database)
-                _ensure_compatible_schema_change(
-                    previous_table,
-                    table,
-                    extend_wildcard_key=extend_key,
-                    shrink_wildcard_key=shrink_key,
-                    wildcard_except=table.key_wildcard_except,
-                )
                 transition_record = self._read_immutable_head(namespace)
+                if transition_record is None:
+                    # No step recorded yet: the owner records one straight to the live schema.
+                    # A recorded step is checked below one step at a time instead, so a reader
+                    # a generation behind is not refused a drop and an add the pipeline ran
+                    # between, as each step may make only one of them.
+                    _ensure_compatible_schema_change(
+                        previous_table,
+                        table,
+                        extend_wildcard_key=extend_key,
+                        shrink_wildcard_key=shrink_key,
+                        wildcard_except=table.key_wildcard_except,
+                    )
                 if transition_record is None and owner:
                     try:
                         if set(table.primary_keys) - set(previous_table.primary_keys):
@@ -20163,9 +20211,10 @@ def register_lakeflow_source(spark):
             exposed = table_options.get("qualified_source_table", table_name)
             # Preserve eager configuration/schema failures. Registration commonly
             # leaves the table in this process-local cache, so validation here costs
-            # no source connection. An explicitly append-only table must always reach
-            # the normal path, which raises that it has no delete channel.
-            if table_options.get(_APPEND_INGESTION_OPTION, "false").lower() == "true":
+            # no source connection. An explicitly append-only table (per table or for the
+            # connection) must always reach the normal path, which raises that it has no
+            # delete channel.
+            if self._append_only_mode(table_options) == "true":
                 return True
             cached = self._tables.get(exposed) if self._tables is not None else None
             if cached is not None:
@@ -20181,6 +20230,17 @@ def register_lakeflow_source(spark):
                     cached,
                     primary_keys=tuple(c.name for c in cached.columns) if key is None else key,
                 )
+                # A key the options name but the table does not ingest fails here as the read
+                # path would, instead of waiting on an upsert reader that fails the same way.
+                if override is not None and key is not None:
+                    ingested = {column.name for column in cached.columns}
+                    missing = [name for name in key if name not in ingested]
+                    if missing:
+                        # 193: Option '{}' names column(s) not present in '{}': {}
+                        raise InformixError(
+                            _m(193, _PRIMARY_KEYS_OPTION, cached.exposed_name, ", ".join(missing))
+                        )
+                _ensure_selected_keys(cached)
                 _ensure_materializable(cached, table_options)
                 if self._append_only_table(cached, table_options) or not _cdc_capable(cached):
                     return True

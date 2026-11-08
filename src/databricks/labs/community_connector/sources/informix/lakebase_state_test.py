@@ -1269,6 +1269,18 @@ class LakebaseProjectNamingTests(unittest.TestCase):
 
         self.assertEqual(state.collect_unused_projects(90, 24), 0)
 
+    def test_a_project_listing_that_fails_skips_the_sweep(self):
+        # The sweep runs on the read path a day apart; by then the reader's workspace token
+        # may have expired, and a failed listing must skip the sweep, not fail the read.
+        lakebase_state.LakebaseState._project_gc_checked.clear()
+        state = lakebase_state.LakebaseState({}, "current")
+        api = mock.MagicMock()
+        api.request.side_effect = RuntimeError("401 Unauthorized")
+        state._api_client = mock.Mock(return_value=api)
+
+        with self.assertLogs(lakebase_state.__name__, "WARNING"):
+            self.assertEqual(state.collect_unused_projects(90, 24), 0)
+
     def test_owned_inactive_project_is_deleted_after_retention(self):
         lakebase_state.LakebaseState._project_gc_checked.clear()
         state = lakebase_state.LakebaseState({}, "current")
