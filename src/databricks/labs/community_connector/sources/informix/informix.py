@@ -8656,8 +8656,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             start_split, start_record = _unl_position(effective_start)
             splits = self._unl_all_splits(table, table_options)
             end_split, end_record = _unl_position(end_offset or {}, terminal=len(splits))
-            driver_window = self._unl_gzip_driver_window(
-                table_options, splits, start_split, start_record
+            # The window Spark logged decides, not the gzip record-window option as it is now
+            # (a re-plan after a restart may see it changed): a record window ends inside its
+            # file or finishes it, and executors serve a window of several files.
+            driver_window = (end_split == start_split and end_record > start_record) or (
+                self._unl_gzip_driver_window(table_options, splits, start_split, start_record)
+                and end_split <= start_split + 1
             )
             # A batch re-planned after a restart reaches here without its latest_offset, so
             # the extract is checked against its pinned manifest here as well.
@@ -8709,7 +8713,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             or self._bootstrap_page_batch(table, effective_start, end_offset or {}, table_options)
         )
         if batch is not None:
-            scope, schema_id, snapshot_lsn, start_page, end_page, _ = batch
+            scope, schema_id, snapshot_lsn, start_page, end_page, page_count = batch
+            # The pages Spark logged for the batch: a re-plan after a restart computes its
+            # window afresh, and pages.per.batch may have changed since.
+            logged = (end_offset or {}).get("snapshot")
+            if (end_offset or {}).get("phase") == "stream":
+                end_page = page_count
+            elif isinstance(logged, dict) and str((end_offset or {}).get("snapshot_lsn")) == str(
+                snapshot_lsn
+            ):
+                end_page = min(int(logged.get("page_index", end_page)), page_count)
             return [
                 {
                     "kind": "page",
@@ -9957,7 +9970,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
 
     def _resnapshot_delete_seed(self, table: Table, scope: str) -> dict | None:
         # Docstring: The delete seed at the update's resnapshot boundary, once it is published.
+        #
+        # The resnapshot ran under the live layout, which this reader's cached table may
+        # predate, and the boundary lookup checks the two match.
 
+        table = self._refresh_table_schema(table, None)
         high_water = self._initial_lsn(table, owner=False, wait=False, scope=scope)
         if high_water is None:
             return None
@@ -10051,6 +10068,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # cannot remove a newer row or apply a delete twice. This is a bootstrap-only
             # cost; once the delete flow checkpoints, it resumes from its own cursor.
             minimum = self._bridge.minimum_lsn()
+            if snapshot_mode == "auto_snapshot" and high_water < minimum:
+                # auto_snapshot replaces the expired checkpoint the channel start names (it was
+                # published before the resnapshot, and the lowest start wins) with a snapshot
+                # whose boundary the upsert reader publishes: seed there once it has, and
+                # until then yield a retry that does not run out, as a checkpointed reader of
+                # an expired position does (_read_resnapshotted_deletes).
+                seed = self._resnapshot_delete_seed(table, self._pipeline_scope())
+                return iter(()), seed or self._trigger_boundary_retry_offset(bootstrap_offset)
             floor_state = self._read_delete_snapshot_floor(table, schema_id, fingerprint)
             floor = floor_state[0] if floor_state else None
             bootstrap_lsn = high_water
@@ -10080,16 +10105,6 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     _m(201, table.exposed_name, floor, high_water),
                 )
             if bootstrap_lsn < minimum:
-                # auto_snapshot replaces the expired checkpoint the channel start names (it was
-                # published before the resnapshot, and the lowest start wins) with a snapshot
-                # whose boundary the upsert reader publishes: seed there once it has.
-                seed = (
-                    self._resnapshot_delete_seed(table, self._pipeline_scope())
-                    if snapshot_mode == "auto_snapshot"
-                    else None
-                )
-                if seed is not None:
-                    return iter(()), seed
                 # 202: Informix delete bootstrap boundary {} for '{}' precedes the minimum retained
                 # LSN {}; the delete channel is waiting for a resnapshot
                 logging.getLogger(__name__).warning(
@@ -13673,8 +13688,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         if view is None:
             return None
         # A fingerprint mismatch means a schema transition is in flight; defer to the
-        # direct-read path, which owns the transition/replay logic.
-        if str(checkpoint.get("schema_fingerprint")) != view.fingerprint:
+        # direct-read path, which owns the transition/replay logic. So does a view of
+        # another layout than this reader's: two flows can read one table under different
+        # options with the same capture, and the shard keeps the first one's table.
+        if view.fingerprint != str(
+            checkpoint.get("schema_fingerprint")
+        ) or view.fingerprint != _schema_fingerprint(table):
             return None
         replay_stop = self._replay_stop_lsn(options)
         if (self._trigger_available_now or replay_stop is not None) and not view.committed:
@@ -14051,7 +14070,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             and drained
             and reached is not None
             and transition_lsn is None
-            and not projection_schema_transition
+            # A metadata-only step keeps its position for Spark to evolve the target first;
+            # a replay's end is already logged, so it lands there through a step too.
+            and (not projection_schema_transition or replay_stop is not None)
             and min(reached, quiet_bound) > int(end["commit_lsn"])
         ):
             quiet = min(reached, quiet_bound)
@@ -14080,7 +14101,6 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             replay_stop is not None
             and crossed_trigger_boundary
             and transition_lsn is None
-            and not projection_schema_transition
             and (open_begin is None or open_begin >= replay_stop)
             and replay_stop > int(end["commit_lsn"])
         ):
@@ -14287,14 +14307,20 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # differ by both. Where the recorded history ends short of the live layout, the
         # owner records the rest as one step, so the last node is checked against it, with
         # the default check that step gets when a column joins the key. A record that is
-        # not a valid successor fails as the step would; history that loops (layout-only ids
-        # recorded before transition ids hashed their predecessor) or runs past the bound is
-        # checked against the live layout from where the walk stopped.
+        # not a valid successor fails as the step would, and so does history that loops
+        # (layout-only ids recorded before transition ids hashed their predecessor); one
+        # running past the bound is checked against the live layout from where it stopped.
 
         live = _schema_fingerprint(table)
         seen: set[str] = set()
         while _schema_fingerprint(node_table) != live:
-            if node_id in seen or len(seen) >= _MAX_SCHEMA_DESCENT:
+            if node_id in seen:
+                # No node of a loop is left without a recorded successor, so a reader steps
+                # around it forever and never reaches the live layout.
+                # 425: Informix schema history for '{}' returns to node {} without reaching the
+                # live layout; run a full refresh
+                raise InformixError(_m(425, table.exposed_name, node_id))
+            if len(seen) >= _MAX_SCHEMA_DESCENT:
                 break
             seen.add(node_id)
             record = self._read_immutable_head(self._immutable_namespace(table, "schemas", node_id))
@@ -14371,13 +14397,21 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 # A recorded step is checked below one step at a time instead, so a reader
                 # a generation behind is not refused a drop and an add the pipeline ran
                 # between, as each step may make only one of them.
-                _ensure_compatible_schema_change(
-                    previous_table,
-                    table,
-                    extend_wildcard_key=extend_key,
-                    shrink_wildcard_key=shrink_key,
-                    wildcard_except=table.key_wildcard_except,
-                )
+                try:
+                    _ensure_compatible_schema_change(
+                        previous_table,
+                        table,
+                        extend_wildcard_key=extend_key,
+                        shrink_wildcard_key=shrink_key,
+                        wildcard_except=table.key_wildcard_except,
+                    )
+                except InformixError as error:
+                    if owner:
+                        # The delete reader can pass this check (no incremental copy in its
+                        # offset, or its own first read of the update) and would wait for a
+                        # step that never comes: it fails with this error instead.
+                        self._publish_schema_rejection(table, checkpoint_schema_id, error)
+                    raise
             if transition_record is None and owner:
                 try:
                     if set(table.primary_keys) - set(previous_table.primary_keys):
@@ -16153,8 +16187,15 @@ def _project_transaction(
         after = record.get("after", record.get("row") if op == "INSERT" else None)
         entered = False
         if predicate is not None:
-            was_in = op in {"UPDATE", "DELETE"} and _row_filter_matches(predicate, before or {})
-            is_in = op in {"INSERT", "UPDATE"} and _row_filter_matches(predicate, after or {})
+            # A missing image counts as in the filter, so the record reaches the shaping
+            # that fails closed on it, as it does without a filter, instead of dropping or
+            # reclassifying the change.
+            was_in = op in {"UPDATE", "DELETE"} and (
+                before is None or _row_filter_matches(predicate, before)
+            )
+            is_in = op in {"INSERT", "UPDATE"} and (
+                after is None or _row_filter_matches(predicate, after)
+            )
             if not (was_in or is_in):
                 continue
             if op == "UPDATE" and not is_in:

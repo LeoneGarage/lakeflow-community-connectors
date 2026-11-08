@@ -5437,6 +5437,39 @@ class LakeflowContractTests(unittest.TestCase):
             "expected at least one non-terminal snapshot batch",
         )
 
+    def test_a_replanned_page_batch_serves_the_pages_spark_logged(self):
+        # get_partitions re-plans an uncommitted batch after a restart with no latest_offset
+        # to share its window. pages.per.batch changed since: the batch still serves the
+        # pages between the logged start and end, none dropped and none served twice.
+        for planned, replanned in (("3", "1"), ("1", "3")):
+            with self.subTest(planned=planned, replanned=replanned):
+                bridge = FakeBridge()
+                bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 7)]
+                scope = f"replan-{planned}-{replanned}"
+                connector = self._partitioned_connector(
+                    bridge,
+                    registration_scope=scope,
+                    **{
+                        "snapshot.page.size": "1",
+                        "stream.partitioned.snapshot.pages.per.batch": planned,
+                    },
+                )
+                first = connector.latest_offset("app.orders", {}, {})
+                second = connector.latest_offset("app.orders", {}, first)
+                logged = range(first["snapshot"]["page_index"], second["snapshot"]["page_index"])
+                restarted = self._partitioned_connector(
+                    bridge,
+                    registration_scope=scope,
+                    **{
+                        "snapshot.page.size": "1",
+                        "stream.partitioned.snapshot.pages.per.batch": replanned,
+                    },
+                )
+
+                partitions = restarted.get_partitions("app.orders", {}, first, second)
+
+                self.assertEqual([p["page_index"] for p in partitions], list(logged))
+
     def test_partitioned_snapshot_matches_the_serial_serve(self):
         # The partitioned drive yields exactly the rows a serial read_table drive
         # yields, in the same order -- the fan-out changes only how pages are read.
@@ -6630,6 +6663,58 @@ class LakeflowContractTests(unittest.TestCase):
         _, seed = self.connector(bridge).read_table_deletes("app.orders", {}, options)
 
         self.assertEqual(seed["commit_lsn"], "150")
+
+    def test_an_unseeded_delete_flow_waits_on_an_expired_channel_start_without_a_floor(self):
+        # The channel start names the expired checkpoint auto_snapshot is replacing, and the
+        # floor is the new snapshot's under its schema. The delete flow waits for that
+        # snapshot's boundary without weighing the floor (no warning about it) and with a
+        # retry that does not run out and end a triggered update.
+        bridge = FakeBridge()
+        bridge.minimum = 91
+        bridge.now = 150
+        options = {"snapshot.mode": "auto_snapshot"}
+        connector = self.connector(bridge)
+        table = connector._table("app.orders", {})
+        scope = connector._pipeline_scope()
+        connector._publish_upsert_channel_start(
+            table, 90, "1" * 32, _schema_fingerprint(table), scope
+        )
+        connector._publish_delete_snapshot_floor(table, "f" * 32, 150, scope)
+
+        offset = {}
+        with mock.patch.object(
+            connector, "_read_delete_snapshot_floor", wraps=connector._read_delete_snapshot_floor
+        ) as floor:
+            for _ in range(informix_module._SCHEMA_NODE_FALLBACK_RETRIES + 2):
+                _, waited = connector.read_table_deletes("app.orders", offset, options)
+                self.assertNotEqual(waited, offset)
+                offset = waited
+        floor.assert_not_called()
+        self.assertNotIn("commit_lsn", offset)
+
+    def test_an_auto_snapshot_delete_seed_reads_the_live_layout(self):
+        # The resnapshot ran under the live layout; a delete reader whose cached table
+        # predates a column added since still finds the boundary rather than failing on
+        # the mismatch.
+        bridge = FakeBridge()
+        bridge.minimum = 91
+        bridge.now = 150
+        checkpoint = _stream_offset(90)
+        checkpoint["pipeline_scope"] = "f" * 32
+        options = {"snapshot.mode": "auto_snapshot"}
+        deletes = self.connector(bridge)
+        stale = deletes._table("app.orders", {})
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        self.connector(bridge, registration_scope="test-pipeline").read_table(
+            "app.orders", checkpoint, dict(options, **{"snapshot.page.size": "1"})
+        )
+
+        with mock.patch.object(deletes, "_table", return_value=stale):
+            _, seeded = deletes.read_table_deletes("app.orders", checkpoint, options)
+
+        self.assertEqual(seeded["commit_lsn"], "150")
 
     def test_snapshot_mode_auto_snapshot_starts_incrementally_without_checkpoint(self):
         bridge = FakeBridge()
@@ -7831,6 +7916,28 @@ class LakeflowContractTests(unittest.TestCase):
         connector._trigger_boundaries[table.identity] = (95, "a" * 32, connector._pipeline_scope())
         self.assertIsNone(poll(at_checkpoint, {}, trigger=True))
 
+    def test_a_shard_view_of_another_layout_than_the_readers_is_not_taken(self):
+        # Two flows can read one source table under different options (a row_filter, say)
+        # while their captures are the same; the shard keeps the first one's table. A
+        # reader whose own layout differs reads directly instead of taking that table,
+        # even where its checkpoint still names the view's layout.
+        connector = self.connector(
+            FakeBridge(), shared_cdc=True, **{"cdc.shared.session": "process"}
+        )
+        table = connector._table("app.orders", {"row_filter": "id > 1"})
+        other = connector._table("app.orders", {})
+        checkpoint = _stream_offset(90)
+        checkpoint["schema_fingerprint"] = _schema_fingerprint(other)
+        shown = _SharedCdcSnapshot(other, _schema_fingerprint(other), 1, 200, [], True, None, 120)
+        shard = mock.Mock()
+        shard.snapshot.return_value = shown
+        with mock.patch.object(informix_module, "_shared_cdc_shard", return_value=shard):
+            view = connector._shared_cdc_snapshot(
+                table, checkpoint, {}, False, connector._pipeline_scope()
+            )
+
+        self.assertIsNone(view)
+
     def test_the_first_available_now_poll_of_an_idle_table_keeps_the_shard_view(self):
         # The first poll of an AvailableNow update has no frozen boundary in this process yet.
         # The upsert reader publishes it from the view's sample, as it does on taking the
@@ -7993,6 +8100,65 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(list(replayed), [])
         self.assertEqual(len(bridge.change_reads), reads)
+
+    def test_a_change_missing_its_image_fails_under_a_row_filter_as_without_one(self):
+        # A filter is evaluated on a change's images, but a missing one is a broken record,
+        # not one outside the filter: the change fails as it would with no filter set.
+        connector = self.connector(FakeBridge())
+        table = connector._table("app.orders", {})
+        filtered = connector._table("app.orders", {"row_filter": "id > 0"})
+        self.assertIsNotNone(informix_module._row_filter_predicate(filtered))
+        transaction = informix_module.CommittedTransaction
+        cases = (
+            ("DELETE", {"op": "DELETE", "lsn": 101}, True, "no before image"),
+            ("INSERT", {"op": "INSERT", "lsn": 101}, False, "image"),
+            (
+                "UPDATE",
+                {"op": "UPDATE", "lsn": 101, "before": {"id": 1, "value": "a"}},
+                False,
+                "image",
+            ),
+        )
+        for name, record, deletes, message in cases:
+            with self.subTest(operation=name):
+                record = dict(record, table="demo:app.orders", tx_id=7)
+                tx = transaction(7, 100, 102, 100, (record,))
+                for layout in (table, filtered):
+                    with self.assertRaisesRegex(InformixError, message):
+                        informix_module._project_transaction(tx, layout, deletes)
+
+    def test_a_quiet_range_replayed_after_a_schema_change_lands_on_its_end(self):
+        # A triggered read went idle across a quiet log and moved its offset there. Replayed
+        # after a column was added, the replay steps the schema on the way, and still lands
+        # on the logged end: whether the log stayed idle or a later commit crossed it.
+        for later in ([], [(115, 116, 117)]):
+            with self.subTest(later_commit=bool(later)):
+                bridge = FakeBridge()
+                connector = self.connector(bridge, registration_scope=f"quiet-{bool(later)}")
+                _, start = connector.read_table("app.orders", {}, {})
+                end = dict(start, commit_lsn="110", change_lsn="110", begin_lsn="110")
+                bridge.tables[0]["columns"].append(
+                    {"name": "added", "type_name": "INTEGER", "nullable": True}
+                )
+                bridge.now = 130
+                bridge.changes = []
+                for begin, change, commit in later:
+                    bridge.changes += [
+                        {"op": "BEGIN", "tx_id": 5, "lsn": begin},
+                        {
+                            "op": "INSERT",
+                            "tx_id": 5,
+                            "lsn": change,
+                            "table": "demo:app.orders",
+                            "row": {"id": 5, "value": "e", "added": None},
+                        },
+                        {"op": "COMMIT", "tx_id": 5, "lsn": commit},
+                    ]
+                bridge.changes.append({"op": "TIMEOUT", "lsn": 120})
+
+                replayed = connector._replay_embedded_range("app.orders", start, end, {})
+
+                self.assertEqual(list(replayed), [])
 
     def test_a_replay_of_a_metadata_only_step_to_the_live_schema_reads_nothing(self):
         # A step straight to the live schema on an idle log ends where it started. Its replay
@@ -8444,10 +8610,11 @@ class LakeflowContractTests(unittest.TestCase):
             record_type="schema-transition",
         )
 
-    def test_a_looping_recorded_history_is_checked_against_the_live_layout(self):
+    def test_a_looping_recorded_history_fails_closed(self):
         # Nodes from before transition ids hashed their predecessor can loop (a column added
-        # and dropped again reused the first node). The walk stops at the loop and checks
-        # the live layout from there rather than accepting a path it never finished.
+        # and dropped again reused the first node). No node of the loop is left without a
+        # recorded successor, so a reader would step around it forever: the walk fails even
+        # where the live layout is one the loop could step to.
         connector = self.connector(FakeBridge())
         first = Table.parse(_table(), "demo")
         grown_raw = _table()
@@ -8456,10 +8623,15 @@ class LakeflowContractTests(unittest.TestCase):
         first_id, grown_id = "a" * 32, "b" * 32
         self._recorded_successor(connector, grown_id, first, first_id, grown_id)
         self._recorded_successor(connector, first_id, grown, grown_id, first_id)
-        rekeyed = Table.parse(_table(primary_keys=("value",)), "demo")
+        live_raw = _table()
+        live_raw["columns"] += [
+            {"name": "x", "type_name": "INTEGER", "nullable": True},
+            {"name": "y", "type_name": "INTEGER", "nullable": True},
+        ]
+        live = Table.parse(live_raw, "demo")
 
-        with self.assertRaisesRegex(InformixError, "primary keys"):
-            connector._ensure_recorded_path_to_live(rekeyed, grown, grown_id, {})
+        with self.assertRaisesRegex(InformixError, "returns to node .* full refresh"):
+            connector._ensure_recorded_path_to_live(live, grown, grown_id, {})
 
     def test_a_corrupt_recorded_step_on_the_way_to_the_live_layout_fails(self):
         # A step record that names another predecessor is not this node's successor and
@@ -12334,6 +12506,31 @@ class LakeflowContractTests(unittest.TestCase):
                     "app.orders", checkpoint, options
                 )
                 list(rows)
+
+    def test_a_delete_reader_fails_with_the_upsert_readers_compatibility_refusal(self):
+        # During an incremental copy a whole-row key may not grow, so the upsert reader
+        # refuses an added column; the delete reader's offset carries no copy and would
+        # accept it, then wait for a step that never comes. It fails with the refusal.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 4)]
+        options = {"primary.keys": "*", "snapshot.mode": "incremental", "snapshot.page.size": "1"}
+        _, copying = self.connector(bridge).read_table("app.orders", {}, dict(options))
+        self.assertIn("incremental", copying)
+        _, deletes = self.connector(bridge).read_table_deletes("app.orders", {}, dict(options))
+        self.assertNotIn("incremental", deletes)
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+        with self.assertRaisesRegex(InformixError, "primary keys"):
+            self.connector(bridge).read_table("app.orders", copying, dict(options))
+
+        with self.assertRaisesRegex(InformixError, "upsert reader refused"):
+            rows, _ = self.connector(bridge).read_table_deletes(
+                "app.orders", deletes, dict(options)
+            )
+            list(rows)
 
     def test_delete_reader_fails_with_any_refusal_the_upsert_reader_records(self):
         bridge = FakeBridge()
@@ -18139,6 +18336,41 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
         rows = connector._replay_unl_gzip_window(table, options, 90, split, 0, stop_record=2)
 
         self.assertEqual([row["id"] for row in rows], [1])
+
+    def test_a_replanned_file_window_follows_the_window_spark_logged(self):
+        # The window an uncommitted batch logged decides how its re-plan serves it, not the
+        # gzip record-window option after a restart: a record window cleared of the option
+        # keeps its records, and a window of whole files set to it keeps every file.
+        source = self._gzip_source(self._FIVE_RECORDS)
+        windowed = {"snapshot.source": source, "snapshot.gzip.records.per.batch": "2"}
+        end = self.connector(FakeBridge()).latest_offset("app.orders", windowed, {})
+        self.assertEqual(self._position(end), ("snapshot", 0, 2))
+        cleared = {"snapshot.source": source}
+        restarted = self.connector(FakeBridge())
+        partitions = restarted.get_partitions("app.orders", cleared, {}, end)
+        rows = [
+            row
+            for partition in partitions
+            for row in restarted.read_partition("app.orders", partition, cleared)
+        ]
+        self.assertEqual([row["id"] for row in rows], [1, 2])
+
+        mixed = self._gzip_source("1|a|\n2|b|\n")
+        with open(os.path.join(mixed, "part-001.unl"), "w") as handle:
+            handle.write("3|c|\n4|d|\n")
+        whole = {"snapshot.source": mixed}
+        end = self.connector(FakeBridge(), registration_scope="whole").latest_offset(
+            "app.orders", whole, {}
+        )
+        set_now = dict(whole, **{"snapshot.gzip.records.per.batch": "2"})
+        restarted = self.connector(FakeBridge(), registration_scope="whole")
+        partitions = restarted.get_partitions("app.orders", set_now, {}, end)
+        rows = [
+            row
+            for partition in partitions
+            for row in restarted.read_partition("app.orders", partition, set_now)
+        ]
+        self.assertEqual(sorted(row["id"] for row in rows), [1, 2, 3, 4])
 
     def test_gzip_record_windows_keep_one_decompressor_across_batches(self):
         source = self._gzip_source(self._FIVE_RECORDS)
