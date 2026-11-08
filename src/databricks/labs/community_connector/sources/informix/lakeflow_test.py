@@ -5667,6 +5667,26 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(seeded["stage_scope"], "a" * 32)
         self.assertEqual(seeded["pipeline_scope"], connector._pipeline_scope())
 
+    def test_a_seed_read_again_during_the_cutover_keeps_both_tokens(self):
+        # Under table.migration the upsert flow reads its committed seed again (AvailableNow
+        # confirming it is done). That read belongs to the record-and-stop read path; the
+        # page plan must not run, or it drops the delete channel's token before the delete
+        # flow, scheduled on its own, has seeded from it.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 6)]
+        options = {"snapshot.page.size": "1", "stream.partitioned.snapshot.pages.per.batch": "2"}
+        connector = self._partitioned_connector(bridge, **options)
+        seed = dict(connector.latest_offset("app.orders", {}, {}), handoff_seeded=True)
+
+        with (
+            mock.patch.object(connector, "_drop_orphaned_handoff_tokens") as drop,
+            mock.patch.object(connector, "_embedded_read", return_value=([], seed)) as read,
+        ):
+            connector.latest_offset("app.orders", {"table.migration": "true"}, seed)
+
+        drop.assert_not_called()
+        read.assert_called_once()
+
     def test_a_restored_seed_served_from_its_pages_drops_the_cutover_tokens(self):
         # A seed taken mid-snapshot is served by the page plan after Restore, not by the
         # read path that drops the tokens the cutover left; the plan must drop them, once.

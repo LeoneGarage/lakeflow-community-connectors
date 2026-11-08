@@ -8455,22 +8455,27 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             self._is_delete_flow()
             or not effective_start
             or effective_start.get("phase") not in (None, "snapshot")
+            # Migration records and stops on the read path, which owns a seed's marker.
+            or self._table_migration(table_options)
         ):
             return None
 
         def plan() -> dict | None:
             with self._metadata_access():
                 table = self._table(table_name, table_options)
+                batch = None
+                if not unl:
+                    batch = self._snapshot_page_batch(table, effective_start, table_options)
+                    if batch is None:
+                        # The read path serves it, and drops a restored seed's tokens itself.
+                        return None
                 if effective_start.get("handoff_seeded"):
                     # The first post-Restore read of a seed taken mid-snapshot is served
                     # here, not by _read_table_attempt, so drop the cutover's tokens here.
                     self._drop_orphaned_handoff_tokens(
                         table, [_HANDOFF_CHANNEL_UPSERT, _HANDOFF_CHANNEL_DELETE]
                     )
-                if not unl:
-                    batch = self._snapshot_page_batch(table, effective_start, table_options)
-                    if batch is None:
-                        return None
+                if batch is not None:
                     return self._snapshot_page_batch_offset(table, effective_start, batch)
                 # File source: serve the extract as a window of splits per microbatch. Leaving
                 # the embedded cache untouched steers the following get_partitions to the
