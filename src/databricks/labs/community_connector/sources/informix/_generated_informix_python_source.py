@@ -15570,9 +15570,27 @@ def register_lakeflow_source(spark):
                     # permanently skip old-key deletes after a cancelled refresh.
                     return iter(()), self._schema_node_fallback_offset(bootstrap_offset)
                 high_water, schema_id, fingerprint = channel_start
+                seed_table = table
                 if fingerprint != _schema_fingerprint(table):
-                    # 199: Informix upsert/delete bootstrap schema mismatch for '{}'
-                    raise InformixError(_m(199, table.exposed_name))
+                    # The upsert reader publishes the update's channel start at its checkpoint
+                    # before it steps, so the record can hold a schema the live one has moved
+                    # past (a column changed while the pipeline was stopped). Seed under that
+                    # recorded node; the next poll steps from it as any lagging reader does.
+                    record = self._read_immutable_head(
+                        self._immutable_namespace(table, "schema-nodes", schema_id)
+                    )
+                    node = record.get("schema") if isinstance(record, dict) else None
+                    if not isinstance(node, dict) or node.get("id") != schema_id:
+                        # 199: Informix upsert/delete bootstrap schema mismatch for '{}'
+                        raise InformixError(_m(199, table.exposed_name))
+                    self._validate_immutable_record_header(record, "schema-node", table.exposed_name)
+                    seed_table = _table_from_schema_state(node, table.database)
+                    if (
+                        seed_table.native_identity != table.native_identity
+                        or _schema_fingerprint(seed_table) != fingerprint
+                    ):
+                        # 199: Informix upsert/delete bootstrap schema mismatch for '{}'
+                        raise InformixError(_m(199, table.exposed_name))
                 # The upsert channel-start records the upsert reader's *resume* position
                 # for the current scope, which the restart/replay cycles push forward past
                 # the snapshot boundary. Bootstrapping a delete flow there skips before-image
@@ -15633,7 +15651,7 @@ def register_lakeflow_source(spark):
                     bootstrap_lsn,
                     None,
                     "stream",
-                    table,
+                    seed_table,
                     schema_id,
                     self._pipeline_scope(),
                 )
@@ -19180,12 +19198,16 @@ def register_lakeflow_source(spark):
                 # scan has not reached it yet, or went idle where the consumer already is)
                 # yields to a direct read, which waits on the log itself -- unless it went idle
                 # at or past the read's boundary, where moving nowhere is the read being done.
-                # The update's frozen boundary is known once this process has read it.
+                # An AvailableNow read takes the update's frozen boundary here when this process
+                # has not read it yet, the upsert reader publishing it from this view's sample as
+                # it would on taking the view, so the update's first poll of an idle table does
+                # not open a session.
                 reached = view.reached_lsn if view.caught_up else None
                 bound = replay_stop
-                if bound is None:
-                    frozen = self._trigger_boundaries.get(table.identity)
-                    bound = frozen[0] if frozen and frozen[2] == pipeline_scope else None
+                if bound is None and reached is not None and reached <= checkpoint_commit:
+                    bound, _ = self._shared_trigger_boundary(
+                        table, checkpoint, owner=not deletes, current_lsn=view.current_lsn
+                    )
                 if reached is None or (
                     reached <= checkpoint_commit and (bound is None or reached < bound)
                 ):
@@ -19357,17 +19379,18 @@ def register_lakeflow_source(spark):
                     shared_view.open_begin,
                     shared_view.reached_lsn,
                 )
-            elif past_step and replay_stop is None:
+            elif past_step and (replay_stop is None or replay_stop <= int(checkpoint["commit_lsn"])):
                 # A step to a generation the live schema has moved past: commit its schema and
                 # read nothing under it. Its columns are not the live ones -- a column added
                 # since would go uncaptured in every change read here, and one dropped since
                 # cannot be captured -- so the changes wait for the step to the live schema,
-                # which captures them with the live layout from this same position.
+                # which captures them with the live layout from this same position. A replay
+                # of such a step ends where it started, so it reads nothing either.
                 committed, caught_up, open_begin, reached = [], False, None, None
             else:
-                # A replay of such a step reads its committed range, every change of which was
-                # committed while the step's generation was live, so its projection loses
-                # nothing; it captures with the live layout, which spans the ALTERs since.
+                # A replay of a step that read changes reads its committed range, every change
+                # of which was committed while the step's generation was live. It captures with
+                # the live layout, which spans the ALTERs since, and is shaped by it below.
                 raw_records = self._read_changes_with_reconnect(
                     [
                         _capture_descriptor(
@@ -19412,10 +19435,13 @@ def register_lakeflow_source(spark):
             # Shaped by the generation the read captured, which a reader a step behind the live
             # schema registers (capture_table): the live table can key or type a column the
             # captured records lack. A schema record keeps the table's options, filter and
-            # transforms included, so the projection loses none of them.
+            # transforms included, so the projection loses none of them. A replay of a step
+            # the live schema moved past captured with the live layout, and this update's
+            # destination keys by it: the step's own key can name a column dropped since.
+            shape_table = table if past_step else capture_table
             tombstones = (
                 not deletes
-                and self._append_only_table(capture_table, options)
+                and self._append_only_table(shape_table, options)
                 and self._append_delete_tombstones(options)
             )
             for tx in recovered:
@@ -19431,13 +19457,13 @@ def register_lakeflow_source(spark):
                     break
                 projected = _project_transaction(
                     tx,
-                    capture_table,
+                    shape_table,
                     deletes,
                     tombstones=tombstones,
                     encoding=self._source_encoding(options),
                 )
                 projected = [
-                    _coerce_variable_decimal_values(row, capture_table, options) for row in projected
+                    _coerce_variable_decimal_values(row, shape_table, options) for row in projected
                 ]
                 # Never split a transaction.  A single large transaction is
                 # accepted; subsequent complete transactions wait for next poll.

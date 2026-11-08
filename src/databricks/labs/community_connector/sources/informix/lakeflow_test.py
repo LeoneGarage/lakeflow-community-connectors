@@ -7777,6 +7777,39 @@ class LakeflowContractTests(unittest.TestCase):
         connector._trigger_boundaries[table.identity] = (95, "a" * 32, connector._pipeline_scope())
         self.assertIsNone(poll(at_checkpoint, {}, trigger=True))
 
+    def test_the_first_available_now_poll_of_an_idle_table_keeps_the_shard_view(self):
+        # The first poll of an AvailableNow update has no frozen boundary in this process yet.
+        # The upsert reader publishes it from the view's sample, as it does on taking the
+        # view, so a table idle where the shard is caught up to the log keeps the view; one
+        # the shard went idle behind (a stalled scan) still reads directly.
+        def first_poll(current):
+            connector = self.connector(
+                FakeBridge(),
+                shared_cdc=True,
+                registration_scope=f"available-now-{current}",
+                **{"cdc.shared.session": "process"},
+            )
+            table = connector._table("app.orders", {})
+            checkpoint = _stream_offset(90)
+            shown = _SharedCdcSnapshot(
+                table, checkpoint["schema_fingerprint"], 1, current, [], True, None, 90
+            )
+            shard = mock.Mock()
+            shard.snapshot.return_value = shown
+            connector._trigger_available_now = True
+            with mock.patch.object(informix_module, "_shared_cdc_shard", return_value=shard):
+                view = connector._shared_cdc_snapshot(
+                    table, checkpoint, {}, False, connector._pipeline_scope()
+                )
+            return shown, view, connector._trigger_boundaries[table.identity][0]
+
+        shown, view, boundary = first_poll(90)
+        self.assertIs(view, shown)
+        self.assertEqual(boundary, 90)
+        _, view, boundary = first_poll(200)
+        self.assertIsNone(view)
+        self.assertEqual(boundary, 200)
+
     def test_a_schema_change_undone_then_followed_by_another_reaches_the_newest(self):
         # A column added and dropped again returns the table to its first layout. Were the
         # node id the layout alone, that return would reuse the first node, whose recorded
@@ -7872,6 +7905,92 @@ class LakeflowContractTests(unittest.TestCase):
         replayed = self.connector(bridge)._replay_embedded_range("app.orders", start, end, {})
 
         self.assertEqual([(row["id"], row["added_b"]) for row in replayed], [(9, 2)])
+
+    def test_a_replay_of_a_metadata_only_step_reads_nothing(self):
+        # A lagging reader stepped to a generation the live schema moved past without reading,
+        # so the step ends where it started. Its replay has nothing to read either and opens
+        # no capture session for it.
+        bridge = FakeBridge()
+        _, checkpoint_a = self.connector(bridge).read_table("app.orders", {}, {})
+        bridge.tables[0]["columns"].append(
+            {"name": "added_b", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+        _, checkpoint_b = self.connector(bridge).read_table("app.orders", checkpoint_a, {})
+        bridge.tables[0]["columns"].append(
+            {"name": "added_c", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 140
+        self.connector(bridge).read_table("app.orders", checkpoint_b, {})
+        lagging = self.connector(bridge)
+        _, step = lagging.read_table("app.orders", checkpoint_a, {})
+        self.assertEqual(step["commit_lsn"], checkpoint_a["commit_lsn"])
+        self.assertEqual(step["schema_fingerprint"], checkpoint_b["schema_fingerprint"])
+        reads = len(bridge.change_reads)
+
+        replayed = lagging._replay_embedded_range("app.orders", checkpoint_a, step, {})
+
+        self.assertEqual(list(replayed), [])
+        self.assertEqual(len(bridge.change_reads), reads)
+
+    def test_a_delete_replay_after_a_wildcard_key_column_drop_keys_by_the_live_layout(self):
+        # A delete batch read under a whole-row key that still held a column is replayed
+        # once that column is dropped. The live capture cannot return it, and the update
+        # replaying the batch keys its destination without it, so the delete is keyed by
+        # the live layout instead of failing on the absent column.
+        bridge = FakeBridge()
+        bridge.tables[0]["columns"].append(
+            {"name": "dropped", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.rows = [dict(row, dropped=None) for row in bridge.rows]
+        options = {"primary.keys": "*", "snapshot.mode": "initial"}
+
+        def connector(scope):
+            return self.connector(bridge, registration_scope=scope)
+
+        _, checkpoint = connector("update-a").read_table("app.orders", {}, dict(options))
+        _, start = connector("update-a").read_table_deletes("app.orders", {}, dict(options))
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 110
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 110}]
+        connector("update-b").read_table("app.orders", checkpoint, dict(options))
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 9, "lsn": 100},
+            {
+                "op": "DELETE",
+                "tx_id": 9,
+                "lsn": 101,
+                "table": "demo:app.orders",
+                "row": {"id": 1, "value": "a", "dropped": 5, "added": None},
+            },
+            {"op": "COMMIT", "tx_id": 9, "lsn": 102},
+            {"op": "TIMEOUT", "lsn": 110},
+        ]
+        rows, end = connector("update-b").read_table_deletes("app.orders", start, dict(options))
+        self.assertEqual([(row["id"], row["dropped"]) for row in rows], [(1, 5)])
+        bridge.tables[0]["columns"] = [
+            column for column in bridge.tables[0]["columns"] if column["name"] != "dropped"
+        ]
+        bridge.now = 130
+        bridge.changes[1] = dict(bridge.changes[1], row={"id": 1, "value": "a", "added": None})
+        replaying = connector("update-c")
+        replay_options = dict(options)
+
+        replayed = informix_module._replay_between_offsets(
+            start,
+            end,
+            lambda offset: replaying.read_table_deletes("app.orders", offset, replay_options),
+            replay_options,
+            replaying.options,
+        )
+
+        self.assertEqual(
+            [(row["id"], row["value"], row["added"], row["_informix_op"]) for row in replayed],
+            [(1, "a", None, "d")],
+        )
 
     def test_a_lagging_reader_keeps_the_values_of_a_column_added_after_its_next_step(self):
         # Two columns added in two runs. A reader still at the first schema steps to the
@@ -11694,6 +11813,38 @@ class LakeflowContractTests(unittest.TestCase):
             {key: value for key, value in offset.items() if key != "schema_transition_retry_count"},
             checkpoint,
         )
+
+    def test_a_delete_flow_seeds_at_the_channel_starts_schema_after_a_stopped_alter(self):
+        # The pipeline stops after the snapshot but before the delete flow checkpoints, and a
+        # column is added. The resumed upsert reader publishes the update's channel start at
+        # its checkpoint, under the snapshot's schema, before stepping to the live one. The
+        # delete flow seeds there under that schema and steps itself on its next poll.
+        bridge = FakeBridge()
+        _, checkpoint = self.connector(bridge, registration_scope="update-1").read_table(
+            "app.orders", {}, {}
+        )
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+        self.connector(bridge, registration_scope="update-2").read_table(
+            "app.orders", checkpoint, {}
+        )
+
+        _, seed = self.connector(bridge, registration_scope="update-2").read_table_deletes(
+            "app.orders", {}, {}
+        )
+
+        self.assertEqual(seed["commit_lsn"], checkpoint["commit_lsn"])
+        self.assertEqual(seed["schema_id"], checkpoint["schema_id"])
+        self.assertEqual(seed["schema_fingerprint"], checkpoint["schema_fingerprint"])
+        rows, stepped = self.connector(bridge, registration_scope="update-2").read_table_deletes(
+            "app.orders", seed, {}
+        )
+        self.assertEqual(list(rows), [])
+        live = _schema_fingerprint(Table.parse(bridge.tables[0], "demo"))
+        self.assertEqual(stepped["schema_fingerprint"], live)
 
     def test_delete_schema_transition_resumes_once_the_owner_publishes(self):
         bridge = FakeBridge()
