@@ -5508,6 +5508,40 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual([row["id"] for row in rows], [2])
 
+    def test_an_initial_snapshot_replay_serves_the_logged_snapshot(self):
+        # The first batch of a staged snapshot, replayed in a later update by the simple
+        # reader, serves page 0 of the snapshot Spark logged rather than draining a newer
+        # one: the pages after it come from that snapshot.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 4)]
+        pipeline = "11111111-1111-1111-1111-111111111111"
+
+        def connector(update):
+            reader = self.connector(bridge, **{"snapshot.page.size": "1"})
+            reader.set_registration_scope(f"{pipeline}_@_{update}")
+            return reader
+
+        _, end = connector("22222222-2222-2222-2222-222222222222").read_table("app.orders", {}, {})
+        bridge.now = 110
+        restarted = connector("33333333-3333-3333-3333-333333333333")
+        replay_options = {}
+
+        replayed = list(
+            informix_module._replay_between_offsets(
+                {},
+                end,
+                lambda offset: restarted.read_table("app.orders", offset, replay_options),
+                replay_options,
+                restarted.options,
+            )
+        )
+
+        self.assertEqual([row["id"] for row in replayed], [1])
+        self.assertEqual(
+            {row[informix_module.COMMIT_LSN] for row in replayed},
+            {informix_module._sortable_lsn(int(end["snapshot_lsn"]))},
+        )
+
     def test_a_simple_reader_replay_of_a_multi_page_batch_serves_every_page(self):
         # stream.partitioned switched off while a batch of several staged pages is
         # uncommitted: the simple reader replays it a page per read, so the replay keeps
@@ -7011,6 +7045,109 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertTrue(any("landing on its logged end 150" in line for line in logs.output))
         _, after = replaying.read_table_deletes("app.orders", seed, dict(options))
         self.assertEqual(after["commit_lsn"], "150")
+
+    def test_a_delete_batch_read_before_the_log_expired_replays_by_landing(self):
+        # A delete batch read a transaction, then the pipeline stopped and the log expired
+        # past its start. Its replay lands on the logged end, whose transaction is gone from
+        # the log, rather than failing for want of it.
+        bridge = FakeBridge()
+        options = {"snapshot.mode": "auto_snapshot"}
+        start = _stream_offset(90)
+        bridge.now = 110
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 93},
+            {
+                "op": "DELETE",
+                "tx_id": 7,
+                "lsn": 94,
+                "table": "demo:app.orders",
+                "row": {"id": 1, "value": "a"},
+            },
+            {"op": "COMMIT", "tx_id": 7, "lsn": 95},
+            {"op": "TIMEOUT", "lsn": 110},
+        ]
+        rows, end = self.connector(bridge).read_table_deletes("app.orders", start, options)
+        self.assertEqual((end["commit_lsn"], end["tx_id"]), ("95", 7))
+        bridge.minimum = 96
+        bridge.now = 170
+        replaying = self.connector(bridge, registration_scope="later")
+        replay_options = dict(options)
+
+        with self.assertLogs(informix_module.__name__, level="WARNING"):
+            replayed = list(
+                informix_module._replay_between_offsets(
+                    start,
+                    end,
+                    lambda offset: replaying.read_table_deletes(
+                        "app.orders", offset, replay_options
+                    ),
+                    replay_options,
+                    replaying.options,
+                )
+            )
+
+        self.assertEqual(replayed, [])
+
+    def test_an_upsert_resnapshot_batch_replayed_in_a_later_update_resnapshots(self):
+        # auto_snapshot replaced an expired checkpoint with a snapshot, and the batch was
+        # replayed after a restart. The log no longer holds its start, so the replay cannot
+        # reproduce it: it resnapshots at a later boundary, as an initial range does.
+        bridge = FakeBridge()
+        bridge.minimum = 91
+        bridge.now = 150
+        checkpoint = _stream_offset(90)
+        checkpoint["pipeline_scope"] = "f" * 32
+        options = {"snapshot.mode": "auto_snapshot", "snapshot.page.size": "1"}
+        _, end = self.connector(bridge, registration_scope="u1").read_table(
+            "app.orders", checkpoint, dict(options)
+        )
+        self.assertEqual(end["commit_lsn"], "150")
+        bridge.now = 170
+        replaying = self.connector(bridge, registration_scope="u2")
+        replay_options = dict(options)
+
+        replayed = list(
+            informix_module._replay_between_offsets(
+                checkpoint,
+                end,
+                lambda offset: replaying.read_table("app.orders", offset, replay_options),
+                replay_options,
+                replaying.options,
+            )
+        )
+
+        self.assertEqual([row["id"] for row in replayed], [1])
+
+    def test_a_copy_finished_in_its_first_batch_replays_to_its_bound(self):
+        # The copy fitted one chunk, so its first batch finished it and neither offset
+        # carries a copy block. Rows were inserted below the bound before the replay: it
+        # still drains to the bound, so every row the batch copied is copied again.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": 5, "value": "e"}, {"id": 10, "value": "j"}]
+        options = {"snapshot.mode": "incremental", "snapshot.page.size": "2"}
+        connector = self.connector(bridge)
+        rows, end = connector.read_table("app.orders", {}, dict(options))
+        self.assertEqual(sorted(row["id"] for row in rows), [5, 10])
+        self.assertNotIn("incremental", end)
+        bridge.rows = [{"id": 1, "value": "a"}, {"id": 2, "value": "b"}] + bridge.rows
+
+        replayed = list(connector._replay_embedded_range("app.orders", {}, end, dict(options)))
+
+        self.assertLessEqual({5, 10}, {row["id"] for row in replayed})
+
+    def test_a_snapshot_replay_that_stops_short_of_its_page_fails(self):
+        # Every page of a snapshot shares its LSN, so landing on the LSN does not show the
+        # replay reached its page: one that stops short fails instead of passing.
+        start = dict(_stream_offset(90), phase="snapshot", snapshot_lsn="90")
+        start["snapshot"] = {"page_index": 1, "last_pk": [1]}
+        end = dict(start, snapshot={"page_index": 3, "last_pk": [3]})
+
+        with self.assertRaisesRegex(InformixError, "snapshot position"):
+            list(
+                informix_module._replay_between_offsets(
+                    start, end, lambda offset: (iter(()), dict(start)), {}, {}
+                )
+            )
 
     def test_snapshot_mode_auto_snapshot_starts_incrementally_without_checkpoint(self):
         bridge = FakeBridge()

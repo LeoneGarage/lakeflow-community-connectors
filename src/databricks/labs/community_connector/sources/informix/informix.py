@@ -796,6 +796,10 @@ _REPLAY_STOP_LSN_OPTION = "_informix.replay.stop.lsn"
 # JSON ``null`` meaning "the copy finished inside this range" -- which must
 # drain to max_pk rather than stop early. Absent means an ordinary read.
 _REPLAY_STOP_PK_OPTION = "_informix.replay.stop.pk"
+# Set by a replayed read on the offset it reached when the range cannot be reproduced and
+# was re-established instead (a start the log no longer retains, under auto_snapshot):
+# _replay_between_offsets then holds it to an initial range's terms. Never persisted.
+_REPLAY_REESTABLISHED = "_informix.replay.reestablished"
 # Distinguish JSON null (replay the copy-completing range through max_pk) from
 # an absent option (ordinary one-page incremental read).
 _REPLAY_DRAIN_TO_MAX_PK = object()
@@ -1064,9 +1068,14 @@ def _replay_between_offsets(start, end, read, options, connector_options):
         return iter(())
     # The first incremental range starts at {} and still emits a chunk. Bound it
     # whenever either side identifies an in-progress copy; a start-side block with
-    # no end-side block is the final range and is represented by JSON null below.
-    replaying_chunk = isinstance((start or {}).get("incremental"), dict) or isinstance(
-        (end or {}).get("incremental"), dict
+    # no end-side block is the final range and is represented by JSON null below. A
+    # copy that finished in its first batch leaves neither side a block, so an initial
+    # range ending in the stream phase drains to max_pk too (only a copy reads it).
+    initial_range = not positional_keys.intersection(start or {})
+    replaying_chunk = (
+        isinstance((start or {}).get("incremental"), dict)
+        or isinstance((end or {}).get("incremental"), dict)
+        or (initial_range and (end or {}).get("phase") == "stream")
     )
     # ``null`` is meaningful: the copy finished inside this range, so the replay
     # must drain to max_pk instead of stopping at a cursor.
@@ -1078,8 +1087,13 @@ def _replay_between_offsets(start, end, read, options, connector_options):
     if replaying_chunk:
         options[_REPLAY_STOP_PK_OPTION] = stop_pk
     try:
-        initial_range = not positional_keys.intersection(start or {})
         replay_start = start
+        if initial_range and end_position is not None:
+            # A staged snapshot's first batch: serve it from the snapshot Spark logged, from
+            # page 0, rather than drain another one (a later update would), so the batch and
+            # the pages after it come from one snapshot.
+            position = {k: v for k, v in end["snapshot"].items() if k != "record_index"}
+            replay_start = {**end, "snapshot": {**position, "page_index": 0, "last_pk": []}}
         record_parts = []
         configured_wait = float(
             options.get(
@@ -1117,9 +1131,13 @@ def _replay_between_offsets(start, end, read, options, connector_options):
             record_parts.append(records)
             if isinstance(reached, dict) and reached.get("commit_lsn") is not None:
                 position = _snapshot_position(reached)
-                if position is not None and (
-                    end_position is None
-                    or (position[0] == end_position[0] and position[1:] < end_position[1:])
+                if (
+                    position is not None
+                    and position != _snapshot_position(replay_start)
+                    and (
+                        end_position is None
+                        or (position[0] == end_position[0] and position[1:] < end_position[1:])
+                    )
                 ):
                     # The simple reader serves a staged snapshot a page per read, and a batch
                     # the partitioned reader logged can span several: read on to its end.
@@ -1181,17 +1199,24 @@ def _replay_between_offsets(start, end, read, options, connector_options):
         # that newer state and replaying them is safe. A checkpointed range,
         # however, must land on its exact transaction boundary. In both cases an
         # under-read is always destructive.
-        wrong_lsn = reached_lsn < stop_lsn or (not initial_range and reached_lsn != stop_lsn)
+        # A range the read re-established is held to the same terms as an initial one.
+        reestablished = bool(reached.pop(_REPLAY_REESTABLISHED, False))
+        initial_terms = initial_range or reestablished
+        wrong_lsn = reached_lsn < stop_lsn or (not initial_terms and reached_lsn != stop_lsn)
         if wrong_lsn:
             # 5: Informix replay did not reach its committed end LSN {}; reached {}
             raise InformixError(_m(5, stop_lsn, reached_lsn))
+        # Every page of a snapshot shares its LSN, so the page is checked on its own.
+        if end_position is not None and _snapshot_position(reached) != end_position:
+            # 428: Informix replay did not reach its committed snapshot position {}; reached {}
+            raise InformixError(_m(428, end_position[1:], (_snapshot_position(reached) or ())[1:]))
         # An end that names a transaction is reached only by consuming that transaction.
         # The read lands on its bound without one only for an end the original read
         # reached by going idle, so landing there for this end means the replay never
         # saw the transaction.
         expected_tx = (end or {}).get("tx_id")
         if (
-            not initial_range
+            not initial_terms
             and not replaying_chunk
             and expected_tx is not None
             and str(reached.get("tx_id")) != str(expected_tx)
@@ -1201,7 +1226,10 @@ def _replay_between_offsets(start, end, read, options, connector_options):
             raise InformixError(_m(6, expected_tx, stop_lsn, reached.get("tx_id")))
         expected_incremental = (end or {}).get("incremental")
         reached_incremental = reached.get("incremental")
-        if isinstance(expected_incremental, dict):
+        if reestablished:
+            # Another snapshot's copy: Spark goes on from the cursor it logged.
+            pass
+        elif isinstance(expected_incremental, dict):
             expected_pk = expected_incremental.get("last_pk")
             if (
                 not isinstance(reached_incremental, dict)
@@ -8270,6 +8298,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                         table_options,
                         pipeline_scope_override=self._resnapshot_scope(table, effective_start),
                     )
+                    if self._replay_stop_lsn(table_options) is not None:
+                        # A replayed range from a start the log no longer holds cannot be
+                        # reproduced; it resnapshots, as an initial range does.
+                        result = result[0], {**result[1], _REPLAY_REESTABLISHED: True}
                 elif snapshot_mode in {"incremental", "auto_snapshot"} and not effective_start:
                     result = self._read_incremental(table, None, table_options)
                 elif (
@@ -10058,6 +10090,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 "change_lsn": position,
                 "begin_lsn": position,
                 "tx_id": None,
+                # No transaction to match: the batch's deletes, if any, are gone.
+                _REPLAY_REESTABLISHED: True,
             }
         seed = self._resnapshot_delete_seed(table, self._resnapshot_scope(table, checkpoint))
         if seed is not None:
