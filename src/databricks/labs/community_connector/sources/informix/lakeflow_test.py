@@ -8404,11 +8404,13 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(connector._read_immutable_head(namespace)["value"], 90)
 
-    def test_a_bounded_read_takes_a_shard_view_only_when_it_moves_the_consumer_on(self):
+    def test_a_bounded_read_takes_a_shard_view_only_when_it_shows_the_read_done(self):
         # An AvailableNow update or a replay ends at the first read that moves it nowhere.
-        # A shard view with nothing for this consumer, not idle past its checkpoint (its
-        # scan has not got here yet), would end it short of its boundary, so it reads
-        # directly instead. A continuous read keeps the view and polls again.
+        # A shard view with nothing for this consumer that does not show the read done --
+        # its scan stopped short of the consumer, or it read before the log reached the
+        # update's boundary -- would end it short of that boundary, so it reads directly
+        # instead (once a wait for the shard's next read runs out, cut to nothing here).
+        # A continuous read keeps the view and polls again.
         connector = self.connector(
             FakeBridge(), shared_cdc=True, **{"cdc.shared.session": "process"}
         )
@@ -8419,16 +8421,23 @@ class LakeflowContractTests(unittest.TestCase):
         # Past the page the shard is idle on: the boundary current_lsn names is a page end.
         current = 90 + (1 << 12) + 10
 
-        def view(caught_up=False, reached=None, committed=()):
+        def view(caught_up=False, reached=None, committed=(), started=None):
             return _SharedCdcSnapshot(
-                table, fingerprint, 1, current, list(committed), caught_up, None, reached
+                table, fingerprint, 1, current, list(committed), caught_up, None, reached, started
             )
 
         def poll(shown, options, trigger=False):
             shard = mock.Mock()
             shard.snapshot.return_value = shown
             connector._trigger_available_now = trigger
-            with mock.patch.object(informix_module, "_shared_cdc_shard", return_value=shard):
+            with (
+                mock.patch.object(informix_module, "_shared_cdc_shard", return_value=shard),
+                mock.patch.multiple(
+                    informix_module,
+                    _SHARED_VIEW_WAIT_TIMEOUTS=0,
+                    _SHARED_VIEW_WAIT_MARGIN_SECONDS=0,
+                ),
+            ):
                 return connector._shared_cdc_snapshot(
                     table, checkpoint, options, False, connector._pipeline_scope()
                 )
@@ -8438,7 +8447,9 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertIs(poll(behind, {}), behind)
         self.assertIsNone(poll(behind, {}, trigger=True))
         self.assertIsNone(poll(behind, replay))
-        self.assertIsNone(poll(view(caught_up=True, reached=90), {}, trigger=True))
+        # Idle short of the consumer after moving on from where it started: a scan whose
+        # timeout ran out on the log before it got here.
+        self.assertIsNone(poll(view(caught_up=True, reached=80, started=70), {}, trigger=True))
         idle_past = view(caught_up=True, reached=120)
         self.assertIs(poll(idle_past, {}, trigger=True), idle_past)
         # Idle at or past the read's boundary is the read being done, not stuck: the
@@ -8447,14 +8458,24 @@ class LakeflowContractTests(unittest.TestCase):
         at_checkpoint = view(caught_up=True, reached=90)
         done = {informix_module._REPLAY_STOP_LSN_OPTION: "90"}
         self.assertIs(poll(at_checkpoint, done), at_checkpoint)
-        connector._trigger_boundaries[table.identity] = (90, "a" * 32, connector._pipeline_scope())
+        self.assertIsNone(poll(at_checkpoint, replay))
+        # So is an AvailableNow read whose shard went idle where this consumer is, or where
+        # its read started (the log reader's position held back), from a read made once the
+        # log had reached the boundary: a direct read would see no further.
         self.assertIs(poll(at_checkpoint, {}, trigger=True), at_checkpoint)
-        connector._trigger_boundaries[table.identity] = (
-            current,
-            "a" * 32,
-            connector._pipeline_scope(),
-        )
+        self.assertEqual(connector._trigger_boundaries[table.identity][0], current)
+        held = view(caught_up=True, reached=80, started=85)
+        self.assertIs(poll(held, {}, trigger=True), held)
+        # Within the boundary's page is done as well.
+        scope = connector._pipeline_scope()
+        connector._trigger_boundaries[table.identity] = (90, "a" * 32, scope)
+        within = view(caught_up=True, reached=80, started=70)
+        self.assertIs(poll(within, {}, trigger=True), within)
+        # Not from a read made before the log got to the boundary, as the delete reader's
+        # shard can be when the upsert reader published it from its own.
+        connector._trigger_boundaries[table.identity] = (current + 1, "a" * 32, scope)
         self.assertIsNone(poll(at_checkpoint, {}, trigger=True))
+        self.assertIsNone(poll(held, {}, trigger=True))
 
     def test_a_shard_view_of_another_layout_than_the_readers_is_not_taken(self):
         # Two flows can read one source table under different options (a row_filter, say)
@@ -8481,40 +8502,52 @@ class LakeflowContractTests(unittest.TestCase):
     def test_the_first_available_now_poll_of_an_idle_table_keeps_the_shard_view(self):
         # The first poll of an AvailableNow update has no frozen boundary in this process yet.
         # The upsert reader publishes it from the view's sample, as it does on taking the
-        # view, so a table idle where the shard is caught up to the log keeps the view; one
-        # the shard went idle behind (a stalled scan) still reads directly.
-        def first_poll(current, minimum=1, deletes=False):
+        # view, so a table the shard went idle on where the consumer is keeps the view, however
+        # far the log reader's position is held back; one the shard went idle behind (a
+        # stalled scan) still reads directly.
+        def first_poll(current, minimum=1, deletes=False, reached=90, started=None):
             connector = self.connector(
                 FakeBridge(),
                 shared_cdc=True,
-                registration_scope=f"available-now-{current}-{minimum}",
+                registration_scope=f"available-now-{current}-{minimum}-{reached}",
                 **{"cdc.shared.session": "process"},
             )
             table = connector._table("app.orders", {})
             checkpoint = _stream_offset(90)
             shown = _SharedCdcSnapshot(
-                table, checkpoint["schema_fingerprint"], minimum, current, [], True, None, 90
+                table,
+                checkpoint["schema_fingerprint"],
+                minimum,
+                current,
+                [],
+                True,
+                None,
+                reached,
+                started,
             )
             shard = mock.Mock()
             shard.snapshot.return_value = shown
             connector._trigger_available_now = True
-            with mock.patch.object(informix_module, "_shared_cdc_shard", return_value=shard):
+            with (
+                mock.patch.object(informix_module, "_shared_cdc_shard", return_value=shard),
+                mock.patch.multiple(
+                    informix_module,
+                    _SHARED_VIEW_WAIT_TIMEOUTS=0,
+                    _SHARED_VIEW_WAIT_MARGIN_SECONDS=0,
+                ),
+            ):
                 view = connector._shared_cdc_snapshot(
                     table, checkpoint, {}, deletes, connector._pipeline_scope()
                 )
             frozen = connector._trigger_boundaries.get(table.identity)
             return shown, view, frozen[0] if frozen else None
 
-        shown, view, boundary = first_poll(90)
-        self.assertIs(view, shown)
-        self.assertEqual(boundary, 90)
-        # The boundary is a page end, up to a page past the write position: a shard idle
-        # within that page has read everything committed before it.
-        shown, view, boundary = first_poll(90 + 4000)
-        self.assertIs(view, shown)
-        self.assertEqual(boundary, 90 + 4000)
+        for current in (90, 90 + 4000, 90 + 36 * (1 << 12)):
+            shown, view, boundary = first_poll(current)
+            self.assertIs(view, shown)
+            self.assertEqual(boundary, current)
         far = 90 + (1 << 12) + 10
-        _, view, boundary = first_poll(far)
+        _, view, boundary = first_poll(far, reached=80, started=70)
         self.assertIsNone(view)
         self.assertEqual(boundary, far)
         # A checkpoint the log no longer retains reads directly, which reports it, rather
@@ -8522,6 +8555,58 @@ class LakeflowContractTests(unittest.TestCase):
         _, view, boundary = first_poll(90, minimum=95, deletes=True)
         self.assertIsNone(view)
         self.assertIsNone(boundary)
+
+    def test_a_bounded_read_waits_for_the_shards_next_read_rather_than_reading_directly(self):
+        # A view that does not show an AvailableNow read done yet is re-taken until the
+        # shard's next read does, holding no connection slot, rather than every idle flow
+        # opening a session of its own; past the wait it reads directly. A replay does not
+        # wait: its stop is exact, and a view short of it reads directly at once.
+        connector = self.connector(
+            FakeBridge(), shared_cdc=True, **{"cdc.shared.session": "process"}
+        )
+        table = connector._table("app.orders", {})
+        checkpoint = _stream_offset(90)
+        fingerprint = checkpoint["schema_fingerprint"]
+        bound = 90 + 2 * (1 << 12)
+        scope = connector._pipeline_scope()
+
+        def view(current, fingerprint=fingerprint):
+            return _SharedCdcSnapshot(table, fingerprint, 1, current, [], True, None, 90, 90)
+
+        def poll(*shown, options=None, **wait):
+            shard = mock.Mock()
+            shard.snapshot.side_effect = list(shown) if len(shown) > 1 else None
+            shard.snapshot.return_value = shown[0]
+            connector._trigger_available_now = True
+            connector._trigger_boundaries[table.identity] = (bound, "a" * 32, scope)
+            with (
+                mock.patch.object(informix_module, "_shared_cdc_shard", return_value=shard),
+                mock.patch.multiple(informix_module, _SHARED_VIEW_WAIT_POLL_SECONDS=0.01, **wait),
+            ):
+                started = time.monotonic()
+                got = connector._shared_cdc_snapshot(
+                    table, checkpoint, options or {}, True, connector._pipeline_scope()
+                )
+            return got, shard.snapshot.call_count, time.monotonic() - started
+
+        stale, fresh = view(bound - 1), view(bound)
+        got, polls, _ = poll(stale, stale, fresh)
+        self.assertIs(got, fresh)
+        self.assertEqual(polls, 3)
+        # A schema transition arriving meanwhile goes to the direct read, which owns it.
+        got, polls, _ = poll(stale, view(bound, fingerprint="0" * 64))
+        self.assertIsNone(got)
+        self.assertEqual(polls, 2)
+        got, polls, elapsed = poll(
+            stale, _SHARED_VIEW_WAIT_TIMEOUTS=0, _SHARED_VIEW_WAIT_MARGIN_SECONDS=0.2
+        )
+        self.assertIsNone(got)
+        self.assertGreater(polls, 1)
+        self.assertGreaterEqual(elapsed, 0.2)
+        replay = {informix_module._REPLAY_STOP_LSN_OPTION: "150"}
+        got, polls, _ = poll(fresh, options=replay)
+        self.assertIsNone(got)
+        self.assertEqual(polls, 1)
 
     def test_a_schema_change_undone_then_followed_by_another_reaches_the_newest(self):
         # A column added and dropped again returns the table to its first layout. Were the
@@ -14854,6 +14939,20 @@ class SharedCdcShardTests(unittest.TestCase):
         self.assertTrue(view_a.caught_up)
         self.assertEqual((view_a.min_lsn, view_a.current_lsn), (1, 106))
 
+    def test_a_view_names_where_the_idle_read_it_comes_from_started(self):
+        # A bounded read tells a scan stopped short from the log reader's end by where the
+        # shard's idle read started; a read that did not go idle names no start.
+        shard = self._shard_with_two_tables()
+        shard.ingest(self._two_table_stream(), self._schema_map(), 1, 106, 0)
+        self.assertEqual(shard.snapshot(self.id_a, 0).read_start_lsn, 0)
+        busy = [record for record in self._two_table_stream() if record["op"] != "TIMEOUT"]
+        shard.ingest(busy, self._schema_map(), 1, 106, 105)
+        view = shard.snapshot(self.id_a, 0)
+        self.assertFalse(view.caught_up)
+        self.assertIsNone(view.read_start_lsn)
+        shard.ingest([{"op": "TIMEOUT", "lsn": 106}], self._schema_map(), 1, 106, 106)
+        self.assertEqual(shard.snapshot(self.id_a, 0).read_start_lsn, 106)
+
     def test_per_table_cursor_blocks_reread_duplicates(self):
         shard = self._shard_with_two_tables()
         stream = self._two_table_stream()
@@ -15754,6 +15853,7 @@ class HostSharedCdcTests(unittest.TestCase):
             caught_up=True,
             open_begin=None,
             reached_lsn=13,
+            read_start_lsn=9,
         )
         wired = pickle.loads(pickle.dumps(informix_module._wire_view(view)))
         back = informix_module._unwire_view(wired)
@@ -15762,8 +15862,8 @@ class HostSharedCdcTests(unittest.TestCase):
         self.assertEqual(_schema_fingerprint(back.table), _schema_fingerprint(table))
         self.assertEqual(back.committed[0].records, (record,))
         self.assertEqual(
-            (back.caught_up, back.reached_lsn, back.committed[0].commit_time),
-            (True, 13, 1700000000),
+            (back.caught_up, back.reached_lsn, back.read_start_lsn, back.committed[0].commit_time),
+            (True, 13, 9, 1700000000),
         )
 
     def test_the_first_process_leads_and_the_next_one_polls_it(self):

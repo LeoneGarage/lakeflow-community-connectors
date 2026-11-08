@@ -413,6 +413,13 @@ _SHARED_CDC_SUBSCRIBER_TTL_SECONDS = 300.0
 # Idle back-off between reads once a shard has drained its log, so a caught-up daemon
 # does not busy-spin (and releases its connection slot for consumer bootstrap).
 _SHARED_CDC_IDLE_POLL_SECONDS = 1.0
+# A bounded read whose shard view does not yet show it done waits for the shard's next read,
+# holding no connection slot, rather than opening a session of its own: for two of the
+# shard's reads (each waits out cdc.timeout about twice) and a margin, re-taking the view
+# at this interval, before it reads directly.
+_SHARED_VIEW_WAIT_TIMEOUTS = 4
+_SHARED_VIEW_WAIT_MARGIN_SECONDS = 5.0
+_SHARED_VIEW_WAIT_POLL_SECONDS = 0.5
 # Tables per batched catalog query (table_versions, get_tables), well inside the SQLI
 # limit of 1024 bind values a statement.
 _CATALOG_BATCH = 500
@@ -6204,6 +6211,8 @@ class _SharedCdcSnapshot:
     open_begin: int | None
     # Where the daemon's latest read went idle (its TIMEOUT LSN), or None.
     reached_lsn: int | None = None
+    # Where that idle read started (the shard's restart LSN), or None.
+    read_start_lsn: int | None = None
 
 
 class _SharedCdcShard:
@@ -6229,6 +6238,7 @@ class _SharedCdcShard:
         self.min_lsn: int | None = None
         self.current_lsn: int | None = None
         self.reached_lsn: int | None = None
+        self.read_start_lsn: int | None = None
         self.caught_up = False
         self.open_begins: dict[str, int | None] = {}
         self.ready = False
@@ -6357,6 +6367,7 @@ class _SharedCdcShard:
                 caught_up=caught_up,
                 open_begin=self.open_begins.get(identity),
                 reached_lsn=self.reached_lsn if caught_up else None,
+                read_start_lsn=self.read_start_lsn if caught_up else None,
             )
 
     # ---- daemon side --------------------------------------------------------
@@ -6479,6 +6490,7 @@ class _SharedCdcShard:
             )
             self.caught_up = timed_out and not buffer.open
             self.reached_lsn = reached if self.caught_up else None
+            self.read_start_lsn = read_start if self.caught_up else None
             self.ready = True
             self.condition.notify_all()
         return self.caught_up
@@ -6652,6 +6664,7 @@ def _wire_view(view: "_SharedCdcSnapshot") -> dict[str, Any]:
         "caught_up": view.caught_up,
         "open_begin": view.open_begin,
         "reached_lsn": view.reached_lsn,
+        "read_start_lsn": view.read_start_lsn,
     }
 
 
@@ -6665,6 +6678,7 @@ def _unwire_view(data: dict[str, Any]) -> "_SharedCdcSnapshot":
         caught_up=data["caught_up"],
         open_begin=data["open_begin"],
         reached_lsn=data["reached_lsn"],
+        read_start_lsn=data.get("read_start_lsn"),
     )
 
 
@@ -13795,64 +13809,83 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             ),
         }
         reader_factory = self._shared_cdc_reader_factory()
-        if _shared_cdc_mode(self.options) == _SHARED_CDC_SESSION_HOST:
-            view = _host_shard_poll(
-                key,
-                reader_factory,
-                config,
-                table.native_identity,
-                table,
-                capture,
-                checkpoint_commit,
-                floor,
-            )
-        else:
-            shard = _shared_cdc_shard(key, reader_factory=reader_factory, **config)
-            shard.subscribe(table.native_identity, table, capture, checkpoint_commit, floor)
-            view = shard.snapshot(table.native_identity, checkpoint_commit)
-        if view is None:
-            return None
-        # A fingerprint mismatch means a schema transition is in flight; defer to the
-        # direct-read path, which owns the transition/replay logic. So does a view of
-        # another layout than this reader's: two flows can read one table under different
-        # options with the same capture, and the shard keeps the first one's table.
-        if view.fingerprint != str(
-            checkpoint.get("schema_fingerprint")
-        ) or view.fingerprint != _schema_fingerprint(table):
-            return None
         replay_stop = self._replay_stop_lsn(options)
-        if (self._trigger_available_now or replay_stop is not None) and not view.committed:
+        deadline = (
+            time.monotonic()
+            + _SHARED_VIEW_WAIT_TIMEOUTS * config["timeout_seconds"]
+            + _SHARED_VIEW_WAIT_MARGIN_SECONDS
+        )
+        while True:
+            if _shared_cdc_mode(self.options) == _SHARED_CDC_SESSION_HOST:
+                view = _host_shard_poll(
+                    key,
+                    reader_factory,
+                    config,
+                    table.native_identity,
+                    table,
+                    capture,
+                    checkpoint_commit,
+                    floor,
+                )
+            else:
+                shard = _shared_cdc_shard(key, reader_factory=reader_factory, **config)
+                shard.subscribe(table.native_identity, table, capture, checkpoint_commit, floor)
+                view = shard.snapshot(table.native_identity, checkpoint_commit)
+            # A fingerprint mismatch means a schema transition is in flight; defer to the
+            # direct-read path, which owns the transition/replay logic. So does a view of
+            # another layout than this reader's: two flows can read one table under different
+            # options with the same capture, and the shard keeps the first one's table.
+            if (
+                view is None
+                or view.fingerprint != str(checkpoint.get("schema_fingerprint"))
+                or view.fingerprint != _schema_fingerprint(table)
+            ):
+                return None
+            if not (self._trigger_available_now or replay_stop is not None) or view.committed:
+                return view
             # A bounded read -- an AvailableNow update, or a replay -- ends at the first read
             # that moves it nowhere. A view that cannot move this consumer on (the shard's
             # scan has not reached it yet, or went idle where the consumer already is)
-            # yields to a direct read, which waits on the log itself -- unless it went idle
-            # at or past the read's boundary, where moving nowhere is the read being done.
+            # yields to a direct read, which waits on the log itself -- unless it shows the
+            # read done. A replay is done once the shard went idle at or past its stop. Not
+            # a checkpoint the log no longer retains: the read reports that first.
+            reached = view.reached_lsn if view.caught_up else None
+            if (
+                reached is None
+                or reached > checkpoint_commit
+                or replay_stop is not None
+                or floor < view.min_lsn
+            ):
+                moved_on = reached is not None and reached > checkpoint_commit
+                at_stop = replay_stop is not None and reached is not None and reached >= replay_stop
+                return view if moved_on or at_stop else None
             # An AvailableNow read takes the update's frozen boundary here when this process
             # has not read it yet, the upsert reader publishing it from this view's sample as
-            # it would on taking the view, so the update's first poll of an idle table does
-            # not open a session. Not for a checkpoint the log no longer retains: the read
-            # reports that first, before any boundary is published or awaited.
-            reached = view.reached_lsn if view.caught_up else None
-            bound = replay_stop
-            if (
-                bound is None
-                and reached is not None
-                and reached <= checkpoint_commit
-                and floor >= view.min_lsn
+            # it would on taking the view. The boundary is current_lsn, the end of the log
+            # page being written, which an idle read never reaches; and on a quiet log the
+            # server's CDC reader, shared by every session, reports a TIMEOUT position held
+            # dozens of pages back until the next checkpoint, even to a session started past
+            # it. A direct read, started from the checkpoint, is done when the server reports
+            # no position past it. The shard's read is as good once the log had reached the
+            # boundary when it started (its sample, current_lsn, is at or past it) and it
+            # went idle where this consumer is, or where it started: a scan stopped short,
+            # its timeout spent on other tables' log, ends past where it started instead.
+            # Within the boundary's page is done as well.
+            bound, _ = self._shared_trigger_boundary(
+                table, checkpoint, owner=not deletes, current_lsn=view.current_lsn
+            )
+            started = view.read_start_lsn
+            if view.current_lsn >= bound and (
+                reached >= bound - (1 << 12)
+                or reached == checkpoint_commit
+                or (started is not None and reached <= started)
             ):
-                bound, _ = self._shared_trigger_boundary(
-                    table, checkpoint, owner=not deletes, current_lsn=view.current_lsn
-                )
-                # That boundary is current_lsn, the end of the log page being written, up
-                # to a page past the write position: a shard idle on a quiet log never gets
-                # there, and every idle flow would open a session of its own to confirm it.
-                # Idle within that page is the read being done (see _log_lsn).
-                bound -= 1 << 12
-            if reached is None or (
-                reached <= checkpoint_commit and (bound is None or reached < bound)
-            ):
+                return view
+            # Otherwise the shard's next read, started later, is waited for.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 return None
-        return view
+            time.sleep(min(_SHARED_VIEW_WAIT_POLL_SECONDS, remaining))
 
     def _read_stream(self, table: Table, start: dict, options: dict[str, str], deletes: bool):
         checkpoint = _validated_offset(start)
