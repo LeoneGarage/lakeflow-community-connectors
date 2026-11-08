@@ -128,22 +128,25 @@ class _Messages:
     # that cannot be read never masks the error a message describes.
     #
     # Code imported from a zip archive (zipimport) has its path inside the archive, where
-    # open() fails; the file is then read from the archive.
+    # open() fails; the file is then read from the archive. After a failed read the numbered
+    # message is used for a minute before the file is tried again. Every call passes its
+    # values here, logging calls included, so the numbered message keeps them.
 
     def __init__(self) -> None:
         self.path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "informix_messages.json"
         )
         self.templates: list[str] | None = None
+        self.retry_at = 0.0
 
     def __getstate__(self) -> dict[str, str]:
         return {"path": self.path}
 
     def __setstate__(self, state: dict[str, str]) -> None:
-        self.path, self.templates = state["path"], None
+        self.path, self.templates, self.retry_at = state["path"], None, 0.0
 
     def __call__(self, index: int, *values: Any) -> str:
-        if self.templates is None:
+        if self.templates is None and time.monotonic() >= self.retry_at:
             try:
                 archive, member = self.path, []
                 while not os.path.isfile(archive):
@@ -159,7 +162,9 @@ class _Messages:
                         text = handle.read()
                 self.templates = json.loads(text)
             except Exception:  # pylint: disable=broad-except
-                return f"Informix message {index} {values!r}"
+                self.retry_at = time.monotonic() + 60
+        if self.templates is None:
+            return f"Informix message {index} {values!r}"
         return self.templates[index].format(*values)
 
 
@@ -1224,12 +1229,9 @@ def _informix_available_now_base(base: type, spark_session: Any | None = None) -
                 options = getattr(reader, "options", {})
                 table = options.get("tableName", "<unknown>")
                 role = "delete" if options.get("isDeleteFlow") == "true" else "upsert"
-                # 10: Informix CDC reader initialized: scope=%s table=%s role=%s
+                # 10: Informix CDC reader initialized: scope={} table={} role={}
                 logging.getLogger(__name__).info(
-                    _m(10),
-                    registration_scope,
-                    table,
-                    role,
+                    _m(10, registration_scope, table, role),
                 )
 
             def prepare_for_trigger(reader) -> None:
@@ -1931,10 +1933,9 @@ class PurePythonInformixBridge:
                 if not heartbeat_waiter(
                     connection, namespace, ticket_id, waiter_ttl=_LAKEBASE_WAITER_TTL_SECONDS
                 ):
-                    # 18: Informix connection-slot waiter ticket %s was reaped; re-enqueuing
+                    # 18: Informix connection-slot waiter ticket {} was reaped; re-enqueuing
                     logging.getLogger(__name__).warning(
-                        _m(18),
-                        ticket_id,
+                        _m(18, ticket_id),
                     )
                     ticket_id = enqueue_waiter(
                         connection,
@@ -2050,12 +2051,10 @@ class PurePythonInformixBridge:
                     # that outlasts the lease means another reader may already
                     # have reclaimed the slot, so the transport has to go.
                     if now - first_failure >= _CONNECTION_SLOT_LEASE_SECONDS:
-                        # 22: Informix Lakebase slot renewal failed for %.0fs; treating the lease as
-                        # lost: %s
+                        # 22: Informix Lakebase slot renewal failed for {:.0f}s; treating the lease
+                        # as lost: {}
                         logging.getLogger(__name__).warning(
-                            _m(22),
-                            now - first_failure,
-                            slot,
+                            _m(22, now - first_failure, slot),
                             exc_info=True,
                         )
                         report_lease_lost()
@@ -2110,11 +2109,10 @@ class PurePythonInformixBridge:
             # Releasing is best effort: the lease expires on its own, so a failed
             # release costs one slot for one lease period rather than a stranded
             # slot as it did on the Volume.
-            # 24: Informix could not release Lakebase connection slot %s; its lease will expire
+            # 24: Informix could not release Lakebase connection slot {}; its lease will expire
             # instead
             logging.getLogger(__name__).warning(
-                _m(24),
-                slot,
+                _m(24, slot),
                 exc_info=True,
             )
 
@@ -2148,11 +2146,9 @@ class PurePythonInformixBridge:
                 context.callback(operation_lock.release)
             else:
                 # 25: Informix connection-slot lease loss could not take the operation lock within
-                # %.0fs; closing the transport while an operation is still in flight: %s
+                # {:.0f}s; closing the transport while an operation is still in flight: {}
                 logging.getLogger(__name__).warning(
-                    _m(25),
-                    _POISON_OPERATION_LOCK_SECONDS,
-                    getattr(self, "_connection_slot", None),
+                    _m(25, _POISON_OPERATION_LOCK_SECONDS, getattr(self, "_connection_slot", None)),
                 )
         with context:
             with self._connect_lock:
@@ -2811,15 +2807,11 @@ class PurePythonInformixBridge:
                     _VALIDATE_LSN_RETRY_BASE_SECONDS * (2**attempt),
                     _VALIDATE_LSN_RETRY_MAX_SECONDS,
                 )
-                # 39: Informix CDC initial-LSN validation timed out (%s); resetting the transport
-                # and retrying (attempt %d/%d) after %.1fs. Raise cdc.read.timeout.seconds or reduce
-                # concurrent CDC sessions if this recurs.
+                # 39: Informix CDC initial-LSN validation timed out ({}); resetting the transport
+                # and retrying (attempt {}/{}) after {:.1f}s. Raise cdc.read.timeout.seconds or
+                # reduce concurrent CDC sessions if this recurs.
                 logging.getLogger(__name__).warning(
-                    _m(39),
-                    error,
-                    attempt + 1,
-                    _VALIDATE_LSN_RETRY_MAX_RETRIES,
-                    delay,
+                    _m(39, error, attempt + 1, _VALIDATE_LSN_RETRY_MAX_RETRIES, delay),
                     exc_info=True,
                 )
                 self.reset_transport()
@@ -3617,12 +3609,10 @@ class PurePythonInformixBridge:
                     # bound forever, so surface the stall instead.
                     # 54: A CDC poll exceeded {} before any transaction completed
                     raise InformixError(_m(54, bound))
-                # 55: Informix CDC poll reached %s after %d completed transactions; ending the poll
+                # 55: Informix CDC poll reached {} after {} completed transactions; ending the poll
                 # early and resuming from the oldest open transaction
                 logging.getLogger(__name__).warning(
-                    _m(55),
-                    bound,
-                    completed_transactions,
+                    _m(55, bound, completed_transactions),
                 )
 
             # cdc.max.records is a soft boundary: once crossed, finish every
@@ -4264,12 +4254,10 @@ def _leave_out_unsupported_columns(table: Table, key: tuple[str, ...] | None) ->
         first = warning not in coordinator.unsupported_column_warnings
         coordinator.unsupported_column_warnings.add(warning)
     if first:
-        # 81: Informix table '%s' has column(s) of a type the connector can't read: %s. They are
+        # 81: Informix table '{}' has column(s) of a type the connector can't read: {}. They are
         # left out; the rest of the table is ingested without them.
         logging.getLogger(__name__).warning(
-            _m(81),
-            table.exposed_name,
-            _unsupported_column_list(unsupported),
+            _m(81, table.exposed_name, _unsupported_column_list(unsupported)),
         )
     keep_index = not set(table.nullable_index_key) & names
     return replace(
@@ -5651,8 +5639,8 @@ def _staging_subdirectories(path: str) -> list[str]:
     except FileNotFoundError:
         return []
     except OSError:
-        # 119: Cannot scan Informix snapshot staging path: %s
-        logging.getLogger(__name__).warning(_m(119), path, exc_info=True)
+        # 119: Cannot scan Informix snapshot staging path: {}
+        logging.getLogger(__name__).warning(_m(119, path), exc_info=True)
         return []
 
 
@@ -6474,9 +6462,9 @@ class _HostShardEndpoints:
         self.leading: dict[tuple, dict[str, Any]] = {}
         self.clients: dict[tuple, Any] = {}
         self.client_locks: dict[tuple, threading.Lock] = {}
-        # (key, identity) -> (checkpoint commit LSN, transactions) a follower holds from
-        # its earlier polls, so the leader sends each transaction only once.
-        self.mirrors: dict[tuple, tuple[int, tuple]] = {}
+        # (key, identity) -> (checkpoint commit LSN, capture, transactions) a follower holds
+        # from its earlier polls, so the leader sends each transaction only once.
+        self.mirrors: dict[tuple, tuple[int, dict, tuple]] = {}
         # Set when this process can't lock or serve a shard at all, so it shares in
         # process mode instead of reading directly on every poll.
         self.unavailable: str | None = None
@@ -6673,12 +6661,9 @@ def _host_shard_accept(
             if key not in endpoints.leading:
                 return
             failures += 1
-            # 144: Host-shared CDC shard %s-%s could not accept a follower (%s)
+            # 144: Host-shared CDC shard {}-{} could not accept a follower ({})
             logging.getLogger(__name__).warning(
-                _m(144),
-                key[-2],
-                key[-1],
-                error,
+                _m(144, key[-2], key[-1], error),
             )
             if failures < _HOST_SHARD_ACCEPT_FAILURES:
                 time.sleep(min(5.0, 0.05 * 2**failures))
@@ -6694,8 +6679,8 @@ def _host_shard_accept(
                 shard = _SHARED_CDC_SHARDS.get(key)
                 for identity in list(leading["remote"]) if shard is not None else ():
                     shard.evict(identity)
-                # 145: Process %s gave up host-shared CDC shard %s-%s
-                logging.getLogger(__name__).warning(_m(145), os.getpid(), key[-2], key[-1])
+                # 145: Process {} gave up host-shared CDC shard {}-{}
+                logging.getLogger(__name__).warning(_m(145, os.getpid(), key[-2], key[-1]))
             return
         failures = 0
         if key not in endpoints.leading:
@@ -6752,12 +6737,10 @@ def _host_shard_try_lead(
             if descriptor is not None:
                 os.close(descriptor)
             endpoints.unavailable = f"{type(error).__name__}: {error}"
-            # 146: Host-shared CDC shards are unavailable in process %s (%s); sharing within the
+            # 146: Host-shared CDC shards are unavailable in process {} ({}); sharing within the
             # process instead
             logging.getLogger(__name__).warning(
-                _m(146),
-                os.getpid(),
-                endpoints.unavailable,
+                _m(146, os.getpid(), endpoints.unavailable),
             )
             return False
         endpoints.leading[key] = {
@@ -6773,8 +6756,8 @@ def _host_shard_try_lead(
         daemon=True,
         name=f"informix-host-shard-{key[-2]}-{key[-1]}",
     ).start()
-    # 147: Process %s leads host-shared CDC shard %s-%s
-    logging.getLogger(__name__).info(_m(147), os.getpid(), key[-2], key[-1])
+    # 147: Process {} leads host-shared CDC shard {}-{}
+    logging.getLogger(__name__).info(_m(147, os.getpid(), key[-2], key[-1]))
     return True
 
 
@@ -6840,9 +6823,10 @@ def _host_shard_poll(
     endpoints = _HOST_SHARD_ENDPOINTS if endpoints is None else endpoints
     local = (key, reader_factory, config, identity, table, capture, commit, floor)
     # The leader sends only transactions after those this follower holds from earlier
-    # polls, so each crosses the socket once. A checkpoint moved back past them, or a
-    # poll without a view, starts over with the whole buffer; leading drops them.
-    held_commit, held = endpoints.mirrors.pop((key, identity), (commit, ()))
+    # polls, so each crosses the socket once. A checkpoint moved back past them, a new
+    # capture (they were decoded under the old one), or a poll without a view, starts over
+    # with the whole buffer; leading drops them.
+    held_commit, held_capture, held = endpoints.mirrors.pop((key, identity), (commit, capture, ()))
     if key in endpoints.leading or endpoints.unavailable:
         return _host_shard_local_poll(*local)
     if (
@@ -6850,7 +6834,7 @@ def _host_shard_poll(
         and _host_shard_try_lead(endpoints, key, reader_factory, config)
     ) or endpoints.unavailable:
         return _host_shard_local_poll(*local)
-    if held_commit > commit:
+    if held_commit > commit or held_capture != capture:
         held = ()
     request = {
         "config": config,
@@ -6866,37 +6850,28 @@ def _host_shard_poll(
     except (OSError, EOFError, TimeoutError, ValueError) as error:
         if _host_shard_try_lead(endpoints, key, reader_factory, config) or endpoints.unavailable:
             return _host_shard_local_poll(*local)
-        # 149: Host-shared CDC shard %s-%s leader unreachable (%s); reading directly
+        # 149: Host-shared CDC shard {}-{} leader unreachable ({}); reading directly
         logging.getLogger(__name__).debug(
-            _m(149),
-            key[-2],
-            key[-1],
-            error,
+            _m(149, key[-2], key[-1], error),
         )
         return None
     except Exception as error:  # noqa: BLE001 - e.g. a failed auth handshake
-        # 150: Host-shared CDC shard %s-%s poll failed (%s); reading directly
+        # 150: Host-shared CDC shard {}-{} poll failed ({}); reading directly
         logging.getLogger(__name__).debug(
-            _m(150),
-            key[-2],
-            key[-1],
-            error,
+            _m(150, key[-2], key[-1], error),
         )
         return None
     if status != "ok":
-        # 151: Host-shared CDC shard %s-%s leader refused a poll (%s); reading directly
+        # 151: Host-shared CDC shard {}-{} leader refused a poll ({}); reading directly
         logging.getLogger(__name__).warning(
-            _m(151),
-            key[-2],
-            key[-1],
-            payload,
+            _m(151, key[-2], key[-1], payload),
         )
         return None
     if payload is None:
         return None
     view = _unwire_view(payload)
     committed = [tx for tx in held if tx.commit_lsn > commit] + view.committed
-    endpoints.mirrors[(key, identity)] = (commit, tuple(committed))
+    endpoints.mirrors[(key, identity)] = (commit, capture, tuple(committed))
     return replace(view, committed=committed)
 
 
@@ -7032,21 +7007,19 @@ def _shard_schema_map(
     for identity, table in identities:
         fresh = fresh_tables.get(identity)
         if fresh is None:
-            # 152: Shared CDC shard leaves %s to direct reads: the catalog no longer has it
+            # 152: Shared CDC shard leaves {} to direct reads: the catalog no longer has it
             logging.getLogger(__name__).warning(
-                _m(152),
-                identity,
+                _m(152, identity),
             )
             unfit.append(identity)
             continue
         try:
             schema_map[identity] = _carry_table_options(fresh, table)
         except (InformixError, ValueError):
-            # 153: Shared CDC shard leaves %s to direct reads: its table options no longer fit the
+            # 153: Shared CDC shard leaves {} to direct reads: its table options no longer fit the
             # catalog
             logging.getLogger(__name__).warning(
-                _m(153),
-                identity,
+                _m(153, identity),
                 exc_info=True,
             )
             unfit.append(identity)
@@ -8196,35 +8169,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     self._cleanup_completed_snapshot_stage(table, effective_start)
                     result = self._read_stream(table, effective_start, table_options, deletes=False)
                 return self._reset_retry_counts(result, start_offset)
-            except SharedStateAccessUnavailable:
-                retried = self._retry_transient_volume_read(
-                    read_again, table_options, attempt_index
+            except (SharedStateAccessUnavailable, OSError) as error:
+                return self._volume_failure_result(
+                    error, read_again, table_options, attempt_index, start_offset
                 )
-                if retried is not None:
-                    return self._retried_result(retried, start_offset)
-                return iter(()), self._shared_state_retry_offset(start_offset)
-            except OSError as error:
-                # A dropped Volume mount can surface from any of the shared-state
-                # helpers, not only the one that retries open(2), so classify it
-                # here and reuse the transient-Volume retry. Any other OSError is
-                # a real fault and must keep propagating.
-                dropped = _dropped_mount_error(error)
-                if dropped is None:
-                    raise
-                # Retry in place first: a remount settles in seconds, and yielding
-                # is unavailable during a replay (see _retry_transient_volume_read).
-                retried = self._retry_transient_volume_read(
-                    read_again, table_options, attempt_index
-                )
-                if retried is not None:
-                    return self._retried_result(retried, start_offset)
-                # 173: Informix snapshot staging Volume mount is not connected; yielding an empty
-                # batch and retrying this checkpoint
-                logging.getLogger(__name__).warning(
-                    _m(173),
-                    exc_info=True,
-                )
-                return iter(()), self._dropped_mount_retry_offset(start_offset, dropped)
             except ConnectionCapacityUnavailable:
                 # Continuous flows are permanent, so capacity pressure is the
                 # steady state rather than a fault: always yield and let the
@@ -8308,10 +8256,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 table = self._registration_table(table_name, self.options)
             return bool(_cdc_capable(table) or self._append_only_table(table, self.options))
         except Exception:  # pylint: disable=broad-except
-            # 174: Informix reads '%s' with the simple stream reader: its table lookup failed
+            # 174: Informix reads '{}' with the simple stream reader: its table lookup failed
             logging.getLogger(__name__).warning(
-                _m(174),
-                table_name,
+                _m(174, table_name),
                 exc_info=True,
             )
             return False
@@ -8430,6 +8377,62 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             return self._read_deletes(table_name, start_offset, table_options)
         return self._read_upserts(table_name, start_offset, table_options)
 
+    def _served_offset(
+        self,
+        table_name: str,
+        table_options: dict[str, str],
+        start_offset: dict,
+        effective_start: dict,
+    ) -> dict | None:
+        # Docstring: The end of a ``.unl`` split window or staged page batch, else None.
+        #
+        # Both serves plan from metadata without a read, so they run under _metadata_access:
+        # no wait behind running reads for a slot, and the session a catalog lookup or the
+        # ``.unl`` boundary pin opened is given back whether planning succeeds or fails. A
+        # delete flow or a stream-phase offset never serves, so it skips the lookup, which
+        # for a delete reader would take a slot its upsert reader may need. A dropped Volume
+        # mount is retried in place: returning the start offset instead would end a
+        # triggered update early, so the last attempt's error fails the batch.
+
+        unl = self._unl_snapshot_serve(table_options, effective_start)
+        if not unl and (
+            self._is_delete_flow()
+            or not effective_start
+            or effective_start.get("phase") not in (None, "snapshot")
+        ):
+            return None
+        for attempt_index in range(_TRANSIENT_VOLUME_IN_PROCESS_ATTEMPTS):
+            try:
+                with self._metadata_access():
+                    table = self._table(table_name, table_options)
+                    if not unl:
+                        batch = self._snapshot_page_batch(table, effective_start, table_options)
+                        if batch is None:
+                            return None
+                        return self._snapshot_page_batch_offset(table, effective_start, batch)
+                    # File source: serve the extract as a window of splits per microbatch.
+                    # Leaving the embedded cache untouched steers the following
+                    # get_partitions to the unl_split fan-out instead of the driver-side
+                    # embedded path. A gzip record window is the exception: its rows were
+                    # read here on the driver, so they are cached for get_partitions exactly
+                    # as an embedded read's are.
+                    end, rows = self._unl_snapshot_offset(table, table_options, effective_start)
+                    if rows is not None:
+                        self._partition_embedded_rows.clear()
+                        self._partition_embedded_rows[self._partition_offset_key(start_offset)] = (
+                            self._encode_embedded_rows(rows)
+                        )
+                    return end
+            except Exception as error:  # pylint: disable=broad-except
+                transient = isinstance(error, SharedStateAccessUnavailable) or _dropped_mount_error(
+                    error
+                )
+                if not transient or attempt_index + 1 >= _TRANSIENT_VOLUME_IN_PROCESS_ATTEMPTS:
+                    raise
+                delay = min(0.25 * (2**attempt_index), _TRANSIENT_VOLUME_IN_PROCESS_MAX_SECONDS)
+                time.sleep(random.uniform(delay / 2, delay))
+        return None
+
     def latest_offset(
         self,
         table_name: str,
@@ -8437,28 +8440,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         start_offset: dict | None = None,
     ) -> dict:
         start_offset = start_offset or {}
-        table = self._table(table_name, table_options)
         effective_start = self._effective_start_offset(start_offset)
-        if self._unl_snapshot_serve(table_options, effective_start):
-            # File source: serve the extract as a window of splits per microbatch. Leaving
-            # the embedded cache untouched steers the following get_partitions to the
-            # unl_split fan-out instead of the driver-side embedded path. A gzip record
-            # window is the exception: its rows were read here on the driver, so they are
-            # cached for get_partitions exactly as an embedded read's are.
-            end, window_rows = self._unl_snapshot_offset(table, table_options, effective_start)
-            if window_rows is not None:
-                self._partition_embedded_rows.clear()
-                self._partition_embedded_rows[self._partition_offset_key(start_offset)] = (
-                    self._encode_embedded_rows(window_rows)
-                )
-            # The file and page serves plan without a read, which would have given back the
-            # session the .unl boundary pin or an uncached catalog lookup opened.
-            self._release_worker_connection()
-            return end
-        batch = self._snapshot_page_batch(table, effective_start, table_options)
-        if batch is not None:
-            end = self._snapshot_page_batch_offset(table, effective_start, batch)
-            self._release_worker_connection()
+        end = self._served_offset(table_name, table_options, start_offset, effective_start)
+        if end is not None:
             return end
         self._defer_staged_rows = not effective_start
         try:
@@ -8884,33 +8868,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                         bootstrap_offset=start_offset,
                     )
                 return self._reset_retry_counts(result, start_offset)
-            except SharedStateAccessUnavailable:
-                retried = self._retry_transient_volume_read(
-                    read_again, table_options, attempt_index
+            except (SharedStateAccessUnavailable, OSError) as error:
+                return self._volume_failure_result(
+                    error, read_again, table_options, attempt_index, start_offset
                 )
-                if retried is not None:
-                    return self._retried_result(retried, start_offset)
-                return iter(()), self._shared_state_retry_offset(start_offset)
-            except OSError as error:
-                # A dropped Volume mount can surface from any of the shared-state
-                # helpers, not only the one that retries open(2), so classify it
-                # here and reuse the transient-Volume retry. Any other OSError is
-                # a real fault and must keep propagating.
-                dropped = _dropped_mount_error(error)
-                if dropped is None:
-                    raise
-                retried = self._retry_transient_volume_read(
-                    read_again, table_options, attempt_index
-                )
-                if retried is not None:
-                    return self._retried_result(retried, start_offset)
-                # 173: Informix snapshot staging Volume mount is not connected; yielding an empty
-                # batch and retrying this checkpoint
-                logging.getLogger(__name__).warning(
-                    _m(173),
-                    exc_info=True,
-                )
-                return iter(()), self._dropped_mount_retry_offset(start_offset, dropped)
             except TriggerBoundaryUnavailable:
                 if self._replay_stop_lsn(table_options) is not None:
                     raise
@@ -8967,12 +8928,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         result = dict(start_offset)
         retry_count = _dropped_mount_retry_count(result)
         if retry_count >= self._dropped_mount_max_retries():
-            # 179: Informix snapshot staging Volume mount was not connected for %d consecutive
+            # 179: Informix snapshot staging Volume mount was not connected for {} consecutive
             # reads; this flow yielded empty batches throughout and replicated nothing. The Volume's
             # FUSE mount is down rather than the source being idle: check the Volume's availability.
             logging.getLogger(__name__).error(
-                _m(179),
-                retry_count,
+                _m(179, retry_count),
             )
             # 180: Informix snapshot staging Volume mount has not been connected for {} consecutive
             # reads; the staging Volume is unavailable
@@ -9105,6 +9065,38 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             return result
         return self._reset_retry_counts(result, start_offset)
 
+    def _volume_failure_result(
+        self,
+        error: Exception,
+        read_again: Callable[[], Any],
+        options: dict[str, str],
+        attempt_index: int,
+        start_offset: dict,
+    ) -> tuple[Iterator[dict], dict]:
+        # Docstring: Answer a read whose shared-state Volume access failed.
+        #
+        # A dropped mount (ENOTCONN) can surface from any shared-state helper, not only the
+        # one that retries open(2), and from that one wrapped in SharedStateAccessUnavailable
+        # once its own retries run out, so it is classified by the error's cause chain. Any
+        # other OSError is a real fault and keeps propagating. Both are retried in place
+        # first: a remount settles in seconds, and yielding is unavailable during a replay
+        # (see _retry_transient_volume_read). A dropped mount then yields under
+        # dropped.mount.max.retries with a warning, anything else under the shared-state
+        # retry limit.
+
+        dropped = _dropped_mount_error(error)
+        if dropped is None and not isinstance(error, SharedStateAccessUnavailable):
+            raise error
+        retried = self._retry_transient_volume_read(read_again, options, attempt_index)
+        if retried is not None:
+            return self._retried_result(retried, start_offset)
+        if dropped is None:
+            return iter(()), self._shared_state_retry_offset(start_offset)
+        # 173: Informix snapshot staging Volume mount is not connected; yielding an empty
+        # batch and retrying this checkpoint
+        logging.getLogger(__name__).warning(_m(173), exc_info=True)
+        return iter(()), self._dropped_mount_retry_offset(start_offset, dropped)
+
     def _retry_transient_volume_read(
         self, attempt: Callable[[], Any], options: dict[str, str], attempt_index: int
     ):
@@ -9128,10 +9120,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # the chain; returning None at the bound hands the decision back.
 
         if attempt_index + 1 >= _TRANSIENT_VOLUME_IN_PROCESS_ATTEMPTS:
-            # 182: Informix shared state stayed inaccessible across %d in-process attempts
+            # 182: Informix shared state stayed inaccessible across {} in-process attempts
             logging.getLogger(__name__).warning(
-                _m(182),
-                _TRANSIENT_VOLUME_IN_PROCESS_ATTEMPTS,
+                _m(182, _TRANSIENT_VOLUME_IN_PROCESS_ATTEMPTS),
             )
             if self._replay_stop_lsn(options) is not None:
                 # 183: Informix shared state is inaccessible while replaying a committed offset
@@ -9333,12 +9324,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         result = dict(start_offset)
         retry_count = _capacity_retry_count(result)
         if retry_count >= self._capacity_retry_max_retries():
-            # 189: Informix connection capacity was unavailable for %d consecutive continuous reads;
+            # 189: Informix connection capacity was unavailable for {} consecutive continuous reads;
             # this flow yielded empty batches throughout and replicated nothing. Raise
             # max.concurrent.connections, reduce the number of flows, or use a triggered pipeline.
             logging.getLogger(__name__).error(
-                _m(189),
-                retry_count,
+                _m(189, retry_count),
             )
             # 190: Informix connection capacity exhausted its continuous retry limit; raise
             # max.concurrent.connections or reduce the number of flows
@@ -9899,16 +9889,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 # is the only boundary left. Deletes committed between the two are gone
                 # from the source and cannot be replicated: say so, loudly, rather than
                 # bootstrapping ahead of them in silence.
-                # 200: Informix delete snapshot floor %s for '%s' precedes the minimum retained LSN
-                # %s; bootstrapping the delete channel at the upsert resume position %s instead, so
+                # 200: Informix delete snapshot floor {} for '{}' precedes the minimum retained LSN
+                # {}; bootstrapping the delete channel at the upsert resume position {} instead, so
                 # deletes committed between the floor and it can no longer be replicated. Run a full
                 # refresh if the destination must match the source exactly
                 logging.getLogger(__name__).warning(
-                    _m(200),
-                    floor,
-                    table.exposed_name,
-                    minimum,
-                    high_water,
+                    _m(200, floor, table.exposed_name, minimum, high_water),
                 )
             elif floor is not None and floor < high_water:
                 # The range between them was never consumed by a delete checkpoint, so it
@@ -9916,35 +9902,26 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 # long (days of log after a stalled bootstrap) and lowers the delete
                 # shard's shared restart under the sharded daemon.
                 bootstrap_lsn = floor
-                # 201: Informix delete channel for '%s' bootstraps at the snapshot floor %s rather
-                # than the upsert resume position %s: no delete checkpoint has consumed that range
+                # 201: Informix delete channel for '{}' bootstraps at the snapshot floor {} rather
+                # than the upsert resume position {}: no delete checkpoint has consumed that range
                 # yet, so it is re-read (idempotent for the target)
                 logging.getLogger(__name__).info(
-                    _m(201),
-                    table.exposed_name,
-                    floor,
-                    high_water,
+                    _m(201, table.exposed_name, floor, high_water),
                 )
             if bootstrap_lsn < minimum:
-                # 202: Informix delete bootstrap boundary %s for '%s' precedes the minimum retained
-                # LSN %s; the delete channel is waiting for a resnapshot
+                # 202: Informix delete bootstrap boundary {} for '{}' precedes the minimum retained
+                # LSN {}; the delete channel is waiting for a resnapshot
                 logging.getLogger(__name__).warning(
-                    _m(202),
-                    bootstrap_lsn,
-                    table.exposed_name,
-                    minimum,
+                    _m(202, bootstrap_lsn, table.exposed_name, minimum),
                 )
                 return iter(()), self._schema_node_fallback_offset(bootstrap_offset)
             current = self._bridge.current_lsn()
             if (bootstrap_lsn >> 32) > (current >> 32):
-                # 203: Informix delete bootstrap boundary %s for '%s' is ahead of the source's
-                # current logical log %s; the delete channel is waiting for a new snapshot
+                # 203: Informix delete bootstrap boundary {} for '{}' is ahead of the source's
+                # current logical log {}; the delete channel is waiting for a new snapshot
                 # generation
                 logging.getLogger(__name__).warning(
-                    _m(203),
-                    bootstrap_lsn,
-                    table.exposed_name,
-                    current,
+                    _m(203, bootstrap_lsn, table.exposed_name, current),
                 )
                 return iter(()), self._schema_node_fallback_offset(bootstrap_offset)
             return iter(()), _offset(
@@ -10113,12 +10090,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             try:
                 self._delete_handoff_token(table, channel)
             except Exception:  # pylint: disable=broad-except
-                # 206: Best-effort cleanup of a lingering handoff token for '%s' (channel %s)
+                # 206: Best-effort cleanup of a lingering handoff token for '{}' (channel {})
                 # failed; it will be retried on a later read
                 logging.getLogger(__name__).warning(
-                    _m(206),
-                    table.exposed_name,
-                    channel,
+                    _m(206, table.exposed_name, channel),
                     exc_info=True,
                 )
 
@@ -10389,20 +10364,18 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 if os.path.lexists(path):
                     continue
             except OSError:
-                # 212: Cannot remove completed Informix snapshot staging data: %s
+                # 212: Cannot remove completed Informix snapshot staging data: {}
                 logging.getLogger(__name__).warning(
-                    _m(212),
-                    path,
+                    _m(212, path),
                     exc_info=True,
                 )
                 return
             break
         if os.path.lexists(path):
-            # 213: Completed Informix snapshot staging data is still changing; leaving %s for a
+            # 213: Completed Informix snapshot staging data is still changing; leaving {} for a
             # later read or the retention sweep
             logging.getLogger(__name__).warning(
-                _m(213),
-                path,
+                _m(213, path),
             )
             return
         self._cleaned_snapshot_stages.add(path)
@@ -10637,10 +10610,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             except FileNotFoundError:
                 pass
             except OSError:
-                # 219: Cannot remove Informix snapshot-page candidate: %s
+                # 219: Cannot remove Informix snapshot-page candidate: {}
                 logging.getLogger(__name__).warning(
-                    _m(219),
-                    candidate,
+                    _m(219, candidate),
                     exc_info=True,
                 )
         return body["upper_pk"]
@@ -10918,10 +10890,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         except FileNotFoundError:
             pass
         except OSError:
-            # 226: Cannot remove consumed Informix snapshot page: %s
+            # 226: Cannot remove consumed Informix snapshot page: {}
             logging.getLogger(__name__).warning(
-                _m(226),
-                path,
+                _m(226, path),
                 exc_info=True,
             )
 
@@ -11009,8 +10980,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     except FileNotFoundError:
                         pass
                     except OSError:
-                        # 227: Cannot remove stale Informix snapshot run: %s
-                        logging.getLogger(__name__).warning(_m(227), run, exc_info=True)
+                        # 227: Cannot remove stale Informix snapshot run: {}
+                        logging.getLogger(__name__).warning(_m(227, run), exc_info=True)
 
     def _read_snapshot_stage_manifest(
         self, table: Table, pipeline_scope: str, schema_id: str
@@ -11263,14 +11234,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # A bound from an earlier update was captured before this update's CDC
             # start, which would orphan rows inserted in between. Recapture it --
             # and only it, since the cursor still names rows this table holds.
-            # 232: Informix incremental snapshot bound for '%s' was captured by scope=%s but this
-            # update is scope=%s; recapturing the snapshot bound so rows above a stale bound are not
+            # 232: Informix incremental snapshot bound for '{}' was captured by scope={} but this
+            # update is scope={}; recapturing the snapshot bound so rows above a stale bound are not
             # orphaned between the snapshot and the change stream
             logging.getLogger(__name__).warning(
-                _m(232),
-                table.exposed_name,
-                incremental.get("scope"),
-                self._registration_scope,
+                _m(232, table.exposed_name, incremental.get("scope"), self._registration_scope),
             )
             chunk_exprs, viable = self._incremental_datetime_chunk_exprs(table, options)
             if viable:
@@ -11301,13 +11269,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # snapshot.scan=cursor reads without key order, so there are no key ranges to
         # chunk by: take the blocking consistent snapshot, which honours the cursor scan.
         if self._snapshot_cursor_scan(options):
-            # 235: Informix incremental snapshot for '%s' using the blocking consistent snapshot
-            # because %s=%s reads without key order
+            # 235: Informix incremental snapshot for '{}' using the blocking consistent snapshot
+            # because {}={} reads without key order
             logging.getLogger(__name__).info(
-                _m(235),
-                table.exposed_name,
-                _SNAPSHOT_SCAN_OPTION,
-                _SNAPSHOT_SCAN_CURSOR,
+                _m(235, table.exposed_name, _SNAPSHOT_SCAN_OPTION, _SNAPSHOT_SCAN_CURSOR),
             )
             return self._read_snapshot(
                 table, None, options, pipeline_scope_override=pipeline_scope_override
@@ -11318,12 +11283,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # otherwise fall back to the blocking consistent snapshot.
         chunk_exprs, viable = self._incremental_datetime_chunk_exprs(table, options)
         if not viable:
-            # 236: Informix incremental snapshot for '%s' falling back to the blocking consistent
+            # 236: Informix incremental snapshot for '{}' falling back to the blocking consistent
             # snapshot because a DATETIME, INTERVAL or floating-point primary-key column cannot be
             # chunked by an exact key bound
             logging.getLogger(__name__).info(
-                _m(236),
-                table.exposed_name,
+                _m(236, table.exposed_name),
             )
             return self._read_snapshot(
                 table, None, options, pipeline_scope_override=pipeline_scope_override
@@ -12432,11 +12396,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             self._unl_extract_namespace(table, pipeline_scope, schema_id)
         )
         if record is None:
-            # 267: Informix file snapshot for '%s' has no pinned extract manifest; pinning the
+            # 267: Informix file snapshot for '{}' has no pinned extract manifest; pinning the
             # extract as it is now
             logging.getLogger(__name__).info(
-                _m(267),
-                table.exposed_name,
+                _m(267, table.exposed_name),
             )
             self._pin_unl_extract(table, table_options, pipeline_scope, schema_id, snapshot_lsn)
             return
@@ -13173,15 +13136,17 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     _CDC_RECONNECT_BASE_SECONDS * (2**attempt),
                     _CDC_RECONNECT_MAX_SECONDS,
                 )
-                # 277: Informix CDC poll for '%s' lost its connection (%s); resetting the transport
-                # and retrying the same read (attempt %d/%d) after %.1fs
+                # 277: Informix CDC poll for '{}' lost its connection ({}); resetting the transport
+                # and retrying the same read (attempt {}/{}) after {:.1f}s
                 logging.getLogger(__name__).warning(
-                    _m(277),
-                    table.exposed_name,
-                    error,
-                    attempt + 1,
-                    _CDC_RECONNECT_MAX_RETRIES,
-                    delay,
+                    _m(
+                        277,
+                        table.exposed_name,
+                        error,
+                        attempt + 1,
+                        _CDC_RECONNECT_MAX_RETRIES,
+                        delay,
+                    ),
                     exc_info=True,
                 )
                 reset = getattr(self._bridge, "reset_transport", None)
@@ -13225,16 +13190,18 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     _SNAPSHOT_RECONNECT_BASE_SECONDS * (2**attempt),
                     _SNAPSHOT_RECONNECT_MAX_SECONDS,
                 )
-                # 278: Informix snapshot %s for '%s' lost its connection (%s); resetting the
-                # transport and retrying the same read (attempt %d/%d) after %.1fs
+                # 278: Informix snapshot {} for '{}' lost its connection ({}); resetting the
+                # transport and retrying the same read (attempt {}/{}) after {:.1f}s
                 logging.getLogger(__name__).warning(
-                    _m(278),
-                    operation,
-                    table.exposed_name,
-                    error,
-                    attempt + 1,
-                    _SNAPSHOT_RECONNECT_MAX_RETRIES,
-                    delay,
+                    _m(
+                        278,
+                        operation,
+                        table.exposed_name,
+                        error,
+                        attempt + 1,
+                        _SNAPSHOT_RECONNECT_MAX_RETRIES,
+                        delay,
+                    ),
                     exc_info=True,
                 )
                 reset = getattr(self._bridge, "reset_transport", None)
@@ -13282,15 +13249,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     _LAKEBASE_RECONNECT_BASE_SECONDS * (2**attempt),
                     _LAKEBASE_RECONNECT_MAX_SECONDS,
                 )
-                # 279: Informix Lakebase state %s lost its connection (%s); reconnecting and
-                # retrying the same operation (attempt %d/%d) after %.1fs
+                # 279: Informix Lakebase state {} lost its connection ({}); reconnecting and
+                # retrying the same operation (attempt {}/{}) after {:.1f}s
                 logging.getLogger(__name__).warning(
-                    _m(279),
-                    operation,
-                    error,
-                    attempt + 1,
-                    _LAKEBASE_RECONNECT_MAX_RETRIES,
-                    delay,
+                    _m(279, operation, error, attempt + 1, _LAKEBASE_RECONNECT_MAX_RETRIES, delay),
                     exc_info=True,
                 )
                 self._reset_lakebase_connection()
@@ -14216,11 +14178,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 record_type="schema-rejection",
             )
         except Exception as publish_error:  # pylint: disable=broad-except
-            # 306: Could not record that the upsert reader refused the schema change for %s: %s
+            # 306: Could not record that the upsert reader refused the schema change for {}: {}
             logging.getLogger(__name__).warning(
-                _m(306),
-                table.exposed_name,
-                publish_error,
+                _m(306, table.exposed_name, publish_error),
             )
 
     def _schema_rejection(self, table: Table, checkpoint_schema_id: str) -> str | None:
@@ -14539,17 +14499,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             return None
         floor = self._immutable_lsn(record, "start_lsn", table.exposed_name)
         if record.get("schema_id") != schema_id or record.get("fingerprint") != fingerprint:
-            # 314: Informix delete snapshot floor %s for '%s' was captured under schema generation
-            # %s, but the upsert channel now runs generation %s; the delete channel bootstraps at
+            # 314: Informix delete snapshot floor {} for '{}' was captured under schema generation
+            # {}, but the upsert channel now runs generation {}; the delete channel bootstraps at
             # the upsert resume position instead, so deletes committed between that snapshot and the
             # resume position are not replayed. Run a full refresh if the destination must match the
             # source exactly
             logging.getLogger(__name__).warning(
-                _m(314),
-                floor,
-                table.exposed_name,
-                record.get("schema_id"),
-                schema_id,
+                _m(314, floor, table.exposed_name, record.get("schema_id"), schema_id),
             )
             return None
         return floor
@@ -14953,8 +14909,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             operation="stale-state GC",
         )
         if deleted:
-            # 322: Collected %s stale Informix Lakebase state records
-            logging.getLogger(__name__).info(_m(322), deleted)
+            # 322: Collected {} stale Informix Lakebase state records
+            logging.getLogger(__name__).info(_m(322, deleted))
         drop_projects = self.options.get("state.gc.drop.unused.projects", "false").lower()
         if drop_projects not in {"true", "false"}:
             # 323: Option 'state.gc.drop.unused.projects' must be true or false
@@ -15018,11 +14974,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         )
         self._cleaned_update_scopes.add(cache_key)
         if deleted:
-            # 326: Removed %s obsolete Informix update-scoped records for table=%s
+            # 326: Removed {} obsolete Informix update-scoped records for table={}
             logging.getLogger(__name__).info(
-                _m(326),
-                deleted,
-                table.exposed_name,
+                _m(326, deleted, table.exposed_name),
             )
 
     def _lakebase_state_namespace(self) -> str:
@@ -16416,11 +16370,10 @@ def _unl_split_read_chunk(partition: dict) -> Callable[[int, int], bytes]:
             except WorkspaceHttpError as error:
                 if error.status_code != 401 or not partition.get("fuse_fallback"):
                     raise
-                # 362: The snapshot-staging token for %s was rejected; reading the split through the
+                # 362: The snapshot-staging token for {} was rejected; reading the split through the
                 # FUSE mount
                 logging.getLogger(__name__).warning(
-                    _m(362),
-                    path,
+                    _m(362, path),
                 )
                 files_api = None
         return local(offset, length)

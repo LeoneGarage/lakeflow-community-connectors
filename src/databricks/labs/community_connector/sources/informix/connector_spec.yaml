@@ -1207,7 +1207,10 @@ connection:
         indistinguishable from an idle source. This bound surfaces the outage
         instead. Counts reads rather than seconds, so the wall-clock tolerance is
         this many microbatch intervals; raise it for a long trigger interval.
-        Reaching the Volume resets the count. Default `10`; minimum `1`.
+        Reaching the Volume resets the count. The partitioned reader's planning of
+        a staged-page or `.unl` microbatch cannot yield (that would end a
+        triggered update early), so it retries in place, six attempts with backoff,
+        and then fails the batch. Default `10`; minimum `1`.
 
     - name: snapshot.incremental.blocking
       type: string

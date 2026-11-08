@@ -638,19 +638,25 @@ class Probe:
                     stage / "labs/community_connector" / package,
                     ignore=ignore,
                 )
-            informix = src / "labs/community_connector/sources/informix"
-            target = stage / "labs/community_connector/sources/informix"
-            target.mkdir(parents=True)
-            for name in (
-                "__init__.py",
-                "_generated_informix_python_source.py",
-                "cdc_protocol.py",
-                "informix.py",
-                "lakebase_state.py",
-                "sqli.py",
-                "connector_spec.yaml",
-            ):
-                shutil.copy(informix / name, target / name)
+            # The whole package minus tests, tools and docs, so files the connector reads at
+            # run time (informix_messages.json) are never left behind.
+            shutil.copytree(
+                src / "labs/community_connector/sources/informix",
+                stage / "labs/community_connector/sources/informix",
+                ignore=shutil.ignore_patterns(
+                    ".*",
+                    "__pycache__",
+                    "*.pyc",
+                    "*_test.py",
+                    "*_tool.py",
+                    "tests",
+                    "build",
+                    "*.egg-info",
+                    "*.md",
+                    "*.sh",
+                    "pyproject.toml",
+                ),
+            )
             ingest = pathlib.Path(stage_dir) / "ingest.py"
             ingest.write_text(self.ingest_source())
             subprocess.run(

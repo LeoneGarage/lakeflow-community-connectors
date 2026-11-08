@@ -1109,6 +1109,56 @@ class LakeflowContractTests(unittest.TestCase):
                     restored(273, "db.tab"), expected or "Informix message 273 ('db.tab',)"
                 )
 
+    def test_logging_calls_hand_their_values_to_the_message(self):
+        # A numbered message cannot take %-style arguments: logging would fail formatting it
+        # and print a "Logging error" instead. So every logging call passes its values to
+        # _m, and the numbered message keeps them.
+        import ast
+
+        with open(informix_module.__file__, encoding="utf-8") as handle:
+            source = handle.read()
+        lazy = []
+        for node in ast.walk(ast.parse(source)):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"debug", "info", "warning", "error", "exception"}
+                and node.args
+                and getattr(getattr(node.args[0], "func", None), "id", None) == "_m"
+                and len(node.args) > 1
+            ):
+                lazy.append(node.lineno)
+        self.assertEqual(lazy, [])
+
+        messages = informix_module._m.__class__()
+        messages.path = os.path.join(self._shared_state.name, "missing.json")
+        with self.assertLogs("informix-message-test", "WARNING") as logs:
+            logging.getLogger("informix-message-test").warning(messages(39, "boom", 1, 5, 2.0))
+        self.assertEqual(logs.records[0].getMessage(), "Informix message 39 ('boom', 1, 5, 2.0)")
+
+    def test_an_unreadable_message_table_is_retried_after_a_minute(self):
+        # A missing table is not looked for on every message, but a file that comes back
+        # (a mount that recovers) is read again once the minute has passed.
+        with open(informix_module._m.path, encoding="utf-8") as handle:
+            templates = json.load(handle)
+        path = os.path.join(self._shared_state.name, "late.json")
+        messages = informix_module._m.__class__()
+        messages.path = path
+        clock = [1000.0]
+        with (
+            mock.patch.object(informix_module.time, "monotonic", lambda: clock[0]),
+            mock.patch.object(informix_module.os.path, "isfile", wraps=os.path.isfile) as looks,
+        ):
+            self.assertEqual(messages(7, "x"), "Informix message 7 ('x',)")
+            tried = looks.call_count
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(templates, handle)
+            clock[0] += 59
+            self.assertEqual(messages(7, "x"), "Informix message 7 ('x',)")
+            self.assertEqual(looks.call_count, tried)
+            clock[0] += 2
+            self.assertEqual(messages(7, "x"), templates[7].format("x"))
+
     def test_a_module_imported_from_a_zip_reads_its_messages(self):
         # The live test runner imports the connector from a zip of the sources: __file__, and
         # with it the message table's path, then points inside the archive.
@@ -4670,6 +4720,32 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(list(rows), [])
         self.assertEqual(offset["dropped_mount_retry_count"], 1)
 
+    def test_a_dropped_mount_behind_the_open_retry_is_still_a_dropped_mount(self):
+        # The state-file open retries ENOTCONN itself and, once that runs out, reports it as
+        # SharedStateAccessUnavailable. The read still treats it as the dropped mount it is:
+        # its counter, dropped.mount.max.retries, and the warning that names the Volume.
+        def unavailable(*_args, **_kwargs):
+            try:
+                raise OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+            except OSError as error:
+                raise SharedStateAccessUnavailable("inaccessible") from error
+
+        for channel in ("read_table", "read_table_deletes"):
+            with self.subTest(channel=channel):
+                bridge = FakeBridge()
+                connector = self.connector(bridge)
+                with (
+                    mock.patch.object(bridge, "read_changes", side_effect=unavailable),
+                    mock.patch.object(informix_module.time, "sleep"),
+                    self.assertLogs(informix_module.__name__, "WARNING") as logs,
+                ):
+                    rows, offset = getattr(connector, channel)("app.orders", _stream_offset(), {})
+
+                self.assertEqual(list(rows), [])
+                self.assertEqual(offset["dropped_mount_retry_count"], 1)
+                self.assertNotIn("shared_state_retry_count", offset)
+                self.assertTrue(any("mount is not connected" in line for line in logs.output))
+
     def test_a_dropped_mount_fails_the_flow_once_the_retry_cap_is_reached(self):
         """A mount that never returns must fail rather than yield forever.
 
@@ -5429,25 +5505,91 @@ class LakeflowContractTests(unittest.TestCase):
         ):
             self.assertFalse(connector.is_partitioned("app.orders"))
 
-    def test_a_dropped_mount_under_a_page_serve_plan_is_not_wrapped(self):
-        # Planning a page-serve batch reads the boundary page off the Volume mount. A dropped
-        # mount surfaces as the OSError it is, not wrapped in an InformixError, so the
-        # dropped-mount handling that classifies OSErrors sees it.
+    def test_a_dropped_mount_under_a_page_serve_plan_is_retried_in_place(self):
+        # Planning a page-serve batch reads the boundary page off the Volume mount. Answering
+        # a dropped mount with the start offset would end a triggered update early, so the
+        # plan is retried in place; a mount that stays down fails the batch with the OSError
+        # it is, not wrapped in an InformixError.
         bridge = FakeBridge()
         bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 6)]
         # Two pages a batch, so the batch ends mid-snapshot and reads its boundary page.
         options = {"snapshot.page.size": "1", "stream.partitioned.snapshot.pages.per.batch": "2"}
         connector = self._partitioned_connector(bridge, **options)
         first = connector.latest_offset("app.orders", {}, {})
+        expected = connector.latest_offset("app.orders", {}, first)
         dropped = OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+        real_open = informix_module._open_state_file
+        failures = [dropped, dropped]
+
+        def flaky(*args, **kwargs):
+            if failures:
+                raise failures.pop()
+            return real_open(*args, **kwargs)
 
         with (
-            mock.patch.object(informix_module, "_open_state_file", side_effect=dropped),
+            mock.patch.object(informix_module, "_open_state_file", side_effect=flaky),
+            mock.patch.object(informix_module.time, "sleep") as slept,
+        ):
+            self.assertEqual(connector.latest_offset("app.orders", {}, first), expected)
+        self.assertEqual(slept.call_count, 2)
+
+        with (
+            mock.patch.object(informix_module, "_open_state_file", side_effect=dropped) as opens,
+            mock.patch.object(informix_module.time, "sleep"),
             self.assertRaises(OSError) as raised,
         ):
             connector.latest_offset("app.orders", {}, first)
-
         self.assertIs(raised.exception, dropped)
+        self.assertEqual(opens.call_count, informix_module._TRANSIENT_VOLUME_IN_PROCESS_ATTEMPTS)
+
+    def test_offset_planning_skips_the_lookup_where_nothing_is_served(self):
+        # A delete flow or a stream-phase offset never page-serves, so latest_offset goes
+        # straight to the embedded read: a catalog lookup there would take a connection slot
+        # outside the read's capacity attempt, which a delete reader's upsert reader needs.
+        cases = {
+            "delete flow": ({"isDeleteFlow": "true"}, {}),
+            "stream offset": ({}, _stream_offset()),
+        }
+        for name, (options, start) in cases.items():
+            with self.subTest(name):
+                connector = self._partitioned_connector(**options)
+                with (
+                    mock.patch.object(connector, "_table") as lookup,
+                    mock.patch.object(
+                        connector, "_embedded_read", return_value=([], {"commit_lsn": "1"})
+                    ),
+                ):
+                    connector.latest_offset("app.orders", {}, start)
+                lookup.assert_not_called()
+
+    def test_a_page_serve_plan_bypasses_capacity_and_gives_back_its_session(self):
+        # The serve plans from metadata, like registration: it must not queue behind running
+        # reads for a slot, and it gives the session back even when planning fails.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 6)]
+        options = {"snapshot.page.size": "1", "stream.partitioned.snapshot.pages.per.batch": "2"}
+        connector = self._partitioned_connector(bridge, **options)
+        first = connector.latest_offset("app.orders", {}, {})
+        bypass = []
+        real_table = connector._table
+
+        def lookup(*args, **kwargs):
+            bypass.append(connector.options.get("_informix.bypass.connection.capacity"))
+            return real_table(*args, **kwargs)
+
+        with (
+            mock.patch.object(connector, "_table", side_effect=lookup),
+            mock.patch.object(
+                connector, "_snapshot_page_batch_offset", side_effect=InformixError("bad page")
+            ),
+            mock.patch.object(connector, "_release_worker_connection") as release,
+            self.assertRaises(InformixError),
+        ):
+            connector.latest_offset("app.orders", {}, first)
+
+        self.assertEqual(bypass, ["true"])
+        self.assertNotIn("_informix.bypass.connection.capacity", connector.options)
+        release.assert_called_once()
 
     def test_partitioned_bootstrap_serves_page_zero_from_the_stage(self):
         # The first microbatch drains the snapshot and serves page 0. Page 0 reaches the
@@ -13808,6 +13950,35 @@ class HostSharedCdcTests(unittest.TestCase):
 
         self.assertEqual(sent, [(None, [5]), (102, [6]), (112, []), (None, [6])])
 
+    def test_a_follower_drops_what_it_holds_when_its_capture_changes(self):
+        # What a follower holds was decoded under the capture it polled with. After a schema
+        # transition it polls under a new capture, and the leader must send the whole buffer
+        # again instead of skipping the transactions the follower decoded the old way.
+        leader, follower = self.process(), self.process()
+        self.poll(leader)
+        self.poll(follower)
+        sent = self.requests()
+        self.cover()
+        self.assertEqual([tx.tx_id for tx in self.poll(follower).committed], [5])
+        changed = {
+            **self.capture,
+            "descriptors": [dict(d, encoding="latin-1") for d in self.capture["descriptors"]],
+        }
+
+        informix_module._host_shard_poll(
+            self.KEY,
+            lambda: None,
+            dict(self.CONFIG),
+            self.identity,
+            self.table,
+            changed,
+            0,
+            0,
+            endpoints=follower,
+        )
+
+        self.assertEqual([after for after, _ in sent], [None, None])
+
     def test_a_reply_that_cannot_be_sent_ends_the_serve_thread_quietly(self):
         self.shard.subscribe(self.identity, self.table, self.capture, 0, 0)
         self.cover()
@@ -17069,6 +17240,21 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
             self.assertEqual(release.call_count, 1)
             connector.get_partitions("app.orders", options, {}, end)
         self.assertEqual(release.call_count, 2)
+
+    def test_a_unl_serve_that_fails_to_plan_still_gives_back_its_session(self):
+        # The boundary pin has opened a session by the time a bad extract fails the plan; the
+        # failure must not strand that session and its slot.
+        connector = self.connector(FakeBridge())
+        options = {"snapshot.source": self._source("1|alpha|\n2|beta|\n")}
+        with (
+            mock.patch.object(
+                connector, "_unl_snapshot_offset", side_effect=InformixError("bad extract")
+            ),
+            mock.patch.object(connector, "_release_worker_connection") as release,
+            self.assertRaises(InformixError),
+        ):
+            connector.latest_offset("app.orders", options, {})
+        release.assert_called_once()
 
     def test_a_unl_cutover_seeds_from_the_token_not_the_extract(self):
         # Under table.migration the partitioned reader must not serve the .unl extract: the
