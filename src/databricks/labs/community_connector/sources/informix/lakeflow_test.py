@@ -8416,9 +8416,12 @@ class LakeflowContractTests(unittest.TestCase):
         checkpoint = _stream_offset(90)
         fingerprint = checkpoint["schema_fingerprint"]
 
+        # Past the page the shard is idle on: the boundary current_lsn names is a page end.
+        current = 90 + (1 << 12) + 10
+
         def view(caught_up=False, reached=None, committed=()):
             return _SharedCdcSnapshot(
-                table, fingerprint, 1, 200, list(committed), caught_up, None, reached
+                table, fingerprint, 1, current, list(committed), caught_up, None, reached
             )
 
         def poll(shown, options, trigger=False):
@@ -8446,7 +8449,11 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertIs(poll(at_checkpoint, done), at_checkpoint)
         connector._trigger_boundaries[table.identity] = (90, "a" * 32, connector._pipeline_scope())
         self.assertIs(poll(at_checkpoint, {}, trigger=True), at_checkpoint)
-        connector._trigger_boundaries[table.identity] = (95, "a" * 32, connector._pipeline_scope())
+        connector._trigger_boundaries[table.identity] = (
+            current,
+            "a" * 32,
+            connector._pipeline_scope(),
+        )
         self.assertIsNone(poll(at_checkpoint, {}, trigger=True))
 
     def test_a_shard_view_of_another_layout_than_the_readers_is_not_taken(self):
@@ -8501,9 +8508,15 @@ class LakeflowContractTests(unittest.TestCase):
         shown, view, boundary = first_poll(90)
         self.assertIs(view, shown)
         self.assertEqual(boundary, 90)
-        _, view, boundary = first_poll(200)
+        # The boundary is a page end, up to a page past the write position: a shard idle
+        # within that page has read everything committed before it.
+        shown, view, boundary = first_poll(90 + 4000)
+        self.assertIs(view, shown)
+        self.assertEqual(boundary, 90 + 4000)
+        far = 90 + (1 << 12) + 10
+        _, view, boundary = first_poll(far)
         self.assertIsNone(view)
-        self.assertEqual(boundary, 200)
+        self.assertEqual(boundary, far)
         # A checkpoint the log no longer retains reads directly, which reports it, rather
         # than wait on a boundary the upsert reader (failing the same way) never publishes.
         _, view, boundary = first_poll(90, minimum=95, deletes=True)

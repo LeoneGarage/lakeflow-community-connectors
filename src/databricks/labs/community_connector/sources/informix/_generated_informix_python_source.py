@@ -19437,6 +19437,11 @@ def register_lakeflow_source(spark):
                     bound, _ = self._shared_trigger_boundary(
                         table, checkpoint, owner=not deletes, current_lsn=view.current_lsn
                     )
+                    # That boundary is current_lsn, the end of the log page being written, up
+                    # to a page past the write position: a shard idle on a quiet log never gets
+                    # there, and every idle flow would open a session of its own to confirm it.
+                    # Idle within that page is the read being done (see _log_lsn).
+                    bound -= 1 << 12
                 if reached is None or (
                     reached <= checkpoint_commit and (bound is None or reached < bound)
                 ):
