@@ -17444,6 +17444,14 @@ def register_lakeflow_source(spark):
                 schema_id = str(checkpoint["schema_id"])
                 manifest = self._read_snapshot_stage_manifest(table, stage_scope, schema_id)
                 if manifest is None:
+                    if self._table_snapshot_source(options) is not None:
+                        # A .unl serve stages no pages: its checkpoint is a split position the
+                        # partitioned reader's windows advance, and the simple reader can only
+                        # serve an extract whole.
+                        # 423: Informix file snapshot of '{}' is part-way through a serve in split
+                        # windows, which only stream.partitioned=true can continue; set it back to true
+                        # until the snapshot has finished, and no full refresh is needed
+                        raise InformixError(_m(423, table.exposed_name))
                     # 245: Incremental snapshot state for '{}' is missing; run a full refresh
                     raise InformixError(_m(245, table.exposed_name))
                 if int(manifest["snapshot_lsn"]) != high_water:
@@ -19163,6 +19171,20 @@ def register_lakeflow_source(spark):
             # direct-read path, which owns the transition/replay logic.
             if str(checkpoint.get("schema_fingerprint")) != view.fingerprint:
                 return None
+            if (
+                (self._trigger_available_now or self._replay_stop_lsn(options) is not None)
+                and not view.committed
+                and not (
+                    view.caught_up
+                    and view.reached_lsn is not None
+                    and view.reached_lsn > checkpoint_commit
+                )
+            ):
+                # A bounded read -- an AvailableNow update, or a replay -- ends at the first read
+                # that moves it nowhere, short of its boundary. A view that cannot move this
+                # consumer on (the shard's scan has not reached it yet, or went idle where the
+                # consumer already is) yields to a direct read, which waits on the log itself.
+                return None
             return view
 
         def _read_stream(self, table: Table, start: dict, options: dict[str, str], deletes: bool):
@@ -19327,6 +19349,13 @@ def register_lakeflow_source(spark):
                     shared_view.open_begin,
                     shared_view.reached_lsn,
                 )
+            elif projection_schema_transition and _schema_fingerprint(capture_table) != fingerprint:
+                # A step to a generation the live schema has moved past: commit its schema and
+                # read nothing under it. Its columns are not the live ones -- a column added
+                # since would go uncaptured in every change read here, and one dropped since
+                # cannot be captured -- so the changes wait for the step to the live schema,
+                # which captures them with the live layout from this same position.
+                committed, caught_up, open_begin, reached = [], False, None, None
             else:
                 raw_records = self._read_changes_with_reconnect(
                     [_capture_descriptor(capture_table, _client_encoding(self.options))],

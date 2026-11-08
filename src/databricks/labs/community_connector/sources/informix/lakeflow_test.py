@@ -7732,6 +7732,81 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(connector._read_immutable_head(namespace)["value"], 90)
 
+    def test_a_bounded_read_takes_a_shard_view_only_when_it_moves_the_consumer_on(self):
+        # An AvailableNow update or a replay ends at the first read that moves it nowhere.
+        # A shard view with nothing for this consumer, not idle past its checkpoint (its
+        # scan has not got here yet), would end it short of its boundary, so it reads
+        # directly instead. A continuous read keeps the view and polls again.
+        connector = self.connector(
+            FakeBridge(), shared_cdc=True, **{"cdc.shared.session": "process"}
+        )
+        table = connector._table("app.orders", {})
+        checkpoint = _stream_offset(90)
+        fingerprint = checkpoint["schema_fingerprint"]
+
+        def view(caught_up=False, reached=None, committed=()):
+            return _SharedCdcSnapshot(
+                table, fingerprint, 1, 200, list(committed), caught_up, None, reached
+            )
+
+        def poll(shown, options, trigger=False):
+            shard = mock.Mock()
+            shard.snapshot.return_value = shown
+            connector._trigger_available_now = trigger
+            with mock.patch.object(informix_module, "_shared_cdc_shard", return_value=shard):
+                return connector._shared_cdc_snapshot(
+                    table, checkpoint, options, False, connector._pipeline_scope()
+                )
+
+        replay = {informix_module._REPLAY_STOP_LSN_OPTION: "150"}
+        behind = view()
+        self.assertIs(poll(behind, {}), behind)
+        self.assertIsNone(poll(behind, {}, trigger=True))
+        self.assertIsNone(poll(behind, replay))
+        self.assertIsNone(poll(view(caught_up=True, reached=90), {}, trigger=True))
+        idle_past = view(caught_up=True, reached=120)
+        self.assertIs(poll(idle_past, {}, trigger=True), idle_past)
+
+    def test_a_lagging_reader_keeps_the_values_of_a_column_added_after_its_next_step(self):
+        # Two columns added in two runs. A reader still at the first schema steps to the
+        # second without reading; reading the insert there would capture it without the
+        # third schema's column, and its value would be lost once the reader moved past it.
+        bridge = FakeBridge()
+        _, checkpoint_a = self.connector(bridge).read_table("app.orders", {}, {})
+        bridge.tables[0]["columns"].append(
+            {"name": "added_b", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+        _, checkpoint_b = self.connector(bridge).read_table("app.orders", checkpoint_a, {})
+        bridge.tables[0]["columns"].append(
+            {"name": "added_c", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 140
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 140}]
+        self.connector(bridge).read_table("app.orders", checkpoint_b, {})
+        bridge.now = 160
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 9, "lsn": 150},
+            {
+                "op": "INSERT",
+                "tx_id": 9,
+                "lsn": 151,
+                "table": "demo:app.orders",
+                "row": {"id": 9, "value": "n", "added_b": 2, "added_c": 3},
+            },
+            {"op": "COMMIT", "tx_id": 9, "lsn": 152},
+            {"op": "TIMEOUT", "lsn": 160},
+        ]
+        lagging = self.connector(bridge)
+
+        rows, step = lagging.read_table("app.orders", checkpoint_a, {})
+
+        self.assertEqual(list(rows), [])
+        self.assertEqual(step["schema_fingerprint"], checkpoint_b["schema_fingerprint"])
+        rows, _ = lagging.read_table("app.orders", step, {})
+        self.assertEqual([(row["id"], row["added_b"], row["added_c"]) for row in rows], [(9, 2, 3)])
+
     def test_lagging_checkpoint_advances_one_schema_version_at_a_time(self):
         bridge = FakeBridge()
         _, checkpoint_a = self.connector(bridge).read_table("app.orders", {}, {})
@@ -7756,10 +7831,11 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(lagging_c["schema_fingerprint"], checkpoint_c["schema_fingerprint"])
         self.assertEqual(lagging_c["commit_lsn"], checkpoint_c["commit_lsn"])
 
-    def test_a_lagging_reader_shapes_rows_by_the_generation_it_captured(self):
-        # A delete reader a step behind captures that step's columns. Shaped by the live
-        # schema, whose whole-row key has gained a column since, its delete would ask for a
-        # key column the captured before image lacks.
+    def test_a_lagging_reader_reads_changes_only_under_the_live_layout(self):
+        # A delete reader two generations behind steps to the first without reading: its
+        # columns are not the live ones, so a change read under them would miss the column
+        # the whole-row key gained since. The step to the live schema then reads from the
+        # same position with the live layout, and the delete carries that column.
         bridge = FakeBridge()
         bridge.tables[0]["columns"].append(
             {"name": "dropped", "type_name": "INTEGER", "nullable": True}
@@ -7789,15 +7865,22 @@ class LakeflowContractTests(unittest.TestCase):
                 "tx_id": 7,
                 "lsn": 151,
                 "table": "demo:app.orders",
-                "row": {"id": 1, "value": "a"},
+                "row": {"id": 1, "value": "a", "added": None},
             },
             {"op": "COMMIT", "tx_id": 7, "lsn": 152},
             {"op": "TIMEOUT", "lsn": 160},
         ]
+        deletes = connector("update-d")
 
-        rows, _ = connector("update-d").read_table_deletes("app.orders", checkpoint_a, options)
+        rows, step = deletes.read_table_deletes("app.orders", checkpoint_a, options)
 
-        self.assertEqual([(row["id"], row["_informix_op"]) for row in rows], [(1, "d")])
+        self.assertEqual(list(rows), [])
+        self.assertEqual(step["schema_fingerprint"], checkpoint_b["schema_fingerprint"])
+        self.assertEqual(step["commit_lsn"], checkpoint_a["commit_lsn"])
+        rows, _ = deletes.read_table_deletes("app.orders", step, options)
+        self.assertEqual(
+            [(row["id"], row["added"], row["_informix_op"]) for row in rows], [(1, None, "d")]
+        )
 
     def test_a_lagging_wildcard_key_reader_takes_a_drop_and_an_add_one_step_at_a_time(self):
         # The README's rule for a whole-row key: drop one column, run the pipeline, then add
@@ -17549,6 +17632,17 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
 
     # Added and removed files are separate tests: each needs its own pinned manifest, and
     # cases within one test share the pipeline scope the manifest is keyed by.
+    def test_a_serve_in_split_windows_asks_for_the_partitioned_reader_back(self):
+        # The simple reader serves an extract only whole, so it cannot continue a serve the
+        # partitioned reader left part-way; it says so instead of asking for a full refresh.
+        source = self._source(self._THREE_RECORDS)
+        options = {"snapshot.source": source, "snapshot.split.bytes": "1"}
+        end = self._first_batch(options)
+        simple = self.connector(FakeBridge(), **{"stream.partitioned": "false"})
+
+        with self.assertRaisesRegex(InformixError, "only stream.partitioned=true can continue"):
+            simple.read_table("app.orders", end, options)
+
     def test_a_file_added_before_a_later_update_resumes_is_caught(self):
         # A pipeline stopped mid-serve resumes in a new update, with a new registration
         # scope. The extract pin lives under the scope the serve started in, so the check

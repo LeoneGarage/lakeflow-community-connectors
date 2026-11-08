@@ -363,7 +363,9 @@ connection:
         tables with a bounded staged-snapshot->stream lifecycle (keyed CDC tables and
         append-only tables); snapshot-only tables always use the simple reader. Both
         readers persist the same offset, so flipping this and restarting resumes an
-        existing checkpoint in place with no full refresh. Set `false` to force the
+        existing checkpoint in place with no full refresh, except a `snapshot.source`
+        (`.unl`) snapshot part-way through its serve, which only `true` can continue
+        (turning it off then fails the table until it is back on). Set `false` to force the
         simple (single-partition, driver) reader. Accepts `true`/`false`.
 
     - name: stream.partitioned.snapshot.pages.per.batch
