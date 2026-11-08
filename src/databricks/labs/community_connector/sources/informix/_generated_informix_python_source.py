@@ -5720,9 +5720,10 @@ def register_lakeflow_source(spark):
         # values here, logging calls included, so the numbered message keeps them.
 
         def __init__(self) -> None:
-            self.path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "informix_messages.json"
-            )
+            # Source run without a __file__ (the merged file pasted into a notebook cell, or
+            # exec'd) looks in the working directory instead of failing to register.
+            source = globals().get("__file__") or "_"
+            self.path = os.path.join(os.path.dirname(os.path.abspath(source)), "informix_messages.json")
             self.templates: list[str] | None = None
             self.retry_at = 0.0
 
@@ -14241,10 +14242,11 @@ def register_lakeflow_source(spark):
                 raise NotImplementedError(_m(175))
             if start_offset == end_offset:
                 return []
-            table = self._table(table_name, table_options)
-            # Planning needs no source session: give back any the lookup opened (an embedded
-            # replay below takes its own).
-            self._release_worker_connection()
+            # A metadata lookup, as in latest_offset: no capacity wait if the table is not cached
+            # (a re-plan after a restart), and the session it opened is given back even when it
+            # fails. An embedded replay below takes its own.
+            with self._metadata_access():
+                table = self._table(table_name, table_options)
             effective_start = self._effective_start_offset(start_offset or {})
             served = self._plan_with_mount_retry(
                 self._served_partitions, table, table_options, start_offset, end_offset, effective_start

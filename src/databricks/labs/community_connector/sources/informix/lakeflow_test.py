@@ -1136,6 +1136,17 @@ class LakeflowContractTests(unittest.TestCase):
             logging.getLogger("informix-message-test").warning(messages(39, "boom", 1, 5, 2.0))
         self.assertEqual(logs.records[0].getMessage(), "Informix message 39 ('boom', 1, 5, 2.0)")
 
+    def test_a_message_table_built_without_a_file_path_looks_in_the_working_directory(self):
+        # The merged source pasted into a notebook cell, or exec'd, runs with no __file__:
+        # building the message table there must not stop the connector registering.
+        messages_class = informix_module._m.__class__
+        init = types.FunctionType(
+            messages_class.__init__.__code__, {"os": os, "__builtins__": __builtins__}
+        )
+        messages = messages_class.__new__(messages_class)
+        init(messages)
+        self.assertEqual(messages.path, os.path.join(os.getcwd(), "informix_messages.json"))
+
     def test_an_unreadable_message_table_is_retried_after_a_minute(self):
         # A missing table is not looked for on every message, but a file that comes back
         # (a mount that recovers) is read again once the minute has passed.
@@ -5541,6 +5552,27 @@ class LakeflowContractTests(unittest.TestCase):
             connector.latest_offset("app.orders", {}, first)
         self.assertIs(raised.exception, dropped)
         self.assertEqual(opens.call_count, informix_module._TRANSIENT_VOLUME_IN_PROCESS_ATTEMPTS)
+
+    def test_partition_planning_looks_the_table_up_without_waiting_for_capacity(self):
+        # A re-plan after a restart reaches get_partitions with no table cached. Its catalog
+        # lookup must not queue behind running reads for a slot, and the session it opened
+        # must be given back even when the lookup fails.
+        connector = self._partitioned_connector()
+        bypass = []
+
+        def lookup(*_args, **_kwargs):
+            bypass.append(connector.options.get("_informix.bypass.connection.capacity"))
+            raise ValueError("lookup failed")
+
+        with (
+            mock.patch.object(connector, "_table", side_effect=lookup),
+            mock.patch.object(connector, "_release_worker_connection") as release,
+            self.assertRaises(ValueError),
+        ):
+            connector.get_partitions("app.orders", {}, _stream_offset(90), _stream_offset(95))
+
+        self.assertEqual(bypass, ["true"])
+        release.assert_called_once()
 
     def test_an_embedded_replay_is_not_retried_by_the_plan(self):
         # get_partitions' embedded replay is a real read with its own dropped-mount handling
