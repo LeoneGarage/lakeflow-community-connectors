@@ -31,6 +31,7 @@ import sys
 import tempfile
 import threading
 import time
+import zipfile
 import zlib
 from collections import deque
 from dataclasses import dataclass, field, replace
@@ -125,6 +126,9 @@ class _Messages:
     # every serverless worker can read, and each worker reads the file itself. The comment
     # above each ``_m`` call shows its template; lakeflow_test keeps the two in step. A file
     # that cannot be read never masks the error a message describes.
+    #
+    # Code imported from a zip archive (zipimport) has its path inside the archive, where
+    # open() fails; the file is then read from the archive.
 
     def __init__(self) -> None:
         self.path = os.path.join(
@@ -141,9 +145,20 @@ class _Messages:
     def __call__(self, index: int, *values: Any) -> str:
         if self.templates is None:
             try:
-                with open(self.path, encoding="utf-8") as handle:
-                    self.templates = json.load(handle)
-            except (OSError, ValueError):
+                archive, member = self.path, []
+                while not os.path.isfile(archive):
+                    archive, name = os.path.split(archive)
+                    if not name:
+                        raise FileNotFoundError(self.path)
+                    member.insert(0, name)
+                if member:
+                    with zipfile.ZipFile(archive) as bundle:
+                        text = bundle.read("/".join(member))
+                else:
+                    with open(archive, "rb") as handle:
+                        text = handle.read()
+                self.templates = json.loads(text)
+            except Exception:  # pylint: disable=broad-except
                 return f"Informix message {index} {values!r}"
         return self.templates[index].format(*values)
 

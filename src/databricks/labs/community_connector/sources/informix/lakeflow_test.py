@@ -1079,6 +1079,64 @@ class LakeflowContractTests(unittest.TestCase):
         restored.path = os.path.join(self._shared_state.name, "missing.json")
         self.assertEqual(restored(7, "x"), "Informix message 7 ('x',)")
 
+    def test_messages_inside_a_zip_archive_are_read_from_it(self):
+        # Code imported from a zip has its path inside the archive, where open() fails; the
+        # table is read from the archive. A member or archive that is not there still falls
+        # back to the numbered message.
+        import zipfile
+
+        with open(informix_module._m.path, encoding="utf-8") as handle:
+            templates = json.load(handle)
+        archive = os.path.join(self._shared_state.name, "sources.zip")
+        inner = "databricks/labs/community_connector/sources/informix/informix_messages.json"
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.write(informix_module._m.path, inner)
+        not_a_zip = os.path.join(self._shared_state.name, "plain.txt")
+        with open(not_a_zip, "w", encoding="utf-8") as handle:
+            handle.write("not an archive")
+
+        cases = {
+            os.path.join(archive, *inner.split("/")): templates[273].format("db.tab"),
+            os.path.join(archive, "missing", "informix_messages.json"): None,
+            os.path.join(not_a_zip, "informix_messages.json"): None,
+        }
+        for path, expected in cases.items():
+            with self.subTest(path=os.path.relpath(path, self._shared_state.name)):
+                messages = pickle.loads(pickle.dumps(informix_module._m.__class__()))
+                messages.path = path
+                restored = pickle.loads(pickle.dumps(messages))
+                self.assertEqual(
+                    restored(273, "db.tab"), expected or "Informix message 273 ('db.tab',)"
+                )
+
+    def test_a_module_imported_from_a_zip_reads_its_messages(self):
+        # The live test runner imports the connector from a zip of the sources: __file__, and
+        # with it the message table's path, then points inside the archive.
+        import subprocess
+        import zipfile
+
+        archive = os.path.join(self._shared_state.name, "informix_src.zip")
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.write(informix_module.__file__, "zipped_informix.py")
+            bundle.write(informix_module._m.path, "informix_messages.json")
+        with open(informix_module._m.path, encoding="utf-8") as handle:
+            expected = json.load(handle)[273].format("db.tab")
+        script = (
+            "import sys; sys.path.insert(0, sys.argv[1]); import zipped_informix as m; "
+            "print(m._m.path); print(m._m(273, 'db.tab'))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script, archive],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=120,
+            env={**os.environ, "PYTHONPATH": os.pathsep.join(p for p in sys.path if p)},
+        )
+        path, message = result.stdout.splitlines()
+        self.assertEqual(path, os.path.join(archive, "informix_messages.json"))
+        self.assertEqual(message, expected)
+
     def test_shared_state_validation_module_state_is_pickle_safe(self):
         coordinator = informix_module._STATE_VALIDATION_COORDINATOR
         restored = pickle.loads(pickle.dumps(coordinator))
