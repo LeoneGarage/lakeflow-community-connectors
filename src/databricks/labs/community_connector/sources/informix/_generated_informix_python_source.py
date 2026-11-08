@@ -15645,16 +15645,20 @@ def register_lakeflow_source(spark):
                         _m(203, bootstrap_lsn, table.exposed_name, current),
                     )
                     return iter(()), self._schema_node_fallback_offset(bootstrap_offset)
-                return iter(()), _offset(
-                    bootstrap_lsn,
-                    bootstrap_lsn,
-                    bootstrap_lsn,
-                    None,
-                    "stream",
-                    seed_table,
-                    schema_id,
-                    self._pipeline_scope(),
-                )
+                # The seed is this update's first offset for the flow: see _read_stream.
+                return iter(()), {
+                    **_offset(
+                        bootstrap_lsn,
+                        bootstrap_lsn,
+                        bootstrap_lsn,
+                        None,
+                        "stream",
+                        seed_table,
+                        schema_id,
+                        self._pipeline_scope(),
+                    ),
+                    "update_fingerprint": _schema_fingerprint(table),
+                }
             if start_offset.get("phase") == "snapshot":
                 snapshot_checkpoint = _validated_offset(start_offset)
                 expected = snapshot_checkpoint.get("schema_fingerprint")
@@ -19201,10 +19205,16 @@ def register_lakeflow_source(spark):
                 # An AvailableNow read takes the update's frozen boundary here when this process
                 # has not read it yet, the upsert reader publishing it from this view's sample as
                 # it would on taking the view, so the update's first poll of an idle table does
-                # not open a session.
+                # not open a session. Not for a checkpoint the log no longer retains: the read
+                # reports that first, before any boundary is published or awaited.
                 reached = view.reached_lsn if view.caught_up else None
                 bound = replay_stop
-                if bound is None and reached is not None and reached <= checkpoint_commit:
+                if (
+                    bound is None
+                    and reached is not None
+                    and reached <= checkpoint_commit
+                    and floor >= view.min_lsn
+                ):
                     bound, _ = self._shared_trigger_boundary(
                         table, checkpoint, owner=not deletes, current_lsn=view.current_lsn
                     )
@@ -19273,6 +19283,14 @@ def register_lakeflow_source(spark):
             capture_schema_id = checkpoint_schema_id
             transition_schema_id = checkpoint_schema_id
             projection_schema_transition = False
+            # The live layout this flow saw on its first read of the update, carried on every
+            # offset the update writes. A whole-row key shrinks only by a drop the update's
+            # destination already merges without, one made before it started: the update's first
+            # read may take one, and so may a later read while the live layout is still the one
+            # that read saw. An offset written without reading (a delete seed, a metadata-only
+            # step) then leaves a drop made while the pipeline was stopped to its next read.
+            first_read = checkpoint.get("pipeline_scope") != pipeline_scope
+            update_layout = fingerprint if first_read else checkpoint.get("update_fingerprint")
             if checkpoint_fingerprint != fingerprint:
                 (
                     _previous_table,
@@ -19291,7 +19309,7 @@ def register_lakeflow_source(spark):
                     # Every offset records the update that wrote it, so a checkpoint from an
                     # earlier update marks this update's first read: the destination's merge
                     # key was read at its start and already reflects a dropped column.
-                    new_update=checkpoint.get("pipeline_scope") != pipeline_scope,
+                    new_update=first_read or update_layout == fingerprint,
                 )
                 # Informix capture registration is a projection, not a raw decoder
                 # tied to the catalog layout at ``start_lsn``.  For an appended
@@ -19597,6 +19615,8 @@ def register_lakeflow_source(spark):
                 end = dict(end)
                 end["trigger_generation"] = trigger_generation
                 end["trigger_high_water"] = str(trigger_high_water)
+            if update_layout is not None:
+                end["update_fingerprint"] = update_layout
             end = _with_backlog_streak(end, start, row_budget_reached)
             return iter(output), end
 

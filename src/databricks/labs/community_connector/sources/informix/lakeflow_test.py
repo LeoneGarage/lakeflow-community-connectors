@@ -7782,26 +7782,27 @@ class LakeflowContractTests(unittest.TestCase):
         # The upsert reader publishes it from the view's sample, as it does on taking the
         # view, so a table idle where the shard is caught up to the log keeps the view; one
         # the shard went idle behind (a stalled scan) still reads directly.
-        def first_poll(current):
+        def first_poll(current, minimum=1, deletes=False):
             connector = self.connector(
                 FakeBridge(),
                 shared_cdc=True,
-                registration_scope=f"available-now-{current}",
+                registration_scope=f"available-now-{current}-{minimum}",
                 **{"cdc.shared.session": "process"},
             )
             table = connector._table("app.orders", {})
             checkpoint = _stream_offset(90)
             shown = _SharedCdcSnapshot(
-                table, checkpoint["schema_fingerprint"], 1, current, [], True, None, 90
+                table, checkpoint["schema_fingerprint"], minimum, current, [], True, None, 90
             )
             shard = mock.Mock()
             shard.snapshot.return_value = shown
             connector._trigger_available_now = True
             with mock.patch.object(informix_module, "_shared_cdc_shard", return_value=shard):
                 view = connector._shared_cdc_snapshot(
-                    table, checkpoint, {}, False, connector._pipeline_scope()
+                    table, checkpoint, {}, deletes, connector._pipeline_scope()
                 )
-            return shown, view, connector._trigger_boundaries[table.identity][0]
+            frozen = connector._trigger_boundaries.get(table.identity)
+            return shown, view, frozen[0] if frozen else None
 
         shown, view, boundary = first_poll(90)
         self.assertIs(view, shown)
@@ -7809,6 +7810,11 @@ class LakeflowContractTests(unittest.TestCase):
         _, view, boundary = first_poll(200)
         self.assertIsNone(view)
         self.assertEqual(boundary, 200)
+        # A checkpoint the log no longer retains reads directly, which reports it, rather
+        # than wait on a boundary the upsert reader (failing the same way) never publishes.
+        _, view, boundary = first_poll(90, minimum=95, deletes=True)
+        self.assertIsNone(view)
+        self.assertIsNone(boundary)
 
     def test_a_schema_change_undone_then_followed_by_another_reaches_the_newest(self):
         # A column added and dropped again returns the table to its first layout. Were the
@@ -8137,6 +8143,105 @@ class LakeflowContractTests(unittest.TestCase):
         lagging = read("update-d", checkpoint_a)
 
         self.assertEqual(lagging["schema_fingerprint"], checkpoint_b["schema_fingerprint"])
+
+    def test_a_lagging_wildcard_key_reader_takes_an_add_and_then_a_drop_within_one_update(self):
+        # The reverse of the drop-then-add order: the add is stepped metadata-only on the
+        # update's first read, so the drop is stepped on its second, from an offset this
+        # update wrote. The drop still predates the update, whose destination merges on the
+        # shorter key, so the key shrinks there.
+        bridge = FakeBridge()
+        bridge.tables[0]["columns"].append(
+            {"name": "dropped", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.rows = [dict(row, dropped=None) for row in bridge.rows]
+        options = {"primary.keys": "*", "snapshot.mode": "initial"}
+
+        def read(scope, checkpoint, connector=None):
+            connector = connector or self.connector(bridge, registration_scope=scope)
+            return connector.read_table("app.orders", checkpoint, dict(options))[1]
+
+        checkpoint_a = read("update-a", {})
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+        checkpoint_b = read("update-b", checkpoint_a)
+        bridge.tables[0]["columns"] = [
+            column for column in bridge.tables[0]["columns"] if column["name"] != "dropped"
+        ]
+        bridge.now = 140
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 140}]
+        read("update-c", checkpoint_b)
+        live = _schema_fingerprint(
+            self.connector(bridge, registration_scope="probe")._table("app.orders", options)
+        )
+
+        lagging = self.connector(bridge, registration_scope="update-d")
+        step = read("update-d", checkpoint_a, lagging)
+        self.assertEqual(step["schema_fingerprint"], checkpoint_b["schema_fingerprint"])
+        stepped = read("update-d", step, lagging)
+
+        self.assertEqual(stepped["schema_fingerprint"], live)
+
+    def test_a_delete_flow_seeded_before_a_stopped_wildcard_key_drop_takes_the_drop(self):
+        # A whole-row key column is dropped while the pipeline is stopped, before the delete
+        # flow ever checkpointed. It seeds at the channel start's pre-drop schema in the
+        # resumed update, and its next poll steps the drop: the update merges on the
+        # shorter key from its start, so the key shrinks there.
+        bridge = FakeBridge()
+        bridge.tables[0]["columns"].append(
+            {"name": "dropped", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.rows = [dict(row, dropped=None) for row in bridge.rows]
+        options = {"primary.keys": "*", "snapshot.mode": "initial"}
+
+        def connector(scope):
+            return self.connector(bridge, registration_scope=scope)
+
+        _, checkpoint = connector("update-1").read_table("app.orders", {}, dict(options))
+        bridge.tables[0]["columns"] = [
+            column for column in bridge.tables[0]["columns"] if column["name"] != "dropped"
+        ]
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+        _, upsert = connector("update-2").read_table("app.orders", checkpoint, dict(options))
+        _, seed = connector("update-2").read_table_deletes("app.orders", {}, dict(options))
+        self.assertEqual(seed["schema_id"], checkpoint["schema_id"])
+
+        rows, stepped = connector("update-2").read_table_deletes("app.orders", seed, dict(options))
+
+        self.assertEqual(list(rows), [])
+        self.assertEqual(stepped["schema_fingerprint"], upsert["schema_fingerprint"])
+
+    def test_a_wildcard_key_drop_made_during_a_running_update_waits_for_a_restart(self):
+        # The update has read under the longer key, so its destination merges on it: a drop
+        # made while it runs fails the read until the pipeline restarts, with no refresh.
+        bridge = FakeBridge()
+        bridge.tables[0]["columns"].append(
+            {"name": "dropped", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.rows = [dict(row, dropped=None) for row in bridge.rows]
+        options = {"primary.keys": "*", "snapshot.mode": "initial"}
+
+        def read(scope, checkpoint):
+            connector = self.connector(bridge, registration_scope=scope)
+            return connector.read_table("app.orders", checkpoint, dict(options))[1]
+
+        checkpoint = read("update-a", {})
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+        running = read("update-b", checkpoint)
+        bridge.tables[0]["columns"] = [
+            column for column in bridge.tables[0]["columns"] if column["name"] != "dropped"
+        ]
+        bridge.now = 140
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 140}]
+
+        with self.assertRaisesRegex(InformixError, "running update; stop and restart"):
+            read("update-b", running)
+        restarted = read("update-c", running)
+        self.assertNotEqual(restarted["schema_fingerprint"], running["schema_fingerprint"])
 
     def test_future_immutable_schema_transition_fails_closed(self):
         bridge = FakeBridge()
