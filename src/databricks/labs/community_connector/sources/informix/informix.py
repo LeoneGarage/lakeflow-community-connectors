@@ -1206,10 +1206,13 @@ def _replay_between_offsets(start, end, read, options, connector_options):
         if wrong_lsn:
             # 5: Informix replay did not reach its committed end LSN {}; reached {}
             raise InformixError(_m(5, stop_lsn, reached_lsn))
-        # Every page of a snapshot shares its LSN, so the page is checked on its own.
-        if end_position is not None and _snapshot_position(reached) != end_position:
+        # Every page of a snapshot shares its LSN, so the page is checked on its own, and a
+        # replay still in a snapshot the logged end has left falls short of it too.
+        if _snapshot_position(reached) != end_position:
             # 428: Informix replay did not reach its committed snapshot position {}; reached {}
-            raise InformixError(_m(428, end_position[1:], (_snapshot_position(reached) or ())[1:]))
+            raise InformixError(
+                _m(428, (end_position or ())[1:], (_snapshot_position(reached) or ())[1:])
+            )
         # An end that names a transaction is reached only by consuming that transaction.
         # The read lands on its bound without one only for an end the original read
         # reached by going idle, so landing there for this end means the replay never
@@ -1226,18 +1229,17 @@ def _replay_between_offsets(start, end, read, options, connector_options):
             raise InformixError(_m(6, expected_tx, stop_lsn, reached.get("tx_id")))
         expected_incremental = (end or {}).get("incremental")
         reached_incremental = reached.get("incremental")
-        if reestablished:
-            # Another snapshot's copy: Spark goes on from the cursor it logged.
-            pass
-        elif isinstance(expected_incremental, dict):
+        if isinstance(expected_incremental, dict):
             expected_pk = expected_incremental.get("last_pk")
-            if (
+            # A re-established copy is another snapshot's, read in full up to the logged
+            # cursor: its own last key need not be that cursor.
+            if not reestablished and (
                 not isinstance(reached_incremental, dict)
                 or reached_incremental.get("last_pk") != expected_pk
             ):
                 # 7: Informix replay did not reach its committed incremental snapshot cursor {!r}
                 raise InformixError(_m(7, expected_pk))
-        elif replaying_chunk and isinstance(reached_incremental, dict):
+        elif (replaying_chunk or reestablished) and isinstance(reached_incremental, dict):
             # 8: Informix replay did not finish the incremental snapshot range that Spark has
             # committed
             raise InformixError(_m(8))
@@ -8292,15 +8294,19 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     and effective_start.get("phase") == "stream"
                     and self._checkpoint_requires_snapshot(effective_start)
                 ):
+                    replaying = self._replay_stop_lsn(table_options) is not None
                     result = self._read_incremental(
                         table,
                         None,
-                        table_options,
+                        # A replayed range from a start the log no longer holds cannot be
+                        # reproduced; it resnapshots, as an initial range does. Spark goes on
+                        # from the end it logged, so one with no copy cursor drains the copy.
+                        {_REPLAY_STOP_PK_OPTION: "null", **table_options}
+                        if replaying
+                        else table_options,
                         pipeline_scope_override=self._resnapshot_scope(table, effective_start),
                     )
-                    if self._replay_stop_lsn(table_options) is not None:
-                        # A replayed range from a start the log no longer holds cannot be
-                        # reproduced; it resnapshots, as an initial range does.
+                    if replaying:
                         result = result[0], {**result[1], _REPLAY_REESTABLISHED: True}
                 elif snapshot_mode in {"incremental", "auto_snapshot"} and not effective_start:
                     result = self._read_incremental(table, None, table_options)

@@ -7118,6 +7118,52 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual([row["id"] for row in replayed], [1])
 
+    def test_a_resnapshot_finished_in_one_chunk_replays_the_whole_copy(self):
+        # auto_snapshot's resnapshot fitted one chunk, so its batch logged no copy cursor.
+        # Replayed after a restart from the expired start, the replay resnapshots; Spark goes
+        # on from the logged end, so the new copy is drained in full rather than one page.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": 5, "value": "e"}, {"id": 10, "value": "j"}]
+        bridge.minimum = 91
+        bridge.now = 150
+        checkpoint = _stream_offset(90)
+        checkpoint["pipeline_scope"] = "f" * 32
+        options = {"snapshot.mode": "auto_snapshot", "snapshot.page.size": "2"}
+        _, end = self.connector(bridge, registration_scope="u1").read_table(
+            "app.orders", checkpoint, dict(options)
+        )
+        self.assertNotIn("incremental", end)
+        bridge.rows = [{"id": 1, "value": "a"}, {"id": 2, "value": "b"}] + bridge.rows
+        bridge.now = 170
+        replaying = self.connector(bridge, registration_scope="u2")
+        replay_options = dict(options)
+
+        replayed = list(
+            informix_module._replay_between_offsets(
+                checkpoint,
+                end,
+                lambda offset: replaying.read_table("app.orders", offset, replay_options),
+                replay_options,
+                replaying.options,
+            )
+        )
+
+        self.assertEqual(sorted(row["id"] for row in replayed), [1, 2, 5, 10])
+
+    def test_a_snapshot_replay_left_in_the_snapshot_short_of_a_stream_end_fails(self):
+        # The logged end left the snapshot for the stream; a replay still in the snapshot
+        # when it stops making progress falls short of it.
+        start = dict(_stream_offset(90), phase="snapshot", snapshot_lsn="90")
+        start["snapshot"] = {"page_index": 1, "last_pk": [1]}
+        end = _stream_offset(90)
+
+        with self.assertRaisesRegex(InformixError, "snapshot position"):
+            list(
+                informix_module._replay_between_offsets(
+                    start, end, lambda offset: (iter(()), dict(start)), {}, {}
+                )
+            )
+
     def test_a_copy_finished_in_its_first_batch_replays_to_its_bound(self):
         # The copy fitted one chunk, so its first batch finished it and neither offset
         # carries a copy block. Rows were inserted below the bound before the replay: it
