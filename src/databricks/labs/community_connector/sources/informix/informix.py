@@ -8111,8 +8111,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                         )
                         # Strip the marker so this is one-shot: nothing post-Restore reads
                         # it, and a quiet (no-advance) read would otherwise return it and
-                        # re-drop every poll until the stream advances off it.
-                        effective_start.pop("handoff_seeded", None)
+                        # re-drop every poll until the stream advances off it. A copy: the
+                        # caller's offset is Spark's, and the partition cache is keyed by it.
+                        effective_start = {
+                            k: v for k, v in effective_start.items() if k != "handoff_seeded"
+                        }
                 self._touch_table_state(table)
                 self._maybe_sweep_stale_snapshot_stages(table)
                 _ensure_materializable(table, table_options)
@@ -8937,9 +8940,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     self._drop_orphaned_handoff_tokens(
                         self._table(table_name, table_options), [_HANDOFF_CHANNEL_DELETE]
                     )
-                    effective_start.pop(
-                        "handoff_seeded", None
-                    )  # one-shot (see _read_table_attempt)
+                    # One-shot, on a copy (see _read_table_attempt).
+                    effective_start = {
+                        k: v for k, v in effective_start.items() if k != "handoff_seeded"
+                    }
                 if migration:
                     # Capture parks the delete position and freezes; cutover seeds from it
                     # (keyed relocation keeps the delete channel) or, for the SCD1->append
@@ -10215,7 +10219,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # keyed path, where capture and cutover share _read_handoff. The token is dropped
         # only when that marked offset arrives, so a crash before commit re-seeds.
         seeded = _validated_offset(json.loads(token["offset_json"]))
-        origin_scope = seeded.get("pipeline_scope")
+        # Where the pages live: a serve relocated once already keeps them under its first
+        # capture's scope (stage_scope), not under the scope that parked it again.
+        origin_scope = seeded.get("stage_scope") or seeded.get("pipeline_scope")
         seeded["pipeline_scope"] = self._pipeline_scope()
         if seeded.get("phase") == "snapshot" and origin_scope:
             # A blocking initial snapshot parked mid-serve. The new flow owns a fresh
@@ -13757,9 +13763,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # operator switched tombstones off for this table. So is the old key of a
         # key-changing UPDATE on a keyed table forced to append. A transaction is never
         # split across batches, so such a tombstone always ships with its ``u`` row.
+        # Shaped by the generation the read captured, which a reader a step behind the live
+        # schema registers (capture_table): the live table can key or type a column the
+        # captured records lack. A schema record keeps the table's options, filter and
+        # transforms included, so the projection loses none of them.
         tombstones = (
             not deletes
-            and self._append_only_table(table, options)
+            and self._append_only_table(capture_table, options)
             and self._append_delete_tombstones(options)
         )
         for tx in recovered:
@@ -13774,9 +13784,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 crossed_trigger_boundary = True
                 break
             projected = _project_transaction(
-                tx, table, deletes, tombstones=tombstones, encoding=self._source_encoding(options)
+                tx,
+                capture_table,
+                deletes,
+                tombstones=tombstones,
+                encoding=self._source_encoding(options),
             )
-            projected = [_coerce_variable_decimal_values(row, table, options) for row in projected]
+            projected = [
+                _coerce_variable_decimal_values(row, capture_table, options) for row in projected
+            ]
             # Never split a transaction.  A single large transaction is
             # accepted; subsequent complete transactions wait for next poll.
             if output and len(output) + len(projected) > max_rows:
@@ -14632,13 +14648,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             override = _key_override(table_options)
             cached = self._ingested_columns(cached, table_options, override)
             key = self._requested_key(cached, table_options, override)
-            cached = replace(
-                cached,
-                primary_keys=tuple(c.name for c in cached.columns) if key is None else key,
-            )
             # A key the options name but the table does not ingest fails here as the read
             # path would, instead of waiting on an upsert reader that fails the same way.
-            if override is not None and key is not None:
+            if key is None:
+                # The primary.keys wildcard: every ingested column but those it excepts.
+                _ensure_excepted_columns_exist(cached, override[1])
+                key = tuple(_wildcard_key(cached.columns, override[1]))
+                if not key:
+                    # 192: Option '{}' excepts every column of '{}', leaving no key
+                    raise InformixError(_m(192, _PRIMARY_KEYS_OPTION, cached.exposed_name))
+            elif override is not None:
                 ingested = {column.name for column in cached.columns}
                 missing = [name for name in key if name not in ingested]
                 if missing:
@@ -14646,6 +14665,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     raise InformixError(
                         _m(193, _PRIMARY_KEYS_OPTION, cached.exposed_name, ", ".join(missing))
                     )
+            cached = replace(cached, primary_keys=key)
             _ensure_selected_keys(cached)
             _ensure_materializable(cached, table_options)
             if self._append_only_table(cached, table_options) or not _cdc_capable(cached):

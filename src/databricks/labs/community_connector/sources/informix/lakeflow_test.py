@@ -5629,6 +5629,44 @@ class LakeflowContractTests(unittest.TestCase):
                     connector.latest_offset("app.orders", {}, start)
                 lookup.assert_not_called()
 
+    def test_the_first_read_after_restore_leaves_sparks_offset_as_it_was(self):
+        # The read strips handoff_seeded from the offset it returns. The start it was given
+        # is Spark's and keys the partition cache, so it keeps the marker, and get_partitions
+        # finds the rows latest_offset read instead of replaying them.
+        bridge = FakeBridge()
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 95}]
+        connector = self._partitioned_connector(bridge)
+        start = dict(_stream_offset(), handoff_seeded=True)
+        given = json.loads(json.dumps(start))
+
+        with mock.patch.object(connector, "_drop_orphaned_handoff_tokens") as drop:
+            end = connector.latest_offset("app.orders", {}, start)
+
+        drop.assert_called_once()
+        self.assertEqual(start, given)
+        self.assertNotIn("handoff_seeded", end)
+        with mock.patch.object(
+            connector, "_replay_embedded_range", side_effect=AssertionError("replayed")
+        ):
+            connector.get_partitions("app.orders", {}, start, end)
+
+    def test_a_serve_relocated_twice_keeps_its_pages_first_scope(self):
+        # A seed taken mid-snapshot points stage_scope at the scope its pages were staged
+        # under. Parked again before the serve finishes, that offset already carries one,
+        # and the new seed must keep it rather than point at the scope that parked it.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 6)]
+        options = {"snapshot.page.size": "1", "stream.partitioned.snapshot.pages.per.batch": "2"}
+        connector = self._partitioned_connector(bridge, **options)
+        first = connector.latest_offset("app.orders", {}, {})
+        parked = dict(first, pipeline_scope="b" * 32, stage_scope="a" * 32)
+        table = connector._table("app.orders", {})
+
+        seeded = connector._handoff_seed_from_token(table, {"offset_json": json.dumps(parked)})
+
+        self.assertEqual(seeded["stage_scope"], "a" * 32)
+        self.assertEqual(seeded["pipeline_scope"], connector._pipeline_scope())
+
     def test_a_restored_seed_served_from_its_pages_drops_the_cutover_tokens(self):
         # A seed taken mid-snapshot is served by the page plan after Restore, not by the
         # read path that drops the tokens the cutover left; the plan must drop them, once.
@@ -7414,6 +7452,13 @@ class LakeflowContractTests(unittest.TestCase):
         keyed.list_tables()
         with self.assertRaisesRegex(InformixError, "names column.s. not present.*missing"):
             keyed._upsert_channel_start_exists("app.orders", {"primary.keys": "missing"})
+        # So does a whole-row key excepting a column the table lacks, or every column.
+        with self.assertRaisesRegex(InformixError, "excepts column.s. that .* does not have: nope"):
+            keyed._upsert_channel_start_exists("app.orders", {"primary.keys": "* except(nope)"})
+        with self.assertRaisesRegex(InformixError, "excepts every column"):
+            keyed._upsert_channel_start_exists(
+                "app.orders", {"primary.keys": "* except(id, value)"}
+            )
 
     def test_a_keyless_table_keyed_by_an_option_waits_for_its_upsert_channel(self):
         # primary.keys gives a physically keyless table a key, and with it a delete channel:
@@ -7690,6 +7735,49 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(lagging_b["commit_lsn"], checkpoint_b["commit_lsn"])
         self.assertEqual(lagging_c["schema_fingerprint"], checkpoint_c["schema_fingerprint"])
         self.assertEqual(lagging_c["commit_lsn"], checkpoint_c["commit_lsn"])
+
+    def test_a_lagging_reader_shapes_rows_by_the_generation_it_captured(self):
+        # A delete reader a step behind captures that step's columns. Shaped by the live
+        # schema, whose whole-row key has gained a column since, its delete would ask for a
+        # key column the captured before image lacks.
+        bridge = FakeBridge()
+        bridge.tables[0]["columns"].append(
+            {"name": "dropped", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.rows = [dict(row, dropped=None) for row in bridge.rows]
+        options = {"primary.keys": "*", "snapshot.mode": "initial"}
+
+        def connector(scope):
+            return self.connector(bridge, registration_scope=scope)
+
+        _, checkpoint_a = connector("update-a").read_table("app.orders", {}, dict(options))
+        bridge.tables[0]["columns"].pop()
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+        _, checkpoint_b = connector("update-b").read_table("app.orders", checkpoint_a, options)
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 140
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 140}]
+        connector("update-c").read_table("app.orders", checkpoint_b, dict(options))
+        bridge.now = 160
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 150},
+            {
+                "op": "DELETE",
+                "tx_id": 7,
+                "lsn": 151,
+                "table": "demo:app.orders",
+                "row": {"id": 1, "value": "a"},
+            },
+            {"op": "COMMIT", "tx_id": 7, "lsn": 152},
+            {"op": "TIMEOUT", "lsn": 160},
+        ]
+
+        rows, _ = connector("update-d").read_table_deletes("app.orders", checkpoint_a, options)
+
+        self.assertEqual([(row["id"], row["_informix_op"]) for row in rows], [(1, "d")])
 
     def test_a_lagging_wildcard_key_reader_takes_a_drop_and_an_add_one_step_at_a_time(self):
         # The README's rule for a whole-row key: drop one column, run the pipeline, then add
