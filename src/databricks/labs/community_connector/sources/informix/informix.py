@@ -1241,9 +1241,10 @@ def _replay_between_offsets(start, end, read, options, connector_options):
         reached_incremental = reached.get("incremental")
         if isinstance(expected_incremental, dict):
             expected_pk = expected_incremental.get("last_pk")
-            # A re-established copy is another snapshot's, read in full up to the logged
-            # cursor: its own last key need not be that cursor.
-            if not reestablished and (
+            # A copy the replay seeded again -- an initial range's, or a re-established one --
+            # is another snapshot's, read in full up to the logged cursor: its own last key
+            # need not be that cursor, its max_pk having been sampled again.
+            if not initial_terms and (
                 not isinstance(reached_incremental, dict)
                 or reached_incremental.get("last_pk") != expected_pk
             ):
@@ -6267,6 +6268,15 @@ class _SharedCdcShard:
     def subscribe(self, identity, table, capture, checkpoint_commit_lsn, floor_lsn):
         with self.condition:
             existing = self.subscribers.get(identity)
+            if (
+                existing is not None
+                and existing["capture"] == capture
+                and _schema_fingerprint(existing["table"]) != _schema_fingerprint(table)
+            ):
+                # Another flow reading the table under other options (a schema change
+                # changes the capture): the shard keeps the first one's table, buffer and
+                # coverage, and this one reads directly, rejecting the view's layout.
+                return
             if existing is not None and existing["capture"] != capture:
                 # The table's columns changed (its consumer moved to a new schema): what
                 # was buffered under the old capture lacks the new columns, so drop it and
@@ -8223,9 +8233,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 self._touch_table_state(table)
                 self._maybe_sweep_stale_snapshot_stages(table)
                 _ensure_materializable(table, table_options)
+                # A staged snapshot's checkpoint too, mid-serve: it names the snapshot's LSN
+                # and schema, which its first batch published for the update that took it.
                 if (
                     _cdc_capable(table)
-                    and effective_start.get("phase") == "stream"
+                    and effective_start.get("phase") in ("stream", "snapshot")
                     and effective_start.get("schema_fingerprint") is not None
                 ):
                     checkpoint = _validated_offset(effective_start)
@@ -8568,6 +8580,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             or self._table_migration(table_options)
         ):
             return None
+        if not self._is_delete_flow():
+            # Planned here rather than read, so published here, as _read_upserts does.
+            self._publish_checkpoint_channel_start_before_capacity(
+                table_name, effective_start, table_options
+            )
 
         def plan() -> dict | None:
             with self._metadata_access():
@@ -10499,7 +10516,19 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         if not effective_start:
             token = self._read_handoff_token(table)
             if token is not None:
-                return iter(()), self._handoff_seed_from_token(table, token)
+                seeded = self._handoff_seed_from_token(table, token)
+                # The seed is this update's resume position, as a checkpoint's is (see
+                # _read_table_attempt): a delete reader with no token of its own bootstraps
+                # from it now, not after this reader's next read -- which, for a seed taken
+                # mid-snapshot, comes only once Restore has let the snapshot finish.
+                self._publish_upsert_channel_start(
+                    table,
+                    int(seeded.get("begin_lsn") or seeded["commit_lsn"]),
+                    str(seeded["schema_id"]),
+                    str(seeded["schema_fingerprint"]),
+                    self._pipeline_scope(),
+                )
+                return iter(()), seeded
             # 209: table.migration=true for '{}' has no checkpoint to record and no parked token:
             # the flow has not reached a hand-off-able position. Run it without table.migration
             # until it is streaming (or mid initial snapshot), then set table.migration=true so it
@@ -10552,13 +10581,18 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # No parked delete position (e.g. capture ran before the delete reader had a
             # checkpoint): fall back to the ordinary bootstrap, which adopts the upsert
             # channel's newly published boundary under this flow's scope.
-            return self._read_table_deletes(
+            rows, seeded = self._read_table_deletes(
                 table_name,
                 effective_start,
                 options,
                 snapshot_mode="cdc_only",
                 bootstrap_offset=bootstrap_offset,
             )
+            if "commit_lsn" in seeded:
+                # A seed, marked as a token's is, so the next read during the migration
+                # keeps it rather than parking it as a delete token of its own.
+                seeded = {**seeded, "handoff_seeded": True}
+            return rows, seeded
         if effective_start.get("phase") == "stream":
             self._write_handoff_token(table, effective_start, _HANDOFF_CHANNEL_DELETE)
         return iter(()), dict(effective_start)
@@ -11935,6 +11969,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # within {} chunk reads
             raise InformixError(_m(239, table.exposed_name, _REPLAY_MAX_CHUNK_FETCHES))
         last_cursor = cursor_key(bounded[-1]) if bounded else None
+        to_cursor = replaying_chunk and replay_stop_pk is not _REPLAY_DRAIN_TO_MAX_PK
+        if to_cursor:
+            # The key-ordered scan went past the replay's bound, reached it, or reached the
+            # end of the table: every row of the range that still exists was read. A chunk
+            # holds no lock across batches, so the rows at its end may have been deleted
+            # since its batch, and the replay stands at the cursor Spark logged regardless.
+            last_cursor = bound
         # Strip the "__chunk_<key>" helper aliases before shaping so they never
         # reach the emitted row or the destination schema.
         chunk_aliases = [f"__chunk_{key}" for key in chunk_exprs]
@@ -11954,10 +11995,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # Only the snapshot's own bound ends the copy. A replay stops at the
         # committed cursor, which normally sits well below max_pk, so treating
         # that stop as completion would abandon the rest of the copy: the flow
-        # would leave the incremental phase with most of the table uncopied.
+        # would leave the incremental phase with most of the table uncopied. A row
+        # past max_pk, or the end of the table, says the same only for a replay of
+        # the batch that finished the copy, which drains to max_pk as that batch did.
         reached_max_key = last_cursor is not None and order_key(last_cursor) >= order_key(max_pk)
-        if replaying_chunk:
-            done = passed_upper_bound or reached_max_key
+        if to_cursor:
+            done = reached_max_key
         else:
             done = passed_upper_bound or not has_more or reached_max_key
         result["done"] = done
@@ -15198,7 +15241,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # schema id, and fingerprint, so publishing it requires Lakebase only.
 
         if (
-            effective_start.get("phase") != "stream"
+            effective_start.get("phase") not in ("stream", "snapshot")
             or effective_start.get("schema_fingerprint") is None
         ):
             return

@@ -7922,6 +7922,78 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(list(rows), [])
         self.assertEqual(offset["commit_lsn"], "90")  # adopted the upsert boundary
 
+    def test_a_delete_cutover_without_a_token_seeds_from_the_upsert_seed_once(self):
+        # Only the upsert channel was captured. The upsert cutover seeds from its token and
+        # publishes the seed as this update's channel start, so the delete cutover adopts it
+        # in the same update rather than waiting for the upsert reader's next read. Its seed
+        # carries the cutover marker like a token's, so the next read during the migration
+        # does not park it as a delete token of its own.
+        migration = {"table.migration": "true"}
+        for parked in ("stream", "snapshot"):
+            with self.subTest(parked=parked):
+                bridge = FakeBridge()
+                old = self.connector(bridge, **{"snapshot.page.size": "1"})
+                old.set_registration_scope("a" * 32)
+                if parked == "stream":
+                    old.read_table("app.orders", _stream_offset(125), migration)
+                    position = "125"
+                else:
+                    _, mid = old.read_table("app.orders", {}, {})
+                    self.assertEqual(mid["phase"], "snapshot")
+                    old.read_table("app.orders", mid, migration)
+                    position = mid["snapshot_lsn"]
+                self._lakebase.database.handoff = {
+                    key: token
+                    for key, token in self._lakebase.database.handoff.items()
+                    if key[2] == 0
+                }
+                new = self.connector(bridge, **{"snapshot.page.size": "1"})
+                new.set_registration_scope("b" * 32)
+                _, seeded = new.read_table("app.orders", {}, migration)
+                self.assertTrue(seeded["handoff_seeded"])
+
+                deletes = self.connector(bridge)
+                deletes.set_registration_scope("b" * 32)
+                _, delete_seed = deletes.read_table_deletes("app.orders", {}, migration)
+                self.assertEqual(delete_seed.get("commit_lsn"), position)
+                self.assertTrue(delete_seed.get("handoff_seeded"))
+                _, again = deletes.read_table_deletes("app.orders", delete_seed, migration)
+                self.assertEqual(again, delete_seed)
+                self.assertEqual(
+                    [key for key in self._lakebase.database.handoff if key[2] == 1], []
+                )
+
+    def test_a_staged_snapshot_resumed_in_a_new_update_publishes_its_channel_start(self):
+        # A staged snapshot's first batch publishes its boundary as the update's upsert
+        # channel start. Resumed mid-serve in a later update, the snapshot-phase checkpoint
+        # names the same LSN and schema, so the upsert reader publishes it for that update
+        # as it does a stream checkpoint -- read directly, or planned by the partitioned
+        # reader -- and a delete reader without a checkpoint bootstraps there rather than
+        # waiting for the serve to finish (a replay of its first batch would time out).
+        for partitioned, (taken, resumed) in ((False, "ab"), (True, "cd")):
+            with self.subTest(partitioned=partitioned):
+                bridge = FakeBridge()
+                first_update = self.connector(bridge, **{"snapshot.page.size": "1"})
+                first_update.set_registration_scope(taken * 32)
+                _, mid = first_update.read_table("app.orders", {}, {})
+                self.assertEqual(mid["phase"], "snapshot")
+                bridge.now = 150
+                if partitioned:
+                    later = self._partitioned_connector(bridge, **{"snapshot.page.size": "1"})
+                    later.set_registration_scope(resumed * 32)
+                    later.latest_offset("app.orders", {}, mid)
+                else:
+                    later = self.connector(bridge, **{"snapshot.page.size": "1"})
+                    later.set_registration_scope(resumed * 32)
+                    later.read_table("app.orders", mid, {})
+                deletes = self.connector(bridge)
+                deletes.set_registration_scope(resumed * 32)
+
+                _, seed = deletes.read_table_deletes("app.orders", {}, {})
+
+                self.assertEqual(seed.get("commit_lsn"), mid["snapshot_lsn"])
+                self._flush_snapshot_cleanup(later)
+
     def test_consistent_snapshot_publishes_fresh_resume_lsn_to_both_readers(self):
         bridge = FakeBridge()
 
@@ -13832,6 +13904,72 @@ class IncrementalSnapshotTests(unittest.TestCase):
             "the replay finished on a different cursor than Spark commits",
         )
 
+    def _replay_through(self, connector, options, start, end):
+        replay = dict(options)
+        return sorted(
+            row["id"]
+            for row in informix_module._replay_between_offsets(
+                start,
+                end,
+                lambda offset: connector.read_table("app.orders", offset, replay),
+                replay,
+                connector.options,
+            )
+            if row["_informix_op"] == "r"
+        )
+
+    def test_a_replayed_chunk_reaches_its_cursor_when_rows_at_its_end_are_gone(self):
+        # An incremental chunk holds no lock across batches, so rows can be deleted between
+        # a batch and its replay. A replay of (4, 8] whose row 8 is gone scans past 8 (or to
+        # the end of the table): every row of the range that exists was read, so it stands at
+        # the committed cursor. So does one whose whole rest of the copy is gone, a row past
+        # max_pk inserted since: the copy is not finished at a cursor Spark logged mid-copy.
+        options = {"snapshot.page.size": "4"}
+        for gone, added in ((range(8, 9), ()), (range(7, 21), ()), (range(8, 21), (25,))):
+            with self.subTest(gone=list(gone), added=added):
+                bridge = FakeBridge()
+                bridge.rows = [{"id": index, "value": str(index)} for index in range(1, 21)]
+                connector = self.connector(bridge, **options)
+                _, first = connector.read_table("app.orders", {}, dict(options))
+                _, second = connector.read_table("app.orders", first, dict(options))
+                self.assertEqual(second["incremental"]["last_pk"], [8])
+                bridge.rows = [row for row in bridge.rows if row["id"] not in gone]
+                bridge.rows += [{"id": index, "value": str(index)} for index in added]
+
+                delivered = self._replay_through(connector, options, first, second)
+
+                self.assertEqual(delivered, [index for index in (5, 6, 7) if index not in gone])
+
+    def test_a_replay_of_the_chunk_that_finished_the_copy_finishes_it_without_its_max_key(self):
+        # The copy's last chunk ended at the end of the table because the max_pk row had been
+        # deleted, so its batch logged no copy cursor. Its replay drains to max_pk and meets
+        # the end of the table the same way: the copy is finished there too.
+        options = {"snapshot.page.size": "4"}
+        bridge = FakeBridge()
+        bridge.rows = [{"id": index, "value": str(index)} for index in range(1, 11)]
+        connector = self.connector(bridge, **options)
+        _, first = connector.read_table("app.orders", {}, dict(options))
+        _, second = connector.read_table("app.orders", first, dict(options))
+        bridge.rows = [row for row in bridge.rows if row["id"] != 10]
+        _, third = connector.read_table("app.orders", second, dict(options))
+        self.assertNotIn("incremental", third)
+
+        self.assertEqual(self._replay_through(connector, options, second, third), [9])
+
+    def test_an_initial_chunk_replay_re_seeded_below_its_cursor_is_not_held_to_it(self):
+        # A copy's first range starts from no position, so its replay seeds the copy again,
+        # with the max_pk the table has then. Rows deleted down past the logged cursor end that
+        # copy below it; Spark goes on from the logged end, which the next read copies on from.
+        options = {"snapshot.page.size": "4"}
+        bridge = FakeBridge()
+        bridge.rows = [{"id": index, "value": str(index)} for index in range(1, 21)]
+        connector = self.connector(bridge, **options)
+        _, first = connector.read_table("app.orders", {}, dict(options))
+        self.assertEqual(first["incremental"]["last_pk"], [4])
+        bridge.rows = [row for row in bridge.rows if row["id"] <= 2]
+
+        self.assertEqual(self._replay_through(connector, options, {}, first), [1, 2])
+
     def test_replayed_range_pages_past_a_single_chunk_to_reach_the_bound(self):
         # A replay must not stop at snapshot.page.size. If rows were inserted
         # into the committed key range since the original read, that range no
@@ -14952,6 +15090,23 @@ class SharedCdcShardTests(unittest.TestCase):
         self.assertIsNone(view.read_start_lsn)
         shard.ingest([{"op": "TIMEOUT", "lsn": 106}], self._schema_map(), 1, 106, 106)
         self.assertEqual(shard.snapshot(self.id_a, 0).read_start_lsn, 106)
+
+    def test_a_second_layout_of_a_table_does_not_take_over_its_shard_entry(self):
+        # Two flows can read one source table under different options (a row_filter, say)
+        # with the same capture. The shard keeps the first one's table, buffer and coverage:
+        # the second one reads directly, rather than each re-subscribing over the other and
+        # both losing the view (and the one behind resetting the buffer every time).
+        shard = self._shard_with_two_tables()
+        shard.ingest(self._two_table_stream(), self._schema_map(), 1, 106, 0)
+        filtered = dataclasses.replace(self.table_a, row_filter="id > 1")
+        self.assertNotEqual(_schema_fingerprint(filtered), _schema_fingerprint(self.table_a))
+
+        shard.subscribe(self.id_a, filtered, _capture_descriptor(self.table_a), 102, 102)
+
+        self.assertIs(shard.subscribers[self.id_a]["table"], self.table_a)
+        view = shard.snapshot(self.id_a, 0)
+        self.assertEqual([tx.tx_id for tx in view.committed], [1])
+        self.assertEqual(view.fingerprint, _schema_fingerprint(self.table_a))
 
     def test_per_table_cursor_blocks_reread_duplicates(self):
         shard = self._shard_with_two_tables()
