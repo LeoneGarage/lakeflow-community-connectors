@@ -12,11 +12,18 @@
 # goes through AWS SSM on the demo host, with keys from the informix-cycles secret scope;
 # the compare tools staged next to this notebook do the Informix work exactly as on a laptop.
 #
+# A cycle that ends in MISMATCH cancels the cycles after it: the next cycle would restart the
+# container, which rebuilds testdb and loses the source state the mismatch has to be
+# diagnosed against. The pipeline is already stopped for the compares and stays stopped. The
+# notebook still exits normally, since a failed task is retried as a fresh run that restarts
+# the container. stop_on_mismatch=false runs every cycle regardless.
+#
 # Parameters: cycles, run_minutes, continuous_runs, final_minutes (0 skips the final run),
-# extra_minutes, pipeline_name (default informix-pipeline), and smoke=true, which checks
-# AWS, SSM, the pipeline API, both compares and the event tables without restarting the
-# container or running the pipeline. The pipeline is found by name and its tables in the
-# catalog and schema it writes to, so a recreated pipeline or workspace needs no edit.
+# extra_minutes, pipeline_name (default informix-pipeline), stop_on_mismatch (default true),
+# and smoke=true, which checks AWS, SSM, the pipeline API, both compares and the event
+# tables without restarting the container or running the pipeline. The pipeline is found by
+# name and its tables in the catalog and schema it writes to, so a recreated pipeline or
+# workspace needs no edit.
 
 # COMMAND ----------
 import datetime as dt
@@ -34,6 +41,7 @@ dbutils.widgets.text("final_minutes", "10")
 dbutils.widgets.text("extra_minutes", "8")
 dbutils.widgets.dropdown("smoke", "false", ["false", "true"])
 dbutils.widgets.text("pipeline_name", "informix-pipeline")
+dbutils.widgets.dropdown("stop_on_mismatch", "true", ["true", "false"])
 CYCLES = int(dbutils.widgets.get("cycles"))
 RUN_SECONDS = int(float(dbutils.widgets.get("run_minutes")) * 60)
 CONTINUOUS_RUNS = int(dbutils.widgets.get("continuous_runs"))
@@ -41,6 +49,7 @@ FINAL_SECONDS = int(float(dbutils.widgets.get("final_minutes")) * 60)
 EXTRA_SECONDS = int(float(dbutils.widgets.get("extra_minutes")) * 60)
 SMOKE = dbutils.widgets.get("smoke") == "true"
 PIPELINE_NAME = dbutils.widgets.get("pipeline_name")
+STOP_ON_MISMATCH = dbutils.widgets.get("stop_on_mismatch") == "true"
 
 SCOPE = "informix-cycles"
 SCHEMA = "main.informix_cycles"
@@ -83,7 +92,7 @@ event(
     "start",
     f"run {RUN_ID}: {CYCLES} cycles, {CONTINUOUS_RUNS} continuous runs of "
     f"{RUN_SECONDS // 60} min, final run {FINAL_SECONDS // 60} min, "
-    f"extra run {EXTRA_SECONDS // 60} min, smoke={SMOKE}",
+    f"extra run {EXTRA_SECONDS // 60} min, smoke={SMOKE}, stop_on_mismatch={STOP_ON_MISMATCH}",
 )
 
 # COMMAND ----------
@@ -513,12 +522,27 @@ for cycle in range(1, CYCLES + 1):
         "extra_run boolean, final_count string, data_compare string, details string",
     ).write.mode("append").saveAsTable(RESULTS)
     summary.append((cycle, verdict))
+    if verdict != "MATCH" and STOP_ON_MISMATCH and cycle < CYCLES:
+        event(
+            cycle,
+            "cancel",
+            f"cycle {cycle} MISMATCH: cancelling cycles {cycle + 1}-{CYCLES} so it can be "
+            f"diagnosed; the container is not restarted and pipeline {PIPELINE_NAME} stays "
+            f"stopped. The differing tables and key examples are in this cycle's row in "
+            f"{RESULTS} (details).",
+        )
+        break
 
 mismatched = [c for c, v in summary if v != "MATCH"]
+cancelled = len(summary) < CYCLES
 event(
     0,
     "summary",
-    "all cycles done: "
+    (
+        f"stopped after cycle {len(summary)} of {CYCLES} (mismatch): "
+        if cancelled
+        else "all cycles done: "
+    )
     + ", ".join(f"cycle {c} {v}" for c, v in summary)
     + (
         f"; cycles with mismatched data: {mismatched}"
@@ -526,4 +550,13 @@ event(
         else "; no cycle ended with mismatched data"
     ),
 )
-dbutils.notebook.exit(json.dumps({"run_id": RUN_ID, "cycles": summary, "mismatched": mismatched}))
+dbutils.notebook.exit(
+    json.dumps(
+        {
+            "run_id": RUN_ID,
+            "cycles": summary,
+            "mismatched": mismatched,
+            "cancelled_after": summary[-1][0] if cancelled else None,
+        }
+    )
+)
