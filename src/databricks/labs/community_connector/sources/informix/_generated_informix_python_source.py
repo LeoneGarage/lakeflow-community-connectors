@@ -23278,6 +23278,14 @@ def register_lakeflow_source(spark):
         ):
             # 392: Informix offset has an invalid schema_fingerprint
             raise ValueError(_m(392))
+        layout = result.get("update_fingerprint")
+        if layout is not None and (
+            not isinstance(layout, str)
+            or len(layout) != 64
+            or any(character not in "0123456789abcdef" for character in layout)
+        ):
+            # 424: Informix offset has an invalid update_fingerprint
+            raise ValueError(_m(424))
         schema_id = result.get("schema_id")
         if not isinstance(schema_id, str) or not re.fullmatch(r"[0-9a-f]{32}", schema_id):
             # 393: Informix offset has an invalid schema_id; run a full refresh with this connector

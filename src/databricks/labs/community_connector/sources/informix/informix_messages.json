@@ -422,5 +422,6 @@
 "Informix offset has an out-of-range backlog_rank",
 "Informix offset has an invalid trigger_boundary_retry_count",
 "Informix offset has an invalid schema_transition_retry_count",
-"Informix file snapshot of '{}' is part-way through a serve in split windows, which only stream.partitioned=true can continue; set it back to true until the snapshot has finished, and no full refresh is needed"
+"Informix file snapshot of '{}' is part-way through a serve in split windows, which only stream.partitioned=true can continue; set it back to true until the snapshot has finished, and no full refresh is needed",
+"Informix offset has an invalid update_fingerprint"
 ]

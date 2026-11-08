@@ -4274,6 +4274,20 @@ class LakeflowContractTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     informix_module._validated_offset(corrupt)
 
+    def test_update_fingerprint_survives_offset_validation(self):
+        # The update's first-read layout rides in the durable offset beside the schema
+        # fingerprint, and is held to the same 64-hex form.
+        offset = dict(_stream_offset())
+        offset["update_fingerprint"] = offset["schema_fingerprint"]
+        validated = informix_module._validated_offset(offset)
+        self.assertEqual(validated["update_fingerprint"], offset["schema_fingerprint"])
+        for bad in ("f" * 63, "F" * 64, 7, ["a" * 64]):
+            with self.subTest(bad=bad):
+                corrupt = dict(_stream_offset())
+                corrupt["update_fingerprint"] = bad
+                with self.assertRaisesRegex(ValueError, "invalid update_fingerprint"):
+                    informix_module._validated_offset(corrupt)
+
     def test_a_streak_only_offset_is_recognised_as_a_retry_offset(self):
         # A capacity-miss offset carries only bookkeeping keys. If backlog_streak
         # were not among the recognised set, an offset holding just it would be
