@@ -1144,8 +1144,28 @@ class LakeflowContractTests(unittest.TestCase):
             messages_class.__init__.__code__, {"os": os, "__builtins__": __builtins__}
         )
         messages = messages_class.__new__(messages_class)
-        init(messages)
+        init(messages)  # pylint: disable=not-callable
         self.assertEqual(messages.path, os.path.join(os.getcwd(), "informix_messages.json"))
+
+    def test_a_message_table_from_another_version_still_describes_the_error(self):
+        # A deployment can pair the code with a stale informix_messages.json: an index it
+        # lacks, or a template expecting other values, falls back to the numbered message.
+        messages = informix_module._m.__class__()
+        messages.templates = ["takes {} and {}"]
+        self.assertEqual(messages(0, "a", "b"), "takes a and b")
+        self.assertEqual(messages(0, "a"), "Informix message 0 ('a',)")
+        self.assertEqual(messages(5, "x"), "Informix message 5 ('x',)")
+
+    def test_a_year_one_timestamp_reaches_the_framework_tagged_utc(self):
+        # The decoders tag year-1 DATETIMEs UTC so PySpark's time zone conversion cannot
+        # overflow next to datetime.min; one the connector builds itself (a transform's
+        # TIMESTAMP fallback) gets the same at the boundary. Other values keep their form.
+        value = informix_module._framework_value
+        self.assertEqual(value(datetime(1, 1, 1)), "0001-01-01T00:00:00+00:00")
+        self.assertEqual(value(datetime(1, 1, 1, tzinfo=timezone.utc)), "0001-01-01T00:00:00+00:00")
+        self.assertEqual(value(datetime(2024, 5, 15, 10, 30)), "2024-05-15T10:30:00")
+        self.assertEqual(value(date(1, 1, 1)), "0001-01-01")
+        self.assertEqual(value(7), 7)
 
     def test_an_unreadable_message_table_is_retried_after_a_minute(self):
         # A missing table is not looked for on every message, but a file that comes back
@@ -5655,6 +5675,25 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual([(p["kind"], p["page_index"]) for p in partitions], [("page", 0)])
         self.assertEqual([row["id"] for row in self._served(connector, partitions)], [1, 2])
 
+    def test_a_replanned_first_batch_of_an_empty_table_serves_nothing_new(self):
+        # The drain of an empty table publishes a page_count 0 manifest and a stream end. A
+        # driver restarted before that batch commits re-plans it with no cache: the replay
+        # finds the same manifest and serves nothing, rather than a fresh snapshot of rows
+        # inserted since, which CDC from the boundary delivers.
+        empty = FakeBridge()
+        empty.rows = []
+        end = self._partitioned_connector(empty).latest_offset("app.orders", {}, {})
+        self.assertEqual(end["phase"], "stream")
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 8)]
+        restarted = self._partitioned_connector(bridge, **{"snapshot.page.size": "2"})
+
+        partitions = restarted.get_partitions("app.orders", {}, {}, end)
+
+        served = [r for p in partitions for r in restarted.read_partition("app.orders", p, {})]
+        self.assertEqual(served, [])
+        self.assertEqual(bridge.snapshot_calls, [])
+
     def test_partitioned_bootstrap_replan_serves_page_zero_without_a_read(self):
         # Spark re-plans an uncommitted first microbatch after a driver restart or a retried
         # update, including one an earlier connector version logged with page 0 embedded.
@@ -7327,6 +7366,21 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(initialized["commit_lsn"], "90")
 
+    def test_a_keyless_table_keyed_by_an_option_waits_for_its_upsert_channel(self):
+        # primary.keys gives a physically keyless table a key, and with it a delete channel:
+        # its delete reader must find the upsert reader's channel start in Lakebase before
+        # it takes a connection slot, as a catalog-keyed table's does. Without the option
+        # the table is append-only and has no delete channel to wait for.
+        bridge = FakeBridge()
+        bridge.tables = [_table(primary_keys=())]
+        connector = self.connector(bridge)
+        connector.list_tables()  # registration caches the bare catalog table
+
+        self.assertFalse(
+            connector._upsert_channel_start_exists("app.orders", {"primary.keys": "id"})
+        )
+        self.assertTrue(connector._upsert_channel_start_exists("app.orders", {}))
+
     def test_delete_reader_waits_for_upsert_boundary_without_opening_informix(self):
         class NoConnectionBridge(FakeBridge):
             def get_table(self, identity):
@@ -8753,6 +8807,26 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(bridge.snapshot_page_sizes, [1234])
 
+    def test_an_append_only_snapshot_in_flight_finishes_whatever_the_mode_says_now(self):
+        # A snapshot-phase checkpoint still has pages to serve. With snapshot.mode unset
+        # since (here the connection's cdc_only applies), or a seed from a keyed capture
+        # taken mid-snapshot, the read must serve them, not start CDC at the boundary.
+        connector, bridge = self._keyless_connector()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 4)]
+        initial = dict(
+            self.APPEND, **{"snapshot.mode": "initial", "keyless.snapshot.page.size": "1"}
+        )
+        rows, offset = connector.read_table("app.orders", {}, initial)
+        self.assertEqual([row["id"] for row in rows], [1])
+        self.assertEqual(offset["phase"], "snapshot")
+
+        served = []
+        while offset["phase"] == "snapshot":
+            rows, offset = connector.read_table("app.orders", offset, dict(self.APPEND))
+            served.extend(row["id"] for row in rows)
+
+        self.assertEqual(served, [2, 3])
+
     def test_keyed_initial_snapshot_ignores_the_keyless_page_size(self):
         # The keyed blocking snapshot keeps using snapshot.page.size regardless of
         # the keyless knob, so the two options never interfere.
@@ -9520,11 +9594,11 @@ class LakeflowContractTests(unittest.TestCase):
         Wrapped = _informix_available_now_base(TriggerBase)
 
         class LakeflowStreamReader(Wrapped):
-            def __init__(inner):
+            def __init__(inner):  # pylint: disable=no-self-argument
                 inner.lakeflow_connect = connector
                 inner.options = {"tableName": "app.orders", **options}
 
-            def read(inner, start):
+            def read(inner, start):  # pylint: disable=no-self-argument
                 return connector.read_table(inner.options["tableName"], start, dict(inner.options))
 
         return LakeflowStreamReader()
@@ -9726,11 +9800,11 @@ class LakeflowContractTests(unittest.TestCase):
         Wrapped = _informix_available_now_base(TriggerBase)
 
         class LakeflowStreamReader(Wrapped):
-            def __init__(inner):
+            def __init__(inner):  # pylint: disable=no-self-argument
                 inner.lakeflow_connect = object()
                 inner.options = {}
 
-            def read(inner, start):
+            def read(inner, start):  # pylint: disable=no-self-argument
                 raise AssertionError("an advisory-only range must not read Informix")
 
         reader = LakeflowStreamReader()
@@ -9747,13 +9821,13 @@ class LakeflowContractTests(unittest.TestCase):
         Wrapped = _informix_available_now_base(TriggerBase)
 
         class LakeflowStreamReader(Wrapped):
-            def __init__(inner):
+            def __init__(inner):  # pylint: disable=no-self-argument
                 inner.lakeflow_connect = object()
                 inner.options = {"connection.wait.timeout.seconds": "10"}
                 inner.seen = []
                 inner.wait_budgets = []
 
-            def read(inner, start):
+            def read(inner, start):  # pylint: disable=no-self-argument
                 inner.seen.append(dict(start))
                 inner.wait_budgets.append(
                     float(inner.options[informix_module._REPLAY_CONNECTION_WAIT_BUDGET_OPTION])
@@ -9788,11 +9862,11 @@ class LakeflowContractTests(unittest.TestCase):
         Wrapped = _informix_available_now_base(TriggerBase)
 
         class LakeflowStreamReader(Wrapped):
-            def __init__(inner):
+            def __init__(inner):  # pylint: disable=no-self-argument
                 inner.lakeflow_connect = object()
                 inner.options = {"connection.wait.timeout.seconds": "1"}
 
-            def read(inner, start):
+            def read(inner, start):  # pylint: disable=no-self-argument
                 return iter(()), dict(start)
 
         with (
@@ -9813,12 +9887,12 @@ class LakeflowContractTests(unittest.TestCase):
         Wrapped = _informix_available_now_base(TriggerBase)
 
         class LakeflowStreamReader(Wrapped):
-            def __init__(inner):
+            def __init__(inner):  # pylint: disable=no-self-argument
                 inner.lakeflow_connect = object()
                 inner.options = {"connection.wait.timeout.seconds": "10"}
                 inner.calls = 0
 
-            def read(inner, start):
+            def read(inner, start):  # pylint: disable=no-self-argument
                 inner.calls += 1
                 if inner.calls < 3:
                     return iter(()), dict(start)
@@ -12124,11 +12198,11 @@ class IncrementalSnapshotTests(unittest.TestCase):
         Wrapped = _informix_available_now_base(TriggerBase)
 
         class LakeflowStreamReader(Wrapped):
-            def __init__(inner):
+            def __init__(inner):  # pylint: disable=no-self-argument
                 inner.lakeflow_connect = connector
                 inner.options = {"tableName": "app.orders", **options}
 
-            def read(inner, start):
+            def read(inner, start):  # pylint: disable=no-self-argument
                 return connector.read_table("app.orders", start, dict(inner.options))
 
         reader = LakeflowStreamReader()
@@ -12157,11 +12231,11 @@ class IncrementalSnapshotTests(unittest.TestCase):
         Wrapped = _informix_available_now_base(TriggerBase)
 
         class LakeflowStreamReader(Wrapped):
-            def __init__(inner):
+            def __init__(inner):  # pylint: disable=no-self-argument
                 inner.lakeflow_connect = connector
                 inner.options = {"tableName": "app.orders"}
 
-            def read(inner, start):
+            def read(inner, start):  # pylint: disable=no-self-argument
                 return connector.read_table("app.orders", start, dict(inner.options))
 
         reader = LakeflowStreamReader()
@@ -13202,6 +13276,26 @@ class SharedCdcShardTests(unittest.TestCase):
         shard.ingest([{"op": "TIMEOUT", "lsn": 701}], {self.id_a: self.table_a}, 1, 701, 500)
         self.assertIsNotNone(shard.snapshot(self.id_a, 500))
 
+    def test_a_checkpoint_moved_back_starts_the_table_over(self):
+        # The buffer drops what a consumer has consumed and the cursor keeps a re-read from
+        # landing twice. A consumer back at an earlier checkpoint needs those transactions
+        # again, so it reads directly until the shard has re-read the table from its floor,
+        # and then its view has them.
+        shard = _SharedCdcShard()
+        capture = _capture_descriptor(self.table_a)
+        stream = self._two_table_stream()  # table a's only transaction commits at 102
+        shard.subscribe(self.id_a, self.table_a, capture, 0, 0)
+        shard.ingest(stream, {self.id_a: self.table_a}, 1, 106, 0)
+        shard.subscribe(self.id_a, self.table_a, capture, 102, 102)
+        self.assertEqual(shard.snapshot(self.id_a, 102).committed, [])
+
+        shard.subscribe(self.id_a, self.table_a, capture, 0, 0)
+
+        self.assertIsNone(shard.snapshot(self.id_a, 0))
+        self.assertEqual(shard.shared_restart, 0)
+        shard.ingest(stream, {self.id_a: self.table_a}, 1, 106, 0)
+        self.assertEqual([tx.tx_id for tx in shard.snapshot(self.id_a, 0).committed], [1])
+
     def test_a_resubscribe_trims_what_the_consumer_has_consumed(self):
         # A consumer on direct reads (here the shard is not ready) gets no view, so only its
         # re-subscribes trim its buffer; a full buffer would otherwise stop the shard reading.
@@ -13992,10 +14086,15 @@ class HostSharedCdcTests(unittest.TestCase):
 
         self.assertEqual([tx.tx_id for tx in self.poll(follower).committed], [5, 6])
         self.assertEqual([tx.tx_id for tx in self.poll(follower, commit=102).committed], [6])
-        # A checkpoint moved back past what the follower holds starts over.
-        self.assertEqual([tx.tx_id for tx in self.poll(follower, commit=0).committed], [6])
+        # A checkpoint moved back past what was consumed starts the table over: the leader's
+        # buffer has dropped transaction 5, so the follower reads directly until the shard
+        # has re-read the table from its floor, and then gets both again.
+        self.assertIsNone(self.poll(follower, commit=0))
+        self.cover()
+        self.cover(tx_id=6, lsn=110)
+        self.assertEqual([tx.tx_id for tx in self.poll(follower, commit=0).committed], [5, 6])
 
-        self.assertEqual(sent, [(None, [5]), (102, [6]), (112, []), (None, [6])])
+        self.assertEqual(sent, [(None, [5]), (102, [6]), (112, []), (None, None), (None, [5, 6])])
 
     def test_a_follower_drops_what_it_holds_when_its_capture_changes(self):
         # What a follower holds was decoded under the capture it polled with. After a schema
@@ -15334,7 +15433,7 @@ class FairSlotQueueWiringTests(unittest.TestCase):
         tickets = []
 
         def enqueue(*args, **kwargs):
-            tickets.append(real_enqueue(*args, **kwargs))
+            tickets.append(real_enqueue(*args, **kwargs))  # pylint: disable=missing-kwoa
             return tickets[-1]
 
         def heartbeat(connection, namespace, ticket_id, **kwargs):

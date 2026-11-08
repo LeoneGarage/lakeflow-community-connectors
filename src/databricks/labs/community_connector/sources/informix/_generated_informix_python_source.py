@@ -5751,9 +5751,12 @@ def register_lakeflow_source(spark):
                     self.templates = json.loads(text)
                 except Exception:  # pylint: disable=broad-except
                     self.retry_at = time.monotonic() + 60
-            if self.templates is None:
-                return f"Informix message {index} {values!r}"
-            return self.templates[index].format(*values)
+            if self.templates is not None:
+                try:
+                    return self.templates[index].format(*values)
+                except Exception:  # pylint: disable=broad-except
+                    pass  # a file from another version: no such template, or other fields
+            return f"Informix message {index} {values!r}"
 
 
     _m = _Messages()
@@ -11768,6 +11771,14 @@ def register_lakeflow_source(spark):
                     # And read the table's catalog entry at the daemon's next cycle, not the
                     # next scheduled check.
                     self.catalog.force_check()
+                elif existing is not None and checkpoint_commit_lsn < existing["checkpoint"]:
+                    # The checkpoint moved back (a consumer replaying from an earlier commit):
+                    # the buffer already dropped what lies above the new one and the cursor
+                    # would skip re-reading it, so start the table over from its floor, on
+                    # direct reads until the shard covers it again.
+                    self.buffers.pop(identity, None)
+                    self.cursors.pop(identity, None)
+                    existing = None
                 entry = {
                     "table": table,
                     "capture": capture,
@@ -13692,6 +13703,14 @@ def register_lakeflow_source(spark):
                                 result = self._read_stream(
                                     table, effective_start, table_options, deletes=False
                                 )
+                        elif effective_start and effective_start.get("phase") == "snapshot":
+                            # An in-flight snapshot finishes whatever snapshot.mode says now, as a
+                            # keyed one does below: a seed from a keyed capture mid-snapshot, or a
+                            # mode changed or unset mid-snapshot, would otherwise start CDC at the
+                            # boundary (cdc_only) and drop the pages not yet served.
+                            result = self._read_snapshot(
+                                table, effective_start, table_options, allow_keyless=True
+                            )
                         else:
                             result = self._read_append_only(table, effective_start, table_options)
                     elif migration:
@@ -19885,7 +19904,8 @@ def register_lakeflow_source(spark):
                 )
 
         def _refresh_table_schema(self, table: Table, expected_fingerprint: str | None) -> Table:
-            refreshed = Table.parse(self._bridge.get_table(table.identity), table.database)
+            bare = Table.parse(self._bridge.get_table(table.identity), table.database)
+            refreshed = bare
             # Keep the table options (and therefore the fingerprint) across a schema refresh
             # instead of reverting to the bare catalog table. A primary.keys override is only
             # carried when the caller was already overridden, so a genuine catalog key change
@@ -19901,7 +19921,8 @@ def register_lakeflow_source(spark):
                 # reading additional snapshot or CDC records
                 raise InformixError(_m(243, table.exposed_name))
             if self._tables is not None:
-                self._tables[table.exposed_name] = refreshed
+                # The cache holds catalog tables as read; _table applies the options per call.
+                self._tables[table.exposed_name] = bare
             return refreshed
 
         def _table_int_option(
@@ -20149,8 +20170,17 @@ def register_lakeflow_source(spark):
             cached = self._tables.get(exposed) if self._tables is not None else None
             if cached is not None:
                 # The cache holds the bare catalog table, so narrow it to the columns the read
-                # path ingests first, or a column left out there would fail the check here.
-                cached = self._ingested_columns(cached, table_options, _key_override(table_options))
+                # path ingests first, or a column left out there would fail the check here. Then
+                # give it the key the read path will (primary.keys, or a promoted nullable index)
+                # without the index lookup that can need: a keyless table keyed by an option has
+                # a delete channel, and must wait here for its upsert reader like any keyed one.
+                override = _key_override(table_options)
+                cached = self._ingested_columns(cached, table_options, override)
+                key = self._requested_key(cached, table_options, override)
+                cached = replace(
+                    cached,
+                    primary_keys=tuple(c.name for c in cached.columns) if key is None else key,
+                )
                 _ensure_materializable(cached, table_options)
                 if self._append_only_table(cached, table_options) or not _cdc_capable(cached):
                     return True
@@ -22148,7 +22178,14 @@ def register_lakeflow_source(spark):
         # and TimestampType, but rejects a native datetime.date.  Normalize both
         # temporal Python objects at the connector boundary for consistent snapshot
         # and CDC behavior.
-        return value.isoformat() if isinstance(value, (date, datetime)) else value
+        if isinstance(value, (date, datetime)):
+            if value.year <= 1 and isinstance(value, datetime) and value.tzinfo is None:
+                # A year-1 timestamp built here rather than decoded (a transform's TIMESTAMP
+                # fallback) is tagged UTC as the decoders tag theirs (see cdc_protocol): naive,
+                # next to datetime.min, it overflows PySpark's time zone conversion.
+                value = value.replace(tzinfo=timezone.utc)
+            return value.isoformat()
+        return value
 
 
     def _deep_size(value: Any, seen: set[int] | None = None) -> int:
