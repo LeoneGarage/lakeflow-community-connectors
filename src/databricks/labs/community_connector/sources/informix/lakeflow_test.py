@@ -8531,9 +8531,10 @@ class LakeflowContractTests(unittest.TestCase):
         done = {informix_module._REPLAY_STOP_LSN_OPTION: "90"}
         self.assertIs(poll(at_checkpoint, done), at_checkpoint)
         self.assertIsNone(poll(at_checkpoint, replay))
-        # So is an AvailableNow read whose shard went idle where this consumer is, or where
-        # its read started (the log reader's position held back), from a read made once the
-        # log had reached the boundary: a direct read would see no further.
+        # So is an AvailableNow read whose shard went idle where its read started, or short
+        # of it (the log reader's position held back), from a read made once the log had
+        # reached the boundary: a direct read would see no further.
+        at_checkpoint = view(caught_up=True, reached=90, started=90)
         self.assertIs(poll(at_checkpoint, {}, trigger=True), at_checkpoint)
         self.assertEqual(connector._trigger_boundaries[table.identity][0], current)
         held = view(caught_up=True, reached=80, started=85)
@@ -8548,6 +8549,45 @@ class LakeflowContractTests(unittest.TestCase):
         connector._trigger_boundaries[table.identity] = (current + 1, "a" * 32, scope)
         self.assertIsNone(poll(at_checkpoint, {}, trigger=True))
         self.assertIsNone(poll(held, {}, trigger=True))
+
+    def test_a_scan_stopped_short_does_not_end_the_read_once_the_consumer_reaches_it(self):
+        # A shard read from 90 whose timeout ran out on other tables' log at 120 moves the
+        # consumer on to 120 (the quiet advance). Its next poll can come before the shard's
+        # next read: the same view is then idle where the consumer is, but it is the scan
+        # that stopped short of the boundary, so the read waits for a scan from 120 -- one
+        # the log reader holds where it started is the read done -- rather than end there.
+        connector = self.connector(
+            FakeBridge(), shared_cdc=True, **{"cdc.shared.session": "process"}
+        )
+        table = connector._table("app.orders", {})
+        fingerprint = _stream_offset(90)["schema_fingerprint"]
+        bound = 90 + 10 * (1 << 12)
+        connector._trigger_available_now = True
+
+        def poll(commit, reached, started):
+            shown = _SharedCdcSnapshot(
+                table, fingerprint, 1, bound, [], True, None, reached, started
+            )
+            shard = mock.Mock()
+            shard.snapshot.return_value = shown
+            with (
+                mock.patch.object(informix_module, "_shared_cdc_shard", return_value=shard),
+                mock.patch.multiple(
+                    informix_module,
+                    _SHARED_VIEW_WAIT_TIMEOUTS=0,
+                    _SHARED_VIEW_WAIT_MARGIN_SECONDS=0,
+                ),
+            ):
+                view = connector._shared_cdc_snapshot(
+                    table, _stream_offset(commit), {}, False, connector._pipeline_scope()
+                )
+            return view is shown
+
+        self.assertTrue(poll(90, 120, 90))
+        self.assertFalse(poll(120, 120, 90))
+        self.assertTrue(poll(120, 120, 120))
+        # A read that started below the consumer and stopped short exactly where it is.
+        self.assertFalse(poll(90, 90, 70))
 
     def test_a_shard_view_of_another_layout_than_the_readers_is_not_taken(self):
         # Two flows can read one source table under different options (a row_filter, say)
@@ -8574,10 +8614,10 @@ class LakeflowContractTests(unittest.TestCase):
     def test_the_first_available_now_poll_of_an_idle_table_keeps_the_shard_view(self):
         # The first poll of an AvailableNow update has no frozen boundary in this process yet.
         # The upsert reader publishes it from the view's sample, as it does on taking the
-        # view, so a table the shard went idle on where the consumer is keeps the view, however
-        # far the log reader's position is held back; one the shard went idle behind (a
-        # stalled scan) still reads directly.
-        def first_poll(current, minimum=1, deletes=False, reached=90, started=None):
+        # view, so a table the shard went idle on where its read started keeps the view,
+        # however far the log reader's position is held back; one the shard went idle behind
+        # after moving on from its start (a stalled scan) still reads directly.
+        def first_poll(current, minimum=1, deletes=False, reached=90, started=90):
             connector = self.connector(
                 FakeBridge(),
                 shared_cdc=True,
@@ -15090,6 +15130,21 @@ class SharedCdcShardTests(unittest.TestCase):
         self.assertIsNone(view.read_start_lsn)
         shard.ingest([{"op": "TIMEOUT", "lsn": 106}], self._schema_map(), 1, 106, 106)
         self.assertEqual(shard.snapshot(self.id_a, 0).read_start_lsn, 106)
+
+    def test_an_idle_read_held_below_its_start_resumes_from_its_start(self):
+        # On a quiet log Informix reports an idle read's TIMEOUT position held back, below
+        # where the read started. The read delivered nothing short of its start, so the next
+        # one resumes there rather than re-reading the log in between (and swinging back
+        # and forth between the two positions as a commit in between moves it on again).
+        shard = self._shard_with_two_tables()
+        shard.ingest(self._two_table_stream(), self._schema_map(), 1, 106, 0)
+        self.assertEqual(shard.shared_restart, 106)
+
+        shard.ingest([{"op": "TIMEOUT", "lsn": 80}], self._schema_map(), 1, 106, 106)
+
+        self.assertEqual(shard.shared_restart, 106)
+        view = shard.snapshot(self.id_a, 102)
+        self.assertEqual((view.reached_lsn, view.read_start_lsn), (80, 106))
 
     def test_a_second_layout_of_a_table_does_not_take_over_its_shard_entry(self):
         # Two flows can read one source table under different options (a row_filter, say)

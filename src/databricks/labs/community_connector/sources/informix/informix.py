@@ -6464,8 +6464,12 @@ class _SharedCdcShard:
                 # Idle with nothing open: everything the shard captures up to where the
                 # log reader stopped has been delivered, so resume from there. Resuming
                 # from the last commit instead rescans the same stretch of a busy log on
-                # every poll and can time out before ever passing it.
-                advanced = max(reached, committed[-1].commit_lsn if committed else reached)
+                # every poll and can time out before ever passing it. A position held back
+                # short of where the read started (a quiet log, see _shared_cdc_snapshot)
+                # resumes from the start: the read had nothing to deliver short of it.
+                advanced = max(
+                    read_start, reached, committed[-1].commit_lsn if committed else reached
+                )
             elif committed:
                 advanced = committed[-1].commit_lsn
             else:
@@ -13911,17 +13915,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # it. A direct read, started from the checkpoint, is done when the server reports
             # no position past it. The shard's read is as good once the log had reached the
             # boundary when it started (its sample, current_lsn, is at or past it) and it
-            # went idle where this consumer is, or where it started: a scan stopped short,
-            # its timeout spent on other tables' log, ends past where it started instead.
-            # Within the boundary's page is done as well.
+            # went idle where it started or short of it. A scan stopped short, its timeout
+            # spent on other tables' log, ends past where it started instead -- even where
+            # that is where this consumer now is, the quiet advance having taken it there
+            # before the shard's next read. Within the boundary's page is done as well.
             bound, _ = self._shared_trigger_boundary(
                 table, checkpoint, owner=not deletes, current_lsn=view.current_lsn
             )
             started = view.read_start_lsn
             if view.current_lsn >= bound and (
-                reached >= bound - (1 << 12)
-                or reached == checkpoint_commit
-                or (started is not None and reached <= started)
+                reached >= bound - (1 << 12) or (started is not None and reached <= started)
             ):
                 return view
             # Otherwise the shard's next read, started later, is waited for.
