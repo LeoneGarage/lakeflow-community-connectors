@@ -7425,7 +7425,9 @@ class LakeflowContractTests(unittest.TestCase):
         for lsn, expected in ((90, 90), (120, 120), (100, 120)):
             connector._publish_delete_snapshot_floor(table, schema_id, lsn, scope)
             self.assertEqual(
-                connector._read_delete_snapshot_floor(table, schema_id, fingerprint), expected, lsn
+                connector._read_delete_snapshot_floor(table, schema_id, fingerprint)[0],
+                expected,
+                lsn,
             )
 
     def test_delete_reader_keeps_connection_maintenance_cleanup_enabled(self):
@@ -11950,6 +11952,66 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(list(rows), [])
         live = _schema_fingerprint(Table.parse(bridge.tables[0], "demo"))
         self.assertEqual(stepped["schema_fingerprint"], live)
+
+    def test_a_delete_flow_bootstraps_at_a_floor_its_channel_starts_schema_descends_from(self):
+        # The delete flow never checkpointed while the upsert reader stepped to a new schema
+        # and read on in an earlier update. Its floor is the snapshot's, under the schema
+        # before the step; the channel start's schema descends from it, so the delete flow
+        # seeds at the floor under that schema and steps itself, keeping the deletes
+        # committed between the snapshot and the upsert resume position.
+        bridge = FakeBridge()
+        updates = {
+            name: f"{self._FLOOR_PIPELINE}_@_{update}"
+            for name, update in (
+                ("update-1", "22222222-2222-2222-2222-222222222222"),
+                ("update-2", "33333333-3333-3333-3333-333333333333"),
+                ("update-3", "44444444-4444-4444-4444-444444444444"),
+            )
+        }
+
+        def connector(name):
+            reader = self.connector(bridge)
+            reader.set_registration_scope(updates[name])
+            return reader
+
+        _, snapshot = connector("update-1").read_table("app.orders", {}, {})
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 110
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 94},
+            {
+                "op": "DELETE",
+                "tx_id": 7,
+                "lsn": 95,
+                "table": "demo:app.orders",
+                "row": {"id": 1, "value": "a", "added": None},
+            },
+            {"op": "COMMIT", "tx_id": 7, "lsn": 96},
+            {"op": "BEGIN", "tx_id": 8, "lsn": 100},
+            {
+                "op": "INSERT",
+                "tx_id": 8,
+                "lsn": 101,
+                "table": "demo:app.orders",
+                "row": {"id": 9, "value": "n", "added": 2},
+            },
+            {"op": "COMMIT", "tx_id": 8, "lsn": 102},
+            {"op": "TIMEOUT", "lsn": 110},
+        ]
+        upsert = snapshot
+        for _ in range(3):
+            _, upsert = connector("update-2").read_table("app.orders", upsert, {})
+        self.assertEqual(upsert["commit_lsn"], "102")
+        connector("update-3").read_table("app.orders", upsert, {})
+
+        _, seed = connector("update-3").read_table_deletes("app.orders", {}, {})
+
+        self.assertEqual(seed["commit_lsn"], snapshot["commit_lsn"])
+        self.assertEqual(seed["schema_id"], snapshot["schema_id"])
+        rows, _ = connector("update-3").read_table_deletes("app.orders", seed, {})
+        self.assertEqual([(row["id"], row["_informix_op"]) for row in rows], [(1, "d")])
 
     def test_delete_schema_transition_resumes_once_the_owner_publishes(self):
         bridge = FakeBridge()

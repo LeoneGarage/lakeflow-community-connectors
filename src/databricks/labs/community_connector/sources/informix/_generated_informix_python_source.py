@@ -15506,6 +15506,34 @@ def register_lakeflow_source(spark):
             _validated_offset(checkpoint)
             return self._pipeline_scope()
 
+        def _bootstrap_seed_table(self, table: Table, schema_id: str, fingerprint: str) -> Table:
+            # Docstring: The layout a delete bootstrap seeds under: the live one, or a recorded node.
+            #
+            # The upsert reader publishes the update's channel start at its checkpoint before it
+            # steps, and a snapshot floor keeps the schema it was captured under, so the seed's
+            # schema can be one the live layout has moved past (a column changed while the
+            # pipeline was stopped). The seed names that recorded node; the next poll steps from
+            # it as any lagging reader does.
+
+            if fingerprint == _schema_fingerprint(table):
+                return table
+            record = self._read_immutable_head(
+                self._immutable_namespace(table, "schema-nodes", schema_id)
+            )
+            node = record.get("schema") if isinstance(record, dict) else None
+            if not isinstance(node, dict) or node.get("id") != schema_id:
+                # 199: Informix upsert/delete bootstrap schema mismatch for '{}'
+                raise InformixError(_m(199, table.exposed_name))
+            self._validate_immutable_record_header(record, "schema-node", table.exposed_name)
+            seed_table = _table_from_schema_state(node, table.database)
+            if (
+                seed_table.native_identity != table.native_identity
+                or _schema_fingerprint(seed_table) != fingerprint
+            ):
+                # 199: Informix upsert/delete bootstrap schema mismatch for '{}'
+                raise InformixError(_m(199, table.exposed_name))
+            return seed_table
+
         def _read_table_deletes(
             self,
             table_name: str,
@@ -15570,27 +15598,6 @@ def register_lakeflow_source(spark):
                     # permanently skip old-key deletes after a cancelled refresh.
                     return iter(()), self._schema_node_fallback_offset(bootstrap_offset)
                 high_water, schema_id, fingerprint = channel_start
-                seed_table = table
-                if fingerprint != _schema_fingerprint(table):
-                    # The upsert reader publishes the update's channel start at its checkpoint
-                    # before it steps, so the record can hold a schema the live one has moved
-                    # past (a column changed while the pipeline was stopped). Seed under that
-                    # recorded node; the next poll steps from it as any lagging reader does.
-                    record = self._read_immutable_head(
-                        self._immutable_namespace(table, "schema-nodes", schema_id)
-                    )
-                    node = record.get("schema") if isinstance(record, dict) else None
-                    if not isinstance(node, dict) or node.get("id") != schema_id:
-                        # 199: Informix upsert/delete bootstrap schema mismatch for '{}'
-                        raise InformixError(_m(199, table.exposed_name))
-                    self._validate_immutable_record_header(record, "schema-node", table.exposed_name)
-                    seed_table = _table_from_schema_state(node, table.database)
-                    if (
-                        seed_table.native_identity != table.native_identity
-                        or _schema_fingerprint(seed_table) != fingerprint
-                    ):
-                        # 199: Informix upsert/delete bootstrap schema mismatch for '{}'
-                        raise InformixError(_m(199, table.exposed_name))
                 # The upsert channel-start records the upsert reader's *resume* position
                 # for the current scope, which the restart/replay cycles push forward past
                 # the snapshot boundary. Bootstrapping a delete flow there skips before-image
@@ -15603,7 +15610,8 @@ def register_lakeflow_source(spark):
                 # cannot remove a newer row or apply a delete twice. This is a bootstrap-only
                 # cost; once the delete flow checkpoints, it resumes from its own cursor.
                 minimum = self._bridge.minimum_lsn()
-                floor = self._read_delete_snapshot_floor(table, schema_id, fingerprint)
+                floor_state = self._read_delete_snapshot_floor(table, schema_id, fingerprint)
+                floor = floor_state[0] if floor_state else None
                 bootstrap_lsn = high_water
                 if floor is not None and floor < minimum:
                     # The floor has aged below the retained log, so the upsert channel-start
@@ -15622,7 +15630,8 @@ def register_lakeflow_source(spark):
                     # is re-read from the floor. Visible in the event log because it can be
                     # long (days of log after a stalled bootstrap) and lowers the delete
                     # shard's shared restart under the sharded daemon.
-                    bootstrap_lsn = floor
+                    # Under the floor's own schema, which the channel start's can descend from.
+                    bootstrap_lsn, schema_id, fingerprint = floor_state
                     # 201: Informix delete channel for '{}' bootstraps at the snapshot floor {} rather
                     # than the upsert resume position {}: no delete checkpoint has consumed that range
                     # yet, so it is re-read (idempotent for the target)
@@ -15653,7 +15662,7 @@ def register_lakeflow_source(spark):
                         bootstrap_lsn,
                         None,
                         "stream",
-                        seed_table,
+                        self._bootstrap_seed_table(table, schema_id, fingerprint),
                         schema_id,
                         self._pipeline_scope(),
                     ),
@@ -20299,18 +20308,17 @@ def register_lakeflow_source(spark):
 
         def _read_delete_snapshot_floor(
             self, table: Table, schema_id: str, fingerprint: str
-        ) -> int | None:
+        ) -> tuple[int, str, str] | None:
             # Docstring: Return the snapshot-boundary floor for a bootstrapping delete flow.
             #
-            # ``None`` when no compatible floor exists, so the caller keeps its prior behaviour
-            # of anchoring at the upsert channel-start: either this pipeline has not published
-            # one (no snapshot since the record was introduced), or the floor was captured
-            # under an earlier schema generation -- the source was altered after the snapshot
-            # and the delete flow never checkpointed. The latter is reported: the bootstrap
-            # then starts at the upsert resume position, and the deletes committed between the
-            # snapshot and it are not replayed. A bootstrap offset must name the layout it
-            # starts under, and carrying a superseded generation across the transition is the
-            # upsert channel's job on a checkpoint it owns, not something to improvise here.
+            # The floor with the schema id and fingerprint it was captured under: the channel
+            # start's, or one the channel start's descends from through recorded predecessors
+            # (the source was altered after the snapshot while the delete flow never
+            # checkpointed). The bootstrap seeds under that schema and steps from it as any
+            # lagging reader does. ``None`` when no compatible floor exists, so the caller keeps
+            # anchoring at the upsert channel-start: this pipeline has not published one, or the
+            # floor's schema is not in the channel start's history. The latter is reported: the
+            # deletes committed between the snapshot and the resume position are not replayed.
 
             record = self._read_immutable_head(
                 self._immutable_namespace(
@@ -20323,17 +20331,21 @@ def register_lakeflow_source(spark):
             if record.get("table") != table.native_identity:
                 return None
             floor = self._immutable_lsn(record, "start_lsn", table.exposed_name)
-            if record.get("schema_id") != schema_id or record.get("fingerprint") != fingerprint:
+            floor_schema_id, floor_fingerprint = record.get("schema_id"), record.get("fingerprint")
+            if (floor_schema_id, floor_fingerprint) != (schema_id, fingerprint) and not (
+                isinstance(floor_fingerprint, str)
+                and self._schema_descends_from(table, schema_id, fingerprint, floor_schema_id)
+            ):
                 # 314: Informix delete snapshot floor {} for '{}' was captured under schema generation
                 # {}, but the upsert channel now runs generation {}; the delete channel bootstraps at
                 # the upsert resume position instead, so deletes committed between that snapshot and the
                 # resume position are not replayed. Run a full refresh if the destination must match the
                 # source exactly
                 logging.getLogger(__name__).warning(
-                    _m(314, floor, table.exposed_name, record.get("schema_id"), schema_id),
+                    _m(314, floor, table.exposed_name, floor_schema_id, schema_id),
                 )
                 return None
-            return floor
+            return floor, str(floor_schema_id), floor_fingerprint
 
         def _upsert_channel_start_exists(self, table_name: str, table_options: dict[str, str]) -> bool:
             # Docstring: Check current-scope delete coordination without opening Informix.
