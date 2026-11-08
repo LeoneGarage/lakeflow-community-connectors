@@ -959,6 +959,8 @@ _SHARED_STATE_MOUNT_RETRY_MAX_SECONDS = 8.0
 # exposed name), so this can be generous -- a pipeline registers one entry per
 # configured table.
 _MAX_REGISTRATION_TABLE_CACHES = 512
+# Predecessor hops a same-position channel start may follow back to its first schema.
+_MAX_SCHEMA_DESCENT = 256
 _INFORMIX_REGISTRATION_CONTEXT: dict[str, Any] = {"scope": None}
 
 
@@ -13577,20 +13579,23 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # direct-read path, which owns the transition/replay logic.
         if str(checkpoint.get("schema_fingerprint")) != view.fingerprint:
             return None
-        if (
-            (self._trigger_available_now or self._replay_stop_lsn(options) is not None)
-            and not view.committed
-            and not (
-                view.caught_up
-                and view.reached_lsn is not None
-                and view.reached_lsn > checkpoint_commit
-            )
-        ):
+        replay_stop = self._replay_stop_lsn(options)
+        if (self._trigger_available_now or replay_stop is not None) and not view.committed:
             # A bounded read -- an AvailableNow update, or a replay -- ends at the first read
-            # that moves it nowhere, short of its boundary. A view that cannot move this
-            # consumer on (the shard's scan has not reached it yet, or went idle where the
-            # consumer already is) yields to a direct read, which waits on the log itself.
-            return None
+            # that moves it nowhere. A view that cannot move this consumer on (the shard's
+            # scan has not reached it yet, or went idle where the consumer already is)
+            # yields to a direct read, which waits on the log itself -- unless it went idle
+            # at or past the read's boundary, where moving nowhere is the read being done.
+            # The update's frozen boundary is known once this process has read it.
+            reached = view.reached_lsn if view.caught_up else None
+            bound = replay_stop
+            if bound is None:
+                frozen = self._trigger_boundaries.get(table.identity)
+                bound = frozen[0] if frozen and frozen[2] == pipeline_scope else None
+            if reached is None or (
+                reached <= checkpoint_commit and (bound is None or reached < bound)
+            ):
+                return None
         return view
 
     def _read_stream(self, table: Table, start: dict, options: dict[str, str], deletes: bool):
@@ -13746,6 +13751,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # truncating it is the very divergence being removed. The LSN bound caps
             # the read instead, so the budget must not also cut it short.
             max_rows = _REPLAY_UNBOUNDED_ROWS
+        past_step = projection_schema_transition and (
+            _schema_fingerprint(capture_table) != fingerprint
+        )
         if shared_view is not None:
             # The daemon already assembled and fanned out this shard's transactions and
             # re-validated the schema; take them as-is (no Informix I/O, no re-fetch).
@@ -13755,7 +13763,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 shared_view.open_begin,
                 shared_view.reached_lsn,
             )
-        elif projection_schema_transition and _schema_fingerprint(capture_table) != fingerprint:
+        elif past_step and replay_stop is None:
             # A step to a generation the live schema has moved past: commit its schema and
             # read nothing under it. Its columns are not the live ones -- a column added
             # since would go uncaptured in every change read here, and one dropped since
@@ -13763,8 +13771,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # which captures them with the live layout from this same position.
             committed, caught_up, open_begin, reached = [], False, None, None
         else:
+            # A replay of such a step reads its committed range, every change of which was
+            # committed while the step's generation was live, so its projection loses
+            # nothing; it captures with the live layout, which spans the ALTERs since.
             raw_records = self._read_changes_with_reconnect(
-                [_capture_descriptor(capture_table, _client_encoding(self.options))],
+                [
+                    _capture_descriptor(
+                        table if past_step else capture_table, _client_encoding(self.options)
+                    )
+                ],
                 restart,
                 self._table_int_option(options, "cdc.timeout", 5, minimum=1),
                 self._table_int_option(
@@ -14520,7 +14535,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         same_position_schema_change = winner_start == start_lsn and (
             winner.get("schema_id") != schema_id or winner.get("fingerprint") != fingerprint
         )
-        compatible_successor = same_position_schema_change and self._schema_is_direct_successor(
+        compatible_successor = same_position_schema_change and self._schema_descends_from(
             table, schema_id, fingerprint, winner.get("schema_id")
         )
         if (
@@ -14532,27 +14547,43 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # 312: Conflicting Informix upsert start boundary for '{}' in update scope '{}'
             raise InformixError(_m(312, table.exposed_name, scope))
 
-    def _schema_is_direct_successor(
+    def _schema_descends_from(
         self,
         table: Table,
         schema_id: str,
         fingerprint: str,
-        predecessor_id: Any,
+        ancestor_id: Any,
     ) -> bool:
         # Docstring: Return whether a schema node safely replaces one at the same position.
+        #
+        # A reader can step more than once without moving (metadata-only steps while no
+        # change commits), so the update's channel start keeps its first schema while the
+        # reader holds a later one. Any node reached from it through recorded predecessors
+        # is a step the delete flow takes the same way once it seeds there.
 
-        if not isinstance(predecessor_id, str):
+        if not isinstance(ancestor_id, str):
             return False
-        record = self._read_immutable_head(
-            self._immutable_namespace(table, "schema-nodes", schema_id)
-        )
-        schema = record.get("schema") if isinstance(record, dict) else None
-        return bool(
-            isinstance(schema, dict)
-            and schema.get("id") == schema_id
-            and schema.get("fingerprint") == fingerprint
-            and schema.get("predecessor") == predecessor_id
-        )
+        current, expected_fingerprint, seen = schema_id, fingerprint, set()
+        while current not in seen and len(seen) < _MAX_SCHEMA_DESCENT:
+            seen.add(current)
+            record = self._read_immutable_head(
+                self._immutable_namespace(table, "schema-nodes", current)
+            )
+            schema = record.get("schema") if isinstance(record, dict) else None
+            if not isinstance(schema, dict) or schema.get("id") != current:
+                return False
+            if (
+                expected_fingerprint is not None
+                and schema.get("fingerprint") != expected_fingerprint
+            ):
+                return False
+            predecessor = schema.get("predecessor")
+            if predecessor == ancestor_id:
+                return True
+            if not isinstance(predecessor, str):
+                return False
+            current, expected_fingerprint = predecessor, None
+        return False
 
     def _read_upsert_channel_start(self, table: Table, scope: str) -> tuple[int, str, str] | None:
         record = self._read_immutable_head(
@@ -16991,7 +17022,7 @@ def _schema_state(
     schema_id: str | None = None,
 ) -> dict[str, object]:
     return {
-        "id": schema_id or _schema_node_id(table),
+        "id": schema_id or _schema_node_id(table, predecessor),
         "fingerprint": _schema_fingerprint(table),
         "start_lsn": str(start_lsn),
         "predecessor": predecessor,
@@ -17041,10 +17072,17 @@ def _schema_state(
     }
 
 
-def _schema_node_id(table: Table) -> str:
+def _schema_node_id(table: Table, predecessor: str | None = None) -> str:
     # Docstring: Return the stable identity of one physical-table schema layout.
+    #
+    # A transition's node also hashes the node it follows. A layout can recur (a column
+    # added, then dropped), and with the layout alone its return would reuse the first
+    # node's id, whose recorded successor is the change it already undid: the history
+    # would cycle between the two and never reach a later schema. An initial node has no
+    # predecessor and keeps the layout-only id.
 
-    identity = "\0".join((table.native_identity, _schema_fingerprint(table)))
+    parts = (table.native_identity, _schema_fingerprint(table))
+    identity = "\0".join(parts if predecessor is None else (*parts, predecessor))
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
 
 

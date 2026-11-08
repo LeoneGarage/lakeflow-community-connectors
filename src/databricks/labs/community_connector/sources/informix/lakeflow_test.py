@@ -7766,6 +7766,112 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertIsNone(poll(view(caught_up=True, reached=90), {}, trigger=True))
         idle_past = view(caught_up=True, reached=120)
         self.assertIs(poll(idle_past, {}, trigger=True), idle_past)
+        # Idle at or past the read's boundary is the read being done, not stuck: the
+        # AvailableNow confirmation poll, or a replay that has reached its stop, keeps the
+        # view rather than opening a session that would wait out cdc.timeout for nothing.
+        at_checkpoint = view(caught_up=True, reached=90)
+        done = {informix_module._REPLAY_STOP_LSN_OPTION: "90"}
+        self.assertIs(poll(at_checkpoint, done), at_checkpoint)
+        connector._trigger_boundaries[table.identity] = (90, "a" * 32, connector._pipeline_scope())
+        self.assertIs(poll(at_checkpoint, {}, trigger=True), at_checkpoint)
+        connector._trigger_boundaries[table.identity] = (95, "a" * 32, connector._pipeline_scope())
+        self.assertIsNone(poll(at_checkpoint, {}, trigger=True))
+
+    def test_a_schema_change_undone_then_followed_by_another_reaches_the_newest(self):
+        # A column added and dropped again returns the table to its first layout. Were the
+        # node id the layout alone, that return would reuse the first node, whose recorded
+        # successor is the change already undone: the reader would cycle between the two
+        # and never reach the third change.
+        bridge = FakeBridge()
+        _, checkpoint = self.connector(bridge).read_table("app.orders", {}, {})
+
+        def run(now):
+            bridge.now = now
+            bridge.changes = [{"op": "TIMEOUT", "lsn": now}]
+            return self.connector(bridge).read_table("app.orders", checkpoint, {})[1]
+
+        bridge.tables[0]["columns"].append({"name": "x", "type_name": "INTEGER", "nullable": True})
+        checkpoint = run(120)
+        bridge.tables[0]["columns"].pop()
+        checkpoint = run(140)
+        bridge.tables[0]["columns"].append({"name": "y", "type_name": "INTEGER", "nullable": True})
+        live = informix_module._schema_fingerprint(Table.parse(bridge.tables[0], "demo"))
+
+        reached = []
+        for now in (160, 170, 180):
+            checkpoint = run(now)
+            reached.append(checkpoint["schema_fingerprint"] == live)
+
+        self.assertTrue(reached[0])
+
+    def test_two_schema_steps_at_one_position_within_one_update(self):
+        # Two columns added between runs of one update while no change commits: the reader
+        # steps twice without moving, so both steps publish the update's channel start at
+        # the position its first schema holds. The second step's schema descends from that
+        # first schema through the intermediate one.
+        bridge = FakeBridge()
+        _, checkpoint = self.connector(bridge).read_table("app.orders", {}, {})
+
+        def run(now):
+            bridge.now = now
+            bridge.changes = [{"op": "TIMEOUT", "lsn": now}]
+            return self.connector(bridge).read_table("app.orders", checkpoint, {})[1]
+
+        first = checkpoint["schema_id"]
+        bridge.tables[0]["columns"].append({"name": "x", "type_name": "INTEGER", "nullable": True})
+        checkpoint = run(120)
+        bridge.tables[0]["columns"].append({"name": "y", "type_name": "INTEGER", "nullable": True})
+        checkpoint = run(140)
+        checkpoint = run(160)
+        live = informix_module._schema_fingerprint(Table.parse(bridge.tables[0], "demo"))
+        self.assertEqual(checkpoint["schema_fingerprint"], live)
+
+        # Only a recorded descendant of the channel start's schema may replace it there.
+        connector = self.connector(bridge)
+        table = connector._table("app.orders", {})
+        newest = checkpoint["schema_id"]
+        self.assertTrue(connector._schema_descends_from(table, newest, live, first))
+        self.assertFalse(connector._schema_descends_from(table, newest, "0" * 32, first))
+        self.assertFalse(connector._schema_descends_from(table, first, "0" * 32, newest))
+        scope = connector._pipeline_scope()
+        start, held, _ = connector._read_upsert_channel_start(table, scope)
+        self.assertEqual(held, first)
+        with self.assertRaisesRegex(InformixError, "Conflicting Informix upsert start"):
+            connector._publish_upsert_channel_start(table, start, "f" * 32, live, scope)
+
+    def test_a_replay_of_a_step_reads_its_range_after_a_later_schema_change(self):
+        # A batch that stepped to a new schema and read changes under it is replayed after
+        # the table changed again while the pipeline was stopped. Every change in the range
+        # was committed under the step's schema, so the replay reads it, and captures with
+        # the live layout, instead of skipping it as a step the live schema moved past.
+        bridge = FakeBridge()
+        _, start = self.connector(bridge).read_table("app.orders", {}, {})
+        bridge.tables[0]["columns"].append(
+            {"name": "added_b", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 110
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 9, "lsn": 100},
+            {
+                "op": "INSERT",
+                "tx_id": 9,
+                "lsn": 101,
+                "table": "demo:app.orders",
+                "row": {"id": 9, "value": "n", "added_b": 2},
+            },
+            {"op": "COMMIT", "tx_id": 9, "lsn": 102},
+            {"op": "TIMEOUT", "lsn": 110},
+        ]
+        rows, end = self.connector(bridge).read_table("app.orders", start, {})
+        self.assertEqual([row["id"] for row in rows], [9])
+        bridge.tables[0]["columns"].append(
+            {"name": "added_c", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 130
+
+        replayed = self.connector(bridge)._replay_embedded_range("app.orders", start, end, {})
+
+        self.assertEqual([(row["id"], row["added_b"]) for row in replayed], [(9, 2)])
 
     def test_a_lagging_reader_keeps_the_values_of_a_column_added_after_its_next_step(self):
         # Two columns added in two runs. A reader still at the first schema steps to the
@@ -8051,7 +8157,9 @@ class LakeflowContractTests(unittest.TestCase):
         ):
             self.connector(bridge).read_table("app.orders", old_checkpoint, {})
 
-    def test_full_refresh_of_evolved_layout_reuses_its_schema_node(self):
+    def test_full_refresh_of_evolved_layout_starts_the_layouts_own_schema_node(self):
+        # A schema change's node hashes the node it follows, so a full refresh of the
+        # evolved layout starts the layout's own initial node rather than reusing it.
         bridge = FakeBridge()
         _, checkpoint_a = self.connector(bridge).read_table("app.orders", {}, {})
         bridge.tables[0]["columns"].append(
@@ -8070,7 +8178,11 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(checkpoint_b["commit_lsn"], checkpoint_a["commit_lsn"])
         self.assertEqual(refreshed_b["commit_lsn"], "120")
         self.assertEqual(refreshed_b["schema_fingerprint"], checkpoint_b["schema_fingerprint"])
-        self.assertEqual(refreshed_b["schema_id"], checkpoint_b["schema_id"])
+        self.assertNotEqual(refreshed_b["schema_id"], checkpoint_b["schema_id"])
+        self.assertEqual(
+            refreshed_b["schema_id"],
+            informix_module._schema_node_id(Table.parse(bridge.tables[0], "demo")),
+        )
 
     def test_repeated_layout_reuses_its_schema_node(self):
         bridge = FakeBridge()

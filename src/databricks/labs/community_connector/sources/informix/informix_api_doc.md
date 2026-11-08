@@ -425,7 +425,16 @@ Committed state records are never deleted automatically, and no candidate garbag
 Schema-node IDs are deterministic hashes of physical table identity and schema
 fingerprint. The node describes a reusable layout; refresh-specific initial and
 snapshot LSNs remain in update-scoped records, so an unchanged full refresh does
-not create another global schema node.
+not create another global schema node. A node a schema change creates also hashes
+the node it follows: a layout can recur (a column added, then dropped again), and
+with the layout alone its return would reuse the first node, whose recorded
+successor is the change already undone, so the history would cycle and never
+reach a later schema.
+Within one update the upsert channel start keeps the schema it was first published
+with. A reader that steps without moving (no change commits between schema changes)
+publishes the same position under a later schema; that is accepted only for a node
+that descends from the held one through recorded predecessors, the steps a delete
+flow seeding there takes as well.
 
 AvailableNow coordination uses exactly one immutable high-water boundary per
 physical table and current pipeline/update scope. It is deliberately independent
