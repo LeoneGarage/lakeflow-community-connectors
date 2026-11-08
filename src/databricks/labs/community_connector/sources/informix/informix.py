@@ -14206,6 +14206,41 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # scope '{}' yet
             raise TriggerBoundaryUnavailable(_m(297, table.exposed_name, scope))
 
+    def _ensure_recorded_path_to_live(
+        self, table: Table, node_table: Table, node_id: str, rules: dict[str, Any]
+    ) -> None:
+        # Docstring: Check the steps a reader takes from a step's target on to the live layout.
+        #
+        # A reader that steps to a generation the live schema has moved past takes the rest
+        # one recorded step at a time, so they are checked that way here: a whole-row key
+        # may make only a drop or an add in one step, and the target and the live layout can
+        # differ by both. Where the recorded history ends short of the live layout, the
+        # owner records the rest as one step, so the last node is checked against it.
+
+        live = _schema_fingerprint(table)
+        seen: set[str] = set()
+        while (
+            _schema_fingerprint(node_table) != live
+            and node_id not in seen
+            and len(seen) < _MAX_SCHEMA_DESCENT
+        ):
+            seen.add(node_id)
+            record = self._read_immutable_head(self._immutable_namespace(table, "schemas", node_id))
+            successor = record.get("schema") if isinstance(record, dict) else None
+            following = None
+            if isinstance(successor, dict) and successor.get("predecessor") == node_id:
+                self._validate_immutable_record_header(
+                    record, "schema-transition", table.exposed_name
+                )
+                following = _table_from_schema_state(successor, table.database)
+            # rules: the wildcard-key growth and shrink the caller allows.
+            _ensure_compatible_schema_change(
+                node_table, following or table, wildcard_except=table.key_wildcard_except, **rules
+            )
+            if following is None:
+                return
+            node_table, node_id = following, str(successor["id"])
+
     def _schema_transition(
         self,
         table: Table,
@@ -14317,14 +14352,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     shrink_wildcard_key=shrink_key,
                     wildcard_except=table.key_wildcard_except,
                 )
-                if _schema_fingerprint(target_table) != _schema_fingerprint(table):
-                    _ensure_compatible_schema_change(
-                        target_table,
-                        table,
-                        extend_wildcard_key=extend_key,
-                        shrink_wildcard_key=shrink_key,
-                        wildcard_except=table.key_wildcard_except,
-                    )
+                self._ensure_recorded_path_to_live(
+                    table,
+                    target_table,
+                    str(current["id"]),
+                    {"extend_wildcard_key": extend_key, "shrink_wildcard_key": shrink_key},
+                )
                 schema_winner = self._publish_immutable_head(
                     self._immutable_namespace(table, "schema-nodes", str(current["id"])),
                     transition_record,

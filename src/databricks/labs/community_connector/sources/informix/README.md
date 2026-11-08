@@ -727,7 +727,8 @@ ALTER TABLE informix.members DROP (legacy_code);
 
 Shared state stores predecessor-linked schema generations, the Informix catalog
 table ID for incarnation detection, and one observation LSN per additive step. Lagging pipelines advance one recorded schema
-at a time instead of skipping intermediate layouts. An incompatible full
+at a time instead of skipping intermediate layouts, and each step is checked on its own, so a
+reader behind a whole-row key follows a drop and an add that ran in separate updates. An incompatible full
 refresh creates a new root generation while retaining older descriptors for
 other pipelines. Both upsert and delete readers register the expanded projection
 and replay directly from their retained checkpoints. Informix emits `NULL` for

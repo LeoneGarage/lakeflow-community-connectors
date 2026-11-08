@@ -8259,6 +8259,67 @@ class LakeflowContractTests(unittest.TestCase):
         restarted = read("update-c", running)
         self.assertNotEqual(restarted["schema_fingerprint"], running["schema_fingerprint"])
 
+    def _wildcard_history(self, steps):
+        # A whole-row key table run through ``steps`` (callables changing the columns), the
+        # pipeline reading once in its own update after each. Returns the bridge, the
+        # options, a reader factory and every checkpoint, the first being the snapshot's.
+        bridge = FakeBridge()
+        options = {"primary.keys": "*", "snapshot.mode": "initial"}
+
+        def read(scope, checkpoint):
+            connector = self.connector(bridge, registration_scope=scope)
+            return connector.read_table("app.orders", checkpoint, dict(options))[1]
+
+        checkpoints = [read("history-0", {})]
+        for number, step in enumerate(steps, start=1):
+            step(bridge.tables[0]["columns"])
+            bridge.now = 100 + 20 * number
+            bridge.changes = [{"op": "TIMEOUT", "lsn": bridge.now}]
+            checkpoints.append(read(f"history-{number}", checkpoints[-1]))
+        return bridge, options, read, checkpoints
+
+    @staticmethod
+    def _add(name):
+        return lambda columns: columns.append(
+            {"name": name, "type_name": "INTEGER", "nullable": True}
+        )
+
+    @staticmethod
+    def _drop(name):
+        return lambda columns: columns.remove(
+            next(column for column in columns if column["name"] == name)
+        )
+
+    def test_a_reader_three_steps_behind_on_a_wildcard_key_follows_each_recorded_step(self):
+        # An add, a drop and an add, the pipeline run between each as the README asks. A
+        # reader still at the first schema steps one recorded change at a time; the drop
+        # and the add after its next step are two steps, not one change it must refuse.
+        _, _, read, checkpoints = self._wildcard_history(
+            [self._add("z"), self._drop("value"), self._add("y")]
+        )
+
+        step = read("lagging", checkpoints[0])
+
+        self.assertEqual(step["schema_fingerprint"], checkpoints[1]["schema_fingerprint"])
+        for expected in checkpoints[2:]:
+            step = read("lagging", step)
+            self.assertEqual(step["schema_fingerprint"], expected["schema_fingerprint"])
+
+    def test_a_reader_left_at_a_layout_the_table_returned_to_follows_a_later_change(self):
+        # A column added and dropped again while a reader held the first schema: its layout
+        # is live again, so it holds there. A later add steps it through the recorded
+        # history, the add and the drop one at a time, to the newest schema.
+        _, _, read, checkpoints = self._wildcard_history(
+            [self._add("x"), self._drop("x"), self._add("y")]
+        )
+        self.assertEqual(checkpoints[0]["schema_fingerprint"], checkpoints[2]["schema_fingerprint"])
+
+        step = read("lagging", checkpoints[0])
+        for _ in range(3):
+            step = read("lagging", step)
+
+        self.assertEqual(step["schema_fingerprint"], checkpoints[3]["schema_fingerprint"])
+
     def test_future_immutable_schema_transition_fails_closed(self):
         bridge = FakeBridge()
         connector = self.connector(bridge)
