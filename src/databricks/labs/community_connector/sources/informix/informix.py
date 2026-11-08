@@ -1099,14 +1099,16 @@ def _replay_between_offsets(start, end, read, options, connector_options):
             record_parts.append(records)
             if isinstance(reached, dict) and reached.get("commit_lsn") is not None:
                 if (
-                    not replaying_chunk
-                    and isinstance(replay_start, dict)
+                    isinstance(replay_start, dict)
                     and replay_start.get("commit_lsn") is not None
                     and int(replay_start["commit_lsn"]) < int(reached["commit_lsn"]) < int(stop)
                 ):
                     # One poll can go idle short of the committed end; the original
                     # read then advanced across the quiet log in several batches.
-                    # Keep reading from where this one stopped, as it did.
+                    # Keep reading from where this one stopped, as it did. A chunked
+                    # range too, whose CDC a direct poll may cap short of what the shared
+                    # reader delivered: its chunk reached the committed cursor in the
+                    # first poll, so the next ones read none.
                     replay_start = reached
                     continue
                 break
@@ -11650,7 +11652,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         output = list(cdc_rows)
         # The stream reader may return a freshly built offset that drops the
         # incremental block; the schema it used is authoritative for chunking.
-        table = self._refresh_table_schema(table, end.get("schema_fingerprint"))
+        live = self._refresh_table_schema(table, None)
+        if end.get("schema_fingerprint") != _schema_fingerprint(live):
+            # A step to a generation the live layout has moved past reads nothing under it
+            # (see _read_stream), so the copy keeps its cursor until a read reaches the live
+            # schema: a chunk read now would land rows under columns that are not current.
+            return iter(output), {**end, "incremental": incremental}
+        table = live
         if not incremental["done"]:
             chunk_rows, incremental = self._next_incremental_chunk(table, incremental, options)
             output.extend(chunk_rows)
@@ -11729,6 +11737,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         if replay_stop_pk is not None and replay_stop_pk is not _REPLAY_DRAIN_TO_MAX_PK:
             # min() in the key's own paging order, not Python's default.
             bound = replay_stop_pk if order_key(replay_stop_pk) < order_key(max_pk) else max_pk
+
+        if (
+            replaying_chunk
+            and last_pk is not None
+            and replay_stop_pk is not _REPLAY_DRAIN_TO_MAX_PK
+            and order_key(tuple(last_pk)) >= order_key(bound)
+        ):
+            # A replay already at its committed cursor, as a second poll of a range is,
+            # has no chunk rows left to read.
+            return [], dict(incremental)
 
         def cursor_key(row: dict[str, Any]) -> tuple:
             return tuple(row[name] for name in cursor_names)
@@ -12277,9 +12295,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             return False
         if self._table_snapshot_source(table_options) is None:
             return False
-        if self._snapshot_mode(table_options) != "initial":
-            return False
-        return not effective_start or effective_start.get("phase") == "snapshot"
+        if not effective_start:
+            return self._snapshot_mode(table_options) == "initial"
+        # A serve part-way through finishes as a staged one does, whatever snapshot.mode
+        # says now: the mode chooses how a snapshot starts.
+        return effective_start.get("phase") == "snapshot"
 
     def _list_unl_files(self, source: str, exposed_name: str) -> list[str]:
         # Docstring: Sorted `.unl`/`.unl.gz` files under ``source`` (listing/stat only -- no content
@@ -14356,6 +14376,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         _ensure_compatible_schema_change(
             node_table, table, wildcard_except=table.key_wildcard_except, **rules
         )
+        if set(table.primary_keys) - set(node_table.primary_keys):
+            self._ensure_added_key_columns_have_no_default(node_table, table)
 
     def _schema_transition(
         self,
@@ -17707,8 +17729,10 @@ def _ensure_compatible_schema_change(
         previous.column_transforms != current.column_transforms
         and not _transforms_cleanup_only(previous, current)
     ) or (
-        previous.column_transforms is not None
-        and current.column_transforms is not None
+        # A key id only where HASH is used: taking out the last HASH entry with its dropped
+        # column leaves none to compare, and adding one is not a cleanup.
+        previous.transform_key_id is not None
+        and current.transform_key_id is not None
         and previous.transform_key_id != current.transform_key_id
     ):
         # 384: '{}' or '{}' changed for '{}'; run a full refresh so every row lands under the new

@@ -6716,6 +6716,99 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(seeded["commit_lsn"], "150")
 
+    def test_an_incremental_copy_two_schema_steps_behind_steps_before_copying(self):
+        # A copy still in progress at the first schema, with two columns added since in
+        # separate runs. Its first step goes to the middle generation, which the live
+        # layout has moved past: it reads no chunk under it, keeps its copy cursor, and
+        # copies again once it reaches the live schema.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 5)]
+        options = {"snapshot.mode": "incremental", "snapshot.page.size": "1"}
+
+        def read(scope, checkpoint):
+            return self.connector(bridge, registration_scope=scope).read_table(
+                "app.orders", checkpoint, dict(options)
+            )
+
+        _, copying = read("update-a", {})
+        self.assertFalse(copying["incremental"]["done"])
+        bridge.tables[0]["columns"].append({"name": "b", "type_name": "INTEGER", "nullable": True})
+        bridge.rows = [dict(row, b=None) for row in bridge.rows]
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+        _, middle = read("update-b", copying)
+        bridge.tables[0]["columns"].append({"name": "c", "type_name": "INTEGER", "nullable": True})
+        bridge.rows = [dict(row, c=None) for row in bridge.rows]
+        bridge.now = 140
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 140}]
+
+        rows, step = read("update-c", copying)
+
+        self.assertEqual(list(rows), [])
+        self.assertEqual(step["schema_fingerprint"], middle["schema_fingerprint"])
+        self.assertEqual(step["incremental"]["last_pk"], copying["incremental"]["last_pk"])
+        self.assertFalse(step["incremental"]["done"])
+        rows, copied = read("update-c", step)
+        live = _schema_fingerprint(Table.parse(bridge.tables[0], "demo"))
+        self.assertEqual(copied["schema_fingerprint"], live)
+        self.assertTrue(list(rows))
+
+    def test_a_chunked_replay_keeps_polling_change_data_a_poll_left_short(self):
+        # An incremental batch read its changes and a chunk. Replayed, its first change poll
+        # stops short of the committed end (a direct poll caps what the shared reader had
+        # delivered in one go): the replay polls on from there without reading the chunk
+        # twice, and lands on the logged end.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 5)]
+        options = {"snapshot.mode": "incremental", "snapshot.page.size": "1"}
+        connector = self.connector(bridge)
+        _, start = connector.read_table("app.orders", {}, dict(options))
+        changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 100},
+            {
+                "op": "INSERT",
+                "tx_id": 7,
+                "lsn": 101,
+                "table": "demo:app.orders",
+                "row": {"id": 7, "value": "g"},
+            },
+            {"op": "COMMIT", "tx_id": 7, "lsn": 102},
+            {"op": "BEGIN", "tx_id": 8, "lsn": 104},
+            {
+                "op": "INSERT",
+                "tx_id": 8,
+                "lsn": 105,
+                "table": "demo:app.orders",
+                "row": {"id": 8, "value": "h"},
+            },
+            {"op": "COMMIT", "tx_id": 8, "lsn": 106},
+            {"op": "TIMEOUT", "lsn": 110},
+        ]
+        bridge.now = 120
+        bridge.changes = changes
+        rows, end = connector.read_table("app.orders", start, dict(options))
+        original = sorted(row["id"] for row in rows)
+        self.assertEqual(end["commit_lsn"], "106")
+        short = changes[:3] + [{"op": "TIMEOUT", "lsn": 103}]
+        polls = []
+
+        def read_changes(tables, start_lsn, timeout_seconds, max_records):
+            polls.append(start_lsn)
+            return list(short if len(polls) == 1 else changes)
+
+        with (
+            mock.patch.object(bridge, "read_changes", side_effect=read_changes),
+            mock.patch.object(bridge, "snapshot_chunk", wraps=bridge.snapshot_chunk) as chunks,
+        ):
+            replayed = list(
+                connector._replay_embedded_range("app.orders", start, end, dict(options))
+            )
+
+        self.assertEqual(sorted(row["id"] for row in replayed), original)
+        self.assertEqual(len(polls), 2)
+        # The second poll starts at the committed cursor and reads no chunk.
+        self.assertEqual(chunks.call_count, 1)
+
     def test_snapshot_mode_auto_snapshot_starts_incrementally_without_checkpoint(self):
         bridge = FakeBridge()
 
@@ -18337,6 +18430,29 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
 
         self.assertEqual([row["id"] for row in rows], [1])
 
+    def test_a_part_served_file_snapshot_finishes_after_its_mode_changes(self):
+        # snapshot.mode chooses how a snapshot starts. Changed while a file serve is part-way
+        # through, the serve finishes from its split position, as a staged one does.
+        source = self._source("1|a|\n", "2|b|\n")
+        started = {"snapshot.source": source}
+        connector = self.connector(
+            FakeBridge(), **{"stream.partitioned.snapshot.pages.per.batch": "1"}
+        )
+        first = connector.latest_offset("app.orders", started, {})
+        self.assertEqual(first["phase"], "snapshot")
+        changed = dict(started, **{"snapshot.mode": "incremental"})
+
+        end = connector.latest_offset("app.orders", changed, first)
+        partitions = connector.get_partitions("app.orders", changed, first, end)
+        rows = [
+            row
+            for partition in partitions
+            for row in connector.read_partition("app.orders", partition, changed)
+        ]
+
+        self.assertEqual(end["phase"], "stream")
+        self.assertEqual([row["id"] for row in rows], [2])
+
     def test_a_replanned_file_window_follows_the_window_spark_logged(self):
         # The window an uncommitted batch logged decides how its re-plan serves it, not the
         # gzip record-window option after a restart: a record window cleared of the option
@@ -20855,6 +20971,23 @@ class ColumnTransformTests(_TableOptionTestCase):
         connector = connector or self.connector(bridge)
         rows, checkpoint = connector.read_table("app.orders", {}, dict(options))
         return connector, checkpoint, list(rows)
+
+    def test_dropping_the_only_hashed_column_takes_its_entry_out_without_a_refresh(self):
+        # The HASH entry goes with its dropped column, as the README asks; the transforms
+        # left use no key, which is no change of key for the rows already landed.
+        bridge = _ProjectingBridge()
+        hashed = {"transform_columns": '{"extra": "HASH(extra)", "value": "UPPER(value)"}'}
+        connector, checkpoint, _ = self.stream(bridge, hashed, self.keyed(bridge))
+        bridge.tables[0]["columns"] = [
+            column for column in bridge.tables[0]["columns"] if column["name"] != "extra"
+        ]
+        bridge.now = 200
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 200}]
+        left = {"transform_columns": '{"value": "UPPER(value)"}'}
+
+        _, stepped = self.keyed(bridge).read_table("app.orders", checkpoint, dict(left))
+
+        self.assertNotEqual(stepped["schema_fingerprint"], checkpoint["schema_fingerprint"])
 
     def test_transforms_parse_from_a_json_object(self):
         parse = informix_module._column_transforms
