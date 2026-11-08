@@ -7164,6 +7164,60 @@ class LakeflowContractTests(unittest.TestCase):
                 )
             )
 
+    def _blocking_resnapshot(self, rows):
+        # auto_snapshot replacing an expired checkpoint with a blocking staged snapshot (a
+        # cursor scan cannot be chunked), one row per page, in update u1.
+        bridge = FakeBridge()
+        bridge.rows = rows
+        bridge.minimum = 91
+        bridge.now = 150
+        checkpoint = _stream_offset(90)
+        checkpoint["pipeline_scope"] = "f" * 32
+        options = {
+            "snapshot.mode": "auto_snapshot",
+            "snapshot.scan": "cursor",
+            "keyless.snapshot.page.size": "1",
+        }
+        rows, end = self.connector(bridge, registration_scope="u1").read_table(
+            "app.orders", checkpoint, dict(options)
+        )
+        return bridge, options, checkpoint, [row["id"] for row in rows], end
+
+    def _replay_in_a_later_update(self, bridge, options, start, end):
+        bridge.now = 170
+        replaying = self.connector(bridge, registration_scope="u2")
+        replay_options = dict(options)
+        return [
+            row["id"]
+            for row in informix_module._replay_between_offsets(
+                start,
+                end,
+                lambda offset: replaying.read_table("app.orders", offset, replay_options),
+                replay_options,
+                replaying.options,
+            )
+        ]
+
+    def test_a_blocking_resnapshots_first_batch_replays_from_the_logged_snapshot(self):
+        # The resnapshot's first batch served page 0 of several. Replayed in a later update,
+        # it serves page 0 of the snapshot Spark logged, as an initial snapshot's first batch
+        # does, rather than drain a newer one whose pages it cannot reach.
+        rows = [{"id": i, "value": f"v{i}"} for i in range(1, 4)]
+        bridge, options, start, served, end = self._blocking_resnapshot(rows)
+        self.assertEqual(end["phase"], "snapshot")
+
+        self.assertEqual(self._replay_in_a_later_update(bridge, options, start, end), served)
+
+    def test_a_blocking_resnapshot_replayed_across_its_pages_stays_re_established(self):
+        # The resnapshot fitted one page, so its batch ended in the stream phase. Rows were
+        # added before the replay, which resnapshots over several pages: the range stays
+        # re-established across them rather than only on the read that started it.
+        bridge, options, start, _, end = self._blocking_resnapshot([{"id": 1, "value": "a"}])
+        self.assertEqual(end["phase"], "stream")
+        bridge.rows += [{"id": 2, "value": "b"}, {"id": 3, "value": "c"}]
+
+        self.assertEqual(self._replay_in_a_later_update(bridge, options, start, end), [1, 2, 3])
+
     def test_a_copy_finished_in_its_first_batch_replays_to_its_bound(self):
         # The copy fitted one chunk, so its first batch finished it and neither offset
         # carries a copy block. Rows were inserted below the bound before the replay: it

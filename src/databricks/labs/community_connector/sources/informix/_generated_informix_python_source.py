@@ -6682,10 +6682,12 @@ def register_lakeflow_source(spark):
             options[_REPLAY_STOP_PK_OPTION] = stop_pk
         try:
             replay_start = start
-            if initial_range and end_position is not None:
-                # A staged snapshot's first batch: serve it from the snapshot Spark logged, from
-                # page 0, rather than drain another one (a later update would), so the batch and
-                # the pages after it come from one snapshot.
+            reestablished = False
+            if end_position is not None and _snapshot_position(start) is None:
+                # A staged snapshot's first batch (an initial one, or auto_snapshot's replacing an
+                # expired checkpoint): serve it from the snapshot Spark logged, from page 0,
+                # rather than drain another one (a later update would), so the batch and the
+                # pages after it come from one snapshot.
                 position = {k: v for k, v in end["snapshot"].items() if k != "record_index"}
                 replay_start = {**end, "snapshot": {**position, "page_index": 0, "last_pk": []}}
             record_parts = []
@@ -6714,6 +6716,10 @@ def register_lakeflow_source(spark):
                 options[_REPLAY_CONNECTION_WAIT_BUDGET_OPTION] = repr(remaining_wait)
                 try:
                     records, reached = read(replay_start)
+                    if isinstance(reached, dict):
+                        # Marked on the read that re-established the range; later polls of it
+                        # read on from there.
+                        reestablished = bool(reached.pop(_REPLAY_REESTABLISHED, False)) or reestablished
                 except SchemaTransitionUnavailable:
                     # The range needs a schema step the upsert reader records on its own read
                     # (a column changed while the pipeline was stopped). A replay cannot yield
@@ -6794,7 +6800,6 @@ def register_lakeflow_source(spark):
             # however, must land on its exact transaction boundary. In both cases an
             # under-read is always destructive.
             # A range the read re-established is held to the same terms as an initial one.
-            reestablished = bool(reached.pop(_REPLAY_REESTABLISHED, False))
             initial_terms = initial_range or reestablished
             wrong_lsn = reached_lsn < stop_lsn or (not initial_terms and reached_lsn != stop_lsn)
             if wrong_lsn:
@@ -6804,9 +6809,7 @@ def register_lakeflow_source(spark):
             # replay still in a snapshot the logged end has left falls short of it too.
             if _snapshot_position(reached) != end_position:
                 # 428: Informix replay did not reach its committed snapshot position {}; reached {}
-                raise InformixError(
-                    _m(428, (end_position or ())[1:], (_snapshot_position(reached) or ())[1:])
-                )
+                raise InformixError(_m(428, end_position, _snapshot_position(reached)))
             # An end that names a transaction is reached only by consuming that transaction.
             # The read lands on its bound without one only for an end the original read
             # reached by going idle, so landing there for this end means the replay never
