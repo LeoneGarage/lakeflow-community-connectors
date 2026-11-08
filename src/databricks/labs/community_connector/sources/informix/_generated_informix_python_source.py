@@ -12087,9 +12087,9 @@ def register_lakeflow_source(spark):
             self.leading: dict[tuple, dict[str, Any]] = {}
             self.clients: dict[tuple, Any] = {}
             self.client_locks: dict[tuple, threading.Lock] = {}
-            # (key, identity) -> (checkpoint commit LSN, capture, transactions) a follower holds
-            # from its earlier polls, so the leader sends each transaction only once.
-            self.mirrors: dict[tuple, tuple[int, dict, tuple]] = {}
+            # (key, identity) -> (checkpoint commit LSN, floor, capture, transactions) a follower
+            # holds from its earlier polls, so the leader sends each transaction only once.
+            self.mirrors: dict[tuple, tuple[int, int, dict, tuple]] = {}
             # Set when this process can't lock or serve a shard at all, so it shares in
             # process mode instead of reading directly on every poll.
             self.unavailable: str | None = None
@@ -12448,10 +12448,13 @@ def register_lakeflow_source(spark):
         endpoints = _HOST_SHARD_ENDPOINTS if endpoints is None else endpoints
         local = (key, reader_factory, config, identity, table, capture, commit, floor)
         # The leader sends only transactions after those this follower holds from earlier
-        # polls, so each crosses the socket once. A checkpoint moved back past them, a new
-        # capture (they were decoded under the old one), or a poll without a view, starts over
-        # with the whole buffer; leading drops them.
-        held_commit, held_capture, held = endpoints.mirrors.pop((key, identity), (commit, capture, ()))
+        # polls, so each crosses the socket once. A checkpoint moved back past them, a floor
+        # moved back (an older open transaction the view they came from lacked), a new capture
+        # (they were decoded under the old one), or a poll without a view, starts over with
+        # the whole buffer; leading drops them.
+        held_commit, held_floor, held_capture, held = endpoints.mirrors.pop(
+            (key, identity), (commit, floor, capture, ())
+        )
         if key in endpoints.leading or endpoints.unavailable:
             return _host_shard_local_poll(*local)
         if (
@@ -12459,7 +12462,7 @@ def register_lakeflow_source(spark):
             and _host_shard_try_lead(endpoints, key, reader_factory, config)
         ) or endpoints.unavailable:
             return _host_shard_local_poll(*local)
-        if held_commit > commit or held_capture != capture:
+        if held_commit > commit or held_floor > floor or held_capture != capture:
             held = ()
         request = {
             "config": config,
@@ -12496,7 +12499,7 @@ def register_lakeflow_source(spark):
             return None
         view = _unwire_view(payload)
         committed = [tx for tx in held if tx.commit_lsn > commit] + view.committed
-        endpoints.mirrors[(key, identity)] = (commit, capture, tuple(committed))
+        endpoints.mirrors[(key, identity)] = (commit, floor, capture, tuple(committed))
         return replace(view, committed=committed)
 
 

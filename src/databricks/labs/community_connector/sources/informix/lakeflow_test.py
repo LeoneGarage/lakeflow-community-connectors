@@ -14344,6 +14344,21 @@ class HostSharedCdcTests(unittest.TestCase):
 
         self.assertEqual(sent, [(None, [5]), (102, [6]), (112, []), (None, None), (None, [5, 6])])
 
+    def test_a_follower_drops_what_it_holds_when_its_floor_moves_back(self):
+        # A floor moved back means an open transaction older than the old floor, which the
+        # view the follower's transactions came from never assembled. It may commit below
+        # the newest one held, so the follower must not tell the leader to skip up to that.
+        leader, follower = self.process(), self.process()
+        self.poll(leader)
+        self.poll(follower, floor=5)
+        sent = self.requests()
+        self.cover()
+        self.assertEqual([tx.tx_id for tx in self.poll(follower, floor=5).committed], [5])
+
+        self.poll(follower, floor=2)
+
+        self.assertEqual([after for after, _ in sent], [None, None])
+
     def test_a_follower_drops_what_it_holds_when_its_capture_changes(self):
         # What a follower holds was decoded under the capture it polled with. After a schema
         # transition it polls under a new capture, and the leader must send the whole buffer
