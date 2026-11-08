@@ -1275,7 +1275,7 @@ on change images. That limits it to:
   | `REPLACE(s, from[, to])` | strings | `to` defaults to `''` |
   | `LPAD(s, n, pad)`, `RPAD(s, n, pad)` | strings | a longer value is cut to `n` |
   | `NVL(x, value)`, `COALESCE(x, value)` | any | `value` replaces NULL, padded like a `CHAR` column; in a transform it takes the column's own type |
-  | `ABS(n)`, `ROUND(n[, digits])`, `TRUNC(n[, digits])` | numbers | `ROUND` rounds halves away from zero; `digits` from -32 to 32 |
+  | `ABS(n)`, `ROUND(n[, digits])`, `TRUNC(n[, digits])` | numbers | `ROUND` rounds halves away from zero; a float is taken by the digits it shows, so `ROUND(1.15, 1)` is 1.2; `digits` from -32 to 32 |
   | `MOD(n, divisor)` | numbers | truncates both to integers first, so `MOD(2.5, 3)` is 2 |
   | `YEAR(d)`, `MONTH(d)`, `DAY(d)`, `WEEKDAY(d)` | `DATE`, `DATETIME` | `WEEKDAY` counts from 0 for Sunday |
 

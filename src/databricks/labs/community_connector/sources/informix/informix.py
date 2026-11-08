@@ -1073,6 +1073,7 @@ def _replay_between_offsets(start, end, read, options, connector_options):
             )
         )
         replay_wait_deadline = time.monotonic() + configured_wait
+        step_wait = 0.1
         # Spark cannot checkpoint an advisory yield while replaying: it has already
         # fixed this range's end. Advance bootstrap coordination counters inside
         # this call until the reader obtains a real source position. This is
@@ -1085,7 +1086,16 @@ def _replay_between_offsets(start, end, read, options, connector_options):
                 # deadline
                 raise InformixError(_m(2))
             options[_REPLAY_CONNECTION_WAIT_BUDGET_OPTION] = repr(remaining_wait)
-            records, reached = read(replay_start)
+            try:
+                records, reached = read(replay_start)
+            except SchemaTransitionUnavailable:
+                # The range needs a schema step the upsert reader records on its own read
+                # (a column changed while the pipeline was stopped). A replay cannot yield
+                # for it, so it waits in place, the read having given its slot back.
+                if replay_wait_deadline - time.monotonic() <= 0:
+                    raise
+                step_wait = _sleep_with_backoff(replay_wait_deadline, step_wait)
+                continue
             record_parts.append(records)
             if isinstance(reached, dict) and reached.get("commit_lsn") is not None:
                 if (
@@ -4882,7 +4892,9 @@ def _apply_function(name: str, value: Any, literals: list, context: dict) -> Any
         return getattr(moment, name.lower())
     with localcontext() as decimal_context:
         decimal_context.prec = 80
-        number = Decimal(value)
+        # A float by the digits it shows (1.15, not its binary 1.1499...), as
+        # _hash_number_text reads one, so a half rounds as the documentation says.
+        number = Decimal(repr(value)) if isinstance(value, float) else Decimal(value)
         if name == "ABS":
             result = abs(number)
         elif name == "MOD":
@@ -4994,7 +5006,10 @@ def _number_for_column(value: Decimal, column: "Column", options: dict[str, str]
             scale = column.scale
         else:
             scale = 2 if column.type_name == "MONEY" else 0
-        return value.quantize(Decimal(1).scaleb(-scale))
+        with localcontext() as decimal_context:
+            # Past the default 28 digits: a DECIMAL holds up to 32.
+            decimal_context.prec = 80
+            return value.quantize(Decimal(1).scaleb(-scale))
     return value
 
 
@@ -9940,6 +9955,41 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             raise InformixError(_m(199, table.exposed_name))
         return seed_table
 
+    def _resnapshot_delete_seed(self, table: Table, scope: str) -> dict | None:
+        # Docstring: The delete seed at the update's resnapshot boundary, once it is published.
+
+        high_water = self._initial_lsn(table, owner=False, wait=False, scope=scope)
+        if high_water is None:
+            return None
+        schema_id = self._snapshot_schema_ids[(scope, table.identity)]
+        return {
+            **_offset(high_water, high_water, high_water, None, "stream", table, schema_id, scope),
+            # The seed is this update's first offset for the flow: see _read_stream.
+            "update_fingerprint": _schema_fingerprint(table),
+        }
+
+    def _read_resnapshotted_deletes(
+        self, table: Table, start_offset: dict, table_options: dict[str, str]
+    ) -> tuple[Iterator[dict], dict]:
+        # Docstring: Move a delete checkpoint the log no longer retains to its resnapshot.
+        #
+        # auto_snapshot replaces it with a snapshot whose boundary the upsert reader
+        # publishes on its read. Until it has, this yields a retry offset at the same
+        # position: an unchanged offset reads as a drained source, which would end a
+        # triggered update with no seed, and a later update's scope never gets one. A
+        # replayed wait stays where it was.
+
+        checkpoint = _validated_offset(start_offset)
+        replay_stop = self._replay_stop_lsn(table_options)
+        if replay_stop is not None and replay_stop <= int(checkpoint["commit_lsn"]):
+            return iter(()), dict(start_offset)
+        seed = self._resnapshot_delete_seed(table, self._resnapshot_scope(table, checkpoint))
+        if seed is not None:
+            return iter(()), seed
+        if replay_stop is not None:
+            return iter(()), dict(start_offset)
+        return iter(()), self._trigger_boundary_retry_offset(start_offset)
+
     def _read_table_deletes(
         self,
         table_name: str,
@@ -9974,22 +10024,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             and start_offset.get("phase") == "stream"
             and self._checkpoint_requires_snapshot(start_offset)
         ):
-            checkpoint = _validated_offset(start_offset)
-            scope = self._resnapshot_scope(table, checkpoint)
-            high_water = self._initial_lsn(table, owner=False, wait=False, scope=scope)
-            if high_water is None:
-                return iter(()), dict(start_offset)
-            schema_id = self._snapshot_schema_ids[(scope, table.identity)]
-            return iter(()), _offset(
-                high_water,
-                high_water,
-                high_water,
-                None,
-                "stream",
-                table,
-                schema_id,
-                scope,
-            )
+            return self._read_resnapshotted_deletes(table, start_offset, table_options)
         # Lakeflow checkpoints this independently from read_table(). The
         # upsert reader owns initialization and publishes the table boundary
         # through durable shared state; delete readers only consume it.
@@ -10045,6 +10080,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     _m(201, table.exposed_name, floor, high_water),
                 )
             if bootstrap_lsn < minimum:
+                # auto_snapshot replaces the expired checkpoint the channel start names (it was
+                # published before the resnapshot, and the lowest start wins) with a snapshot
+                # whose boundary the upsert reader publishes: seed there once it has.
+                seed = (
+                    self._resnapshot_delete_seed(table, self._pipeline_scope())
+                    if snapshot_mode == "auto_snapshot"
+                    else None
+                )
+                if seed is not None:
+                    return iter(()), seed
                 # 202: Informix delete bootstrap boundary {} for '{}' precedes the minimum retained
                 # LSN {}; the delete channel is waiting for a resnapshot
                 logging.getLogger(__name__).warning(
@@ -12392,7 +12437,28 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # 265: Conflicting Informix initialization boundary for '{}': the table was already
             # initialized at a different LSN; run a full refresh
             raise InformixError(_m(265, table.exposed_name))
-        return str(node["id"])
+        schema = winner.get("schema")
+        if not isinstance(schema, dict) or not re.fullmatch(r"[0-9a-f]{32}", str(schema.get("id"))):
+            # 316: Invalid Informix immutable initialization schema
+            raise InformixError(_m(316))
+        if (
+            schema.get("fingerprint") != _schema_fingerprint(table)
+            or schema.get("predecessor") is not None
+            or self._immutable_lsn(schema, "start_lsn", table.exposed_name) != boundary
+            or _table_from_schema_state(schema, table.database).native_identity
+            != table.native_identity
+        ):
+            # 316: Invalid Informix immutable initialization schema
+            raise InformixError(_m(316))
+        # The node every later schema step and delete seed starts from, as a self-pinned
+        # initialization records it.
+        schema_winner = self._publish_immutable_head(
+            self._immutable_namespace(table, "schema-nodes", str(schema["id"])),
+            {"created_at": winner.get("created_at", time.time()), "schema": schema},
+            record_type="schema-node",
+        )
+        self._validate_schema_node_winner(schema_winner, schema, table)
+        return str(schema["id"])
 
     def _pin_unl_boundary(
         self, table: Table, options: dict[str, str], pipeline_scope: str
@@ -13812,13 +13878,17 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 shared_view.open_begin,
                 shared_view.reached_lsn,
             )
-        elif past_step and (replay_stop is None or replay_stop <= int(checkpoint["commit_lsn"])):
+        elif (past_step and replay_stop is None) or (
+            replay_stop is not None and replay_stop <= int(checkpoint["commit_lsn"])
+        ):
             # A step to a generation the live schema has moved past: commit its schema and
             # read nothing under it. Its columns are not the live ones -- a column added
             # since would go uncaptured in every change read here, and one dropped since
             # cannot be captured -- so the changes wait for the step to the live schema,
             # which captures them with the live layout from this same position. A replay
-            # of such a step ends where it started, so it reads nothing either.
+            # that ends where it starts (such a step, or a metadata-only step to the live
+            # schema) has no transaction to read either: none commits after its start and
+            # at or before its stop.
             committed, caught_up, open_begin, reached = [], False, None, None
         else:
             # A replay of a step that read changes reads its committed range, every change
@@ -14215,31 +14285,51 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # one recorded step at a time, so they are checked that way here: a whole-row key
         # may make only a drop or an add in one step, and the target and the live layout can
         # differ by both. Where the recorded history ends short of the live layout, the
-        # owner records the rest as one step, so the last node is checked against it.
+        # owner records the rest as one step, so the last node is checked against it, with
+        # the default check that step gets when a column joins the key. A record that is
+        # not a valid successor fails as the step would; history that loops (layout-only ids
+        # recorded before transition ids hashed their predecessor) or runs past the bound is
+        # checked against the live layout from where the walk stopped.
 
         live = _schema_fingerprint(table)
         seen: set[str] = set()
-        while (
-            _schema_fingerprint(node_table) != live
-            and node_id not in seen
-            and len(seen) < _MAX_SCHEMA_DESCENT
-        ):
+        while _schema_fingerprint(node_table) != live:
+            if node_id in seen or len(seen) >= _MAX_SCHEMA_DESCENT:
+                break
             seen.add(node_id)
             record = self._read_immutable_head(self._immutable_namespace(table, "schemas", node_id))
-            successor = record.get("schema") if isinstance(record, dict) else None
-            following = None
-            if isinstance(successor, dict) and successor.get("predecessor") == node_id:
+            successor = None
+            if record is not None:
                 self._validate_immutable_record_header(
                     record, "schema-transition", table.exposed_name
                 )
-                following = _table_from_schema_state(successor, table.database)
+                successor = record.get("schema")
+                if not isinstance(successor, dict):
+                    # 300: Invalid immutable Informix schema transition
+                    raise InformixError(_m(300))
+                if (
+                    not re.fullmatch(r"[0-9a-f]{32}", str(successor.get("id")))
+                    or successor.get("predecessor") != node_id
+                ):
+                    # 302: Invalid immutable schema identity for '{}'
+                    raise InformixError(_m(302, table.exposed_name))
+            following = (
+                None if successor is None else _table_from_schema_state(successor, table.database)
+            )
             # rules: the wildcard-key growth and shrink the caller allows.
             _ensure_compatible_schema_change(
                 node_table, following or table, wildcard_except=table.key_wildcard_except, **rules
             )
             if following is None:
+                if set(table.primary_keys) - set(node_table.primary_keys):
+                    self._ensure_added_key_columns_have_no_default(node_table, table)
                 return
             node_table, node_id = following, str(successor["id"])
+        else:
+            return
+        _ensure_compatible_schema_change(
+            node_table, table, wildcard_except=table.key_wildcard_except, **rules
+        )
 
     def _schema_transition(
         self,
@@ -17293,6 +17383,9 @@ def _carry_key_override(fresh: Table, overridden: Table) -> Table:
     if overridden.key_wildcard:
         _ensure_excepted_columns_exist(fresh, overridden.key_wildcard_except)
         keys = tuple(_wildcard_key(fresh.columns, overridden.key_wildcard_except))
+        if not keys:
+            # 192: Option '{}' excepts every column of '{}', leaving no key
+            raise InformixError(_m(192, _PRIMARY_KEYS_OPTION, fresh.exposed_name))
         if keys != overridden.primary_keys:
             descending = ()
     return replace(

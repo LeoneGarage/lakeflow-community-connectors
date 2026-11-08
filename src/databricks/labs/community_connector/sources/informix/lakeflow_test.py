@@ -6593,6 +6593,44 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(delete_recovered["commit_lsn"], "150")
         self.assertEqual(delete_recovered["pipeline_scope"], recovered["pipeline_scope"])
 
+    def test_an_auto_snapshot_delete_reader_ahead_of_the_resnapshot_waits_without_ending(self):
+        # The delete reader of an expired checkpoint reads before the upsert reader has
+        # published the update's resnapshot boundary. An unchanged offset would read as a
+        # drained source and end a triggered update with no seed, so it yields a changed one
+        # at the same position, then seeds once the boundary is published.
+        bridge = FakeBridge()
+        bridge.minimum = 91
+        bridge.now = 150
+        checkpoint = _stream_offset(90)
+        checkpoint["pipeline_scope"] = "f" * 32
+        options = {"snapshot.mode": "auto_snapshot"}
+
+        _, waiting = self.connector(bridge).read_table_deletes("app.orders", checkpoint, options)
+
+        self.assertNotEqual(waiting, checkpoint)
+        self.assertEqual(waiting["commit_lsn"], checkpoint["commit_lsn"])
+        self.connector(bridge).read_table("app.orders", checkpoint, dict(options))
+        _, seeded = self.connector(bridge).read_table_deletes("app.orders", waiting, options)
+        self.assertEqual(seeded["commit_lsn"], "150")
+        self.assertNotIn("trigger_boundary_retry_count", seeded)
+
+    def test_an_auto_snapshot_resnapshot_seeds_a_delete_flow_that_never_checkpointed(self):
+        # The upsert reader published the update's channel start at its expired checkpoint
+        # before auto_snapshot replaced it; the lowest start wins, so the record keeps naming
+        # a position the log no longer holds. A delete flow with no checkpoint seeds at the
+        # resnapshot's boundary instead of waiting on that position for the whole update.
+        bridge = FakeBridge()
+        bridge.minimum = 91
+        bridge.now = 150
+        checkpoint = _stream_offset(90)
+        checkpoint["pipeline_scope"] = "f" * 32
+        options = {"snapshot.mode": "auto_snapshot"}
+        self.connector(bridge).read_table("app.orders", checkpoint, dict(options))
+
+        _, seed = self.connector(bridge).read_table_deletes("app.orders", {}, options)
+
+        self.assertEqual(seed["commit_lsn"], "150")
+
     def test_snapshot_mode_auto_snapshot_starts_incrementally_without_checkpoint(self):
         bridge = FakeBridge()
 
@@ -7956,6 +7994,27 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(list(replayed), [])
         self.assertEqual(len(bridge.change_reads), reads)
 
+    def test_a_replay_of_a_metadata_only_step_to_the_live_schema_reads_nothing(self):
+        # A step straight to the live schema on an idle log ends where it started. Its replay
+        # stops at its start, so no transaction can fall in it and no session is opened.
+        bridge = FakeBridge()
+        _, start = self.connector(bridge).read_table("app.orders", {}, {})
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+        reader = self.connector(bridge)
+        _, step = reader.read_table("app.orders", start, {})
+        self.assertEqual(step["commit_lsn"], start["commit_lsn"])
+        self.assertNotEqual(step["schema_fingerprint"], start["schema_fingerprint"])
+        reads = len(bridge.change_reads)
+
+        replayed = reader._replay_embedded_range("app.orders", start, step, {})
+
+        self.assertEqual(list(replayed), [])
+        self.assertEqual(len(bridge.change_reads), reads)
+
     def test_a_delete_replay_after_a_wildcard_key_column_drop_keys_by_the_live_layout(self):
         # A delete batch read under a whole-row key that still held a column is replayed
         # once that column is dropped. The live capture cannot return it, and the update
@@ -8013,6 +8072,62 @@ class LakeflowContractTests(unittest.TestCase):
             [(row["id"], row["value"], row["added"], row["_informix_op"]) for row in replayed],
             [(1, "a", None, "d")],
         )
+
+    def test_a_delete_replay_waits_for_the_schema_step_its_range_needs(self):
+        # A delete batch read under one schema is replayed in an update that started after a
+        # column was added. Its range needs the step the upsert reader records on its own
+        # read; a replay cannot yield for it, so it waits in place until that is recorded.
+        bridge = FakeBridge()
+
+        def connector(scope):
+            return self.connector(bridge, registration_scope=scope)
+
+        _, checkpoint = connector("update-1").read_table("app.orders", {}, {})
+        _, start = connector("update-1").read_table_deletes("app.orders", {}, {})
+        bridge.now = 110
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 9, "lsn": 100},
+            {
+                "op": "DELETE",
+                "tx_id": 9,
+                "lsn": 101,
+                "table": "demo:app.orders",
+                "row": {"id": 1, "value": "a"},
+            },
+            {"op": "COMMIT", "tx_id": 9, "lsn": 102},
+            {"op": "TIMEOUT", "lsn": 110},
+        ]
+        _, end = connector("update-1").read_table_deletes("app.orders", start, {})
+        self.assertEqual(end["schema_id"], start["schema_id"])
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 130
+        bridge.changes[1] = dict(bridge.changes[1], row={"id": 1, "value": "a", "added": None})
+        replaying = connector("update-2")
+        replay_options = {}
+        waits = []
+
+        def upsert_reads_meanwhile(seconds):
+            waits.append(seconds)
+            if len(waits) == 1:
+                connector("update-2").read_table("app.orders", checkpoint, {})
+
+        with mock.patch.object(informix_module.time, "sleep", side_effect=upsert_reads_meanwhile):
+            replayed = list(
+                informix_module._replay_between_offsets(
+                    start,
+                    end,
+                    lambda offset: replaying.read_table_deletes(
+                        "app.orders", offset, replay_options
+                    ),
+                    replay_options,
+                    replaying.options,
+                )
+            )
+
+        self.assertEqual([(row["id"], row["_informix_op"]) for row in replayed], [(1, "d")])
+        self.assertTrue(waits)
 
     def test_a_lagging_reader_keeps_the_values_of_a_column_added_after_its_next_step(self):
         # Two columns added in two runs. A reader still at the first schema steps to the
@@ -8319,6 +8434,84 @@ class LakeflowContractTests(unittest.TestCase):
             step = read("lagging", step)
 
         self.assertEqual(step["schema_fingerprint"], checkpoints[3]["schema_fingerprint"])
+
+    def _recorded_successor(self, connector, of_id, layout, schema_id, predecessor):
+        # Record ``layout`` under ``schema_id`` as the step after node ``of_id``.
+        node = _schema_state(layout, 100, predecessor=predecessor, schema_id=schema_id)
+        connector._publish_immutable_head(
+            connector._immutable_namespace(layout, "schemas", of_id),
+            {"created_at": informix_module.time.time(), "schema": node},
+            record_type="schema-transition",
+        )
+
+    def test_a_looping_recorded_history_is_checked_against_the_live_layout(self):
+        # Nodes from before transition ids hashed their predecessor can loop (a column added
+        # and dropped again reused the first node). The walk stops at the loop and checks
+        # the live layout from there rather than accepting a path it never finished.
+        connector = self.connector(FakeBridge())
+        first = Table.parse(_table(), "demo")
+        grown_raw = _table()
+        grown_raw["columns"].append({"name": "x", "type_name": "INTEGER", "nullable": True})
+        grown = Table.parse(grown_raw, "demo")
+        first_id, grown_id = "a" * 32, "b" * 32
+        self._recorded_successor(connector, grown_id, first, first_id, grown_id)
+        self._recorded_successor(connector, first_id, grown, grown_id, first_id)
+        rekeyed = Table.parse(_table(primary_keys=("value",)), "demo")
+
+        with self.assertRaisesRegex(InformixError, "primary keys"):
+            connector._ensure_recorded_path_to_live(rekeyed, grown, grown_id, {})
+
+    def test_a_corrupt_recorded_step_on_the_way_to_the_live_layout_fails(self):
+        # A step record that names another predecessor is not this node's successor and
+        # not an absent one either: it fails as the step itself would, not as a gap.
+        connector = self.connector(FakeBridge())
+        first = Table.parse(_table(), "demo")
+        grown_raw = _table()
+        grown_raw["columns"].append({"name": "x", "type_name": "INTEGER", "nullable": True})
+        grown = Table.parse(grown_raw, "demo")
+        self._recorded_successor(connector, "a" * 32, grown, "b" * 32, "c" * 32)
+
+        with self.assertRaisesRegex(InformixError, "Invalid immutable schema identity"):
+            connector._ensure_recorded_path_to_live(grown, first, "a" * 32, {})
+
+    def test_a_lagging_reader_refuses_a_defaulted_key_column_before_stepping_toward_it(self):
+        # The delete reader is a recorded step behind; the live layout after it adds a column
+        # with a default to the whole-row key. It fails there, as the upsert reader does on
+        # that step, instead of committing the recorded step first.
+        bridge = FakeBridge()
+        options = {"primary.keys": "*", "snapshot.mode": "initial"}
+
+        def connector(scope):
+            return self.connector(bridge, registration_scope=scope)
+
+        _, checkpoint = connector("update-a").read_table("app.orders", {}, dict(options))
+        _, deletes = connector("update-a").read_table_deletes("app.orders", {}, dict(options))
+        bridge.tables[0]["columns"].append({"name": "z", "type_name": "INTEGER", "nullable": True})
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+        connector("update-b").read_table("app.orders", checkpoint, dict(options))
+        bridge.tables[0]["columns"].append({"name": "w", "type_name": "INTEGER", "nullable": True})
+        bridge.column_default_names = {"w"}
+        bridge.now = 140
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 140}]
+
+        with self.assertRaisesRegex(InformixError, "with a default"):
+            rows, _ = connector("update-c").read_table_deletes("app.orders", deletes, dict(options))
+            list(rows)
+
+    def test_a_wildcard_except_key_cannot_shrink_to_no_columns(self):
+        # "* except(id)" keys on value alone. Re-applying it to a catalog read without value
+        # would leave the key empty, which the option refuses when it is set: carrying it
+        # across a refresh refuses it the same way rather than stream with no key.
+        options = {"primary.keys": "* except(id)"}
+        connector = self.connector(FakeBridge())
+        keyed = connector._table("app.orders", options)
+        self.assertEqual(keyed.primary_keys, ("value",))
+        raw = _table()
+        raw["columns"] = [column for column in raw["columns"] if column["name"] != "value"]
+
+        with self.assertRaisesRegex(InformixError, "excepts every column"):
+            informix_module._carry_key_override(Table.parse(raw, "demo"), keyed)
 
     def test_future_immutable_schema_transition_fails_closed(self):
         bridge = FakeBridge()
@@ -18763,6 +18956,26 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
             self.assertEqual(row[informix_module.OP], "r")
             self.assertEqual(row[informix_module.COMMIT_LSN], informix_module._sortable_lsn(50))
 
+    def test_an_operator_boundary_records_its_schema_for_a_later_schema_change(self):
+        # An operator-supplied boundary initializes the table under a schema node the
+        # reader's history starts from, as a self-pinned one does, so a column added once
+        # the snapshot is served steps the stream instead of failing on missing history.
+        source = self._source("1|a|\n2|b|\n")
+        bridge = FakeBridge()
+        options = {"snapshot.source": source, "snapshot.boundary.lsn": "50"}
+        _, offset = self.connector(bridge).read_table("app.orders", {}, dict(options))
+        self.assertEqual(offset["phase"], "stream")
+        bridge.tables[0]["columns"].append(
+            {"name": "added", "type_name": "INTEGER", "nullable": True}
+        )
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+
+        _, stepped = self.connector(bridge).read_table("app.orders", offset, dict(options))
+
+        live = _schema_fingerprint(Table.parse(bridge.tables[0], "demo"))
+        self.assertEqual(stepped["schema_fingerprint"], live)
+
     def test_unl_boundary_lsn_from_manifest(self):
         source = self._source("1|a|\n")
         self._manifest(source, "55")
@@ -20379,6 +20592,29 @@ class ColumnTransformTests(_TableOptionTestCase):
 
     KEY = "0123456789abcdef-test-key"
     MASKED = {"transform_columns": '{"value": "MASK(value, 1)", "extra": "NULLIFY(extra)"}'}
+
+    def test_round_and_trunc_read_a_float_by_the_digits_it_shows(self):
+        # 1.15 and 12.34 are binary 1.1499... and 12.3399... as floats; rounding those
+        # would give 1.1 and 12.33, against what the value shows and the documented halves.
+        apply = informix_module._apply_function
+        self.assertEqual(apply("ROUND", 1.15, [1], {}), 1.2)
+        self.assertEqual(apply("ROUND", -1.15, [1], {}), -1.2)
+        self.assertEqual(apply("TRUNC", 12.34, [2], {}), 12.34)
+        self.assertEqual(apply("ROUND", Decimal("1.15"), [1], {}), Decimal("1.2"))
+
+    def test_a_fallback_on_a_wide_decimal_keeps_its_digits(self):
+        # A DECIMAL(32,10) fallback holds 30 digits, past Python's default 28.
+        raw = _table()
+        raw["columns"].append(
+            {"name": "amount", "type_name": "DECIMAL", "precision": 32, "scale": 10}
+        )
+        column = Table.parse(raw, "demo").columns[-1]
+        value = Decimal("12345678901234567890")
+
+        number = informix_module._number_for_column(value, column, {})
+
+        self.assertEqual(number, value)
+        self.assertEqual(number.as_tuple().exponent, -10)
 
     def keyed(self, bridge):
         return self.connector(bridge, **{"transform.hash.key": self.KEY})
