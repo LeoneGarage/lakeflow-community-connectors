@@ -1159,6 +1159,11 @@ def _fixed_result_size(column: ResultColumn) -> int:
     raise SqliDescriptorNotImplemented(f"ordinary Informix result type {kind} is unsupported")
 
 
+# How long a TLS connection waits before its first and second retry of reading
+# ssl.ca.file (twice this, the second time).
+_CA_FILE_RETRY_SECONDS = 0.5
+
+
 @dataclass(eq=False, repr=False)
 class InformixSqliClient:
     hostname: str
@@ -1275,6 +1280,21 @@ class InformixSqliClient:
         deadline: float,
         validated_address: str | None = None,
     ) -> None:
+        context = self.ssl_context
+        if self.tls and context is None:
+            # ssl.ca.file can sit on a Volume, read through its FUSE mount, which refuses
+            # a read now and then: a failed read is tried twice more, before the socket is
+            # opened. Contents that don't load (ssl.SSLError) fail at once.
+            for attempt in range(3):
+                try:
+                    context = ssl.create_default_context(cafile=self.ca_file)
+                    break
+                except ssl.SSLError:
+                    raise
+                except OSError:
+                    if attempt == 2:
+                        raise
+                    time.sleep(_CA_FILE_RETRY_SECONDS * (attempt + 1))
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise SqliUnsupportedAuthentication("Informix login deadline exceeded")
@@ -1289,7 +1309,6 @@ class InformixSqliClient:
             raw.settimeout(min(self.socket_timeout, max(0.001, deadline - time.monotonic())))
             raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             if self.tls:
-                context = self.ssl_context or ssl.create_default_context(cafile=self.ca_file)
                 connection = context.wrap_socket(raw, server_hostname=host)
             self._socket = connection
             self._input = _DeadlineReader(

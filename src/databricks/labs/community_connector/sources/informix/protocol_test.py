@@ -2,6 +2,7 @@
 
 import base64
 import io
+import ssl
 import struct
 import unittest
 from datetime import date, datetime, timezone
@@ -1044,6 +1045,45 @@ class SqliPacketTests(unittest.TestCase):
         # the one that must be closed; closing raw would leak the TLS session.
         wrapped.close.assert_called_once_with()
         raw.close.assert_not_called()
+
+    def test_a_failed_ca_file_read_is_retried_before_the_socket_opens(self):
+        # ssl.ca.file on a Volume is read through its FUSE mount, which refuses a read now
+        # and then. The read is tried three times before the connection fails, and before
+        # any socket is opened; a CA file whose contents don't load fails at once.
+        module = "databricks.labs.community_connector.sources.informix.sqli"
+        refused = PermissionError(1, "Operation not permitted")
+        context = Mock()
+        context.wrap_socket.side_effect = RuntimeError("stop after the TLS wrap")
+        client = InformixSqliClient(
+            "host", 9088, "db", "user", "secret", server_name="server", ca_file="/v/ca.pem"
+        )
+
+        def connect(created):
+            with (
+                patch(f"{module}._CA_FILE_RETRY_SECONDS", 0),
+                patch("ssl.create_default_context", side_effect=created) as create_context,
+                patch("socket.create_connection", return_value=Mock()) as open_socket,
+            ):
+                try:
+                    client._connect_once("host", 9088, "server", float("inf"))
+                except Exception as error:  # noqa: BLE001 - returned for the assertions
+                    return error, create_context, open_socket
+            raise AssertionError("connect unexpectedly succeeded")
+
+        error, create_context, open_socket = connect([refused, refused, context])
+        self.assertRegex(str(error), "stop after the TLS wrap")
+        self.assertEqual(create_context.call_count, 3)
+        create_context.assert_called_with(cafile="/v/ca.pem")
+        open_socket.assert_called_once()
+        error, create_context, open_socket = connect([refused] * 3)
+        self.assertIs(error, refused)
+        self.assertEqual(create_context.call_count, 3)
+        open_socket.assert_not_called()
+        bad = ssl.SSLError("no certificate or crl found")
+        error, create_context, open_socket = connect([bad, context])
+        self.assertIs(error, bad)
+        self.assertEqual(create_context.call_count, 1)
+        open_socket.assert_not_called()
 
     def test_plaintext_connection_does_not_create_or_wrap_tls_context(self):
         raw = Mock()
