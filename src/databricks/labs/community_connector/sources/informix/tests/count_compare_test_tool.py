@@ -232,26 +232,10 @@ def main() -> int:
     # tool's aws() helper to drop --profile so every SSM call uses those creds.
     C.aws = lambda args, *command: C.run(["aws", *command, "--region", args.aws_region])
 
-    instance_id = subprocess.run(
-        [
-            "aws",
-            "ec2",
-            "describe-instances",
-            "--region",
-            "us-east-1",
-            "--filters",
-            "Name=tag:Name,Values=informix-cdc",
-            "Name=instance-state-name,Values=running",
-            "--query",
-            "Reservations[].Instances[].InstanceId",
-            "--output",
-            "text",
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.split()[0]
-    args = make_args(instance_id)
+    # The host by its Name tag, in make_args' region, as the data compare finds it: a clear
+    # error when none (or several) is running, rather than an IndexError.
+    args = make_args(None)
+    args.instance_id = C.resolve_instance_id(args)
 
     t0 = time.monotonic()
     # Run both sides concurrently: Informix as one SSM job, Databricks as a pool.
@@ -269,7 +253,7 @@ def main() -> int:
 
     print(
         f"\nCompared {len(TABLES)} tables in {elapsed:.1f}s "
-        f"(instance {instance_id[:12]}, target {target})\n"
+        f"(instance {args.instance_id[:12]}, target {target})\n"
     )
     print(f"{'table':22} {'informix':>12} {'pipeline':>12} {'diff':>10}  status")
     print("-" * 72)

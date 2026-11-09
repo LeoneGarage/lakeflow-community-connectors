@@ -81,7 +81,7 @@ def rows_written(op, mj):
         return 0
     try:
         m = json.loads(mj)
-    except:
+    except (TypeError, ValueError):
         return 0
     if op == "MERGE":
         return sum(
