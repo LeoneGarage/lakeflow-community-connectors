@@ -121,7 +121,7 @@ rather than start from an unrelated position.
 | `lakebase.password` | **Yes** | | Password for `informix_state_user`, the long-lived Postgres role all state access authenticates as. Required, because it is the credential the running pipeline uses for every read and write of state, so nothing in that path depends on a token that can expire. It is the source of truth: a role whose password differs is repaired to match, which invalidates the previous password. The role name is fixed and not configurable — every pipeline sharing an endpoint must agree on which role owns the state tables. |
 | `lakebase.admin_user` | No | ambient identity | Postgres role used **only** to provision `informix_state_user`, which requires CREATEROLE. Separate from the state role on purpose, so the credential every reader holds cannot create roles. Defaults to `DATABRICKS_CLIENT_ID` for a service principal, otherwise the workspace user. |
 | `lakebase.admin_password` | No | OAuth credential | Password for `lakebase.admin_user`. When unset the admin authenticates with a short-lived OAuth credential minted for the pipeline's identity, which is the usual case. Not the same as `lakebase.password`. |
-| `lakebase.project.id` | No | derived | Overrides the project id derived from `hostname`, `port`, and `server`. Set it to share one project across connections that should pool capacity, or to adopt a pre-created project. |
+| `lakebase.project.id` | No | derived | Overrides the project id derived from `hostname`, `port`, and `server`. Set the same id on several connections to keep their state in one project, or set it to adopt a pre-created project. Rows stay separate per Informix server and database, so sharing a project doesn't pool capacity between servers; see [Sharing one project across Informix servers](#sharing-one-project-across-informix-servers). |
 | `lakebase.autoscale.min.cu` | No | `0.5` | Minimum Lakebase compute units; `0.5` is the smallest the API accepts. Applied only when the connector creates the project. |
 | `lakebase.autoscale.max.cu` | No | `2` | Maximum Lakebase compute units. Applied only at project creation. |
 | `lakebase.suspend.timeout.seconds` | No | `60` | Idle seconds before the endpoint scales to zero compute. Applied only at project creation, because the API accepts it solely through a project's `default_endpoint_settings` and never retroactively. |
@@ -1863,6 +1863,48 @@ Requirements and caveats:
   is no longer accepted. Update the connection and run a full refresh.
 - The endpoint bills for compute whenever it is awake, so a pipeline that never
   idles never scales to zero.
+
+#### Sharing one project across Informix servers
+
+By default each Informix server gets its own project. To keep the state of
+connections to several servers in one project, set `lakebase.project.id` to the
+same id on each of them. Nothing else changes: every state row carries a
+namespace, so the servers' rows never mix.
+
+- Connection slots, waiters, the capacity limit and backlog hints are namespaced by
+  `hostname`, `port` and `server`. Each server keeps its own connection budget, so
+  sharing a project doesn't pool capacity between servers.
+- State records and CDC handoffs are namespaced by those three plus `database`, so
+  two databases never share a record.
+
+Every connection sharing the project must use the same:
+
+- `lakebase.password`. They all log in as `informix_state_user`, and a connection
+  whose password doesn't match resets the role to its own, which breaks the other
+  connections' next logins.
+- `lakebase.database`, the database that holds the state tables.
+- Connector version, or compatible ones. The connections share one set of state
+  tables, and a newer connector upgrades them in place.
+
+Also:
+
+- Connections to the same Informix server must use the same project, whether that's
+  the derived one or the override. In different projects their slots are counted
+  separately, so together they can open more than `max.concurrent.connections`.
+- Existing connections can stay on their derived projects; only connections that
+  set the override use the shared one. A pipeline moved to another project leaves
+  its state behind, so it needs a full refresh.
+- `lakebase.autoscale.*` and `lakebase.suspend.timeout.seconds` apply only for the
+  connection that creates the project. Size the endpoint for every pipeline that
+  uses it, and resize it with `databricks postgres update-endpoint`.
+- Every pipeline's run-as identity needs access to the project, not only the one
+  that created it. If a pipeline ever has to repair the state role, its admin
+  identity also needs `CREATEROLE` there; otherwise set `lakebase.admin_user` and
+  `lakebase.admin_password`.
+- Use an id that doesn't start with `informix-state-`. With
+  `state.gc.drop.unused.projects` on, a connection deletes unused projects with
+  that prefix other than its own. A project named otherwise is never deleted, and
+  connections that set `lakebase.project.id` never delete projects.
 
 ## Operational guidance
 

@@ -856,8 +856,12 @@ connection:
       description: >
         Override the derived Lakebase project id. Defaults to
         `informix-state-<16 hex>` computed from hostname, port, and
-        INFORMIXSERVER. Set this to share one project across connections that
-        should pool capacity together, or to adopt a pre-created project.
+        INFORMIXSERVER. Set the same id on several connections to keep their
+        state in one project, or set it to adopt a pre-created project. Rows
+        stay separate per Informix server and database, so sharing a project
+        doesn't pool capacity between servers. Every connection sharing it
+        needs the same lakebase.password and lakebase.database, and
+        connections to one server must use the same project.
 
     - name: lakebase.database
       type: string
