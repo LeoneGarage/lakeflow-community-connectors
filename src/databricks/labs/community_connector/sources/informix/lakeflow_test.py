@@ -1889,7 +1889,7 @@ class LakeflowContractTests(unittest.TestCase):
         # 32 MiB, so a table of wide text or byte columns stays inside the page bound.
         pages = []
         spill = informix_module._CdcSpill(
-            1, lambda *args: pages.append(len(args[4])), lambda *args: None, "l", "s", {}
+            1, lambda *args: pages.append(len(args[4])), lambda *args: None, {}, "s", {}
         )
         wide = {"value": "x" * (20 << 20)}
         spill.start(7, 100, [{"op": "INSERT", "tx_id": 7, "lsn": 101, "row": wide}])
@@ -1924,7 +1924,7 @@ class LakeflowContractTests(unittest.TestCase):
                 2,
                 lambda *args: writes.append((args[2], args[3], [r["lsn"] for r in args[4]])),
                 lambda *args: deletes.append(args[1]),
-                "layout",
+                {"demo.app.orders": "layout"},
                 "scope",
                 {"demo.app.orders": "demo:app.orders"},
             )
@@ -6461,6 +6461,77 @@ class LakeflowContractTests(unittest.TestCase):
             encoding="latin-1",
         )
         self.assertEqual([row["id"] for row in rows], [1, 4])
+
+    def test_a_staged_page_serialises_its_body_once_to_the_same_bytes(self):
+        # The digest is spliced between the fields either side of "sha256": byte for byte
+        # the page that serialising the record twice produced, so pages written before and
+        # after compare equal and every reader accepts them.
+        encode = informix_module._encode_snapshot_stage_value
+        rows = [
+            {
+                "id": Decimal("12.50"),
+                "note": 'naïve ☃ "quoted" \\ back',
+                "raw": b"\x00\xff",
+                "on": date(2026, 1, 2),
+                "at": datetime(2026, 1, 2, 3, 4, 5, 600000),
+                "none": None,
+            }
+        ]
+        body = {
+            "lower_pk": encode(None),
+            "page_index": 3,
+            "pipeline_scope": "a" * 32,
+            "row_count": 1,
+            "rows": encode(rows),
+            "schema_id": "s" * 32,
+            "snapshot_lsn": "12345",
+            "table": "demo:app.orders",
+            "upper_pk": encode([Decimal("12.50")]),
+            "version": informix_module._SNAPSHOT_STAGE_VERSION,
+        }
+        options = {"allow_nan": False, "separators": (",", ":"), "sort_keys": True}
+        digest = hashlib.sha256(json.dumps(body, **options).encode()).hexdigest()
+        twice = json.dumps({**body, "sha256": digest}, **options).encode()
+        self.assertEqual(informix_module._staged_page_payload(body), (twice, digest))
+
+    def test_the_second_channel_keeps_a_spilled_page_the_first_wrote(self):
+        # Both channels read the same transaction under the same capture and scope, so the
+        # second to reach a page finds it written and neither encodes nor writes it again. A
+        # table's run is named by its own capture, so a shard that captures other tables
+        # too names the same pages.
+        connector = self.connector(FakeBridge(), registration_scope="spill-once")
+        table = connector._table("app.orders", {})
+        capture = informix_module._capture_descriptor(table)
+        other = {**capture, "identity": "demo:app.audit", "logical_identity": "demo.app.audit"}
+        changes = [
+            {"op": "INSERT", "tx_id": 7, "lsn": 102 + i, "table": table.identity, "row": {"id": i}}
+            for i in range(5)
+        ]
+
+        def spill(captures):
+            publish = mock.Mock(wraps=connector._publish_snapshot_stage_page)
+            with (
+                mock.patch.object(informix_module, "_CDC_SPILL_PAGE_RECORDS", 2),
+                mock.patch.object(connector, "_publish_snapshot_stage_page", publish),
+            ):
+                writer = connector._cdc_spill(captures)
+                writer.start(7, 101, changes)
+                return writer.finish(7), publish.call_count
+
+        first, written = spill([capture])
+        second, rewritten = spill([other, capture])
+        self.assertEqual((written, rewritten), (3, 0))
+        self.assertEqual(second, first)
+
+    def test_a_shard_daemon_spills_under_its_consumers_scope(self):
+        # The daemon reader is a new connector, so it is handed the consumer's scope; a
+        # reader with none keeps transactions in memory rather than failing every poll.
+        connector = self.connector(FakeBridge(), registration_scope="spill-daemon")
+        daemon = connector._shared_cdc_reader_factory()()
+        self.assertEqual(daemon._registration_scope, connector._registration_scope)
+        self.assertIsNotNone(daemon._cdc_spill([]))
+        daemon._registration_scope = None
+        self.assertIsNone(daemon._cdc_spill([]))
 
     def test_partitioned_embedded_path_matches_read_table(self):
         # A non-page-serve microbatch (stream phase) yields a single embedded

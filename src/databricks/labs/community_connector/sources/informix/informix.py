@@ -6275,23 +6275,24 @@ class _CdcSpill:
     # SPILLED record per table naming its run, which the transaction buffer keeps in place
     # of the changes; a ROLLBACK deletes the runs. A DISCARD (rollback to a savepoint) drops
     # the changes it covers still in memory and records the LSN range for the pages, which
-    # readers skip. A run is named by the capture layout, the BEGIN LSN and the transaction,
-    # so a poll that reads the transaction again writes the same pages.
+    # readers skip. A table's run is named by its capture layout, the BEGIN LSN and the
+    # transaction, so a poll that reads the transaction again, or the other channel's,
+    # names the same pages.
 
-    def __init__(self, threshold, write, delete, layout, scope, natives) -> None:
+    def __init__(self, threshold, write, delete, layouts, scope, natives) -> None:
         self.threshold = threshold
         self._write = write  # (native identity, table, run, page index, records)
         self._delete = delete  # (native identity, run)
-        self._layout = layout
+        self._layouts = layouts  # logical identity -> capture layout hash
         self._scope = scope
         self._natives = natives  # logical identity -> native identity
-        self._open: dict[int, tuple[str, dict[str, dict[str, Any]]]] = {}
+        self._open: dict[int, tuple[int, dict[str, dict[str, Any]]]] = {}
 
     def holds(self, tx_id: int) -> bool:
         return tx_id in self._open
 
     def start(self, tx_id: int, begin_lsn: int, records: list[dict[str, Any]]) -> None:
-        self._open[tx_id] = (f"{self._layout}-{begin_lsn}-{tx_id}", {})
+        self._open[tx_id] = (begin_lsn, {})
         for record in records:
             if record["op"] == "DISCARD":
                 self.discard(tx_id, int(record["lsn"]))
@@ -6299,11 +6300,20 @@ class _CdcSpill:
                 self.add(record)
 
     def add(self, record: dict[str, Any]) -> None:
-        run, parts = self._open[int(record.get("tx_id") or 0)]
+        tx_id = int(record.get("tx_id") or 0)
+        begin, parts = self._open[tx_id]
         table = str(record.get("table") or "")
-        part = parts.setdefault(
-            table, {"pages": 0, "rows": [], "bytes": 0, "last": 0, "discarded": []}
-        )
+        part = parts.get(table)
+        if part is None:
+            run = f"{self._layouts.get(table, '')}-{begin}-{tx_id}"
+            part = parts[table] = {
+                "run": run,
+                "pages": 0,
+                "rows": [],
+                "bytes": 0,
+                "last": 0,
+                "discarded": [],
+            }
         part["rows"].append(record)
         part["last"] = int(record["lsn"])
         # Wide text or byte columns end a page early, well inside the staged-page bound.
@@ -6314,10 +6324,11 @@ class _CdcSpill:
         if record["op"] != "BEFORE_UPDATE" and (
             len(part["rows"]) >= _CDC_SPILL_PAGE_RECORDS or part["bytes"] >= 32 << 20
         ):
-            self._flush(run, table, part)
+            self._flush(table, part)
 
-    def _flush(self, run: str, table: str, part: dict[str, Any]) -> None:
-        self._write(self._natives.get(table, table), table, run, part["pages"], part["rows"])
+    def _flush(self, table: str, part: dict[str, Any]) -> None:
+        native = self._natives.get(table, table)
+        self._write(native, table, part["run"], part["pages"], part["rows"])
         part["pages"] += 1
         part["rows"] = []
         part["bytes"] = 0
@@ -6329,17 +6340,17 @@ class _CdcSpill:
                 part["discarded"].append([lsn, part["last"]])
 
     def drop(self, tx_id: int) -> None:
-        run, parts = self._open.pop(tx_id)
+        _begin, parts = self._open.pop(tx_id)
         for table, part in parts.items():
             if part["pages"]:
-                self._delete(self._natives.get(table, table), run)
+                self._delete(self._natives.get(table, table), part["run"])
 
     def finish(self, tx_id: int) -> list[dict[str, Any]]:
-        run, parts = self._open.pop(tx_id)
+        _begin, parts = self._open.pop(tx_id)
         spilled = []
         for table, part in parts.items():
             if part["rows"]:
-                self._flush(run, table, part)
+                self._flush(table, part)
             if part["pages"]:
                 spilled.append(
                     {
@@ -6349,7 +6360,7 @@ class _CdcSpill:
                         "table": table,
                         "native_identity": self._natives.get(table, table),
                         "pipeline_scope": self._scope,
-                        "run": run,
+                        "run": part["run"],
                         "pages": part["pages"],
                         "discarded": part["discarded"],
                     }
@@ -11168,16 +11179,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             "upper_pk": _encode_snapshot_stage_value([rows[-1][key] for key in table.primary_keys]),
             "version": _SNAPSHOT_STAGE_VERSION,
         }
-        canonical = json.dumps(body, allow_nan=False, separators=(",", ":"), sort_keys=True).encode(
-            "utf-8"
-        )
-        record = {
-            **body,
-            "sha256": hashlib.sha256(canonical).hexdigest(),
-        }
-        payload = json.dumps(record, allow_nan=False, separators=(",", ":"), sort_keys=True).encode(
-            "utf-8"
-        )
+        payload, digest = _staged_page_payload(body)
+        record = {**body, "sha256": digest}
         if len(payload) > _MAX_SNAPSHOT_STAGE_PAGE_BYTES:
             # 217: Staged snapshot page {} for '{}' exceeds {} decoded bytes; reduce
             # snapshot.page.size
@@ -13857,19 +13860,39 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # in a "cdc-spill" stage the stale-stage sweep also clears.
 
         threshold = int(self.options.get(_CDC_SPILL_RECORDS_OPTION, _DEFAULT_CDC_SPILL_RECORDS))
-        if threshold <= 0 or not getattr(self, "_snapshot_staging_location", None):
+        scope = getattr(self, "_registration_scope", None)
+        if (
+            threshold <= 0
+            or not getattr(self, "_snapshot_staging_location", None)
+            # A reader without a scope can't name pages another process finds: it keeps
+            # every transaction in memory instead of failing the read.
+            or not isinstance(scope, str)
+            or _PIPELINE_SCOPE.fullmatch(scope) is None
+        ):
             return None
-        scope = self._pipeline_scope()
         natives = {str(c["logical_identity"]): str(c["identity"]) for c in captures}
-        layout = hashlib.sha256(
-            json.dumps(list(captures), sort_keys=True, default=str).encode("utf-8")
-        ).hexdigest()[:12]
+        # Each table's run is named by its own capture, so the upsert and delete channels,
+        # whose shards capture different sets of tables, name the same pages.
+        layouts = {
+            str(c["logical_identity"]): hashlib.sha256(
+                json.dumps(c, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()[:12]
+            for c in captures
+        }
 
         def write(native: str, name: str, run: str, page_index: int, records: list) -> None:
             target = types.SimpleNamespace(
                 native_identity=native, exposed_name=name, primary_keys=()
             )
             self._maybe_sweep_stale_snapshot_stages(target)
+            # The upsert and delete channels read the same transaction under the same
+            # capture and scope, so they name the same pages with the same contents: a page
+            # the other channel has written already is kept, not encoded and written again.
+            # Both are written atomically, so one that exists is whole.
+            namespace = self._snapshot_stage_namespace_for(native, scope, _CDC_SPILL_SCHEMA)
+            page = f"page-{page_index:08d}"
+            if os.path.isfile(os.path.join(namespace, "runs", run, page, "data.json.gz")):
+                return
             self._publish_snapshot_stage_page(
                 target, scope, _CDC_SPILL_SCHEMA, run, page_index, records, None
             )
@@ -13881,7 +13904,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             with contextlib.suppress(OSError):
                 PurePythonInformixBridge._remove_connection_slot_tree(path)
 
-        return _CdcSpill(threshold, write, delete, layout, scope, natives)
+        return _CdcSpill(threshold, write, delete, layouts, scope, natives)
 
     def _snapshot_read_with_reconnect(self, thunk, *, table: Table, operation: str):
         # Docstring: Run one snapshot page or key-bound read, retrying in place on a drop.
@@ -14142,7 +14165,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         reader_options.pop(_CONNECTION_ATTEMPT_BUDGET_OPTION, None)
         reader_options.pop(_REPLAY_CONNECTION_WAIT_BUDGET_OPTION, None)
         cls = type(self)
-        return lambda: cls(reader_options)
+        # The shard is keyed by this reader's scope, and its reads spill under it.
+        scope = self._registration_scope
+
+        def factory() -> "InformixLakeflowConnect":
+            reader = cls(reader_options)
+            if scope is not None:
+                reader.set_registration_scope(scope)
+            return reader
+
+        return factory
 
     def _shared_cdc_snapshot(self, table, checkpoint, options, deletes, pipeline_scope):
         # Docstring: Subscribe this table to its shard and return the daemon's coherent view, or
@@ -17575,6 +17607,27 @@ _SNAPSHOT_STAGE_TRAILING_KEYS = (
     "upper_pk",
     "version",
 )
+
+
+def _staged_page_payload(body: dict[str, Any]) -> tuple[bytes, str]:
+    # Docstring: A staged page's bytes and its digest, with the body serialised once.
+    #
+    # A page is the canonical JSON of ``body`` plus a "sha256" field, in sorted-key order,
+    # holding the digest of that canonical JSON. The fields either side of "sha256" are
+    # serialised once each, hashed as joined, and the digest spliced between them: byte for
+    # byte what serialising the whole record would give, and what _scan_staged_page undoes
+    # by cutting out the field and its trailing comma. The body always has fields on both
+    # sides (schema_id before it, snapshot_lsn after).
+
+    options: dict[str, Any] = {"allow_nan": False, "separators": (",", ":"), "sort_keys": True}
+    before = json.dumps({k: v for k, v in body.items() if k < "sha256"}, **options)[:-1]
+    after = json.dumps({k: v for k, v in body.items() if k > "sha256"}, **options)[1:]
+    head, tail = before.encode("utf-8"), after.encode("utf-8")
+    hasher = hashlib.sha256(head)
+    hasher.update(b",")
+    hasher.update(tail)
+    digest = hasher.hexdigest()
+    return head + b',"sha256":"' + digest.encode("ascii") + b'",' + tail, digest
 
 
 def _scan_staged_page(text: str) -> tuple[dict[str, Any], int, tuple[int, int]]:
