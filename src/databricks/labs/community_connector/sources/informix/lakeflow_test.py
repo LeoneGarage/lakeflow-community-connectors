@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import dataclasses
 import errno
 import gzip
@@ -1272,6 +1273,61 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertLess(len(cloudpickle.dumps(source_class)), 1 << 20)
 
+    def test_generated_source_drops_the_merge_prefix_and_annotations(self):
+        # The merge nests the connector inside register_lakeflow_source, and the end of
+        # informix.py strips that prefix from every qualname and drops annotations, about
+        # 80 KB of the pickle. Reach the connector's code the way cloudpickle does: through
+        # the source class's members and closures.
+        generated = importlib.import_module(
+            "databricks.labs.community_connector.sources.informix."
+            "_generated_informix_python_source"
+        )
+        registry = mock.Mock()
+        generated.register_lakeflow_source(types.SimpleNamespace(dataSource=registry))
+        source_class = registry.register.call_args.args[0]
+        reached: dict[str, object] = {}
+        seen: set[int] = set()
+        pending: list[object] = [source_class]
+        while pending:
+            value = pending.pop()
+            if id(value) in seen:
+                continue
+            seen.add(id(value))
+            if isinstance(value, type):
+                reached.setdefault(value.__name__, value)
+                pending.extend(vars(value).values())
+            elif isinstance(value, (staticmethod, classmethod)):
+                pending.append(value.__func__)
+            elif isinstance(value, property):
+                pending.extend(f for f in (value.fget, value.fset, value.fdel) if f)
+            elif isinstance(value, types.FunctionType):
+                reached.setdefault(value.__name__, value)
+                for cell in value.__closure__ or ():
+                    with contextlib.suppress(ValueError):
+                        pending.append(cell.cell_contents)
+        shape_delete, table = reached["_shape_delete"], reached["Table"]
+        self.assertEqual(shape_delete.__qualname__, "_shape_delete")
+        self.assertEqual(shape_delete.__code__.co_qualname, "_shape_delete")
+        self.assertEqual(shape_delete.__annotations__, {})
+        self.assertEqual(table.__qualname__, "Table")
+        self.assertEqual(table.parse.__qualname__, "Table.parse")
+        # Only the Spark data source wrapper, merged after informix.py, keeps the prefix.
+        with open(generated.__file__, encoding="utf-8") as handle:
+            wrapper_line = next(
+                number
+                for number, line in enumerate(handle, 1)
+                if line.strip()
+                == "# src/databricks/labs/community_connector/sparkpds/lakeflow_datasource.py"
+            )
+        prefixed = sorted(
+            name
+            for name, value in reached.items()
+            if isinstance(value, types.FunctionType)
+            and value.__code__.co_firstlineno < wrapper_line
+            and "register_lakeflow_source.<locals>." in value.__code__.co_qualname
+        )
+        self.assertEqual(prefixed, [])
+
     def test_generated_state_op_reconnect_resolves_connection_lost_types(self):
         # Regression: connection_lost_error_types cached via a `global` rebind
         # crashed with NameError in the single-file merged deployment, where the
@@ -1827,6 +1883,108 @@ class LakeflowContractTests(unittest.TestCase):
         # The budget is reached, but a transaction is still open when the read ends.
         with self.assertRaisesRegex(InformixError, "incomplete native frame"):
             poll([begin(100, 7) + commit(200, 7) + following + commit(400, 8)[:7]], 2)
+
+    def test_a_spill_page_ends_early_for_wide_changes(self):
+        # Pages hold up to _CDC_SPILL_PAGE_RECORDS changes, fewer once their values reach
+        # 32 MiB, so a table of wide text or byte columns stays inside the page bound.
+        pages = []
+        spill = informix_module._CdcSpill(
+            1, lambda *args: pages.append(len(args[4])), lambda *args: None, "l", "s", {}
+        )
+        wide = {"value": "x" * (20 << 20)}
+        spill.start(7, 100, [{"op": "INSERT", "tx_id": 7, "lsn": 101, "row": wide}])
+        spill.add({"op": "INSERT", "tx_id": 7, "lsn": 102, "row": wide})
+        spill.add({"op": "INSERT", "tx_id": 7, "lsn": 103, "row": {"value": "small"}})
+        spill.finish(7)
+        self.assertEqual(pages, [2, 1])
+
+    def test_a_poll_spills_an_open_transaction_past_cdc_spill_records(self):
+        # Once transaction 7 holds more than the threshold its changes, those already read
+        # included, go to staged pages; the poll keeps its BEGIN, its DISCARD and its
+        # COMMIT, with a SPILLED record naming the pages ahead of the COMMIT. Transaction 8,
+        # interleaved with it, stays in memory. A page never ends between an UPDATE's two
+        # images, and a DISCARD drops what it covers in memory and marks the range on the
+        # pages. A ROLLBACK deletes the pages and leaves no SPILLED record.
+        capture = {
+            "identity": "demo:app.orders",
+            "logical_identity": "demo.app.orders",
+            "columns": ["id"],
+            "descriptors": [{"name": "id", "type_name": "INTEGER"}],
+        }
+
+        def change(op, tx_id, lsn):
+            return {"op": op, "tx_id": tx_id, "lsn": lsn, "label": 1, "row": {"id": lsn}}
+
+        def poll(records):
+            writes, deletes = [], []
+            bridge = object.__new__(PurePythonInformixBridge)
+            bridge.options = {}
+            bridge.transport = FakeCdcTransport([records])
+            bridge.cdc_spill = informix_module._CdcSpill(
+                2,
+                lambda *args: writes.append((args[2], args[3], [r["lsn"] for r in args[4]])),
+                lambda *args: deletes.append(args[1]),
+                "layout",
+                "scope",
+                {"demo.app.orders": "demo:app.orders"},
+            )
+            with (
+                mock.patch.object(informix_module, "_CDC_SPILL_PAGE_RECORDS", 2),
+                mock.patch.object(informix_module, "CdcFrameParser", RecordParser),
+                mock.patch.object(
+                    informix_module,
+                    "decode_frame",
+                    side_effect=lambda frame, labels, **_: dict(frame),
+                ),
+            ):
+                returned = bridge.read_changes([capture], 90, 1, 256)
+            return returned, writes, deletes
+
+        opening = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 100},
+            change("INSERT", 7, 101),
+            {"op": "BEGIN", "tx_id": 8, "lsn": 102},
+            change("INSERT", 8, 103),
+            change("INSERT", 7, 104),
+            change("BEFORE_UPDATE", 7, 105),
+            change("AFTER_UPDATE", 7, 106),
+            {"op": "COMMIT", "tx_id": 8, "lsn": 107},
+            change("INSERT", 7, 108),
+            {"op": "DISCARD", "tx_id": 7, "lsn": 108},
+            change("DELETE", 7, 109),
+        ]
+        records, writes, deletes = poll([*opening, {"op": "COMMIT", "tx_id": 7, "lsn": 110}])
+        self.assertEqual(
+            [(r["op"], r["tx_id"]) for r in records],
+            [
+                ("BEGIN", 7),
+                ("BEGIN", 8),
+                ("INSERT", 8),
+                ("COMMIT", 8),
+                ("DISCARD", 7),
+                ("SPILLED", 7),
+                ("COMMIT", 7),
+            ],
+        )
+        run = "layout-100-7"
+        # 105 and 106 share a page; 108 was discarded before it reached one.
+        self.assertEqual(writes, [(run, 0, [101, 104]), (run, 1, [105, 106]), (run, 2, [109])])
+        spilled = records[5]
+        self.assertEqual(
+            {key: spilled[key] for key in ("lsn", "table", "run", "pages", "discarded")},
+            {
+                "lsn": 109,
+                "table": "demo.app.orders",
+                "run": run,
+                "pages": 3,
+                "discarded": [[108, 108]],
+            },
+        )
+        self.assertEqual(deletes, [])
+
+        records, writes, deletes = poll([*opening, {"op": "ROLLBACK", "tx_id": 7, "lsn": 110}])
+        self.assertNotIn("SPILLED", [r["op"] for r in records])
+        self.assertEqual(deletes, [run])
 
     def test_connection_port_range_is_validated_before_connecting(self):
         self.connector(**{"port": "1"})
@@ -6165,6 +6323,122 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual([len(p["rows"]) for p in partitions], [3, 3, 1, 1])
         self.assertEqual(self._served(connector, partitions), rows)
+
+    def test_a_spilled_transaction_is_served_from_its_pages_as_the_same_rows(self):
+        # A transaction whose changes went to staged pages (a SPILLED record per table)
+        # yields the rows the same changes held in memory yield: on the simple reader,
+        # upserts and deletes alike, and from executors on the partitioned one, after a
+        # re-plan too. It is a batch of its own, so a transaction ahead of it goes first.
+        bridge = FakeBridge()
+        connector = self.connector(bridge, registration_scope="spill-simple")
+        table = connector._table("app.orders", {})
+
+        def change(op, lsn, key, value):
+            row = {"id": key, "value": value}
+            return {"op": op, "tx_id": 7, "lsn": lsn, "table": table.identity, "row": row}
+
+        changes = [
+            change("INSERT", 102, 10, "a"),
+            change("INSERT", 103, 11, "b"),
+            change("BEFORE_UPDATE", 104, 10, "a"),
+            change("AFTER_UPDATE", 105, 10, "c"),
+            change("DELETE", 106, 11, "b"),
+            change("INSERT", 107, 12, "d"),
+        ]
+        begin = {"op": "BEGIN", "tx_id": 7, "lsn": 101}
+        commit = {"op": "COMMIT", "tx_id": 7, "lsn": 110, "timestamp": 1_700_000_100}
+        ahead = [
+            {"op": "BEGIN", "tx_id": 6, "lsn": 95},
+            {"op": "INSERT", "tx_id": 6, "lsn": 96, "row": {"id": 20, "value": "e"}},
+            {"op": "COMMIT", "tx_id": 6, "lsn": 97},
+        ]
+
+        def read(start, *, deletes=False):
+            reader = connector.read_table_deletes if deletes else connector.read_table
+            rows, end = reader("app.orders", start, {})
+            return list(rows), end
+
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        bridge.changes = [begin, *changes, commit]
+        expected, expected_end = read(checkpoint)
+        expected_deletes, _ = read(checkpoint, deletes=True)
+        self.assertEqual([row["_informix_op"] for row in expected], ["c", "c", "u", "c"])
+        self.assertEqual([row["id"] for row in expected_deletes], [11])
+
+        with mock.patch.object(informix_module, "_CDC_SPILL_PAGE_RECORDS", 2):
+            spill = connector._cdc_spill([informix_module._capture_descriptor(table)])
+            spill.start(7, 101, changes[:3])
+            for record in changes[3:]:
+                spill.add(record)
+            spilled = spill.finish(7)
+        self.assertEqual([part["pages"] for part in spilled], [3])
+        bridge.changes = [begin, *spilled, commit]
+        self.assertEqual(read(checkpoint), (expected, expected_end))
+        self.assertEqual(read(checkpoint, deletes=True)[0], expected_deletes)
+
+        partitioned = self._partitioned_connector(bridge, registration_scope="spill-partitioned")
+        bridge.changes = []
+        start = self._drive_partitioned_snapshot(partitioned)[1][-1]
+        bridge.changes = [*ahead, begin, *spilled, commit]
+
+        def batch(start):
+            end = partitioned.latest_offset("app.orders", {}, start)
+            parts = json.loads(json.dumps(partitioned.get_partitions("app.orders", {}, start, end)))
+            rows = [
+                row for part in parts for row in partitioned.read_partition("app.orders", part, {})
+            ]
+            return end, parts, rows
+
+        after_ahead, parts, rows = batch(start)
+        self.assertEqual([part["kind"] for part in parts], ["embedded"])
+        self.assertEqual([row["id"] for row in rows], [20])
+        end, parts, rows = batch(after_ahead)
+        self.assertEqual([part["kind"] for part in parts], ["spill"] * 3)
+        self.assertEqual(rows, expected)
+        self.assertEqual(end["commit_lsn"], expected_end["commit_lsn"])
+        # A re-plan with the driver's cache gone reads the transaction again, as pages.
+        partitioned._partition_embedded_rows.clear()
+        replanned = partitioned.get_partitions("app.orders", {}, after_ahead, end)
+        self.assertEqual(json.loads(json.dumps(replanned)), parts)
+        # An executor shapes the delete channel from the same pages.
+        deleted = [
+            row
+            for part in parts
+            for row in partitioned.read_partition(
+                "app.orders", {**part, "deletes": True, "tombstones": False}, {}
+            )
+        ]
+        self.assertEqual(deleted, expected_deletes)
+
+    def test_a_spilled_savepoint_rollback_drops_the_changes_it_covers(self):
+        # A DISCARD drops what it covers both on pages already written and in memory;
+        # changes after it are kept.
+        connector = self.connector(FakeBridge(), registration_scope="spill-discard")
+        table = connector._table("app.orders", {})
+
+        def insert(lsn, key):
+            row = {"id": key, "value": "v"}
+            return {"op": "INSERT", "tx_id": 7, "lsn": lsn, "table": table.identity, "row": row}
+
+        with mock.patch.object(informix_module, "_CDC_SPILL_PAGE_RECORDS", 2):
+            spill = connector._cdc_spill([informix_module._capture_descriptor(table)])
+            spill.start(7, 101, [insert(102, 1), insert(103, 2)])
+            spill.add(insert(104, 3))
+            spill.discard(7, 103)
+            spill.add(insert(105, 4))
+            parts = spill.finish(7)
+        tx = informix_module.CommittedTransaction(7, 101, 110, 110, (), None, tuple(parts))
+        rows = informix_module._SpilledRows(
+            connector._stream_staged_page_for,
+            parts,
+            tx,
+            table,
+            {},
+            deletes=False,
+            tombstones=False,
+            encoding="latin-1",
+        )
+        self.assertEqual([row["id"] for row in rows], [1, 4])
 
     def test_partitioned_embedded_path_matches_read_table(self):
         # A non-page-serve microbatch (stream phase) yields a single embedded
@@ -15159,6 +15433,40 @@ class SharedCdcShardTests(unittest.TestCase):
         self.assertEqual([tx.tx_id for tx in view_b.committed], [2])
         self.assertTrue(view_a.caught_up)
         self.assertEqual((view_a.min_lsn, view_a.current_lsn), (1, 106))
+
+    def test_a_spilled_transaction_reaches_its_table_and_crosses_the_host_socket(self):
+        # A transaction whose changes all went to staged pages has no change records, only
+        # a SPILLED record per table: the shard still delivers it to that table alone, and
+        # a host-shared view carries the SPILLED records to the follower.
+        shard = self._shard_with_two_tables()
+        spilled = {
+            "op": "SPILLED",
+            "tx_id": 3,
+            "lsn": 108,
+            "table": self.table_b.identity,
+            "pipeline_scope": "scope",
+            "run": "layout-107-3",
+            "pages": 2,
+            "discarded": [],
+        }
+        stream = self._two_table_stream()[:-1] + [
+            {"op": "BEGIN", "tx_id": 3, "lsn": 107},
+            spilled,
+            {"op": "COMMIT", "tx_id": 3, "lsn": 109},
+            {"op": "TIMEOUT", "lsn": 110},
+        ]
+        shard.ingest(stream, self._schema_map(), 1, 110, 0)
+        view_a, view_b = shard.snapshot(self.id_a, 0), shard.snapshot(self.id_b, 0)
+        self.assertEqual([tx.tx_id for tx in view_a.committed], [1])
+        self.assertEqual([tx.tx_id for tx in view_b.committed], [2, 3])
+        self.assertEqual(view_b.committed[-1].records, ())
+        self.assertEqual(view_b.committed[-1].spilled[0]["run"], "layout-107-3")
+        wired = informix_module._unwire_view(
+            pickle.loads(pickle.dumps(informix_module._wire_view(view_b)))
+        )
+        self.assertEqual(
+            [tx.spilled for tx in wired.committed], [tx.spilled for tx in view_b.committed]
+        )
 
     def test_a_view_names_where_the_idle_read_it_comes_from_started(self):
         # A bounded read tells a scan stopped short from the log reader's end by where the

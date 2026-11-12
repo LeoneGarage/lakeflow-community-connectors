@@ -182,7 +182,8 @@ rather than start from an unrelated position.
 | `cdc.shared.state.wait.seconds` | No | `300` | Maximum time a delete reader waits for its table's upsert reader to publish initialization, trigger-boundary, or schema-transition state. When the upsert reader refuses a schema change, it records why for the current update, and the delete reader fails at once with that error rather than waiting. Otherwise, in a triggered update, a delete reader still waiting this long for a schema transition fails, naming the upsert reader, whose flow has most likely failed: the update would never end. A continuous update needs no such bound, since one failed flow fails it. It also sets how long a CDC shard keeps a table subscribed after its last poll: a flow that stops polling, or whose process exits, is dropped from its shard after this long, so it can't hold back the shard's restart position. |
 | `cdc.max.records` | No | `256` | Soft native record target per CDC session; range `1`–`256`. Defaults to the source's own per-session ceiling because each poll pays a connection slot plus a full CDC session open/activate/close, so a smaller window amortises that fixed cost over less log progress. Once reached, records continue until every transaction already observed commits, rolls back, or Informix returns TIMEOUT. |
 | `cdc.max.frame.bytes` | No | `16777216` | Maximum accepted native CDC frame size (16 MiB by default; minimum `16`). |
-| `cdc.max.transaction.records` | No | `100000` | Maximum records buffered in an open transaction. Exceeding it fails without emitting uncommitted data. |
+| `cdc.max.transaction.records` | No | `100000` | Maximum records buffered in memory in an open transaction. Exceeding it fails without emitting uncommitted data. With `cdc.spill.records` on (the default) a transaction is spilled before it gets there, so this bounds only the transactions kept in memory. |
+| `cdc.spill.records` | No | `50000` | Change records an open transaction may hold in memory in one CDC poll. Past it, the transaction's changes go to the staging Volume (`snapshot.staging.location`) in pages of up to 10,000 (fewer for wide rows), and its batch is served from those pages by executors, so a transaction of any size neither fails nor fills the reader's memory. See [Large transactions](#large-transactions). `0` keeps every transaction in memory, bounded by `cdc.max.transaction.records`. |
 | `cdc.max.poll.records` | No | `200000` | Total decoded-record bound for one native CDC poll, including committed records interleaved with a long-running transaction. Reaching it ends the poll and returns the transactions that already committed, so the checkpoint advances and the next poll resumes from the oldest still-open transaction. It fails only when no transaction completed, since then there is no progress to checkpoint. |
 | `cdc.max.poll.bytes` | No | `0` | Optional estimated retained-byte bound per CDC poll, counting native frames plus recursively sized decoded Python values. Reaching it truncates the poll on the same terms as `cdc.max.poll.records`. The default `0` disables the bound and byte accounting. |
 | `cdc.read.bytes` | No | `32000` | Bytes requested in each SmartLOB CDC read. |
@@ -587,6 +588,34 @@ use that boundary even when cancellation or retry left their predecessor
 generations different, then independently checkpoint the shared generation.
 
 A CDC poll ends when Informix's log reader goes idle for `cdc.timeout` seconds, which on a busy log can happen before it reaches the end. In a continuous pipeline an idle poll returns no rows and leaves the checkpoint unchanged. A triggered update reads until the log reader has passed the update's high-water boundary: a poll that goes idle short of it, with no transaction open, moves the checkpoint to where the log reader stopped, so the next read carries on from there instead of rescanning, and the update doesn't end early. Incomplete or open transactions never advance the checkpoint past their `BEGIN`. If the restart LSN predates the minimum retained logical log in `sysmaster:syslogs`, continuation fails and the table must be resnapshotted. Every CDC session validates its initial METADATA frame against a fresh catalog layout before decoding later records; another METADATA frame in that session fails immediately and requires a full refresh.
+
+### Large transactions
+
+The connector emits a transaction only once it has seen its `COMMIT`, so a poll holds an
+open transaction's changes until then. An UPDATE counts twice, its before- and
+after-image. Once one open transaction holds more than `cdc.spill.records` (50,000 by
+default), its changes go to the staging Volume instead, in pages of up to 10,000 changes (fewer for wide rows) under a
+`cdc-spill` stage beside the snapshot pages:
+
+- **What stays in memory:** only the page being filled. A transaction of any size gets
+  through without raising `cdc.max.transaction.records`.
+- **How it's served:** the committed transaction is a microbatch of its own, never
+  combined with others. Executors read its pages in parallel, one partition per page,
+  and shape the rows there. The rows are the same as an in-memory transaction's,
+  including filters, renames, transforms and the delete channel.
+- **Rollbacks:** a `ROLLBACK` deletes the pages. A rollback to a savepoint drops the
+  changes it covers on the pages as well as in memory.
+- **Retries and re-plans:** a poll that's retried, or a batch planned again after a
+  restart, reads the transaction from its `BEGIN` again and rewrites the same pages.
+- **Clean-up:** pages are left in place once served, and the stale-stage sweep
+  (`snapshot.staging.retention.days`) removes them.
+- **The cost:** the poll writes every page before the batch can be served.
+- **Where memory still applies:** on the simple reader (`stream.partitioned` off), and
+  during an incremental snapshot, the rows are shaped from the pages on the driver and
+  held in memory there, as every batch is on those paths.
+
+Set `cdc.spill.records` to `0` to keep every transaction in memory, bounded by
+`cdc.max.transaction.records`.
 
 ### Schema evolution without full refresh
 

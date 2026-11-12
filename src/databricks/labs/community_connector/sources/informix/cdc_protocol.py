@@ -99,6 +99,13 @@ class OpenTransactionRecords:
             raise CdcProtocolError(f"CDC data for unknown transaction {tx_id}")
         self._sequences[tx_id].append(lsn)
 
+    def held(self, tx_id: int) -> int:
+        return len(self._sequences.get(tx_id, ()))
+
+    def release(self, tx_id: int) -> None:
+        # Docstring: Stop counting an open transaction whose records went to storage.
+        self._sequences[tx_id] = []
+
     def discard(self, tx_id: int, lsn: int) -> None:
         if tx_id not in self._sequences:
             raise CdcProtocolError(f"CDC DISCARD for unknown transaction {tx_id}")

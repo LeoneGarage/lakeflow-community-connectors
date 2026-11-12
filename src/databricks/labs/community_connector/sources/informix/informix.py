@@ -31,6 +31,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import zipfile
 import zlib
 from collections import deque
@@ -289,6 +290,15 @@ _DEFAULT_MAX_RECORDS_PER_BATCH = 10000
 # largest window the source accepts and let the soft-boundary loop finish any
 # transaction still open past it.
 _DEFAULT_CDC_MAX_RECORDS = 256
+# An open transaction holding more change records than cdc.spill.records in one poll has
+# them written to the staging Volume as pages of up to _CDC_SPILL_PAGE_RECORDS, under a
+# "cdc-spill" stage beside the snapshot pages, rather than kept in memory. Its batch is
+# served from those pages by executors. 0 keeps every transaction in memory, bounded by
+# cdc.max.transaction.records.
+_CDC_SPILL_RECORDS_OPTION = "cdc.spill.records"
+_DEFAULT_CDC_SPILL_RECORDS = 50_000
+_CDC_SPILL_PAGE_RECORDS = 10_000
+_CDC_SPILL_SCHEMA = "cdc-spill"
 _SNAPSHOT_MODES = frozenset(
     {
         "incremental",
@@ -1196,7 +1206,13 @@ def _replay_between_offsets(start, end, read, options, connector_options):
                     raise InformixError(_m(2))
                 time.sleep(min(random.uniform(0.05, 0.2), remaining_wait))
             replay_start = reached
-        records = itertools.chain.from_iterable(record_parts)
+        # A replay done in one read hands back that read's rows as they came, so a spilled
+        # transaction (_SpilledRows) still reaches get_partitions as pages.
+        records = (
+            record_parts[0]
+            if len(record_parts) == 1
+            else itertools.chain.from_iterable(record_parts)
+        )
         try:
             reached_lsn = int(reached["commit_lsn"])
             stop_lsn = int(stop)
@@ -3666,6 +3682,8 @@ class PurePythonInformixBridge:
                 "cdc_activatesess",
             )
             parser = CdcFrameParser(int(self.options.get("cdc.max.frame.bytes", str(16 << 20))))
+            # Set by the connector for one poll (_read_changes_with_reconnect), else None.
+            spill = getattr(self, "cdc_spill", None)
             records = []
             budget_records = 0
             open_transactions = OpenTransactionRecords()
@@ -3727,7 +3745,12 @@ class PurePythonInformixBridge:
                         )
                     except CdcProtocolError as error:
                         raise _stale_capture_label_error(frame, error, start_lsn) from error
-                    if max_poll_bytes:
+                    if max_poll_bytes and not (
+                        # A spilled transaction's changes are not retained.
+                        spill is not None
+                        and record["op"] in _DATA_OPS
+                        and spill.holds(int(record.get("tx_id") or 0))
+                    ):
                         retained_bytes += len(frame) + _deep_size(record)
                     if max_poll_bytes and retained_bytes > max_poll_bytes:
                         _stop_at_poll_bound(f"cdc.max.poll.bytes={max_poll_bytes}")
@@ -3765,19 +3788,45 @@ class PurePythonInformixBridge:
                         _stop_at_poll_bound(f"cdc.max.poll.records={max_poll_records}")
                         truncated = True
                         break
-                    records.append(record)
+                    # A transaction that outgrew cdc.spill.records keeps its changes on
+                    # the staging Volume (see _CdcSpill), not in this poll's records.
+                    tx_id = int(record.get("tx_id") or 0)
+                    spilling = spill is not None and spill.holds(tx_id)
+                    if spilling and record["op"] in _DATA_OPS:
+                        spill.add(record)
+                    else:
+                        records.append(record)
                     if record["op"] not in {"METADATA", "TIMEOUT"}:
                         budget_records += 1
                     if record["op"] == "COMMIT":
                         completed_transactions += 1
                     if record["op"] == "BEGIN":
-                        open_transactions.begin(int(record["tx_id"]))
-                    elif record["op"] in _DATA_OPS:
-                        open_transactions.append(int(record["tx_id"]), int(record["lsn"]))
+                        open_transactions.begin(tx_id)
+                    elif record["op"] in _DATA_OPS and not spilling:
+                        open_transactions.append(tx_id, int(record["lsn"]))
+                        if spill is not None and open_transactions.held(tx_id) > spill.threshold:
+                            # Its changes, and any DISCARD among them, go to the spill in
+                            # order; its BEGIN stays here for the transaction buffer.
+                            own = [r for r in records if r.get("tx_id") == tx_id]
+                            records[:] = [
+                                r for r in records if r.get("tx_id") != tx_id or r["op"] == "BEGIN"
+                            ]
+                            begin = next((r for r in own if r["op"] == "BEGIN"), own[0])
+                            spill.start(
+                                tx_id, int(begin["lsn"]), [r for r in own if r["op"] != "BEGIN"]
+                            )
+                            open_transactions.release(tx_id)
                     elif record["op"] == "DISCARD":
-                        open_transactions.discard(int(record["tx_id"]), int(record["lsn"]))
+                        open_transactions.discard(tx_id, int(record["lsn"]))
+                        if spilling:
+                            spill.discard(tx_id, int(record["lsn"]))
                     elif record["op"] in {"COMMIT", "ROLLBACK"}:
-                        open_transactions.finish(int(record["tx_id"]))
+                        open_transactions.finish(tx_id)
+                        if spilling and record["op"] == "ROLLBACK":
+                            spill.drop(tx_id)
+                        elif spilling:
+                            # Ahead of the COMMIT, so the transaction carries its pages.
+                            records[-1:-1] = spill.finish(tx_id)
                     if open_transactions.buffered > max_transaction_records:
                         # 58: An open CDC transaction exceeded cdc.max.transaction.records={}
                         raise InformixError(_m(58, max_transaction_records))
@@ -6088,6 +6137,8 @@ class Transaction:
     begin_lsn: int
     records: list[dict[str, Any]] = field(default_factory=list)
     pending_before: dict[str, Any] | None = None
+    # One SPILLED record per table whose changes were written to staged pages (_CdcSpill).
+    spilled: list[dict[str, Any]] = field(default_factory=list)
     last_lsn: int = field(init=False)
 
     def __post_init__(self) -> None:
@@ -6146,6 +6197,8 @@ class CommittedTransaction:
     # UTC epoch seconds from the COMMIT record (kind 2); None if the record carried none.
     # Stamped onto every row of the transaction as ``_informix_commit_time``.
     commit_time: int | None = None
+    # The SPILLED records naming the staged pages that hold the rest of its changes.
+    spilled: tuple[dict[str, Any], ...] = ()
 
 
 class TransactionBuffer:
@@ -6179,6 +6232,9 @@ class TransactionBuffer:
         if op in _DATA_OPS:
             tx.append(record)
             return None
+        if op == "SPILLED":
+            tx.spilled.append(record)
+            return None
         if op == "DISCARD":
             tx.discard(_lsn(record))
             return None
@@ -6197,8 +6253,172 @@ class TransactionBuffer:
         restart = min((item.begin_lsn for item in self.open.values()), default=end)
         commit_time = record.get("timestamp")
         return CommittedTransaction(
-            tx_id, tx.begin_lsn, end, restart, tuple(tx.records), commit_time
+            tx_id, tx.begin_lsn, end, restart, tuple(tx.records), commit_time, tuple(tx.spilled)
         )
+
+
+class _CdcSpill:
+    # Docstring: One poll's writer for open transactions that outgrow cdc.spill.records.
+    #
+    # Once an open transaction holds more changes than ``threshold``, those changes and
+    # every later one go to staged pages of up to _CDC_SPILL_PAGE_RECORDS, a run per table,
+    # instead of the poll's records. A page never ends between an UPDATE's before- and
+    # after-image, so each page shapes on its own. At COMMIT the transaction gets one
+    # SPILLED record per table naming its run, which the transaction buffer keeps in place
+    # of the changes; a ROLLBACK deletes the runs. A DISCARD (rollback to a savepoint) drops
+    # the changes it covers still in memory and records the LSN range for the pages, which
+    # readers skip. A run is named by the capture layout, the BEGIN LSN and the transaction,
+    # so a poll that reads the transaction again writes the same pages.
+
+    def __init__(self, threshold, write, delete, layout, scope, natives) -> None:
+        self.threshold = threshold
+        self._write = write  # (native identity, table, run, page index, records)
+        self._delete = delete  # (native identity, run)
+        self._layout = layout
+        self._scope = scope
+        self._natives = natives  # logical identity -> native identity
+        self._open: dict[int, tuple[str, dict[str, dict[str, Any]]]] = {}
+
+    def holds(self, tx_id: int) -> bool:
+        return tx_id in self._open
+
+    def start(self, tx_id: int, begin_lsn: int, records: list[dict[str, Any]]) -> None:
+        self._open[tx_id] = (f"{self._layout}-{begin_lsn}-{tx_id}", {})
+        for record in records:
+            if record["op"] == "DISCARD":
+                self.discard(tx_id, int(record["lsn"]))
+            else:
+                self.add(record)
+
+    def add(self, record: dict[str, Any]) -> None:
+        run, parts = self._open[int(record.get("tx_id") or 0)]
+        table = str(record.get("table") or "")
+        part = parts.setdefault(
+            table, {"pages": 0, "rows": [], "bytes": 0, "last": 0, "discarded": []}
+        )
+        part["rows"].append(record)
+        part["last"] = int(record["lsn"])
+        # Wide text or byte columns end a page early, well inside the staged-page bound.
+        part["bytes"] += 64 + sum(
+            len(value) if isinstance(value, (str, bytes, bytearray)) else 16
+            for value in (record.get("row") or {}).values()
+        )
+        if record["op"] != "BEFORE_UPDATE" and (
+            len(part["rows"]) >= _CDC_SPILL_PAGE_RECORDS or part["bytes"] >= 32 << 20
+        ):
+            self._flush(run, table, part)
+
+    def _flush(self, run: str, table: str, part: dict[str, Any]) -> None:
+        self._write(self._natives.get(table, table), table, run, part["pages"], part["rows"])
+        part["pages"] += 1
+        part["rows"] = []
+        part["bytes"] = 0
+
+    def discard(self, tx_id: int, lsn: int) -> None:
+        for part in self._open[tx_id][1].values():
+            part["rows"] = [record for record in part["rows"] if int(record["lsn"]) < lsn]
+            if part["pages"] and part["last"] >= lsn:
+                part["discarded"].append([lsn, part["last"]])
+
+    def drop(self, tx_id: int) -> None:
+        run, parts = self._open.pop(tx_id)
+        for table, part in parts.items():
+            if part["pages"]:
+                self._delete(self._natives.get(table, table), run)
+
+    def finish(self, tx_id: int) -> list[dict[str, Any]]:
+        run, parts = self._open.pop(tx_id)
+        spilled = []
+        for table, part in parts.items():
+            if part["rows"]:
+                self._flush(run, table, part)
+            if part["pages"]:
+                spilled.append(
+                    {
+                        "op": "SPILLED",
+                        "tx_id": tx_id,
+                        "lsn": part["last"],
+                        "table": table,
+                        "native_identity": self._natives.get(table, table),
+                        "pipeline_scope": self._scope,
+                        "run": run,
+                        "pages": part["pages"],
+                        "discarded": part["discarded"],
+                    }
+                )
+        return spilled
+
+
+def _spilled_page_rows(read_page, part, page_index, tx, table, options, **shape):
+    # Docstring: One spilled page's rows on one channel, shaped as _read_stream shapes an
+    # in-memory transaction. ``tx`` is (tx_id, begin, commit, restart, commit time), ``shape``
+    # the deletes, tombstones and encoding _project_transaction takes.
+
+    _header, records = read_page(
+        part["native_identity"],
+        part["table"],
+        part["pipeline_scope"],
+        _CDC_SPILL_SCHEMA,
+        part["run"],
+        page_index,
+    )
+    discarded = part["discarded"]
+    buffer = Transaction(int(tx[0]), int(tx[1]))
+    for record in records:
+        record = _normalise_record(record)
+        if not any(low <= record["lsn"] <= high for low, high in discarded):
+            buffer.append(record)
+    committed = CommittedTransaction(
+        int(tx[0]), int(tx[1]), int(tx[2]), int(tx[3]), tuple(buffer.records), tx[4]
+    )
+    for row in _project_transaction(committed, table, **shape):
+        yield _coerce_variable_decimal_values(row, table, options)
+
+
+class _SpilledRows:
+    # Docstring: A batch that is one spilled transaction: its rows on one channel, shaped
+    # from the staged pages only when iterated (the simple reader), or served page by page
+    # from executors through ``descriptors`` (the partitioned reader), so the driver never
+    # holds them.
+
+    def __init__(self, read_page, parts, tx, table, options, **shape) -> None:
+        self._read_page = read_page
+        self.parts = parts
+        self.tx = (tx.tx_id, tx.begin_lsn, tx.commit_lsn, tx.restart_lsn, tx.commit_time)
+        self.table = table
+        self.shape = shape
+        self._options = options
+        self._rows: Iterator[dict[str, Any]] | None = None
+
+    def __iter__(self) -> "_SpilledRows":
+        return self
+
+    def __next__(self) -> dict[str, Any]:
+        if self._rows is None:
+            self._rows = itertools.chain.from_iterable(
+                _spilled_page_rows(
+                    self._read_page, part, page, self.tx, self.table, self._options, **self.shape
+                )
+                for part in self.parts
+                for page in range(part["pages"])
+            )
+        return next(self._rows)
+
+    def descriptors(self, extra: dict[str, Any]) -> list[dict[str, Any]]:
+        table = _wire_table(self.table)
+        return [
+            {
+                "kind": "spill",
+                "part": part,
+                "page_index": page,
+                "tx": list(self.tx),
+                "table": table,
+                **self.shape,
+                **extra,
+            }
+            for part in self.parts
+            for page in range(part["pages"])
+        ]
 
 
 @dataclass(frozen=True, eq=False, repr=False)
@@ -6445,7 +6665,10 @@ class _SharedCdcShard:
                 for identity, sub in self.subscribers.items():
                     if identity in stale or tx.commit_lsn <= self.cursors.get(identity, 0):
                         continue
-                    if any(_record_matches(record, sub["table"]) for record in tx.records):
+                    if any(
+                        _record_matches(record, sub["table"])
+                        for record in itertools.chain(tx.records, tx.spilled)
+                    ):
                         self.buffers.setdefault(identity, deque()).append(tx)
                         self.cursors[identity] = tx.commit_lsn
             # A subscriber is covered once a read that captured it was activated at or
@@ -6666,6 +6889,21 @@ def _unwire_table(data: dict[str, Any]) -> Table:
     return Table(**fields)
 
 
+def _unwire_json_table(data: dict[str, Any]) -> Table:
+    # Docstring: _unwire_table for a table that crossed JSON (a partition descriptor), which
+    # turned its tuples into lists.
+
+    def tuples(value: Any) -> Any:
+        return tuple(tuples(item) for item in value) if isinstance(value, list) else value
+
+    return _unwire_table(
+        {
+            name: value if name in _HOST_SHARD_TABLE_COLUMN_FIELDS else tuples(value)
+            for name, value in data.items()
+        }
+    )
+
+
 def _wire_view(view: "_SharedCdcSnapshot") -> dict[str, Any]:
     # Docstring: A shard view as plain data; its records already are (decoded CDC values).
 
@@ -6675,7 +6913,15 @@ def _wire_view(view: "_SharedCdcSnapshot") -> dict[str, Any]:
         "min_lsn": view.min_lsn,
         "current_lsn": view.current_lsn,
         "committed": [
-            (tx.tx_id, tx.begin_lsn, tx.commit_lsn, tx.restart_lsn, tx.records, tx.commit_time)
+            (
+                tx.tx_id,
+                tx.begin_lsn,
+                tx.commit_lsn,
+                tx.restart_lsn,
+                tx.records,
+                tx.commit_time,
+                tx.spilled,
+            )
             for tx in view.committed
         ],
         "caught_up": view.caught_up,
@@ -7649,6 +7895,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             ("cdc.max.records", str(_DEFAULT_CDC_MAX_RECORDS), 1),
             ("cdc.max.frame.bytes", str(16 << 20), 16),
             ("cdc.max.transaction.records", "100000", 1),
+            (_CDC_SPILL_RECORDS_OPTION, str(_DEFAULT_CDC_SPILL_RECORDS), 0),
             ("cdc.max.poll.records", "200000", 1),
             ("cdc.max.poll.bytes", "0", 0),
             ("cdc.read.bytes", "32000", 1),
@@ -8679,7 +8926,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             self._partition_page_batches[self._partition_offset_key(start_offset)] = rows.page_batch
             return next_offset
         self._partition_embedded_rows[self._partition_offset_key(start_offset)] = (
-            self._encode_embedded_rows(rows)
+            # A spilled transaction stays on its pages, which get_partitions hands to executors.
+            rows if isinstance(rows, _SpilledRows) else self._encode_embedded_rows(rows)
         )
         return next_offset
 
@@ -8893,7 +9141,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             rows = self._replay_embedded_range(
                 table_name, start_offset or {}, end_offset or {}, table_options
             )
-            encoded = self._encode_embedded_rows(rows)
+            encoded = rows if isinstance(rows, _SpilledRows) else self._encode_embedded_rows(rows)
+        if isinstance(encoded, _SpilledRows):
+            return encoded.descriptors(self._transform_descriptor_fields(table))
         return self._embedded_descriptors(table, encoded)
 
     def _replay_embedded_range(
@@ -9017,6 +9267,21 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # Executor side: read one `.unl` byte split by descriptor only -- no Table
             # and no Informix connection; shape rows identically to the serial path.
             yield from self._read_unl_split(partition, table_options)
+            return
+        if kind == "spill":
+            # Executor side: one staged page of a spilled transaction, shaped here by the
+            # table the descriptor carries -- no catalog lookup and no Informix connection.
+            yield from _spilled_page_rows(
+                self._stream_staged_page_for,
+                partition["part"],
+                int(partition["page_index"]),
+                partition["tx"],
+                _unwire_json_table(partition["table"]),
+                table_options,
+                deletes=bool(partition["deletes"]),
+                tombstones=bool(partition["tombstones"]),
+                encoding=str(partition["encoding"]),
+            )
             return
         # 176: Unknown Informix partition descriptor kind: {!r}
         raise InformixError(_m(176, kind))
@@ -13540,6 +13805,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
 
         attempt = 0
         while True:
+            # A fresh spill each attempt: a retried read writes its transactions' pages again.
+            self._bridge.cdc_spill = self._cdc_spill(captures)
             try:
                 return self._bridge.read_changes(captures, restart, timeout_seconds, max_records)
             except ConnectionCapacityUnavailable:
@@ -13573,6 +13840,40 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     reset()
                 time.sleep(delay)
                 attempt += 1
+            finally:
+                self._bridge.cdc_spill = None
+
+    def _cdc_spill(self, captures: Sequence[dict[str, Any]]) -> _CdcSpill | None:
+        # Docstring: The spill writer for one poll over ``captures``, or None when
+        # cdc.spill.records is 0. Pages go to the staging Volume under this reader's scope,
+        # in a "cdc-spill" stage the stale-stage sweep also clears.
+
+        threshold = int(self.options.get(_CDC_SPILL_RECORDS_OPTION, _DEFAULT_CDC_SPILL_RECORDS))
+        if threshold <= 0 or not getattr(self, "_snapshot_staging_location", None):
+            return None
+        scope = self._pipeline_scope()
+        natives = {str(c["logical_identity"]): str(c["identity"]) for c in captures}
+        layout = hashlib.sha256(
+            json.dumps(list(captures), sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:12]
+
+        def write(native: str, name: str, run: str, page_index: int, records: list) -> None:
+            target = types.SimpleNamespace(
+                native_identity=native, exposed_name=name, primary_keys=()
+            )
+            self._maybe_sweep_stale_snapshot_stages(target)
+            self._publish_snapshot_stage_page(
+                target, scope, _CDC_SPILL_SCHEMA, run, page_index, records, None
+            )
+
+        def delete(native: str, run: str) -> None:
+            path = os.path.join(
+                self._snapshot_stage_namespace_for(native, scope, _CDC_SPILL_SCHEMA), "runs", run
+            )
+            with contextlib.suppress(OSError):
+                PurePythonInformixBridge._remove_connection_slot_tree(path)
+
+        return _CdcSpill(threshold, write, delete, layout, scope, natives)
 
     def _snapshot_read_with_reconnect(self, thunk, *, table: Table, operation: str):
         # Docstring: Run one snapshot page or key-bound read, retrying in place on a drop.
@@ -14189,6 +14490,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             if stop_lsn is not None and tx.commit_lsn > stop_lsn:
                 crossed_trigger_boundary = True
                 break
+            spilled = [part for part in tx.spilled if _record_matches(part, shape_table)]
+            if spilled and output:
+                # A spilled transaction is a batch of its own: it waits for the next one.
+                row_budget_reached = True
+                break
             projected = _project_transaction(
                 tx,
                 shape_table,
@@ -14218,6 +14524,22 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 trigger_generation=checkpoint.get("trigger_generation"),
                 trigger_high_water=checkpoint.get("trigger_high_water"),
             )
+            if spilled:
+                # Its changes stay on the staged pages until the batch is served. All of
+                # them went there once it spilled, so nothing was projected above.
+                output = _SpilledRows(
+                    self._stream_staged_page_for,
+                    spilled,
+                    tx,
+                    shape_table,
+                    options,
+                    deletes=deletes,
+                    tombstones=tombstones,
+                    encoding=self._source_encoding(options),
+                )
+                # Work remains for this table only if a transaction follows it.
+                row_budget_reached = tx is not recovered[-1]
+                break
             if len(output) >= max_rows:
                 row_budget_reached = True
                 break
@@ -18394,3 +18716,69 @@ __all__ = [
     "UnsupportedChangeError",
     "set_bridge_factory",
 ]
+
+
+def _shorten_merged_definitions(namespace: dict[str, Any]) -> None:
+    # Docstring: In the merged single file, strip ``register_lakeflow_source.<locals>.``
+    # from every definition's qualname and drop function annotations.
+    #
+    # The merge nests the whole connector inside register_lakeflow_source, so Spark
+    # pickles every function and class by value. Each function carries that prefix twice
+    # (on the function and on its code object, nested code included) and an annotations
+    # dict nothing reads at run time: about 67 KB of the 1 MiB the planner accepts.
+    # Tracebacks still show each function's name, file and line. Imported as a module,
+    # nothing carries the prefix, so this changes nothing.
+    prefix = "register_lakeflow_source.<locals>."
+    seen: set[int] = set()
+    codes: dict[int, types.CodeType] = {}
+
+    def shorten(code: types.CodeType) -> types.CodeType:
+        if id(code) not in codes:
+            consts = tuple(
+                shorten(c) if isinstance(c, types.CodeType) else c for c in code.co_consts
+            )
+            qualname = getattr(code, "co_qualname", None)
+            if qualname is None:  # Python 3.10: only the function carries a qualname
+                codes[id(code)] = code.replace(co_consts=consts)
+            else:
+                codes[id(code)] = code.replace(
+                    co_consts=consts, co_qualname=qualname.removeprefix(prefix)
+                )
+        return codes[id(code)]
+
+    def visit(value: Any) -> None:
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        if isinstance(value, (staticmethod, classmethod)):
+            visit(value.__func__)
+        elif isinstance(value, property):
+            for accessor in (value.fget, value.fset, value.fdel):
+                visit(accessor)
+        elif isinstance(value, types.FunctionType):
+            if prefix in value.__qualname__ or prefix in getattr(value.__code__, "co_qualname", ""):
+                value.__code__ = shorten(value.__code__)
+                value.__qualname__ = value.__qualname__.removeprefix(prefix)
+                value.__annotations__ = {}
+                for cell in value.__closure__ or ():
+                    with contextlib.suppress(ValueError):  # an unfilled cell
+                        visit(cell.cell_contents)
+        elif isinstance(value, type):
+            if value.__qualname__.startswith(prefix):
+                value.__qualname__ = value.__qualname__.removeprefix(prefix)
+                for member in list(vars(value).values()):
+                    visit(member)
+        elif isinstance(value, dict):
+            for member in list(value.values()):
+                visit(member)
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            for member in list(value):
+                visit(member)
+
+    for value in list(namespace.values()):
+        visit(value)
+
+
+# The merged file keeps a few of its definitions as module globals (the AvailableNow
+# reader base), so both namespaces are visited.
+_shorten_merged_definitions({**globals(), **locals()})
