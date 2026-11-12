@@ -3573,6 +3573,101 @@ def register_lakeflow_source(spark):
         return deleted
 
 
+    # --- spilled CDC runs ------------------------------------------------------
+    #
+    # One record per spilled run per pipeline, naming the channels that have committed past
+    # its transaction. A channel adds itself and reads the result back in one statement, so of
+    # two channels finishing together exactly one sees the set complete (Postgres serializes
+    # the conflicting update on the row) and deletes the pages. The record has no ``scope``
+    # field, so the obsolete-update cleanup leaves it alone; the table-state GC removes it
+    # with the table.
+    _MARK_SPILL_RUN = """
+    INSERT INTO state_records (namespace, record_key, record, record_type)
+    VALUES (%(namespace)s, %(record_key)s, %(record)s::jsonb, 'cdc-spill-run')
+    ON CONFLICT (namespace, record_key) DO UPDATE
+    SET record = state_records.record || jsonb_build_object(
+      'done', COALESCE(state_records.record->'done', '{}'::jsonb) || (EXCLUDED.record->'done'),
+      'required', EXCLUDED.record->'required'
+    )
+    WHERE state_records.record_type = 'cdc-spill-run'
+    RETURNING record
+    """
+
+    _DELETE_EXPIRED_SPILL_RUNS = """
+    DELETE FROM state_records
+    WHERE namespace = %(namespace)s
+      AND record_type = 'cdc-spill-run'
+      AND record_key LIKE %(record_key_pattern)s
+      AND created_at < now() - make_interval(secs => %(retention_seconds)s)
+    """
+
+    _SELECT_SPILL_RUNS = """
+    SELECT record FROM state_records
+    WHERE namespace = %(namespace)s
+      AND record_type = 'cdc-spill-run'
+      AND record_key LIKE %(record_key_pattern)s
+      AND NOT (COALESCE(record->'done', '{}'::jsonb) ? %(channel)s)
+    """
+
+
+    def mark_spill_run(
+        connection: Any, namespace: str, record_key: str, record: dict[str, Any]
+    ) -> dict[str, Any]:
+        # Docstring: Add ``record``'s channel to a spilled run's record; return the record as stored.
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                _MARK_SPILL_RUN,
+                {
+                    "namespace": namespace,
+                    "record_key": record_key,
+                    "record": json.dumps(record, sort_keys=True),
+                },
+            )
+            row = cursor.fetchone()
+        connection.commit()
+        if row is None:
+            raise LakebaseStateError(f"state record {namespace}/{record_key} is not a spilled run")
+        return _as_dict(row[0])
+
+
+    def list_spill_runs(
+        connection: Any,
+        namespace: str,
+        spill_prefix: str,
+        scope: str,
+        channel: str,
+        retention_seconds: float,
+    ) -> list[dict[str, Any]]:
+        # Docstring: A table's spilled-run records under one scope that ``channel`` has not finished.
+        #
+        # Records older than ``retention_seconds`` go first, under every scope of the table: the
+        # staging sweep removes their pages by then, and a pipeline that no longer runs has no
+        # reader left to expire its own. 0 keeps them.
+
+        with connection.cursor() as cursor:
+            if retention_seconds > 0:
+                cursor.execute(
+                    _DELETE_EXPIRED_SPILL_RUNS,
+                    {
+                        "namespace": namespace,
+                        "record_key_pattern": f"{spill_prefix}/%",
+                        "retention_seconds": float(retention_seconds),
+                    },
+                )
+            cursor.execute(
+                _SELECT_SPILL_RUNS,
+                {
+                    "namespace": namespace,
+                    "record_key_pattern": f"{spill_prefix}/{scope}/%",
+                    "channel": channel,
+                },
+            )
+            rows = cursor.fetchall()
+        connection.commit()
+        return [_as_dict(row[0]) for row in rows]
+
+
     def touch_table_activity(
         connection: Any,
         namespace: str,
@@ -5919,6 +6014,9 @@ def register_lakeflow_source(spark):
     _DEFAULT_CDC_SPILL_RECORDS = 50_000
     _CDC_SPILL_PAGE_RECORDS = 10_000
     _CDC_SPILL_SCHEMA = "cdc-spill"
+    # A run's Lakebase record names the channels that have committed past its transaction;
+    # the channel that completes the table's set deletes the pages.
+    _CDC_SPILL_RECORD_TYPE = "cdc-spill-run"
     _SNAPSHOT_MODES = frozenset(
         {
             "incremental",
@@ -11885,6 +11983,37 @@ def register_lakeflow_source(spark):
             )
 
 
+    def _spill_scope(scope: Any) -> str | None:
+        # Docstring: The scope spilled pages are named under, or None without a valid scope.
+        #
+        # The pipeline's, not the update's: a later update reading a transaction again finds the
+        # pages and the Lakebase record an earlier one left, so a cancelled update leaves no copy
+        # behind. A scope outside a pipeline (random per registration) stays as it is.
+
+        if not isinstance(scope, str) or _PIPELINE_SCOPE.fullmatch(scope) is None:
+            return None
+        pipeline, separator, _update = scope.partition("_@_")
+        return pipeline.replace("-", "") if separator else scope
+
+
+    def _spill_run(layout: str, begin: int, tx_id: int, record: dict[str, Any]) -> str:
+        # Docstring: A run's name: its table's capture layout, its transaction's BEGIN LSN and ID,
+        # and a digest of the table's first change in it. A reinitialized log reuses positions, so
+        # the digest keeps a later transaction from taking an earlier one's pages or record.
+
+        first = json.dumps(
+            [record.get("lsn"), record.get("op"), record.get("row")], sort_keys=True, default=str
+        )
+        return f"{layout}-{begin}-{tx_id}-{hashlib.sha256(first.encode()).hexdigest()[:12]}"
+
+
+    def _spill_run_consumed(record: dict[str, Any]) -> bool:
+        # Docstring: Whether every channel a run's record requires has committed past it.
+
+        required, done = record.get("required"), record.get("done") or {}
+        return isinstance(required, list) and bool(required) and all(done.get(c) for c in required)
+
+
     class _CdcSpill:
         # Docstring: One poll's writer for open transactions that outgrow cdc.spill.records.
         #
@@ -11895,9 +12024,9 @@ def register_lakeflow_source(spark):
         # SPILLED record per table naming its run, which the transaction buffer keeps in place
         # of the changes; a ROLLBACK deletes the runs. A DISCARD (rollback to a savepoint) drops
         # the changes it covers still in memory and records the LSN range for the pages, which
-        # readers skip. A table's run is named by its capture layout, the BEGIN LSN and the
-        # transaction, so a poll that reads the transaction again, or the other channel's,
-        # names the same pages.
+        # readers skip. A table's run is named by its capture layout, the BEGIN LSN, the
+        # transaction and its first change (see _spill_run), so a poll that reads the
+        # transaction again, the other channel's, or a later update's, names the same pages.
 
         def __init__(self, threshold, write, delete, layouts, scope, natives) -> None:
             self.threshold = threshold
@@ -11925,7 +12054,7 @@ def register_lakeflow_source(spark):
             table = str(record.get("table") or "")
             part = parts.get(table)
             if part is None:
-                run = f"{self._layouts.get(table, '')}-{begin}-{tx_id}"
+                run = _spill_run(self._layouts.get(table, ""), begin, tx_id, record)
                 part = parts[table] = {
                     "run": run,
                     "pages": 0,
@@ -13732,6 +13861,11 @@ def register_lakeflow_source(spark):
             # reader instance, so the age-based safety net runs at most once per table per
             # instance (off the serve path) instead of every microbatch.
             self._retention_swept: set[str] = set()
+            # Driver-only: the spilled runs each (table, channel) has yet to finish, as run ->
+            # (spill scope, BEGIN LSN, commit LSN or None), and the pairs whose runs have been
+            # listed from Lakebase already (see _settle_spilled_runs).
+            self._spill_runs: dict[tuple[str, str], dict[str, tuple[str, int, int | None]]] = {}
+            self._spill_runs_listed: set[tuple[str, str]] = set()
 
         def set_registration_scope(self, scope: str) -> None:
             # Docstring: Install the scope shared by every reader serialized from one registration.
@@ -13754,6 +13888,8 @@ def register_lakeflow_source(spark):
                 self._unl_gzip_reader = None
                 self._unl_gzip_window_memo = None
                 self._retention_swept.clear()
+                self._spill_runs.clear()
+                self._spill_runs_listed.clear()
                 self._trigger_available_now = False
             self._registration_scope = scope
 
@@ -13857,6 +13993,8 @@ def register_lakeflow_source(spark):
             state["_staging_files_api"] = None
             state["_staging_transport_resolved"] = False
             state["_partition_page_batches"] = {}
+            state["_spill_runs"] = {}
+            state["_spill_runs_listed"] = set()
             return state
 
         def __setstate__(self, state: dict[str, Any]) -> None:
@@ -19476,18 +19614,17 @@ def register_lakeflow_source(spark):
 
         def _cdc_spill(self, captures: Sequence[dict[str, Any]]) -> _CdcSpill | None:
             # Docstring: The spill writer for one poll over ``captures``, or None when
-            # cdc.spill.records is 0. Pages go to the staging Volume under this reader's scope,
-            # in a "cdc-spill" stage the stale-stage sweep also clears.
+            # cdc.spill.records is 0. Pages go to the staging Volume under the pipeline's spill
+            # scope (see _spill_scope), in a "cdc-spill" stage the stale-stage sweep also clears.
 
             threshold = int(self.options.get(_CDC_SPILL_RECORDS_OPTION, _DEFAULT_CDC_SPILL_RECORDS))
-            scope = getattr(self, "_registration_scope", None)
+            scope = _spill_scope(getattr(self, "_registration_scope", None))
             if (
                 threshold <= 0
                 or not getattr(self, "_snapshot_staging_location", None)
                 # A reader without a scope can't name pages another process finds: it keeps
                 # every transaction in memory instead of failing the read.
-                or not isinstance(scope, str)
-                or _PIPELINE_SCOPE.fullmatch(scope) is None
+                or scope is None
             ):
                 return None
             natives = {str(c["logical_identity"]): str(c["identity"]) for c in captures}
@@ -19499,12 +19636,21 @@ def register_lakeflow_source(spark):
                 ).hexdigest()[:12]
                 for c in captures
             }
+            # Whether each run this poll writes is consumed already, asked once per run.
+            consumed: dict[str, bool] = {}
 
             def write(native: str, name: str, run: str, page_index: int, records: list) -> None:
                 target = types.SimpleNamespace(
                     native_identity=native, exposed_name=name, primary_keys=()
                 )
                 self._maybe_sweep_stale_snapshot_stages(target)
+                if run not in consumed:
+                    consumed[run] = self._register_spill_run(native, scope, run)
+                if consumed[run]:
+                    # Every channel has committed past this transaction, so no batch reads these
+                    # pages: a poll that reads it again (a shard reading below it for another
+                    # table) writes none.
+                    return
                 # The upsert and delete channels read the same transaction under the same
                 # capture and scope, so they name the same pages with the same contents: a page
                 # the other channel has written already is kept, not encoded and written again.
@@ -19525,6 +19671,155 @@ def register_lakeflow_source(spark):
                     PurePythonInformixBridge._remove_connection_slot_tree(path)
 
             return _CdcSpill(threshold, write, delete, layouts, scope, natives)
+
+        def _spill_run_key(self, native_identity: str, scope: str, run: str) -> str:
+            # Docstring: A run's Lakebase record key, under its table's state prefix so the
+            # table-state GC removes it with the table.
+
+            return "/".join(
+                (*self._table_state_keys_for(native_identity), _CDC_SPILL_SCHEMA, scope, run)
+            )
+
+        def _register_spill_run(self, native_identity: str, scope: str, run: str) -> bool:
+            # Docstring: Record a run a poll writes in Lakebase; report whether it is consumed.
+            #
+            # Best-effort: without the record the pages are written all the same, and only their
+            # cleanup falls to the retention sweep.
+
+            begin = run.split("-")[1]
+            record = {
+                "format_version": 1,
+                "table": native_identity,
+                "spill_scope": scope,
+                "run": run,
+                "begin_lsn": begin,
+                "done": {},
+            }
+            key = self._spill_run_key(native_identity, scope, run)
+            try:
+                elected = self._state_op_with_reconnect(
+                    lambda: publish_state_record(
+                        self._lakebase_connection(),
+                        self._lakebase_state_namespace(),
+                        key,
+                        record,
+                        record_type=_CDC_SPILL_RECORD_TYPE,
+                    ),
+                    operation="spilled-run registration",
+                )
+            except Exception:  # pylint: disable=broad-except
+                # 429: Cannot record spilled CDC run {} in Lakebase; its pages are left for the
+                # retention sweep
+                logging.getLogger(__name__).warning(_m(429, run), exc_info=True)
+                return False
+            return _spill_run_consumed(elected)
+
+        def _note_spilled_runs(self, spilled, tx: CommittedTransaction, deletes: bool) -> None:
+            # Docstring: Remember the runs of a spilled transaction this channel serves, by commit.
+
+            channel = "delete" if deletes else "upsert"
+            for part in spilled:
+                runs = self._spill_runs.setdefault((str(part["native_identity"]), channel), {})
+                runs[str(part["run"])] = (str(part["pipeline_scope"]), tx.begin_lsn, tx.commit_lsn)
+
+        def _settle_spilled_runs(self, table: Table, checkpoint: dict, options, deletes: bool) -> None:
+            # Docstring: Mark the spilled runs this channel has committed past, in Lakebase, and
+            # delete the pages of each run whose last channel this is.
+            #
+            # Spark gives a reader only a start it has committed, and _recover never serves a
+            # transaction at or below it. So a run is finished for this channel once the start's
+            # commit LSN reaches the transaction's commit (a run this reader served), or once its
+            # restart LSN is past the run's BEGIN (a run found in Lakebase, listed once per
+            # reader, which also expires the table's old records of every pipeline): no read
+            # from here starts below that. Not called on a replay, whose later
+            # polls start at positions Spark has not committed. The table's channels are the
+            # upsert one and, unless it is append-only, the delete one: the connector already
+            # serves one of each per table per pipeline.
+
+            scope = _spill_scope(getattr(self, "_registration_scope", None))
+            if scope is None or not getattr(self, "_snapshot_staging_location", None):
+                return
+            native = table.native_identity
+            channel = "delete" if deletes else "upsert"
+            pending = self._spill_runs.setdefault((native, channel), {})
+            listed_already = (native, channel) in self._spill_runs_listed
+            if listed_already and not pending:
+                return
+            namespace = self._lakebase_state_namespace()
+            try:
+                if not listed_already:
+                    prefix = "/".join((*self._table_state_keys_for(native), _CDC_SPILL_SCHEMA))
+                    listed = self._state_op_with_reconnect(
+                        lambda: list_spill_runs(
+                            self._lakebase_connection(),
+                            namespace,
+                            prefix,
+                            scope,
+                            channel,
+                            self._snapshot_staging_retention_seconds,
+                        ),
+                        operation="spilled-run listing",
+                    )
+                    self._spill_runs_listed.add((native, channel))
+                    for record in listed:
+                        pending.setdefault(str(record["run"]), (scope, int(record["begin_lsn"]), None))
+                commit = int(checkpoint["commit_lsn"])
+                restart = int(checkpoint.get("begin_lsn") or commit)
+                finished = [
+                    (run, entry)
+                    for run, entry in pending.items()
+                    if entry[1] < restart or (entry[2] is not None and entry[2] <= commit)
+                ]
+                if not finished:
+                    return
+                required = (
+                    ["upsert"] if self._append_only_table(table, options) else ["upsert", "delete"]
+                )
+                for run, (run_scope, begin, _end) in finished:
+                    record = {
+                        "format_version": 1,
+                        "table": native,
+                        "spill_scope": run_scope,
+                        "run": run,
+                        "begin_lsn": str(begin),
+                        "done": {channel: True},
+                        "required": required,
+                    }
+                    key = self._spill_run_key(native, run_scope, run)
+                    marked = self._state_op_with_reconnect(
+                        lambda key=key, record=record: mark_spill_run(
+                            self._lakebase_connection(), namespace, key, record
+                        ),
+                        operation="spilled-run settlement",
+                    )
+                    del pending[run]
+                    if _spill_run_consumed(marked):
+                        path = os.path.join(
+                            self._snapshot_stage_namespace_for(native, run_scope, _CDC_SPILL_SCHEMA),
+                            "runs",
+                            run,
+                        )
+                        self._snapshot_cleanup_executor().submit(self._delete_spill_pages, path)
+            except Exception:  # pylint: disable=broad-except
+                # 430: Cannot update the spilled CDC runs of '{}' in Lakebase; trying again on the
+                # next batch
+                logging.getLogger(__name__).warning(_m(430, table.exposed_name), exc_info=True)
+
+        def _delete_spill_pages(self, path: str) -> None:
+            # Docstring: Delete a consumed run's pages, then the run once nothing else is in it.
+            #
+            # A candidate page another writer is still renaming into place keeps the run, for
+            # the retention sweep.
+
+            try:
+                names = os.listdir(path)
+            except OSError:
+                return
+            for name in names:
+                if name.startswith("page-"):
+                    self._delete_snapshot_page(os.path.join(path, name))
+            with contextlib.suppress(OSError):
+                os.rmdir(path)
 
         def _snapshot_read_with_reconnect(self, thunk, *, table: Table, operation: str):
             # Docstring: Run one snapshot page or key-bound read, retrying in place on a drop.
@@ -20027,6 +20322,8 @@ def register_lakeflow_source(spark):
             # the correct stop and is applied below, so skip the live handshake while replaying.
             # A normal (non-replay) read has no replay stop and takes the boundary as before.
             replay_stop = self._replay_stop_lsn(options)
+            if replay_stop is None:
+                self._settle_spilled_runs(table, checkpoint, options, deletes)
             if self._trigger_available_now and replay_stop is None:
                 stop_lsn, trigger_generation = self._shared_trigger_boundary(
                     table,
@@ -20187,6 +20484,7 @@ def register_lakeflow_source(spark):
                 if spilled:
                     # Its changes stay on the staged pages until the batch is served. All of
                     # them went there once it spilled, so nothing was projected above.
+                    self._note_spilled_runs(spilled, tx, deletes)
                     output = _SpilledRows(
                         self._stream_staged_page_for,
                         spilled,

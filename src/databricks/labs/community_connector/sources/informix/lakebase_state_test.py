@@ -133,6 +133,15 @@ class _FakeCursor:
         if "FROM conn_limits" in text:
             self._read_limit(args)
             return
+        if "'cdc-spill-run'" in text and "INSERT INTO state_records" in text:
+            self._mark_spill_run(args)
+            return
+        if "'cdc-spill-run'" in text and text.startswith("DELETE FROM state_records"):
+            self._delete_expired_spill_runs(args)
+            return
+        if "'cdc-spill-run'" in text and text.startswith("SELECT record FROM state_records"):
+            self._select_spill_runs(args)
+            return
         if "'table-activity'" in text and "INSERT INTO state_records" in text:
             self._touch_activity(args)
             return
@@ -479,7 +488,56 @@ class _FakeCursor:
                 if maximum_lsn and current >= proposed:
                     return
             self._database.records[key] = args["record"]
+            self._database.record_types.setdefault(key, args.get("record_type", "generic"))
+            self._database.record_created.setdefault(key, self._database.now())
             self._result = [(args["record"],)]
+
+    def _mark_spill_run(self, args: dict) -> None:
+        # ON CONFLICT merges the channel into ``done`` and takes ``required`` from the
+        # candidate, keeping the stored record's other fields; another type's row is left.
+        key = (args["namespace"], args["record_key"])
+        candidate = json.loads(args["record"])
+        with self._database.lock:
+            stored = self._database.records.get(key)
+            if stored is None:
+                record = candidate
+                self._database.record_types[key] = "cdc-spill-run"
+                self._database.record_created[key] = self._database.now()
+            elif self._database.record_types.get(key) != "cdc-spill-run":
+                return
+            else:
+                record = json.loads(stored)
+                record["done"] = {**(record.get("done") or {}), **candidate["done"]}
+                record["required"] = candidate["required"]
+            raw = json.dumps(record)
+            self._database.records[key] = raw
+            self._result = [(raw,)]
+
+    def _spill_run_keys(self, args: dict) -> list[tuple[str, str]]:
+        prefix = args["record_key_pattern"].removesuffix("%")
+        return [
+            key
+            for key in self._database.records
+            if key[0] == args["namespace"]
+            and key[1].startswith(prefix)
+            and self._database.record_types.get(key) == "cdc-spill-run"
+        ]
+
+    def _delete_expired_spill_runs(self, args: dict) -> None:
+        cutoff = self._database.now() - float(args["retention_seconds"])
+        with self._database.lock:
+            for key in self._spill_run_keys(args):
+                if self._database.record_created.get(key, cutoff) < cutoff:
+                    del self._database.records[key]
+
+    def _select_spill_runs(self, args: dict) -> None:
+        with self._database.lock:
+            self._result = [
+                (self._database.records[key],)
+                for key in self._spill_run_keys(args)
+                if args["channel"]
+                not in (json.loads(self._database.records[key]).get("done") or {})
+            ]
 
     def _touch_activity(self, args: dict) -> None:
         key = (args["namespace"], args["record_key"])
@@ -538,6 +596,9 @@ class _FakeDatabase:
         self.hints: dict[tuple[str, str], dict] = {}
         self.limits: dict[str, dict] = {}
         self.records: dict[tuple[str, str], str] = {}
+        # Each record's record_type and created_at (on the fake clock), set on first insert.
+        self.record_types: dict[tuple[str, str], str] = {}
+        self.record_created: dict[tuple[str, str], float] = {}
         # Checkpoint-handoff tokens, keyed (namespace, table_key, channel).
         self.handoff: dict[tuple[str, str, int], dict] = {}
         # Postgres roles, so password provisioning and validation are testable
@@ -1138,6 +1199,74 @@ class LakebaseStateRecordTests(unittest.TestCase):
                 lakebase_state.publish_state_record(self.connection, "ns", "key", {"v": 2})
         finally:
             _FakeCursor._insert_record = original
+
+    def _spill_run(self, channel, run="run-1", required=("upsert", "delete")):
+        return {
+            "format_version": 1,
+            "run": run,
+            "begin_lsn": "100",
+            "done": {channel: True},
+            "required": list(required),
+        }
+
+    def test_a_spilled_run_is_complete_for_the_channel_that_marks_it_last(self):
+        # Each channel adds itself and reads the set back in one statement, keeping the
+        # fields a writer registered; only the second channel sees it complete.
+        lakebase_state.publish_state_record(
+            self.connection,
+            "ns",
+            "t/cdc-spill/s/run-1",
+            {"run": "run-1", "begin_lsn": "100", "table": "demo:app.orders", "done": {}},
+            record_type="cdc-spill-run",
+        )
+        first = lakebase_state.mark_spill_run(
+            self.connection, "ns", "t/cdc-spill/s/run-1", self._spill_run("upsert")
+        )
+        self.assertEqual(first["done"], {"upsert": True})
+        self.assertEqual(first["table"], "demo:app.orders")
+        second = lakebase_state.mark_spill_run(
+            self.connection, "ns", "t/cdc-spill/s/run-1", self._spill_run("delete")
+        )
+        self.assertEqual(second["done"], {"upsert": True, "delete": True})
+        self.assertEqual(second["required"], ["upsert", "delete"])
+        # A key that some other state owns is never taken over.
+        lakebase_state.publish_state_record(self.connection, "ns", "other", {"v": 1})
+        with self.assertRaises(lakebase_state.LakebaseStateError):
+            lakebase_state.mark_spill_run(self.connection, "ns", "other", self._spill_run("upsert"))
+        self.assertEqual(lakebase_state.read_state_record(self.connection, "ns", "other"), {"v": 1})
+
+    def test_spilled_runs_are_listed_per_channel_and_expire_with_the_staging_retention(self):
+        # A reader lists its own pipeline's runs of a table, and expires every pipeline's:
+        # one that no longer runs has no reader left to expire its own.
+        for key in ("t/cdc-spill/s/run-1", "t/cdc-spill/s/run-2", "t/cdc-spill/gone/run-3"):
+            run = key.rsplit("/", 1)[1]
+            lakebase_state.mark_spill_run(
+                self.connection, "ns", key, self._spill_run("upsert", run)
+            )
+        lakebase_state.mark_spill_run(
+            self.connection, "ns", "u/cdc-spill/s/run-4", self._spill_run("upsert", "run-4")
+        )
+        lakebase_state.publish_state_record(self.connection, "ns", "t/cdc-spill/s/x", {"v": 1})
+
+        def listed(channel, retention=3600.0):
+            records = lakebase_state.list_spill_runs(
+                self.connection, "ns", "t/cdc-spill", "s", channel, retention
+            )
+            return sorted(record["run"] for record in records)
+
+        def stored(key):
+            return lakebase_state.read_state_record(self.connection, "ns", key)
+
+        self.assertEqual(listed("delete"), ["run-1", "run-2"])
+        self.assertEqual(listed("upsert"), [])
+        self.database.advance(3601.0)
+        self.assertEqual(listed("delete", retention=0), ["run-1", "run-2"])
+        self.assertIsNotNone(stored("t/cdc-spill/gone/run-3"))
+        self.assertEqual(listed("delete"), [])
+        self.assertIsNone(stored("t/cdc-spill/gone/run-3"))
+        # Only the table's spilled-run records expire.
+        self.assertEqual(stored("t/cdc-spill/s/x"), {"v": 1})
+        self.assertIsNotNone(stored("u/cdc-spill/s/run-4"))
 
     def test_jsonb_text_and_dict_shapes_both_decode(self):
         # Drivers differ: psycopg2 returns jsonb as str, psycopg 3 as dict.

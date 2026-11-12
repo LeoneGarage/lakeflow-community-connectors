@@ -98,7 +98,7 @@ rather than start from an unrelated position.
 | `password` | Yes | | Password for `user`; store it as a secret. |
 | `server` | Yes | | Exact `INFORMIXSERVER` name sent during SQLI authentication. |
 | `snapshot.staging.location` | Yes | | Writable Unity Catalog Volume directory for gzip-compressed immutable initial-snapshot pages, for example `/Volumes/main/informix_cdc/staging`. This is the only Volume the connector uses; everything else lives in Lakebase. Restrict `READ VOLUME`: staged files contain source row values. Pages older than the checkpoint start page are removed incrementally; remaining staging is removed after the checkpoint reaches CDC. Abandoned scopes use `snapshot.staging.retention.days`. |
-| `snapshot.staging.retention.days` | No | `4` | Age threshold for the **background retention sweep** that reclaims abandoned snapshot staging; minimum `1`. Normal cleanup removes consumed pages incrementally and the whole stage at the snapshot→CDC transition — this sweep is the safety net for a `runs/<snapshot_lsn>` subtree left behind by a crash, an abandoned resnapshot, or a superseded schema/scope. It runs **asynchronously** (off the read path, on the same background pool as page deletion), at most once per table per reader, and deletes only runs whose newest page file is older than this window, so an active run (recent writes) is never touched. Best-effort: a leftover only wastes Volume space, never affects correctness. |
+| `snapshot.staging.retention.days` | No | `4` | Age threshold for the **background retention sweep** that reclaims abandoned snapshot staging; minimum `1`. Normal cleanup removes consumed pages incrementally and the whole stage at the snapshot→CDC transition — this sweep is the safety net for a `runs/<snapshot_lsn>` subtree left behind by a crash, an abandoned resnapshot, or a superseded schema/scope. It runs **asynchronously** (off the read path, on the same background pool as page deletion), at most once per table per reader, and deletes only runs whose newest page file is older than this window, so an active run (recent writes) is never touched. Best-effort: a leftover only wastes Volume space, never affects correctness. It also removes spilled CDC pages left behind (see [Large transactions](#large-transactions)), whose Lakebase records expire after the same window. |
 | `DB_LOCALE` | No | `en_US.819` | Database locale. Set it explicitly when the database uses another locale. |
 | `CLIENT_LOCALE` | No | `en_US.utf8` | Client locale. Its codeset controls Python row decoding. |
 | `port` | No | `9088` | Informix SQLI port; range `1`–`65535`. |
@@ -605,10 +605,20 @@ default), its changes go to the staging Volume instead, in pages of up to 10,000
   including filters, renames, transforms and the delete channel.
 - **Rollbacks:** a `ROLLBACK` deletes the pages. A rollback to a savepoint drops the
   changes it covers on the pages as well as in memory.
-- **Retries and re-plans:** a poll that's retried, or a batch planned again after a
-  restart, reads the transaction from its `BEGIN` again and rewrites the same pages.
-- **Clean-up:** pages are left in place once served, and the stale-stage sweep
-  (`snapshot.staging.retention.days`) removes them.
+- **Retries and re-plans:** pages are named by the pipeline, the table's capture, the
+  transaction and its first change, not by the update. A poll that's retried, the other
+  channel, a batch planned again after a restart, or a later update all find the pages
+  already written and keep them.
+- **Clean-up:** each run of pages has a record in the Lakebase state database (`state_records`,
+  type `cdc-spill-run`). Once Spark has committed a batch past the transaction, the upsert
+  flow and, for a keyed table, the delete flow each mark the record. The flow that marks it
+  last deletes the pages. A poll that reads the transaction again afterwards finds it
+  consumed and writes nothing.
+  - **Fallback:** pages the marking misses are removed by the stale-stage sweep
+    (`snapshot.staging.retention.days`). This covers a flow removed from the pipeline, a
+    Lakebase error while marking, and a page that was still being written.
+  - **Record expiry:** records are dropped after the same retention, whichever pipeline
+    wrote them, by the next reader of the table, or with the table's other state.
 - **The cost:** the poll writes every page before the batch can be served.
 - **Where memory still applies:** on the simple reader (`stream.partitioned` off), and
   during an incremental snapshot, the rows are shaped from the pages on the driver and

@@ -2318,6 +2318,101 @@ def delete_obsolete_scoped_state_records(
     return deleted
 
 
+# --- spilled CDC runs ------------------------------------------------------
+#
+# One record per spilled run per pipeline, naming the channels that have committed past
+# its transaction. A channel adds itself and reads the result back in one statement, so of
+# two channels finishing together exactly one sees the set complete (Postgres serializes
+# the conflicting update on the row) and deletes the pages. The record has no ``scope``
+# field, so the obsolete-update cleanup leaves it alone; the table-state GC removes it
+# with the table.
+_MARK_SPILL_RUN = """
+INSERT INTO state_records (namespace, record_key, record, record_type)
+VALUES (%(namespace)s, %(record_key)s, %(record)s::jsonb, 'cdc-spill-run')
+ON CONFLICT (namespace, record_key) DO UPDATE
+SET record = state_records.record || jsonb_build_object(
+  'done', COALESCE(state_records.record->'done', '{}'::jsonb) || (EXCLUDED.record->'done'),
+  'required', EXCLUDED.record->'required'
+)
+WHERE state_records.record_type = 'cdc-spill-run'
+RETURNING record
+"""
+
+_DELETE_EXPIRED_SPILL_RUNS = """
+DELETE FROM state_records
+WHERE namespace = %(namespace)s
+  AND record_type = 'cdc-spill-run'
+  AND record_key LIKE %(record_key_pattern)s
+  AND created_at < now() - make_interval(secs => %(retention_seconds)s)
+"""
+
+_SELECT_SPILL_RUNS = """
+SELECT record FROM state_records
+WHERE namespace = %(namespace)s
+  AND record_type = 'cdc-spill-run'
+  AND record_key LIKE %(record_key_pattern)s
+  AND NOT (COALESCE(record->'done', '{}'::jsonb) ? %(channel)s)
+"""
+
+
+def mark_spill_run(
+    connection: Any, namespace: str, record_key: str, record: dict[str, Any]
+) -> dict[str, Any]:
+    # Docstring: Add ``record``'s channel to a spilled run's record; return the record as stored.
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            _MARK_SPILL_RUN,
+            {
+                "namespace": namespace,
+                "record_key": record_key,
+                "record": json.dumps(record, sort_keys=True),
+            },
+        )
+        row = cursor.fetchone()
+    connection.commit()
+    if row is None:
+        raise LakebaseStateError(f"state record {namespace}/{record_key} is not a spilled run")
+    return _as_dict(row[0])
+
+
+def list_spill_runs(
+    connection: Any,
+    namespace: str,
+    spill_prefix: str,
+    scope: str,
+    channel: str,
+    retention_seconds: float,
+) -> list[dict[str, Any]]:
+    # Docstring: A table's spilled-run records under one scope that ``channel`` has not finished.
+    #
+    # Records older than ``retention_seconds`` go first, under every scope of the table: the
+    # staging sweep removes their pages by then, and a pipeline that no longer runs has no
+    # reader left to expire its own. 0 keeps them.
+
+    with connection.cursor() as cursor:
+        if retention_seconds > 0:
+            cursor.execute(
+                _DELETE_EXPIRED_SPILL_RUNS,
+                {
+                    "namespace": namespace,
+                    "record_key_pattern": f"{spill_prefix}/%",
+                    "retention_seconds": float(retention_seconds),
+                },
+            )
+        cursor.execute(
+            _SELECT_SPILL_RUNS,
+            {
+                "namespace": namespace,
+                "record_key_pattern": f"{spill_prefix}/{scope}/%",
+                "channel": channel,
+            },
+        )
+        rows = cursor.fetchall()
+    connection.commit()
+    return [_as_dict(row[0]) for row in rows]
+
+
 def touch_table_activity(
     connection: Any,
     namespace: str,

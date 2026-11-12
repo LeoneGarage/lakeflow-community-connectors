@@ -528,12 +528,38 @@ def _drain_snapshots_inline(connector):
     return connector
 
 
+def _track_cleanup_pools(test_case):
+    """Collect every background page-cleanup pool a connector starts during a test.
+
+    A page deletion still running when the next test starts opens state directories under
+    that test's process-wide ``os.open`` and ``time.sleep`` patches, and its calls count as
+    the next test's own. The test's tearDown waits for the pools instead.
+    """
+
+    pools = []
+    original = InformixLakeflowConnect._snapshot_cleanup_executor
+
+    def tracked(connector):
+        pool = original(connector)
+        if not any(pool is known for known in pools):
+            pools.append(pool)
+        return pool
+
+    patcher = mock.patch.object(InformixLakeflowConnect, "_snapshot_cleanup_executor", tracked)
+    patcher.start()
+    test_case.addCleanup(patcher.stop)
+    return pools
+
+
 class LakeflowContractTests(unittest.TestCase):
     def setUp(self):
         self._shared_state = tempfile.TemporaryDirectory()
         self._lakebase = _OfflineLakebase().install(self)
+        self._cleanup_pools = _track_cleanup_pools(self)
 
     def tearDown(self):
+        for pool in self._cleanup_pools:
+            pool.shutdown(wait=True)
         self._shared_state.cleanup()
 
     def connector(self, bridge=None, *, shared_cdc=False, **options):
@@ -1966,7 +1992,9 @@ class LakeflowContractTests(unittest.TestCase):
                 ("COMMIT", 7),
             ],
         )
-        run = "layout-100-7"
+        # Named by the layout, the BEGIN and the transaction, and a digest of its first change.
+        run = informix_module._spill_run("layout", 100, 7, change("INSERT", 7, 101))
+        self.assertRegex(run, r"^layout-100-7-[0-9a-f]{12}$")
         # 105 and 106 share a page; 108 was discarded before it reached one.
         self.assertEqual(writes, [(run, 0, [101, 104]), (run, 1, [105, 106]), (run, 2, [109])])
         spilled = records[5]
@@ -6522,6 +6550,130 @@ class LakeflowContractTests(unittest.TestCase):
         second, rewritten = spill([other, capture])
         self.assertEqual((written, rewritten), (3, 0))
         self.assertEqual(second, first)
+
+    def test_spilled_pages_are_named_by_pipeline_and_first_change(self):
+        # A pipeline's updates share one spill scope, so a later update reading a transaction
+        # again finds the pages an earlier one wrote; a scope outside a pipeline stays as it
+        # is. A transaction at a position a reinitialized log reuses names other pages.
+        pipeline = "f80dd5fb-882f-4690-942e-a1eeaf09335e"
+        scope = informix_module._spill_scope(f"{pipeline}_@_89b3d55b-001f-44ce-9769-4b2548af1f9b")
+        self.assertEqual(scope, pipeline.replace("-", ""))
+        self.assertEqual(
+            informix_module._spill_scope(f"{pipeline}_@_0cfb5486-66ba-481c-b708-69e8d1512858"),
+            scope,
+        )
+        self.assertEqual(informix_module._spill_scope("a" * 32), "a" * 32)
+        self.assertIsNone(informix_module._spill_scope("not a scope"))
+        self.assertIsNone(informix_module._spill_scope(None))
+        change = {"op": "INSERT", "lsn": 101, "row": {"id": 1}}
+        self.assertNotEqual(
+            informix_module._spill_run("layout", 100, 7, change),
+            informix_module._spill_run("layout", 100, 7, {**change, "row": {"id": 2}}),
+        )
+
+    def _spilled_run(self, connector, table, changes):
+        # Spill transaction 7 (BEGIN 101) over pages of 2 changes; return its SPILLED part, its
+        # run directory, and its Lakebase record key.
+        with mock.patch.object(informix_module, "_CDC_SPILL_PAGE_RECORDS", 2):
+            writer = connector._cdc_spill([informix_module._capture_descriptor(table)])
+            writer.start(7, 101, changes)
+            (part,) = writer.finish(7)
+        namespace = connector._snapshot_stage_namespace_for(
+            table.native_identity, part["pipeline_scope"], informix_module._CDC_SPILL_SCHEMA
+        )
+        key = connector._spill_run_key(table.native_identity, part["pipeline_scope"], part["run"])
+        return part, os.path.join(namespace, "runs", part["run"]), key
+
+    def _spill_record(self, connector, key):
+        return informix_module.read_state_record(
+            connector._lakebase_connection(), connector._lakebase_state_namespace(), key
+        )
+
+    def test_a_spilled_run_is_deleted_once_both_channels_commit_past_it(self):
+        # A channel marks a run in Lakebase once Spark has committed past its transaction,
+        # never on a replay; the second channel to do so deletes the pages, and a poll that
+        # reads the transaction again writes none.
+        bridge = FakeBridge()
+        connector = self.connector(bridge, registration_scope="spill-cleanup")
+        table = connector._table("app.orders", {})
+        changes = [
+            {"op": op, "tx_id": 7, "lsn": lsn, "table": table.identity, "row": {"id": key}}
+            for op, lsn, key in (("INSERT", 102, 10), ("INSERT", 103, 11), ("DELETE", 104, 10))
+        ]
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        part, run, key = self._spilled_run(connector, table, changes)
+        self.assertEqual(sorted(os.listdir(run)), ["page-00000000", "page-00000001"])
+        self.assertEqual(self._spill_record(connector, key)["done"], {})
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 101},
+            part,
+            {"op": "COMMIT", "tx_id": 7, "lsn": 110},
+        ]
+
+        def finish(deletes):
+            reader = connector.read_table_deletes if deletes else connector.read_table
+            rows, end = reader("app.orders", checkpoint, {})
+            self.assertTrue(list(rows))
+            replay = {informix_module._REPLAY_STOP_LSN_OPTION: end["commit_lsn"]}
+            reader("app.orders", end, replay)
+            before = self._spill_record(connector, key)["done"]
+            reader("app.orders", end, {})
+            self._flush_snapshot_cleanup(connector)
+            return before, self._spill_record(connector, key)
+
+        before, record = finish(deletes=False)
+        self.assertEqual((before, record["done"]), ({}, {"upsert": True}))
+        self.assertEqual(record["required"], ["upsert", "delete"])
+        self.assertTrue(os.path.isdir(run))
+        before, record = finish(deletes=True)
+        self.assertEqual(before, {"upsert": True})
+        self.assertEqual(record["done"], {"upsert": True, "delete": True})
+        self.assertFalse(os.path.exists(run))
+        # A poll reading the transaction again names the same run and writes nothing.
+        again, _, _ = self._spilled_run(connector, table, changes)
+        self.assertEqual(again, part)
+        self.assertFalse(os.path.exists(run))
+
+    def test_a_new_reader_finishes_the_spilled_runs_it_finds_in_lakebase(self):
+        # A reader started after the batch (a later update's) lists the table's runs from
+        # Lakebase once and finishes each when its restart LSN passes the run's BEGIN. An
+        # append-only table has no delete channel, so its upsert channel alone deletes.
+        connector = self.connector(FakeBridge(), registration_scope="spill-listed")
+        table = connector._table("app.orders", {})
+        changes = [
+            {"op": "INSERT", "tx_id": 7, "lsn": 102 + i, "table": table.identity, "row": {"id": i}}
+            for i in range(3)
+        ]
+        # A run another pipeline recorded past the staging retention expires with the listing.
+        gone = connector._spill_run_key(table.native_identity, "0" * 32, "layout-1-2-abc")
+        informix_module.mark_spill_run(
+            connector._lakebase_connection(),
+            connector._lakebase_state_namespace(),
+            gone,
+            {"run": "layout-1-2-abc", "begin_lsn": "1", "done": {"upsert": True}, "required": []},
+        )
+        self._lakebase.database.advance(connector._snapshot_staging_retention_seconds + 1)
+        _, run, key = self._spilled_run(connector, table, changes)
+        later = self.connector(FakeBridge(), registration_scope="spill-listed")
+
+        def settle(restart):
+            checkpoint = {"commit_lsn": str(restart + 10), "begin_lsn": str(restart)}
+            later._settle_spilled_runs(table, checkpoint, {}, False)
+            self._flush_snapshot_cleanup(later)
+            return os.path.isdir(run)
+
+        with (
+            mock.patch.object(later, "_append_only_table", return_value=True),
+            mock.patch.object(
+                informix_module, "list_spill_runs", wraps=informix_module.list_spill_runs
+            ) as listed,
+        ):
+            self.assertTrue(settle(100))
+            self.assertTrue(settle(101))
+            self.assertFalse(settle(102))
+        self.assertEqual(listed.call_count, 1)
+        self.assertEqual(self._spill_record(later, key)["done"], {"upsert": True})
+        self.assertIsNone(self._spill_record(later, gone))
 
     def test_a_shard_daemon_spills_under_its_consumers_scope(self):
         # The daemon reader is a new connector, so it is handed the consumer's scope; a
