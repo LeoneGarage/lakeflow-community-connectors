@@ -6902,6 +6902,57 @@ class LakeflowContractTests(unittest.TestCase):
             self.assertEqual(len(list(rows)), 3)
         self.assertEqual(end["commit_lsn"], upsert_end["commit_lsn"])
 
+    def _delete_only_spill(self, scope, table_options):
+        # A connector whose next poll returns transaction 7 spilled with three DELETEs,
+        # and the checkpoint that poll starts from.
+        bridge = FakeBridge()
+        connector = self.connector(bridge, registration_scope=scope)
+        table = connector._table("app.orders", table_options)
+        _, checkpoint = connector.read_table("app.orders", {}, table_options)
+        changes = [
+            {
+                "op": "DELETE",
+                "tx_id": 7,
+                "lsn": 102 + i,
+                "table": table.identity,
+                "row": {"id": i, "value": f"v{i}"},
+            }
+            for i in range(3)
+        ]
+        part, _, _ = self._spilled_run(connector, table, changes)
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 101},
+            part,
+            {"op": "COMMIT", "tx_id": 7, "lsn": 110},
+        ]
+        return connector, checkpoint
+
+    def test_the_upsert_channel_skips_the_pages_of_a_delete_only_spilled_transaction(self):
+        # A keyed table's upsert channel shapes nothing from DELETEs, so a purge in one
+        # transaction reads none of its pages there; the delete channel still serves every
+        # delete, and both move past it.
+        connector, checkpoint = self._delete_only_spill("spill-deletes", {})
+        with mock.patch.object(
+            connector, "_stream_staged_page_for", wraps=connector._stream_staged_page_for
+        ) as pages:
+            rows, upsert_end = connector.read_table("app.orders", checkpoint, {})
+            self.assertEqual(list(rows), [])
+            self.assertEqual(pages.call_count, 0)
+            rows, end = connector.read_table_deletes("app.orders", checkpoint, {})
+            self.assertEqual(sorted(row["id"] for row in rows), [0, 1, 2])
+        self.assertEqual(end["commit_lsn"], upsert_end["commit_lsn"])
+
+    def test_an_append_upsert_channel_with_tombstones_still_reads_delete_only_pages(self):
+        # On the append path a DELETE lands on the upsert channel as a tombstone, so the
+        # pages of a delete-only transaction are read there.
+        options = {"append.only.ingestion": "true"}
+        connector, checkpoint = self._delete_only_spill("spill-tombstones", options)
+        rows, _ = connector.read_table("app.orders", checkpoint, options)
+        self.assertEqual(
+            sorted((row["id"], row["_informix_op"]) for row in rows),
+            [(0, "d"), (1, "d"), (2, "d")],
+        )
+
     def test_a_replay_whose_first_read_went_idle_keeps_a_spilled_batch_on_its_pages(self):
         # A replay that reads more than once returns a spilled transaction from its last read
         # as pages, not rows chained onto the empty reads before it, so get_partitions does
@@ -6911,18 +6962,41 @@ class LakeflowContractTests(unittest.TestCase):
         spilled = informix_module._SpilledRows(
             lambda *args: None, [], tx, table, {}, deletes=False, tombstones=False, encoding="x"
         )
+        # An idle read returns iter([]), as _read_stream does.
+        self.assertIs(self._replay_idle_then(iter([]), spilled), spilled)
+
+    def test_a_replay_whose_first_read_returned_rows_chains_them_before_a_spilled_batch(self):
+        # Rows from an earlier read are served with the spilled batch, whether that read
+        # reports its size (a list iterator) or not (a generator, which may hold rows).
+        table = Table.parse(_table(), "demo")
+        tx = informix_module.CommittedTransaction(7, 106, 110, 110, (), None, ())
+        spilled = informix_module._SpilledRows(
+            lambda *args: None, [], tx, table, {}, deletes=False, tombstones=False, encoding="x"
+        )
+        row = {"id": 1}
+        for earlier in (iter([row]), (item for item in [row])):
+            with self.subTest(earlier=type(earlier).__name__):
+                records = self._replay_idle_then(earlier, spilled)
+                self.assertIsNot(records, spilled)
+                self.assertEqual(list(records), [row])
+
+    @staticmethod
+    def _replay_idle_then(first, spilled):
+        # Replay [100, 110) over two reads: ``first`` up to LSN 105, then ``spilled``.
         reads = iter(
             [
-                ([], {"phase": "stream", "commit_lsn": "105", "begin_lsn": "105", "tx_id": None}),
+                (
+                    first,
+                    {"phase": "stream", "commit_lsn": "105", "begin_lsn": "105", "tx_id": None},
+                ),
                 (spilled, {"phase": "stream", "commit_lsn": "110", "begin_lsn": "110", "tx_id": 7}),
             ]
         )
         start = {"phase": "stream", "commit_lsn": "100", "begin_lsn": "100", "tx_id": 5}
         end = {"phase": "stream", "commit_lsn": "110", "begin_lsn": "110", "tx_id": 7}
-        records = informix_module._replay_between_offsets(
+        return informix_module._replay_between_offsets(
             start, end, lambda _start: next(reads), {}, {}
         )
-        self.assertIs(records, spilled)
 
     def test_a_shard_daemon_spills_under_its_consumers_scope(self):
         # The daemon reader is a new connector, so it is handed the consumer's scope; a

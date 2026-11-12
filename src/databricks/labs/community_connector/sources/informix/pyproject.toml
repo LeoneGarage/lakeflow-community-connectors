@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Informix connector for Lakeflow Community Connectors"
 requires-python = ">=3.10"
 dependencies = [
-    "lakeflow-community-connectors>=0.1.0",
+    "lakeflow-community-connectors>=0.1.0,<1.0",
     # Postgres driver for Lakebase state. The binary wheel bundles libpq so it
     # installs without a compiler/pg_config (absent on serverless pipeline
     # compute); the connector prefers a preinstalled psycopg2 and only falls back
@@ -29,6 +29,10 @@ packages = ["databricks.labs.community_connector.sources.informix"]
 
 [tool.setuptools.package-dir]
 "databricks.labs.community_connector.sources.informix" = "."
+
+# Leaves the *_test* modules beside the runtime code out of the wheel; see the module.
+[tool.setuptools.cmdclass]
+build_py = "tests.wheel_build_test_tool.BuildPy"
 
 [tool.setuptools.package-data]
 "*" = ["*.json", "*.md", "*.yaml"]

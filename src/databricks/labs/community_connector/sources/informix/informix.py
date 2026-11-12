@@ -21,6 +21,7 @@ import itertools
 import json
 import logging
 import math
+import operator
 import os
 import queue
 import random
@@ -1219,8 +1220,9 @@ def _replay_between_offsets(start, end, read, options, connector_options):
             replay_start = reached
         # A replay with one read that returned rows hands back those rows as they came, so a
         # spilled transaction (_SpilledRows) still reaches get_partitions as pages after reads
-        # that went idle.
-        filled = [part for part in record_parts if not (isinstance(part, list) and not part)]
+        # that went idle. An idle read returns an empty list iterator, which reports its
+        # size; a part that reports none (a generator) may hold rows, so it is kept.
+        filled = [part for part in record_parts if operator.length_hint(part, -1) != 0]
         records = (
             filled[0] if len(filled) == 1 else itertools.chain.from_iterable(filled or record_parts)
         )
@@ -14859,6 +14861,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     for part in spilled
                     if part.get("ops") is None or _SPILL_DELETE_OPS.intersection(part["ops"])
                 ]
+            elif not tombstones:
+                # Nor does an upsert channel without tombstones from a run of DELETEs. A
+                # TRUNCATE is not a DELETE, so it still reaches the shaping that rejects it.
+                spilled = [part for part in spilled if part.get("ops") != ["DELETE"]]
             if spilled and output:
                 # A spilled transaction is a batch of its own: it waits for the next one.
                 row_budget_reached = True
