@@ -1,0 +1,2 @@
+# The sdist carries the build_py hook pyproject.toml names, so a wheel builds from it.
+include tests/wheel_build_test_tool.py
