@@ -2320,22 +2320,28 @@ def delete_obsolete_scoped_state_records(
 
 # --- spilled CDC runs ------------------------------------------------------
 #
-# One record per spilled run per pipeline, naming the channels that have committed past
-# its transaction. A channel adds itself and reads the result back in one statement, so of
-# two channels finishing together exactly one sees the set complete (Postgres serializes
-# the conflicting update on the row) and deletes the pages. The record has no ``scope``
-# field, so the obsolete-update cleanup leaves it alone; the table-state GC removes it
-# with the table.
-_MARK_SPILL_RUN = """
+# One record per spilled run per pipeline: its transaction's commit LSN once a poll saw
+# the COMMIT, and the channels that have committed past it. An update merges its fields in
+# and reads the record back in one statement, so of two channels finishing together
+# exactly one sees the set complete (Postgres serializes the conflicting update on the
+# row) and deletes the pages. The record has no ``scope`` field, so the obsolete-update
+# cleanup leaves it alone; the table-state GC removes it with the table.
+_MERGE_SPILL_RUN = """
 INSERT INTO state_records (namespace, record_key, record, record_type)
 VALUES (%(namespace)s, %(record_key)s, %(record)s::jsonb, 'cdc-spill-run')
 ON CONFLICT (namespace, record_key) DO UPDATE
-SET record = state_records.record || jsonb_build_object(
-  'done', COALESCE(state_records.record->'done', '{}'::jsonb) || (EXCLUDED.record->'done'),
-  'required', EXCLUDED.record->'required'
+SET record = state_records.record || (EXCLUDED.record - 'done') || jsonb_build_object(
+  'done', COALESCE(state_records.record->'done', '{}'::jsonb)
+    || COALESCE(EXCLUDED.record->'done', '{}'::jsonb)
 )
 WHERE state_records.record_type = 'cdc-spill-run'
 RETURNING record
+"""
+
+_DELETE_SPILL_RUN = """
+DELETE FROM state_records
+WHERE namespace = %(namespace)s AND record_key = %(record_key)s
+  AND record_type = 'cdc-spill-run'
 """
 
 _DELETE_EXPIRED_SPILL_RUNS = """
@@ -2355,14 +2361,15 @@ WHERE namespace = %(namespace)s
 """
 
 
-def mark_spill_run(
+def merge_spill_run(
     connection: Any, namespace: str, record_key: str, record: dict[str, Any]
 ) -> dict[str, Any]:
-    # Docstring: Add ``record``'s channel to a spilled run's record; return the record as stored.
+    # Docstring: Merge ``record`` into a spilled run's record, ``done`` channel by channel;
+    # return the record as stored.
 
     with connection.cursor() as cursor:
         cursor.execute(
-            _MARK_SPILL_RUN,
+            _MERGE_SPILL_RUN,
             {
                 "namespace": namespace,
                 "record_key": record_key,
@@ -2374,6 +2381,14 @@ def mark_spill_run(
     if row is None:
         raise LakebaseStateError(f"state record {namespace}/{record_key} is not a spilled run")
     return _as_dict(row[0])
+
+
+def delete_spill_run(connection: Any, namespace: str, record_key: str) -> None:
+    # Docstring: Remove a spilled run's record (its transaction rolled back). Idempotent.
+
+    with connection.cursor() as cursor:
+        cursor.execute(_DELETE_SPILL_RUN, {"namespace": namespace, "record_key": record_key})
+    connection.commit()
 
 
 def list_spill_runs(

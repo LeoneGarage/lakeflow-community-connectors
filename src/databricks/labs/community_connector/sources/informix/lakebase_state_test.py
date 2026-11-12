@@ -134,10 +134,13 @@ class _FakeCursor:
             self._read_limit(args)
             return
         if "'cdc-spill-run'" in text and "INSERT INTO state_records" in text:
-            self._mark_spill_run(args)
+            self._merge_spill_run(args)
             return
         if "'cdc-spill-run'" in text and text.startswith("DELETE FROM state_records"):
-            self._delete_expired_spill_runs(args)
+            if "created_at" in text:
+                self._delete_expired_spill_runs(args)
+            else:
+                self._delete_spill_run(args)
             return
         if "'cdc-spill-run'" in text and text.startswith("SELECT record FROM state_records"):
             self._select_spill_runs(args)
@@ -492,9 +495,9 @@ class _FakeCursor:
             self._database.record_created.setdefault(key, self._database.now())
             self._result = [(args["record"],)]
 
-    def _mark_spill_run(self, args: dict) -> None:
-        # ON CONFLICT merges the channel into ``done`` and takes ``required`` from the
-        # candidate, keeping the stored record's other fields; another type's row is left.
+    def _merge_spill_run(self, args: dict) -> None:
+        # ON CONFLICT takes the candidate's fields over the stored record's and merges
+        # ``done`` channel by channel; another type's row is left.
         key = (args["namespace"], args["record_key"])
         candidate = json.loads(args["record"])
         with self._database.lock:
@@ -506,9 +509,9 @@ class _FakeCursor:
             elif self._database.record_types.get(key) != "cdc-spill-run":
                 return
             else:
-                record = json.loads(stored)
-                record["done"] = {**(record.get("done") or {}), **candidate["done"]}
-                record["required"] = candidate["required"]
+                stored = json.loads(stored)
+                done = {**(stored.get("done") or {}), **(candidate.get("done") or {})}
+                record = {**stored, **candidate, "done": done}
             raw = json.dumps(record)
             self._database.records[key] = raw
             self._result = [(raw,)]
@@ -523,12 +526,23 @@ class _FakeCursor:
             and self._database.record_types.get(key) == "cdc-spill-run"
         ]
 
+    def _forget_record(self, key: tuple[str, str]) -> None:
+        self._database.records.pop(key, None)
+        self._database.record_types.pop(key, None)
+        self._database.record_created.pop(key, None)
+
+    def _delete_spill_run(self, args: dict) -> None:
+        key = (args["namespace"], args["record_key"])
+        with self._database.lock:
+            if self._database.record_types.get(key) == "cdc-spill-run":
+                self._forget_record(key)
+
     def _delete_expired_spill_runs(self, args: dict) -> None:
         cutoff = self._database.now() - float(args["retention_seconds"])
         with self._database.lock:
             for key in self._spill_run_keys(args):
                 if self._database.record_created.get(key, cutoff) < cutoff:
-                    del self._database.records[key]
+                    self._forget_record(key)
 
     def _select_spill_runs(self, args: dict) -> None:
         with self._database.lock:
@@ -1219,12 +1233,12 @@ class LakebaseStateRecordTests(unittest.TestCase):
             {"run": "run-1", "begin_lsn": "100", "table": "demo:app.orders", "done": {}},
             record_type="cdc-spill-run",
         )
-        first = lakebase_state.mark_spill_run(
+        first = lakebase_state.merge_spill_run(
             self.connection, "ns", "t/cdc-spill/s/run-1", self._spill_run("upsert")
         )
         self.assertEqual(first["done"], {"upsert": True})
         self.assertEqual(first["table"], "demo:app.orders")
-        second = lakebase_state.mark_spill_run(
+        second = lakebase_state.merge_spill_run(
             self.connection, "ns", "t/cdc-spill/s/run-1", self._spill_run("delete")
         )
         self.assertEqual(second["done"], {"upsert": True, "delete": True})
@@ -1232,7 +1246,26 @@ class LakebaseStateRecordTests(unittest.TestCase):
         # A key that some other state owns is never taken over.
         lakebase_state.publish_state_record(self.connection, "ns", "other", {"v": 1})
         with self.assertRaises(lakebase_state.LakebaseStateError):
-            lakebase_state.mark_spill_run(self.connection, "ns", "other", self._spill_run("upsert"))
+            lakebase_state.merge_spill_run(
+                self.connection, "ns", "other", self._spill_run("upsert")
+            )
+        self.assertEqual(lakebase_state.read_state_record(self.connection, "ns", "other"), {"v": 1})
+
+    def test_a_spilled_runs_commit_merges_in_and_a_rollback_deletes_it(self):
+        # The poll that sees the COMMIT adds its LSN without touching the channels already
+        # marked; a ROLLBACK deletes the run's record, and only a spilled run's.
+        key = "t/cdc-spill/s/run-1"
+        lakebase_state.merge_spill_run(self.connection, "ns", key, self._spill_run("upsert"))
+        merged = lakebase_state.merge_spill_run(
+            self.connection, "ns", key, {"run": "run-1", "commit_lsn": "400", "done": {}}
+        )
+        self.assertEqual(merged["done"], {"upsert": True})
+        self.assertEqual((merged["commit_lsn"], merged["required"]), ("400", ["upsert", "delete"]))
+        lakebase_state.publish_state_record(self.connection, "ns", "other", {"v": 1})
+        lakebase_state.delete_spill_run(self.connection, "ns", key)
+        lakebase_state.delete_spill_run(self.connection, "ns", "other")
+        lakebase_state.delete_spill_run(self.connection, "ns", key)
+        self.assertIsNone(lakebase_state.read_state_record(self.connection, "ns", key))
         self.assertEqual(lakebase_state.read_state_record(self.connection, "ns", "other"), {"v": 1})
 
     def test_spilled_runs_are_listed_per_channel_and_expire_with_the_staging_retention(self):
@@ -1240,10 +1273,10 @@ class LakebaseStateRecordTests(unittest.TestCase):
         # one that no longer runs has no reader left to expire its own.
         for key in ("t/cdc-spill/s/run-1", "t/cdc-spill/s/run-2", "t/cdc-spill/gone/run-3"):
             run = key.rsplit("/", 1)[1]
-            lakebase_state.mark_spill_run(
+            lakebase_state.merge_spill_run(
                 self.connection, "ns", key, self._spill_run("upsert", run)
             )
-        lakebase_state.mark_spill_run(
+        lakebase_state.merge_spill_run(
             self.connection, "ns", "u/cdc-spill/s/run-4", self._spill_run("upsert", "run-4")
         )
         lakebase_state.publish_state_record(self.connection, "ns", "t/cdc-spill/s/x", {"v": 1})

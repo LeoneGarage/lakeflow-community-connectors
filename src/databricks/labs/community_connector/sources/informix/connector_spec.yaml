@@ -1252,11 +1252,12 @@ connection:
       type: string
       required: false
       description: >
-        Maximum buffered records while a CDC transaction remains open. Default
-        `100000`. `cdc.max.records` is a soft target while a transaction is open;
-        exceeding this safety bound fails rather than emitting uncommitted data.
-        With cdc.spill.records on, a larger transaction is spilled before it
-        gets there.
+        Maximum change records all open CDC transactions together hold in memory
+        in one poll. Default `100000`. `cdc.max.records` is a soft target while a
+        transaction is open; exceeding this safety bound fails rather than
+        emitting uncommitted data. With cdc.spill.records on, a transaction is
+        spilled once it alone passes that, and the largest of several
+        interleaved ones is spilled before they reach this bound together.
 
     - name: cdc.spill.records
       type: string

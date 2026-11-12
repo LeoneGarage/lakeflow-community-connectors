@@ -88,13 +88,14 @@ from databricks.labs.community_connector.sources.informix.lakebase_state import 
     connection_lost_error_types,
     delete_cdc_handoff,
     delete_obsolete_scoped_state_records,
+    delete_spill_run,
     dequeue_waiter,
     enqueue_waiter,
     get_cdc_handoff,
     heartbeat_slot,
     heartbeat_waiter,
     list_spill_runs,
-    mark_spill_run,
+    merge_spill_run,
     pool_progress_token,
     publish_backlog_hint,
     publish_connection_limit,
@@ -304,6 +305,11 @@ _CDC_SPILL_SCHEMA = "cdc-spill"
 # A run's Lakebase record names the channels that have committed past its transaction;
 # the channel that completes the table's set deletes the pages.
 _CDC_SPILL_RECORD_TYPE = "cdc-spill-run"
+# How often a reader lists its tables' runs from Lakebase again: a channel that read a
+# transaction in memory (its shard spilled nothing) finishes the other shard's run so.
+_CDC_SPILL_LIST_SECONDS = 300
+# The changes a delete channel shapes rows from; a run of none of them has nothing for it.
+_SPILL_DELETE_OPS = frozenset({"DELETE", "BEFORE_UPDATE", "AFTER_UPDATE", "TRUNCATE"})
 _SNAPSHOT_MODES = frozenset(
     {
         "incremental",
@@ -1211,12 +1217,12 @@ def _replay_between_offsets(start, end, read, options, connector_options):
                     raise InformixError(_m(2))
                 time.sleep(min(random.uniform(0.05, 0.2), remaining_wait))
             replay_start = reached
-        # A replay done in one read hands back that read's rows as they came, so a spilled
-        # transaction (_SpilledRows) still reaches get_partitions as pages.
+        # A replay with one read that returned rows hands back those rows as they came, so a
+        # spilled transaction (_SpilledRows) still reaches get_partitions as pages after reads
+        # that went idle.
+        filled = [part for part in record_parts if not (isinstance(part, list) and not part)]
         records = (
-            record_parts[0]
-            if len(record_parts) == 1
-            else itertools.chain.from_iterable(record_parts)
+            filled[0] if len(filled) == 1 else itertools.chain.from_iterable(filled or record_parts)
         )
         try:
             reached_lsn = int(reached["commit_lsn"])
@@ -3699,6 +3705,9 @@ class PurePythonInformixBridge:
             empty_reads = 0
             timed_out = False
             retained_bytes = 0
+            # What each open transaction's changes add to retained_bytes, which they leave
+            # when it spills.
+            held_bytes: dict[int, int] = {}
             truncated = False
             completed_transactions = 0
             metadata_labels: set[int] = set()
@@ -3707,6 +3716,32 @@ class PurePythonInformixBridge:
             # Informix rejects an ALTER TABLE, and the batch sees what each table's own
             # metadata record describes, as reading each table at its record did.
             capture_catalog: dict[tuple[str, str], dict[str, Any]] | None = None
+
+            def _spill_open(tx_id: int) -> None:
+                # Its changes, and any DISCARD among them, go to the spill in order; its
+                # BEGIN stays here for the transaction buffer, with a SPILLING record per
+                # table so that it still shows which tables it holds open. Informix reuses
+                # transaction IDs, so only what follows its latest BEGIN is its own: an
+                # earlier transaction with this ID stays as it was.
+                nonlocal retained_bytes
+                begin = max(
+                    (
+                        index
+                        for index, r in enumerate(records)
+                        if r.get("tx_id") == tx_id and r["op"] == "BEGIN"
+                    ),
+                    default=-1,
+                )
+                later = records[begin + 1 :]
+                records[begin + 1 :] = [r for r in later if r.get("tx_id") != tx_id]
+                own = [r for r in later if r.get("tx_id") == tx_id]
+                begin_lsn = int((records[begin] if begin >= 0 else own[0])["lsn"])
+                for table in spill.start(tx_id, begin_lsn, own):
+                    records.append(
+                        {"op": "SPILLING", "tx_id": tx_id, "lsn": begin_lsn, "table": table}
+                    )
+                open_transactions.release(tx_id)
+                retained_bytes -= held_bytes.pop(tx_id, 0)
 
             def _stop_at_poll_bound(bound: str) -> None:
                 # The poll bounds cap what one poll may retain, not how much the
@@ -3756,7 +3791,11 @@ class PurePythonInformixBridge:
                         and record["op"] in _DATA_OPS
                         and spill.holds(int(record.get("tx_id") or 0))
                     ):
-                        retained_bytes += len(frame) + _deep_size(record)
+                        size = len(frame) + _deep_size(record)
+                        retained_bytes += size
+                        if record["op"] in _DATA_OPS:
+                            held = int(record.get("tx_id") or 0)
+                            held_bytes[held] = held_bytes.get(held, 0) + size
                     if max_poll_bytes and retained_bytes > max_poll_bytes:
                         _stop_at_poll_bound(f"cdc.max.poll.bytes={max_poll_bytes}")
                         truncated = True
@@ -3798,7 +3837,15 @@ class PurePythonInformixBridge:
                     tx_id = int(record.get("tx_id") or 0)
                     spilling = spill is not None and spill.holds(tx_id)
                     if spilling and record["op"] in _DATA_OPS:
-                        spill.add(record)
+                        if spill.add(record):
+                            records.append(
+                                {
+                                    "op": "SPILLING",
+                                    "tx_id": tx_id,
+                                    "lsn": int(record["lsn"]),
+                                    "table": record.get("table"),
+                                }
+                            )
                     else:
                         records.append(record)
                     if record["op"] not in {"METADATA", "TIMEOUT"}:
@@ -3807,39 +3854,31 @@ class PurePythonInformixBridge:
                         completed_transactions += 1
                     if record["op"] == "BEGIN":
                         open_transactions.begin(tx_id)
+                        held_bytes.pop(tx_id, None)
                     elif record["op"] in _DATA_OPS and not spilling:
                         open_transactions.append(tx_id, int(record["lsn"]))
                         if spill is not None and open_transactions.held(tx_id) > spill.threshold:
-                            # Its changes, and any DISCARD among them, go to the spill in
-                            # order; its BEGIN stays here for the transaction buffer. Informix
-                            # reuses transaction IDs, so only what follows its latest BEGIN is
-                            # its own: an earlier transaction with this ID stays as it was.
-                            begin = max(
-                                (
-                                    index
-                                    for index, r in enumerate(records)
-                                    if r.get("tx_id") == tx_id and r["op"] == "BEGIN"
-                                ),
-                                default=-1,
-                            )
-                            later = records[begin + 1 :]
-                            records[begin + 1 :] = [r for r in later if r.get("tx_id") != tx_id]
-                            own = [r for r in later if r.get("tx_id") == tx_id]
-                            spill.start(
-                                tx_id, int((records[begin] if begin >= 0 else own[0])["lsn"]), own
-                            )
-                            open_transactions.release(tx_id)
+                            _spill_open(tx_id)
                     elif record["op"] == "DISCARD":
                         open_transactions.discard(tx_id, int(record["lsn"]))
                         if spilling:
                             spill.discard(tx_id, int(record["lsn"]))
                     elif record["op"] in {"COMMIT", "ROLLBACK"}:
                         open_transactions.finish(tx_id)
+                        held_bytes.pop(tx_id, None)
                         if spilling and record["op"] == "ROLLBACK":
                             spill.drop(tx_id)
                         elif spilling:
                             # Ahead of the COMMIT, so the transaction carries its pages.
-                            records[-1:-1] = spill.finish(tx_id)
+                            records[-1:-1] = spill.finish(tx_id, int(record["lsn"]))
+                    while (
+                        spill is not None
+                        and open_transactions.buffered > max_transaction_records
+                        and open_transactions.held(open_transactions.largest())
+                    ):
+                        # Interleaved transactions, none past cdc.spill.records alone, hold
+                        # more than the bound between them: spill the largest.
+                        _spill_open(open_transactions.largest())
                     if open_transactions.buffered > max_transaction_records:
                         # 58: An open CDC transaction exceeded cdc.max.transaction.records={}
                         raise InformixError(_m(58, max_transaction_records))
@@ -6152,6 +6191,9 @@ class Transaction:
     pending_before: dict[str, Any] | None = None
     # One SPILLED record per table whose changes were written to staged pages (_CdcSpill).
     spilled: list[dict[str, Any]] = field(default_factory=list)
+    # One SPILLING record per table while it is open: its changes went to pages, so they no
+    # longer show which tables it touches.
+    spilling: list[dict[str, Any]] = field(default_factory=list)
     last_lsn: int = field(init=False)
 
     def __post_init__(self) -> None:
@@ -6248,6 +6290,9 @@ class TransactionBuffer:
         if op == "SPILLED":
             tx.spilled.append(record)
             return None
+        if op == "SPILLING":
+            tx.spilling.append(record)
+            return None
         if op == "DISCARD":
             tx.discard(_lsn(record))
             return None
@@ -6315,10 +6360,11 @@ class _CdcSpill:
     # transaction and its first change (see _spill_run), so a poll that reads the
     # transaction again, the other channel's, or a later update's, names the same pages.
 
-    def __init__(self, threshold, write, delete, layouts, scope, natives) -> None:
+    def __init__(self, threshold, write, delete, layouts, scope, natives, commit=None) -> None:
         self.threshold = threshold
         self._write = write  # (native identity, table, run, page index, records)
         self._delete = delete  # (native identity, run)
+        self._commit = commit  # (native identity, run, commit LSN), or None
         self._layouts = layouts  # logical identity -> capture layout hash
         self._scope = scope
         self._natives = natives  # logical identity -> native identity
@@ -6327,19 +6373,26 @@ class _CdcSpill:
     def holds(self, tx_id: int) -> bool:
         return tx_id in self._open
 
-    def start(self, tx_id: int, begin_lsn: int, records: list[dict[str, Any]]) -> None:
+    def start(self, tx_id: int, begin_lsn: int, records: list[dict[str, Any]]) -> list[str]:
+        # Docstring: Start spilling a transaction with the changes it holds; return the tables
+        # it has a run for.
+
         self._open[tx_id] = (begin_lsn, {})
         for record in records:
             if record["op"] == "DISCARD":
                 self.discard(tx_id, int(record["lsn"]))
             else:
                 self.add(record)
+        return list(self._open[tx_id][1])
 
-    def add(self, record: dict[str, Any]) -> None:
+    def add(self, record: dict[str, Any]) -> bool:
+        # Docstring: Add one change; return whether it began its table's run.
+
         tx_id = int(record.get("tx_id") or 0)
         begin, parts = self._open[tx_id]
         table = str(record.get("table") or "")
         part = parts.get(table)
+        began = part is None
         if part is None:
             run = _spill_run(self._layouts.get(table, ""), begin, tx_id, record)
             part = parts[table] = {
@@ -6349,8 +6402,14 @@ class _CdcSpill:
                 "bytes": 0,
                 "last": 0,
                 "discarded": [],
+                "ops": set(),
             }
-        part["rows"].append(record)
+        # A capture label is the table's place in one shard's capture list: the other
+        # channel's shard can list it elsewhere, and both write the same pages.
+        part["rows"].append(
+            {key: value for key, value in record.items() if key not in ("label", "capture_label")}
+        )
+        part["ops"].add(record["op"])
         part["last"] = int(record["lsn"])
         # Wide text or byte columns end a page early, well inside the staged-page bound.
         part["bytes"] += 64 + sum(
@@ -6361,6 +6420,7 @@ class _CdcSpill:
             len(part["rows"]) >= _CDC_SPILL_PAGE_RECORDS or part["bytes"] >= 32 << 20
         ):
             self._flush(table, part)
+        return began
 
     def _flush(self, table: str, part: dict[str, Any]) -> None:
         native = self._natives.get(table, table)
@@ -6381,24 +6441,31 @@ class _CdcSpill:
             if part["pages"]:
                 self._delete(self._natives.get(table, table), part["run"])
 
-    def finish(self, tx_id: int) -> list[dict[str, Any]]:
+    def finish(self, tx_id: int, commit_lsn: int | None = None) -> list[dict[str, Any]]:
+        # Docstring: The SPILLED records of a transaction at its COMMIT (``commit_lsn``), which
+        # each run's record also learns.
+
         _begin, parts = self._open.pop(tx_id)
         spilled = []
         for table, part in parts.items():
             if part["rows"]:
                 self._flush(table, part)
             if part["pages"]:
+                native = self._natives.get(table, table)
+                if self._commit is not None and commit_lsn is not None:
+                    self._commit(native, part["run"], commit_lsn)
                 spilled.append(
                     {
                         "op": "SPILLED",
                         "tx_id": tx_id,
                         "lsn": part["last"],
                         "table": table,
-                        "native_identity": self._natives.get(table, table),
+                        "native_identity": native,
                         "pipeline_scope": self._scope,
                         "run": part["run"],
                         "pages": part["pages"],
                         "discarded": part["discarded"],
+                        "ops": sorted(part["ops"]),
                     }
                 )
         return spilled
@@ -6423,6 +6490,11 @@ def _spilled_page_rows(read_page, part, page_index, tx, table, options, **shape)
         record = _normalise_record(record)
         if not any(low <= record["lsn"] <= high for low, high in discarded):
             buffer.append(record)
+    if buffer.pending_before is not None:
+        # A page never ends between an UPDATE's images, so this transaction committed with
+        # one unpaired, as an in-memory one fails at its COMMIT.
+        # 141: Transaction {} committed with unpaired BEFORE_UPDATE
+        raise InformixError(_m(141, buffer.tx_id))
     committed = CommittedTransaction(
         int(tx[0]), int(tx[1]), int(tx[2]), int(tx[3]), tuple(buffer.records), tx[4]
     )
@@ -6771,7 +6843,10 @@ class _SharedCdcShard:
                 begins = [
                     item.begin_lsn
                     for item in buffer.open.values()
-                    if any(_record_matches(record, sub["table"]) for record in item.records)
+                    if any(
+                        _record_matches(record, sub["table"])
+                        for record in itertools.chain(item.records, item.spilling)
+                    )
                 ]
                 open_begins[identity] = min(begins) if begins else None
             self.open_begins = open_begins
@@ -8149,10 +8224,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # instance (off the serve path) instead of every microbatch.
         self._retention_swept: set[str] = set()
         # Driver-only: the spilled runs each (table, channel) has yet to finish, as run ->
-        # (spill scope, BEGIN LSN, commit LSN or None), and the pairs whose runs have been
-        # listed from Lakebase already (see _settle_spilled_runs).
+        # (spill scope, BEGIN LSN, commit LSN or None), and when each pair last listed its runs
+        # from Lakebase (see _settle_spilled_runs).
         self._spill_runs: dict[tuple[str, str], dict[str, tuple[str, int, int | None]]] = {}
-        self._spill_runs_listed: set[tuple[str, str]] = set()
+        self._spill_runs_listed: dict[tuple[str, str], float] = {}
 
     def set_registration_scope(self, scope: str) -> None:
         # Docstring: Install the scope shared by every reader serialized from one registration.
@@ -8281,7 +8356,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         state["_staging_transport_resolved"] = False
         state["_partition_page_batches"] = {}
         state["_spill_runs"] = {}
-        state["_spill_runs_listed"] = set()
+        state["_spill_runs_listed"] = {}
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
@@ -13951,13 +14026,32 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             )
 
         def delete(native: str, run: str) -> None:
+            # A rolled-back transaction: its pages and its record go.
             path = os.path.join(
                 self._snapshot_stage_namespace_for(native, scope, _CDC_SPILL_SCHEMA), "runs", run
             )
             with contextlib.suppress(OSError):
                 PurePythonInformixBridge._remove_connection_slot_tree(path)
+            key = self._spill_run_key(native, scope, run)
+            self._spill_run_state(
+                run,
+                lambda: delete_spill_run(
+                    self._lakebase_connection(), self._lakebase_state_namespace(), key
+                ),
+            )
 
-        return _CdcSpill(threshold, write, delete, layouts, scope, natives)
+        def commit(native: str, run: str, commit_lsn: int) -> None:
+            # The commit LSN finishes the run for each channel whose checkpoint reaches it.
+            record = {**self._spill_run_record(native, scope, run), "commit_lsn": str(commit_lsn)}
+            key = self._spill_run_key(native, scope, run)
+            self._spill_run_state(
+                run,
+                lambda: merge_spill_run(
+                    self._lakebase_connection(), self._lakebase_state_namespace(), key, record
+                ),
+            )
+
+        return _CdcSpill(threshold, write, delete, layouts, scope, natives, commit)
 
     def _spill_run_key(self, native_identity: str, scope: str, run: str) -> str:
         # Docstring: A run's Lakebase record key, under its table's state prefix so the
@@ -13967,39 +14061,47 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             (*self._table_state_keys_for(native_identity), _CDC_SPILL_SCHEMA, scope, run)
         )
 
-    def _register_spill_run(self, native_identity: str, scope: str, run: str) -> bool:
-        # Docstring: Record a run a poll writes in Lakebase; report whether it is consumed.
-        #
-        # Best-effort: without the record the pages are written all the same, and only their
-        # cleanup falls to the retention sweep.
-
-        begin = run.split("-")[1]
-        record = {
+    @staticmethod
+    def _spill_run_record(native_identity: str, scope: str, run: str) -> dict[str, Any]:
+        return {
             "format_version": 1,
             "table": native_identity,
             "spill_scope": scope,
             "run": run,
-            "begin_lsn": begin,
+            "begin_lsn": run.split("-")[1],
             "done": {},
         }
-        key = self._spill_run_key(native_identity, scope, run)
+
+    def _spill_run_state(self, run: str, thunk):
+        # Docstring: One Lakebase update of a run's record, or None when it fails.
+        #
+        # Best-effort: without the record the pages are written all the same, and only their
+        # cleanup falls to the retention sweep.
+
         try:
-            elected = self._state_op_with_reconnect(
-                lambda: publish_state_record(
-                    self._lakebase_connection(),
-                    self._lakebase_state_namespace(),
-                    key,
-                    record,
-                    record_type=_CDC_SPILL_RECORD_TYPE,
-                ),
-                operation="spilled-run registration",
-            )
+            return self._state_op_with_reconnect(thunk, operation="spilled-run record")
         except Exception:  # pylint: disable=broad-except
-            # 429: Cannot record spilled CDC run {} in Lakebase; its pages are left for the
+            # 429: Cannot update spilled CDC run {} in Lakebase; its pages are left for the
             # retention sweep
             logging.getLogger(__name__).warning(_m(429, run), exc_info=True)
-            return False
-        return _spill_run_consumed(elected)
+            return None
+
+    def _register_spill_run(self, native_identity: str, scope: str, run: str) -> bool:
+        # Docstring: Record a run a poll writes in Lakebase; report whether it is consumed.
+
+        record = self._spill_run_record(native_identity, scope, run)
+        key = self._spill_run_key(native_identity, scope, run)
+        elected = self._spill_run_state(
+            run,
+            lambda: publish_state_record(
+                self._lakebase_connection(),
+                self._lakebase_state_namespace(),
+                key,
+                record,
+                record_type=_CDC_SPILL_RECORD_TYPE,
+            ),
+        )
+        return elected is not None and _spill_run_consumed(elected)
 
     def _note_spilled_runs(self, spilled, tx: CommittedTransaction, deletes: bool) -> None:
         # Docstring: Remember the runs of a spilled transaction this channel serves, by commit.
@@ -14014,14 +14116,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # delete the pages of each run whose last channel this is.
         #
         # Spark gives a reader only a start it has committed, and _recover never serves a
-        # transaction at or below it. So a run is finished for this channel once the start's
-        # commit LSN reaches the transaction's commit (a run this reader served), or once its
-        # restart LSN is past the run's BEGIN (a run found in Lakebase, listed once per
-        # reader, which also expires the table's old records of every pipeline): no read
-        # from here starts below that. Not called on a replay, whose later
-        # polls start at positions Spark has not committed. The table's channels are the
-        # upsert one and, unless it is append-only, the delete one: the connector already
-        # serves one of each per table per pipeline.
+        # transaction at or below it, so a run is finished for this channel once the start's
+        # commit LSN reaches its transaction's commit: the commit of a run this reader served,
+        # or the commit LSN a poll recorded at the COMMIT. Its BEGIN proves nothing: Informix
+        # hands a channel a transaction whose BEGIN is below its restart LSN when the first
+        # captured change came later. Runs are listed from Lakebase at the first read and every
+        # _CDC_SPILL_LIST_SECONDS, which also expires the table's old records of every
+        # pipeline, so a channel that read a transaction in memory finishes the other shard's
+        # run too. Not called on a replay, whose later polls start at positions Spark has not
+        # committed. The table's channels are the upsert one and, unless it is append-only,
+        # the delete one: the connector already serves one of each per table per pipeline.
 
         scope = _spill_scope(getattr(self, "_registration_scope", None))
         if scope is None or not getattr(self, "_snapshot_staging_location", None):
@@ -14029,12 +14133,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         native = table.native_identity
         channel = "delete" if deletes else "upsert"
         pending = self._spill_runs.setdefault((native, channel), {})
-        listed_already = (native, channel) in self._spill_runs_listed
-        if listed_already and not pending:
+        now = time.monotonic()
+        due = now - self._spill_runs_listed.get((native, channel), -math.inf)
+        due = due >= _CDC_SPILL_LIST_SECONDS
+        if not due and not pending:
             return
         namespace = self._lakebase_state_namespace()
         try:
-            if not listed_already:
+            if due:
                 prefix = "/".join((*self._table_state_keys_for(native), _CDC_SPILL_SCHEMA))
                 listed = self._state_op_with_reconnect(
                     lambda: list_spill_runs(
@@ -14047,34 +14153,43 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     ),
                     operation="spilled-run listing",
                 )
-                self._spill_runs_listed.add((native, channel))
-                for record in listed:
-                    pending.setdefault(str(record["run"]), (scope, int(record["begin_lsn"]), None))
+                self._spill_runs_listed[(native, channel)] = now
+                runs = {
+                    str(record["run"]): (
+                        scope,
+                        int(record["begin_lsn"]),
+                        int(record["commit_lsn"]) if record.get("commit_lsn") else None,
+                    )
+                    for record in listed
+                }
+                for run, entry in list(pending.items()):
+                    # A listed run gone since (rolled back, finished, expired) is dropped; a
+                    # served one keeps the commit it was served with.
+                    if entry[2] is None and run not in runs:
+                        del pending[run]
+                for run, entry in runs.items():
+                    if run not in pending or pending[run][2] is None:
+                        pending[run] = entry
             commit = int(checkpoint["commit_lsn"])
-            restart = int(checkpoint.get("begin_lsn") or commit)
             finished = [
                 (run, entry)
                 for run, entry in pending.items()
-                if entry[1] < restart or (entry[2] is not None and entry[2] <= commit)
+                if entry[2] is not None and entry[2] <= commit
             ]
             if not finished:
                 return
             required = (
                 ["upsert"] if self._append_only_table(table, options) else ["upsert", "delete"]
             )
-            for run, (run_scope, begin, _end) in finished:
+            for run, (run_scope, _begin, _end) in finished:
                 record = {
-                    "format_version": 1,
-                    "table": native,
-                    "spill_scope": run_scope,
-                    "run": run,
-                    "begin_lsn": str(begin),
+                    **self._spill_run_record(native, run_scope, run),
                     "done": {channel: True},
                     "required": required,
                 }
                 key = self._spill_run_key(native, run_scope, run)
                 marked = self._state_op_with_reconnect(
-                    lambda key=key, record=record: mark_spill_run(
+                    lambda key=key, record=record: merge_spill_run(
                         self._lakebase_connection(), namespace, key, record
                     ),
                     operation="spilled-run settlement",
@@ -14735,6 +14850,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 crossed_trigger_boundary = True
                 break
             spilled = [part for part in tx.spilled if _record_matches(part, shape_table)]
+            if spilled:
+                self._note_spilled_runs(spilled, tx, deletes)
+            if deletes:
+                # The delete channel shapes nothing from a run of inserts: it skips its pages.
+                spilled = [
+                    part
+                    for part in spilled
+                    if part.get("ops") is None or _SPILL_DELETE_OPS.intersection(part["ops"])
+                ]
             if spilled and output:
                 # A spilled transaction is a batch of its own: it waits for the next one.
                 row_budget_reached = True
@@ -14771,7 +14895,6 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             if spilled:
                 # Its changes stay on the staged pages until the batch is served. All of
                 # them went there once it spilled, so nothing was projected above.
-                self._note_spilled_runs(spilled, tx, deletes)
                 output = _SpilledRows(
                     self._stream_staged_page_for,
                     spilled,

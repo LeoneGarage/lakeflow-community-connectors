@@ -502,6 +502,23 @@ def _committed_transactions(records):
     return informix_module._transaction_batch(records)[0]
 
 
+def _spill_poll(records, captures, spill, **options):
+    """One bridge poll over ``records`` (each its own frame) with ``spill`` as its spill
+    writer and pages of 2 changes; returns the records the poll keeps."""
+    bridge = object.__new__(PurePythonInformixBridge)
+    bridge.options = dict(options)
+    bridge.transport = FakeCdcTransport([records])
+    bridge.cdc_spill = spill
+    with (
+        mock.patch.object(informix_module, "_CDC_SPILL_PAGE_RECORDS", 2),
+        mock.patch.object(informix_module, "CdcFrameParser", RecordParser),
+        mock.patch.object(
+            informix_module, "decode_frame", side_effect=lambda frame, labels, **_: dict(frame)
+        ),
+    ):
+        return bridge.read_changes(captures, 90, 1, 256)
+
+
 def _no_shared_cdc_view(*_args, **_kwargs):
     """Stand-in for _shared_cdc_snapshot: the shard has no view, so the poll reads directly."""
     return None
@@ -1927,7 +1944,8 @@ class LakeflowContractTests(unittest.TestCase):
     def test_a_poll_spills_an_open_transaction_past_cdc_spill_records(self):
         # Once transaction 7 holds more than the threshold its changes, those already read
         # included, go to staged pages; the poll keeps its BEGIN, its DISCARD and its
-        # COMMIT, with a SPILLED record naming the pages ahead of the COMMIT. Transaction 8,
+        # COMMIT, a SPILLING record naming its table from when it spilled, and a SPILLED
+        # record naming the pages ahead of the COMMIT. Transaction 8,
         # interleaved with it, stays in memory. A page never ends between an UPDATE's two
         # images, and a DISCARD drops what it covers in memory and marks the range on the
         # pages. A ROLLBACK deletes the pages and leaves no SPILLED record.
@@ -1986,6 +2004,7 @@ class LakeflowContractTests(unittest.TestCase):
                 ("BEGIN", 7),
                 ("BEGIN", 8),
                 ("INSERT", 8),
+                ("SPILLING", 7),
                 ("COMMIT", 8),
                 ("DISCARD", 7),
                 ("SPILLED", 7),
@@ -1997,7 +2016,7 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertRegex(run, r"^layout-100-7-[0-9a-f]{12}$")
         # 105 and 106 share a page; 108 was discarded before it reached one.
         self.assertEqual(writes, [(run, 0, [101, 104]), (run, 1, [105, 106]), (run, 2, [109])])
-        spilled = records[5]
+        (spilled,) = [record for record in records if record["op"] == "SPILLED"]
         self.assertEqual(
             {key: spilled[key] for key in ("lsn", "table", "run", "pages", "discarded")},
             {
@@ -2028,13 +2047,90 @@ class LakeflowContractTests(unittest.TestCase):
         )
         self.assertEqual(
             [r["op"] for r in records[4:]],
-            ["BEGIN", "INSERT", "COMMIT", "DISCARD", "SPILLED", "COMMIT"],
+            ["BEGIN", "INSERT", "SPILLING", "COMMIT", "DISCARD", "SPILLED", "COMMIT"],
         )
         self.assertEqual(writes, [(run, 0, [101, 104]), (run, 1, [105, 106]), (run, 2, [109])])
         committed, *_ = informix_module._transaction_batch(records)
         self.assertEqual(
             [(tx.commit_lsn, len(tx.spilled)) for tx in committed], [(92, 0), (107, 0), (110, 1)]
         )
+
+    _ORDERS_CAPTURE = {
+        "identity": "demo:app.orders",
+        "logical_identity": "demo.app.orders",
+        "columns": ["id"],
+        "descriptors": [{"name": "id", "type_name": "INTEGER"}],
+    }
+
+    def _orders_spill(self, threshold, writes=None):
+        return informix_module._CdcSpill(
+            threshold,
+            lambda *args: (writes if writes is not None else []).append(args[2]),
+            lambda *args: None,
+            {"demo.app.orders": "layout"},
+            "scope",
+            {"demo.app.orders": "demo:app.orders"},
+        )
+
+    def test_spilled_changes_stop_counting_toward_cdc_max_poll_bytes(self):
+        # The changes a transaction held before it spilled leave the poll's records, so they
+        # leave its byte count too: only what stays in memory meets cdc.max.poll.bytes.
+        def change(tx_id, lsn, value):
+            row = {"id": lsn, "value": value}
+            return {"op": "INSERT", "tx_id": tx_id, "lsn": lsn, "label": 1, "row": row}
+
+        def size(record):
+            return len(record) + informix_module._deep_size(dict(record))
+
+        big = "x" * 4000
+        stream = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 100},
+            change(7, 101, big),
+            change(7, 102, big),
+            change(7, 103, big),
+            {"op": "BEGIN", "tx_id": 8, "lsn": 104},
+            change(8, 105, "s"),
+            {"op": "COMMIT", "tx_id": 8, "lsn": 106},
+            change(7, 107, big),
+            {"op": "COMMIT", "tx_id": 7, "lsn": 108},
+        ]
+        # Enough for the four records held when transaction 7 spills, and transaction 8's
+        # BEGIN on top, but not for those four with the rest of transaction 8.
+        bound = sum(size(record) for record in stream[:5])
+        records = _spill_poll(
+            stream, [self._ORDERS_CAPTURE], self._orders_spill(2), **{"cdc.max.poll.bytes": bound}
+        )
+        self.assertEqual(
+            [(tx.tx_id, len(tx.spilled)) for tx in _committed_transactions(records)],
+            [(8, 0), (7, 1)],
+        )
+
+    def test_interleaved_transactions_past_the_open_bound_spill_the_largest(self):
+        # cdc.max.transaction.records bounds every open transaction together. Three of 2
+        # changes each, none past cdc.spill.records=4 alone, pass a bound of 5 between them,
+        # so the largest is spilled rather than the poll failing.
+        def change(tx_id, lsn):
+            return {"op": "INSERT", "tx_id": tx_id, "lsn": lsn, "label": 1, "row": {"id": lsn}}
+
+        stream = [
+            *({"op": "BEGIN", "tx_id": tx_id, "lsn": 100 + tx_id} for tx_id in (1, 2, 3)),
+            *(change(tx_id, 110 + tx_id) for tx_id in (1, 2, 3)),
+            *(change(tx_id, 120 + tx_id) for tx_id in (1, 2, 3)),
+            *({"op": "COMMIT", "tx_id": tx_id, "lsn": 130 + tx_id} for tx_id in (1, 2, 3)),
+        ]
+        writes = []
+        records = _spill_poll(
+            stream,
+            [self._ORDERS_CAPTURE],
+            self._orders_spill(4, writes),
+            **{"cdc.max.transaction.records": "5"},
+        )
+        committed = _committed_transactions(records)
+        self.assertEqual(
+            [(tx.tx_id, len(tx.spilled)) for tx in committed], [(1, 1), (2, 0), (3, 0)]
+        )
+        self.assertEqual([len(tx.records) for tx in committed], [0, 2, 2])
+        self.assertEqual(len(writes), 1)
 
     def test_connection_port_range_is_validated_before_connecting(self):
         self.connector(**{"port": "1"})
@@ -6571,13 +6667,13 @@ class LakeflowContractTests(unittest.TestCase):
             informix_module._spill_run("layout", 100, 7, {**change, "row": {"id": 2}}),
         )
 
-    def _spilled_run(self, connector, table, changes):
-        # Spill transaction 7 (BEGIN 101) over pages of 2 changes; return its SPILLED part, its
-        # run directory, and its Lakebase record key.
+    def _spilled_run(self, connector, table, changes, captures=None, commit=None):
+        # Spill transaction 7 (BEGIN 101) over pages of 2 changes, committed at ``commit``;
+        # return its SPILLED part, its run directory, and its Lakebase record key.
         with mock.patch.object(informix_module, "_CDC_SPILL_PAGE_RECORDS", 2):
-            writer = connector._cdc_spill([informix_module._capture_descriptor(table)])
+            writer = connector._cdc_spill(captures or [informix_module._capture_descriptor(table)])
             writer.start(7, 101, changes)
-            (part,) = writer.finish(7)
+            (part,) = writer.finish(7, commit)
         namespace = connector._snapshot_stage_namespace_for(
             table.native_identity, part["pipeline_scope"], informix_module._CDC_SPILL_SCHEMA
         )
@@ -6636,8 +6732,8 @@ class LakeflowContractTests(unittest.TestCase):
 
     def test_a_new_reader_finishes_the_spilled_runs_it_finds_in_lakebase(self):
         # A reader started after the batch (a later update's) lists the table's runs from
-        # Lakebase once and finishes each when its restart LSN passes the run's BEGIN. An
-        # append-only table has no delete channel, so its upsert channel alone deletes.
+        # Lakebase and finishes each once its commit LSN reaches the commit the poll recorded.
+        # An append-only table has no delete channel, so its upsert channel alone deletes.
         connector = self.connector(FakeBridge(), registration_scope="spill-listed")
         table = connector._table("app.orders", {})
         changes = [
@@ -6646,18 +6742,18 @@ class LakeflowContractTests(unittest.TestCase):
         ]
         # A run another pipeline recorded past the staging retention expires with the listing.
         gone = connector._spill_run_key(table.native_identity, "0" * 32, "layout-1-2-abc")
-        informix_module.mark_spill_run(
+        informix_module.merge_spill_run(
             connector._lakebase_connection(),
             connector._lakebase_state_namespace(),
             gone,
             {"run": "layout-1-2-abc", "begin_lsn": "1", "done": {"upsert": True}, "required": []},
         )
         self._lakebase.database.advance(connector._snapshot_staging_retention_seconds + 1)
-        _, run, key = self._spilled_run(connector, table, changes)
+        _, run, key = self._spilled_run(connector, table, changes, commit=110)
         later = self.connector(FakeBridge(), registration_scope="spill-listed")
 
-        def settle(restart):
-            checkpoint = {"commit_lsn": str(restart + 10), "begin_lsn": str(restart)}
+        def settle(commit):
+            checkpoint = {"commit_lsn": str(commit), "begin_lsn": str(commit)}
             later._settle_spilled_runs(table, checkpoint, {}, False)
             self._flush_snapshot_cleanup(later)
             return os.path.isdir(run)
@@ -6669,11 +6765,164 @@ class LakeflowContractTests(unittest.TestCase):
             ) as listed,
         ):
             self.assertTrue(settle(100))
-            self.assertTrue(settle(101))
-            self.assertFalse(settle(102))
+            self.assertTrue(settle(109))
+            self.assertFalse(settle(110))
         self.assertEqual(listed.call_count, 1)
         self.assertEqual(self._spill_record(later, key)["done"], {"upsert": True})
         self.assertIsNone(self._spill_record(later, gone))
+
+    def _polled_run(self, connector, table, end, *, lsn=300):
+        # Spill transaction 7 (BEGIN 100) through a bridge poll ending in ``end`` (a COMMIT or
+        # ROLLBACK record); return the poll's records and the run's Lakebase record key.
+        capture = informix_module._capture_descriptor(table)
+        changes = [
+            {"op": "INSERT", "tx_id": 7, "lsn": lsn + i, "label": 1, "row": {"id": i}}
+            for i in range(3)
+        ]
+        records = _spill_poll(
+            [{"op": "BEGIN", "tx_id": 7, "lsn": 100}, *changes, end],
+            [capture],
+            connector._cdc_spill([capture]),
+        )
+        layout = connector._cdc_spill([capture])._layouts[table.identity]
+        run = informix_module._spill_run(layout, 100, 7, changes[0])
+        scope = informix_module._spill_scope(connector._registration_scope)
+        return records, connector._spill_run_key(table.native_identity, scope, run)
+
+    def test_a_listed_spilled_run_is_finished_by_its_commit_not_its_begin(self):
+        # Informix can hand a channel a transaction whose BEGIN lies below the channel's
+        # restart LSN (its first captured change came later), so a run found in Lakebase
+        # is finished only once the channel's commit LSN reaches the transaction's commit.
+        # A rolled-back transaction leaves no record.
+        connector = self.connector(
+            FakeBridge(), registration_scope="spill-commit", **{"cdc.spill.records": "2"}
+        )
+        table = connector._table("app.orders", {})
+        _, key = self._polled_run(connector, table, {"op": "COMMIT", "tx_id": 7, "lsn": 400})
+        later = self.connector(FakeBridge(), registration_scope="spill-commit")
+
+        def settle(commit):
+            checkpoint = {"commit_lsn": str(commit), "begin_lsn": str(commit)}
+            later._settle_spilled_runs(table, checkpoint, {}, False)
+            return self._spill_record(later, key)["done"]
+
+        self.assertEqual(settle(350), {})
+        self.assertEqual(settle(400), {"upsert": True})
+        _, key = self._polled_run(
+            connector, table, {"op": "ROLLBACK", "tx_id": 7, "lsn": 500}, lsn=450
+        )
+        self.assertIsNone(self._spill_record(connector, key))
+
+    def test_a_channel_that_read_a_transaction_in_memory_still_finishes_its_run(self):
+        # The upsert shard spilled a transaction the delete shard kept in memory (it captures
+        # fewer of the transaction's tables), so the delete channel never served the run from
+        # pages: it lists the table's runs again later and finishes this one by its commit.
+        connector = self.connector(
+            FakeBridge(), registration_scope="spill-relist", **{"cdc.spill.records": "2"}
+        )
+        table = connector._table("app.orders", {})
+        later = self.connector(FakeBridge(), registration_scope="spill-relist")
+        later._settle_spilled_runs(table, {"commit_lsn": "50", "begin_lsn": "50"}, {}, True)
+        _, key = self._polled_run(connector, table, {"op": "COMMIT", "tx_id": 7, "lsn": 400})
+        with mock.patch.object(informix_module, "_CDC_SPILL_LIST_SECONDS", 0, create=True):
+            later._settle_spilled_runs(table, {"commit_lsn": "400", "begin_lsn": "400"}, {}, True)
+        self.assertEqual(self._spill_record(later, key)["done"], {"delete": True})
+
+    def test_both_channels_write_the_same_bytes_to_a_shared_spill_page(self):
+        # The channels' shards list the table at different positions, so their records carry
+        # different capture labels. A page keeps neither, so on FUSE the second channel to
+        # rename a page into place finds the first's equal instead of conflicting (218).
+        connector = self.connector(FakeBridge(), registration_scope="spill-labels")
+        table = connector._table("app.orders", {})
+        capture = informix_module._capture_descriptor(table)
+        other = {**capture, "identity": "demo:app.audit", "logical_identity": "demo.app.audit"}
+
+        def page(captures, label):
+            changes = [
+                {"op": "INSERT", "tx_id": 7, "lsn": 102 + i, "label": label, "row": {"id": i}}
+                for i in range(2)
+            ]
+            changes = [{**change, "table": table.identity} for change in changes]
+            _, run, _ = self._spilled_run(connector, table, changes, captures=captures)
+            with open(os.path.join(run, "page-00000000", "data.json.gz"), "rb") as handle:
+                data = handle.read()
+            shutil.rmtree(run)
+            return data
+
+        self.assertEqual(page([capture], 1), page([other, capture], 2))
+
+    def test_an_unpaired_before_image_on_a_spilled_page_fails_the_read(self):
+        # In memory a transaction committed with an unpaired BEFORE_UPDATE fails (error 141);
+        # served from its pages it fails the same way rather than dropping the image.
+        connector = self.connector(FakeBridge(), registration_scope="spill-unpaired")
+        table = connector._table("app.orders", {})
+        changes = [
+            {"op": op, "tx_id": 7, "lsn": lsn, "table": table.identity, "row": {"id": 1}}
+            for op, lsn in (("INSERT", 102), ("BEFORE_UPDATE", 103))
+        ]
+        part, _, _ = self._spilled_run(connector, table, changes)
+        tx = informix_module.CommittedTransaction(7, 101, 110, 110, (), None, (part,))
+        rows = informix_module._SpilledRows(
+            connector._stream_staged_page_for,
+            [part],
+            tx,
+            table,
+            {},
+            deletes=False,
+            tombstones=False,
+            encoding="latin-1",
+        )
+        with self.assertRaisesRegex(InformixError, "unpaired BEFORE_UPDATE"):
+            list(rows)
+
+    def test_the_delete_channel_skips_the_pages_of_an_insert_only_spilled_transaction(self):
+        # An insert-only transaction has nothing for the delete channel, so it reads none of
+        # its pages; the upsert channel still serves every change, and both move past it.
+        bridge = FakeBridge()
+        connector = self.connector(bridge, registration_scope="spill-inserts")
+        table = connector._table("app.orders", {})
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        changes = [
+            {"op": "INSERT", "tx_id": 7, "lsn": 102 + i, "table": table.identity, "row": {"id": i}}
+            for i in range(3)
+        ]
+        part, _, _ = self._spilled_run(connector, table, changes)
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 101},
+            part,
+            {"op": "COMMIT", "tx_id": 7, "lsn": 110},
+        ]
+        with mock.patch.object(
+            connector, "_stream_staged_page_for", wraps=connector._stream_staged_page_for
+        ) as pages:
+            rows, end = connector.read_table_deletes("app.orders", checkpoint, {})
+            self.assertEqual(list(rows), [])
+            self.assertEqual(pages.call_count, 0)
+            rows, upsert_end = connector.read_table("app.orders", checkpoint, {})
+            self.assertEqual(len(list(rows)), 3)
+        self.assertEqual(end["commit_lsn"], upsert_end["commit_lsn"])
+
+    def test_a_replay_whose_first_read_went_idle_keeps_a_spilled_batch_on_its_pages(self):
+        # A replay that reads more than once returns a spilled transaction from its last read
+        # as pages, not rows chained onto the empty reads before it, so get_partitions does
+        # not shape every change on the driver.
+        table = Table.parse(_table(), "demo")
+        tx = informix_module.CommittedTransaction(7, 106, 110, 110, (), None, ())
+        spilled = informix_module._SpilledRows(
+            lambda *args: None, [], tx, table, {}, deletes=False, tombstones=False, encoding="x"
+        )
+        reads = iter(
+            [
+                ([], {"phase": "stream", "commit_lsn": "105", "begin_lsn": "105", "tx_id": None}),
+                (spilled, {"phase": "stream", "commit_lsn": "110", "begin_lsn": "110", "tx_id": 7}),
+            ]
+        )
+        start = {"phase": "stream", "commit_lsn": "100", "begin_lsn": "100", "tx_id": 5}
+        end = {"phase": "stream", "commit_lsn": "110", "begin_lsn": "110", "tx_id": 7}
+        records = informix_module._replay_between_offsets(
+            start, end, lambda _start: next(reads), {}, {}
+        )
+        self.assertIs(records, spilled)
 
     def test_a_shard_daemon_spills_under_its_consumers_scope(self):
         # The daemon reader is a new connector, so it is handed the consumer's scope; a
@@ -15678,6 +15927,32 @@ class SharedCdcShardTests(unittest.TestCase):
         self.assertEqual([tx.tx_id for tx in view_b.committed], [2])
         self.assertTrue(view_a.caught_up)
         self.assertEqual((view_a.min_lsn, view_a.current_lsn), (1, 106))
+
+    def test_an_open_spilled_transaction_holds_its_tables_open_begin(self):
+        # A transaction spilled and still open when the read ends has no change records in
+        # memory; its table still reports the BEGIN as open, so a replay bounded above the
+        # BEGIN stays short of it. The other table has nothing open.
+        capture = _capture_descriptor(self.table_b)
+        spill = informix_module._CdcSpill(
+            2,
+            lambda *args: None,
+            lambda *args: None,
+            {self.table_b.identity: "layout"},
+            "scope",
+            {self.table_b.identity: self.id_b},
+        )
+        changes = [
+            {"op": "INSERT", "tx_id": 3, "lsn": 101 + i, "label": 1, "row": {"id": i}}
+            for i in range(3)
+        ]
+        records = _spill_poll(
+            [{"op": "BEGIN", "tx_id": 3, "lsn": 100}, *changes, {"op": "TIMEOUT", "lsn": 120}],
+            [capture],
+            spill,
+        )
+        shard = self._shard_with_two_tables()
+        shard.ingest(records, self._schema_map(), 1, 120, 0)
+        self.assertEqual(shard.open_begins, {self.id_a: None, self.id_b: 100})
 
     def test_a_spilled_transaction_reaches_its_table_and_crosses_the_host_socket(self):
         # A transaction whose changes all went to staged pages has no change records, only

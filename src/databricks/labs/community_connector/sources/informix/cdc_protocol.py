@@ -99,8 +99,12 @@ class OpenTransactionRecords:
             raise CdcProtocolError(f"CDC data for unknown transaction {tx_id}")
         self._sequences[tx_id].append(lsn)
 
-    def held(self, tx_id: int) -> int:
-        return len(self._sequences.get(tx_id, ()))
+    def held(self, tx_id: int | None) -> int:
+        return len(self._sequences.get(tx_id, ())) if tx_id is not None else 0
+
+    def largest(self) -> int | None:
+        # Docstring: The open transaction holding the most data records, or None.
+        return max(self._sequences, key=lambda tx_id: len(self._sequences[tx_id]), default=None)
 
     def release(self, tx_id: int) -> None:
         # Docstring: Stop counting an open transaction whose records went to storage.
