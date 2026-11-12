@@ -1986,6 +1986,28 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertNotIn("SPILLED", [r["op"] for r in records])
         self.assertEqual(deletes, [run])
 
+        # Informix reuses transaction IDs: an earlier transaction 7 committed in the same
+        # poll keeps its records, and only what follows the latest BEGIN 7 is spilled.
+        earlier = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 90},
+            change("INSERT", 7, 91),
+            {"op": "COMMIT", "tx_id": 7, "lsn": 92},
+        ]
+        records, writes, _ = poll([*earlier, *opening, {"op": "COMMIT", "tx_id": 7, "lsn": 110}])
+        self.assertEqual(
+            [(r["op"], r["lsn"]) for r in records[:4]],
+            [("BEGIN", 90), ("INSERT", 91), ("COMMIT", 92), ("BEGIN", 100)],
+        )
+        self.assertEqual(
+            [r["op"] for r in records[4:]],
+            ["BEGIN", "INSERT", "COMMIT", "DISCARD", "SPILLED", "COMMIT"],
+        )
+        self.assertEqual(writes, [(run, 0, [101, 104]), (run, 1, [105, 106]), (run, 2, [109])])
+        committed, *_ = informix_module._transaction_batch(records)
+        self.assertEqual(
+            [(tx.commit_lsn, len(tx.spilled)) for tx in committed], [(92, 0), (107, 0), (110, 1)]
+        )
+
     def test_connection_port_range_is_validated_before_connecting(self):
         self.connector(**{"port": "1"})
         self.connector(**{"port": "65535"})

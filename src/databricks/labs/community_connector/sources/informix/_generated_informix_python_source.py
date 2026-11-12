@@ -9426,14 +9426,22 @@ def register_lakeflow_source(spark):
                             open_transactions.append(tx_id, int(record["lsn"]))
                             if spill is not None and open_transactions.held(tx_id) > spill.threshold:
                                 # Its changes, and any DISCARD among them, go to the spill in
-                                # order; its BEGIN stays here for the transaction buffer.
-                                own = [r for r in records if r.get("tx_id") == tx_id]
-                                records[:] = [
-                                    r for r in records if r.get("tx_id") != tx_id or r["op"] == "BEGIN"
-                                ]
-                                begin = next((r for r in own if r["op"] == "BEGIN"), own[0])
+                                # order; its BEGIN stays here for the transaction buffer. Informix
+                                # reuses transaction IDs, so only what follows its latest BEGIN is
+                                # its own: an earlier transaction with this ID stays as it was.
+                                begin = max(
+                                    (
+                                        index
+                                        for index, r in enumerate(records)
+                                        if r.get("tx_id") == tx_id and r["op"] == "BEGIN"
+                                    ),
+                                    default=-1,
+                                )
+                                later = records[begin + 1 :]
+                                records[begin + 1 :] = [r for r in later if r.get("tx_id") != tx_id]
+                                own = [r for r in later if r.get("tx_id") == tx_id]
                                 spill.start(
-                                    tx_id, int(begin["lsn"]), [r for r in own if r["op"] != "BEGIN"]
+                                    tx_id, int((records[begin] if begin >= 0 else own[0])["lsn"]), own
                                 )
                                 open_transactions.release(tx_id)
                         elif record["op"] == "DISCARD":
