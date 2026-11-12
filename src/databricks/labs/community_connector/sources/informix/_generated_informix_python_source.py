@@ -9399,9 +9399,12 @@ def register_lakeflow_source(spark):
                             # session. The checkpoint remains at the last complete
                             # transaction, so a later poll safely replays it.
                             break
-                if parser.buffered_bytes and not timed_out and not truncated:
-                    # A truncated poll abandons the rest of the chunk deliberately,
-                    # so a partial trailing frame is expected rather than corruption.
+                # A poll that reached cdc.max.records with every transaction complete stops on
+                # purpose, so its last cdc.read.bytes read can end inside the next record. Like a
+                # truncated poll, it leaves that partial frame for the next poll, which
+                # replays from the last complete transaction.
+                stopped_at_budget = budget_records >= max_records and not open_transactions
+                if parser.buffered_bytes and not (timed_out or truncated or stopped_at_budget):
                     # 59: CDC read ended with an incomplete native frame
                     raise InformixError(_m(59))
                 return records

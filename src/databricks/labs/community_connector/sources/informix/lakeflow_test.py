@@ -16,6 +16,7 @@ import pickle
 import shutil
 import socket
 import stat
+import struct
 import sys
 import tempfile
 import threading
@@ -1784,6 +1785,48 @@ class LakeflowContractTests(unittest.TestCase):
         # The window reaches Informix itself through cdc_opensess, not just the
         # connector's own loop bound.
         self.assertEqual(requested, [256])
+
+    def test_a_poll_stopped_at_its_record_budget_leaves_a_partial_frame_for_the_next(self):
+        # cdc.max.records ends a poll at the first read that leaves every transaction
+        # complete. That read can stop inside the next record; the poll returns what it
+        # completed, and the next one replays the rest from the checkpoint. A read that
+        # ends inside a frame for any other reason still fails.
+        def frame(kind, header):
+            return struct.pack(">IIII", 16 + len(header), 0, 0, kind) + header
+
+        def begin(lsn, tx_id):
+            return frame(1, struct.pack(">Qiqi", lsn, tx_id, 1_700_000_000, 0))
+
+        def commit(lsn, tx_id):
+            return frame(2, struct.pack(">Qiq", lsn, tx_id, 1_700_000_000))
+
+        capture = {
+            "identity": "demo:app.orders",
+            "logical_identity": "demo.app.orders",
+            "columns": ["id"],
+            "descriptors": [{"name": "id", "type_name": "INTEGER"}],
+        }
+        following = begin(300, 8)
+
+        def poll(chunks, max_records):
+            bridge = object.__new__(PurePythonInformixBridge)
+            bridge.options = {}
+            bridge.transport = FakeCdcTransport(chunks)
+            return bridge.read_changes([capture], 90, 1, max_records)
+
+        records = poll([begin(100, 7) + commit(200, 7) + following[:7]], 2)
+        self.assertEqual([(r["op"], r["lsn"]) for r in records], [("BEGIN", 100), ("COMMIT", 200)])
+        # Short of the budget, the loop reads on and reassembles the split frame.
+        records = poll(
+            [begin(100, 7) + commit(200, 7) + following[:7], following[7:] + commit(400, 8)], 10
+        )
+        self.assertEqual([r["lsn"] for r in records], [100, 200, 300, 400])
+        # The source stops sending inside a frame before the budget is reached.
+        with self.assertRaisesRegex(InformixError, "incomplete native frame"):
+            poll([begin(100, 7) + commit(200, 7) + following[:7]], 10)
+        # The budget is reached, but a transaction is still open when the read ends.
+        with self.assertRaisesRegex(InformixError, "incomplete native frame"):
+            poll([begin(100, 7) + commit(200, 7) + following + commit(400, 8)[:7]], 2)
 
     def test_connection_port_range_is_validated_before_connecting(self):
         self.connector(**{"port": "1"})
