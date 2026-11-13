@@ -308,8 +308,9 @@ _CDC_SPILL_SCHEMA = "cdc-spill"
 # the channel that completes the table's set deletes the pages.
 _CDC_SPILL_RECORD_TYPE = "cdc-spill-run"
 # The shape _spill_run gives a run's name: a record whose run differs names no pages of
-# this connector's, and is never made into a path.
-_SPILL_RUN_NAME = re.compile(r"[0-9a-f]{0,12}-[0-9]+-[0-9]+-[0-9a-f]{12}")
+# this connector's, and is never made into a path. The transaction ID comes from a signed
+# 32-bit header field, so it may carry a minus.
+_SPILL_RUN_NAME = re.compile(r"[0-9a-f]{0,12}-[0-9]+--?[0-9]+-[0-9a-f]{12}")
 # How often a reader lists its tables' runs from Lakebase again: a channel that read a
 # transaction in memory (its shard spilled nothing) finishes the other shard's run so.
 _CDC_SPILL_LIST_SECONDS = 300
@@ -5834,8 +5835,10 @@ def _newest_created_entry_mtime(path: str, recursive: bool = False) -> float:
 def _created_since(path: str, cutoff: float) -> bool:
     # Docstring: Whether anything beneath ``path`` was created at or after ``cutoff``, by the
     # rule of _newest_created_entry_mtime (files only; a tree with none goes by its own
-    # directory), stopping at the first such file: an active run of thousands of pages then
-    # costs one directory listing, not a stat of every page over the mount.
+    # directory), stopping at the first such file. Directories are told apart by the listing
+    # where it carries the entry type, and only files are statted, so an active run of
+    # thousands of pages costs two listings and one stat, not a stat of every page over the
+    # mount.
 
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     root = os.open(path, flags)
@@ -5849,10 +5852,9 @@ def _created_since(path: str, cutoff: float) -> bool:
                 directories = []
                 with os.scandir(descriptor) as entries:
                     for entry in entries:
-                        metadata = entry.stat(follow_symlinks=False)
-                        if stat.S_ISDIR(metadata.st_mode):
+                        if entry.is_dir(follow_symlinks=False):
                             directories.append(entry.name)
-                        elif metadata.st_mtime >= cutoff:
+                        elif entry.stat(follow_symlinks=False).st_mtime >= cutoff:
                             return True
                         else:
                             files = True
@@ -14235,11 +14237,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # reading from below it still hands over a transaction open across it. So a run no
         # poll saw commit (an update stopped inside it) waits for a later COMMIT or ROLLBACK,
         # or for its record to expire, unless its first change names a logical log ahead of
-        # the source's current one (``current_lsn``): the source reinitialized its log, and
-        # every checkpoint from before that fails (error 284). Runs are listed from Lakebase at
-        # the first read and every _CDC_SPILL_LIST_SECONDS, which also expires the table's old
-        # records of every pipeline, their stale pages with them, so a channel that read a
-        # transaction in memory finishes the other shard's run too. Not called on a replay,
+        # the source's current one: the source reinitialized its log, and every checkpoint
+        # from before that fails (error 284). ``current_lsn`` samples that position, and is
+        # called only after a listing, so after every listed record existed: an earlier
+        # sample can name an older log than a live run's first change. A read served from a
+        # shard view passes none, since the view's position predates the read that published
+        # it, so there such a run waits for a direct read or its expiry. Runs are listed from
+        # Lakebase at the first read and every _CDC_SPILL_LIST_SECONDS, which also expires the
+        # table's old records of every pipeline, their stale pages with them, so a channel that
+        # read a transaction in memory finishes the other shard's run too. Not called on a replay,
         # whose later polls start at positions Spark has not committed. The table's channels
         # are the upsert one and, unless it is append-only, the delete one: the connector
         # already serves one of each per table per pipeline.
@@ -14310,7 +14316,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     if run not in pending or pending[run][2] is None:
                         pending[run] = entry
             commit = int(checkpoint["commit_lsn"])
-            log = None if current_lsn is None else int(current_lsn) >> 32
+            log = None
+            if (
+                due
+                and current_lsn is not None
+                and any(entry[2] is None and entry[3] is not None for entry in pending.values())
+            ):
+                log = int(current_lsn()) >> 32
             finished = [
                 (run, entry)
                 for run, entry in pending.items()
@@ -14866,7 +14878,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # A normal (non-replay) read has no replay stop and takes the boundary as before.
         replay_stop = self._replay_stop_lsn(options)
         if replay_stop is None:
-            self._settle_spilled_runs(table, checkpoint, options, deletes, current)
+            self._settle_spilled_runs(
+                table,
+                checkpoint,
+                options,
+                deletes,
+                None if shared_view is not None else self._bridge.current_lsn,
+            )
         if self._trigger_available_now and replay_stop is None:
             stop_lsn, trigger_generation = self._shared_trigger_boundary(
                 table,

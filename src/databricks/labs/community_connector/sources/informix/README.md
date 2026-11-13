@@ -626,8 +626,10 @@ default), its changes go to the staging Volume instead, in pages of up to 10,000
     `ROLLBACK`, or until the record expires, since a shared shard reading from below a
     flow's checkpoint can still hand the flow that transaction at its `COMMIT`. If the
     source has reinitialized its logical log, so the run's first change names a log file
-    ahead of the current one, no reader can be handed it again and the flows finish it at
-    once.
+    ahead of the current one, no reader can be handed it again: a flow reading the log
+    directly finishes it at its next listing, sampling the current log after the listing.
+    A flow served by a shared shard leaves it to the record's expiry, since the shard's
+    position can predate the run.
   - **Fallback:** pages the marking misses are removed by the stale-stage sweep
     (`snapshot.staging.retention.days`). This covers a flow removed from the pipeline, a
     Lakebase error while marking, a page an update was stopped while writing, and a

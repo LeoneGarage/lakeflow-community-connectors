@@ -6943,19 +6943,67 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(self._spill_record(connector, key)["first_lsn"], str(log + 102))
         later = self.connector(FakeBridge(), registration_scope="spill-abandoned")
 
+        order = []
+        listing = informix_module.list_spill_runs
+
+        def listed(*args):
+            order.append("listed")
+            return listing(*args)
+
         def settle(current, deletes, restart=log + 500):
             checkpoint = {"commit_lsn": str(log + 500), "begin_lsn": str(restart)}
-            with mock.patch.object(informix_module, "_CDC_SPILL_LIST_SECONDS", 0, create=True):
-                later._settle_spilled_runs(table, checkpoint, {}, deletes, current)
+
+            def sample():
+                order.append("sampled")
+                return current
+
+            with (
+                mock.patch.object(informix_module, "_CDC_SPILL_LIST_SECONDS", 0, create=True),
+                mock.patch.object(informix_module, "list_spill_runs", side_effect=listed),
+            ):
+                later._settle_spilled_runs(
+                    table, checkpoint, {}, deletes, None if current is None else sample
+                )
             self._flush_snapshot_cleanup(later)
             return self._spill_record(later, key)["done"], os.path.isdir(run)
 
         self.assertEqual(settle(log + 900, False), ({}, True))
         self.assertEqual(settle((6 << 32) + 1, True), ({}, True))
+        # Without a sample (a read served from a shard view) the rule never applies.
+        self.assertEqual(settle(None, False, restart=500), ({}, True))
+        # The sample is taken after the listing, so after every listed record existed.
+        del order[:]
         self.assertEqual(settle((3 << 32) + 10, False, restart=500), ({"upsert": True}, True))
+        self.assertEqual(order, ["listed", "sampled"])
         self.assertEqual(
             settle((3 << 32) + 10, True, restart=500), ({"upsert": True, "delete": True}, False)
         )
+
+    def test_a_read_from_a_shard_view_gives_the_log_rule_no_current_lsn(self):
+        # A shard view's current LSN was sampled before the read that published it, so a run
+        # that read registered can name a later log file than the view. A read served from a
+        # view therefore settles without a sample, whatever the view's current LSN.
+        connector = self.connector(FakeBridge(), registration_scope="spill-view")
+        table = connector._table("app.orders", {})
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        connector._shared_cdc_snapshot = lambda *args, **kwargs: types.SimpleNamespace(
+            table=table, min_lsn=0, current_lsn=5 << 32
+        )
+        settled = []
+
+        class Settled(Exception):
+            pass
+
+        def settle(*args):
+            settled.append(args)
+            raise Settled
+
+        with (
+            mock.patch.object(connector, "_settle_spilled_runs", side_effect=settle),
+            self.assertRaises(Settled),
+        ):
+            connector.read_table("app.orders", checkpoint, {})
+        self.assertIsNone(settled[0][4])
 
     def test_an_expired_run_record_takes_its_stale_pages_with_it(self):
         # The listing expires a table's records older than the staging retention, under every
@@ -7134,6 +7182,37 @@ class LakeflowContractTests(unittest.TestCase):
         self._flush_snapshot_cleanup(later)
         self.assertTrue(os.path.isdir(listed))
 
+    def test_a_spilled_run_of_a_negative_transaction_id_is_listed_and_settled(self):
+        # The CDC header decodes the transaction ID as a signed 32-bit value, so a run's name
+        # can carry a negative ID. The listing still takes the run, and its pages go once both
+        # channels finish it.
+        connector = self.connector(FakeBridge(), registration_scope="spill-negative")
+        table = connector._table("app.orders", {})
+        changes = [
+            {"op": "INSERT", "tx_id": -7, "lsn": 102 + i, "table": table.identity, "row": {"id": i}}
+            for i in range(3)
+        ]
+        with mock.patch.object(informix_module, "_CDC_SPILL_PAGE_RECORDS", 2):
+            writer = connector._cdc_spill([informix_module._capture_descriptor(table)])
+            writer.start(-7, 101, changes)
+            (part,) = writer.finish(-7, 110)
+        self.assertIn("-101--7-", part["run"])
+        run = os.path.join(
+            connector._snapshot_stage_namespace_for(
+                table.native_identity, part["pipeline_scope"], informix_module._CDC_SPILL_SCHEMA
+            ),
+            "runs",
+            part["run"],
+        )
+        self.assertTrue(os.path.isdir(run))
+        later = self.connector(FakeBridge(), registration_scope="spill-negative")
+        for deletes in (False, True):
+            later._settle_spilled_runs(
+                table, {"commit_lsn": "110", "begin_lsn": "110"}, {}, deletes
+            )
+        self._flush_snapshot_cleanup(later)
+        self.assertFalse(os.path.exists(run))
+
     def test_the_stale_stage_check_stops_at_the_first_recent_file(self):
         # An active run keeps its pages whatever the age of the others, so the sweep stops
         # at its first recent file rather than statting every page over the mount.
@@ -7149,6 +7228,36 @@ class LakeflowContractTests(unittest.TestCase):
                 InformixLakeflowConnect._remove_stale_stage_run(run, time.time() - 100)
             self.assertTrue(os.path.isdir(run))
             self.assertEqual(scanned.call_count, 1)
+        # A run directory holds only page directories: those are told apart by the listing,
+        # so an active run of many pages costs one stat, its first page's file.
+        stats = []
+        listing = os.scandir
+
+        class Entry:
+            def __init__(self, entry):
+                self._entry = entry
+
+            def __getattr__(self, name):
+                return getattr(self._entry, name)
+
+            def stat(self, **kwargs):
+                stats.append(self._entry.name)
+                return self._entry.stat(**kwargs)
+
+        @contextlib.contextmanager
+        def counted(path):
+            with listing(path) as entries:
+                yield (Entry(entry) for entry in entries)
+
+        with tempfile.TemporaryDirectory() as run:
+            for index in range(50):
+                page = os.path.join(run, f"page-{index:08d}")
+                os.makedirs(page)
+                open(os.path.join(page, "data.json.gz"), "wb").close()
+            with mock.patch.object(os, "scandir", side_effect=counted):
+                InformixLakeflowConnect._remove_stale_stage_run(run, time.time() - 100)
+            self.assertTrue(os.path.isdir(run))
+            self.assertEqual(stats, ["data.json.gz"])
         with tempfile.TemporaryDirectory() as root:
             stale = os.path.join(root, "stale")
             os.makedirs(os.path.join(stale, "page-00000000"))
