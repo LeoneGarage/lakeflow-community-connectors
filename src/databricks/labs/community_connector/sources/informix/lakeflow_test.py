@@ -6979,6 +6979,57 @@ class LakeflowContractTests(unittest.TestCase):
             settle((3 << 32) + 10, True, restart=500), ({"upsert": True, "delete": True}, False)
         )
 
+    def test_an_informix_error_sampling_the_current_log_reaches_the_read(self):
+        # The sample is an Informix query. Its errors, capacity loss included, propagate to the
+        # read like any bridge call's, rather than being logged as a Lakebase failure (430).
+        bridge = FakeBridge()
+        connector = self.connector(bridge, registration_scope="spill-sample")
+        table = connector._table("app.orders", {})
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        changes = [
+            {"op": "INSERT", "tx_id": 7, "lsn": 102 + i, "table": table.identity, "row": {"id": i}}
+            for i in range(3)
+        ]
+        with mock.patch.object(informix_module, "_CDC_SPILL_PAGE_RECORDS", 2):
+            connector._cdc_spill([informix_module._capture_descriptor(table)]).start(
+                7, 101, changes
+            )
+        listed = []
+        listing = informix_module.list_spill_runs
+        position = bridge.current_lsn
+
+        def list_runs(*args):
+            listed.append(True)
+            return listing(*args)
+
+        def current_lsn():
+            if listed:
+                raise InformixError("current log unavailable")
+            return position()
+
+        with (
+            mock.patch.object(informix_module, "list_spill_runs", side_effect=list_runs),
+            mock.patch.object(bridge, "current_lsn", side_effect=current_lsn),
+            self.assertNoLogs(informix_module.__name__, level="WARNING"),
+            self.assertRaisesRegex(InformixError, "current log unavailable"),
+        ):
+            connector.read_table("app.orders", checkpoint, {})
+        later = self.connector(FakeBridge(), registration_scope="spill-sample")
+        for error in (informix_module.ConnectionCapacityUnavailable("no slot"), OSError("reset")):
+            with (
+                self.subTest(error=type(error).__name__),
+                self.assertNoLogs(informix_module.__name__, level="WARNING"),
+                self.assertRaises(type(error)),
+            ):
+                later._spill_runs_listed.clear()
+                later._settle_spilled_runs(
+                    table,
+                    {"commit_lsn": "50", "begin_lsn": "50"},
+                    {},
+                    False,
+                    mock.Mock(side_effect=error),
+                )
+
     def test_a_read_from_a_shard_view_gives_the_log_rule_no_current_lsn(self):
         # A shard view's current LSN was sampled before the read that published it, so a run
         # that read registered can name a later log file than the view. A read served from a

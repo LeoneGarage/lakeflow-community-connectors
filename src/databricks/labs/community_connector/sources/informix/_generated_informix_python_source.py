@@ -20037,6 +20037,9 @@ def register_lakeflow_source(spark):
             if not due and not pending:
                 return
             namespace = self._lakebase_state_namespace()
+            # Set while the sampler runs: it is an Informix query, so its errors (a lost capacity
+            # lease included) go to the read like any bridge call's, not to the Lakebase handler.
+            sampling = False
             try:
                 if due:
                     prefix = "/".join((*self._table_state_keys_for(native), _CDC_SPILL_SCHEMA))
@@ -20097,7 +20100,9 @@ def register_lakeflow_source(spark):
                     and current_lsn is not None
                     and any(entry[2] is None and entry[3] is not None for entry in pending.values())
                 ):
+                    sampling = True
                     log = int(current_lsn()) >> 32
+                    sampling = False
                 finished = [
                     (run, entry)
                     for run, entry in pending.items()
@@ -20131,6 +20136,8 @@ def register_lakeflow_source(spark):
                         )
                         self._snapshot_cleanup_executor().submit(self._delete_spill_pages, path)
             except Exception:  # pylint: disable=broad-except
+                if sampling:
+                    raise
                 # 430: Cannot update the spilled CDC runs of '{}' in Lakebase; trying again on the
                 # next batch
                 logging.getLogger(__name__).warning(_m(430, table.exposed_name), exc_info=True)
