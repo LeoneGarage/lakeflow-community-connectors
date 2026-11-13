@@ -1885,6 +1885,82 @@ class LakeflowContractTests(unittest.TestCase):
         # connector's own loop bound.
         self.assertEqual(requested, [256])
 
+    def test_a_poll_starts_with_a_small_read_and_sizes_the_next_by_how_the_last_went(self):
+        # Informix returns a CDC read only when the bytes asked for have arrived, the
+        # session's record cap is reached or the session has been idle for its timeout. A
+        # full-size read under a steady trickle waited 25-33 s on the demo server and timed
+        # the socket out. So a poll starts at 128 bytes, the smallest read Informix accepts,
+        # doubles the read while reads come back full at once, up to cdc.read.bytes, and
+        # halves it after a read that waited.
+        clock = [1000.0]
+        # (bytes returned, seconds the read took)
+        plan = [(128, 0.01), (256, 0.01), (300, 0.01), (100, 3.0), (10, 3.0), (5, 3.0)]
+
+        class SizedTransport(FakeCdcTransport):
+            def __init__(self):
+                super().__init__([])
+                self.requested = []
+
+            def read_lodata(self, descriptor, requested):
+                self.requested.append(requested)
+                if not plan:
+                    return b"T"
+                size, seconds = plan.pop(0)
+                clock[0] += seconds
+                return b"x" * size
+
+        class TimeoutOnlyParser(RecordParser):
+            def feed(self, chunk):
+                if chunk == b"T":
+                    yield {"op": "TIMEOUT", "lsn": 100}
+
+        transport = SizedTransport()
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {"cdc.read.bytes": "300"}
+        bridge.transport = transport
+        capture = {
+            "identity": "demo:app.orders",
+            "logical_identity": "demo.app.orders",
+            "columns": ["id"],
+            "descriptors": [{"name": "id", "type_name": "INTEGER"}],
+        }
+        with (
+            mock.patch.object(informix_module, "CdcFrameParser", TimeoutOnlyParser),
+            mock.patch.object(
+                informix_module, "decode_frame", side_effect=lambda frame, labels, **_: dict(frame)
+            ),
+            mock.patch.object(informix_module.time, "monotonic", side_effect=lambda: clock[0]),
+        ):
+            records = bridge.read_changes([capture], 90, 5, 256)
+
+        self.assertEqual([record["op"] for record in records], ["TIMEOUT"])
+        self.assertEqual(transport.requested, [128, 256, 300, 300, 150, 128, 128])
+
+    def test_a_read_size_below_the_starting_size_is_used_as_it_is(self):
+        class SizedTransport(FakeCdcTransport):
+            def __init__(self):
+                super().__init__([])
+                self.requested = []
+
+            def read_lodata(self, descriptor, requested):
+                self.requested.append(requested)
+                return b"x" * requested if len(self.requested) < 3 else b""
+
+        transport = SizedTransport()
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {"cdc.read.bytes": "40"}
+        bridge.transport = transport
+        capture = {"identity": "demo:app.orders", "columns": ["id"], "descriptors": []}
+
+        class NoFrames(RecordParser):
+            def feed(self, chunk):
+                return iter(())
+
+        with mock.patch.object(informix_module, "CdcFrameParser", NoFrames):
+            bridge.read_changes([capture], 90, 5, 256)
+
+        self.assertEqual(transport.requested, [40, 40, 40])
+
     def test_a_poll_stopped_at_its_record_budget_leaves_a_partial_frame_for_the_next(self):
         # cdc.max.records ends a poll at the first read that leaves every transaction
         # complete. That read can stop inside the next record; the poll returns what it
@@ -2340,7 +2416,7 @@ class LakeflowContractTests(unittest.TestCase):
         ):
             bridge.read_changes([capture], 90, 60, 2)
 
-        self.assertEqual(transport.timeouts, [65.0, 30.0])
+        self.assertEqual(transport.timeouts, [125.0, 30.0])
 
     def test_native_poll_restores_socket_timeout_after_a_lost_lease(self):
         # A lost lease skips the session teardown, but the raised timeout must still be
@@ -2376,7 +2452,7 @@ class LakeflowContractTests(unittest.TestCase):
         ):
             bridge.read_changes([capture], 90, 60, 2)
 
-        self.assertEqual(transport.timeouts, [65.0, 30.0])
+        self.assertEqual(transport.timeouts, [125.0, 30.0])
 
     @staticmethod
     def _stepwise_bridge(answers, options=None):

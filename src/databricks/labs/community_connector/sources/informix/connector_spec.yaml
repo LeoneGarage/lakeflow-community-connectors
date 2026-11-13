@@ -1295,7 +1295,12 @@ connection:
     - name: cdc.read.bytes
       type: string
       required: false
-      description: Bytes requested from each Informix SmartLOB CDC read. Default `32000`.
+      description: >-
+        The most bytes requested in one Informix SmartLOB CDC read. Default `32000`.
+        Informix returns a read only when the bytes asked for have arrived, 256
+        records are waiting, or the session has been idle for `cdc.timeout`, so each
+        poll starts with a 128-byte read, doubles the size while reads come back full
+        at once, and halves it after a read that waited.
 
 # Exact per-table overrides consumed by the connector. `qualified_source_table` maps a
 # pipeline table to a dynamically discovered exposed name (`owner.table`).

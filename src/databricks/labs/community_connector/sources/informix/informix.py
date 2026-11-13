@@ -295,6 +295,17 @@ _DEFAULT_MAX_RECORDS_PER_BATCH = 10000
 # largest window the source accepts and let the soft-boundary loop finish any
 # transaction still open past it.
 _DEFAULT_CDC_MAX_RECORDS = 256
+# A CDC read returns only once the bytes it asked for have arrived, the session's record cap is
+# reached, or the session has been idle for cdc.timeout. Under a steady trickle a full-size
+# read therefore waits for the cap, however long that takes, and can outlast the socket
+# timeout. So a poll starts with a small read, which the first record or two fill, and
+# doubles it up to cdc.read.bytes while reads come back full at once (a backlog); a read
+# that waited halves it again. 128 bytes is the smallest read Informix accepts (a smaller
+# one fails with ISAM error -1); a read may end inside a record, which the frame parser
+# carries over to the next.
+_CDC_READ_START_BYTES = 128
+_CDC_READ_GROW_SECONDS = 0.2
+_CDC_READ_SHRINK_SECONDS = 1.0
 # An open transaction holding more change records than cdc.spill.records in one poll has
 # them written to the staging Volume as pages of up to _CDC_SPILL_PAGE_RECORDS, under a
 # "cdc-spill" stage beside the snapshot pages, rather than kept in memory. Its batch is
@@ -3672,7 +3683,11 @@ class PurePythonInformixBridge:
         captures = []
         try:
             if set_socket_timeout is not None:
-                set_socket_timeout(max(float(previous_socket_timeout or 30), timeout_seconds + 5.0))
+                # A read at the smallest size can wait for two records, each up to the
+                # session timeout after the last.
+                set_socket_timeout(
+                    max(float(previous_socket_timeout or 30), 2 * timeout_seconds + 5.0)
+                )
             for label, capture in enumerate(tables, 1):
                 native = capture["identity"]
                 columns = tuple(capture["columns"])
@@ -3708,7 +3723,8 @@ class PurePythonInformixBridge:
             max_transaction_records = int(self.options.get("cdc.max.transaction.records", "100000"))
             max_poll_records = int(self.options.get("cdc.max.poll.records", "200000"))
             max_poll_bytes = int(self.options.get("cdc.max.poll.bytes", "0"))
-            requested = int(self.options.get("cdc.read.bytes", "32000"))
+            read_bytes = int(self.options.get("cdc.read.bytes", "32000"))
+            requested = min(read_bytes, _CDC_READ_START_BYTES)
             empty_reads = 0
             timed_out = False
             retained_bytes = 0
@@ -3780,7 +3796,13 @@ class PurePythonInformixBridge:
                 and not timed_out
                 and not truncated
             ):
+                read_started = time.monotonic()
                 chunk = self.transport.read_lodata(session, requested)
+                read_seconds = time.monotonic() - read_started
+                if len(chunk) >= requested and read_seconds < _CDC_READ_GROW_SECONDS:
+                    requested = min(read_bytes, requested * 2)
+                elif read_seconds > _CDC_READ_SHRINK_SECONDS:
+                    requested = max(min(read_bytes, _CDC_READ_START_BYTES), requested // 2)
                 if not chunk:
                     empty_reads += 1
                     continue
