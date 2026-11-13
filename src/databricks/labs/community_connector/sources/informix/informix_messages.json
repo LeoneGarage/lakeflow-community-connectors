@@ -430,5 +430,10 @@
 "Informix replay did not reach its committed snapshot position {}; reached {}",
 "Cannot update spilled CDC run {} in Lakebase; its pages are left for the retention sweep",
 "Cannot update the spilled CDC runs of '{}' in Lakebase; trying again on the next batch",
-"Cannot claim the connection-wide staging sweep in Lakebase; a later read tries again"
+"Cannot claim the connection-wide staging sweep in Lakebase; a later read tries again",
+"Table '{}' has no index that snapshot.scan=index can page by: it needs an index on ingested NOT NULL columns of integer, decimal, date or character type",
+"snapshot.scan=index does not support {} on '{}'",
+"snapshot.scan=index could not settle {} key(s) of '{}' after {} re-reads because they kept changing; run the snapshot when the table is quieter",
+"snapshot.scan=index stopped waiting for Informix CDC to reach the snapshot's position for '{}' after {} seconds",
+"snapshot.scan=index read a change to '{}' from Informix CDC after staging the rows it applies to, so the snapshot is not known to be exact; Informix CDC fell behind the scan"
 ]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import collections
 import contextlib
 import dataclasses
 import errno
@@ -14,6 +15,7 @@ import json
 import logging
 import os
 import pickle
+import random as random_module
 import shutil
 import socket
 import stat
@@ -566,6 +568,115 @@ def _track_cleanup_pools(test_case):
     patcher.start()
     test_case.addCleanup(patcher.stop)
     return pools
+
+
+class _IndexScanSource:
+    """A keyless table (id, value) with an index on id, for snapshot.scan=index: it commits
+    random transactions between the calls a scan makes and reports its log position to the
+    page, the start of the page as the boundary and its end as the current position."""
+
+    PAGE = 64
+
+    def __init__(self, random, *, transactions=40, hot_key=None, descending=False):
+        self.random = random
+        self.left = transactions
+        self.hot_key = hot_key
+        self.descending = descending
+        self.indexes = [(["id"], [descending], 20)]
+        self.lsn = 1000
+        self.tx_id = 0
+        self.log: list[dict] = []
+        self.rows = [
+            {"id": key, "value": random.choice("ab")}
+            for key in range(1, 21)
+            for _ in range(random.randint(0, 3))
+        ]
+
+    @staticmethod
+    def text(row):
+        return f"{row['id']}|{row['value']}"
+
+    def rows_as_text(self):
+        return [self.text(row) for row in self.rows]
+
+    def log_changes(self):
+        # Each change with its transaction's BEGIN position: a session started at an LSN
+        # hands over the transactions that begin after it, whole.
+        begins = {r["tx_id"]: r["lsn"] for r in self.log if r["op"] == "BEGIN"}
+        for record in self.log:
+            if record["op"] in {"INSERT", "DELETE"}:
+                sign = 1 if record["op"] == "INSERT" else -1
+                yield begins[record["tx_id"]], sign, self.text(record["row"])
+
+    def _write(self, op, **fields):
+        self.lsn += self.random.randint(8, 40)
+        self.log.append({"op": op, "tx_id": self.tx_id, "lsn": self.lsn, **fields})
+
+    def _tick(self):
+        # Maybe commit a transaction: replace a key's rows, or add to them.
+        # A hot key changes once in every gap.
+        once = iter([True])
+        while self.left > 0 and (next(once, False) if self.hot_key else self.random.random() < 0.6):
+            self.left -= 1
+            self.tx_id += 1
+            key = self.hot_key or self.random.randint(1, 24)
+            self._write("BEGIN")
+            if self.random.random() < 0.6:
+                for row in [row for row in self.rows if row["id"] == key]:
+                    self.rows.remove(row)
+                    self._write("DELETE", row=dict(row))
+            for _ in range(self.random.randint(0, 3)):
+                row = {"id": key, "value": self.random.choice("ab")}
+                self.rows.insert(self.random.randint(0, len(self.rows)), row)
+                self._write("INSERT", row=dict(row))
+            self._write("COMMIT")
+
+    def boundary_lsn(self):
+        self._tick()
+        return self.lsn // self.PAGE * self.PAGE
+
+    def current_lsn(self):
+        lsn = (self.lsn // self.PAGE + 1) * self.PAGE
+        self._tick()
+        return lsn
+
+    def table_indexes(self, identity):
+        return self.indexes
+
+    def snapshot_chunk(
+        self, identity, columns, keys, after, limit, key_descending=None, isolation=None
+    ):
+        assert isolation == "COMMITTED READ LAST COMMITTED" and list(keys) == ["id"]
+        assert list(key_descending) == [self.descending]
+        boundary = self.boundary_lsn()
+        self._tick()
+        ordered = sorted(self.rows, key=lambda row: row["id"], reverse=self.descending)
+        if after is not None:
+            ordered = [
+                row
+                for row in ordered
+                if (row["id"] < after[0] if self.descending else row["id"] > after[0])
+            ]
+        rows = [dict(row) for row in ordered[:limit]]
+        self._tick()
+        return boundary, rows
+
+    def key_rows(self, identity, columns, keys, values, isolation):
+        self._tick()
+        rows = [dict(row) for row in self.rows if row["id"] == values[0]]
+        self._tick()
+        return rows
+
+    def read_changes(self, captures, start, timeout, max_records):
+        self._tick()
+        begins = {r["tx_id"]: r["lsn"] for r in self.log if r["op"] == "BEGIN"}
+        records = [dict(record) for record in self.log if begins[record["tx_id"]] > start]
+        # An idle session reports the last checkpoint's position; one happens here.
+        self.lsn += self.PAGE
+        return records + [{"op": "TIMEOUT", "lsn": self.lsn}]
+
+    def buffered_logging(self):
+        return False
 
 
 class LakeflowContractTests(unittest.TestCase):
@@ -1884,6 +1995,97 @@ class LakeflowContractTests(unittest.TestCase):
         # The window reaches Informix itself through cdc_opensess, not just the
         # connector's own loop bound.
         self.assertEqual(requested, [256])
+
+    def test_an_index_scan_stages_a_keyless_table_as_it_was_at_its_snapshot_position(self):
+        # snapshot.scan=index: a keyless change log's snapshot must hold none of the changes
+        # the stream replays (commits after the snapshot LSN), or the two overlap as
+        # duplicate or missing rows. The source here commits transactions at random between
+        # every call the scan makes, and reports its log position to the page only, as
+        # Informix does. Whatever the interleaving, the staged rows plus every transaction
+        # the stream is handed from the snapshot LSN must give the final table, duplicates
+        # included.
+        table = Table.parse(_table(primary_keys=()), "demo")
+        for seed in range(60):
+            random = random_module.Random(seed)
+            source = _IndexScanSource(random, descending=seed % 3 == 0)
+            connector = self.connector(source)
+            staged: list[dict] = []
+            pages: list[int] = []
+
+            def stage_page(lsn, index, rows, staged=staged, pages=pages):
+                pages.append(index)
+                staged.extend(rows)
+
+            boundary = connector._index_scan_snapshot(
+                table, {}, random.choice([3, 5, 50]), 0, stage_page
+            )
+
+            expected = collections.Counter(source.rows_as_text())
+            for begin, sign, row in source.log_changes():
+                if begin > boundary:
+                    expected[row] -= sign
+            self.assertEqual(
+                collections.Counter(_IndexScanSource.text(row) for row in staged),
+                +expected,
+                f"seed {seed}",
+            )
+            self.assertEqual(pages, list(range(len(pages))))
+
+    def test_an_index_scan_fails_when_cdc_stops_handing_changes_over(self):
+        # A server whose CDC has stalled answers every poll as an idle one. Taken for
+        # "nothing changed", that would stage changes the stream replays later. The scan
+        # ends by asking for proof the log was read through its end, which a stalled session
+        # cannot give: it reports no progress.
+        table = Table.parse(_table(primary_keys=()), "demo")
+        source = _IndexScanSource(random_module.Random(4))
+        source.read_changes = lambda captures, start, timeout, max_records: [
+            {"op": "TIMEOUT", "lsn": start}
+        ]
+        with (
+            mock.patch.object(informix_module, "_INDEX_SCAN_FOLLOW_SECONDS", 0),
+            self.assertRaisesRegex(InformixError, "stopped waiting for Informix CDC"),
+        ):
+            self.connector(source)._index_scan_snapshot(table, {}, 5, 0, lambda *_: None)
+
+    def test_an_index_scan_fails_on_a_change_it_is_handed_too_late(self):
+        # CDC hands over a change only after the page it applies to was staged, although
+        # it committed before that page was read.
+        table = Table.parse(_table(primary_keys=()), "demo")
+        source = _IndexScanSource(random_module.Random(5), transactions=0)
+        source.tx_id = 1
+        source._write("BEGIN")
+        source._write("INSERT", row={"id": 1, "value": "late"})
+        source._write("COMMIT")
+        source.rows.append({"id": 1, "value": "late"})
+        held, polls = list(source.log), []
+        source.log = []
+
+        def read_changes(captures, start, timeout, max_records):
+            polls.append(start)
+            if len(polls) == 2:
+                source.log = held
+            return _IndexScanSource.read_changes(source, captures, start, timeout, max_records)
+
+        source.read_changes = read_changes
+        source.boundary_lsn = lambda: 0
+        with self.assertRaisesRegex(InformixError, "after staging the rows it applies to"):
+            self.connector(source)._index_scan_snapshot(table, {}, 5, 0, lambda *_: None)
+
+    def test_an_index_scan_needs_an_index_on_not_null_columns(self):
+        table = Table.parse(_table(primary_keys=()), "demo")
+        source = _IndexScanSource(random_module.Random(1))
+        source.indexes = [(["value"], [False], 9)]  # nullable column
+        with self.assertRaisesRegex(InformixError, "no index that snapshot.scan=index"):
+            self.connector(source)._index_scan_snapshot(table, {}, 5, 0, lambda *_: None)
+
+    def test_an_index_scan_fails_when_a_key_never_stops_changing(self):
+        table = Table.parse(_table(primary_keys=()), "demo")
+        source = _IndexScanSource(random_module.Random(2), transactions=10**9, hot_key=3)
+        with (
+            mock.patch.object(informix_module, "_INDEX_SCAN_SETTLE_ATTEMPTS", 3),
+            self.assertRaisesRegex(InformixError, "could not settle 1 key"),
+        ):
+            self.connector(source)._index_scan_snapshot(table, {}, 5, 0, lambda *_: None)
 
     def test_a_poll_starts_with_a_small_read_and_sizes_the_next_by_how_the_last_went(self):
         # Informix returns a CDC read only when the bytes asked for have arrived, the

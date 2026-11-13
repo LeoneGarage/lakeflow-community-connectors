@@ -18,6 +18,7 @@ The pure-Python protocol implementation has completed authentication, query, dis
   - [Variable-scale decimals](#variable-scale-decimals)
 - [Snapshot, CDC, and deletes](#snapshot-cdc-and-deletes)
   - [Snapshot isolation](#snapshot-isolation)
+  - [Exact snapshots of keyless tables](#exact-snapshots-of-keyless-tables)
   - [Checkpoints and log retention](#checkpoints-and-log-retention)
   - [Schema evolution without full refresh](#schema-evolution-without-full-refresh)
 - [Keyless tables](#keyless-tables)
@@ -160,8 +161,8 @@ rather than start from an unrelated position.
 | `exclude_columns` | No | none | Per-table list of columns to leave out (comma-separated or a JSON array). Columns added to the source later come in. Can't be combined with `include_columns`. See [Column selection](#column-selection). |
 | `transform_columns` | No | none | Per-table object from column name to an expression replacing its value as rows leave the connector, such as `{"ssn": "MASK(ssn, 4)"}`; keys take only `HASH`. See [Value transforms](#value-transforms). |
 | `rename_columns` | No | none | Per-table new destination names for columns, as a JSON object (`{"cust_nm": "customer_name"}`) or `source:destination` pairs. Other options keep using source names. See [Column renames](#column-renames). |
-| `snapshot.isolation` | No | `committed_read_last_committed` | Per-table isolation level for the monolithic `snapshot.mode=initial` full-table snapshot. `committed_read_last_committed` (default) reads the last-committed image of a locked row instead of holding shared locks, so the snapshot does **not** lock the table against writers. `repeatable_read` restores the exactly-once, table-locking behavior. Tokens are case- and whitespace-insensitive; unknown values are rejected. **⚠️ Duplicate-row warning:** under `committed_read_last_committed` the table is no longer frozen at the snapshot LSN, so a row inserted **during** the scan can be captured by both the snapshot and the change stream. A keyed table de-duplicates these by primary key, but a **keyless (append-only) table has no key to de-duplicate on and may therefore emit duplicate rows**. Use `repeatable_read` for keyless tables that require exactly-once, or run the `initial` backfill during a quiet window. See [Snapshot isolation](#snapshot-isolation). |
-| `snapshot.scan` | No | `keyset` | Per-table (also connection-scope) read strategy for a **keyed** table's one-pass snapshot. `keyset` (default) pages in key order: each page is its own query ordered by the key columns, which an index on those columns serves cheaply. Without such an index every page can scan and sort the table, so the cost grows with pages times table size, which is the usual case for a `primary.keys` override and especially the `"*"` wildcard. `cursor` reads the table through one forward-only cursor with no sorting, as a keyless table is read, while the key still drives the destination merge and delete handling. It also avoids keyset paging's trouble with NULL key values. Pages are sized by `keyless.snapshot.page.size`. Rows committed during a non-locking scan can reach both the snapshot and the change stream, which the key de-duplicates; set `snapshot.isolation=repeatable_read` for an exactly-once scan that locks the table. With `snapshot.mode=incremental` or `auto_snapshot`, a cursor scan has no key ranges to chunk by, so a new snapshot uses the one-pass snapshot instead of the chunked one; a chunked copy already in progress finishes as it started. A keyless table always reads through the cursor. Accepts `keyset`/`cursor`. |
+| `snapshot.isolation` | No | `committed_read_last_committed` | Per-table isolation level for the monolithic `snapshot.mode=initial` full-table snapshot. `committed_read_last_committed` (default) reads the last-committed image of a locked row instead of holding shared locks, so the snapshot does **not** lock the table against writers. `repeatable_read` restores the exactly-once, table-locking behavior. Tokens are case- and whitespace-insensitive; unknown values are rejected. **⚠️ Duplicate-row warning:** under `committed_read_last_committed` the table is no longer frozen at the snapshot LSN, so a row inserted **during** the scan can be captured by both the snapshot and the change stream. A keyed table de-duplicates these by primary key, but a **keyless (append-only) table has no key to de-duplicate on and may therefore emit duplicate rows**. `repeatable_read` stops changes during the scan but not the replay of the snapshot's log page, so for a keyless table that must be exact set `snapshot.scan: index`, or run the `initial` backfill during a quiet window. See [Snapshot isolation](#snapshot-isolation). |
+| `snapshot.scan` | No | `keyset` | Per-table (also connection-scope) read strategy for a **keyed** table's one-pass snapshot. `keyset` (default) pages in key order: each page is its own query ordered by the key columns, which an index on those columns serves cheaply. Without such an index every page can scan and sort the table, so the cost grows with pages times table size, which is the usual case for a `primary.keys` override and especially the `"*"` wildcard. `cursor` reads the table through one forward-only cursor with no sorting, as a keyless table is read, while the key still drives the destination merge and delete handling. It also avoids keyset paging's trouble with NULL key values. Pages are sized by `keyless.snapshot.page.size`. Rows committed during a non-locking scan can reach both the snapshot and the change stream, which the key de-duplicates; set `snapshot.isolation=repeatable_read` for an exactly-once scan that locks the table. With `snapshot.mode=incremental` or `auto_snapshot`, a cursor scan has no key ranges to chunk by, so a new snapshot uses the one-pass snapshot instead of the chunked one; a chunked copy already in progress finishes as it started. A keyless table always reads through the cursor unless set to `index`, which makes a change log's snapshot exact when the table can hold identical rows; see [Exact snapshots of keyless tables](#exact-snapshots-of-keyless-tables). Accepts `keyset`/`cursor`/`index`. |
 | `snapshot.incremental.datetime.as.string` | No | `true` | Per-table boolean, also accepted at connection scope. When `true`, an incremental snapshot of a table whose primary key includes one or more `DATETIME` columns chunks by a fixed-width string cast of each `DATETIME` key column instead of falling back to the blocking snapshot. Any contiguous qualifier is supported, including `HOUR`-anchored time-of-day ranges, and `DATETIME` key columns alongside other key columns. Set `false` to force the blocking snapshot for such tables. |
 | `stream.partitioned` | No | `true` | Whether the connector uses the **partitioned stream reader**. When enabled (default), the staged-snapshot page-serve phase **fans out**: a microbatch spans up to `stream.partitioned.snapshot.pages.per.batch` immutable staged pages, each read and decoded on a **separate Spark executor** instead of one page per microbatch on the driver — the parallel-read win for large snapshots. The first microbatch, which stages the snapshot, serves its first page from the stage the same way. Every other phase (the live CDC/incremental stream, snapshot→CDC transitions, deletes) is **computed on the driver**, its rows byte-for-byte the current output, just wrapped, in partitions of at most 16 MiB of row JSON each (an executor parses a partition's rows all at once, under serverless's 1 GB Python memory limit) — **CDC is never parallelized here** (the shard daemon remains the CDC lever; see `cdc.shared.session`). Applies only to tables with a bounded staged-snapshot→stream lifecycle (keyed CDC tables and append-only tables); snapshot-only tables always use the simple reader. Both readers persist the **same offset**, so this can be flipped on a **running** pipeline and it resumes the existing checkpoint in place with **no full refresh** (verified: serverless SDP resumes across the reader-class swap). The exception is a `snapshot.source` (`.unl`) snapshot part-way through its serve: only the partitioned reader continues its split windows, so turning this off then fails the table with an error saying to turn it back on until the snapshot has finished; no full refresh is needed. It relies on the shared CDC session, which is always on (`cdc.shared.session` is `host` or `process`), because an embedded CDC microbatch that Spark re-plans after a driver restart is recomputed from its committed start offset **bounded at its committed end offset** — the recompute must reach exactly that `end` and fails closed on a shortfall, the same contract as the simple reader's `readBetweenOffsets` — and only the shared session's accumulating buffer lets a bounded replay of a range larger than one `cdc.max.records` poll converge (a direct per-table poll is capped per read and could never satisfy the bound). Set `false` to force the simple single-partition driver reader. Accepts `true`/`false`. |
 | `stream.partitioned.snapshot.pages.per.batch` | No | `8` | Maximum staged snapshot pages a single partitioned microbatch spans — the executor fan-out per batch; minimum `1`. Only meaningful when `stream.partitioned=true`. Larger values read more pages in parallel per microbatch at the cost of a larger batch. Independent of this value, the driver reads one boundary page's header per microbatch to record the resume cursor (`last_pk`). **Also governs a `snapshot.source` (`.unl`) serve**: it advances that many byte splits per microbatch, so the file snapshot drains over several bounded, resumable microbatches instead of one. |
@@ -547,9 +548,59 @@ The `snapshot.mode=initial` full-table snapshot runs in a single transaction, so
 - **`committed_read_last_committed`** (default) — Informix reads the last-committed image of any row locked by a concurrent writer instead of taking and holding shared locks. The scan therefore **does not lock the table against writes** for its whole duration.
 - **`repeatable_read`** — the scan holds shared locks on every row it reads until commit, freezing the table (a sequential scan effectively locks the whole table). This blocks concurrent `INSERT`/`UPDATE`/`DELETE` for the entire drain, which for a large keyless table can be minutes.
 
-> **⚠️ Duplicate rows under `committed_read_last_committed`.** The gapless handoff to CDC works by capturing `snapshot_lsn` at the start of the scan and having the stream replay everything committed after it. `repeatable_read` freezes the table at that LSN, so each row is emitted exactly once. `committed_read_last_committed` does **not** freeze it: a row inserted *during* the multi-minute scan can be read into the snapshot **and** replayed by CDC (its commit LSN is greater than `snapshot_lsn`). A **keyed** table de-duplicates these by primary key at the sink, so this is harmless. A **keyless (append-only) table has no key to de-duplicate on and will emit duplicate rows** for anything inserted during the scan. For keyless tables that require exactly-once, set `snapshot.isolation=repeatable_read`, run the `initial` backfill during a quiet window, or use the default `cdc_only` mode (which takes no snapshot at all).
+> **⚠️ Duplicate rows under `committed_read_last_committed`.** The gapless handoff to CDC works by capturing `snapshot_lsn` at the start of the scan and having the stream replay everything committed after it. `repeatable_read` freezes the table during the scan. `committed_read_last_committed` does **not** freeze it: a row inserted *during* the multi-minute scan can be read into the snapshot **and** replayed by CDC (its commit LSN is greater than `snapshot_lsn`). A **keyed** table de-duplicates these by primary key at the sink, so this is harmless. A **keyless (append-only) table has no key to de-duplicate on and will emit duplicate rows** for anything inserted during the scan. `repeatable_read` narrows this but does not remove it, because the stream also replays the log page the snapshot LSN starts on. For keyless tables that must be exact, set `snapshot.scan: index` (see [Exact snapshots of keyless tables](#exact-snapshots-of-keyless-tables)), run the `initial` backfill during a quiet window, or use the default `cdc_only` mode (which takes no snapshot at all).
 
 This option applies only to the monolithic `initial` snapshot. The default `incremental`/`auto_snapshot` strategy reads each chunk in its own short repeatable-read transaction regardless, so it never holds a whole-table lock.
+
+### Exact snapshots of keyless tables
+
+A keyless table lands as a change log, and its initial snapshot can overlap the change
+stream. Informix reports its log position to the page, so the snapshot LSN is the start of
+a log page and the stream replays every transaction on that page, including ones that
+committed before the scan began. A non-locking scan also sees changes made while it runs.
+A keyed table's target merges the overlap away. A change log keeps it, as a row that is
+both an `r` row and a `c` row, or a `d` row for a row the snapshot never held.
+`snapshot.isolation=repeatable_read` stops changes during the scan but not the replay of
+the snapshot's log page, so it does not make a keyless snapshot exact.
+
+`snapshot.scan: index` on the table does. With it the snapshot:
+
+1. Records the snapshot LSN, then reads the table a page at a time in the order of an
+   index, each index key whole within one read, with the log position sampled before and
+   after each read. The reads take no locks.
+2. Reads the table's changes from the snapshot LSN while it scans.
+3. Sorts each change by when it committed against the read of its key's page. Before the
+   read: the page holds it and the stream will replay it, so it is taken back out of the
+   page (an inserted row dropped, a deleted row added back). After the read: the page
+   does not hold it, and it is left to the stream. Between the two samples: the key is read
+   again until a read sees no change to that key, then every change to it since the
+   snapshot LSN is taken back out.
+
+The staged rows are then the table as it was at the snapshot LSN, and the stream is
+unchanged.
+
+Requirements and limits:
+
+- The table needs an index whose columns are all ingested, `NOT NULL`, and of integer,
+  decimal, `DATE` or `CHAR`/`VARCHAR`/`LVARCHAR` type. The index with the most distinct
+  keys is used, in its own column directions.
+- `row_filter` and `snapshot.filter` are not supported with it, and a `TRUNCATE` during
+  the snapshot fails it.
+- A key that keeps changing through five re-reads fails the snapshot; run it when the
+  table is quieter.
+- The snapshot ends by waiting until Informix CDC shows it has read the log past the end
+  of the scan. On a table with no changes that takes until the server's next checkpoint
+  (`CKPTINTVL`, 300 seconds by default). If CDC hands over a change for rows already
+  staged, or gives no such proof within 10 minutes, the snapshot fails instead of staging
+  rows that may overlap the stream.
+- A database with buffered logging is refused: its commits are visible to the scan before
+  CDC can hand them over.
+- All rows of one index key are read together, so an index with very large groups reads
+  slowly. The index-ordered scan is also slower than the default sequential pass.
+- It applies to a live `snapshot.mode=initial` scan. A `snapshot.source` extract still
+  has the overlap described above.
+- A transaction that was open at the snapshot LSN and had already changed the table is
+  not reconciled.
 
 To validate the ANSI transaction sequence against a live ANSI-mode database, supply the standard `CONNECTOR_TEST_CONFIG_JSON` or `CONNECTOR_TEST_CONFIG_PATH` configuration with `ansi.live.validation=true` and `ansi.test.table=owner.table`, then run `ansi_live_test.py`. The selected table must have a primary key and no more than 10,000 rows.
 
