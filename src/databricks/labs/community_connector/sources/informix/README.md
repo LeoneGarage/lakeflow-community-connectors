@@ -98,7 +98,7 @@ rather than start from an unrelated position.
 | `password` | Yes | | Password for `user`; store it as a secret. |
 | `server` | Yes | | Exact `INFORMIXSERVER` name sent during SQLI authentication. |
 | `snapshot.staging.location` | Yes | | Writable Unity Catalog Volume directory for gzip-compressed immutable initial-snapshot pages, for example `/Volumes/main/informix_cdc/staging`. This is the only Volume the connector uses; everything else lives in Lakebase. Restrict `READ VOLUME`: staged files contain source row values. Pages older than the checkpoint start page are removed incrementally; remaining staging is removed after the checkpoint reaches CDC. Abandoned scopes use `snapshot.staging.retention.days`. |
-| `snapshot.staging.retention.days` | No | `4` | Age threshold for the **background retention sweep** that reclaims abandoned snapshot staging; minimum `1`. Normal cleanup removes consumed pages incrementally and the whole stage at the snapshot→CDC transition — this sweep is the safety net for a `runs/<snapshot_lsn>` subtree left behind by a crash, an abandoned resnapshot, or a superseded schema/scope. It runs **asynchronously** (off the read path, on the same background pool as page deletion), at most once per table per reader, and once per `state.gc.interval.hours` over every table of the connection by whichever reader claims it in Lakebase, and deletes only runs whose newest page file is older than this window, so an active run (recent writes) is never touched. Best-effort: a leftover only wastes Volume space, never affects correctness. It also removes spilled CDC pages left behind (see [Large transactions](#large-transactions)), whose Lakebase records expire after the same window. |
+| `snapshot.staging.retention.days` | No | `4` | Age threshold for the **background retention sweep** that reclaims abandoned snapshot staging; minimum `1`. Normal cleanup removes consumed pages incrementally and the whole stage at the snapshot→CDC transition — this sweep is the safety net for a `runs/<snapshot_lsn>` subtree left behind by a crash, an abandoned resnapshot, or a superseded schema/scope. It runs **asynchronously** (off the read path, on the same background pool as page deletion), at most once per table per reader, and once per `state.gc.interval.hours` over every table staged under the location by whichever reader claims it in Lakebase, and deletes only runs whose newest page file is older than this window, so an active run (recent writes) is never touched. Best-effort: a leftover only wastes Volume space, never affects correctness. It also removes spilled CDC pages left behind (see [Large transactions](#large-transactions)), whose Lakebase records expire after the same window. The location-wide sweep applies the claiming reader's retention, so connections sharing a staging location should set the same value. |
 | `DB_LOCALE` | No | `en_US.819` | Database locale. Set it explicitly when the database uses another locale. |
 | `CLIENT_LOCALE` | No | `en_US.utf8` | Client locale. Its codeset controls Python row decoding. |
 | `port` | No | `9088` | Informix SQLI port; range `1`–`65535`. |
@@ -621,17 +621,20 @@ default), its changes go to the staging Volume instead, in pages of up to 10,000
   - **Flows that read it in memory:** a flow whose shard kept the transaction in memory
     (capturing fewer of its tables) finds the record when it lists its tables' runs from
     Lakebase, at its first read and every 5 minutes after.
-  - **Transactions no poll saw commit:** an update stopped inside a spilled transaction,
-    followed by a container restart or a full refresh, leaves a record with no commit LSN.
-    A flow finishes it once its checkpoint's restart LSN passes the run's first change: the
-    transaction ended before that checkpoint, since reading from there would miss that
-    change.
+  - **Transactions no poll saw commit:** an update stopped inside a spilled transaction
+    leaves a record with no commit LSN. It stays until a later poll sees the `COMMIT` or
+    `ROLLBACK`, or until the record expires, since a shared shard reading from below a
+    flow's checkpoint can still hand the flow that transaction at its `COMMIT`. If the
+    source has reinitialized its logical log, so the run's first change names a log file
+    ahead of the current one, no reader can be handed it again and the flows finish it at
+    once.
   - **Fallback:** pages the marking misses are removed by the stale-stage sweep
     (`snapshot.staging.retention.days`). This covers a flow removed from the pipeline, a
-    Lakebase error while marking, and a page an update was stopped while writing. Once per
-    `state.gc.interval.hours`, one reader of the connection, whichever claims it in
-    Lakebase first, also runs that sweep over every table's staging, so the pages of a
-    dropped table or a deleted pipeline go too.
+    Lakebase error while marking, a page an update was stopped while writing, and a
+    transaction an update was stopped inside. Once per `state.gc.interval.hours`, one
+    reader staging under each location, whichever claims it in Lakebase first, also runs
+    that sweep over every table's staging there, so the pages of a dropped table or a
+    deleted pipeline go too.
   - **Record expiry:** records are dropped after the same retention, whichever pipeline
     wrote them, by the next reader of the table, which deletes the run's pages with the
     record once they are as old, or with the table's other state.

@@ -2432,8 +2432,9 @@ def list_spill_runs(
     return [_as_dict(row[0]) for row in rows], expired
 
 
-# One row per staging root: when its next connection-wide sweep is due. A reader takes it
-# once the time has passed, so of a connection's readers one sweeps per interval.
+# One row per staging root: when its next sweep of every table staged there is due. A
+# reader takes it once the time has passed, so of the readers staging there one sweeps
+# per interval.
 _CLAIM_STAGING_SWEEP = """
 INSERT INTO state_records (namespace, record_key, record, record_type)
 VALUES (

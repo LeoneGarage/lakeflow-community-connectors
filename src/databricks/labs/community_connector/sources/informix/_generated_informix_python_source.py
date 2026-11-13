@@ -3692,8 +3692,9 @@ def register_lakeflow_source(spark):
         return [_as_dict(row[0]) for row in rows], expired
 
 
-    # One row per staging root: when its next connection-wide sweep is due. A reader takes it
-    # once the time has passed, so of a connection's readers one sweeps per interval.
+    # One row per staging root: when its next sweep of every table staged there is due. A
+    # reader takes it once the time has passed, so of the readers staging there one sweeps
+    # per interval.
     _CLAIM_STAGING_SWEEP = """
     INSERT INTO state_records (namespace, record_key, record, record_type)
     VALUES (
@@ -6081,6 +6082,9 @@ def register_lakeflow_source(spark):
     # A run's Lakebase record names the channels that have committed past its transaction;
     # the channel that completes the table's set deletes the pages.
     _CDC_SPILL_RECORD_TYPE = "cdc-spill-run"
+    # The shape _spill_run gives a run's name: a record whose run differs names no pages of
+    # this connector's, and is never made into a path.
+    _SPILL_RUN_NAME = re.compile(r"[0-9a-f]{0,12}-[0-9]+-[0-9]+-[0-9a-f]{12}")
     # How often a reader lists its tables' runs from Lakebase again: a channel that read a
     # transaction in memory (its shard spilled nothing) finishes the other shard's run so.
     _CDC_SPILL_LIST_SECONDS = 300
@@ -11600,6 +11604,41 @@ def register_lakeflow_source(spark):
             for descriptor in stack:
                 os.close(descriptor)
             raise
+
+
+    def _created_since(path: str, cutoff: float) -> bool:
+        # Docstring: Whether anything beneath ``path`` was created at or after ``cutoff``, by the
+        # rule of _newest_created_entry_mtime (files only; a tree with none goes by its own
+        # directory), stopping at the first such file: an active run of thousands of pages then
+        # costs one directory listing, not a stat of every page over the mount.
+
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        root = os.open(path, flags)
+        stack = [root]
+        root_mtime = os.fstat(root).st_mtime
+        files = False
+        try:
+            while stack:
+                descriptor = stack.pop()
+                try:
+                    directories = []
+                    with os.scandir(descriptor) as entries:
+                        for entry in entries:
+                            metadata = entry.stat(follow_symlinks=False)
+                            if stat.S_ISDIR(metadata.st_mode):
+                                directories.append(entry.name)
+                            elif metadata.st_mtime >= cutoff:
+                                return True
+                            else:
+                                files = True
+                    for name in directories:
+                        stack.append(os.open(name, flags, dir_fd=descriptor))
+                finally:
+                    os.close(descriptor)
+            return not files and root_mtime >= cutoff
+        finally:
+            for descriptor in stack:
+                os.close(descriptor)
 
 
     def _staging_subdirectories(path: str) -> list[str]:
@@ -17509,7 +17548,7 @@ def register_lakeflow_source(spark):
             # Docstring: Delete one staged run whose newest page is older than ``cutoff``.
 
             try:
-                if _newest_created_entry_mtime(run, recursive=True) >= cutoff:
+                if _created_since(run, cutoff):
                     return
             except OSError:
                 return  # vanished or unreadable -- nothing to reclaim
@@ -17522,24 +17561,29 @@ def register_lakeflow_source(spark):
                 logging.getLogger(__name__).warning(_m(227, run), exc_info=True)
 
         def _maybe_sweep_connection_staging(self, interval_seconds: float) -> None:
-            # Docstring: Sweep every table's stale staging under this connection, at most once per
-            # interval across its readers.
+            # Docstring: Sweep every table's stale staging under this connection's staging root, at
+            # most once per interval across the readers staging there.
             #
             # The per-table sweep reaches only the tables a reader serves, so the pages of a
-            # dropped table or a deleted pipeline would stay. The reader that takes the claim in
-            # Lakebase runs the same age-based sweep over every table's root, in the background.
+            # dropped table or a deleted pipeline would stay. The reader that takes the root's
+            # claim in Lakebase runs the same age-based sweep over every table's root, in the
+            # background, with its own retention.
 
             location = self._snapshot_staging_location
             retention = self._snapshot_staging_retention_seconds
             if not location or retention <= 0:
                 return
             connection_key = self._table_state_keys_for("")[0]
+            root = os.path.normpath(os.path.join(location, connection_key))
+            # Each staging root has its own claim: two connections to one database can stage
+            # under different locations, and each is swept by a reader that stages there.
+            claim = f"{connection_key}/staging-sweep/{hashlib.sha256(root.encode()).hexdigest()[:16]}"
             try:
                 claimed = self._state_op_with_reconnect(
                     lambda: claim_staging_sweep(
                         self._lakebase_connection(),
                         self._lakebase_state_namespace(),
-                        f"{connection_key}/staging-sweep",
+                        claim,
                         interval_seconds,
                     ),
                     operation="staging sweep claim",
@@ -17551,7 +17595,7 @@ def register_lakeflow_source(spark):
                 return
             if claimed:
                 self._snapshot_cleanup_executor().submit(
-                    self._sweep_connection_staging, os.path.join(location, connection_key), retention
+                    self._sweep_connection_staging, root, retention
                 )
 
         @staticmethod
@@ -19950,20 +19994,25 @@ def register_lakeflow_source(spark):
                 entry = (str(part["pipeline_scope"]), tx.begin_lsn, tx.commit_lsn, None)
                 runs[str(part["run"])] = entry
 
-        def _settle_spilled_runs(self, table: Table, checkpoint: dict, options, deletes: bool) -> None:
+        def _settle_spilled_runs(
+            self, table: Table, checkpoint: dict, options, deletes: bool, current_lsn=None
+        ) -> None:
             # Docstring: Mark the spilled runs this channel has committed past, in Lakebase, and
             # delete the pages of each run whose last channel this is.
             #
             # Spark gives a reader only a start it has committed, and _recover never serves a
             # transaction at or below it, so a run is finished for this channel once the start's
             # commit LSN reaches its transaction's commit: the commit of a run this reader served,
-            # or the commit LSN a poll recorded at the COMMIT. Its BEGIN proves nothing: Informix
-            # hands a channel a transaction whose BEGIN is below its restart LSN when the first
-            # captured change came later. Its first change does: a restart LSN past it means the
-            # transaction ended before the checkpoint (re-reading from there would miss that
-            # change), so a run no poll saw commit (an update stopped inside it, then a container
-            # restart or a full refresh) is finished there too. Runs are listed from Lakebase at the
-            # first read and every _CDC_SPILL_LIST_SECONDS, which also expires the table's old
+            # or the commit LSN a poll recorded at the COMMIT. The restart LSN proves nothing, past
+            # the BEGIN or the first change alike: Informix hands a channel a transaction whose
+            # BEGIN is below it when the first captured change came later, and a stream started at
+            # a snapshot or delete-bootstrap boundary restarts at the boundary while a shared shard
+            # reading from below it still hands over a transaction open across it. So a run no
+            # poll saw commit (an update stopped inside it) waits for a later COMMIT or ROLLBACK,
+            # or for its record to expire, unless its first change names a logical log ahead of
+            # the source's current one (``current_lsn``): the source reinitialized its log, and
+            # every checkpoint from before that fails (error 284). Runs are listed from Lakebase at
+            # the first read and every _CDC_SPILL_LIST_SECONDS, which also expires the table's old
             # records of every pipeline, their stale pages with them, so a channel that read a
             # transaction in memory finishes the other shard's run too. Not called on a replay,
             # whose later polls start at positions Spark has not committed. The table's channels
@@ -19999,13 +20048,20 @@ def register_lakeflow_source(spark):
                     )
                     self._spill_runs_listed[(native, channel)] = now
                     for record in expired:
-                        if {"table", "spill_scope", "run"} <= set(record):
+                        # Only a record of this table, with a scope and run of the shapes the
+                        # connector writes, names pages to delete.
+                        run_scope, run = str(record.get("spill_scope")), str(record.get("run"))
+                        if (
+                            record.get("table") == native
+                            and _PIPELINE_SCOPE.fullmatch(run_scope)
+                            and _SPILL_RUN_NAME.fullmatch(run)
+                        ):
                             path = os.path.join(
                                 self._snapshot_stage_namespace_for(
-                                    str(record["table"]), str(record["spill_scope"]), _CDC_SPILL_SCHEMA
+                                    native, run_scope, _CDC_SPILL_SCHEMA
                                 ),
                                 "runs",
-                                str(record["run"]),
+                                run,
                             )
                             self._snapshot_cleanup_executor().submit(
                                 self._remove_stale_stage_run, path, time.time() - retention
@@ -20018,6 +20074,7 @@ def register_lakeflow_source(spark):
                             int(record["first_lsn"]) if record.get("first_lsn") else None,
                         )
                         for record in listed
+                        if _SPILL_RUN_NAME.fullmatch(str(record.get("run")))
                     }
                     for run, entry in list(pending.items()):
                         # A listed run gone since (rolled back, finished, expired) is dropped; a
@@ -20028,12 +20085,12 @@ def register_lakeflow_source(spark):
                         if run not in pending or pending[run][2] is None:
                             pending[run] = entry
                 commit = int(checkpoint["commit_lsn"])
-                restart = int(checkpoint.get("begin_lsn") or -1)
+                log = None if current_lsn is None else int(current_lsn) >> 32
                 finished = [
                     (run, entry)
                     for run, entry in pending.items()
                     if (entry[2] is not None and entry[2] <= commit)
-                    or (entry[2] is None and entry[3] is not None and entry[3] < restart)
+                    or (entry[2] is None and None not in (entry[3], log) and entry[3] >> 32 > log)
                 ]
                 if not finished:
                     return
@@ -20584,7 +20641,7 @@ def register_lakeflow_source(spark):
             # A normal (non-replay) read has no replay stop and takes the boundary as before.
             replay_stop = self._replay_stop_lsn(options)
             if replay_stop is None:
-                self._settle_spilled_runs(table, checkpoint, options, deletes)
+                self._settle_spilled_runs(table, checkpoint, options, deletes, current)
             if self._trigger_available_now and replay_stop is None:
                 stop_lsn, trigger_generation = self._shared_trigger_boundary(
                     table,
