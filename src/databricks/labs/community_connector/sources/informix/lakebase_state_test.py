@@ -151,6 +151,9 @@ class _FakeCursor:
         if "'state-gc'" in text and "INSERT INTO state_records" in text:
             self._claim_state_gc(args)
             return
+        if "'staging-sweep'" in text and "INSERT INTO state_records" in text:
+            self._claim_staging_sweep(args)
+            return
         if text.startswith("SELECT extract(epoch FROM clock_timestamp())"):
             self._result = [(self._database.now(),)]
             return
@@ -538,10 +541,13 @@ class _FakeCursor:
                 self._forget_record(key)
 
     def _delete_expired_spill_runs(self, args: dict) -> None:
+        # RETURNING record: the deleted records come back.
         cutoff = self._database.now() - float(args["retention_seconds"])
+        self._result = []
         with self._database.lock:
             for key in self._spill_run_keys(args):
                 if self._database.record_created.get(key, cutoff) < cutoff:
+                    self._result.append((self._database.records[key],))
                     self._forget_record(key)
 
     def _select_spill_runs(self, args: dict) -> None:
@@ -586,6 +592,24 @@ class _FakeCursor:
             }
             raw = json.dumps(record)
             self._database.records[key] = raw
+            self._result = [(raw,)]
+
+    def _claim_staging_sweep(self, args: dict) -> None:
+        # Inserted, or taken over once next_run_at has passed; another type's row is left.
+        key = (args["namespace"], args["record_key"])
+        now = self._database.now()
+        with self._database.lock:
+            existing = self._database.records.get(key)
+            if existing is not None and (
+                self._database.record_types.get(key) != "staging-sweep"
+                or float(json.loads(existing)["next_run_at"]) > now
+            ):
+                return
+            raw = json.dumps(
+                {"format_version": 1, "next_run_at": now + float(args["interval_seconds"])}
+            )
+            self._database.records[key] = raw
+            self._database.record_types[key] = "staging-sweep"
             self._result = [(raw,)]
 
     def _select_record(self, args: dict) -> None:
@@ -1280,11 +1304,13 @@ class LakebaseStateRecordTests(unittest.TestCase):
             self.connection, "ns", "u/cdc-spill/s/run-4", self._spill_run("upsert", "run-4")
         )
         lakebase_state.publish_state_record(self.connection, "ns", "t/cdc-spill/s/x", {"v": 1})
+        expired = []
 
         def listed(channel, retention=3600.0):
-            records = lakebase_state.list_spill_runs(
+            records, gone = lakebase_state.list_spill_runs(
                 self.connection, "ns", "t/cdc-spill", "s", channel, retention
             )
+            expired.extend(sorted(record["run"] for record in gone))
             return sorted(record["run"] for record in records)
 
         def stored(key):
@@ -1297,9 +1323,27 @@ class LakebaseStateRecordTests(unittest.TestCase):
         self.assertIsNotNone(stored("t/cdc-spill/gone/run-3"))
         self.assertEqual(listed("delete"), [])
         self.assertIsNone(stored("t/cdc-spill/gone/run-3"))
+        # The expired records come back, so the reader can take their pages with them.
+        self.assertEqual(expired, ["run-1", "run-2", "run-3"])
         # Only the table's spilled-run records expire.
         self.assertEqual(stored("t/cdc-spill/s/x"), {"v": 1})
         self.assertIsNotNone(stored("u/cdc-spill/s/run-4"))
+
+    def test_one_staging_sweep_is_claimed_per_interval(self):
+        # Every reader of a connection asks; one wins each interval. A key some other state
+        # owns is never taken over.
+        def claim(key="c/staging-sweep", interval=3600.0):
+            return lakebase_state.claim_staging_sweep(self.connection, "ns", key, interval)
+
+        self.assertTrue(claim())
+        self.assertFalse(claim())
+        self.database.advance(3599.0)
+        self.assertFalse(claim())
+        self.database.advance(2.0)
+        self.assertTrue(claim())
+        lakebase_state.publish_state_record(self.connection, "ns", "other", {"v": 1})
+        self.assertFalse(claim("other", 0.0))
+        self.assertEqual(lakebase_state.read_state_record(self.connection, "ns", "other"), {"v": 1})
 
     def test_jsonb_text_and_dict_shapes_both_decode(self):
         # Drivers differ: psycopg2 returns jsonb as str, psycopg 3 as dict.

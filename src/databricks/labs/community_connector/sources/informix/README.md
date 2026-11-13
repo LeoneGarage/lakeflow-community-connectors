@@ -98,7 +98,7 @@ rather than start from an unrelated position.
 | `password` | Yes | | Password for `user`; store it as a secret. |
 | `server` | Yes | | Exact `INFORMIXSERVER` name sent during SQLI authentication. |
 | `snapshot.staging.location` | Yes | | Writable Unity Catalog Volume directory for gzip-compressed immutable initial-snapshot pages, for example `/Volumes/main/informix_cdc/staging`. This is the only Volume the connector uses; everything else lives in Lakebase. Restrict `READ VOLUME`: staged files contain source row values. Pages older than the checkpoint start page are removed incrementally; remaining staging is removed after the checkpoint reaches CDC. Abandoned scopes use `snapshot.staging.retention.days`. |
-| `snapshot.staging.retention.days` | No | `4` | Age threshold for the **background retention sweep** that reclaims abandoned snapshot staging; minimum `1`. Normal cleanup removes consumed pages incrementally and the whole stage at the snapshot→CDC transition — this sweep is the safety net for a `runs/<snapshot_lsn>` subtree left behind by a crash, an abandoned resnapshot, or a superseded schema/scope. It runs **asynchronously** (off the read path, on the same background pool as page deletion), at most once per table per reader, and deletes only runs whose newest page file is older than this window, so an active run (recent writes) is never touched. Best-effort: a leftover only wastes Volume space, never affects correctness. It also removes spilled CDC pages left behind (see [Large transactions](#large-transactions)), whose Lakebase records expire after the same window. |
+| `snapshot.staging.retention.days` | No | `4` | Age threshold for the **background retention sweep** that reclaims abandoned snapshot staging; minimum `1`. Normal cleanup removes consumed pages incrementally and the whole stage at the snapshot→CDC transition — this sweep is the safety net for a `runs/<snapshot_lsn>` subtree left behind by a crash, an abandoned resnapshot, or a superseded schema/scope. It runs **asynchronously** (off the read path, on the same background pool as page deletion), at most once per table per reader, and once per `state.gc.interval.hours` over every table of the connection by whichever reader claims it in Lakebase, and deletes only runs whose newest page file is older than this window, so an active run (recent writes) is never touched. Best-effort: a leftover only wastes Volume space, never affects correctness. It also removes spilled CDC pages left behind (see [Large transactions](#large-transactions)), whose Lakebase records expire after the same window. |
 | `DB_LOCALE` | No | `en_US.819` | Database locale. Set it explicitly when the database uses another locale. |
 | `CLIENT_LOCALE` | No | `en_US.utf8` | Client locale. Its codeset controls Python row decoding. |
 | `port` | No | `9088` | Informix SQLI port; range `1`–`65535`. |
@@ -130,7 +130,7 @@ rather than start from an unrelated position.
 | `lakebase.workspace.host` | No | resolved | Workspace host for Lakebase control-plane calls (project and endpoint provisioning). Normally resolved from the pipeline's driver credential, `DATABRICKS_HOST`, or the Databricks SDK; set it only when none of those is available. |
 | `lakebase.workspace.token` | No | resolved | Bearer token for those control-plane calls, resolved alongside `lakebase.workspace.host`. Set it only when the ambient credential cannot be resolved. |
 | `state.gc.retention.days` | No | `30` | Age in days after which unreferenced per-table state records (activity markers for pipelines that no longer read the table) become eligible for best-effort garbage collection; minimum `1`. |
-| `state.gc.interval.hours` | No | `24` | Minimum hours between garbage-collection sweeps for a table, and the window within which a reader touches its activity marker; must be `> 0`. |
+| `state.gc.interval.hours` | No | `24` | Minimum hours between garbage-collection sweeps for a table, and the window within which a reader touches its activity marker; must be `> 0`. Also the interval of the connection-wide staging sweep (see `snapshot.staging.retention.days`). |
 | `state.gc.drop.unused.projects` | No | `false` | Whether to also drop Lakebase projects unused within `state.gc.project.retention.days`. Accepts `true` or `false`. |
 | `state.gc.project.retention.days` | No | `90` | Age in days after which an unused Lakebase project becomes eligible for removal when `state.gc.drop.unused.projects` is `true`; must be `>=` `state.gc.retention.days`. |
 | `connection.backlog.hint.enabled` | No | `true` | Whether readers publish and consume connection-backlog hints. A reader waiting for a connection slot cannot measure how far behind it is: reading the server log position requires a connection, which requires the very slot it is waiting for. A reader that already holds a slot therefore publishes the server log position into the `backlog_hints` table, and a waiter subtracts its own checkpoint from that value to estimate its backlog, then presses proportionally harder (a larger per-attempt acquisition budget) so scarce slots skew toward the readers furthest behind. Publication is one `INSERT ... ON CONFLICT DO UPDATE` that takes `GREATEST(existing, new)`, so a hint can never regress no matter which reader writes last or in what order. A waiter reads only rows updated within the last 45 seconds, so a stale hint is simply invisible rather than misleading. Purely advisory and fail-open: an absent, stale, malformed, or unreadable hint leaves acquisition behaving exactly as it does with hints disabled, so this can never affect correctness or fail a read. Note the published value is the **whole server's** log position, so it over-states the backlog of a low-traffic table (the log advances because other tables are written); it measures staleness rather than a row count and is therefore bucketed on a log scale into 8 ranks. Set to `false` to disable both halves of the protocol. |
@@ -616,15 +616,25 @@ default), its changes go to the staging Volume instead, in pages of up to 10,000
   `COMMIT`. Once Spark has committed a batch at or past that LSN, the upsert flow and, for a
   keyed table, the delete flow each mark the record. The flow that marks it last deletes the
   pages. A poll that reads the transaction again afterwards finds it consumed and writes
-  nothing.
+  nothing, and a poll that was still writing pages when the run was finished deletes them
+  at the `COMMIT`.
   - **Flows that read it in memory:** a flow whose shard kept the transaction in memory
     (capturing fewer of its tables) finds the record when it lists its tables' runs from
     Lakebase, at its first read and every 5 minutes after.
+  - **Transactions no poll saw commit:** an update stopped inside a spilled transaction,
+    followed by a container restart or a full refresh, leaves a record with no commit LSN.
+    A flow finishes it once its checkpoint's restart LSN passes the run's first change: the
+    transaction ended before that checkpoint, since reading from there would miss that
+    change.
   - **Fallback:** pages the marking misses are removed by the stale-stage sweep
     (`snapshot.staging.retention.days`). This covers a flow removed from the pipeline, a
-    Lakebase error while marking, and a page that was still being written.
+    Lakebase error while marking, and a page an update was stopped while writing. Once per
+    `state.gc.interval.hours`, one reader of the connection, whichever claims it in
+    Lakebase first, also runs that sweep over every table's staging, so the pages of a
+    dropped table or a deleted pipeline go too.
   - **Record expiry:** records are dropped after the same retention, whichever pipeline
-    wrote them, by the next reader of the table, or with the table's other state.
+    wrote them, by the next reader of the table, which deletes the run's pages with the
+    record once they are as old, or with the table's other state.
 - **The cost:** the poll writes every page before the batch can be served.
 - **Where memory still applies:** on the simple reader (`stream.partitioned` off), and
   during an incremental snapshot, the rows are shaped from the pages on the driver and

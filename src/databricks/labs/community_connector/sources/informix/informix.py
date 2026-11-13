@@ -85,6 +85,7 @@ from databricks.labs.community_connector.sources.informix.lakebase_state import 
     _workspace_credentials,
     acquire_slot,
     capture_workspace_credentials,
+    claim_staging_sweep,
     collect_stale_table_state,
     connection_lost_error_types,
     delete_cdc_handoff,
@@ -8226,9 +8227,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # instance (off the serve path) instead of every microbatch.
         self._retention_swept: set[str] = set()
         # Driver-only: the spilled runs each (table, channel) has yet to finish, as run ->
-        # (spill scope, BEGIN LSN, commit LSN or None), and when each pair last listed its runs
-        # from Lakebase (see _settle_spilled_runs).
-        self._spill_runs: dict[tuple[str, str], dict[str, tuple[str, int, int | None]]] = {}
+        # (spill scope, BEGIN LSN, commit LSN or None, first change LSN or None), and when each
+        # pair last listed its runs from Lakebase (see _settle_spilled_runs).
+        self._spill_runs: dict[tuple[str, str], dict[str, tuple]] = {}
         self._spill_runs_listed: dict[tuple[str, str], float] = {}
 
     def set_registration_scope(self, scope: str) -> None:
@@ -11727,18 +11728,64 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         for scope in _staging_subdirectories(root):
             for schema in _staging_subdirectories(scope):
                 for run in _staging_subdirectories(os.path.join(schema, "runs")):
-                    try:
-                        if _newest_created_entry_mtime(run, recursive=True) >= cutoff:
-                            continue
-                    except OSError:
-                        continue  # vanished or unreadable -- nothing to reclaim
-                    try:
-                        PurePythonInformixBridge._remove_connection_slot_tree(run)
-                    except FileNotFoundError:
-                        pass
-                    except OSError:
-                        # 227: Cannot remove stale Informix snapshot run: {}
-                        logging.getLogger(__name__).warning(_m(227, run), exc_info=True)
+                    InformixLakeflowConnect._remove_stale_stage_run(run, cutoff)
+
+    @staticmethod
+    def _remove_stale_stage_run(run: str, cutoff: float) -> None:
+        # Docstring: Delete one staged run whose newest page is older than ``cutoff``.
+
+        try:
+            if _newest_created_entry_mtime(run, recursive=True) >= cutoff:
+                return
+        except OSError:
+            return  # vanished or unreadable -- nothing to reclaim
+        try:
+            PurePythonInformixBridge._remove_connection_slot_tree(run)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # 227: Cannot remove stale Informix snapshot run: {}
+            logging.getLogger(__name__).warning(_m(227, run), exc_info=True)
+
+    def _maybe_sweep_connection_staging(self, interval_seconds: float) -> None:
+        # Docstring: Sweep every table's stale staging under this connection, at most once per
+        # interval across its readers.
+        #
+        # The per-table sweep reaches only the tables a reader serves, so the pages of a
+        # dropped table or a deleted pipeline would stay. The reader that takes the claim in
+        # Lakebase runs the same age-based sweep over every table's root, in the background.
+
+        location = self._snapshot_staging_location
+        retention = self._snapshot_staging_retention_seconds
+        if not location or retention <= 0:
+            return
+        connection_key = self._table_state_keys_for("")[0]
+        try:
+            claimed = self._state_op_with_reconnect(
+                lambda: claim_staging_sweep(
+                    self._lakebase_connection(),
+                    self._lakebase_state_namespace(),
+                    f"{connection_key}/staging-sweep",
+                    interval_seconds,
+                ),
+                operation="staging sweep claim",
+            )
+        except Exception:  # pylint: disable=broad-except
+            # 431: Cannot claim the connection-wide staging sweep in Lakebase; a later read
+            # tries again
+            logging.getLogger(__name__).warning(_m(431), exc_info=True)
+            return
+        if claimed:
+            self._snapshot_cleanup_executor().submit(
+                self._sweep_connection_staging, os.path.join(location, connection_key), retention
+            )
+
+    @staticmethod
+    def _sweep_connection_staging(root: str, retention_seconds: float) -> None:
+        for table in _staging_subdirectories(root):
+            InformixLakeflowConnect._sweep_stale_snapshot_stages(
+                os.path.join(table, "snapshot-page-data"), float(retention_seconds)
+            )
 
     def _read_snapshot_stage_manifest(
         self, table: Table, pipeline_scope: str, schema_id: str
@@ -14009,7 +14056,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             )
             self._maybe_sweep_stale_snapshot_stages(target)
             if run not in consumed:
-                consumed[run] = self._register_spill_run(native, scope, run)
+                # A poll writes a run from its first page, whose first record is the
+                # table's first change in the transaction.
+                first = records[0]["lsn"] if page_index == 0 and records else None
+                consumed[run] = self._register_spill_run(native, scope, run, first)
             if consumed[run]:
                 # Every channel has committed past this transaction, so no batch reads these
                 # pages: a poll that reads it again (a shard reading below it for another
@@ -14046,12 +14096,21 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # The commit LSN finishes the run for each channel whose checkpoint reaches it.
             record = {**self._spill_run_record(native, scope, run), "commit_lsn": str(commit_lsn)}
             key = self._spill_run_key(native, scope, run)
-            self._spill_run_state(
+            merged = self._spill_run_state(
                 run,
                 lambda: merge_spill_run(
                     self._lakebase_connection(), self._lakebase_state_namespace(), key, record
                 ),
             )
+            if merged is not None and _spill_run_consumed(merged):
+                # The last channel finished the run while this poll wrote it (it asked at
+                # its first page), so the pages written since have no reader.
+                path = os.path.join(
+                    self._snapshot_stage_namespace_for(native, scope, _CDC_SPILL_SCHEMA),
+                    "runs",
+                    run,
+                )
+                self._snapshot_cleanup_executor().submit(self._delete_spill_pages, path)
 
         return _CdcSpill(threshold, write, delete, layouts, scope, natives, commit)
 
@@ -14088,10 +14147,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             logging.getLogger(__name__).warning(_m(429, run), exc_info=True)
             return None
 
-    def _register_spill_run(self, native_identity: str, scope: str, run: str) -> bool:
-        # Docstring: Record a run a poll writes in Lakebase; report whether it is consumed.
+    def _register_spill_run(self, native_identity: str, scope: str, run: str, first=None) -> bool:
+        # Docstring: Record a run a poll writes in Lakebase, with the LSN of its first change
+        # when known; report whether it is consumed.
 
         record = self._spill_run_record(native_identity, scope, run)
+        if first is not None:
+            record["first_lsn"] = str(first)
         key = self._spill_run_key(native_identity, scope, run)
         elected = self._spill_run_state(
             run,
@@ -14111,7 +14173,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         channel = "delete" if deletes else "upsert"
         for part in spilled:
             runs = self._spill_runs.setdefault((str(part["native_identity"]), channel), {})
-            runs[str(part["run"])] = (str(part["pipeline_scope"]), tx.begin_lsn, tx.commit_lsn)
+            entry = (str(part["pipeline_scope"]), tx.begin_lsn, tx.commit_lsn, None)
+            runs[str(part["run"])] = entry
 
     def _settle_spilled_runs(self, table: Table, checkpoint: dict, options, deletes: bool) -> None:
         # Docstring: Mark the spilled runs this channel has committed past, in Lakebase, and
@@ -14122,12 +14185,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # commit LSN reaches its transaction's commit: the commit of a run this reader served,
         # or the commit LSN a poll recorded at the COMMIT. Its BEGIN proves nothing: Informix
         # hands a channel a transaction whose BEGIN is below its restart LSN when the first
-        # captured change came later. Runs are listed from Lakebase at the first read and every
-        # _CDC_SPILL_LIST_SECONDS, which also expires the table's old records of every
-        # pipeline, so a channel that read a transaction in memory finishes the other shard's
-        # run too. Not called on a replay, whose later polls start at positions Spark has not
-        # committed. The table's channels are the upsert one and, unless it is append-only,
-        # the delete one: the connector already serves one of each per table per pipeline.
+        # captured change came later. Its first change does: a restart LSN past it means the
+        # transaction ended before the checkpoint (re-reading from there would miss that
+        # change), so a run no poll saw commit (an update stopped inside it, then a container
+        # restart or a full refresh) is finished there too. Runs are listed from Lakebase at the
+        # first read and every _CDC_SPILL_LIST_SECONDS, which also expires the table's old
+        # records of every pipeline, their stale pages with them, so a channel that read a
+        # transaction in memory finishes the other shard's run too. Not called on a replay,
+        # whose later polls start at positions Spark has not committed. The table's channels
+        # are the upsert one and, unless it is append-only, the delete one: the connector
+        # already serves one of each per table per pipeline.
 
         scope = _spill_scope(getattr(self, "_registration_scope", None))
         if scope is None or not getattr(self, "_snapshot_staging_location", None):
@@ -14144,23 +14211,37 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         try:
             if due:
                 prefix = "/".join((*self._table_state_keys_for(native), _CDC_SPILL_SCHEMA))
-                listed = self._state_op_with_reconnect(
+                retention = self._snapshot_staging_retention_seconds
+                listed, expired = self._state_op_with_reconnect(
                     lambda: list_spill_runs(
                         self._lakebase_connection(),
                         namespace,
                         prefix,
                         scope,
                         channel,
-                        self._snapshot_staging_retention_seconds,
+                        retention,
                     ),
                     operation="spilled-run listing",
                 )
                 self._spill_runs_listed[(native, channel)] = now
+                for record in expired:
+                    if {"table", "spill_scope", "run"} <= set(record):
+                        path = os.path.join(
+                            self._snapshot_stage_namespace_for(
+                                str(record["table"]), str(record["spill_scope"]), _CDC_SPILL_SCHEMA
+                            ),
+                            "runs",
+                            str(record["run"]),
+                        )
+                        self._snapshot_cleanup_executor().submit(
+                            self._remove_stale_stage_run, path, time.time() - retention
+                        )
                 runs = {
                     str(record["run"]): (
                         scope,
                         int(record["begin_lsn"]),
                         int(record["commit_lsn"]) if record.get("commit_lsn") else None,
+                        int(record["first_lsn"]) if record.get("first_lsn") else None,
                     )
                     for record in listed
                 }
@@ -14173,17 +14254,19 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     if run not in pending or pending[run][2] is None:
                         pending[run] = entry
             commit = int(checkpoint["commit_lsn"])
+            restart = int(checkpoint.get("begin_lsn") or -1)
             finished = [
                 (run, entry)
                 for run, entry in pending.items()
-                if entry[2] is not None and entry[2] <= commit
+                if (entry[2] is not None and entry[2] <= commit)
+                or (entry[2] is None and entry[3] is not None and entry[3] < restart)
             ]
             if not finished:
                 return
             required = (
                 ["upsert"] if self._append_only_table(table, options) else ["upsert", "delete"]
             )
-            for run, (run_scope, _begin, _end) in finished:
+            for run, (run_scope, *_) in finished:
                 record = {
                     **self._spill_run_record(native, run_scope, run),
                     "done": {channel: True},
@@ -16214,7 +16297,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return "/".join(safe)
 
     def _touch_table_state(self, table: Table) -> None:
-        # Docstring: Mark a pipeline/table active and opportunistically run daily state GC.
+        # Docstring: Mark a pipeline/table active and opportunistically run daily state GC and
+        # the connection-wide staging sweep.
 
         scope = self._pipeline_scope()
         if "_@_" not in scope:
@@ -16269,6 +16353,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         if deleted:
             # 322: Collected {} stale Informix Lakebase state records
             logging.getLogger(__name__).info(_m(322, deleted))
+        self._maybe_sweep_connection_staging(touch_seconds)
         drop_projects = self.options.get("state.gc.drop.unused.projects", "false").lower()
         if drop_projects not in {"true", "false"}:
             # 323: Option 'state.gc.drop.unused.projects' must be true or false

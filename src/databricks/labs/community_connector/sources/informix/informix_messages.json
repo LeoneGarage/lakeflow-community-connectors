@@ -429,5 +429,6 @@
 "The upsert reader has not published a resnapshot boundary for '{}' in {} seconds, so this update cannot finish: its flow has most likely failed (see its error), or its checkpoint is still retained while the delete channel's is not, which needs a full refresh",
 "Informix replay did not reach its committed snapshot position {}; reached {}",
 "Cannot update spilled CDC run {} in Lakebase; its pages are left for the retention sweep",
-"Cannot update the spilled CDC runs of '{}' in Lakebase; trying again on the next batch"
+"Cannot update the spilled CDC runs of '{}' in Lakebase; trying again on the next batch",
+"Cannot claim the connection-wide staging sweep in Lakebase; a later read tries again"
 ]

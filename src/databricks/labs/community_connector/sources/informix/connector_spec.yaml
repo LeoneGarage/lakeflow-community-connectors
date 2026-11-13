@@ -996,10 +996,12 @@ connection:
         pages incrementally and the whole stage at the snapshot->CDC transition; this
         sweep is the safety net for a run left behind by a crash, an abandoned
         resnapshot, or a superseded schema/scope. It runs asynchronously (off the read
-        path) at most once per table per reader and deletes only runs/<snapshot_lsn>
-        subtrees whose newest page file is older than this window, so an active run
-        (recent writes) is never removed. Best-effort: a leftover only wastes Volume
-        space, never affects correctness.
+        path) at most once per table per reader, and once per state.gc.interval.hours
+        over every table of the connection by whichever reader claims it in Lakebase.
+        It deletes only runs/<snapshot_lsn> subtrees, spilled CDC runs included, whose
+        newest page file is older than this window, so an active run (recent writes) is
+        never removed. Best-effort: a leftover only wastes Volume space, never affects
+        correctness.
 
     - name: cdc.shared.state.wait.seconds
       type: string
@@ -1061,8 +1063,8 @@ connection:
       required: false
       description: >
         Minimum hours between garbage-collection sweeps for a given table, and
-        the window a reader touches its activity marker within. Default `24`;
-        must be greater than `0`.
+        the window a reader touches its activity marker within. Also the interval
+        of the connection-wide staging sweep. Default `24`; must be greater than `0`.
 
     - name: state.gc.drop.unused.projects
       type: string

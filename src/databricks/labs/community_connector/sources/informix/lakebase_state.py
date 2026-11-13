@@ -2350,6 +2350,7 @@ WHERE namespace = %(namespace)s
   AND record_type = 'cdc-spill-run'
   AND record_key LIKE %(record_key_pattern)s
   AND created_at < now() - make_interval(secs => %(retention_seconds)s)
+RETURNING record
 """
 
 _SELECT_SPILL_RUNS = """
@@ -2398,13 +2399,15 @@ def list_spill_runs(
     scope: str,
     channel: str,
     retention_seconds: float,
-) -> list[dict[str, Any]]:
-    # Docstring: A table's spilled-run records under one scope that ``channel`` has not finished.
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    # Docstring: A table's spilled-run records under one scope that ``channel`` has not
+    # finished, and the records this call expired.
     #
-    # Records older than ``retention_seconds`` go first, under every scope of the table: the
-    # staging sweep removes their pages by then, and a pipeline that no longer runs has no
+    # Records older than ``retention_seconds`` go first, under every scope of the table, and
+    # come back so the caller can delete their pages: a pipeline that no longer runs has no
     # reader left to expire its own. 0 keeps them.
 
+    expired: list[dict[str, Any]] = []
     with connection.cursor() as cursor:
         if retention_seconds > 0:
             cursor.execute(
@@ -2415,6 +2418,7 @@ def list_spill_runs(
                     "retention_seconds": float(retention_seconds),
                 },
             )
+            expired = [_as_dict(row[0]) for row in cursor.fetchall()]
         cursor.execute(
             _SELECT_SPILL_RUNS,
             {
@@ -2425,7 +2429,47 @@ def list_spill_runs(
         )
         rows = cursor.fetchall()
     connection.commit()
-    return [_as_dict(row[0]) for row in rows]
+    return [_as_dict(row[0]) for row in rows], expired
+
+
+# One row per staging root: when its next connection-wide sweep is due. A reader takes it
+# once the time has passed, so of a connection's readers one sweeps per interval.
+_CLAIM_STAGING_SWEEP = """
+INSERT INTO state_records (namespace, record_key, record, record_type)
+VALUES (
+  %(namespace)s, %(record_key)s,
+  jsonb_build_object(
+    'format_version', 1,
+    'next_run_at', extract(epoch FROM clock_timestamp()) + %(interval_seconds)s
+  ),
+  'staging-sweep'
+)
+ON CONFLICT (namespace, record_key) DO UPDATE
+SET record = EXCLUDED.record
+WHERE state_records.record_type = 'staging-sweep'
+  AND (state_records.record->>'next_run_at')::double precision
+      <= extract(epoch FROM clock_timestamp())
+RETURNING record
+"""
+
+
+def claim_staging_sweep(
+    connection: Any, namespace: str, record_key: str, interval_seconds: float
+) -> bool:
+    # Docstring: Whether this caller runs the staging sweep due under ``record_key``.
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            _CLAIM_STAGING_SWEEP,
+            {
+                "namespace": namespace,
+                "record_key": record_key,
+                "interval_seconds": float(interval_seconds),
+            },
+        )
+        claimed = cursor.fetchone() is not None
+    connection.commit()
+    return claimed
 
 
 def touch_table_activity(

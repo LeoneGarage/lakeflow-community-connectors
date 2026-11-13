@@ -6828,6 +6828,151 @@ class LakeflowContractTests(unittest.TestCase):
             later._settle_spilled_runs(table, {"commit_lsn": "400", "begin_lsn": "400"}, {}, True)
         self.assertEqual(self._spill_record(later, key)["done"], {"delete": True})
 
+    def test_a_poll_deletes_the_pages_it_wrote_after_its_run_finished(self):
+        # A poll asks at its first page whether a run is finished. When the last channel
+        # finishes the run and deletes its pages while the poll is still writing, the pages
+        # the poll writes after that have no reader: at the COMMIT it finds the run finished
+        # and deletes them. A run still unfinished at the COMMIT keeps its pages.
+        connector = self.connector(FakeBridge(), registration_scope="spill-late")
+        table = connector._table("app.orders", {})
+        changes = [
+            {"op": "INSERT", "tx_id": 7, "lsn": 102 + i, "table": table.identity, "row": {"id": i}}
+            for i in range(4)
+        ]
+        _, kept, _ = self._spilled_run(
+            connector,
+            table,
+            [{**change, "row": {"id": change["lsn"]}} for change in changes],
+            commit=110,
+        )
+        scope = informix_module._spill_scope(connector._registration_scope)
+        with mock.patch.object(informix_module, "_CDC_SPILL_PAGE_RECORDS", 2):
+            writer = connector._cdc_spill([informix_module._capture_descriptor(table)])
+            writer.start(7, 101, changes[:2])
+            run = informix_module._spill_run(writer._layouts[table.identity], 101, 7, changes[0])
+            path = os.path.join(
+                connector._snapshot_stage_namespace_for(
+                    table.native_identity, scope, informix_module._CDC_SPILL_SCHEMA
+                ),
+                "runs",
+                run,
+            )
+            self.assertEqual(os.listdir(path), ["page-00000000"])
+            # The last channel finishes the run and deletes its pages.
+            informix_module.merge_spill_run(
+                connector._lakebase_connection(),
+                connector._lakebase_state_namespace(),
+                connector._spill_run_key(table.native_identity, scope, run),
+                {
+                    "run": run,
+                    "done": {"upsert": True, "delete": True},
+                    "required": ["upsert", "delete"],
+                },
+            )
+            shutil.rmtree(path)
+            for change in changes[2:]:
+                writer.add(change)
+            self.assertEqual(os.listdir(path), ["page-00000001"])
+            writer.finish(7, 110)
+        self._flush_snapshot_cleanup(connector)
+        self.assertFalse(os.path.exists(path))
+        self.assertTrue(os.path.isdir(kept))
+
+    def test_a_run_no_poll_saw_commit_finishes_once_the_restart_passes_its_first_change(self):
+        # An update stopped inside a spilled transaction, which then went (a container restart,
+        # a full refresh), leaves a run with no commit LSN. A checkpoint whose restart LSN is
+        # past the run's first change proves the transaction is no longer open: re-reading
+        # from there would miss that change. So each channel finishes it there, and the last
+        # deletes the pages. A restart at or below the first change may still hold it open.
+        connector = self.connector(FakeBridge(), registration_scope="spill-abandoned")
+        table = connector._table("app.orders", {})
+        changes = [
+            {"op": "INSERT", "tx_id": 7, "lsn": 102 + i, "table": table.identity, "row": {"id": i}}
+            for i in range(3)
+        ]
+        _, run, key = self._spilled_run(connector, table, changes)
+        self.assertEqual(self._spill_record(connector, key)["first_lsn"], "102")
+        later = self.connector(FakeBridge(), registration_scope="spill-abandoned")
+
+        def settle(restart, deletes):
+            checkpoint = {"commit_lsn": "500", "begin_lsn": str(restart)}
+            with mock.patch.object(informix_module, "_CDC_SPILL_LIST_SECONDS", 0, create=True):
+                later._settle_spilled_runs(table, checkpoint, {}, deletes)
+            self._flush_snapshot_cleanup(later)
+            return self._spill_record(later, key)["done"], os.path.isdir(run)
+
+        self.assertEqual(settle(102, False), ({}, True))
+        self.assertEqual(settle(103, False), ({"upsert": True}, True))
+        self.assertEqual(settle(103, True), ({"upsert": True, "delete": True}, False))
+
+    def test_an_expired_run_record_takes_its_stale_pages_with_it(self):
+        # The listing expires a table's records older than the staging retention, under every
+        # scope; a run's pages go with its record once they are as old, so no page outlives
+        # the record that names it. Pages written since keep their run.
+        connector = self.connector(FakeBridge(), registration_scope="spill-expired")
+        table = connector._table("app.orders", {})
+        changes = [
+            {"op": "INSERT", "tx_id": 7, "lsn": 102 + i, "table": table.identity, "row": {"id": i}}
+            for i in range(3)
+        ]
+        _, stale, _ = self._spilled_run(connector, table, changes)
+        _, fresh, _ = self._spilled_run(
+            connector, table, [{**change, "row": {"id": change["lsn"]}} for change in changes]
+        )
+        retention = connector._snapshot_staging_retention_seconds
+        self._lakebase.database.advance(retention + 1)
+        old = time.time() - retention - 10
+        for directory, _, files in os.walk(stale):
+            for name in files:
+                os.utime(os.path.join(directory, name), (old, old))
+        later = self.connector(FakeBridge(), registration_scope="spill-expired")
+        later._settle_spilled_runs(table, {"commit_lsn": "50", "begin_lsn": "50"}, {}, False)
+        self._flush_snapshot_cleanup(later)
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.path.isdir(fresh))
+
+    def test_one_reader_per_gc_interval_sweeps_the_whole_connections_stale_staging(self):
+        # The per-table sweep reaches only the tables a reader serves. Once per state GC
+        # interval one reader of the connection also sweeps every table's staging, so a
+        # dropped table's or a deleted pipeline's pages go too; readers that lose the claim
+        # in Lakebase sweep nothing.
+        current = "94368468-bc2d-4797-868d-0cb9e19a5610_@_33333333-3333-4333-8333-333333333333"
+        location = self._shared_state.name
+
+        def reader():
+            connector = self.connector(FakeBridge())
+            connector.set_registration_scope(current)
+            return connector, connector._table("app.orders", {})
+
+        first, table = reader()
+        root = os.path.join(location, first._table_state_keys_for(table.native_identity)[0])
+        retention = first._snapshot_staging_retention_seconds
+
+        def staged(table_key, age):
+            run = os.path.join(root, table_key, "snapshot-page-data", "s", "cdc-spill", "runs", "r")
+            os.makedirs(os.path.join(run, "page-00000000"))
+            page = os.path.join(run, "page-00000000", "data.json.gz")
+            open(page, "wb").close()
+            moment = time.time() - age
+            os.utime(page, (moment, moment))
+            return run
+
+        stale, fresh = staged("a" * 24, retention + 10), staged("b" * 24, 0)
+        first._touch_table_state(table)
+        self._flush_snapshot_cleanup(first)
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.path.isdir(fresh))
+        second, table = reader()
+        stale = staged("c" * 24, retention + 10)
+        second._touch_table_state(table)
+        self._flush_snapshot_cleanup(second)
+        self.assertTrue(os.path.isdir(stale))
+        self._lakebase.database.advance(24 * 3600)
+        third, table = reader()
+        third._touch_table_state(table)
+        self._flush_snapshot_cleanup(third)
+        self.assertFalse(os.path.exists(stale))
+
     def test_both_channels_write_the_same_bytes_to_a_shared_spill_page(self):
         # The channels' shards list the table at different positions, so their records carry
         # different capture labels. A page keeps neither, so on FUSE the second channel to
@@ -13056,6 +13201,7 @@ class LakeflowContractTests(unittest.TestCase):
         with (
             mock.patch.object(informix_module, "touch_table_activity", return_value=True) as touch,
             mock.patch.object(informix_module, "collect_stale_table_state", return_value=0) as gc,
+            mock.patch.object(informix_module, "claim_staging_sweep", return_value=False) as sweep,
         ):
             connector._touch_table_state(table)
             connector._touch_table_state(table)
@@ -13063,6 +13209,8 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(touch.call_count, 1)
         self.assertEqual(gc.call_count, 1)
         self.assertEqual(gc.call_args.args[-2:], (30, 24.0))
+        self.assertEqual(sweep.call_count, 1)
+        self.assertEqual(sweep.call_args.args[-1], 24 * 3600.0)
 
     def test_scope_cleanup_retains_checkpoint_scope_regardless_of_phase(self):
         pipeline_id = "94368468-bc2d-4797-868d-0cb9e19a5610"
