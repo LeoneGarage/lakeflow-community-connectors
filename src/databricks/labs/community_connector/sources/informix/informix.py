@@ -13239,6 +13239,20 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                             raise InformixError(_m(433, "TRUNCATE", table.exposed_name))
                         before = record.get("before", record.get("row") if op == "DELETE" else None)
                         after = record.get("after", record.get("row") if op == "INSERT" else None)
+                        if None not in (before, after) and _index_scan_key(
+                            before, keys
+                        ) != _index_scan_key(after, keys):
+                            # 433: The index-ordered snapshot of a
+                            # keyless table does not support {} on
+                            # '{}'; set snapshot.scan=cursor to read
+                            # the table without index order
+                            raise InformixError(
+                                _m(
+                                    433,
+                                    "an UPDATE of an index column during it",
+                                    table.exposed_name,
+                                )
+                            )
                         for row, sign in ((before, -1), (after, 1)):
                             if row is not None:
                                 key = _index_scan_key(row, keys)
@@ -13344,13 +13358,6 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     bisect.bisect_left(bounds, _index_scan_order(key, descending))
                 ]
                 unsure = [event for event in changed if event[0] <= read_after]
-                if any(event[4] == "UPDATE" for event in unsure):
-                    # 433: The index-ordered snapshot of a keyless table does
-                    # not support {} on '{}'; set snapshot.scan=cursor to read
-                    # the table without index order
-                    raise InformixError(
-                        _m(433, "an UPDATE of a key while it is read", table.exposed_name)
-                    )
                 # What the scan staged for the key, less what the key holds now, plus every
                 # change since its read began: the net of the unsure changes the scan saw.
                 saw = collections.Counter(
@@ -13362,15 +13369,32 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 for event in changed:
                     if event[0] <= before:
                         saw[event[2]] += event[1]
-                for event in unsure:
-                    if saw[event[2]] * event[1] > 0:
-                        saw[event[2]] -= event[1]
-                        suppress.append(event[3])
-                if any(saw.values()):
+                # The scan read the key at one moment as a rule, so it saw the unsure
+                # transactions up to some point in commit order: the one where their net is
+                # that. Their changes to the key are dropped, an UPDATE with both its images.
+                seen: list[int] | None = [] if not +saw and not -saw else None
+                net: collections.Counter = collections.Counter()
+                for at, event in enumerate(unsure):
+                    net[event[2]] += event[1]
+                    last = at + 1 == len(unsure) or unsure[at + 1][0] != event[0]
+                    if seen is None and last and not +(net - saw) and not +(saw - net):
+                        seen = [event[3] for event in unsure[: at + 1]]
+                if seen is None and not any(event[4] == "UPDATE" for event in unsure):
+                    # It read the key while one of them committed. Identical rows cannot be
+                    # told apart, so any inserts and deletes of the right rows will do.
+                    seen = []
+                    for event in unsure:
+                        if saw[event[2]] * event[1] > 0:
+                            saw[event[2]] -= event[1]
+                            seen.append(event[3])
+                    if any(saw.values()):
+                        seen = None
+                if seen is None:
                     # 436: The index-ordered snapshot cannot tell which
                     # changes to a key of '{}' its scan saw: the rows staged
                     # for the key do not fit the key's changes
                     raise InformixError(_m(436, table.exposed_name))
+                suppress.extend(seen)
                 del doubt[key], events[key]
         if doubt:
             # 434: The index-ordered snapshot could not settle {} key(s) of '{}' after
@@ -17859,7 +17883,10 @@ def _project_transaction(
     # key-changing UPDATE is a delete of the old key too: with ``tombstones`` on it lands
     # the before-image as a ``d`` row ahead of the new key's ``u`` row, sequenced at the
     # before-image's own log position so the two never tie on the cursor. A keyless table
-    # has no key to change, so its UPDATEs land only their after-image. TRUNCATE is
+    # has no key to tell which row an UPDATE replaced, so with ``tombstones`` on every
+    # UPDATE of one lands its before-image as a ``d`` row the same way, also when nothing
+    # changed: the log then nets to the table, an update being one row out and one in.
+    # Without ``tombstones`` its UPDATEs land only their after-image. TRUNCATE is
     # unrepresentable on either channel.
 
     #
@@ -17900,7 +17927,9 @@ def _project_transaction(
             if op == "DELETE" or key_changed:
                 output.append(_shape_delete(before, table, record, tx))
         elif op in {"INSERT", "UPDATE"}:
-            if tombstones and table.primary_keys and key_changed:
+            if tombstones and (
+                key_changed or (op == "UPDATE" and not entered and not table.primary_keys)
+            ):
                 output.append(_shape_tombstone(before, table, record, tx, lsn=_before_lsn(record)))
             output.append(_shape_change(after, record, tx, "u" if op == "UPDATE" else "c"))
         elif op == "DELETE" and tombstones:

@@ -621,7 +621,16 @@ class _IndexScanSource:
             self.tx_id += 1
             key = self.hot_key or self.random.randint(1, 24)
             self._write("BEGIN")
-            if self.random.random() < 0.6:
+            kind = self.random.random()
+            if kind < 0.2 and not self.hot_key:
+                # UPDATE ... WHERE id = key: every row of the key, some to the value it has.
+                for row in [row for row in self.rows if row["id"] == key]:
+                    self._write("BEFORE_UPDATE", row=dict(row))
+                    row["value"] = self.random.choice("abc")
+                    self._write("AFTER_UPDATE", row=dict(row))
+                self._write("COMMIT")
+                continue
+            if kind < 0.7:
                 for row in [row for row in self.rows if row["id"] == key]:
                     self.rows.remove(row)
                     self._write("DELETE", row=dict(row))
@@ -2057,9 +2066,16 @@ class LakeflowContractTests(unittest.TestCase):
             result = collections.Counter(_IndexScanSource.text(row) for row in staged)
             for tx in kept:
                 for record in tx.records:
-                    result[_IndexScanSource.text(record["row"])] += (
-                        1 if record["op"] == "INSERT" else -1
+                    before = record.get(
+                        "before", record.get("row") if record["op"] == "DELETE" else None
                     )
+                    after = record.get(
+                        "after", record.get("row") if record["op"] == "INSERT" else None
+                    )
+                    if before is not None:
+                        result[_IndexScanSource.text(before)] -= 1
+                    if after is not None:
+                        result[_IndexScanSource.text(after)] += 1
             dropped += sum(len(tx.records) for tx in transactions) - sum(
                 len(tx.records) for tx in kept
             )
@@ -12866,10 +12882,25 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(self._ops(rows), [(1, "a", "c"), (2, "b", "u")])
 
-    def test_a_keyless_append_update_never_emits_a_tombstone(self):
-        # With no key there is nothing to change: an update is only its after-image.
+    def test_a_keyless_append_update_lands_the_row_it_replaced_as_a_tombstone(self):
+        # With no key, nothing says which row an update replaced: `UPDATE ... WHERE
+        # order_id = n` on four rows would add four rows to the log and take none away. So
+        # each update lands its before-image as a 'd' row ahead of its 'u' row, and the log
+        # nets to the table.
         rows = self._append_stream({}, changes=self._KEY_CHANGE)
 
+        self.assertEqual(self._ops(rows), [(1, "a", "c"), (1, "a", "d"), (2, "b", "u")])
+        tombstone, updated = rows[1], rows[2]
+        self.assertLess(tombstone["_informix_change_lsn"], updated["_informix_change_lsn"])
+
+        # An update that changes nothing does too: one row out, the same row in.
+        same = [dict(record) for record in self._KEY_CHANGE]
+        same[3]["row"] = dict(same[2]["row"])
+        rows = self._append_stream({}, changes=same)
+        self.assertEqual(self._ops(rows), [(1, "a", "c"), (1, "a", "d"), (1, "a", "u")])
+
+        # Without tombstones an update is only its after-image, as a delete is nothing.
+        rows = self._append_stream({"append.delete.tombstones": "false"}, changes=self._KEY_CHANGE)
         self.assertEqual(self._ops(rows), [(1, "a", "c"), (2, "b", "u")])
 
     def test_a_keyed_cdc_upsert_channel_never_tombstones_a_key_change(self):

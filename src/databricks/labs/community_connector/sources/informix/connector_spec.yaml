@@ -760,7 +760,9 @@ connection:
         bounded snapshot-only ingestion.
         Append output is a change log, not current state: an UPDATE at the source
         appends its after-image as a `u` row, and a DELETE appends a `d` tombstone
-        row carrying the full before-image (see `append.delete.tombstones`). On a
+        row carrying the full before-image (see `append.delete.tombstones`). A
+        keyless table has no key to tell which row an UPDATE replaced, so its UPDATE
+        also appends the row it replaced as a `d` row ahead of the `u` row. On a
         keyless table a tombstone is a change-log record, not an applied delete --
         there is no key to pair it with -- so consumers wanting current state
         filter on `_informix_op`. Nothing in the schema distinguishes an
@@ -783,7 +785,10 @@ connection:
         DELETE lands on the upsert channel as a `d` tombstone row carrying the full
         before-image plus the usual `_informix_change_lsn`, `_informix_commit_lsn`,
         `_informix_tx_id` and `_informix_commit_time` columns, so the change log is
-        lossless (an UPDATE already lands as a `u` row). On a keyed table forced to
+        lossless (an UPDATE already lands as a `u` row). An UPDATE of a keyless
+        table also lands the row it replaced as a `d` row ahead of its `u` row, the
+        same way and also when nothing changed, so that counting `r`, `c` and `u`
+        rows less `d` rows gives the table. On a keyed table forced to
         append, a key-changing UPDATE also removes the old key, so it lands the old
         row's before-image as a `d` tombstone ahead of the new key's `u` row, with
         the before-image's own, strictly lower, `_informix_change_lsn`. Every CDC
