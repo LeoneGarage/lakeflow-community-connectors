@@ -437,5 +437,8 @@
 "The index-ordered snapshot stopped waiting for Informix CDC to reach the snapshot's position for '{}' after {} seconds; a transaction left open on the table with more changes behind it than cdc.max.poll.records can keep it from getting there, as can a table that changes faster than its changes are read",
 "The index-ordered snapshot cannot tell which changes to a key of '{}' its scan saw: the rows staged for the key do not fit the key's changes",
 "Informix snapshot of '{}', which has no key of its own, reads without index order because it has {}; a row that changes during the snapshot can then be in its change log twice, or not at all",
-"A change to keyless table '{}' committed while its snapshot was reading the rows it applies to, and reached Informix CDC only after the snapshot was staged, so the change log may hold it twice or not at all; run a full refresh"
+"A change to keyless table '{}' committed while its snapshot was reading the rows it applies to, and reached Informix CDC only after the snapshot was staged, so the change log may hold it twice or not at all; run a full refresh",
+"Informix snapshot of '{}' continues the index-ordered scan an earlier update of this pipeline began: {} staged pages with {} rows are kept",
+"Informix snapshot of '{}' discards the index-ordered scan an earlier update of this pipeline began ({}); its staged pages are not used",
+"Cannot record the progress of the index-ordered snapshot of '{}' ({}); a restart reads the table from its first row again"
 ]

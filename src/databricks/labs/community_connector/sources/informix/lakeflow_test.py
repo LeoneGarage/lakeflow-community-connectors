@@ -7,6 +7,7 @@ import collections
 import contextlib
 import dataclasses
 import errno
+import glob
 import gzip
 import hashlib
 import hmac
@@ -27,6 +28,7 @@ import time
 import traceback
 import types
 import unittest
+import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from unittest import mock
@@ -2169,7 +2171,7 @@ class LakeflowContractTests(unittest.TestCase):
         # connector's own loop bound.
         self.assertEqual(requested, [256])
 
-    def _index_scan(self, source, page_size, table=None, options=None):
+    def _index_scan(self, source, page_size, table=None, options=None, pages=None, resumable=None):
         """Run snapshot.scan=index over ``source``: (snapshot LSN, staged rows, what the scan
         recorded for the stream, the connector). Pages go through the staging codec, as the
         rows read back for a key in doubt do."""
@@ -2178,9 +2180,17 @@ class LakeflowContractTests(unittest.TestCase):
             raw["columns"][0]["nullable"] = bool(getattr(source, "nulls", False))
             table = Table.parse(raw, "demo")
         options = options or {}
-        connector = self.connector(source)
-        pages: dict[int, list[dict]] = {}
+        connector = self.connector(source, registration_scope=resumable or "test-pipeline")
+        # ``pages`` carries the staged pages of an earlier attempt, for a scan that goes on
+        # from its recorded progress (``resumable``, the name of its update).
+        pages = {} if pages is None else pages
         scan: dict = {}
+        resume = progress = None
+        if resumable:
+            scope, schema, index = connector._pipeline_scope(), "5" * 32, None
+            index = connector._scan_index(table, options)
+            resume = connector._scan_resume_state(table, scope, schema, 0, index)
+            progress = connector._scan_progress_writer(table, scope, schema, index, None, 0)
 
         def stage_page(lsn, index, rows):
             self.assertEqual(index, len(pages))
@@ -2202,6 +2212,8 @@ class LakeflowContractTests(unittest.TestCase):
             stage_page,
             lambda lsn, index: iter(pages[index]),
             scan,
+            resume,
+            progress,
         )
         staged = [row for index in sorted(pages) for row in pages[index]]
         return boundary, staged, scan, connector, table
@@ -2262,6 +2274,421 @@ class LakeflowContractTests(unittest.TestCase):
         # The interleavings do overlap: without the dropped changes the sums are wrong.
         self.assertGreater(dropped, 100)
         self.assertGreater(settled_nulls, 5)
+
+    def test_an_index_scan_taken_up_after_a_failure_still_adds_up_to_the_table(self):
+        # The scan records each page it has read. A second attempt goes on after the last
+        # one, under the same snapshot LSN, and reads the table's changes from that LSN
+        # again: the pages of both attempts and the stream must still give the table, with
+        # the source changing all the while.
+        resumed = 0
+        for seed in range(60):
+            random = random_module.Random(1000 + seed)
+            source = _IndexScanSource(random, descending=seed % 3 == 0, nulls=seed % 2 == 0)
+            source.minimum_lsn = lambda: 0
+            page_size = random.choice([3, 5])
+            fail_at = random.randint(2, 6)
+            chunk, calls = source.snapshot_chunk, []
+
+            def failing(*args, _chunk=chunk, _calls=calls, _fail_at=fail_at, **kwargs):
+                _calls.append(1)
+                if len(_calls) == _fail_at:
+                    raise RuntimeError("the connection is lost")
+                return _chunk(*args, **kwargs)
+
+            source.snapshot_chunk = failing
+            pages: dict = {}
+            failed = False
+            with mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0):
+                try:
+                    self._index_scan(source, page_size, pages=pages, resumable=f"update-{seed}")
+                except RuntimeError:
+                    failed = True
+                first = dict(pages)
+                if failed:
+                    # A page staged but not recorded gives way to the second attempt's.
+                    boundary, staged, scan, connector, table = self._index_scan(
+                        source, page_size, pages=pages, resumable=f"update-{seed}"
+                    )
+                else:
+                    continue
+            resumed += bool(first)
+            # The pages of the first attempt are kept as they were.
+            for index, rows in first.items():
+                self.assertEqual(pages[index], rows, f"seed {seed}")
+            records = source.history(boundary)
+            transactions = informix_module._transaction_batch(records)[0]
+            connector._read_snapshot_stage_manifest = lambda *_, _scan=scan: _scan
+            connector._offset_scopes = lambda checkpoint: ("scope", "scope")
+            kept = connector._drop_scanned_changes(
+                table, {"commit_lsn": str(boundary), "schema_id": "s"}, {}, transactions
+            )
+            result = collections.Counter(_IndexScanSource.text(row) for row in staged)
+            for tx in kept:
+                for record in tx.records:
+                    before = record.get(
+                        "before", record.get("row") if record["op"] == "DELETE" else None
+                    )
+                    after = record.get(
+                        "after", record.get("row") if record["op"] == "INSERT" else None
+                    )
+                    if before is not None:
+                        result[_IndexScanSource.text(before)] -= 1
+                    if after is not None:
+                        result[_IndexScanSource.text(after)] += 1
+            self.assertEqual(+result, collections.Counter(source.rows_as_text()), f"seed {seed}")
+            self.assertFalse(-result, f"seed {seed}")
+        # Most attempts had staged pages to go on from.
+        self.assertGreater(resumed, 20)
+
+    def _failed_index_scan(self, scope, extra=None):
+        """A keyless table of seven rows whose index-ordered snapshot, under ``scope``, has
+        staged two pages (ids 1-4) and then lost its connection: (bridge, options, the
+        cursors its later page reads start after)."""
+        bridge = _KeylessIndexBridge()
+        bridge.rows = [{"id": number, "value": "v"} for number in range(1, 8)]
+        # Three rows a read, the last left to the next page: 1-2, 3-4, 5-6, 7.
+        options = {
+            "snapshot.mode": "initial",
+            "keyless.snapshot.page.size": "3",
+            "snapshot.page.size": "3",
+            **(extra or {}),
+        }
+        chunk, cursors, lost = bridge.snapshot_chunk, [], []
+
+        def failing(identity, columns, keys, after, *args, **kwargs):
+            if len(cursors) == 2 and not lost:
+                # Once: the third read of the first attempt.
+                lost.append(True)
+                cursors.append("failed")
+                raise RuntimeError("the connection is lost")
+            cursors.append(after)
+            return chunk(identity, columns, keys, after, *args, **kwargs)
+
+        bridge.snapshot_chunk = failing
+        first = self.connector(bridge)
+        first.set_registration_scope(scope)
+        with (
+            mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0),
+            self.assertRaises(Exception),
+        ):
+            first.read_table("app.orders", {}, options)
+        self.assertEqual(cursors, [None, [2], "failed"])
+        del cursors[:]
+        return bridge, options, cursors
+
+    def _snapshot_ids(self, connector, options):
+        with mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0):
+            rows, offset = connector.read_table("app.orders", {}, options)
+            ids = [row["id"] for row in rows]
+            while offset.get("phase") != "stream":
+                rows, offset = connector.read_table("app.orders", offset, options)
+                ids += [row["id"] for row in rows]
+        return ids, offset
+
+    def test_a_later_update_takes_a_failed_index_scan_up_unless_it_is_a_full_refresh(self):
+        pipeline = uuid.UUID(int=1)
+        scopes = [f"{pipeline}_@_{uuid.UUID(int=number)}" for number in (2, 3, 4, 5)]
+        pointers = os.path.join(self._shared_state.name, "**", "snapshot-scan", f"{pipeline}.json")
+
+        # An update that was not started as a full refresh goes on after the pages the
+        # failed one staged, under that update's scope, as a snapshot being served does.
+        bridge, options, cursors = self._failed_index_scan(scopes[0])
+        later = self.connector(bridge)
+        later.set_registration_scope(scopes[1])
+        later.set_update_request("continue")
+        with self.assertLogs(informix_module.__name__, "INFO") as logs:
+            ids, offset = self._snapshot_ids(later, options)
+        self.assertEqual(ids, [1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(cursors, [[4], [6]])
+        self.assertEqual(offset["pipeline_scope"], scopes[0])
+        self.assertTrue(any("2 staged pages with 4 rows are kept" in line for line in logs.output))
+        # The stream's first read has a committed offset to go on from: the record of the
+        # scan is gone, and no update is sent back to its pages.
+        later.read_table("app.orders", offset, options)
+        self.assertEqual(glob.glob(pointers, recursive=True), [])
+
+    def test_a_table_keyed_by_an_option_takes_its_scan_up_and_seeds_its_delete_reader(self):
+        # primary.keys gives the table a key to merge by and a delete reader of its own.
+        # The scan is taken up under the failed update's scope, where its end also publishes
+        # the upsert reader's start. The delete reader of this update looks under this
+        # update's scope: it waits until the upsert reader's first read with a committed
+        # offset publishes the start there, as it does for any snapshot served in a later
+        # update, and then begins at the snapshot's position.
+        pipeline = uuid.UUID(int=11)
+        scopes = [f"{pipeline}_@_{uuid.UUID(int=update)}" for update in (2, 3)]
+        bridge, options, cursors = self._failed_index_scan(scopes[0], {"primary.keys": "id"})
+        later = self.connector(bridge)
+        later.set_registration_scope(scopes[1])
+        later.set_update_request("continue")
+
+        deletes, waiting = later.read_table_deletes("app.orders", {}, options)
+        self.assertEqual(list(deletes), [])
+        self.assertNotIn("commit_lsn", waiting)
+
+        rows, offset = later.read_table("app.orders", {}, options)
+        ids = [row["id"] for row in rows]
+        self.assertEqual(cursors, [[4], [6]])
+        self.assertEqual(offset["pipeline_scope"], scopes[0])
+        deletes, waiting = later.read_table_deletes("app.orders", waiting, options)
+        self.assertEqual(list(deletes), [])
+        self.assertNotIn("commit_lsn", waiting)
+
+        while offset.get("phase") != "stream":
+            rows, offset = later.read_table("app.orders", offset, options)
+            ids += [row["id"] for row in rows]
+        self.assertEqual(ids, [1, 2, 3, 4, 5, 6, 7])
+        deletes, seeded = later.read_table_deletes("app.orders", waiting, options)
+        self.assertEqual(list(deletes), [])
+        self.assertEqual(seeded["phase"], "stream")
+        self.assertEqual(seeded["commit_lsn"], offset["commit_lsn"])
+
+    def test_an_index_scan_that_had_read_its_last_page_only_settles_when_taken_up(self):
+        # The scan failed while reading the table's changes at its end, with every page
+        # staged and recorded: taken up, it reads no page again.
+        pipeline = uuid.UUID(int=12)
+        scopes = [f"{pipeline}_@_{uuid.UUID(int=update)}" for update in (2, 3)]
+        bridge = _KeylessIndexBridge()
+        bridge.rows = [{"id": number, "value": "v"} for number in range(1, 8)]
+        options = {"snapshot.mode": "initial", "keyless.snapshot.page.size": "3"}
+        chunk, cursors = bridge.snapshot_chunk, []
+        polls, lost = bridge.read_changes, []
+
+        def recording(identity, columns, keys, after, *args, **kwargs):
+            cursors.append(after)
+            return chunk(identity, columns, keys, after, *args, **kwargs)
+
+        def failing(*args, **kwargs):
+            if not lost:
+                lost.append(True)
+                raise RuntimeError("the connection is lost")
+            return polls(*args, **kwargs)
+
+        bridge.snapshot_chunk, bridge.read_changes = recording, failing
+        first = self.connector(bridge)
+        first.set_registration_scope(scopes[0])
+        with (
+            mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0),
+            self.assertRaises(Exception),
+        ):
+            first.read_table("app.orders", {}, options)
+        self.assertEqual(cursors, [None, [2], [4], [6]])
+        del cursors[:]
+
+        later = self.connector(bridge)
+        later.set_registration_scope(scopes[1])
+        later.set_update_request("continue")
+        ids, offset = self._snapshot_ids(later, options)
+        self.assertEqual(ids, [1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(cursors, [])
+        self.assertEqual(offset["pipeline_scope"], scopes[0])
+
+    def test_a_page_staged_but_not_recorded_gives_way_when_the_scan_is_taken_up(self):
+        # The failure fell between staging a page and recording it. The page is read
+        # again, and what it holds by then may differ: its staged file must not stand in
+        # the way of the one that replaces it.
+        pipeline = uuid.UUID(int=13)
+        scopes = [f"{pipeline}_@_{uuid.UUID(int=update)}" for update in (2, 3)]
+        bridge, options, cursors = self._failed_index_scan(scopes[0])
+        records = os.path.join(
+            self._shared_state.name, "**", "snapshot-scan", "**", "[0-9]" * 8 + ".json"
+        )
+        recorded = sorted(glob.glob(records, recursive=True))
+        self.assertEqual(
+            [os.path.basename(path) for path in recorded], ["00000000.json", "00000001.json"]
+        )
+        os.remove(recorded[-1])
+        bridge.rows[2]["value"] = "changed since"
+
+        later = self.connector(bridge)
+        later.set_registration_scope(scopes[1])
+        later.set_update_request("continue")
+        with mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0):
+            rows, offset = later.read_table("app.orders", {}, options)
+            rows = list(rows)
+            while offset.get("phase") != "stream":
+                more, offset = later.read_table("app.orders", offset, options)
+                rows += list(more)
+        self.assertEqual(cursors, [[2], [4], [6]])
+        self.assertEqual([row["id"] for row in rows], [1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual([row["value"] for row in rows if row["id"] == 3], ["changed since"])
+
+    def test_an_index_scan_that_cannot_record_its_progress_still_completes(self):
+        bridge = _KeylessIndexBridge()
+        bridge.rows = [{"id": number, "value": "v"} for number in range(1, 8)]
+        options = {"snapshot.mode": "initial", "keyless.snapshot.page.size": "3"}
+        connector = self.connector(bridge)
+        with (
+            mock.patch.object(
+                InformixLakeflowConnect,
+                "_write_progress_file",
+                side_effect=OSError("read-only file system"),
+            ),
+            self.assertLogs(informix_module.__name__, "WARNING") as logs,
+        ):
+            ids, _offset_ = self._snapshot_ids(connector, options)
+        self.assertEqual(ids, [1, 2, 3, 4, 5, 6, 7])
+        # Said once, not for every page.
+        warned = [line for line in logs.output if "Cannot record the progress" in line]
+        self.assertEqual(len(warned), 1)
+        self.assertIn("read-only file system", warned[0])
+
+    def test_the_last_progress_file_is_found_without_listing_them_all(self):
+        directory = os.path.join(self._shared_state.name, "progress")
+        os.makedirs(directory)
+        latest = InformixLakeflowConnect._latest_progress_file
+        self.assertEqual(os.path.basename(latest(directory)), "head.json")
+        for count in (1, 2, 3, 7, 8, 9, 100):
+            for number in range(count):
+                with open(os.path.join(directory, f"{number:08d}.json"), "w", encoding="utf-8"):
+                    pass
+            with mock.patch.object(os, "listdir", side_effect=AssertionError("listed")):
+                with mock.patch.object(os.path, "exists", wraps=os.path.exists) as probes:
+                    self.assertEqual(os.path.basename(latest(directory)), f"{count - 1:08d}.json")
+            self.assertLessEqual(probes.call_count, 2 * count.bit_length() + 2)
+
+    def test_the_pipelines_api_is_asked_about_an_update_with_the_captured_credentials(self):
+        from databricks.labs.community_connector.sources.informix import lakebase_state
+
+        captured = {"host": "https://workspace.invalid", "token": "captured-for-the-test"}
+        with mock.patch.object(lakebase_state, "capture_workspace_credentials", return_value={}):
+            self.assertIsNone(lakebase_state.pipeline_update("p", "u"))
+        with (
+            mock.patch.object(
+                lakebase_state, "capture_workspace_credentials", return_value=captured
+            ),
+            mock.patch.object(lakebase_state._WorkspaceApi, "request", autospec=True) as request,
+        ):
+            request.return_value = {"update": {"full_refresh": True, "cause": "API_CALL"}}
+            self.assertEqual(
+                lakebase_state.pipeline_update("p", "u"),
+                {"full_refresh": True, "cause": "API_CALL"},
+            )
+            self.assertEqual(request.call_args.args[1:], ("GET", "/api/2.0/pipelines/p/updates/u"))
+            # Anything but an update, and any failure, is "cannot say": never an error.
+            request.return_value = {"error": "no"}
+            self.assertIsNone(lakebase_state.pipeline_update("p", "u"))
+            request.return_value = None
+            self.assertIsNone(lakebase_state.pipeline_update("p", "u"))
+            request.side_effect = lakebase_state.WorkspaceHttpError("forbidden", 403)
+            self.assertIsNone(lakebase_state.pipeline_update("p", "u"))
+
+    def test_a_drain_is_handed_to_this_updates_pool_whichever_scope_it_stages_under(self):
+        connector = self.connector(FakeBridge())
+        current = connector._pipeline_scope()
+        table = Table.parse(_table(), "demo")
+        handed = {}
+
+        class _Pool:
+            def submit(self, job_key, **job):
+                handed["job"] = job
+                raise RuntimeError("handed over")
+
+        def pool_for(key, **_):
+            handed["pool"] = key
+            return _Pool()
+
+        with (
+            mock.patch.object(informix_module, "_snapshot_drain_pool", pool_for),
+            self.assertRaisesRegex(RuntimeError, "handed over"),
+        ):
+            connector._drain_via_snapshot_daemon(table, {}, "e" * 32, "5" * 32, False)
+        self.assertEqual(handed["pool"][1], current)
+        self.assertEqual(handed["job"]["pipeline_scope"], "e" * 32)
+        self.assertEqual(handed["job"]["registration_scope"], current)
+
+    def test_a_full_refresh_discards_a_failed_index_scan(self):
+        for number, (request, reason) in enumerate(
+            (
+                ("full_refresh", "this update is a full refresh"),
+                (None, "the pipelines API does not say what this update was started for"),
+            )
+        ):
+            # A pipeline of its own each time: the state store outlives the staged files.
+            pipeline = uuid.UUID(int=70 + number)
+            scopes = [f"{pipeline}_@_{uuid.UUID(int=update)}" for update in (2, 3)]
+            pointers = os.path.join(
+                self._shared_state.name, "**", "snapshot-scan", f"{pipeline}.json"
+            )
+            with self.subTest(request=request):
+                bridge, options, cursors = self._failed_index_scan(scopes[0])
+                (pointer,) = glob.glob(pointers, recursive=True)
+                with open(pointer, encoding="utf-8") as handle:
+                    self.assertEqual(json.load(handle)["scope"], scopes[0])
+                refresh = self.connector(bridge)
+                refresh.set_registration_scope(scopes[1])
+                refresh.set_update_request(request)
+                with self.assertLogs(informix_module.__name__, "INFO") as logs:
+                    ids, offset = self._snapshot_ids(refresh, options)
+                # It reads the table from its first row, under its own scope. Once its
+                # snapshot is being served no record is left: the earlier pages, and its
+                # own, are no one's to take up.
+                self.assertEqual(ids, [1, 2, 3, 4, 5, 6, 7])
+                self.assertEqual(cursors, [None, [2], [4], [6]])
+                self.assertEqual(offset["pipeline_scope"], scopes[1])
+                self.assertTrue(
+                    any(
+                        f"scan an earlier update of this pipeline began ({reason})" in line
+                        for line in logs.output
+                    )
+                )
+                self.assertEqual(glob.glob(pointers, recursive=True), [])
+
+    def test_an_index_scan_is_taken_up_only_while_its_record_is_recent_and_its_log_kept(self):
+        for number, (spoil, reason) in enumerate(
+            (
+                ("old", "it was last written to too long ago"),
+                ("log", "the log it began in is no longer kept"),
+            )
+        ):
+            pipeline = uuid.UUID(int=90 + number)
+            scopes = [f"{pipeline}_@_{uuid.UUID(int=update)}" for update in (2, 3)]
+            with self.subTest(spoil=spoil):
+                bridge, options, cursors = self._failed_index_scan(scopes[0])
+                later = self.connector(bridge)
+                later.set_registration_scope(scopes[1])
+                later.set_update_request("continue")
+                if spoil == "log":
+                    bridge.minimum = bridge.now + 10_000
+                    table = Table.parse(bridge.tables[0], "demo")
+                    with self.assertLogs(informix_module.__name__, "INFO") as logs:
+                        self.assertEqual(later._adopted_scan_scope(table, scopes[1]), scopes[1])
+                else:
+                    with (
+                        mock.patch.object(informix_module, "_SCAN_RESUME_SECONDS", -1),
+                        self.assertLogs(informix_module.__name__, "INFO") as logs,
+                    ):
+                        ids, offset = self._snapshot_ids(later, options)
+                    self.assertEqual(cursors, [None, [2], [4], [6]])
+                    self.assertEqual(offset["pipeline_scope"], scopes[1])
+                self.assertTrue(any(reason in line for line in logs.output))
+
+    def test_what_an_update_was_started_for_comes_from_the_pipelines_api(self):
+        # Spark gives an update no setting that says it is a full refresh (probed on
+        # serverless: only spark.pipelines.updateId differs). The pipelines API does, and an
+        # automatic retry of a failed full refresh still carries the flag, with its cause.
+        for update, expected in (
+            ({"full_refresh": True, "cause": "API_CALL"}, "full_refresh"),
+            ({"full_refresh": True, "cause": "USER_ACTION"}, "full_refresh"),
+            ({"full_refresh": True, "cause": "RETRY_ON_FAILURE"}, "continue"),
+            (
+                {"full_refresh": False, "full_refresh_selection": ["t"], "cause": "API_CALL"},
+                "full_refresh",
+            ),
+            (
+                {
+                    "full_refresh": False,
+                    "full_refresh_selection": ["t"],
+                    "cause": "RETRY_ON_FAILURE",
+                },
+                "continue",
+            ),
+            ({"full_refresh": False, "cause": "API_CALL"}, "continue"),
+            ({}, "continue"),
+            (None, None),
+        ):
+            with mock.patch.object(informix_module, "pipeline_update", return_value=update) as ask:
+                self.assertEqual(informix_module._update_request("p", "u"), expected)
+            ask.assert_called_once_with("p", "u")
 
     def test_the_stream_keeps_every_change_once_past_an_index_scans_end(self):
         source = _IndexScanSource(random_module.Random(7))
@@ -19754,6 +20181,41 @@ class SnapshotDrainPoolTests(unittest.TestCase):
         self.assertEqual(calls["read"], ("T", None, "scope", True))
         self.assertEqual(calls["scope_at_read"], "scope")
         self.assertTrue(calls["closed"])
+
+    def test_worker_of_a_scan_taken_up_runs_as_the_consumers_update(self):
+        # A scan taken up from an earlier update is staged under that update's scope, but
+        # the worker is of this update: its staging token is minted under this update, or
+        # minting it would revoke the tokens of every other reader of the pipeline.
+        pool = _SnapshotDrainPool()
+        calls = {}
+
+        class _FakeReader:
+            def set_registration_scope(self, scope):
+                calls["identity"] = scope
+
+            def _read_snapshot(
+                self, table, start, options, *, pipeline_scope_override, allow_keyless
+            ):
+                calls["staged_under"] = pipeline_scope_override
+
+            def close(self):
+                pass
+
+        pool.configure(reader_factory=_FakeReader, thread_count=1)
+        worker = threading.Thread(
+            target=informix_module._run_snapshot_drain_worker, args=(pool,), daemon=True
+        )
+        worker.start()
+        pool.submit(
+            ("k",),
+            table="T",
+            options={},
+            pipeline_scope="earlier",
+            allow_keyless=True,
+            registration_scope="current",
+        )
+        self.assertTrue(pool.wait(("k",), 2.0))
+        self.assertEqual(calls, {"identity": "current", "staged_under": "earlier"})
 
     def test_worker_surfaces_failure_to_waiter(self):
         pool = _SnapshotDrainPool()

@@ -671,6 +671,36 @@ Requirements and limits:
 - A transaction that was open at the snapshot LSN and had already changed the table is
   not reconciled.
 
+**Restart after a failure.** The scan records each page it has staged, beside the pages.
+If it fails before the snapshot is complete, the next attempt goes on after the last
+page recorded instead of reading the table from its first row: it keeps the snapshot
+LSN, reads the table's changes from that LSN again, and continues from the last index
+value. That holds for a retry within the same update and for a later update of the same
+pipeline, which then runs the snapshot under the first update's scope, as a snapshot
+that is already being served does.
+
+A full refresh does not take the earlier scan up. Spark gives an update no setting that
+says it is a full refresh, so the connector asks the pipelines API once, on the driver,
+when the pipeline starts. An update started as a full refresh, of the pipeline or of
+selected tables, discards the record, so no later update returns to those pages, and
+reads the table from its first row. An automatic retry of a failed full refresh carries
+on with what that full refresh began. The record is also discarded, and the table read
+from the start, when:
+
+- the API cannot be asked, so it is unknown what the update was started for;
+- the record was last written more than 24 hours ago;
+- the logical log the scan began in is no longer kept;
+- the table's schema or the index paged by has changed.
+
+Once the snapshot's first batch is committed the record is removed: a restart then goes
+on from the committed offset, as before. A scan under `snapshot.max.bytes` keeps no
+record and starts over.
+
+A table keyed by `primary.keys` whose snapshot pages by an index is taken up the same
+way. Its delete flow waits, as it does for any snapshot served in a later update, until
+the upsert flow's first read with a committed offset has published where it starts, and
+then begins at the snapshot's position.
+
 ### Checkpoints and log retention
 
 Trigger records use pipeline-scope-specific subtrees, so recovery never reads

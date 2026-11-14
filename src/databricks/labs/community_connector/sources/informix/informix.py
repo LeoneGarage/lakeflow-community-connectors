@@ -29,6 +29,7 @@ import queue
 import random
 import re
 import secrets
+import shutil
 import stat
 import sys
 import tempfile
@@ -100,6 +101,7 @@ from databricks.labs.community_connector.sources.informix.lakebase_state import 
     heartbeat_waiter,
     list_spill_runs,
     merge_spill_run,
+    pipeline_update,
     pool_progress_token,
     publish_backlog_hint,
     publish_connection_limit,
@@ -1058,7 +1060,28 @@ _SHARED_STATE_MOUNT_RETRY_MAX_SECONDS = 8.0
 _MAX_REGISTRATION_TABLE_CACHES = 512
 # Predecessor hops a same-position channel start may follow back to its first schema.
 _MAX_SCHEMA_DESCENT = 256
-_INFORMIX_REGISTRATION_CONTEXT: dict[str, Any] = {"scope": None}
+_INFORMIX_REGISTRATION_CONTEXT: dict[str, Any] = {"scope": None, "request": None}
+# An index-ordered snapshot records its progress beside its staged pages, so that a restart
+# after a failure continues from the last page instead of the table's first row. The
+# record of an earlier update is used only while it is this recent: its pages are swept
+# after snapshot.staging.retention.days, and the log it needs is not kept for ever.
+_SCAN_PROGRESS_VERSION = 1
+_SCAN_RESUME_SECONDS = 24 * 3600
+
+
+def _update_request(pipeline_id: str, update_id: str) -> str | None:
+    # Docstring: What this update was started for: ``"full_refresh"`` when a full refresh
+    # was asked for, ``"continue"`` otherwise, None when the pipelines API cannot say.
+    #
+    # An automatic retry of a failed full refresh is itself marked a full refresh, with
+    # the cause RETRY_ON_FAILURE: it carries on with what the failed update began, and so
+    # counts as "continue".
+
+    update = pipeline_update(pipeline_id, update_id)
+    if update is None:
+        return None
+    asked = bool(update.get("full_refresh") or update.get("full_refresh_selection"))
+    return "full_refresh" if asked and update.get("cause") != "RETRY_ON_FAILURE" else "continue"
 
 
 class _StateValidationCoordinator:
@@ -1377,6 +1400,7 @@ def _informix_available_now_base(base: type, spark_session: Any | None = None) -
             update_id = spark_session.conf.get("spark.pipelines.updateId", None)
         except (AttributeError, TypeError):
             pass
+    update_request: str | None = None
     if not pipeline_id or not update_id:
         registration_scope = secrets.token_hex(16)
     else:
@@ -1384,6 +1408,8 @@ def _informix_available_now_base(base: type, spark_session: Any | None = None) -
         if _PIPELINE_SCOPE.fullmatch(registration_scope) is None:
             # 9: Spark pipeline and update IDs must be canonical UUID strings
             raise ValueError(_m(9))
+        update_request = _update_request(pipeline_id, update_id)
+    _INFORMIX_REGISTRATION_CONTEXT["request"] = update_request
     # Schema discovery constructs connector instances before stream readers
     # exist. Publish this registration's immutable scope early so those
     # instances can share the registration-scoped catalog snapshot.
@@ -1409,6 +1435,9 @@ def _informix_available_now_base(base: type, spark_session: Any | None = None) -
                 setter = getattr(reader.lakeflow_connect, "set_registration_scope", None)
                 if setter is not None:
                     setter(registration_scope)
+                setter = getattr(reader.lakeflow_connect, "set_update_request", None)
+                if setter is not None:
+                    setter(update_request)
                 options = getattr(reader, "options", {})
                 table = options.get("tableName", "<unknown>")
                 role = "delete" if options.get("isDeleteFlow") == "true" else "upsert"
@@ -8015,7 +8044,12 @@ class _SnapshotDrainPool:
                 self.reader_factory = reader_factory
             self.thread_count = thread_count
 
-    def submit(self, job_key, *, table, options, pipeline_scope, allow_keyless):
+    def submit(
+        self, job_key, *, table, options, pipeline_scope, allow_keyless, registration_scope=None
+    ):
+        # ``pipeline_scope`` is where the snapshot is staged. ``registration_scope`` is the
+        # update the consumer runs in, when that is another: a scan taken up from an
+        # earlier update is staged under that update's scope by a worker of this one.
         with self.condition:
             # Drop a prior terminal result so a re-subscribe after a failed drain (or a
             # process restart that left no manifest) enqueues a fresh attempt.
@@ -8025,6 +8059,7 @@ class _SnapshotDrainPool:
                     "table": table,
                     "options": options,
                     "pipeline_scope": pipeline_scope,
+                    "registration_scope": registration_scope or pipeline_scope,
                     "allow_keyless": allow_keyless,
                 }
                 self.queue.append(job_key)
@@ -8159,9 +8194,11 @@ def _run_snapshot_drain_worker(pool: _SnapshotDrainPool) -> None:
         if job is not None and factory is not None:
             try:
                 reader = factory()
-                # The consumer's scope, not whatever this process's registration context
-                # holds: staging tokens and stage paths are both keyed by it.
-                reader.set_registration_scope(job["pipeline_scope"])
+                # The consumer's update, not whatever this process's registration context
+                # holds: staging tokens are keyed by it, and one minted under another update
+                # revokes this update's, for every table. The stage paths follow the scope
+                # the read below is given, which is an earlier update's for a scan taken up.
+                reader.set_registration_scope(job["registration_scope"])
                 # Each staged page resets the consumer's liveness watchdog, so a big table
                 # that keeps making progress never trips it while a wedged drain does.
                 reader._drain_progress = lambda: pool.report_progress(job_key)
@@ -8497,6 +8534,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         self._staging_rest_required = False
         self._staging_workspace_host = ""
         self._registration_scope: str | None = _INFORMIX_REGISTRATION_CONTEXT["scope"]
+        # What this update was started for (see _update_request).
+        self._update_request: str | None = _INFORMIX_REGISTRATION_CONTEXT.get("request")
         self._metadata_session_lock = threading.RLock()
         # Set by a snapshot-drain worker to a callback that reports a staged page to the
         # pool, resetting the consumer's liveness watchdog. None on a normal reader.
@@ -8549,6 +8588,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # pair last listed its runs from Lakebase (see _settle_spilled_runs).
         self._spill_runs: dict[tuple[str, str], dict[str, tuple]] = {}
         self._spill_runs_listed: dict[tuple[str, str], float] = {}
+
+    def set_update_request(self, request: str | None) -> None:
+        # Docstring: Install what this update was started for (see _update_request).
+
+        self._update_request = request
 
     def set_registration_scope(self, scope: str) -> None:
         # Docstring: Install the scope shared by every reader serialized from one registration.
@@ -12960,6 +13004,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             if not callable(consistent_snapshot):
                 # 247: Configured Informix bridge does not implement consistent_snapshot()
                 raise InformixError(_m(247))
+            if pipeline_scope_override is None:
+                # An index-ordered scan an earlier update began is carried on under that
+                # update's scope, unless this update is a full refresh (see above). The
+                # reader decides; the drain worker it hands the scan to is given the scope.
+                pipeline_scope = self._adopted_scan_scope(table, pipeline_scope)
             # Validate the complete snapshot contract before _initial_lsn()
             # enables full-row logging or publishes durable initialization.
             high_water = self._initial_lsn(table, scope=pipeline_scope)
@@ -13075,6 +13124,33 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             scan_index = self._scan_index(table, options)
             snapshot_lsn = None
             if scan_index is not None:
+                # The scan records its progress and goes on from it after a failure. Not
+                # with a byte limit on the snapshot, whose count is not kept.
+                resume = progress = None
+                if not max_bytes:
+                    resume = self._scan_resume_state(
+                        table, pipeline_scope, schema_id, high_water, scan_index
+                    )
+                    if resume:
+                        commit_time = resume["commit_time"]
+                        page_count, row_count = resume["staged"], resume["rows"]
+                        if page_count:
+                            # What staging the next page needs of those staged: the first
+                            # page's upper key for the manifest, the last one's as the next
+                            # page's lower key. A table with no key has empty ones.
+                            first_upper_pk, previous_upper_pk = (
+                                self._read_snapshot_stage_page_record(
+                                    table, pipeline_scope, schema_id, resume["boundary"], at
+                                )["upper_pk"]
+                                for at in (0, page_count - 1)
+                            )
+                            previous_upper_pk = _decode_snapshot_stage_value(previous_upper_pk)
+                            first_upper_pk = json.dumps(
+                                first_upper_pk, allow_nan=False, sort_keys=True
+                            )
+                    progress = self._scan_progress_writer(
+                        table, pipeline_scope, schema_id, scan_index, commit_time, high_water
+                    )
                 snapshot_lsn = self._index_scan_snapshot(
                     table,
                     options,
@@ -13086,6 +13162,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                         table, pipeline_scope, schema_id, lsn, index
                     )[1],
                     scanned,
+                    resume,
+                    progress,
                 )
             # None when there is no index to page by, or the scan gave way to this read.
             index_scan = snapshot_lsn is not None
@@ -13286,8 +13364,264 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         )
         return None
 
+    # ---- progress of an index-ordered snapshot ------------------------------------------
+    #
+    # The scan stages a page at a time and publishes its manifest only at the end, so a
+    # failure before that left nothing to carry on from: the next attempt read the table
+    # from its first row. The scan now writes, beside the staged pages:
+    #
+    #   snapshot-scan/<pipeline>.json                         which update's scan is under way
+    #   snapshot-scan/<scope>/<schema>/<snapshot LSN>/head.json   the index and the rows' time
+    #   .../<position>.json                                    one per page read, in order
+    #
+    # A restart under the same update, or a later update that was not started as a full
+    # refresh, takes the scan up after the last page recorded: it runs under the first
+    # update's scope, as a snapshot that is already being served in a later update does,
+    # reads the table's changes again from the snapshot LSN and goes on from the last index
+    # value. A full refresh, an update the pipelines API says nothing about, a record that
+    # is too old or one whose log is gone discards the record instead, so that no later
+    # update takes those pages up.
+
+    def _scan_progress_root(self, table) -> str:
+        connection_key, table_key = self._table_state_keys(table)
+        return os.path.join(
+            self._snapshot_staging_location, connection_key, table_key, "snapshot-scan"
+        )
+
+    def _scan_pointer_path(self, table, scope: str) -> str:
+        return os.path.join(self._scan_progress_root(table), f"{scope.partition('_@_')[0]}.json")
+
+    def _scan_progress_directory(self, table, scope: str, schema_id: str, boundary: int) -> str:
+        return os.path.join(self._scan_progress_root(table), scope, schema_id, str(boundary))
+
+    @staticmethod
+    def _read_progress_file(path: str) -> dict[str, Any] | None:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                value = json.load(handle)
+        except (OSError, ValueError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    @staticmethod
+    def _latest_progress_file(directory: str) -> str:
+        # Docstring: The file of the last page recorded in ``directory``, else its head.
+        #
+        # Pages are recorded in order with no gaps, so the last is found by probing: a
+        # scan of thousands of pages costs a few dozen lookups on the Volume, not one for
+        # every file.
+
+        def page(number: int) -> str:
+            return os.path.join(directory, f"{number:08d}.json")
+
+        if not os.path.exists(page(0)):
+            return os.path.join(directory, "head.json")
+        low, high = 0, 1
+        while os.path.exists(page(high)):
+            low, high = high, high * 2
+        while high - low > 1:
+            middle = (low + high) // 2
+            if os.path.exists(page(middle)):
+                low = middle
+            else:
+                high = middle
+        return page(low)
+
+    @staticmethod
+    def _write_progress_file(path: str, value: dict[str, Any]) -> None:
+        # Its directory is made when the scan begins: a page then costs a write and a rename.
+        candidate = f"{path}.{secrets.token_hex(8)}"
+        with open(candidate, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, sort_keys=True)
+        os.replace(candidate, path)
+
+    def _discard_scan_progress(self, table, scope: str, why: str | None = None) -> None:
+        # Docstring: Remove the record of the scan under way for this pipeline, with its
+        # pages' records, so that no update takes it up.
+
+        path = self._scan_pointer_path(table, scope)
+        pointer = self._read_progress_file(path)
+        if pointer is None:
+            return
+        recorded = pointer.get("scope")
+        if isinstance(recorded, str) and _PIPELINE_SCOPE.fullmatch(recorded) is not None:
+            shutil.rmtree(os.path.join(self._scan_progress_root(table), recorded), True)
+        with contextlib.suppress(OSError):
+            os.remove(path)
+        if why:
+            # 440: Informix snapshot of '{}' discards the index-ordered scan an
+            # earlier update of this pipeline began ({}); its staged pages are not
+            # used
+            logging.getLogger(__name__).info(_m(440, table.exposed_name, why))
+
+    def _adopted_scan_scope(self, table, scope: str) -> str:
+        # Docstring: The scope a snapshot with no checkpoint runs under: that of an earlier
+        # update of this pipeline whose index-ordered scan it continues, else its own.
+
+        pointer = self._read_progress_file(self._scan_pointer_path(table, scope))
+        recorded = None if pointer is None else pointer.get("scope")
+        if pointer is None or recorded == scope:
+            return scope
+        directory = None
+        why = None
+        if self._update_request is None:
+            why = "the pipelines API does not say what this update was started for"
+        elif self._update_request != "continue":
+            why = "this update is a full refresh"
+        elif (
+            pointer.get("version") != _SCAN_PROGRESS_VERSION
+            or pointer.get("table") != table.native_identity
+            or not isinstance(recorded, str)
+            or _PIPELINE_SCOPE.fullmatch(recorded) is None
+            or recorded.partition("_@_")[0] != scope.partition("_@_")[0]
+        ):
+            why = "its record is not one this version reads"
+        else:
+            try:
+                directory = self._scan_progress_directory(
+                    table, recorded, str(pointer["schema_id"]), int(pointer["boundary"])
+                )
+                touched = os.path.getmtime(self._latest_progress_file(directory))
+                if time.time() - touched > _SCAN_RESUME_SECONDS:
+                    why = "it was last written to too long ago"
+                elif self._bridge.minimum_lsn() > int(pointer["initial"]):
+                    # That update's capture began there, and its changes are read again.
+                    why = "the log it began in is no longer kept"
+            except (KeyError, OSError, TypeError, ValueError):
+                why = "its record cannot be read"
+        if why is None:
+            return recorded
+        self._discard_scan_progress(table, scope, why)
+        return scope
+
+    def _scan_resume_state(self, table, scope, schema_id, high_water, index):
+        # Docstring: What an index-ordered scan under ``scope`` has recorded, for the scan to
+        # go on from, or None when there is nothing it can go on from.
+
+        pointer = self._read_progress_file(self._scan_pointer_path(table, scope))
+        if (
+            pointer is None
+            or pointer.get("version") != _SCAN_PROGRESS_VERSION
+            or pointer.get("scope") != scope
+            or pointer.get("schema_id") != schema_id
+            or pointer.get("table") != table.native_identity
+        ):
+            return None
+        try:
+            boundary = int(pointer["boundary"])
+            directory = self._scan_progress_directory(table, scope, schema_id, boundary)
+            head = self._read_progress_file(os.path.join(directory, "head.json")) or {}
+            keys, descending = index
+            if (
+                boundary < high_water
+                or head.get("keys") != list(keys)
+                or head.get("descending") != list(descending)
+                # The changes since the snapshot LSN are read again: they must still be there.
+                or self._bridge.minimum_lsn() > boundary
+            ):
+                return None
+            pages = []
+            staged = rows = 0
+            while True:
+                entry = self._read_progress_file(os.path.join(directory, f"{len(pages):08d}.json"))
+                if entry is None:
+                    break
+                if entry["index"] is not None:
+                    if int(entry["index"]) != staged:
+                        return None
+                    staged += 1
+                rows += int(entry["rows"])
+                pages.append(entry)
+                if entry["bound"] is None:
+                    break
+        except (KeyError, TypeError, ValueError):
+            return None
+        # A page staged after the last one recorded is read again: its file gives way.
+        shutil.rmtree(
+            os.path.join(
+                self._snapshot_stage_namespace(table, scope, schema_id),
+                "runs",
+                str(boundary),
+                f"page-{staged:08d}",
+            ),
+            True,
+        )
+        # 439: Informix snapshot of '{}' continues the index-ordered scan an earlier
+        # update of this pipeline began: {} staged pages with {} rows are kept
+        logging.getLogger(__name__).info(_m(439, table.exposed_name, staged, rows))
+        return {
+            "boundary": boundary,
+            "commit_time": head.get("commit_time"),
+            "pages": pages,
+            "staged": staged,
+            "rows": rows,
+        }
+
+    def _scan_progress_writer(self, table, scope, schema_id, index, commit_time, initial):
+        # Docstring: ``(begin, page)``: record that a scan under ``scope`` began at a
+        # snapshot LSN, and each page it has read. A failure to record costs the scan
+        # nothing but its restart point, and is reported once.
+
+        keys, descending = index
+        failed = []
+
+        def record(path, value):
+            if failed:
+                return
+            try:
+                self._write_progress_file(path, value)
+            except OSError as error:
+                failed.append(error)
+                # 441: Cannot record the progress of the index-ordered snapshot of
+                # '{}' ({}); a restart reads the table from its first row again
+                logging.getLogger(__name__).warning(_m(441, table.exposed_name, error))
+
+        def begin(boundary: int) -> None:
+            directory = self._scan_progress_directory(table, scope, schema_id, boundary)
+            shutil.rmtree(directory, True)
+            try:
+                os.makedirs(directory, mode=0o700, exist_ok=True)
+            except OSError:
+                pass  # the write below reports it
+            record(
+                os.path.join(directory, "head.json"),
+                {
+                    "commit_time": commit_time,
+                    "descending": list(descending),
+                    "keys": list(keys),
+                    "table": table.native_identity,
+                },
+            )
+            record(
+                self._scan_pointer_path(table, scope),
+                {
+                    "boundary": boundary,
+                    "initial": initial,
+                    "schema_id": schema_id,
+                    "scope": scope,
+                    "table": table.native_identity,
+                    "version": _SCAN_PROGRESS_VERSION,
+                },
+            )
+
+        def page(boundary: int, position: int, entry: dict[str, Any]) -> None:
+            directory = self._scan_progress_directory(table, scope, schema_id, boundary)
+            record(os.path.join(directory, f"{position:08d}.json"), entry)
+
+        return begin, page
+
     def _index_scan_snapshot(
-        self, table, options, index, page_size, max_rows, stage_page, staged_rows, scan
+        self,
+        table,
+        options,
+        index,
+        page_size,
+        max_rows,
+        stage_page,
+        staged_rows,
+        scan,
+        resume=None,
+        progress=None,
     ) -> int | None:
         # Docstring: Stage a keyless table by an index and record, in ``scan``, which of its
         # changes the stream must not replay; returns the snapshot LSN. Returns None, with
@@ -13322,8 +13656,32 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             shaped = _framework_row(_coerce_variable_decimal_values(row, table, options))
             return json.dumps(shaped, sort_keys=True, default=str)
 
-        boundary = bridge.boundary_lsn()
+        # A scan taken up again keeps its snapshot LSN: the stream starts there, and the
+        # follower reads the table's changes from there once more.
+        boundary = resume["boundary"] if resume else bridge.boundary_lsn()
         start = last_commit = boundary
+        begin, noted = progress or (None, None)
+        if begin is not None and not resume:
+            begin(boundary)
+
+        def note(bound, before, after, staged, count, at) -> None:
+            # Record a page read, for a restart to go on after it.
+            if noted is not None:
+                noted(
+                    boundary,
+                    len(pages) - 1,
+                    {
+                        "after": after,
+                        "before": before,
+                        "bound": None
+                        if bound is None
+                        else _encode_snapshot_stage_value(_index_scan_plain(bound)),
+                        "cursor": None if at is None else _encode_snapshot_stage_value(list(at)),
+                        "index": staged,
+                        "rows": count,
+                    },
+                )
+
         # Changes read from the log and not sorted yet, per key: (commit LSN, +1 for an
         # inserted image or -1 for a deleted one, the row's token, the change's own LSN,
         # its operation). ``events`` keeps those of the keys in doubt, whose index values
@@ -13475,6 +13833,23 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         raw: dict[tuple, list] = {}
         cursor = None
         held = total = staged_pages = 0
+        for entry in resume["pages"] if resume else ():
+            bound = (
+                None
+                if entry["bound"] is None
+                else _index_scan_order(
+                    tuple(_decode_snapshot_stage_value(entry["bound"])), descending
+                )
+            )
+            pages.append((bound, int(entry["before"]), int(entry["after"]), entry["index"]))
+            if bound is not None:
+                bounds.append(bound)
+            if entry["cursor"] is not None:
+                cursor = _decode_snapshot_stage_value(entry["cursor"])
+            total += int(entry["rows"])
+            staged_pages += entry["index"] is not None
+        # The scan had read its last page: only the keys in doubt are left to settle.
+        complete = bool(pages) and pages[-1][0] is None
         # Rows with a NULL in an index column are no part of the keyed order: one group,
         # read first, and left out of the pages that follow. The index finds the NULLs of
         # its leading column; those of its other columns take a pass over the table.
@@ -13500,7 +13875,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     )
             return found
 
-        if nullable:
+        if nullable and not pages:
             before = bridge.boundary_lsn()
             # Too many to read together? The index answers that for its leading column
             # without their rows being read; for the others the read itself must.
@@ -13531,7 +13906,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             pages.append(((), before, after, 0 if rows else None))
             staged_pages = int(bool(rows))
             bounds.append(())
-        while True:
+            note((), before, after, 0 if rows else None, len(rows), None)
+        while not complete:
             # A commit the follower already holds was made before this read, wherever it
             # sits in the log page the read's own position is rounded down to.
             known = last_commit
@@ -13612,6 +13988,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             if rows:
                 stage_page(boundary, staged_pages, rows)
             pages.append((bound, max(before, known), after, staged_pages if rows else None))
+            note(
+                bound, max(before, known), after, staged_pages if rows else None, len(rows), cursor
+            )
             staged_pages += bool(rows)
             if bound is not None:
                 bounds.append(bound)
@@ -15533,8 +15912,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # then return that manifest.
 
         namespace = self._lakebase_state_namespace()
+        # This update's pool, with its one budget of drains, whichever update's scope the
+        # snapshot is staged under.
+        registration_scope = self._pipeline_scope()
         pool = _snapshot_drain_pool(
-            (namespace, pipeline_scope),
+            (namespace, registration_scope),
             reader_factory=self._snapshot_drain_reader_factory(),
             thread_count=self._snapshot_reader_thread_count(),
         )
@@ -15545,6 +15927,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             options=dict(options),
             pipeline_scope=pipeline_scope,
             allow_keyless=allow_keyless,
+            registration_scope=registration_scope,
         )
         # The wait is a liveness watchdog, not a total-duration cap: it trips only after
         # the worker reports no progress for a whole ``connection.wait.timeout.seconds``
@@ -17449,6 +17832,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     ) -> None:
         # Docstring: Clean obsolete scopes without deleting state referenced by Spark.
 
+        if checkpoint:
+            # A committed offset is what a restart goes on from now: the record of the
+            # scan that led to it must not send a later update back to its pages.
+            forgotten = self.__dict__.setdefault("_scan_progress_forgotten", set())
+            if table.identity not in forgotten:
+                forgotten.add(table.identity)
+                with contextlib.suppress(Exception):
+                    self._discard_scan_progress(table, self._pipeline_scope())
         if checkpoint and (checkpoint.get("stage_scope") or checkpoint.get("scan_scope")):
             # A handoff relocation is still serving staged pages that live under the
             # capturing flow's scope (carried on stage_scope). That scope's records --

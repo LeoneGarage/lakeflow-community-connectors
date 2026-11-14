@@ -356,6 +356,31 @@ def capture_workspace_credentials() -> dict[str, str]:
     return _CAPTURED_WORKSPACE
 
 
+def pipeline_update(pipeline_id: str, update_id: str) -> dict[str, Any] | None:
+    # Docstring: The update as the pipelines API describes it, or None when it cannot be asked.
+    #
+    # Called on the driver while the pipeline module executes, with the credentials
+    # captured there. Spark gives an update no setting that says whether it is a full
+    # refresh; the API's ``full_refresh``, ``full_refresh_selection`` and ``cause`` do.
+    # Never fatal: a caller that learns nothing must assume nothing.
+
+    captured = capture_workspace_credentials()
+    host, token = captured.get("host"), captured.get("token")
+    if not host or not token:
+        return None
+    try:
+        answer = _WorkspaceApi(host, token).request(
+            "GET",
+            f"/api/2.0/pipelines/{pipeline_id}/updates/{update_id}",
+            deadline=time.monotonic() + 30,
+        )
+    except Exception:
+        _LOGGER.debug("Cannot read pipeline update %s", update_id, exc_info=True)
+        return None
+    update = (answer or {}).get("update")
+    return update if isinstance(update, dict) else None
+
+
 def _workspace_credentials(options: dict[str, str]) -> tuple[str, str]:
     # Docstring: Resolve the workspace host and bearer token for control-plane calls.
     #
