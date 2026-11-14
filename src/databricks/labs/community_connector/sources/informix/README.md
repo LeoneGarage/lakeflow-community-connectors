@@ -615,9 +615,11 @@ Requirements and limits:
   table is quieter.
 - The snapshot ends by waiting until Informix CDC shows it has read the log past the end
   of the scan, so that step 2 has seen every change. On a table with no changes that takes
-  until the server's next checkpoint, so the wait stops after two minutes. If a change
+  until the server's next checkpoint, so the wait stops after 30 seconds. If a change
   that step 2 should have settled then reaches the stream later, the stream fails and
-  asks for a full refresh instead of guessing whether the snapshot holds it.
+  asks for a full refresh instead of guessing whether the snapshot holds it. A change
+  that committed after the scan by the source's clock is not such a change, even when
+  it is still on the log page the scan ended on.
 - Do not switch the table to `snapshot.scan: cursor` until the stream has passed the
   scan's end: the stream applies step 4 unless the option says `cursor`.
 - All rows of one index key are read together, so an index with very large groups reads

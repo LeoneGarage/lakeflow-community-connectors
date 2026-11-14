@@ -670,7 +670,7 @@ class _IndexScanSource:
         self._tick()
         return boundary, rows
 
-    def key_rows(self, identity, columns, keys, values, isolation):
+    def key_rows(self, identity, columns, keys, values, isolation, limit=None):
         self._tick()
         rows = [dict(row) for row in self.rows if row["id"] == values[0]]
         self._tick()
@@ -2143,20 +2143,33 @@ class LakeflowContractTests(unittest.TestCase):
                 lsn, self.now = self.now, max(self.now, 100)
                 return lsn
 
+            def current_lsn(self):
+                # To the log page only, as Informix reports it: its end.
+                return (self.now // 4096 + 1) * 4096
+
+            def current_utc_time(self):
+                return self.utc_now
+
             def snapshot_chunk(self, *args, isolation=None, **kwargs):
                 return super().snapshot_chunk(*args, **kwargs)
 
-            def key_rows(self, identity, columns, keys, values, isolation):
+            def key_rows(self, identity, columns, keys, values, isolation, limit=None):
                 return [dict(row) for row in self.rows if row["id"] == values[0]]
 
             def read_changes(self, tables, start_lsn, timeout_seconds, max_records):
                 return list(self.changes) + [{"op": "TIMEOUT", "lsn": self.now}]
 
-        def insert(tx, lsn, key):
+        def insert(tx, lsn, key, seconds=0):
+            # Committed that many seconds after the snapshot, by the source's clock.
             return [
                 {"op": "BEGIN", "tx_id": tx, "lsn": lsn},
                 {"op": "INSERT", "tx_id": tx, "lsn": lsn + 1, "row": {"id": key, "value": "x"}},
-                {"op": "COMMIT", "tx_id": tx, "lsn": lsn + 2},
+                {
+                    "op": "COMMIT",
+                    "tx_id": tx,
+                    "lsn": lsn + 2,
+                    "timestamp": 1_700_000_000 + seconds,
+                },
             ]
 
         bridge = Bridge()
@@ -2165,7 +2178,9 @@ class LakeflowContractTests(unittest.TestCase):
         bridge.changes = insert(1, 91, 2)
         options = {"snapshot.mode": "initial"}
         first = self.connector(bridge, registration_scope="update-a")
-        rows, offset = first.read_table("app.orders", {}, options)
+        # The log never leaves its page here, so the scan's wait for proof would run out.
+        with mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0):
+            rows, offset = first.read_table("app.orders", {}, options)
         self.assertEqual([(row["id"], row["_informix_op"]) for row in rows], [(1, "r"), (2, "r")])
         while offset.get("phase") != "stream":
             more, offset = first.read_table("app.orders", offset, options)
@@ -2182,12 +2197,25 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(list(rows), [])
         self.assertNotEqual(offset["pipeline_scope"], scope)
         self.assertEqual(offset["scan_scope"], scope)
-        # Its second batch: one more the page holds, and one from after the scan.
+        # Its second batch: one more the page holds, and one from after the scan. The log
+        # is still on the page the scan ended on, so that one is inside the read's window
+        # by position; the source's clock says it committed after the scan.
         bridge.now = 300
-        bridge.changes += insert(3, 97, 5) + insert(4, 201, 3)
+        bridge.changes += insert(3, 97, 5) + insert(4, 201, 3, seconds=60)
         rows, offset = later.read_table("app.orders", offset, options)
         self.assertEqual([(row["id"], row["_informix_op"]) for row in rows], [(3, "c")])
+        self.assertEqual(offset["scan_scope"], scope)
+        # One that committed while the page was read, by the clock, and that the scan never
+        # settled, may be in the page or not: the stream stops for a full refresh.
+        bridge.changes += insert(5, 301, 6)
+        with self.assertRaisesRegex(InformixError, "run a full refresh"):
+            later.read_table("app.orders", offset, options)
         # Past the scan's end the offset is an ordinary one again.
+        bridge.changes = bridge.changes[:-3]
+        bridge.now = 9000
+        bridge.changes += insert(6, 5000, 7, seconds=120)
+        rows, offset = later.read_table("app.orders", offset, options)
+        self.assertEqual([(row["id"], row["_informix_op"]) for row in rows], [(7, "c")])
         self.assertNotIn("scan_scope", offset)
         self.assertNotIn("scan_schema", offset)
 
@@ -2287,7 +2315,9 @@ class LakeflowContractTests(unittest.TestCase):
         keyed = Table.parse(_table(), "demo")
         self.assertIsNone(connector._scan_index(keyed, {}))
         with self.assertRaisesRegex(InformixError, "has a key and pages by that"):
-            connector._scan_index(keyed, {"snapshot.scan": "keyset(id)"})
+            informix_module._ensure_materializable(keyed, {"snapshot.scan": "keyset(id)"})
+        informix_module._ensure_materializable(keyed, {"snapshot.scan": "keyset"})
+        informix_module._ensure_materializable(table, {"snapshot.scan": "keyset(id)"})
 
     def test_a_keyless_snapshot_pages_by_the_columns_the_option_names(self):
         raw = _table(primary_keys=())

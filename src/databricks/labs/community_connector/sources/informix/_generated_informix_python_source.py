@@ -6325,7 +6325,7 @@ def register_lakeflow_source(spark):
     # does not wait for it longer than this, and the stream then fails on a change the proof
     # would have brought (see _drop_scanned_changes).
     _INDEX_SCAN_FOLLOW_SECONDS = 600
-    _INDEX_SCAN_PROOF_SECONDS = 120
+    _INDEX_SCAN_PROOF_SECONDS = 30
     # The most rows one index key may have: they are read and staged together.
     _INDEX_SCAN_KEY_ROWS = 1_000_000
     _INDEX_SCAN_SETTLE_ATTEMPTS = 5
@@ -8627,8 +8627,9 @@ def register_lakeflow_source(spark):
             return bool(int(_field(row, "is_buff_log", 0) or 0))
 
         @_serialized_sqli_operation
-        def key_rows(self, identity, columns, keys, values, isolation):
-            # Docstring: Every row whose ``keys`` columns equal ``values``, read at ``isolation``.
+        def key_rows(self, identity, columns, keys, values, isolation, limit=None):
+            # Docstring: Every row whose ``keys`` columns equal ``values``, or the first ``limit``
+            # of them, read at ``isolation``.
 
             self._ensure_connected()
             database, owner, name = _split_identity(identity)
@@ -8638,7 +8639,8 @@ def register_lakeflow_source(spark):
                     raise InformixError(_m(43, identifier))
             with self._repeatable_read_transaction(isolation):
                 rows = self.transport.execute(
-                    f"SELECT {','.join(_sql_identifier(column) for column in columns)} "
+                    f"SELECT {f'FIRST {int(limit)} ' if limit else ''}"
+                    f"{','.join(_sql_identifier(column) for column in columns)} "
                     f"FROM {database}:{_sql_identifier(owner)}.{_sql_identifier(name)} WHERE "
                     + " AND ".join(f"{_sql_identifier(key)} = ?" for key in keys),
                     tuple(values),
@@ -14628,15 +14630,6 @@ def register_lakeflow_source(spark):
                             effective_start = {
                                 k: v for k, v in effective_start.items() if k != "handoff_seeded"
                             }
-                    if table.primary_keys and _snapshot_scan_columns(
-                        table_options.get(
-                            _SNAPSHOT_SCAN_OPTION, self.options.get(_SNAPSHOT_SCAN_OPTION, "")
-                        )
-                    ):
-                        # 432: Option snapshot.scan=keyset(...) names columns to
-                        # page '{}' by, but the table has a key and pages by that;
-                        # change the key with primary.keys instead
-                        raise InformixError(_m(432, table.exposed_name))
                     self._touch_table_state(table)
                     self._maybe_sweep_stale_snapshot_stages(table)
                     _ensure_materializable(table, table_options)
@@ -18885,11 +18878,6 @@ def register_lakeflow_source(spark):
             requested = _snapshot_scan_value(raw)
             named = _snapshot_scan_columns(raw)
             if table.primary_keys:
-                if named:
-                    # 432: Option snapshot.scan=keyset(...) names columns to page '{}'
-                    # by, but the table has a key and pages by that; change the key
-                    # with primary.keys instead
-                    raise InformixError(_m(432, table.exposed_name))
                 return None
             bridge = self._bridge
             indexes = getattr(bridge, "table_indexes", None)
@@ -19121,7 +19109,9 @@ def register_lakeflow_source(spark):
                     last = _index_scan_key(rows[-1], keys)
                     if _index_scan_key(rows[0], keys) == last:
                         cursor = [rows[-1][name] for name in keys]
-                        rows = bridge.key_rows(table.identity, names, keys, cursor, isolation)
+                        rows = bridge.key_rows(
+                            table.identity, names, keys, cursor, isolation, _INDEX_SCAN_KEY_ROWS + 1
+                        )
                         if len(rows) > _INDEX_SCAN_KEY_ROWS:
                             # 433: The index-ordered snapshot of a keyless
                             # table does not support {} on '{}'; set
@@ -19158,9 +19148,10 @@ def register_lakeflow_source(spark):
                 if not more:
                     break
             # Every change that committed during the scan should be in before any key is
-            # settled: the follower waits to be shown to have read the log past the page the
-            # scan ended on. A quiet table shows it only at the next checkpoint, so the wait is
-            # bounded; a change it misses then is one the stream fails on.
+            # settled: the follower waits to be shown to have read the log through the page the
+            # scan ended on. A quiet table on a busy server shows it only at the next
+            # checkpoint, so the wait is bounded; a change it misses then is one the stream
+            # fails on.
             follow(bridge.current_lsn(), proof=True, strict=False)
             decided: list[int] = []
             suppress: list[int] = []
@@ -19224,6 +19215,7 @@ def register_lakeflow_source(spark):
                     suppress.extend(seen)
                     decided.extend(event[3] for event in unsure)
                     del doubt[key], events[key]
+            finished = getattr(bridge, "current_utc_time", lambda: None)()
             if doubt:
                 # 434: The index-ordered snapshot could not settle {} key(s) of '{}' after
                 # {} re-reads because they kept changing; run the snapshot when the table
@@ -19251,19 +19243,24 @@ def register_lakeflow_source(spark):
                 "end": max(after for _bound, _before, after, _index in pages),
                 "suppress": sorted(set(suppress)),
                 "keep": sorted(set(decided) - set(suppress)),
+                # The source's clock once every read was done. The second position is the end
+                # of a log page, and a quiet log stays on that page long after the scan: a
+                # change there that committed later by the clock is not one the scan missed.
+                "time": finished,
             }
             return boundary
 
-        def _drop_scanned_changes(self, table, checkpoint, options, transactions):
+        def _drop_scanned_changes(self, table, checkpoint, options, transactions, reached=None):
             # Docstring: ``transactions`` without the changes a keyless table's index-ordered
             # snapshot already holds (see _index_scan_snapshot).
             #
             # The snapshot's manifest names them: every change to a key that committed at or
             # below the position before that key's page was read, and the changes listed by
             # their own log positions. Nothing above the scan's end is dropped. A change that
-            # committed between the two positions of its key's read, and is not among those the
-            # scan settled, reached the scan's follower too late: it may be in the page or not,
-            # so the read fails for a full refresh. The manifest is the snapshot's update's; the
+            # committed between the two positions of its key's read, is not among those the scan
+            # settled, and did not commit after the scan by the source's clock, reached the
+            # scan's follower too late: it may be in the page or not, so the read fails for a
+            # full refresh. The manifest is the snapshot's update's; the
             # stream's offsets name that update (scan_scope, see _read_stream) until the stream
             # is past the scan's end, since a later update's offsets carry its own scope.
 
@@ -19290,13 +19287,18 @@ def register_lakeflow_source(spark):
                     int(recorded["end"]),
                     frozenset(int(lsn) for lsn in recorded["suppress"]),
                     frozenset(int(lsn) for lsn in recorded["keep"]),
+                    recorded.get("time"),
                 )
             live = self.__dict__.setdefault("_index_scan_live", {})
             if not cache[cached]:
                 live[table.identity] = None
                 return transactions
-            keys, descending, bounds, reads, end, suppress, keep = cache[cached]
-            live[table.identity] = (scope, schema_id, end)
+            keys, descending, bounds, reads, end, suppress, keep, finished = cache[cached]
+            # A poll that went idle past the scan's end with nothing at or below it has seen the
+            # last change the scan could hold: a quiet table's offset stays where it is, and
+            # would name the snapshot's update for good.
+            past = (reached or 0) > end and all(tx.commit_lsn > end for tx in transactions)
+            live[table.identity] = None if past else (scope, schema_id, end)
             kept = []
             for tx in transactions:
                 if tx.commit_lsn > end:
@@ -19318,7 +19320,14 @@ def register_lakeflow_source(spark):
                         lsn = _lsn(record)
                         if lsn in suppress or tx.commit_lsn <= before:
                             continue
-                        if tx.commit_lsn <= after and lsn not in keep:
+                        # In the read's window and not settled: the scan's follower never got
+                        # it. By the clock it may still have committed after the scan, on the
+                        # log page the scan ended on.
+                        if (
+                            tx.commit_lsn <= after
+                            and lsn not in keep
+                            and not (finished and tx.commit_time and tx.commit_time > finished)
+                        ):
                             # 438: A change to keyless table '{}' committed
                             # while its snapshot was reading the rows it
                             # applies to, and reached Informix CDC only after
@@ -21445,7 +21454,7 @@ def register_lakeflow_source(spark):
                 table = self._refresh_table_schema(table, fingerprint)
                 committed, caught_up, open_begin, reached = _transaction_batch(raw_records)
             recovered = self._drop_scanned_changes(
-                table, checkpoint, options, _recover(committed, checkpoint)
+                table, checkpoint, options, _recover(committed, checkpoint), reached
             )
             output: list[dict[str, Any]] = []
             end = dict(start)
@@ -23517,6 +23526,10 @@ def register_lakeflow_source(spark):
             # materialize: {}
             raise InformixError(_m(341, table.exposed_name, details))
         options = options or {}
+        if table.primary_keys and _snapshot_scan_columns(options.get(_SNAPSHOT_SCAN_OPTION, "")):
+            # 432: Option snapshot.scan=keyset(...) names columns to page '{}' by, but the
+            # table has a key and pages by that; change the key with primary.keys instead
+            raise InformixError(_m(432, table.exposed_name))
         _validate_variable_decimal_options(options)
         for column in table.columns:
             if column.type_name in {"DECIMAL", "NUMERIC", "MONEY"}:
