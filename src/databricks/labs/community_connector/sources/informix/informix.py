@@ -556,6 +556,9 @@ _INDEX_SCAN_PROOF_SECONDS = 30
 _INDEX_SCAN_POLL_RECORDS = 20_000
 # The most rows one index key may have: they are read and staged together.
 _INDEX_SCAN_KEY_ROWS = 1_000_000
+# The most rows to an index value, on the catalog's statistics, for an index to be chosen
+# for a table that could page by its key instead.
+_INDEX_SCAN_AUTO_GROUP_ROWS = 1_000
 _INDEX_SCAN_SETTLE_ATTEMPTS = 5
 
 # Where snapshot page payloads are written. ``fuse`` uses the UC Volume FUSE mount
@@ -2809,8 +2812,9 @@ class PurePythonInformixBridge:
 
     @_serialized_sqli_operation
     def table_indexes(self, identity):
-        # Docstring: A table's indexes on plain columns, each ``(columns, descending,
-        # nunique)`` with the columns in key order and the catalog's distinct-key estimate.
+        # Docstring: A table's indexes on plain columns, each ``(columns, descending, nunique,
+        # nrows)`` with the columns in key order and the catalog's estimates of the index's
+        # distinct keys and the table's rows, both 0 until statistics are run.
 
         self._ensure_connected()
         _database, owner, name = _split_identity(identity)
@@ -2826,7 +2830,7 @@ class PurePythonInformixBridge:
         }
         indexes = []
         for row in self.transport.execute(
-            f"SELECT {_INDEX_PARTS}, i.nunique FROM systables t JOIN sysindexes i "
+            f"SELECT {_INDEX_PARTS}, i.nunique, t.nrows FROM systables t JOIN sysindexes i "
             "ON t.tabid = i.tabid WHERE t.tabtype = 'T' AND t.owner = ? AND t.tabname = ?",
             (owner, name),
             max_result_bytes=max_bytes,
@@ -2839,6 +2843,7 @@ class PurePythonInformixBridge:
                         [by_number[abs(part)] for part in parts],
                         [part < 0 for part in parts],
                         int(_field(row, "nunique", 16) or 0),
+                        int(_field(row, "nrows", 17) or 0),
                     )
                 )
         return indexes
@@ -13159,7 +13164,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             found = next(
                 (
                     directions
-                    for columns, directions, _n in listed
+                    for columns, directions, *_counts in listed
                     if columns[: len(names)] == names
                 ),
                 [False] * len(names),
@@ -13169,12 +13174,19 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 names,
                 [found[at] if down is None else down for at, (_name, down) in enumerate(named)],
             )
-        for columns, directions, nunique in () if named else listed:
+        for columns, directions, nunique, *rows in () if named else listed:
             # The catalog's count of distinct keys, which is 0 until statistics are run:
             # among equals, more columns make smaller groups.
             rank = (nunique, len(columns))
-            if all(column.lower() in usable for column in columns) and (
-                chosen is None or rank > chosen[0]
+            # A table merged by its key can page by that key instead, so an index is chosen
+            # for it only on statistics that show few rows to a value: all rows of one are
+            # read together, and too many fail the snapshot.
+            count = rows[0] if rows else 0
+            few = follows or (nunique and count and count / nunique <= _INDEX_SCAN_AUTO_GROUP_ROWS)
+            if (
+                few
+                and all(column.lower() in usable for column in columns)
+                and (chosen is None or rank > chosen[0])
             ):
                 chosen = (rank, columns, directions)
         if table.row_filter is not None or _snapshot_filter(options):
@@ -13392,8 +13404,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 isolation=isolation,
             )
             orders = [_index_scan_order(_index_scan_key(row, keys), descending) for row in rows]
-            if any(later < earlier for earlier, later in zip(orders, orders[1:])) or (
-                orders and bounds and not bounds[-1] < orders[0]
+            if follows and (
+                any(later < earlier for earlier, later in zip(orders, orders[1:]))
+                or (orders and bounds and not bounds[-1] < orders[0])
             ):
                 # The page lookup of a change's key relies on it.
                 # 433: The index-ordered snapshot of a keyless table does not

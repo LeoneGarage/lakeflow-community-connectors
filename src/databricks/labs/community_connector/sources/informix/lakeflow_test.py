@@ -622,7 +622,7 @@ class _IndexScanSource:
         self.left = transactions
         self.hot_key = hot_key
         self.descending = descending
-        self.indexes = [(["id"], [descending], 20)]
+        self.indexes = [(["id"], [descending], 20, 60)]
         self.lsn = 1000
         self.tx_id = 0
         self.log: list[dict] = []
@@ -791,7 +791,7 @@ class _KeylessIndexBridge(FakeBridge):
         self.rows = [{"id": 1, "value": "a"}, {"id": 2, "value": "b"}]
 
     def table_indexes(self, identity):
-        return [(["id"], [False], 2)]
+        return [(["id"], [False], 2, 2)]
 
     def buffered_logging(self):
         return False
@@ -2460,6 +2460,21 @@ class LakeflowContractTests(unittest.TestCase):
         informix_module._ensure_materializable(by_option, {"snapshot.scan": "keyset(id)"})
         # Without an index it can use, a merged table pages by its key as before, quietly:
         # the merge takes the overlap out. On the append path nothing does, so it warns.
+        # An index is chosen for a merged table only on statistics that show few rows to a
+        # value: it can page by its key instead, and a value with too many rows would fail
+        # the snapshot. Naming the columns still pages by them.
+        for counts in ((0, 0), (20, 0), (2, 5_000_000)):
+            source.indexes = [(["id"], [False], *counts)]
+            self.assertIsNone(connector._scan_index(by_option, {}))
+            self.assertEqual(
+                connector._scan_index(by_option, {"snapshot.scan": "keyset(id)"}),
+                (["id"], [False]),
+            )
+            self.assertEqual(
+                connector._scan_index(Table.parse(_table(primary_keys=()), "demo"), {}),
+                (["id"], [False]),
+            )
+        source.indexes = [(["id"], [False], 20, 60)]
         # Buffered logging matters to a scan that follows the table's changes, so not to a
         # merged table's.
         source.buffered_logging = lambda: True
