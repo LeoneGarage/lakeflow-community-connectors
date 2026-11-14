@@ -19006,15 +19006,15 @@ def register_lakeflow_source(spark):
             pages: list[tuple[tuple | None, int, int, int | None]] = []
             bounds: list[tuple] = []
 
-            def follow(target: int, proof: bool = False, strict: bool = True) -> None:
+            def follow(target: int, proof: bool = False) -> None:
                 # Read the table's changes until every commit at or below ``target`` is in, and
                 # sort them. An idle poll is taken to mean that, as the stream takes it, but a
                 # session can go idle before it has handed over what is there, and a server that
                 # has stopped handing changes over only ever goes idle. With ``proof`` the poll
                 # must report having read up to ``target``, or bring a later commit. An idle
                 # session reports the last checkpoint's position, so on a quiet table that takes
-                # until the next checkpoint. When it is not ``strict``, the wait for proof is
-                # short and an idle poll is taken in the end.
+                # until the next checkpoint: the wait for it is short, and an idle poll is taken
+                # in the end.
                 nonlocal start, last_commit
                 began = time.monotonic()
                 idle_since = None
@@ -19082,14 +19082,15 @@ def register_lakeflow_source(spark):
                     # read to its end first.
                     now = time.monotonic()
                     idle_since = idle_since or (now if idle else None)
-                    if idle and not strict and now - idle_since >= _INDEX_SCAN_PROOF_SECONDS:
+                    if idle and now - idle_since >= _INDEX_SCAN_PROOF_SECONDS:
                         break
                     if now - began > _INDEX_SCAN_FOLLOW_SECONDS:
                         # 435: The index-ordered snapshot stopped waiting for
                         # Informix CDC to reach the snapshot's position for '{}'
                         # after {} seconds; a transaction left open on the table
                         # with more changes behind it than cdc.max.poll.records
-                        # keeps it from getting there
+                        # can keep it from getting there, as can a table that
+                        # changes faster than its changes are read
                         raise InformixError(_m(435, table.exposed_name, _INDEX_SCAN_FOLLOW_SECONDS))
                 for key, changed in fresh.items():
                     if key in settled:
@@ -19205,7 +19206,7 @@ def register_lakeflow_source(spark):
             # scan ended on. A quiet table on a busy server shows it only at the next
             # checkpoint, so the wait is bounded; a change it misses then is one the stream
             # fails on.
-            follow(bridge.current_lsn(), proof=True, strict=False)
+            follow(bridge.current_lsn(), proof=True)
             for _attempt in range(_INDEX_SCAN_SETTLE_ATTEMPTS):
                 if not doubt:
                     break
@@ -19221,7 +19222,7 @@ def register_lakeflow_source(spark):
                 read_at = clock()
                 # As at the scan's end: the wait for proof is bounded, and a change it misses
                 # is one the scan or the stream fails on.
-                follow(after, proof=True, strict=False)
+                follow(after, proof=True)
                 for key, state in read.items():
                     changed = events[key]
                     if any(before < event[0] <= after for event in changed):
