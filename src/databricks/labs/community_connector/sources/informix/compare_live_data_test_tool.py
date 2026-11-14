@@ -528,7 +528,12 @@ def compare_table(
             raise RuntimeError(
                 f"{table}:{number} has {len(values)} fields; expected {len(columns)}"
             )
-        source.append(dict(zip(columns, values)))
+        # UNLOAD writes a NULL as an empty field, and an empty or all-blank string as a
+        # backslash and a space: an empty field is a NULL whatever the column's type. Read
+        # as an empty string it differed from the destination's NULL in every character
+        # column, which a keyless table's whole-row compare counts as a row missing and a
+        # row too many.
+        source.append(dict(zip(columns, (None if value == "" else value for value in values))))
     with destination_pipe.open("w") as handle:
         for row in destination:
             handle.write("|".join(pipe_value(row.get(column)) for column in columns) + "|\n")
