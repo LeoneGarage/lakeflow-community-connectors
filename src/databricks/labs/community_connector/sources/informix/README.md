@@ -593,9 +593,12 @@ The differences from a keyless table:
   the copy then reach the target after the snapshot has been served, not alongside it.
 - Without an index it can use, a merged table pages by its `primary.keys` columns as
   before, with no warning. For a merged table an index is chosen only when the catalog's
-  statistics show few rows to an index value (run `UPDATE STATISTICS` on the source):
-  all rows of one value are read together, and the table can page by its key instead.
-  Name the columns with `keyset(...)` to page by an index regardless.
+  statistics show at most 1,000 rows to an index value on average (the table's row count
+  over the index's distinct keys; run `UPDATE STATISTICS` on the source to set both): all
+  rows of one value are read together, and the table can page by its key instead. An
+  average hides a skewed index: one value with more than a million rows still fails the
+  snapshot, and `snapshot.scan: cursor` or `keyset(...)` over other columns avoids it.
+  Name the columns with `keyset(...)` to page by an index regardless of the statistics.
 - The connector cannot see the pipeline's `scd_type`. A table whose target is
   `scd_type: APPEND_ONLY` must also set `append.only.ingestion: "true"`, or the connector
   takes it for a merged one, follows no changes, and the overlap lands in the append
