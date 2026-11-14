@@ -632,14 +632,21 @@ out of it.
 
 Requirements and limits:
 
-- The table needs an index whose columns are all ingested, `NOT NULL`, and of integer,
-  decimal, `DATE` or `CHAR`/`VARCHAR`/`LVARCHAR` type. The index with the most distinct
+- The table needs an index whose columns are all ingested and of integer, decimal, `DATE`
+  or `CHAR`/`VARCHAR`/`LVARCHAR` type. The columns may be nullable: the rows with a NULL
+  in any of them are read first, as one group. The index finds the NULLs of its leading
+  column; a nullable column further along costs one extra pass over the table. With more
+  than a million such rows the index is given up: a keyless table reads without index
+  order, with a warning, a table keyed by `primary.keys` pages by that key, and the
+  snapshot fails if `keyset(...)` named the columns. The index with the most distinct
   keys is used, in its own column directions. That count comes from the catalog and is
   zero until `UPDATE STATISTICS` has run; among equals the index with more columns is
   used. Name the columns with `keyset(...)` to choose yourself.
 - The snapshot relies on index values sorting for the connector as they do for Informix.
   It checks that each page arrives in that order and fails if one does not, which a
   character column in a case-insensitive database or with control characters can cause.
+- An index value the connector reads as NULL while Informix does not fails the snapshot:
+  a character value holding a NUL byte, under the default `string.null.byte=null`.
 - One index value may have at most a million rows: they are read and staged together.
 - A `TRUNCATE` during the snapshot fails it. So does an `UPDATE` that changes one of the
   columns the snapshot pages by, and a transaction larger than `cdc.spill.records` that

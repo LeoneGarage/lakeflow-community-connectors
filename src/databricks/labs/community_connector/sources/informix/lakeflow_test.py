@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import types
 import unittest
 from datetime import date, datetime, timezone
@@ -610,8 +611,12 @@ class _IndexScanSource:
 
     PAGE = 64
 
-    def __init__(self, random, *, transactions=40, hot_key=None, descending=False, quiet=False):
+    def __init__(
+        self, random, *, transactions=40, hot_key=None, descending=False, quiet=False, nulls=False
+    ):
         self.random = random
+        # Some rows have no id: the index column is nullable.
+        self.nulls = nulls
         # A quiet log: nothing but the table's own changes moves it, so it stays on one
         # page for long, and the source's clock is what tells a later change from an
         # earlier one there.
@@ -635,6 +640,11 @@ class _IndexScanSource:
     @staticmethod
     def text(row):
         return f"{row['id']}|{row['value']}"
+
+    def _key(self):
+        if self.nulls and self.random.random() < 0.15:
+            return None
+        return self.hot_key or self.random.randint(1, 24)
 
     def rows_as_text(self):
         return [self.text(row) for row in self.rows]
@@ -679,7 +689,7 @@ class _IndexScanSource:
         while self.left > 0 and (next(once, False) if self.hot_key else self.random.random() < 0.6):
             self.left -= 1
             self.tx_id += 1
-            key = self.hot_key or self.random.randint(1, 24)
+            key = self._key()
             self._write("BEGIN")
             kind = self.random.random()
             if kind < 0.2 and not self.hot_key:
@@ -721,13 +731,27 @@ class _IndexScanSource:
         return self.indexes
 
     def snapshot_chunk(
-        self, identity, columns, keys, after, limit, key_descending=None, isolation=None
+        self,
+        identity,
+        columns,
+        keys,
+        after,
+        limit,
+        snapshot_filter=None,
+        key_descending=None,
+        isolation=None,
     ):
         assert isolation == "COMMITTED READ LAST COMMITTED" and list(keys) == ["id"]
         assert list(key_descending) == [self.descending]
+        # Rows with no id are asked for apart, by key_rows: a NULL takes no part in the order.
+        assert snapshot_filter == ("id IS NOT NULL" if self.nulls else None)
         boundary = self.boundary_lsn()
         self._tick()
-        ordered = sorted(self.rows, key=lambda row: row["id"], reverse=self.descending)
+        ordered = sorted(
+            (row for row in self.rows if row["id"] is not None),
+            key=lambda row: row["id"],
+            reverse=self.descending,
+        )
         if after is not None:
             ordered = [
                 row
@@ -738,9 +762,13 @@ class _IndexScanSource:
         self._tick()
         return boundary, rows
 
-    def key_rows(self, identity, columns, keys, values, isolation, limit=None):
+    def key_rows(self, identity, columns, keys, values, isolation, limit=None, present=(), skip=0):
         self._tick()
-        rows = [dict(row) for row in self.rows if row["id"] == values[0]]
+        wanted = None if values is None else values[0]
+        assert list(keys) == ["id"] and not present
+        # A read past the first ``skip`` rows only asks whether there are more than that.
+        self.null_reads = getattr(self, "null_reads", 0) + (values is None and not skip)
+        rows = [dict(row) for row in self.rows if row["id"] == wanted][skip:]
         self._tick()
         return rows
 
@@ -811,8 +839,9 @@ class _KeylessIndexBridge(FakeBridge):
     def snapshot_chunk(self, *args, isolation=None, **kwargs):
         return super().snapshot_chunk(*args, **kwargs)
 
-    def key_rows(self, identity, columns, keys, values, isolation, limit=None):
-        return [dict(row) for row in self.rows if row["id"] == values[0]]
+    def key_rows(self, identity, columns, keys, values, isolation, limit=None, present=(), skip=0):
+        wanted = None if values is None else values[0]
+        return [dict(row) for row in self.rows if row["id"] == wanted][skip:][:limit]
 
     def read_changes(self, tables, start_lsn, timeout_seconds, max_records, budget=None):
         self.polls = getattr(self, "polls", 0) + 1
@@ -2140,7 +2169,10 @@ class LakeflowContractTests(unittest.TestCase):
         """Run snapshot.scan=index over ``source``: (snapshot LSN, staged rows, what the scan
         recorded for the stream, the connector). Pages go through the staging codec, as the
         rows read back for a key in doubt do."""
-        table = table or Table.parse(_table(primary_keys=()), "demo")
+        if table is None:
+            raw = _table(primary_keys=())
+            raw["columns"][0]["nullable"] = bool(getattr(source, "nulls", False))
+            table = Table.parse(raw, "demo")
         options = options or {}
         connector = self.connector(source)
         pages: dict[int, list[dict]] = {}
@@ -2177,13 +2209,16 @@ class LakeflowContractTests(unittest.TestCase):
         # call the scan makes, and reports its log position to the page only, as Informix
         # does. Whatever the interleaving, the staged rows plus the changes the stream keeps
         # must give the final table, duplicates included.
-        dropped = 0
+        dropped = settled_nulls = 0
         for seed in range(120):
             random = random_module.Random(seed)
             # A third of them on a quiet log, where no poll proves anything: the scan's
             # waits for proof run out, and it settles its keys on idle polls.
             quiet = seed % 3 == 1
-            source = _IndexScanSource(random, descending=seed % 3 == 0, quiet=quiet)
+            # Half of them with rows that have no value in the index column.
+            source = _IndexScanSource(
+                random, descending=seed % 3 == 0, quiet=quiet, nulls=seed % 2 == 0
+            )
             with mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0):
                 boundary, staged, scan, connector, table = self._index_scan(
                     source, random.choice([3, 5, 50])
@@ -2217,8 +2252,12 @@ class LakeflowContractTests(unittest.TestCase):
             )
             self.assertEqual(+result, collections.Counter(source.rows_as_text()), f"seed {seed}")
             self.assertFalse(-result, f"seed {seed}")
+            # The rows with no id are read once, and again when they changed meanwhile.
+            self.assertEqual(bool(getattr(source, "null_reads", 0)), source.nulls)
+            settled_nulls += getattr(source, "null_reads", 0) > 1
         # The interleavings do overlap: without the dropped changes the sums are wrong.
         self.assertGreater(dropped, 100)
+        self.assertGreater(settled_nulls, 5)
 
     def test_the_stream_keeps_every_change_once_past_an_index_scans_end(self):
         source = _IndexScanSource(random_module.Random(7))
@@ -2586,16 +2625,237 @@ class LakeflowContractTests(unittest.TestCase):
         ):
             self._index_scan(source, 3)
 
+    def test_an_index_scan_gives_way_on_too_many_rows_with_a_null_index_value(self):
+        source = _IndexScanSource(random_module.Random(3), transactions=0, nulls=True)
+        source.rows = [{"id": None, "value": "a"} for _ in range(9)] + [{"id": 1, "value": "b"}]
+        # They are read together, so there is a limit to them. An index the connector chose
+        # is then given up, before anything is staged, for the read without index order.
+        with (
+            mock.patch.object(informix_module, "_INDEX_SCAN_KEY_ROWS", 8),
+            self.assertLogs(informix_module.__name__, "WARNING") as logs,
+        ):
+            boundary, staged, scan, _connector, _table_ = self._index_scan(source, 3)
+        self.assertEqual((boundary, staged, scan), (None, [], {}))
+        self.assertIn("because it has more than 8 rows with a NULL index value", logs.output[0])
+        # Columns the option names fail instead.
+        with (
+            mock.patch.object(informix_module, "_INDEX_SCAN_KEY_ROWS", 8),
+            self.assertRaisesRegex(InformixError, "more than 8 rows with a NULL index value"),
+        ):
+            self._index_scan(source, 3, options={"snapshot.scan": "keyset(id)"})
+        # Within the limit they are staged as a page of their own, ahead of the rest.
+        source.rows.pop(0)
+        with mock.patch.object(informix_module, "_INDEX_SCAN_KEY_ROWS", 8):
+            _boundary, staged, scan, _connector, _table_ = self._index_scan(source, 3)
+        self.assertEqual([row["id"] for row in staged], [None] * 8 + [1])
+        self.assertEqual(scan["index_scan"]["pages"][0][0], [])
+
+    def test_a_snapshot_reads_without_index_order_once_its_index_scan_gives_way(self):
+        bridge = _KeylessIndexBridge()
+        bridge.tables[0]["columns"][0]["nullable"] = True
+        bridge.rows = [{"id": None, "value": "a"} for _ in range(3)] + [{"id": 1, "value": "b"}]
+        connector = self.connector(bridge)
+        with (
+            mock.patch.object(informix_module, "_INDEX_SCAN_KEY_ROWS", 2),
+            self.assertLogs(informix_module.__name__, "WARNING") as logs,
+        ):
+            rows, offset = connector.read_table("app.orders", {}, {"snapshot.mode": "initial"})
+            rows = list(rows)
+        self.assertTrue(
+            any("more than 2 rows with a NULL index value" in line for line in logs.output)
+        )
+        self.assertEqual(
+            [(row["id"], row["_informix_op"]) for row in rows], [(None, "r")] * 3 + [(1, "r")]
+        )
+        # The stream then drops nothing: no scan recorded what the snapshot holds.
+        options = {"snapshot.mode": "initial"}
+        while offset.get("phase") != "stream":
+            more, offset = connector.read_table("app.orders", offset, options)
+            self.assertEqual(list(more), [])
+        after = int(offset["commit_lsn"])
+        bridge.now = after + 100
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 1, "lsn": after + 1},
+            {"op": "INSERT", "tx_id": 1, "lsn": after + 2, "row": {"id": None, "value": "x"}},
+            {"op": "COMMIT", "tx_id": 1, "lsn": after + 3, "timestamp": 1_700_000_000},
+        ]
+        rows, offset = connector.read_table("app.orders", offset, options)
+        self.assertEqual([(row["id"], row["_informix_op"]) for row in rows], [(None, "c")])
+        self.assertNotIn("scan_scope", offset)
+
+    def test_an_index_scan_asks_for_no_more_null_rows_than_it_can_take(self):
+        # Whether the leading column has too many NULLs is asked of the index, without
+        # their rows; the other columns' NULLs are read only as far as the limit leaves room.
+        raw = _table(primary_keys=())
+        raw["columns"][0]["nullable"] = True
+        table = Table.parse(raw, "demo")
+        for lead, others, expected in (
+            # Too many in the leading column: nothing is read.
+            (9, 0, [(["id"], 1, 8)]),
+            # Within the limit there, over it with the other column's: its read stops there.
+            (5, 9, [(["id"], 1, 8), (["id"], 9, 0), (["value"], 4, 0)]),
+            # The leading column fills the limit by itself: one row of the other is asked for.
+            (8, 9, [(["id"], 1, 8), (["id"], 9, 0), (["value"], 1, 0)]),
+        ):
+            with self.subTest(lead=lead, others=others):
+                bridge = _KeylessIndexBridge()
+                bridge.table_indexes = lambda identity: [(["id", "value"], [False, False], 9, 9)]
+                calls: list = []
+
+                def key_rows(
+                    identity, columns, keys, values, isolation, limit=None, present=(), skip=0
+                ):
+                    calls.append((list(keys), limit, skip))
+                    count = lead if list(keys) == ["id"] else others
+                    return [{"id": None, "value": None}] * max(0, min(count - skip, limit))
+
+                bridge.key_rows = key_rows
+                with (
+                    mock.patch.object(informix_module, "_INDEX_SCAN_KEY_ROWS", 8),
+                    self.assertLogs(informix_module.__name__, "WARNING"),
+                ):
+                    boundary, staged, *_rest = self._index_scan(bridge, 50, table=table)
+                self.assertEqual((boundary, staged, calls), (None, [], expected))
+
+    def test_an_index_scan_finds_the_nulls_of_its_leading_column_by_the_index(self):
+        # IS NULL on an index's leading column is an index read; on another column, or on
+        # several with OR, Informix scans the table. So the leading column's NULLs are read
+        # apart, and the others' in one pass that leaves those out.
+        raw = _table(primary_keys=())
+        raw["columns"] = [
+            {"name": "a", "type_name": "INTEGER"},
+            {"name": "b", "type_name": "INTEGER", "nullable": False},
+            {"name": "c", "type_name": "VARCHAR", "length": 20},
+            {"name": "d", "type_name": "INTEGER"},
+        ]
+        table = Table.parse(raw, "demo")
+        for index, reads, present in (
+            (
+                ["a", "b", "c", "d"],
+                [(["a"], []), (["c", "d"], ["a"])],
+                "a IS NOT NULL AND c IS NOT NULL AND d IS NOT NULL",
+            ),
+            (["b", "c"], [(["c"], [])], "c IS NOT NULL"),
+            (["b", "a"], [(["a"], [])], "a IS NOT NULL"),
+            (["a"], [(["a"], [])], "a IS NOT NULL"),
+            (["b"], [], None),
+        ):
+            with self.subTest(index=index):
+                bridge = _KeylessIndexBridge()
+                bridge.table_indexes = lambda identity, index=index: [
+                    (index, [False] * len(index), 9, 9)
+                ]
+                calls: list = []
+
+                def key_rows(
+                    identity, columns, keys, values, isolation, limit=None, present=(), skip=0
+                ):
+                    self.assertIsNone(values)
+                    if not skip:  # past the question of whether there are too many
+                        calls.append((list(keys), list(present)))
+                    return []
+
+                def snapshot_chunk(*args, snapshot_filter=None, **kwargs):
+                    calls.append(snapshot_filter)
+                    return bridge.now, []
+
+                bridge.key_rows, bridge.snapshot_chunk = key_rows, snapshot_chunk
+                with mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0):
+                    self._index_scan(bridge, 50, table=table)
+                self.assertEqual(calls, [*reads, present])
+
+    def test_a_location_table_without_columns_keeps_every_line(self):
+        # The merged file drops the column ranges Python 3.11+ records per instruction: a
+        # pickled function carries them, and the planner caps the pickle's size.
+        checked = 0
+        pending = [
+            value.__code__
+            for value in vars(informix_module.InformixLakeflowConnect).values()
+            if isinstance(value, types.FunctionType)
+        ]
+        while pending:
+            code = pending.pop()
+            pending.extend(c for c in code.co_consts if isinstance(c, types.CodeType))
+            plain = informix_module._lines_only(code)
+            self.assertEqual(list(plain.co_lines()), list(code.co_lines()))
+            self.assertEqual(plain.co_code, code.co_code)
+            if hasattr(code, "co_positions"):
+                self.assertLessEqual(len(plain.co_linetable), len(code.co_linetable))
+                self.assertTrue(all(p[2] is None for p in plain.co_positions()))
+                self.assertEqual(
+                    [p[0] for p in plain.co_positions()], [p[0] for p in code.co_positions()]
+                )
+            checked += 1
+        self.assertGreater(checked, 200)
+
+        # A function still runs, and its traceback still names the failing line.
+        def fails():
+            value = 1
+            return value / 0
+
+        fails.__code__ = informix_module._lines_only(fails.__code__)
+        try:
+            fails()
+        except ZeroDivisionError as error:
+            frame = traceback.extract_tb(error.__traceback__)[-1]
+        self.assertEqual(frame.lineno, fails.__code__.co_firstlineno + 2)
+
+    def test_the_bridge_reads_the_rows_with_a_null_in_an_index_column(self):
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.transport = mock.Mock(spec=["execute"])
+        bridge.transport.execute.side_effect = [[(None, "x")], [], []]
+        with (
+            mock.patch.object(bridge, "_ensure_connected"),
+            mock.patch.object(
+                bridge, "_repeatable_read_transaction", return_value=contextlib.nullcontext()
+            ),
+        ):
+            rows = bridge.key_rows("demo.app.t", ["a", "b"], ["a", "b"], None, "X", 5, ["c"])
+            bridge.key_rows("demo.app.t", ["a", "b"], ["a"], [7], "X")
+            bridge.key_rows("demo.app.t", ["a"], ["a"], None, "X", 1, (), 1000)
+        self.assertEqual(rows, [{"a": None, "b": "x"}])
+        self.assertEqual(
+            [call.args for call in bridge.transport.execute.call_args_list],
+            [
+                (
+                    "SELECT FIRST 5 a,b FROM demo:app.t "
+                    "WHERE (a IS NULL OR b IS NULL) AND c IS NOT NULL",
+                    (),
+                ),
+                ("SELECT a,b FROM demo:app.t WHERE a = ?", (7,)),
+                ("SELECT SKIP 1000 FIRST 1 a FROM demo:app.t WHERE (a IS NULL)", ()),
+            ],
+        )
+
+    def test_an_index_scan_fails_on_a_value_the_connector_reads_as_null(self):
+        # A string holding a NUL byte is NULL to the connector under string.null.byte=null,
+        # and no NULL to Informix: paging on from it would lose the rows after it.
+        source = _IndexScanSource(random_module.Random(3), transactions=0)
+        chunk = source.snapshot_chunk
+
+        def with_null(*args, **kwargs):
+            boundary, rows = chunk(*args, **kwargs)
+            return boundary, [{"id": None, "value": "x"}, *rows]
+
+        source.snapshot_chunk = with_null
+        with self.assertRaisesRegex(InformixError, "an index value read as NULL"):
+            self._index_scan(source, 50)
+
     def test_a_keyless_snapshot_pages_by_its_most_selective_index_unless_told_not_to(self):
         table = Table.parse(_table(primary_keys=()), "demo")
         source = _IndexScanSource(random_module.Random(1))
-        source.indexes = [(["id"], [True], 5), (["id", "value"], [False, False], 9)]
+        source.indexes = [(["id"], [True], 5), (["id", "ratio"], [False, False], 9)]
         connector = self.connector(source)
-        # value is nullable, so only the index on id will do, in its own direction.
+        # ratio is not ingested, so only the index on id will do, in its own direction.
         self.assertEqual(connector._scan_index(table, {}), (["id"], [True]))
         self.assertEqual(
             connector._scan_index(table, {"snapshot.scan": "keyset"}), (["id"], [True])
         )
+        # A nullable column is no obstacle: its NULL rows are read as a group of their own.
+        source.indexes.append((["value", "id"], [False, True], 7))
+        self.assertEqual(connector._scan_index(table, {}), (["value", "id"], [False, True]))
+        source.indexes = source.indexes[:2]
         self.assertIsNone(connector._scan_index(table, {"snapshot.scan": "cursor"}))
         # A keyed table pages by its key, and columns named for it are a mistake.
         keyed = Table.parse(_table(), "demo")
@@ -2608,6 +2868,7 @@ class LakeflowContractTests(unittest.TestCase):
     def test_a_keyless_snapshot_pages_by_the_columns_the_option_names(self):
         raw = _table(primary_keys=())
         raw["columns"].append({"name": "region", "type_name": "CHAR", "nullable": False})
+        raw["columns"].append({"name": "ratio", "type_name": "FLOAT"})
         table = Table.parse(raw, "demo")
         source = _IndexScanSource(random_module.Random(1))
         source.indexes = [(["id"], [False], 99), (["region", "id"], [True, False], 5)]
@@ -2623,9 +2884,11 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(scan("keyset(region asc, id)"), (["region", "id"], [False, False]))
         self.assertEqual(scan("keyset(id, region)"), (["id", "region"], [False, False]))
         # A column that cannot be paged by fails the snapshot: the option asked for it.
-        for value in ("keyset(value)", "keyset(missing)"):
+        for value in ("keyset(ratio)", "keyset(missing)"):
             with self.assertRaisesRegex(InformixError, "does not support column"):
                 scan(value)
+        # A nullable column can: the rows with a NULL in it are read apart.
+        self.assertEqual(scan("keyset(value)"), (["value"], [False]))
         for value in (
             "keyset()",
             "keyset(id sideways)",
@@ -2641,9 +2904,11 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(scan("keyset(id desc)"), (["id"], [True]))
 
     def test_a_keyless_snapshot_without_a_usable_index_falls_back_to_the_cursor(self):
-        table = Table.parse(_table(primary_keys=()), "demo")
+        raw = _table(primary_keys=())
+        raw["columns"].append({"name": "ratio", "type_name": "FLOAT"})
+        table = Table.parse(raw, "demo")
         source = _IndexScanSource(random_module.Random(1))
-        source.indexes = [(["value"], [False], 9)]  # nullable column
+        source.indexes = [(["ratio"], [False], 9)]  # a type that cannot be paged by
         connector = self.connector(source)
         with self.assertLogs(informix_module.__name__, "WARNING") as logs:
             self.assertIsNone(connector._scan_index(table, {}))

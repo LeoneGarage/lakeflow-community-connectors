@@ -8636,23 +8636,32 @@ def register_lakeflow_source(spark):
             return bool(int(_field(row, "is_buff_log", 0) or 0))
 
         @_serialized_sqli_operation
-        def key_rows(self, identity, columns, keys, values, isolation, limit=None):
+        def key_rows(self, identity, columns, keys, values, isolation, limit=None, present=(), skip=0):
             # Docstring: Every row whose ``keys`` columns equal ``values``, or the first ``limit``
-            # of them, read at ``isolation``.
+            # of them after the first ``skip``, read at ``isolation``. Without ``values``, every
+            # row with a NULL in one of ``keys`` and none in the ``present`` columns.
 
             self._ensure_connected()
             database, owner, name = _split_identity(identity)
-            for identifier in (database, owner, name, *columns, *keys):
+            for identifier in (database, owner, name, *columns, *keys, *present):
                 if not _IDENTIFIER.fullmatch(identifier):
                     # 43: Unsafe snapshot identifier {!r}
                     raise InformixError(_m(43, identifier))
             with self._repeatable_read_transaction(isolation):
                 rows = self.transport.execute(
-                    f"SELECT {f'FIRST {int(limit)} ' if limit else ''}"
+                    f"SELECT {f'SKIP {int(skip)} ' if skip else ''}"
+                    f"{f'FIRST {int(limit)} ' if limit else ''}"
                     f"{','.join(_sql_identifier(column) for column in columns)} "
                     f"FROM {database}:{_sql_identifier(owner)}.{_sql_identifier(name)} WHERE "
-                    + " AND ".join(f"{_sql_identifier(key)} = ?" for key in keys),
-                    tuple(values),
+                    + (
+                        "("
+                        + " OR ".join(f"{_sql_identifier(key)} IS NULL" for key in keys)
+                        + ")"
+                        + "".join(f" AND {_sql_identifier(key)} IS NOT NULL" for key in present)
+                        if values is None
+                        else " AND ".join(f"{_sql_identifier(key)} = ?" for key in keys)
+                    ),
+                    tuple(values or ()),
                 )
             return [
                 dict(row) if isinstance(row, dict) else dict(zip(columns, row, strict=True))
@@ -9981,12 +9990,15 @@ def register_lakeflow_source(spark):
 
     def _index_scan_key(row: dict[str, Any], keys: Sequence[str]) -> tuple:
         # Docstring: A row's index key as an index-ordered snapshot compares it: the values the
-        # connector emits, a character one without the padding a CHAR carries.
+        # connector emits, a character one without the padding a CHAR carries. A row with a NULL
+        # in an index column has the empty key: SQL compares a NULL with nothing, so those rows
+        # are one group, read by IS NULL ahead of the rest, and the empty key sorts first.
 
-        return tuple(
+        values = tuple(
             value.rstrip(" ") if isinstance(value, str) else value
             for value in (_framework_value(row[key]) for key in keys)
         )
+        return () if None in values else values
 
 
     def _index_scan_order(key: Sequence[Any], descending: Sequence[bool]) -> tuple:
@@ -18776,7 +18788,22 @@ def register_lakeflow_source(spark):
                 # only after the pipeline is joined below.
                 scanned: dict[str, Any] = {}
                 scan_index = self._scan_index(table, options)
-                index_scan = scan_index is not None
+                snapshot_lsn = None
+                if scan_index is not None:
+                    snapshot_lsn = self._index_scan_snapshot(
+                        table,
+                        options,
+                        scan_index,
+                        page_size,
+                        max_rows,
+                        stage_page,
+                        lambda lsn, index: self._stream_staged_page(
+                            table, pipeline_scope, schema_id, lsn, index
+                        )[1],
+                        scanned,
+                    )
+                # None when there is no index to page by, or the scan gave way to this read.
+                index_scan = snapshot_lsn is not None
                 pipeline = (
                     _AsyncStagePipeline(stage_page)
                     if not index_scan and self._should_pipeline_staging(scan_keys)
@@ -18785,21 +18812,7 @@ def register_lakeflow_source(spark):
                 page_consumer = pipeline.submit if pipeline is not None else stage_page
                 try:
                     snapshot_lsn, rows = (
-                        (
-                            self._index_scan_snapshot(
-                                table,
-                                options,
-                                scan_index,
-                                page_size,
-                                max_rows,
-                                stage_page,
-                                lambda lsn, index: self._stream_staged_page(
-                                    table, pipeline_scope, schema_id, lsn, index
-                                )[1],
-                                scanned,
-                            ),
-                            [],
-                        )
+                        (snapshot_lsn, [])
                         if index_scan
                         else consistent_snapshot(  # pylint: disable=not-callable
                             table.identity,
@@ -18890,8 +18903,9 @@ def register_lakeflow_source(spark):
             #
             # ``snapshot.scan=cursor`` asks for the cursor. ``snapshot.scan=keyset(a, b desc)``
             # names the columns to page by, and may give their directions. Otherwise the table is
-            # paged by the index with the most distinct keys among those on ingested NOT NULL
-            # columns of a type whose values Python orders as Informix does. It cannot be when
+            # paged by the index with the most distinct keys among those on ingested columns of
+            # a type whose values Python orders as Informix does (rows with a NULL in one of
+            # them are read first, as one group). It cannot be when
             # there is none, with a filter (the scan and the stream would have to agree on it row
             # by row), or on a
             # database that logs buffered (a commit is visible there before CDC can hand it
@@ -18916,7 +18930,7 @@ def register_lakeflow_source(spark):
             usable = {
                 column.name.lower(): column.name
                 for column in table.columns
-                if not column.nullable and column.type_name in _INDEX_SCAN_KEY_TYPES
+                if column.type_name in _INDEX_SCAN_KEY_TYPES
             }
             chosen = None
             if named:
@@ -18930,8 +18944,8 @@ def register_lakeflow_source(spark):
                         raise InformixError(
                             _m(
                                 433,
-                                f"column {name}, which is not an ingested NOT NULL column of "
-                                "integer, decimal, date or character type,",
+                                f"column {name}, which is not an ingested column of integer, "
+                                "decimal, date or character type,",
                                 table.exposed_name,
                             )
                         )
@@ -18989,9 +19003,11 @@ def register_lakeflow_source(spark):
 
         def _index_scan_snapshot(
             self, table, options, index, page_size, max_rows, stage_page, staged_rows, scan
-        ) -> int:
+        ) -> int | None:
             # Docstring: Stage a keyless table by an index and record, in ``scan``, which of its
-            # changes the stream must not replay; returns the snapshot LSN.
+            # changes the stream must not replay; returns the snapshot LSN. Returns None, with
+            # nothing staged, when the index was chosen for the table and too many of its rows
+            # have a NULL in it: the snapshot then reads as it would without the index.
             #
             # The stream replays every transaction that committed after the snapshot LSN, and the
             # scan has already seen some of them: the snapshot LSN is rounded down to its log
@@ -19111,7 +19127,7 @@ def register_lakeflow_source(spark):
                                         )
                                     )
                                     if key not in doubt and key not in raw:
-                                        raw[key] = [row[name] for name in keys]
+                                        raw[key] = [row[name] for name in keys] if key else None
                     # As the stream restarts: at the oldest open BEGIN, else the last commit.
                     start = open_begin if open_begin is not None else max(start, last_commit)
                     if last_commit > target or (idle and (not proof or reached >= target)):
@@ -19165,6 +19181,62 @@ def register_lakeflow_source(spark):
             raw: dict[tuple, list] = {}
             cursor = None
             held = total = staged_pages = 0
+            # Rows with a NULL in an index column are no part of the keyed order: one group,
+            # read first, and left out of the pages that follow. The index finds the NULLs of
+            # its leading column; those of its other columns take a pass over the table.
+            optional = {column.name for column in table.columns if column.nullable}
+            nullable = [name for name in keys if name in optional]
+            lead = nullable[:1] if nullable[:1] == list(keys[:1]) else []
+            rest = nullable[len(lead) :]
+            present = " AND ".join(f"{_sql_identifier(name)} IS NOT NULL" for name in nullable)
+
+            def null_rows(limit=None):
+                # Them all, or one more than ``limit`` of them at most.
+                found: list = []
+                for part, others in ((lead, []), (rest, lead)):
+                    if part and (limit is None or len(found) <= limit):
+                        found += bridge.key_rows(
+                            table.identity,
+                            names,
+                            part,
+                            None,
+                            isolation,
+                            limit and limit + 1 - len(found),
+                            others,
+                        )
+                return found
+
+            if nullable:
+                before = bridge.boundary_lsn()
+                # Too many to read together? The index answers that for its leading column
+                # without their rows being read; for the others the read itself must.
+                many = lead and bridge.key_rows(
+                    table.identity, lead, lead, None, isolation, 1, (), _INDEX_SCAN_KEY_ROWS
+                )
+                rows = [] if many else null_rows(_INDEX_SCAN_KEY_ROWS)
+                if many or len(rows) > _INDEX_SCAN_KEY_ROWS:
+                    reason = f"more than {_INDEX_SCAN_KEY_ROWS} rows with a NULL index value"
+                    if _snapshot_scan_columns(
+                        options.get(_SNAPSHOT_SCAN_OPTION, self.options.get(_SNAPSHOT_SCAN_OPTION, ""))
+                    ):
+                        # 433: The index-ordered snapshot of a keyless table does
+                        # not support {} on '{}'; set snapshot.scan=cursor to read
+                        # the table without index order
+                        raise InformixError(_m(433, reason, table.exposed_name))
+                    if follows:
+                        # 437: Informix snapshot of '{}', which has no key of its
+                        # own, reads without index order because it has {}; a row
+                        # that changes during the snapshot can then be in its
+                        # change log twice, or not at all
+                        logging.getLogger(__name__).warning(_m(437, table.exposed_name, reason))
+                    return None
+                after = bridge.current_lsn()
+                total = len(rows)
+                if rows:
+                    stage_page(boundary, 0, rows)
+                pages.append(((), before, after, 0 if rows else None))
+                staged_pages = int(bool(rows))
+                bounds.append(())
             while True:
                 # A commit the follower already holds was made before this read, wherever it
                 # sits in the log page the read's own position is rounded down to.
@@ -19175,10 +19247,25 @@ def register_lakeflow_source(spark):
                     keys,
                     cursor,
                     page_size,
+                    snapshot_filter=present or None,
                     key_descending=descending,
                     isolation=isolation,
                 )
                 orders = [_index_scan_order(_index_scan_key(row, keys), descending) for row in rows]
+                if () in orders:
+                    # No NULL is among these rows, so the connector made one of a value: paging
+                    # on from it would lose the rows after it.
+                    # 433: The index-ordered snapshot of a keyless table does not
+                    # support {} on '{}'; set snapshot.scan=cursor to read the table
+                    # without index order
+                    raise InformixError(
+                        _m(
+                            433,
+                            "an index value read as NULL, such as a string holding a NUL byte "
+                            f"under {_NULL_BYTE_OPTION}=null,",
+                            table.exposed_name,
+                        )
+                    )
                 if follows and (
                     any(later < earlier for earlier, later in zip(orders, orders[1:]))
                     or (orders and bounds and not bounds[-1] < orders[0])
@@ -19253,7 +19340,11 @@ def register_lakeflow_source(spark):
                 read = {
                     key: collections.Counter(
                         token(row)
-                        for row in bridge.key_rows(table.identity, names, keys, values, isolation)
+                        for row in (
+                            null_rows()
+                            if values is None
+                            else bridge.key_rows(table.identity, names, keys, values, isolation)
+                        )
                     )
                     for key, values in doubt.items()
                 }
@@ -25895,9 +25986,43 @@ def register_lakeflow_source(spark):
     ]
 
 
+    def _lines_only(code: types.CodeType) -> types.CodeType:
+        # Docstring: ``code`` with a location table that keeps each instruction's line and
+        # drops its columns, as ``python -X no_debug_ranges`` compiles it.
+        #
+        # Python 3.11 and later record a column range for nearly every instruction, about one
+        # byte of table per two of bytecode, and a pickled function carries it. A traceback
+        # uses the columns only to underline part of a source line. The table is rebuilt from
+        # ``co_lines()`` as runs of up to eight instructions, each a "no column" entry (code
+        # 13, or 15 for an instruction without a line) with its line's distance from the one
+        # before. The result is kept only if it reads back to the same lines.
+        if not hasattr(code, "co_positions"):  # Python 3.10: its table has lines only
+            return code
+        table = bytearray()
+        previous = code.co_firstlineno
+        for start, end, line in code.co_lines():
+            units = (end - start) // 2
+            while units > 0:
+                run = min(units, 8)
+                units -= run
+                if line is None:
+                    table.append(0xF8 | (run - 1))
+                    continue
+                table.append(0xE8 | (run - 1))
+                delta, previous = line - previous, line
+                value = (-delta << 1) | 1 if delta < 0 else delta << 1
+                while value >= 64:
+                    table.append(0x40 | (value & 63))
+                    value >>= 6
+                table.append(value)
+        plain = code.replace(co_linetable=bytes(table))
+        return plain if list(plain.co_lines()) == list(code.co_lines()) else code
+
+
     def _shorten_merged_definitions(namespace: dict[str, Any]) -> None:
         # Docstring: In the merged single file, strip ``register_lakeflow_source.<locals>.``
-        # from every definition's qualname and drop function annotations.
+        # from every definition's qualname, drop function annotations, and keep lines but not
+        # columns in each code object's location table (see _lines_only).
         #
         # The merge nests the whole connector inside register_lakeflow_source, so Spark
         # pickles every function and class by value. Each function carries that prefix twice
@@ -25918,8 +26043,8 @@ def register_lakeflow_source(spark):
                 if qualname is None:  # Python 3.10: only the function carries a qualname
                     codes[id(code)] = code.replace(co_consts=consts)
                 else:
-                    codes[id(code)] = code.replace(
-                        co_consts=consts, co_qualname=qualname.removeprefix(prefix)
+                    codes[id(code)] = _lines_only(
+                        code.replace(co_consts=consts, co_qualname=qualname.removeprefix(prefix))
                     )
             return codes[id(code)]
 

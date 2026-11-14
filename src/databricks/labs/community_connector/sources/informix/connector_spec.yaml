@@ -735,9 +735,10 @@ connection:
         to page by: under `keyset` its snapshot pages by the table's most selective
         index while following the table's changes, and the stream then leaves out the
         changes the scan already saw, so a change log that may hold identical rows
-        gets no row twice. That needs an index on ingested NOT NULL columns of
-        integer, decimal, date or character type, no row or snapshot filter, and
-        unbuffered logging; otherwise the snapshot reads through the cursor with a
+        gets no row twice. That needs an index on ingested columns of integer,
+        decimal, date or character type (nullable or not, with at most a million
+        rows holding a NULL in them), no row or snapshot filter, and unbuffered
+        logging; otherwise the snapshot reads through the cursor with a
         warning. `keyset(col1, col2 desc)` names the columns a keyless table pages by
         instead of the chosen index, each optionally followed by `asc` or `desc` (a
         direction left out is taken from an index that starts with those columns,
