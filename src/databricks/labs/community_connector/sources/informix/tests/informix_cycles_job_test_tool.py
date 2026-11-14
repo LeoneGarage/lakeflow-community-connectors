@@ -386,7 +386,9 @@ def stop_part_way(cycle, label, update_id):
         if state in TERMINAL:
             event(cycle, "resume", f"SKIPPED: {label} ended ({state}) before its scan was seen")
             return None
-        if RESUME_TABLE not in undrained():
+        # Only once the update runs: until then the targets still hold the rows of the run
+        # before, which the full refresh has not reset yet, and would pass for a drain.
+        if state == "RUNNING" and RESUME_TABLE not in undrained():
             event(cycle, "resume", f"SKIPPED: {RESUME_TABLE} drained before it could be stopped")
             return None
         pointer, pages = _scan_progress()
