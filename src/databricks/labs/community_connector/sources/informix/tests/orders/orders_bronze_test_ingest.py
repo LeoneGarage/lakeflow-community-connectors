@@ -22,16 +22,17 @@ pipeline_spec = {
                 },
             }
         },
-        # order_items has no key: it lands as a change log (r, c, d and u rows). Its snapshot
-        # pages by order_id, named here so that it fails instead of falling back to the
-        # unordered scan, and the stream leaves out the changes the snapshot already holds.
+        # order_items has no key: it lands as a change log (r, c, d and u rows). Under
+        # keyset the connector picks the index its snapshot pages by (here the one on
+        # order_id), and the stream leaves out the changes the snapshot already holds.
+        # With no index it could use, it would read without index order, with a warning.
         {
             "table": {
                 "source_table": "order_items",
                 "table_configuration": {
                     "qualified_source_table": "informix.order_items",
                     "snapshot.mode": "initial",
-                    "snapshot.scan": "keyset(order_id)",
+                    "snapshot.scan": "keyset",
                 },
             }
         },
