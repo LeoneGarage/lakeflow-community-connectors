@@ -499,6 +499,39 @@ class _OfflineLakebase:
         lakebase_state.seed_slots(self._connect(), namespace, slot_count)
 
 
+@contextlib.contextmanager
+def _no_warnings_from_this_thread(test):
+    """assertNoLogs for the connector's logger, counting this thread's records only. A shard
+    or drain thread that an earlier test left running logs there too, at its own pace."""
+    thread, records = threading.get_ident(), []
+
+    class Handler(logging.Handler):
+        def emit(self, record):
+            if record.thread == thread:
+                records.append(record.getMessage())
+
+    handler = Handler(level=logging.WARNING)
+    logger = logging.getLogger(informix_module.__name__)
+    logger.addHandler(handler)
+    try:
+        yield
+    finally:
+        logger.removeHandler(handler)
+    test.assertEqual(records, [])
+
+
+def _sleeps_of_this_thread():
+    """A stand-in for time.sleep and the list of this thread's calls to it: time is one
+    module for every thread, and one left running by an earlier test sleeps too."""
+    thread, calls = threading.get_ident(), []
+
+    def sleep(seconds):
+        if threading.get_ident() == thread:
+            calls.append(seconds)
+
+    return sleep, calls
+
+
 def _committed_transactions(records):
     """The committed transactions of one poll's records."""
     return informix_module._transaction_batch(records)[0]
@@ -6760,12 +6793,13 @@ class LakeflowContractTests(unittest.TestCase):
                 raise failures.pop()
             return real_open(*args, **kwargs)
 
+        sleep, slept = _sleeps_of_this_thread()
         with (
             mock.patch.object(informix_module, "_open_state_file", side_effect=flaky),
-            mock.patch.object(informix_module.time, "sleep") as slept,
+            mock.patch.object(informix_module.time, "sleep", side_effect=sleep),
         ):
             self.assertEqual(connector.latest_offset("app.orders", {}, first), expected)
-        self.assertEqual(slept.call_count, 2)
+        self.assertEqual(len(slept), 2)
 
         with (
             mock.patch.object(informix_module, "_open_state_file", side_effect=dropped) as opens,
@@ -7721,7 +7755,7 @@ class LakeflowContractTests(unittest.TestCase):
         with (
             mock.patch.object(informix_module, "list_spill_runs", side_effect=list_runs),
             mock.patch.object(bridge, "current_lsn", side_effect=current_lsn),
-            self.assertNoLogs(informix_module.__name__, level="WARNING"),
+            _no_warnings_from_this_thread(self),
             self.assertRaisesRegex(InformixError, "current log unavailable"),
         ):
             connector.read_table("app.orders", checkpoint, {})
@@ -7729,7 +7763,7 @@ class LakeflowContractTests(unittest.TestCase):
         for error in (informix_module.ConnectionCapacityUnavailable("no slot"), OSError("reset")):
             with (
                 self.subTest(error=type(error).__name__),
-                self.assertNoLogs(informix_module.__name__, level="WARNING"),
+                _no_warnings_from_this_thread(self),
                 self.assertRaises(type(error)),
             ):
                 later._spill_runs_listed.clear()
@@ -13797,13 +13831,14 @@ class LakeflowContractTests(unittest.TestCase):
                 return iter(({"id": 1},)), {"commit_lsn": "110"}
 
         reader = LakeflowStreamReader()
+        sleep, slept = _sleeps_of_this_thread()
         with (
             mock.patch.object(
                 informix_module.time,
                 "monotonic",
                 side_effect=[100, 100, 100, 100, 100, 100],
             ),
-            mock.patch.object(informix_module.time, "sleep") as sleep,
+            mock.patch.object(informix_module.time, "sleep", side_effect=sleep),
         ):
             rows = list(
                 reader.readBetweenOffsets(
@@ -13813,7 +13848,7 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(rows, [{"id": 1}])
         self.assertEqual(reader.calls, 3)
-        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(len(slept), 2)
 
     def test_a_transient_mount_failure_is_retried_in_process(self):
         """A remount settles in seconds, so the read should ride it out in place.
@@ -19793,7 +19828,7 @@ class FairSlotQueueWiringTests(unittest.TestCase):
 
                 with (
                     mock.patch.object(informix_module, "release_slot", side_effect=release),
-                    self.assertNoLogs(informix_module.__name__, level="WARNING"),
+                    _no_warnings_from_this_thread(self),
                 ):
                     bridge._release_connection_slot()
 
@@ -21777,12 +21812,13 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
                 raise failures.pop()
             return real_list(*args, **kwargs)
 
+        sleep, slept = _sleeps_of_this_thread()
         with (
             mock.patch.object(connector, "_list_unl_files", side_effect=flaky),
-            mock.patch.object(informix_module.time, "sleep") as slept,
+            mock.patch.object(informix_module.time, "sleep", side_effect=sleep),
         ):
             self.assertEqual(connector.get_partitions("app.orders", options, {}, end), expected)
-        self.assertEqual(slept.call_count, 2)
+        self.assertEqual(len(slept), 2)
 
         with (
             mock.patch.object(connector, "_list_unl_files", side_effect=dropped) as listed,
@@ -22716,7 +22752,7 @@ class UnsupportedColumnTests(_TableOptionTestCase):
 
     def test_listing_it_in_exclude_columns_draws_no_warning(self):
         connector = self.connector(_unsupported_bridge())
-        with self.assertNoLogs(informix_module.__name__, level="WARNING"):
+        with _no_warnings_from_this_thread(self):
             schema = connector.get_table_schema("app.orders", {"exclude_columns": "extra"})
         self.assertNotIn("extra", schema.fieldNames())
 
@@ -22775,7 +22811,7 @@ class UnsupportedColumnTests(_TableOptionTestCase):
             ("id,id", "duplicate"),
         ):
             with self.subTest(raw=raw):
-                with self.assertNoLogs(informix_module.__name__, level="WARNING"):
+                with _no_warnings_from_this_thread(self):
                     with self.assertRaisesRegex(ValueError, message):
                         connector.read_table_metadata("app.orders", {"primary.keys": raw})
 
