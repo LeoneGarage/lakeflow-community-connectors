@@ -619,7 +619,9 @@ Requirements and limits:
   that step 2 should have settled then reaches the stream later, the stream fails and
   asks for a full refresh instead of guessing whether the snapshot holds it. A change
   that committed after the scan by the source's clock is not such a change, even when
-  it is still on the log page the scan ended on.
+  it is still on the log page the scan ended on. That needs `DBINFO('utc_current')` on
+  the source; without it, the first change to a quiet table after its snapshot can stop
+  the stream this way, and `snapshot.scan: cursor` is the way round it.
 - Do not switch the table to `snapshot.scan: cursor` until the stream has passed the
   scan's end: the stream applies step 4 unless the option says `cursor`.
 - All rows of one index key are read together, so an index with very large groups reads

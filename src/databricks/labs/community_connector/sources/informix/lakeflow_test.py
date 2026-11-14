@@ -577,8 +577,13 @@ class _IndexScanSource:
 
     PAGE = 64
 
-    def __init__(self, random, *, transactions=40, hot_key=None, descending=False):
+    def __init__(self, random, *, transactions=40, hot_key=None, descending=False, quiet=False):
         self.random = random
+        # A quiet log: nothing but the table's own changes moves it, so it stays on one
+        # page for long, and the source's clock is what tells a later change from an
+        # earlier one there.
+        self.quiet = quiet
+        self.clock = 1_700_000_000
         self.left = transactions
         self.hot_key = hot_key
         self.descending = descending
@@ -609,8 +614,15 @@ class _IndexScanSource:
                 yield begins[record["tx_id"]], sign, self.text(record["row"])
 
     def _write(self, op, **fields):
-        self.lsn += self.random.randint(8, 40)
+        self.lsn += self.random.randint(1, 3) if self.quiet else self.random.randint(8, 40)
+        if op == "COMMIT":
+            fields["timestamp"] = self.clock
         self.log.append({"op": op, "tx_id": self.tx_id, "lsn": self.lsn, **fields})
+
+    def current_utc_time(self):
+        # Every later commit is later by the clock.
+        self.clock += 2
+        return self.clock - 1
 
     def _tick(self):
         # Maybe commit a transaction: replace a key's rows, or add to them.
@@ -680,8 +692,9 @@ class _IndexScanSource:
         self._tick()
         begins = {r["tx_id"]: r["lsn"] for r in self.log if r["op"] == "BEGIN"}
         records = [dict(record) for record in self.log if begins[record["tx_id"]] > start]
-        # An idle session reports the last checkpoint's position; one happens here.
-        self.lsn += self.PAGE
+        # An idle session reports the last checkpoint's position; one happens here, unless
+        # the log is quiet.
+        self.lsn += 0 if self.quiet else self.PAGE
         return records + [{"op": "TIMEOUT", "lsn": self.lsn}]
 
     def buffered_logging(self):
@@ -2046,12 +2059,16 @@ class LakeflowContractTests(unittest.TestCase):
         # does. Whatever the interleaving, the staged rows plus the changes the stream keeps
         # must give the final table, duplicates included.
         dropped = 0
-        for seed in range(80):
+        for seed in range(120):
             random = random_module.Random(seed)
-            source = _IndexScanSource(random, descending=seed % 3 == 0)
-            boundary, staged, scan, connector, table = self._index_scan(
-                source, random.choice([3, 5, 50])
-            )
+            # A third of them on a quiet log, where no poll proves anything: the scan's
+            # waits for proof run out, and it settles its keys on idle polls.
+            quiet = seed % 3 == 1
+            source = _IndexScanSource(random, descending=seed % 3 == 0, quiet=quiet)
+            with mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0):
+                boundary, staged, scan, connector, table = self._index_scan(
+                    source, random.choice([3, 5, 50])
+                )
             records = source.read_changes(None, boundary, 1, 256)
             transactions = informix_module._transaction_batch(records)[0]
             connector._read_snapshot_stage_manifest = lambda *_: scan

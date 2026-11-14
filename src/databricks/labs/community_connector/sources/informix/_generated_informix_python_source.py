@@ -18984,9 +18984,16 @@ def register_lakeflow_source(spark):
             # inserted image or -1 for a deleted one, the row's token, the change's own LSN,
             # its operation). ``events`` keeps those of the keys in doubt, whose index values
             # ``doubt`` holds for reading them again.
-            fresh: dict[tuple, list[tuple[int, int, str, int, str]]] = {}
-            events: dict[tuple, list[tuple[int, int, str, int, str]]] = {}
+            fresh: dict[tuple, list[tuple]] = {}
+            events: dict[tuple, list[tuple]] = {}
             doubt: dict[tuple, list] = {}
+            # The keys settled, each with the position after its last read and the source's
+            # clock then.
+            settled: dict[tuple, tuple[int, int | None]] = {}
+            clock = getattr(bridge, "current_utc_time", lambda: None)
+            # The changes settled, by their own positions: those the scan saw, and all of them.
+            suppress: list[int] = []
+            decided: list[int] = []
             # Each page read, in scan order: its last key's order (None for the last page), the
             # positions before and after its read, and its staged page's index (None if empty).
             pages: list[tuple[tuple | None, int, int, int | None]] = []
@@ -19040,7 +19047,14 @@ def register_lakeflow_source(spark):
                                 if row is not None:
                                     key = _index_scan_key(row, keys)
                                     fresh.setdefault(key, []).append(
-                                        (tx.commit_lsn, sign, token(row), _lsn(record), op)
+                                        (
+                                            tx.commit_lsn,
+                                            sign,
+                                            token(row),
+                                            _lsn(record),
+                                            op,
+                                            tx.commit_time,
+                                        )
                                     )
                                     if key not in doubt and key not in raw:
                                         raw[key] = [row[name] for name in keys]
@@ -19056,6 +19070,23 @@ def register_lakeflow_source(spark):
                         # after {} seconds
                         raise InformixError(_m(435, table.exposed_name, _INDEX_SCAN_FOLLOW_SECONDS))
                 for key, changed in fresh.items():
+                    if key in settled:
+                        # A change the key's last read may have held, handed over only now:
+                        # the key was settled without it. One the source's clock puts after
+                        # that read is the stream's.
+                        position, clock = settled[key]
+                        if any(
+                            event[0] <= position and not (clock and event[5] and event[5] > clock)
+                            for event in changed
+                        ):
+                            # 436: The index-ordered snapshot cannot tell
+                            # which changes to a key of '{}' its scan saw: the
+                            # rows staged for the key do not fit the key's
+                            # changes
+                            raise InformixError(_m(436, table.exposed_name))
+                        # Those it could have held by position are kept by name.
+                        decided.extend(event[3] for event in changed if event[0] <= position)
+                        continue
                     if key in doubt:
                         events[key].extend(changed)
                         continue
@@ -19153,8 +19184,6 @@ def register_lakeflow_source(spark):
             # checkpoint, so the wait is bounded; a change it misses then is one the stream
             # fails on.
             follow(bridge.current_lsn(), proof=True, strict=False)
-            decided: list[int] = []
-            suppress: list[int] = []
             for _attempt in range(_INDEX_SCAN_SETTLE_ATTEMPTS):
                 if not doubt:
                     break
@@ -19167,7 +19196,10 @@ def register_lakeflow_source(spark):
                     for key, values in doubt.items()
                 }
                 after = bridge.current_lsn()
-                follow(after, proof=True)
+                read_at = clock()
+                # As at the scan's end: the wait for proof is bounded, and a change it misses
+                # is one the scan or the stream fails on.
+                follow(after, proof=True, strict=False)
                 for key, state in read.items():
                     changed = events[key]
                     if any(before < event[0] <= after for event in changed):
@@ -19213,9 +19245,12 @@ def register_lakeflow_source(spark):
                         # for the key do not fit the key's changes
                         raise InformixError(_m(436, table.exposed_name))
                     suppress.extend(seen)
-                    decided.extend(event[3] for event in unsure)
+                    # Every change up to this read is accounted for: the unsure ones dropped or
+                    # kept, the later ones kept.
+                    decided.extend(event[3] for event in changed)
+                    settled[key] = (after, read_at)
                     del doubt[key], events[key]
-            finished = getattr(bridge, "current_utc_time", lambda: None)()
+            finished = clock()
             if doubt:
                 # 434: The index-ordered snapshot could not settle {} key(s) of '{}' after
                 # {} re-reads because they kept changing; run the snapshot when the table
@@ -19240,9 +19275,17 @@ def register_lakeflow_source(spark):
                     ]
                     for bound, before, after, _index in pages
                 ],
-                "end": max(after for _bound, _before, after, _index in pages),
+                "end": max(
+                    [after for _bound, _before, after, _index in pages]
+                    + [position for position, _clock in settled.values()]
+                ),
                 "suppress": sorted(set(suppress)),
                 "keep": sorted(set(decided) - set(suppress)),
+                # A settled key's read went on until this position: its window ends there.
+                "settled": [
+                    [_encode_snapshot_stage_value(list(key)), position]
+                    for key, (position, _clock) in settled.items()
+                ],
                 # The source's clock once every read was done. The second position is the end
                 # of a log page, and a quiet log stays on that page long after the scan: a
                 # change there that committed later by the clock is not one the scan missed.
@@ -19288,12 +19331,16 @@ def register_lakeflow_source(spark):
                     frozenset(int(lsn) for lsn in recorded["suppress"]),
                     frozenset(int(lsn) for lsn in recorded["keep"]),
                     recorded.get("time"),
+                    {
+                        tuple(_decode_snapshot_stage_value(key)): int(position)
+                        for key, position in recorded.get("settled", ())
+                    },
                 )
             live = self.__dict__.setdefault("_index_scan_live", {})
             if not cache[cached]:
                 live[table.identity] = None
                 return transactions
-            keys, descending, bounds, reads, end, suppress, keep, finished = cache[cached]
+            keys, descending, bounds, reads, end, suppress, keep, finished, settled = cache[cached]
             # A poll that went idle past the scan's end with nothing at or below it has seen the
             # last change the scan could hold: a quiet table's offset stays where it is, and
             # would name the snapshot's update for good.
@@ -19315,8 +19362,10 @@ def register_lakeflow_source(spark):
                 for record in tx.records:
                     row = record.get("after") or record.get("row") or record.get("before")
                     if row is not None:
-                        order = _index_scan_order(_index_scan_key(row, keys), descending)
+                        key = _index_scan_key(row, keys)
+                        order = _index_scan_order(key, descending)
                         before, after = reads[bisect.bisect_left(bounds, order)]
+                        after = max(after, settled.get(key, 0))
                         lsn = _lsn(record)
                         if lsn in suppress or tx.commit_lsn <= before:
                             continue
