@@ -593,6 +593,14 @@ The differences from a keyless table:
   the copy then reach the target after the snapshot has been served, not alongside it.
 - Without an index it can use, a merged table pages by its `primary.keys` columns as
   before, with no warning.
+- The connector cannot see the pipeline's `scd_type`. A table whose target is
+  `scd_type: APPEND_ONLY` must also set `append.only.ingestion: "true"`, or the connector
+  takes it for a merged one, follows no changes, and the overlap lands in the append
+  target.
+- `snapshot.isolation` does not apply to a snapshot paged by an index: each page is read
+  on its own, at last-committed isolation, so `repeatable_read` would not hold the table
+  still across pages. Set `snapshot.scan: cursor` to read under one `repeatable_read`
+  transaction.
 
 A table that has its own primary key, or a unique index used as its key, is read by that
 key whatever `primary.keys` says, and naming columns with `keyset(...)` is rejected for it.

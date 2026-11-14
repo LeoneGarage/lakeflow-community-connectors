@@ -18904,6 +18904,9 @@ def register_lakeflow_source(spark):
             indexes = getattr(bridge, "table_indexes", None)
             if requested == _SNAPSHOT_SCAN_CURSOR or not (named or callable(indexes)):
                 return None
+            # Whether the scan will follow the table's changes (see _index_scan_snapshot): only
+            # then does buffered logging matter, or a fallback leave an overlap to warn of.
+            follows = not table.primary_keys or self._append_only_table(table, options)
             listed = indexes(table.identity) if callable(indexes) else []
             usable = {
                 column.name.lower(): column.name
@@ -18953,7 +18956,7 @@ def register_lakeflow_source(spark):
                 reason = "a row or snapshot filter"
             elif chosen is None:
                 reason = None
-            elif bridge.buffered_logging():
+            elif follows and bridge.buffered_logging():
                 reason = "a database with buffered logging"
             else:
                 return list(chosen[1]), list(chosen[2])
@@ -18961,12 +18964,12 @@ def register_lakeflow_source(spark):
                 # 433: The index-ordered snapshot of a keyless table does not support {}
                 # on '{}'; set snapshot.scan=cursor to read the table without index order
                 raise InformixError(_m(433, reason, table.exposed_name))
-            if table.primary_keys and not self._append_only_table(table, options):
+            if not follows:
                 # A merged target takes the overlap out by its key: it pages by the key as before.
                 return None
-            # 437: Informix snapshot of keyless table '{}' reads without index order because it has
-            # {}; a row that changes during the snapshot can then be in its change log twice, or
-            # not at all
+            # 437: Informix snapshot of '{}', which has no key of its own, reads without index
+            # order because it has {}; a row that changes during the snapshot can then be in
+            # its change log twice, or not at all
             logging.getLogger(__name__).warning(
                 _m(437, table.exposed_name, reason or "no index the snapshot can page by")
             )

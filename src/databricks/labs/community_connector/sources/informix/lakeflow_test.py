@@ -2460,6 +2460,14 @@ class LakeflowContractTests(unittest.TestCase):
         informix_module._ensure_materializable(by_option, {"snapshot.scan": "keyset(id)"})
         # Without an index it can use, a merged table pages by its key as before, quietly:
         # the merge takes the overlap out. On the append path nothing does, so it warns.
+        # Buffered logging matters to a scan that follows the table's changes, so not to a
+        # merged table's.
+        source.buffered_logging = lambda: True
+        self.assertEqual(connector._scan_index(by_option, {}), (["id"], [False]))
+        with self.assertLogs(informix_module.__name__, "WARNING") as logs:
+            self.assertIsNone(connector._scan_index(by_option, {"append.only.ingestion": "true"}))
+        self.assertIn("which has no key of its own", logs.output[0])
+        source.buffered_logging = lambda: False
         source.indexes = []
         with _no_warnings_from_this_thread(self):
             self.assertIsNone(connector._scan_index(by_option, {}))
