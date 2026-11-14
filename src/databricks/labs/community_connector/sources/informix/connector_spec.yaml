@@ -742,7 +742,10 @@ connection:
         instead of the chosen index, each optionally followed by `asc` or `desc` (a
         direction left out is taken from an index that starts with those columns,
         else ascending), and fails instead of falling back. `cursor` reads a keyless
-        table through the cursor regardless. Accepts
+        table through the cursor regardless. A table with no key of its own that
+        primary.keys gives one pages its snapshot by an index in the same way, in one
+        pass; it follows the table's changes only on the append path, since a merge
+        by the key removes the overlap. Accepts
         `keyset`/`keyset(column [asc|desc], ...)`/`cursor`.
 
     - name: append.only.ingestion

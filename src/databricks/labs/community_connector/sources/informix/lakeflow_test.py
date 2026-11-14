@@ -781,6 +781,44 @@ class _IndexScanSource:
         return [dict(record) for record in self.log if begins[record["tx_id"]] >= start]
 
 
+class _KeylessIndexBridge(FakeBridge):
+    """A FakeBridge whose app.orders has no key and an index on id, with a log position
+    known to the page only, for snapshots that page by an index."""
+
+    def __init__(self):
+        super().__init__()
+        self.tables[0]["primary_keys"] = []
+        self.rows = [{"id": 1, "value": "a"}, {"id": 2, "value": "b"}]
+
+    def table_indexes(self, identity):
+        return [(["id"], [False], 2)]
+
+    def buffered_logging(self):
+        return False
+
+    def boundary_lsn(self):
+        # The snapshot LSN is 90; the page is read once the log is at 100.
+        lsn, self.now = self.now, max(self.now, 100)
+        return lsn
+
+    def current_lsn(self):
+        # To the log page only, as Informix reports it: its end.
+        return (self.now // 4096 + 1) * 4096
+
+    def current_utc_time(self):
+        return self.utc_now
+
+    def snapshot_chunk(self, *args, isolation=None, **kwargs):
+        return super().snapshot_chunk(*args, **kwargs)
+
+    def key_rows(self, identity, columns, keys, values, isolation, limit=None):
+        return [dict(row) for row in self.rows if row["id"] == values[0]]
+
+    def read_changes(self, tables, start_lsn, timeout_seconds, max_records, budget=None):
+        self.polls = getattr(self, "polls", 0) + 1
+        return list(self.changes) + [{"op": "TIMEOUT", "lsn": self.now}]
+
+
 class LakeflowContractTests(unittest.TestCase):
     def setUp(self):
         self._shared_state = tempfile.TemporaryDirectory()
@@ -2098,11 +2136,12 @@ class LakeflowContractTests(unittest.TestCase):
         # connector's own loop bound.
         self.assertEqual(requested, [256])
 
-    def _index_scan(self, source, page_size, **patches):
+    def _index_scan(self, source, page_size, table=None, options=None):
         """Run snapshot.scan=index over ``source``: (snapshot LSN, staged rows, what the scan
         recorded for the stream, the connector). Pages go through the staging codec, as the
         rows read back for a key in doubt do."""
-        table = Table.parse(_table(primary_keys=()), "demo")
+        table = table or Table.parse(_table(primary_keys=()), "demo")
+        options = options or {}
         connector = self.connector(source)
         pages: dict[int, list[dict]] = {}
         scan: dict = {}
@@ -2120,8 +2159,8 @@ class LakeflowContractTests(unittest.TestCase):
 
         boundary = connector._index_scan_snapshot(
             table,
-            {},
-            connector._scan_index(table, {}),
+            options,
+            connector._scan_index(table, options),
             page_size,
             0,
             stage_page,
@@ -2223,39 +2262,6 @@ class LakeflowContractTests(unittest.TestCase):
         # the stream is past the scan's end its offsets also name the snapshot's update:
         # without that, the second batch of a later update finds no manifest and replays
         # changes the snapshot holds.
-        class Bridge(FakeBridge):
-            def __init__(self):
-                super().__init__()
-                self.tables[0]["primary_keys"] = []
-                self.rows = [{"id": 1, "value": "a"}, {"id": 2, "value": "b"}]
-
-            def table_indexes(self, identity):
-                return [(["id"], [False], 2)]
-
-            def buffered_logging(self):
-                return False
-
-            def boundary_lsn(self):
-                # The snapshot LSN is 90; the page is read once the log is at 100.
-                lsn, self.now = self.now, max(self.now, 100)
-                return lsn
-
-            def current_lsn(self):
-                # To the log page only, as Informix reports it: its end.
-                return (self.now // 4096 + 1) * 4096
-
-            def current_utc_time(self):
-                return self.utc_now
-
-            def snapshot_chunk(self, *args, isolation=None, **kwargs):
-                return super().snapshot_chunk(*args, **kwargs)
-
-            def key_rows(self, identity, columns, keys, values, isolation, limit=None):
-                return [dict(row) for row in self.rows if row["id"] == values[0]]
-
-            def read_changes(self, tables, start_lsn, timeout_seconds, max_records, budget=None):
-                return list(self.changes) + [{"op": "TIMEOUT", "lsn": self.now}]
-
         def insert(tx, lsn, key, seconds=0):
             # Committed that many seconds after the snapshot, by the source's clock.
             return [
@@ -2269,7 +2275,7 @@ class LakeflowContractTests(unittest.TestCase):
                 },
             ]
 
-        bridge = Bridge()
+        bridge = _KeylessIndexBridge()
         # Row 2 was inserted just after the snapshot LSN and before the page was read: the
         # snapshot holds it, and the stream is handed it again.
         bridge.changes = insert(1, 91, 2)
@@ -2420,6 +2426,91 @@ class LakeflowContractTests(unittest.TestCase):
         boundary, staged, _scan, _connector, _table = self._index_scan(source, 50)
         self.assertEqual(len(staged), len(source.rows))
         self.assertGreater(len(polls), 3)
+
+    def test_a_table_keyed_by_the_option_alone_pages_its_snapshot_by_an_index(self):
+        # primary.keys on a table with no key of its own says how the target merges. The
+        # snapshot need not page by those columns, which no index may cover: under keyset
+        # it pages by an index, as a keyless table's does. A table with its own key is
+        # read by that key, whatever primary.keys says.
+        connector = self.connector(FakeBridge())
+        keyless = Table.parse(_table(primary_keys=()), "demo")
+        keyed = Table.parse(_table(), "demo")
+        by_option = connector._apply_primary_key_override(keyless, {"primary.keys": "value"})
+        self.assertEqual(by_option.primary_keys, ("value",))
+        self.assertTrue(by_option.key_only_from_option)
+        self.assertFalse(
+            connector._apply_primary_key_override(
+                keyed, {"primary.keys": "value"}
+            ).key_only_from_option
+        )
+        self.assertFalse(keyless.key_only_from_option)
+        # A schema refresh that still finds no key keeps it.
+        self.assertTrue(
+            informix_module._carry_key_override(keyless, by_option).key_only_from_option
+        )
+        self.assertFalse(informix_module._carry_key_override(keyed, by_option).key_only_from_option)
+
+        source = _IndexScanSource(random_module.Random(1), transactions=0)
+        connector = self.connector(source)
+        self.assertEqual(connector._scan_index(by_option, {}), (["id"], [False]))
+        self.assertEqual(
+            connector._scan_index(by_option, {"snapshot.scan": "keyset(id desc)"}), (["id"], [True])
+        )
+        self.assertIsNone(connector._scan_index(by_option, {"snapshot.scan": "cursor"}))
+        informix_module._ensure_materializable(by_option, {"snapshot.scan": "keyset(id)"})
+        # Without an index it can use, a merged table pages by its key as before, quietly:
+        # the merge takes the overlap out. On the append path nothing does, so it warns.
+        source.indexes = []
+        with _no_warnings_from_this_thread(self):
+            self.assertIsNone(connector._scan_index(by_option, {}))
+        with self.assertLogs(informix_module.__name__, "WARNING"):
+            self.assertIsNone(connector._scan_index(by_option, {"append.only.ingestion": "true"}))
+
+    def test_a_merged_table_paged_by_an_index_follows_no_changes(self):
+        # The merge takes out what the snapshot and the stream both hold, so the scan only
+        # pages by the index: it reads no changes and records nothing for the stream. On
+        # the append path the same table is read as a keyless one is.
+        table = self.connector(FakeBridge())._apply_primary_key_override(
+            Table.parse(_table(primary_keys=()), "demo"), {"primary.keys": "*"}
+        )
+        source = _IndexScanSource(random_module.Random(8))
+        polls = []
+        real = source.read_changes
+        source.read_changes = lambda *args, **kwargs: polls.append(1) or real(*args, **kwargs)
+        _boundary, staged, scan, connector, _scanned = self._index_scan(source, 5, table=table)
+        self.assertEqual(polls, [])
+        self.assertFalse(scan.get("index_scan"))
+        self.assertGreater(len(staged), 0)
+        transactions = informix_module._transaction_batch(source.history(0))[0]
+        connector._read_snapshot_stage_manifest = lambda *_: scan
+        connector._offset_scopes = lambda checkpoint: ("scope", "scope")
+        self.assertEqual(
+            connector._drop_scanned_changes(
+                table, {"commit_lsn": "0", "schema_id": "s"}, {}, transactions
+            ),
+            transactions,
+        )
+
+        source = _IndexScanSource(random_module.Random(8))
+        with mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0):
+            _boundary, _staged, scan, _connector, _scanned = self._index_scan(
+                source, 5, table=table, options={"append.only.ingestion": "true"}
+            )
+        self.assertIn("pages", scan["index_scan"])
+
+    def test_a_chunked_snapshot_gives_way_to_paging_by_an_index(self):
+        # snapshot.mode=incremental copies a keyed table in chunks that follow its key. A
+        # table keyed by primary.keys alone that pages by an index has many rows to an index
+        # value, so it takes the one-pass snapshot, as it does under snapshot.scan=cursor.
+        bridge = _KeylessIndexBridge()
+        connector = self.connector(bridge)
+        options = {"snapshot.mode": "incremental", "primary.keys": "value"}
+        with self.assertLogs(informix_module.__name__, "INFO") as logs:
+            rows, offset = connector.read_table("app.orders", {}, options)
+        self.assertEqual([(row["id"], row["_informix_op"]) for row in rows], [(1, "r"), (2, "r")])
+        self.assertTrue(any("keyset over an index" in line for line in logs.output))
+        self.assertNotIn("incremental", offset)
+        self.assertEqual(getattr(bridge, "polls", 0), 0)
 
     def test_the_stream_fails_on_a_change_a_stalled_cdc_kept_from_the_scan(self):
         # A server whose CDC has stalled answers every poll as an idle one, and a quiet

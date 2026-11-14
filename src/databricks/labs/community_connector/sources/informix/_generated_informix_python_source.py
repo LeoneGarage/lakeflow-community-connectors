@@ -12073,6 +12073,11 @@ def register_lakeflow_source(spark):
         nullable_index_key: tuple[str, ...] = ()
         nullable_index_descending: tuple[bool, ...] = ()
         key_from_nullable_index: bool = False
+        # True when the table has no key of its own and primary_keys is the primary.keys
+        # option's. The key then says how the target merges, not how the table is best read:
+        # its snapshot pages by an index, as a keyless table's does (see _scan_index). Not
+        # fingerprinted.
+        key_only_from_option: bool = False
         # The include_columns / exclude_columns selection as (mode, sorted names), or None.
         # ``columns`` then holds only the selected columns, and ``catalog_columns`` every
         # catalog column, which a positional `.unl` extract still needs. The selection and
@@ -16290,6 +16295,7 @@ def register_lakeflow_source(spark):
                 key_wildcard_except=excepted,
                 key_descending=tuple(directions or ()),
                 key_from_nullable_index=False,
+                key_only_from_option=table.key_only_from_option or not table.primary_keys,
             )
 
         def _override_key_directions(self, identity: str, keys: tuple[str, ...]) -> list[bool] | None:
@@ -18091,11 +18097,19 @@ def register_lakeflow_source(spark):
                 raise InformixError(_m(234, table.exposed_name))
             # snapshot.scan=cursor reads without key order, so there are no key ranges to
             # chunk by: take the blocking consistent snapshot, which honours the cursor scan.
-            if self._snapshot_cursor_scan(options):
+            # So does a table keyed by primary.keys alone whose snapshot pages by an index: the
+            # chunks follow a unique key, and an index value has many rows.
+            by_index = table.key_only_from_option and self._scan_index(table, options) is not None
+            if by_index or self._snapshot_cursor_scan(options):
                 # 235: Informix incremental snapshot for '{}' using the blocking consistent snapshot
                 # because {}={} reads without key order
                 logging.getLogger(__name__).info(
-                    _m(235, table.exposed_name, _SNAPSHOT_SCAN_OPTION, _SNAPSHOT_SCAN_CURSOR),
+                    _m(
+                        235,
+                        table.exposed_name,
+                        _SNAPSHOT_SCAN_OPTION,
+                        "keyset over an index" if by_index else _SNAPSHOT_SCAN_CURSOR,
+                    ),
                 )
                 return self._read_snapshot(
                     table, None, options, pipeline_scope_override=pipeline_scope_override
@@ -18884,7 +18898,7 @@ def register_lakeflow_source(spark):
             )
             requested = _snapshot_scan_value(raw)
             named = _snapshot_scan_columns(raw)
-            if table.primary_keys:
+            if table.primary_keys and not table.key_only_from_option:
                 return None
             bridge = self._bridge
             indexes = getattr(bridge, "table_indexes", None)
@@ -18947,6 +18961,9 @@ def register_lakeflow_source(spark):
                 # 433: The index-ordered snapshot of a keyless table does not support {}
                 # on '{}'; set snapshot.scan=cursor to read the table without index order
                 raise InformixError(_m(433, reason, table.exposed_name))
+            if table.primary_keys and not self._append_only_table(table, options):
+                # A merged target takes the overlap out by its key: it pages by the key as before.
+                return None
             # 437: Informix snapshot of keyless table '{}' reads without index order because it has
             # {}; a row that changes during the snapshot can then be in its change log twice, or
             # not at all
@@ -18977,6 +18994,10 @@ def register_lakeflow_source(spark):
             bridge = self._bridge
             timeout = self._table_int_option(options, "cdc.timeout", 5, minimum=1)
             keys, descending = index
+            # A table keyed by primary.keys alone and merged by it needs the index for paging
+            # only: the merge takes out what the snapshot and the stream both hold. On the
+            # append path nothing does, as for a table with no key.
+            follows = not table.primary_keys or self._append_only_table(table, options)
             names = [column.name for column in table.columns]
             isolation = _SNAPSHOT_ISOLATION_SQL[_DEFAULT_SNAPSHOT_ISOLATION]
             capture = _capture_descriptor(table, _client_encoding(self.options))
@@ -19016,6 +19037,8 @@ def register_lakeflow_source(spark):
                 # until the next checkpoint: the wait for it is short, and an idle poll is taken
                 # in the end.
                 nonlocal start, last_commit
+                if not follows:
+                    return
                 began = time.monotonic()
                 idle_since = None
                 while True:
@@ -19281,7 +19304,7 @@ def register_lakeflow_source(spark):
                 raise InformixError(
                     _m(434, len(doubt), table.exposed_name, _INDEX_SCAN_SETTLE_ATTEMPTS)
                 )
-            scan["index_scan"] = {
+            scan["index_scan"] = follows and {
                 "keys": list(keys),
                 "descending": list(descending),
                 # Each page's last key, with the positions before and after its read. A change
@@ -19330,7 +19353,9 @@ def register_lakeflow_source(spark):
             # stream's offsets name that update (scan_scope, see _read_stream) until the stream
             # is past the scan's end, since a later update's offsets carry its own scope.
 
-            if table.primary_keys or self._snapshot_cursor_scan(options):
+            if (table.primary_keys and not table.key_only_from_option) or self._snapshot_cursor_scan(
+                options
+            ):
                 return transactions
             scope = checkpoint.get("scan_scope") or self._offset_scopes(checkpoint)[1]
             schema_id = str(checkpoint.get("scan_schema") or checkpoint.get("schema_id"))
@@ -23598,7 +23623,11 @@ def register_lakeflow_source(spark):
             # materialize: {}
             raise InformixError(_m(341, table.exposed_name, details))
         options = options or {}
-        if table.primary_keys and _snapshot_scan_columns(options.get(_SNAPSHOT_SCAN_OPTION, "")):
+        if (
+            table.primary_keys
+            and not table.key_only_from_option
+            and _snapshot_scan_columns(options.get(_SNAPSHOT_SCAN_OPTION, ""))
+        ):
             # 432: Option snapshot.scan=keyset(...) names columns to page '{}' by, but the
             # table has a key and pages by that; change the key with primary.keys instead
             raise InformixError(_m(432, table.exposed_name))
@@ -25126,6 +25155,7 @@ def register_lakeflow_source(spark):
             key_wildcard=overridden.key_wildcard,
             key_wildcard_except=overridden.key_wildcard_except,
             key_descending=descending,
+            key_only_from_option=not fresh.primary_keys,
         )
 
 
