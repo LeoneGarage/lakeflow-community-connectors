@@ -772,7 +772,9 @@ class _IndexScanSource:
         self._tick()
         return rows
 
-    def read_changes(self, captures, start, timeout, max_records, budget=None):
+    def read_changes(
+        self, captures, start, timeout, max_records, budget=None, until=None, seconds=None
+    ):
         self._tick()
         # A session started at an LSN hands over the transactions that begin at or after
         # it, whole, and those still open as far as they have got.
@@ -843,7 +845,9 @@ class _KeylessIndexBridge(FakeBridge):
         wanted = None if values is None else values[0]
         return [dict(row) for row in self.rows if row["id"] == wanted][skip:][:limit]
 
-    def read_changes(self, tables, start_lsn, timeout_seconds, max_records, budget=None):
+    def read_changes(
+        self, tables, start_lsn, timeout_seconds, max_records, budget=None, until=None, seconds=None
+    ):
         self.polls = getattr(self, "polls", 0) + 1
         return list(self.changes) + [{"op": "TIMEOUT", "lsn": self.now}]
 
@@ -2437,7 +2441,7 @@ class LakeflowContractTests(unittest.TestCase):
             {"op": "INSERT", "tx_id": 1, "lsn": 5001, "row": {"id": 1, "value": "open"}},
         ]
 
-        def read_changes(captures, start, timeout, max_records, budget=None):
+        def read_changes(captures, start, timeout, max_records, budget=None, **_):
             polls.append(start)
             return again + [{"op": "TIMEOUT", "lsn": start}]
 
@@ -2457,7 +2461,7 @@ class LakeflowContractTests(unittest.TestCase):
         source = _IndexScanSource(random_module.Random(6), transactions=0)
         real, polls = source.read_changes, []
 
-        def read_changes(captures, start, timeout, max_records, budget=None):
+        def read_changes(captures, start, timeout, max_records, budget=None, **_):
             polls.append(start)
             return [] if len(polls) < 4 else real(captures, start, timeout, max_records, budget)
 
@@ -2584,7 +2588,7 @@ class LakeflowContractTests(unittest.TestCase):
         for seed in range(12):
             source = _IndexScanSource(random_module.Random(seed))
             real = source.read_changes
-            source.read_changes = lambda captures, start, timeout, max_records, budget=None: [
+            source.read_changes = lambda captures, start, timeout, max_records, budget=None, **_: [
                 {"op": "TIMEOUT", "lsn": start}
             ]
             with mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0):
@@ -2982,6 +2986,107 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual([record["op"] for record in records], ["TIMEOUT"])
         self.assertEqual(transport.requested, [128, 256, 300, 300, 150, 128, 128])
+
+    def test_an_index_scans_follower_names_where_its_polls_may_stop(self):
+        bridge = _KeylessIndexBridge()
+        polls: list = []
+        read = bridge.read_changes
+
+        def read_changes(tables, start_lsn, timeout_seconds, max_records, **limits):
+            polls.append(limits)
+            return read(tables, start_lsn, timeout_seconds, max_records)
+
+        bridge.read_changes = read_changes
+        table = Table.parse(_table(primary_keys=()), "demo")
+        # Every poll that returns tells the drain's liveness check so, even one that brought
+        # nothing: the follower's own limit, with its own error, bounds the wait.
+        progress: list = []
+        connector = self.connector(bridge)
+        connector._drain_progress = lambda: progress.append(len(polls))
+        self.connector = lambda *args, **kwargs: connector
+        with mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0):
+            self._index_scan(bridge, 50, table=table)
+        self.assertTrue(polls)
+        self.assertEqual(progress, list(range(1, len(polls) + 1)))
+        for limits in polls:
+            # The position it is reading up to, and a time after which to look up.
+            self.assertEqual(limits["budget"], informix_module._INDEX_SCAN_POLL_RECORDS)
+            self.assertGreaterEqual(limits["until"], bridge.now)
+            self.assertEqual(limits["seconds"], informix_module._INDEX_SCAN_POLL_SECONDS)
+
+    def test_a_poll_with_a_budget_stops_past_the_commit_or_the_time_its_caller_names(self):
+        # A table that changes about once a second never lets a CDC session go idle, so a
+        # poll with a large budget ran until the budget was read: an index-ordered snapshot's
+        # follower waited in it until the snapshot was taken for stalled.
+        clock = [1000.0]
+
+        def transaction(tx, lsn):
+            return [
+                {"op": "BEGIN", "tx_id": tx, "lsn": lsn},
+                {"op": "INSERT", "tx_id": tx, "lsn": lsn + 1, "label": 1, "row": {"id": tx}},
+                {"op": "COMMIT", "tx_id": tx, "lsn": lsn + 2},
+            ]
+
+        class TrickleTransport(FakeCdcTransport):
+            overlapping = False
+
+            def __init__(self):
+                super().__init__([])
+                self.next = 0
+
+            def read_lodata(self, descriptor, requested):
+                # One transaction a second, without end.
+                self.next += 1
+                clock[0] += 1.0
+                if not self.overlapping:
+                    return transaction(self.next, 100 * self.next)
+                # Writers that overlap: each read ends with the next transaction begun, so
+                # one is open at every moment.
+                begin, insert, _commit = transaction(self.next, 100 * self.next)
+                following = transaction(self.next + 1, 100 * (self.next + 1))[0]
+                if self.next == 1:
+                    return [begin, insert, following]
+                commit = transaction(self.next - 1, 100 * (self.next - 1))[2]
+                return [commit, insert, following]
+
+        capture = {
+            "identity": "demo:app.orders",
+            "logical_identity": "demo.app.orders",
+            "columns": ["id"],
+            "descriptors": [{"name": "id", "type_name": "INTEGER"}],
+        }
+
+        def poll(overlapping=False, **limits):
+            bridge = object.__new__(PurePythonInformixBridge)
+            bridge.options = {}
+            bridge.transport = TrickleTransport()
+            bridge.transport.overlapping = overlapping
+            with (
+                mock.patch.object(informix_module, "CdcFrameParser", RecordParser),
+                mock.patch.object(
+                    informix_module,
+                    "decode_frame",
+                    side_effect=lambda frame, labels, **_: dict(frame),
+                ),
+                mock.patch.object(informix_module.time, "monotonic", side_effect=lambda: clock[0]),
+            ):
+                records = bridge.read_changes([capture], 90, 5, 256, budget=20_000, **limits)
+            return [record["lsn"] for record in records if record["op"] == "COMMIT"]
+
+        # Past the first commit above the position named, whole transactions only.
+        self.assertEqual(poll(until=350), [102, 202, 302, 402])
+        self.assertEqual(poll(until=402), [102, 202, 302, 402, 502])
+        # After the seconds named.
+        self.assertEqual(len(poll(seconds=10)), 11)
+        # Whichever comes first.
+        self.assertEqual(len(poll(until=10**9, seconds=3)), 4)
+        self.assertEqual(len(poll(until=150, seconds=30)), 2)
+        # Neither named: the budget alone, 20,000 records at three a transaction.
+        self.assertEqual(len(poll()), 6667)
+        # A transaction open at every moment does not hold either stop up, as it does the
+        # budget: the caller resumes from the oldest open transaction.
+        self.assertEqual(poll(overlapping=True, until=350), [102, 202, 302, 402])
+        self.assertEqual(len(poll(overlapping=True, seconds=10)), 10)
 
     def test_a_read_size_below_the_starting_size_is_used_as_it_is(self):
         class SizedTransport(FakeCdcTransport):

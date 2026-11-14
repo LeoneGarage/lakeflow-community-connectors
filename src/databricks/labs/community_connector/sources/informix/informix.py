@@ -551,6 +551,8 @@ _INDEX_SCAN_FOLLOW_ROWS = 200_000
 # would have brought (see _drop_scanned_changes).
 _INDEX_SCAN_FOLLOW_SECONDS = 600
 _INDEX_SCAN_PROOF_SECONDS = 30
+# How long one of the follower's polls may read before it returns for the waits to be checked.
+_INDEX_SCAN_POLL_SECONDS = 30
 # The records one poll for changes reads in its session: a backlog in a few sessions, not
 # one of 256 records each.
 _INDEX_SCAN_POLL_RECORDS = 20_000
@@ -1609,6 +1611,8 @@ class InformixBridge(Protocol):
         timeout_seconds: int,
         max_records: int,
         budget: int | None = None,
+        until: int | None = None,
+        seconds: float | None = None,
     ) -> list[dict[str, Any]]: ...
 
     def release_connection(self) -> None:
@@ -3785,10 +3789,25 @@ class PurePythonInformixBridge:
             return snapshot_lsn, rows
 
     @_serialized_sqli_operation
-    def read_changes(self, tables, start_lsn, timeout_seconds, max_records, budget=None):
+    def read_changes(
+        self,
+        tables,
+        start_lsn,
+        timeout_seconds,
+        max_records,
+        budget=None,
+        until=None,
+        seconds=None,
+    ):
         # ``max_records`` is Informix's cap on one read, and the records a poll stops at;
         # ``budget`` raises the latter, for a caller that wants a backlog in one session.
+        # Such a caller names where the poll stops sooner: at a commit above ``until``, or
+        # after ``seconds``. A table that changes steadily never lets the session go idle,
+        # so without them the poll would run until the budget is read. Unlike the budget,
+        # these stop it with transactions still open, as a table with writers that overlap
+        # always has: the caller resumes from the oldest of them.
         budget = budget or max_records
+        poll_started = time.monotonic()
         self._ensure_connected()
         set_socket_timeout = getattr(self.transport, "set_socket_timeout", None)
         previous_socket_timeout = getattr(self.transport, "socket_timeout", None)
@@ -3844,6 +3863,7 @@ class PurePythonInformixBridge:
             spill = getattr(self, "cdc_spill", None)
             records = []
             budget_records = 0
+            halted = False
             open_transactions = OpenTransactionRecords()
             max_transaction_records = int(self.options.get("cdc.max.transaction.records", "100000"))
             max_poll_records = int(self.options.get("cdc.max.poll.records", "200000"))
@@ -3917,6 +3937,7 @@ class PurePythonInformixBridge:
             # still bounded by Informix's TIMEOUT control frame.
             while (
                 (budget_records < budget or open_transactions)
+                and not halted
                 and empty_reads < 1
                 and not timed_out
                 and not truncated
@@ -4006,6 +4027,8 @@ class PurePythonInformixBridge:
                         budget_records += 1
                     if record["op"] == "COMMIT":
                         completed_transactions += 1
+                        if until is not None and int(record["lsn"]) > until:
+                            halted = True
                     if record["op"] == "BEGIN":
                         open_transactions.begin(tx_id)
                         held_bytes.pop(tx_id, None)
@@ -4041,12 +4064,20 @@ class PurePythonInformixBridge:
                         # session. The checkpoint remains at the last complete
                         # transaction, so a later poll safely replays it.
                         break
+                    if halted:
+                        # As far as the caller asked: what follows is the next poll's.
+                        break
+                halted = halted or (
+                    seconds is not None and time.monotonic() - poll_started > seconds
+                )
             # A poll that reached cdc.max.records with every transaction complete stops on
             # purpose, so its last cdc.read.bytes read can end inside the next record. Like a
             # truncated poll, it leaves that partial frame for the next poll, which
             # replays from the last complete transaction.
             stopped_at_budget = budget_records >= budget and not open_transactions
-            if parser.buffered_bytes and not (timed_out or truncated or stopped_at_budget):
+            if parser.buffered_bytes and not (
+                timed_out or truncated or stopped_at_budget or halted
+            ):
                 # 59: CDC read ended with an incomplete native frame
                 raise InformixError(_m(59))
             return records
@@ -13304,8 +13335,17 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     timeout,
                     _DEFAULT_CDC_MAX_RECORDS,
                     budget=_INDEX_SCAN_POLL_RECORDS,
+                    # A table that keeps changing never lets the session go idle: the poll
+                    # ends at the first commit past the target, or to let the waits below
+                    # be checked.
+                    until=target,
+                    seconds=_INDEX_SCAN_POLL_SECONDS,
                 )
                 committed, _caught_up, open_begin, reached = _transaction_batch(records)
+                if self._drain_progress is not None:
+                    # A poll that returned shows the reader is not hung, whatever it
+                    # brought: this wait has its own limit, below, and its own error.
+                    self._drain_progress()
                 # A poll that went idle has handed over every commit there is. A transaction
                 # still open does not hold that up: the scan reads committed rows only, so
                 # its changes are in no page, and it commits after the scan.
