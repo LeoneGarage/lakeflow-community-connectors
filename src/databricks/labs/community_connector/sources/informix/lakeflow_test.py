@@ -584,6 +584,8 @@ class _IndexScanSource:
         # earlier one there.
         self.quiet = quiet
         self.clock = 1_700_000_000
+        self.pending: list[tuple[int, list[dict]]] = []
+        self.started = False
         self.left = transactions
         self.hot_key = hot_key
         self.descending = descending
@@ -613,11 +615,11 @@ class _IndexScanSource:
                 sign = 1 if record["op"] == "INSERT" else -1
                 yield begins[record["tx_id"]], sign, self.text(record["row"])
 
-    def _write(self, op, **fields):
+    def _write(self, op, tx=None, **fields):
         self.lsn += self.random.randint(1, 3) if self.quiet else self.random.randint(8, 40)
         if op == "COMMIT":
             fields["timestamp"] = self.clock
-        self.log.append({"op": op, "tx_id": self.tx_id, "lsn": self.lsn, **fields})
+        self.log.append({"op": op, "tx_id": tx or self.tx_id, "lsn": self.lsn, **fields})
 
     def current_utc_time(self):
         # Every later commit is later by the clock.
@@ -625,6 +627,19 @@ class _IndexScanSource:
         return self.clock - 1
 
     def _tick(self):
+        # A transaction left open commits some gaps later: its rows show only then.
+        if self.pending and self.random.random() < 0.3:
+            tx, rows = self.pending.pop()
+            self.rows.extend(rows)
+            self._write("COMMIT", tx=tx)
+        elif not self.pending and not self.hot_key and self.left > 0 and self.random.random() < 0.1:
+            self.left -= 1
+            self.tx_id += 1
+            rows = [{"id": self.random.randint(1, 24), "value": "open"} for _ in range(2)]
+            self._write("BEGIN")
+            for row in rows:
+                self._write("INSERT", row=dict(row))
+            self.pending.append((self.tx_id, rows))
         # Maybe commit a transaction: replace a key's rows, or add to them.
         # A hot key changes once in every gap.
         once = iter([True])
@@ -654,6 +669,14 @@ class _IndexScanSource:
 
     def boundary_lsn(self):
         self._tick()
+        if not self.started:
+            # The snapshot LSN: nothing is open across it. A transaction that is, and that
+            # has already changed the table, is one the snapshot does not reconcile.
+            self.started = True
+            while self.pending:
+                tx, rows = self.pending.pop()
+                self.rows.extend(rows)
+                self._write("COMMIT", tx=tx)
         return self.lsn // self.PAGE * self.PAGE
 
     def current_lsn(self):
@@ -688,10 +711,24 @@ class _IndexScanSource:
         self._tick()
         return rows
 
-    def read_changes(self, captures, start, timeout, max_records):
+    def read_changes(self, captures, start, timeout, max_records, budget=None):
         self._tick()
+        # A session started at an LSN hands over the transactions that begin at or after
+        # it, whole, and those still open as far as they have got.
         begins = {r["tx_id"]: r["lsn"] for r in self.log if r["op"] == "BEGIN"}
-        records = [dict(record) for record in self.log if begins[record["tx_id"]] > start]
+        records = [dict(record) for record in self.log if begins[record["tx_id"]] >= start]
+        # A backlog: the poll fills its budget and goes on in the next one. It stops only
+        # where no transaction it has read is open, as a poll past its budget reads on
+        # until then.
+        take, open_now = self.random.randint(1, 4), set()
+        for at, record in enumerate(records[:-1]):
+            if record["op"] == "BEGIN":
+                open_now.add(record["tx_id"])
+            elif record["op"] == "COMMIT":
+                open_now.discard(record["tx_id"])
+                take -= 1
+                if take <= 0 and not open_now and not self.pending:
+                    return records[: at + 1]
         # An idle session reports the last checkpoint's position; one happens here, unless
         # the log is quiet.
         self.lsn += 0 if self.quiet else self.PAGE
@@ -699,6 +736,16 @@ class _IndexScanSource:
 
     def buffered_logging(self):
         return False
+
+    def history(self, start):
+        """Every change from ``start`` on, once the transaction left open has committed."""
+        self.left = 0
+        while self.pending:
+            tx, rows = self.pending.pop()
+            self.rows.extend(rows)
+            self._write("COMMIT", tx=tx)
+        begins = {r["tx_id"]: r["lsn"] for r in self.log if r["op"] == "BEGIN"}
+        return [dict(record) for record in self.log if begins[record["tx_id"]] >= start]
 
 
 class LakeflowContractTests(unittest.TestCase):
@@ -2069,7 +2116,7 @@ class LakeflowContractTests(unittest.TestCase):
                 boundary, staged, scan, connector, table = self._index_scan(
                     source, random.choice([3, 5, 50])
                 )
-            records = source.read_changes(None, boundary, 1, 256)
+            records = source.history(boundary)
             transactions = informix_module._transaction_batch(records)[0]
             connector._read_snapshot_stage_manifest = lambda *_: scan
             connector._offset_scopes = lambda checkpoint: ("scope", "scope")
@@ -2173,7 +2220,7 @@ class LakeflowContractTests(unittest.TestCase):
             def key_rows(self, identity, columns, keys, values, isolation, limit=None):
                 return [dict(row) for row in self.rows if row["id"] == values[0]]
 
-            def read_changes(self, tables, start_lsn, timeout_seconds, max_records):
+            def read_changes(self, tables, start_lsn, timeout_seconds, max_records, budget=None):
                 return list(self.changes) + [{"op": "TIMEOUT", "lsn": self.now}]
 
         def insert(tx, lsn, key, seconds=0):
@@ -2266,6 +2313,40 @@ class LakeflowContractTests(unittest.TestCase):
         later = informix_module._index_scan_order((*key[:3], 8), descending)
         self.assertLess(later, order)
 
+    def test_a_transaction_left_open_does_not_hold_an_index_scan_up(self):
+        # A transaction that has changed the table and stays open through the scan. The scan
+        # reads committed rows only, so its changes are in no page, and it commits after the
+        # scan: the stream's. Waiting for it would fail the snapshot of any table a long
+        # transaction is running on.
+        source = _IndexScanSource(random_module.Random(9), transactions=0)
+        source.random.random = lambda: 0.99  # it does not commit while the scan runs
+        sample = source.boundary_lsn
+
+        def boundary_lsn():
+            # It begins right after the snapshot LSN is taken.
+            lsn = sample()
+            if source.tx_id == 0:
+                source.tx_id = 1
+                source._write("BEGIN")
+                source._write("INSERT", row={"id": 3, "value": "open"})
+                source.pending.append((1, [{"id": 3, "value": "open"}]))
+            return lsn
+
+        source.boundary_lsn = boundary_lsn
+        with (
+            mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0),
+            mock.patch.object(informix_module, "_INDEX_SCAN_FOLLOW_SECONDS", 2),
+        ):
+            boundary, staged, scan, connector, table = self._index_scan(source, 5)
+        self.assertNotIn("open", [row["value"] for row in staged])
+        transactions = informix_module._transaction_batch(source.history(boundary))[0]
+        connector._read_snapshot_stage_manifest = lambda *_: scan
+        connector._offset_scopes = lambda checkpoint: ("scope", "scope")
+        kept = connector._drop_scanned_changes(
+            table, {"commit_lsn": str(boundary), "schema_id": "s"}, {}, transactions
+        )
+        self.assertEqual([len(tx.records) for tx in kept], [1])
+
     def test_the_stream_fails_on_a_change_a_stalled_cdc_kept_from_the_scan(self):
         # A server whose CDC has stalled answers every poll as an idle one, and a quiet
         # table's session proves nothing until the next checkpoint. So the scan waits for
@@ -2276,13 +2357,13 @@ class LakeflowContractTests(unittest.TestCase):
         for seed in range(12):
             source = _IndexScanSource(random_module.Random(seed))
             real = source.read_changes
-            source.read_changes = lambda captures, start, timeout, max_records: [
+            source.read_changes = lambda captures, start, timeout, max_records, budget=None: [
                 {"op": "TIMEOUT", "lsn": start}
             ]
             with mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0):
                 boundary, staged, scan, connector, table = self._index_scan(source, 5)
             self.assertEqual(scan["index_scan"]["suppress"], [])
-            transactions = informix_module._transaction_batch(real(None, boundary, 1, 256))[0]
+            transactions = informix_module._transaction_batch(source.history(boundary))[0]
             connector._read_snapshot_stage_manifest = lambda *_, scan=scan: scan
             connector._offset_scopes = lambda checkpoint: ("scope", "scope")
             try:

@@ -551,6 +551,9 @@ _INDEX_SCAN_FOLLOW_ROWS = 200_000
 # would have brought (see _drop_scanned_changes).
 _INDEX_SCAN_FOLLOW_SECONDS = 600
 _INDEX_SCAN_PROOF_SECONDS = 30
+# The records one poll for changes reads in its session: a backlog in a few sessions, not
+# one of 256 records each.
+_INDEX_SCAN_POLL_RECORDS = 20_000
 # The most rows one index key may have: they are read and staged together.
 _INDEX_SCAN_KEY_ROWS = 1_000_000
 _INDEX_SCAN_SETTLE_ATTEMPTS = 5
@@ -3767,7 +3770,10 @@ class PurePythonInformixBridge:
             return snapshot_lsn, rows
 
     @_serialized_sqli_operation
-    def read_changes(self, tables, start_lsn, timeout_seconds, max_records):
+    def read_changes(self, tables, start_lsn, timeout_seconds, max_records, budget=None):
+        # ``max_records`` is Informix's cap on one read, and the records a poll stops at;
+        # ``budget`` raises the latter, for a caller that wants a backlog in one session.
+        budget = budget or max_records
         self._ensure_connected()
         set_socket_timeout = getattr(self.transport, "set_socket_timeout", None)
         previous_socket_timeout = getattr(self.transport, "socket_timeout", None)
@@ -3895,7 +3901,7 @@ class PurePythonInformixBridge:
             # native boundary can make progress. An idle open transaction is
             # still bounded by Informix's TIMEOUT control frame.
             while (
-                (budget_records < max_records or open_transactions)
+                (budget_records < budget or open_transactions)
                 and empty_reads < 1
                 and not timed_out
                 and not truncated
@@ -4024,7 +4030,7 @@ class PurePythonInformixBridge:
             # purpose, so its last cdc.read.bytes read can end inside the next record. Like a
             # truncated poll, it leaves that partial frame for the next poll, which
             # replays from the last complete transaction.
-            stopped_at_budget = budget_records >= max_records and not open_transactions
+            stopped_at_budget = budget_records >= budget and not open_transactions
             if parser.buffered_bytes and not (timed_out or truncated or stopped_at_budget):
                 # 59: CDC read ended with an incomplete native frame
                 raise InformixError(_m(59))
@@ -13234,12 +13240,20 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # until the next checkpoint. When it is not ``strict``, the wait for proof is
             # short and an idle poll is taken in the end.
             nonlocal start, last_commit
-            deadline = time.monotonic() + (
-                _INDEX_SCAN_FOLLOW_SECONDS if strict else _INDEX_SCAN_PROOF_SECONDS
-            )
+            began = time.monotonic()
             while True:
-                records = bridge.read_changes([capture], start, timeout, _DEFAULT_CDC_MAX_RECORDS)
-                committed, caught_up, open_begin, reached = _transaction_batch(records)
+                records = bridge.read_changes(
+                    [capture],
+                    start,
+                    timeout,
+                    _DEFAULT_CDC_MAX_RECORDS,
+                    budget=_INDEX_SCAN_POLL_RECORDS,
+                )
+                committed, _caught_up, open_begin, reached = _transaction_batch(records)
+                # A poll that went idle has handed over every commit there is. A transaction
+                # still open does not hold that up: the scan reads committed rows only, so
+                # its changes are in no page, and it commits after the scan.
+                idle = reached is not None
                 for tx in committed:
                     if tx.commit_lsn <= last_commit:
                         continue
@@ -13285,11 +13299,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                                     raw[key] = [row[name] for name in keys]
                 # As the stream restarts: at the oldest open BEGIN, else the last commit.
                 start = open_begin if open_begin is not None else max(start, last_commit)
-                if last_commit > target or (caught_up and (not proof or (reached or 0) >= target)):
+                if last_commit > target or (idle and (not proof or reached >= target)):
                     break
-                if time.monotonic() > deadline:
-                    if caught_up and not strict:
-                        break
+                # The short wait is for proof alone: a backlog is read to its end first.
+                waited = time.monotonic() - began
+                if idle and not strict and waited > _INDEX_SCAN_PROOF_SECONDS:
+                    break
+                if waited > _INDEX_SCAN_FOLLOW_SECONDS:
                     # 435: The index-ordered snapshot stopped waiting for
                     # Informix CDC to reach the snapshot's position for '{}'
                     # after {} seconds
