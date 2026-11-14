@@ -2942,7 +2942,10 @@ class LakeflowContractTests(unittest.TestCase):
         # full-size read under a steady trickle waited 25-33 s on the demo server and timed
         # the socket out. So a poll starts at 128 bytes, the smallest read Informix accepts,
         # doubles the read while reads come back full at once, up to cdc.read.bytes, and
-        # halves it after a read that waited.
+        # goes back to the start after a read that waited: the backlog is read by then, and
+        # a larger read would wait for the table's own pace again. The read that found the
+        # backlog's end is still the size the backlog earned, so each read's socket timeout
+        # is what its size can take: cdc.timeout for each record it may need.
         clock = [1000.0]
         # (bytes returned, seconds the read took)
         plan = [(128, 0.01), (256, 0.01), (300, 0.01), (100, 3.0), (10, 3.0), (5, 3.0)]
@@ -2951,9 +2954,21 @@ class LakeflowContractTests(unittest.TestCase):
             def __init__(self):
                 super().__init__([])
                 self.requested = []
+                self.socket_timeout = 30.0
+                self.timeouts = []
+                self.ending = []
+
+            def set_socket_timeout(self, timeout):
+                self.socket_timeout = timeout
+
+            def execute(self, sql, parameters=()):
+                if "cdc_endcapture" in sql or "cdc_closesess" in sql:
+                    self.ending.append(self.socket_timeout)
+                return super().execute(sql, parameters)
 
             def read_lodata(self, descriptor, requested):
                 self.requested.append(requested)
+                self.timeouts.append(self.socket_timeout)
                 if not plan:
                     return b"T"
                 size, seconds = plan.pop(0)
@@ -2985,7 +3000,14 @@ class LakeflowContractTests(unittest.TestCase):
             records = bridge.read_changes([capture], 90, 5, 256)
 
         self.assertEqual([record["op"] for record in records], ["TIMEOUT"])
-        self.assertEqual(transport.requested, [128, 256, 300, 300, 150, 128, 128])
+        self.assertEqual(transport.requested, [128, 256, 300, 300, 128, 128, 128])
+        # 5 s for each record of at least 16 bytes the read may need, and 5 s over; the
+        # timeout from before the poll is back afterwards.
+        self.assertEqual(transport.timeouts, [50.0, 90.0, 100.0, 100.0, 50.0, 50.0, 50.0])
+        # The calls that end the session answer at once or have stalled: they run under
+        # the session's own timeout, not the last read's.
+        self.assertEqual(transport.ending, [30.0, 30.0])
+        self.assertEqual(transport.socket_timeout, 30.0)
 
     def test_an_index_scans_follower_names_where_its_polls_may_stop(self):
         bridge = _KeylessIndexBridge()

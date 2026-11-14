@@ -6077,10 +6077,19 @@ def register_lakeflow_source(spark):
     # read therefore waits for the cap, however long that takes, and can outlast the socket
     # timeout. So a poll starts with a small read, which the first record or two fill, and
     # doubles it up to cdc.read.bytes while reads come back full at once (a backlog); a read
-    # that waited halves it again. 128 bytes is the smallest read Informix accepts (a smaller
-    # one fails with ISAM error -1); a read may end inside a record, which the frame parser
-    # carries over to the next.
+    # that waited puts it back to the start. 128 bytes is the smallest read Informix accepts (a
+    # smaller one fails with ISAM error -1); a read may end inside a record, which the frame
+    # parser carries over to the next.
+    #
+    # The read that follows the end of a backlog is the size the backlog earned, and has only
+    # the trickle to fill it: it waits. Each record arrives within cdc.timeout of the one before
+    # (or the session goes idle and the read returns), and the read returns at the record cap,
+    # so it can take up to cdc.timeout for each record it needs. The socket timeout of a read is
+    # set to that, counting a record for every _CDC_RECORD_MIN_BYTES asked for: under a minute
+    # for a read at the start size, the whole record cap's worth for a large one.
     _CDC_READ_START_BYTES = 128
+    # The header every CDC record starts with: no record is smaller.
+    _CDC_RECORD_MIN_BYTES = 16
     _CDC_READ_GROW_SECONDS = 0.2
     _CDC_READ_SHRINK_SECONDS = 1.0
     # An open transaction holding more change records than cdc.spill.records in one poll has
@@ -9601,12 +9610,14 @@ def register_lakeflow_source(spark):
             labels: dict[int, tuple[ColumnDescriptor, ...]] = {}
             captures = []
             try:
+                # The socket timeout in force: the session's own for its calls, and for each
+                # read what its size can take.
+                socket_timeout = session_timeout = None
                 if set_socket_timeout is not None:
-                    # A read at the smallest size can wait for two records, each up to the
-                    # session timeout after the last.
-                    set_socket_timeout(
-                        max(float(previous_socket_timeout or 30), 2 * timeout_seconds + 5.0)
+                    socket_timeout = session_timeout = max(
+                        float(previous_socket_timeout or 30), 2 * timeout_seconds + 5.0
                     )
+                    set_socket_timeout(socket_timeout)
                 for label, capture in enumerate(tables, 1):
                     native = capture["identity"]
                     columns = tuple(capture["columns"])
@@ -9717,13 +9728,24 @@ def register_lakeflow_source(spark):
                     and not timed_out
                     and not truncated
                 ):
+                    if socket_timeout is not None:
+                        # As long as this read can take: cdc.timeout for each record it needs.
+                        needed = min(max_records, requested // _CDC_RECORD_MIN_BYTES + 1)
+                        wanted = max(
+                            float(previous_socket_timeout or 30), timeout_seconds * needed + 5.0
+                        )
+                        if wanted != socket_timeout:
+                            socket_timeout = wanted
+                            set_socket_timeout(wanted)
                     read_started = time.monotonic()
                     chunk = self.transport.read_lodata(session, requested)
                     read_seconds = time.monotonic() - read_started
                     if len(chunk) >= requested and read_seconds < _CDC_READ_GROW_SECONDS:
                         requested = min(read_bytes, requested * 2)
                     elif read_seconds > _CDC_READ_SHRINK_SECONDS:
-                        requested = max(min(read_bytes, _CDC_READ_START_BYTES), requested // 2)
+                        # The backlog is read: what comes now comes at the table's own pace,
+                        # and a read any larger than the start waits for it again.
+                        requested = min(read_bytes, _CDC_READ_START_BYTES)
                     if not chunk:
                         empty_reads += 1
                         continue
@@ -9858,6 +9880,13 @@ def register_lakeflow_source(spark):
                 return records
             finally:
                 cleanup_errors = []
+                if set_socket_timeout is not None and socket_timeout != session_timeout:
+                    # A large read's timeout is not for the calls that end the session: they
+                    # answer at once or have stalled.
+                    try:
+                        set_socket_timeout(session_timeout)
+                    except Exception as error:
+                        cleanup_errors.append(error)
                 lease_lost = getattr(self, "_connection_lease_lost", None)
                 if lease_lost is None or not lease_lost.is_set():
                     for native in captures:
