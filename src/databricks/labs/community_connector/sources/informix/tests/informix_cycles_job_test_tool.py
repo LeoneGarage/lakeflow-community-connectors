@@ -21,6 +21,13 @@
 # goes through AWS SSM on the demo host, with keys from the informix-cycles secret scope;
 # the compare tools staged next to this notebook do the Informix work exactly as on a laptop.
 #
+# A pipeline update that ends FAILED, in any run of a cycle, fails the whole run. A failed
+# full refresh resets nothing, so the targets and checkpoints of the cycle before would meet
+# a rebuilt source; and a later update's failure is a finding of its own, which the runs
+# after it would only bury. The cycle is recorded as PIPELINE FAILED with the update's
+# error, the pipeline is stopped (which also ends the retry it starts by itself), and the
+# notebook raises.
+#
 # A cycle that ends in MISMATCH or NO RESUME cancels the cycles after it: the next cycle
 # would restart the container, which rebuilds testdb and loses the source state the
 # mismatch has to be diagnosed against. The pipeline is already stopped for the compares
@@ -330,12 +337,16 @@ def run_for(cycle, label, update_id, seconds, from_creation=True, until_drained=
         # for the drains can also end by itself after RUN_MINUTES.
         when = f"before {seconds // 60}" if time.time() < deadline else f"after {minutes}"
         event(cycle, "ended", f"{label}: update {update_id} ended {when} minutes: {state}")
+        if state == "FAILED":
+            fail_pipeline(cycle, label, update_id)
         return state
     event(
         cycle, "stopping", f"{label}: stopping update {update_id} after {minutes} minutes ({state})"
     )
     state = stop_update(cycle, label, update_id)
     event(cycle, "ended", f"{label}: update {update_id} final state {state}")
+    if state == "FAILED":
+        fail_pipeline(cycle, label, update_id)
     return state
 
 
@@ -403,7 +414,7 @@ def stop_part_way(cycle, label, update_id):
         f"{label}: stopped update {update_id} ({state}) with {pages} pages of "
         f"{RESUME_TABLE} recorded",
     )
-    return {"pages": pages, "update": update_id}
+    return {"pages": pages, "update": update_id, "state": state}
 
 
 def resume_check(cycle, stopped, update_id):
@@ -443,6 +454,52 @@ def resume_check(cycle, stopped, update_id):
 
 # COMMAND ----------
 # The cycle's steps.
+def save_result(cycle, verdict, first="", extra=False, final="", line="", details=()):
+    spark.createDataFrame(
+        [
+            (
+                RUN_ID,
+                dt.datetime.now(dt.timezone.utc).replace(tzinfo=None),
+                cycle,
+                verdict,
+                first,
+                extra,
+                final,
+                line,
+                json.dumps(details, default=str)[:20000],
+            )
+        ],
+        "run_id string, at timestamp, cycle int, verdict string, first_count string, "
+        "extra_run boolean, final_count string, data_compare string, details string",
+    ).write.mode("append").saveAsTable(RESULTS)
+
+
+class PipelineFailed(RuntimeError):
+    pass
+
+
+def fail_pipeline(cycle, label, update_id):
+    # An update ended FAILED: record it with its error and fail the run (see the top).
+    # The update's own error, for the record: the first one its event log holds.
+    try:
+        row = spark.sql(
+            f"SELECT message, error.exceptions[0].message AS cause "
+            f"FROM event_log('{PIPELINE_ID}') "
+            f"WHERE origin.update_id = '{update_id}' AND level = 'ERROR' "
+            f"ORDER BY timestamp LIMIT 1"
+        ).first()
+        cause = "" if row is None else f"{row['message']} {(row['cause'] or '')[-600:]}"
+    except Exception as error:  # noqa: BLE001 - the failure is reported either way
+        cause = f"(its error could not be read: {error})"
+    message = f"{label}: update {update_id} FAILED; failing the run. {cause}"[:2000]
+    event(cycle, "failed", message)
+    save_result(cycle, "PIPELINE FAILED", line=message)
+    # Also ends the retry the pipeline starts by itself.
+    stop_and_wait()
+    event(0, "summary", f"run failed in cycle {cycle}: {label}: a pipeline update failed")
+    raise PipelineFailed(message)
+
+
 def restart_container(cycle):
     event(cycle, "restart", "restarting the Informix container")
     status = ssm(
@@ -476,6 +533,8 @@ def pipeline_runs(cycle):
         if full_refresh and RESUME_TEST:
             stopped = stop_part_way(cycle, f"run {run}", update_id)
             if stopped:
+                if stopped["state"] == "FAILED":
+                    fail_pipeline(cycle, f"run {run}", update_id)
                 continue
         # The run after a stopped full refresh has the keyless tables' snapshots to finish.
         run_for(
@@ -517,15 +576,11 @@ def pipeline_runs(cycle):
 
 
 def extra_run(cycle):
-    # One more continuous run; an update that fails early starts again for the rest of it.
-    deadline = time.time() + EXTRA_SECONDS
-    for attempt in range(1, 6):
-        event(cycle, "starting", f"extra run: starting continuous update (attempt {attempt})")
-        update_id = start_update(cycle, "extra run")
-        event(cycle, "started", f"extra run: started continuous update {update_id}")
-        state = run_for(cycle, "extra run", update_id, max(60, int(deadline - time.time())), False)
-        if state != "FAILED" or time.time() > deadline - 60:
-            return
+    # One more continuous run. An update that fails fails the run, as in any other.
+    event(cycle, "starting", "extra run: starting continuous update")
+    update_id = start_update(cycle, "extra run")
+    event(cycle, "started", f"extra run: started continuous update {update_id}")
+    run_for(cycle, "extra run", update_id, EXTRA_SECONDS, False)
 
 
 def count_compare(cycle):
@@ -657,23 +712,7 @@ for cycle in range(1, CYCLES + 1):
         + (f" | resume: {resume}" if resume else "")
     )
     event(cycle, "result", message)
-    spark.createDataFrame(
-        [
-            (
-                RUN_ID,
-                dt.datetime.now(dt.timezone.utc).replace(tzinfo=None),
-                cycle,
-                verdict,
-                first,
-                extra,
-                final,
-                line,
-                json.dumps(details, default=str)[:20000],
-            )
-        ],
-        "run_id string, at timestamp, cycle int, verdict string, first_count string, "
-        "extra_run boolean, final_count string, data_compare string, details string",
-    ).write.mode("append").saveAsTable(RESULTS)
+    save_result(cycle, verdict, first, extra, final, line, details)
     summary.append((cycle, verdict))
     if verdict != "MATCH" and STOP_ON_MISMATCH and cycle < CYCLES:
         event(
