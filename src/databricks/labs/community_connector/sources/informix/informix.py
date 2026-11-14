@@ -13243,9 +13243,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             nonlocal start, last_commit
             began = time.monotonic()
             idle_since = None
-            stuck = 0
             while True:
-                held = (start, last_commit)
                 records = bridge.read_changes(
                     [capture],
                     start,
@@ -13305,23 +13303,6 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 start = open_begin if open_begin is not None else max(start, last_commit)
                 if last_commit > target or (idle and (not proof or reached >= target)):
                     break
-                # A poll that read all it may and brought nothing new, from where the last one
-                # began: it filled up behind a transaction still open, and the next will read
-                # the same. Twice in a row, so that one committing meanwhile lets it past. A
-                # poll that ended short of that for any other reason is just taken again.
-                full = len(records) >= _INDEX_SCAN_POLL_RECORDS
-                stuck = stuck + 1 if full and held == (start, last_commit) else 0
-                if stuck > 1:
-                    # 433: The index-ordered snapshot of a keyless table does
-                    # not support {} on '{}'; set snapshot.scan=cursor to read
-                    # the table without index order
-                    raise InformixError(
-                        _m(
-                            433,
-                            "a transaction left open over more changes than cdc.max.poll.records",
-                            table.exposed_name,
-                        )
-                    )
                 # The short wait is for proof alone, from the first idle poll: a backlog is
                 # read to its end first.
                 now = time.monotonic()
@@ -13331,7 +13312,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 if now - began > _INDEX_SCAN_FOLLOW_SECONDS:
                     # 435: The index-ordered snapshot stopped waiting for
                     # Informix CDC to reach the snapshot's position for '{}'
-                    # after {} seconds
+                    # after {} seconds; a transaction left open on the table
+                    # with more changes behind it than cdc.max.poll.records
+                    # keeps it from getting there
                     raise InformixError(_m(435, table.exposed_name, _INDEX_SCAN_FOLLOW_SECONDS))
             for key, changed in fresh.items():
                 if key in settled:

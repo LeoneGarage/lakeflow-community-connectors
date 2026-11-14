@@ -2347,30 +2347,30 @@ class LakeflowContractTests(unittest.TestCase):
         )
         self.assertEqual([len(tx.records) for tx in kept], [1])
 
-    def test_an_index_scan_fails_soon_behind_a_transaction_it_cannot_read_past(self):
-        # A transaction left open with more changes behind it than one poll reads: every
-        # poll starts at it again, fills up, and brings nothing new. The second such poll
-        # in a row fails the scan, by name, not ten minutes of them.
+    def test_an_idle_follower_behind_an_open_transaction_is_caught_up(self):
+        # A transaction left open over many changes already read: every poll starts at it
+        # again, reads them all again, and goes idle with nothing new. That is a follower
+        # that has caught up, however much it read again, and the scan's wait for proof
+        # polls it several times.
         source = _IndexScanSource(random_module.Random(6), transactions=0)
-        full = [
+        real, polls = source.read_changes, []
+        again = [
             {"op": "BEGIN", "tx_id": 1, "lsn": 5000},
             {"op": "INSERT", "tx_id": 1, "lsn": 5001, "row": {"id": 1, "value": "open"}},
         ]
-        polls = []
 
         def read_changes(captures, start, timeout, max_records, budget=None):
             polls.append(start)
-            return [dict(record) for record in full]
+            return again + [{"op": "TIMEOUT", "lsn": start}]
 
         source.read_changes = read_changes
         with (
             mock.patch.object(informix_module, "_INDEX_SCAN_POLL_RECORDS", 2),
-            self.assertRaisesRegex(InformixError, "left open over more changes"),
+            mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0.05),
         ):
-            self._index_scan(source, 5)
-        # The first poll moves the follower back to the open transaction; the next two
-        # start there and bring nothing new.
-        self.assertEqual(len(polls), 3)
+            boundary, staged, _scan, _connector, _table = self._index_scan(source, 50)
+        self.assertEqual(len(staged), len(source.rows))
+        self.assertGreaterEqual(len(polls), 2)
 
     def test_an_index_scan_takes_a_poll_that_ended_short_again(self):
         # A poll can end with no timeout record and nothing new without being full: a read

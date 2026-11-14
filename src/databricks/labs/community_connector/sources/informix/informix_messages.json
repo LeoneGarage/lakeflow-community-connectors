@@ -434,7 +434,7 @@
 "Option snapshot.scan=keyset(...) names columns to page '{}' by, but the table has a key and pages by that; change the key with primary.keys instead",
 "The index-ordered snapshot of a keyless table does not support {} on '{}'; set snapshot.scan=cursor to read the table without index order",
 "The index-ordered snapshot could not settle {} key(s) of '{}' after {} re-reads because they kept changing; run the snapshot when the table is quieter, or set snapshot.scan=cursor",
-"The index-ordered snapshot stopped waiting for Informix CDC to reach the snapshot's position for '{}' after {} seconds",
+"The index-ordered snapshot stopped waiting for Informix CDC to reach the snapshot's position for '{}' after {} seconds; a transaction left open on the table with more changes behind it than cdc.max.poll.records keeps it from getting there",
 "The index-ordered snapshot cannot tell which changes to a key of '{}' its scan saw: the rows staged for the key do not fit the key's changes",
 "Informix snapshot of keyless table '{}' reads without index order because it has {}; a row that changes during the snapshot can then be in its change log twice, or not at all",
 "A change to keyless table '{}' committed while its snapshot was reading the rows it applies to, and reached Informix CDC only after the snapshot was staged, so the change log may hold it twice or not at all; run a full refresh"
