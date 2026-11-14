@@ -1,0 +1,12 @@
+{
+  "name": "informix-pipeline",
+  "catalog": "<catalog>",
+  "schema": "connector_bronze",
+  "serverless": true,
+  "continuous": false,
+  "development": false,
+  "channel": "CURRENT",
+  "root_path": "<workspace path of this repository's Git folder>/src",
+  "libraries": [{"file": {"path": "<workspace path of informix_pipeline_test_ingest.py>"}}],
+  "configuration": {"pipelines.enableTypeWidening": "true"}
+}
