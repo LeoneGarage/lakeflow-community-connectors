@@ -19018,6 +19018,7 @@ def register_lakeflow_source(spark):
                 nonlocal start, last_commit
                 began = time.monotonic()
                 idle_since = None
+                stuck = 0
                 while True:
                     held = (start, last_commit)
                     records = bridge.read_changes(
@@ -19079,9 +19080,13 @@ def register_lakeflow_source(spark):
                     start = open_begin if open_begin is not None else max(start, last_commit)
                     if last_commit > target or (idle and (not proof or reached >= target)):
                         break
-                    if not idle and held == (start, last_commit):
-                        # A poll that filled up behind a transaction still open, and brought
-                        # nothing new: the next would start there again and read the same.
+                    # A poll that read all it may and brought nothing new, from where the last one
+                    # began: it filled up behind a transaction still open, and the next will read
+                    # the same. Twice in a row, so that one committing meanwhile lets it past. A
+                    # poll that ended short of that for any other reason is just taken again.
+                    full = len(records) >= _INDEX_SCAN_POLL_RECORDS
+                    stuck = stuck + 1 if full and held == (start, last_commit) else 0
+                    if stuck > 1:
                         # 433: The index-ordered snapshot of a keyless table does
                         # not support {} on '{}'; set snapshot.scan=cursor to read
                         # the table without index order

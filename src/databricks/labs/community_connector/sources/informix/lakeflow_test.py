@@ -2347,20 +2347,46 @@ class LakeflowContractTests(unittest.TestCase):
         )
         self.assertEqual([len(tx.records) for tx in kept], [1])
 
-    def test_an_index_scan_fails_at_once_behind_a_transaction_it_cannot_read_past(self):
+    def test_an_index_scan_fails_soon_behind_a_transaction_it_cannot_read_past(self):
         # A transaction left open with more changes behind it than one poll reads: every
-        # poll starts at it again, fills up, and brings nothing new. That fails at the
-        # second such poll, by name, not after ten minutes of them.
+        # poll starts at it again, fills up, and brings nothing new. The second such poll
+        # in a row fails the scan, by name, not ten minutes of them.
         source = _IndexScanSource(random_module.Random(6), transactions=0)
         full = [
             {"op": "BEGIN", "tx_id": 1, "lsn": 5000},
             {"op": "INSERT", "tx_id": 1, "lsn": 5001, "row": {"id": 1, "value": "open"}},
         ]
-        source.read_changes = lambda captures, start, timeout, max_records, budget=None: [
-            dict(record) for record in full
-        ]
-        with self.assertRaisesRegex(InformixError, "left open over more changes"):
+        polls = []
+
+        def read_changes(captures, start, timeout, max_records, budget=None):
+            polls.append(start)
+            return [dict(record) for record in full]
+
+        source.read_changes = read_changes
+        with (
+            mock.patch.object(informix_module, "_INDEX_SCAN_POLL_RECORDS", 2),
+            self.assertRaisesRegex(InformixError, "left open over more changes"),
+        ):
             self._index_scan(source, 5)
+        # The first poll moves the follower back to the open transaction; the next two
+        # start there and bring nothing new.
+        self.assertEqual(len(polls), 3)
+
+    def test_an_index_scan_takes_a_poll_that_ended_short_again(self):
+        # A poll can end with no timeout record and nothing new without being full: a read
+        # that came back empty. That is not a transaction in the way; the follower polls
+        # again.
+        source = _IndexScanSource(random_module.Random(6), transactions=0)
+        real, polls = source.read_changes, []
+
+        def read_changes(captures, start, timeout, max_records, budget=None):
+            polls.append(start)
+            return [] if len(polls) < 4 else real(captures, start, timeout, max_records, budget)
+
+        source.read_changes = read_changes
+        boundary, staged, _scan, _connector, _table = self._index_scan(source, 50)
+        self.assertEqual(len(staged), len(source.rows))
+        self.assertGreater(len(polls), 3)
 
     def test_the_stream_fails_on_a_change_a_stalled_cdc_kept_from_the_scan(self):
         # A server whose CDC has stalled answers every poll as an idle one, and a quiet
