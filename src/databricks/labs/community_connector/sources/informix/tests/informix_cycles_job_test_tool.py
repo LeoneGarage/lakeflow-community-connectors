@@ -7,19 +7,30 @@
 # compare again; then compare the data. The full refresh runs past RUN_MINUTES when the
 # keyless tables (DRAIN_TABLES) have not drained by then, so their snapshots never restart.
 #
+# With resume_test=true (the default) the full refresh is instead stopped on purpose, part-way
+# through the index-ordered snapshot of RESUME_TABLE: as soon as that scan has recorded a few
+# pages on the staging Volume. The triggered update after it must go on from the last page
+# instead of reading the table again, and runs until the keyless tables have drained. Whether
+# it did shows in the target: a snapshot row carries the time its scan began, which is before
+# the second update started only if that update took the first one's scan up. The outcome is
+# part of the cycle's verdict (NO RESUME when the second update started the scan over), next
+# to the compares, which show that the resumed snapshot and the stream still add up.
+#
 # Every pipeline start and end, each cycle's verdict and the final summary go to the run's
 # output and to main.informix_cycles.events / main.informix_cycles.cycles. The Informix side
 # goes through AWS SSM on the demo host, with keys from the informix-cycles secret scope;
 # the compare tools staged next to this notebook do the Informix work exactly as on a laptop.
 #
-# A cycle that ends in MISMATCH cancels the cycles after it: the next cycle would restart the
-# container, which rebuilds testdb and loses the source state the mismatch has to be
-# diagnosed against. The pipeline is already stopped for the compares and stays stopped. The
-# notebook still exits normally, since a failed task is retried as a fresh run that restarts
-# the container. stop_on_mismatch=false runs every cycle regardless.
+# A cycle that ends in MISMATCH or NO RESUME cancels the cycles after it: the next cycle
+# would restart the container, which rebuilds testdb and loses the source state the
+# mismatch has to be diagnosed against. The pipeline is already stopped for the compares
+# and stays stopped. The notebook still exits normally, since a failed task is retried as a
+# fresh run that restarts the container. stop_on_mismatch=false runs every cycle regardless.
 #
 # Parameters: cycles, run_minutes, continuous_runs, final_minutes (0 skips the final run),
 # extra_minutes, pipeline_name (default informix-pipeline), stop_on_mismatch (default true),
+# resume_test (default true), staging_location (the connection's snapshot.staging.location,
+# where the scan's progress is read from; without access to it the resume test is skipped),
 # and smoke=true, which checks AWS, SSM, the pipeline API, both compares and the event
 # tables without restarting the container or running the pipeline. The pipeline is found by
 # name and its tables in the catalog and schema it writes to, so a recreated pipeline or
@@ -42,6 +53,8 @@ dbutils.widgets.text("extra_minutes", "8")
 dbutils.widgets.dropdown("smoke", "false", ["false", "true"])
 dbutils.widgets.text("pipeline_name", "informix-pipeline")
 dbutils.widgets.dropdown("stop_on_mismatch", "true", ["true", "false"])
+dbutils.widgets.dropdown("resume_test", "true", ["true", "false"])
+dbutils.widgets.text("staging_location", "/Volumes/members/connector_bronze/informix_cdc_state")
 CYCLES = int(dbutils.widgets.get("cycles"))
 RUN_SECONDS = int(float(dbutils.widgets.get("run_minutes")) * 60)
 CONTINUOUS_RUNS = int(dbutils.widgets.get("continuous_runs"))
@@ -50,6 +63,8 @@ EXTRA_SECONDS = int(float(dbutils.widgets.get("extra_minutes")) * 60)
 SMOKE = dbutils.widgets.get("smoke") == "true"
 PIPELINE_NAME = dbutils.widgets.get("pipeline_name")
 STOP_ON_MISMATCH = dbutils.widgets.get("stop_on_mismatch") == "true"
+RESUME_TEST = dbutils.widgets.get("resume_test") == "true"
+STAGING = dbutils.widgets.get("staging_location").rstrip("/")
 
 SCOPE = "informix-cycles"
 SCHEMA = "main.informix_cycles"
@@ -60,6 +75,13 @@ TERMINAL = {"COMPLETED", "FAILED", "CANCELED"}
 # run stops mid-drain: that run stops at RUN_MINUTES if both have drained by then, and
 # otherwise waits until they have.
 DRAIN_TABLES = ("tw900_member_tag", "tw901_claim_note")
+# The resume test's table: keyless with a non-unique index, so its snapshot pages by that
+# index and records each page it stages; the demo seeds it large enough to take several.
+# The full refresh is stopped once this many pages are recorded.
+RESUME_TABLE = "tw901_claim_note"
+RESUME_PAGES = 2
+# What each cycle's resume test found, for its verdict.
+RESUME_RESULTS = {}
 RUN_ID = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 spark.conf.set("spark.sql.session.timeZone", "UTC")
@@ -92,7 +114,8 @@ event(
     "start",
     f"run {RUN_ID}: {CYCLES} cycles, {CONTINUOUS_RUNS} continuous runs of "
     f"{RUN_SECONDS // 60} min, final run {FINAL_SECONDS // 60} min, "
-    f"extra run {EXTRA_SECONDS // 60} min, smoke={SMOKE}, stop_on_mismatch={STOP_ON_MISMATCH}",
+    f"extra run {EXTRA_SECONDS // 60} min, smoke={SMOKE}, stop_on_mismatch={STOP_ON_MISMATCH}, "
+    f"resume_test={RESUME_TEST}",
 )
 
 # COMMAND ----------
@@ -317,6 +340,106 @@ def run_for(cycle, label, update_id, seconds, from_creation=True, until_drained=
 
 
 # COMMAND ----------
+# The resume test: stop the full refresh part-way through RESUME_TABLE's snapshot, and see
+# whether the update after it took that snapshot up.
+import glob  # noqa: E402
+
+_SCAN_POINTER = []
+
+
+def _scan_progress():
+    # (pointer, pages recorded) of the scan of RESUME_TABLE under way for this pipeline, or
+    # (None, 0). The connector keeps, on the staging Volume, snapshot-scan/<pipeline>.json
+    # naming the update whose scan it is, and one file per page read beside it.
+    if not _SCAN_POINTER:
+        _SCAN_POINTER.extend(
+            path
+            for path in glob.glob(f"{STAGING}/*/*/snapshot-scan/{PIPELINE_ID}.json")
+            if RESUME_TABLE in pathlib.Path(path).read_text()
+        )
+    for path in _SCAN_POINTER[:1]:
+        try:
+            pointer = json.loads(pathlib.Path(path).read_text())
+            directory = os.path.join(
+                os.path.dirname(path),
+                pointer["scope"],
+                pointer["schema_id"],
+                str(pointer["boundary"]),
+            )
+            return pointer, sum(1 for name in os.listdir(directory) if name[:8].isdigit())
+        except (OSError, ValueError, KeyError):
+            # Gone, or being rewritten: the scan ended, or another has just begun.
+            del _SCAN_POINTER[:]
+    return None, 0
+
+
+def stop_part_way(cycle, label, update_id):
+    # Stop the update once RESUME_TABLE's scan, begun by it, has recorded RESUME_PAGES
+    # pages. Returns what the resume check needs, or None when there was nothing to stop
+    # part-way (the update goes on as a run that was never stopped).
+    if not os.path.isdir(STAGING):
+        event(cycle, "resume", f"SKIPPED: cannot read the staging location {STAGING}")
+        return None
+    del _SCAN_POINTER[:]
+    while True:
+        state = update_info(update_id)["state"]
+        if state in TERMINAL:
+            event(cycle, "resume", f"SKIPPED: {label} ended ({state}) before its scan was seen")
+            return None
+        if RESUME_TABLE not in undrained():
+            event(cycle, "resume", f"SKIPPED: {RESUME_TABLE} drained before it could be stopped")
+            return None
+        pointer, pages = _scan_progress()
+        if pointer and str(pointer.get("scope", "")).endswith(update_id) and pages >= RESUME_PAGES:
+            break
+        time.sleep(5)
+    state = stop_update(cycle, label, update_id)
+    _, pages = _scan_progress()
+    event(
+        cycle,
+        "resume",
+        f"{label}: stopped update {update_id} ({state}) with {pages} pages of "
+        f"{RESUME_TABLE} recorded",
+    )
+    return {"pages": pages, "update": update_id}
+
+
+def resume_check(cycle, stopped, update_id):
+    # Did the update after the stop take the scan up? Its snapshot rows carry the source's
+    # time when their scan began: before this update was created if it went on with the
+    # stopped one's scan, after it if it read the table from its first row again.
+    created = dt.datetime.fromtimestamp(
+        int(update_info(update_id)["creation_time"]) / 1000, dt.timezone.utc
+    ).replace(tzinfo=None)
+    try:
+        row = spark.sql(
+            f"SELECT COUNT(*) n, MIN(_informix_commit_time) first, "
+            f"MAX(_informix_commit_time) last FROM {TARGET}.`{RESUME_TABLE}` "
+            f"WHERE _informix_op = 'r'"
+        ).first()
+    except Exception as error:  # noqa: BLE001
+        result = f"UNKNOWN: cannot read the snapshot rows of {RESUME_TABLE}: {error}"[:300]
+        event(cycle, "resume", result)
+        return result
+    if not row["n"]:
+        result = f"UNKNOWN: {RESUME_TABLE} has no snapshot rows yet"
+    elif row["last"] < created:
+        result = (
+            f"PASS: {row['n']} snapshot rows from the scan begun at {row['first']:%H:%M:%S}, "
+            f"stopped after {stopped['pages']} pages and taken up by the update created at "
+            f"{created:%H:%M:%S}"
+        )
+    else:
+        result = (
+            f"FAIL: the update created at {created:%H:%M:%S} read {RESUME_TABLE} from its "
+            f"first row again (snapshot rows from a scan begun at {row['last']:%H:%M:%S}), "
+            f"although {stopped['pages']} pages were recorded when the full refresh stopped"
+        )
+    event(cycle, "resume", result)
+    return result
+
+
+# COMMAND ----------
 # The cycle's steps.
 def restart_container(cycle):
     event(cycle, "restart", "restarting the Informix container")
@@ -342,12 +465,26 @@ def restart_container(cycle):
 def pipeline_runs(cycle):
     event(cycle, "cycle", "pipeline runs starting")
     set_continuous(cycle, False)
+    stopped = None
     for run, full_refresh in ((1, True), (2, False)):
         kind = "triggered full-refresh" if full_refresh else "triggered"
         event(cycle, "starting", f"run {run}: starting {kind} update")
         update_id = start_update(cycle, f"run {run}", full_refresh)
         event(cycle, "started", f"run {run}: started {kind} update {update_id}")
-        run_for(cycle, f"run {run}", update_id, RUN_SECONDS, until_drained=full_refresh)
+        if full_refresh and RESUME_TEST:
+            stopped = stop_part_way(cycle, f"run {run}", update_id)
+            if stopped:
+                continue
+        # The run after a stopped full refresh has the keyless tables' snapshots to finish.
+        run_for(
+            cycle,
+            f"run {run}",
+            update_id,
+            RUN_SECONDS,
+            until_drained=full_refresh or bool(stopped),
+        )
+        if stopped:
+            RESUME_RESULTS[cycle] = resume_check(cycle, stopped, update_id)
     before = latest_update()
     event(
         cycle, "starting", "run 3: starting continuous update (switching to continuous starts it)"
@@ -465,6 +602,12 @@ if SMOKE:
         f"pipeline {state.get('name')} {state.get('state')} "
         f"continuous={state['spec'].get('continuous')}",
     )
+    event(
+        0,
+        "smoke",
+        f"staging location {STAGING}: "
+        + ("readable" if os.path.isdir(STAGING) else "not readable, the resume test would skip"),
+    )
     total, counts_ok, _ = count_compare(0)
     line, data_ok, _ = data_compare(0)
     event(
@@ -497,11 +640,19 @@ for cycle in range(1, CYCLES + 1):
         final, counts_ok, _ = count_compare(cycle)
     event(cycle, "data", "comparing data")
     line, data_ok, details = data_compare(cycle)
-    verdict = "MATCH" if counts_ok and data_ok else "MISMATCH"
+    resume = RESUME_RESULTS.get(cycle)
+    if not (counts_ok and data_ok):
+        verdict = "MISMATCH"
+    elif resume and resume.startswith("FAIL"):
+        # The data is right, but the stopped snapshot was read again from its first row.
+        verdict = "NO RESUME"
+    else:
+        verdict = "MATCH"
     message = (
         f"CYCLE {cycle} {verdict} | first count: {first}"
         + (" | extra continuous run, then" if extra else "")
         + f" | count compare: {final} | {line}"
+        + (f" | resume: {resume}" if resume else "")
     )
     event(cycle, "result", message)
     spark.createDataFrame(
@@ -526,10 +677,10 @@ for cycle in range(1, CYCLES + 1):
         event(
             cycle,
             "cancel",
-            f"cycle {cycle} MISMATCH: cancelling cycles {cycle + 1}-{CYCLES} so it can be "
+            f"cycle {cycle} {verdict}: cancelling cycles {cycle + 1}-{CYCLES} so it can be "
             f"diagnosed; the container is not restarted and pipeline {PIPELINE_NAME} stays "
             f"stopped. The differing tables and key examples are in this cycle's row in "
-            f"{RESULTS} (details).",
+            f"{RESULTS} (details); a NO RESUME cycle's resume event says what was found.",
         )
         break
 
@@ -539,15 +690,15 @@ event(
     0,
     "summary",
     (
-        f"stopped after cycle {len(summary)} of {CYCLES} (mismatch): "
+        f"stopped after cycle {len(summary)} of {CYCLES} (not MATCH): "
         if cancelled
         else "all cycles done: "
     )
     + ", ".join(f"cycle {c} {v}" for c, v in summary)
     + (
-        f"; cycles with mismatched data: {mismatched}"
+        f"; cycles that did not end MATCH: {mismatched}"
         if mismatched
-        else "; no cycle ended with mismatched data"
+        else "; every cycle ended MATCH"
     ),
 )
 dbutils.notebook.exit(
