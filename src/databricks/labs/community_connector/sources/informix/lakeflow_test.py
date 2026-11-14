@@ -2347,6 +2347,21 @@ class LakeflowContractTests(unittest.TestCase):
         )
         self.assertEqual([len(tx.records) for tx in kept], [1])
 
+    def test_an_index_scan_fails_at_once_behind_a_transaction_it_cannot_read_past(self):
+        # A transaction left open with more changes behind it than one poll reads: every
+        # poll starts at it again, fills up, and brings nothing new. That fails at the
+        # second such poll, by name, not after ten minutes of them.
+        source = _IndexScanSource(random_module.Random(6), transactions=0)
+        full = [
+            {"op": "BEGIN", "tx_id": 1, "lsn": 5000},
+            {"op": "INSERT", "tx_id": 1, "lsn": 5001, "row": {"id": 1, "value": "open"}},
+        ]
+        source.read_changes = lambda captures, start, timeout, max_records, budget=None: [
+            dict(record) for record in full
+        ]
+        with self.assertRaisesRegex(InformixError, "left open over more changes"):
+            self._index_scan(source, 5)
+
     def test_the_stream_fails_on_a_change_a_stalled_cdc_kept_from_the_scan(self):
         # A server whose CDC has stalled answers every poll as an idle one, and a quiet
         # table's session proves nothing until the next checkpoint. So the scan waits for

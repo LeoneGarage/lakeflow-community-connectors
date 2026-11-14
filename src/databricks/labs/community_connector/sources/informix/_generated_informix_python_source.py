@@ -7380,6 +7380,7 @@ def register_lakeflow_source(spark):
             start_lsn: int,
             timeout_seconds: int,
             max_records: int,
+            budget: int | None = None,
         ) -> list[dict[str, Any]]: ...
 
         def release_connection(self) -> None:
@@ -19016,7 +19017,9 @@ def register_lakeflow_source(spark):
                 # short and an idle poll is taken in the end.
                 nonlocal start, last_commit
                 began = time.monotonic()
+                idle_since = None
                 while True:
+                    held = (start, last_commit)
                     records = bridge.read_changes(
                         [capture],
                         start,
@@ -19076,11 +19079,26 @@ def register_lakeflow_source(spark):
                     start = open_begin if open_begin is not None else max(start, last_commit)
                     if last_commit > target or (idle and (not proof or reached >= target)):
                         break
-                    # The short wait is for proof alone: a backlog is read to its end first.
-                    waited = time.monotonic() - began
-                    if idle and not strict and waited > _INDEX_SCAN_PROOF_SECONDS:
+                    if not idle and held == (start, last_commit):
+                        # A poll that filled up behind a transaction still open, and brought
+                        # nothing new: the next would start there again and read the same.
+                        # 433: The index-ordered snapshot of a keyless table does
+                        # not support {} on '{}'; set snapshot.scan=cursor to read
+                        # the table without index order
+                        raise InformixError(
+                            _m(
+                                433,
+                                "a transaction left open over more changes than cdc.max.poll.records",
+                                table.exposed_name,
+                            )
+                        )
+                    # The short wait is for proof alone, from the first idle poll: a backlog is
+                    # read to its end first.
+                    now = time.monotonic()
+                    idle_since = idle_since or (now if idle else None)
+                    if idle and not strict and now - idle_since >= _INDEX_SCAN_PROOF_SECONDS:
                         break
-                    if waited > _INDEX_SCAN_FOLLOW_SECONDS:
+                    if now - began > _INDEX_SCAN_FOLLOW_SECONDS:
                         # 435: The index-ordered snapshot stopped waiting for
                         # Informix CDC to reach the snapshot's position for '{}'
                         # after {} seconds
