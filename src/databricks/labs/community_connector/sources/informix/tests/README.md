@@ -131,8 +131,10 @@ Findings:
 `orders/` checks that a keyless table's change log and the silver table rebuilt from it
 hold every source row the right number of times, while the source changes during the
 snapshot. `orders` has a primary key; `order_items` has none, has a non-unique index on
-`order_id`, and holds exact duplicates. The workload only ever deletes all of an order's
-items and inserts new ones, in one transaction or several, or inserts without deleting.
+`order_id`, and holds exact duplicates. The workload deletes all of an order's items and
+inserts new ones, in one transaction or several, inserts without deleting, and updates
+an order's items by `order_id`: all of them, those of one sku, or to the values they
+already have. No update changes `order_id`, the column the snapshot pages by.
 
 | File | Purpose |
 | --- | --- |
