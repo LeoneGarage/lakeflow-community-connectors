@@ -17,6 +17,7 @@ scans `*.py`).
 | `cycles_dashboard.json` | Serialized AI/BI dashboard definition over the two cycles tables: the latest run's status, cycle results and pipeline updates, and a page across all runs. |
 | `wheel_build_test_tool.py` | Build step, not tooling: the `build_py` that `pyproject.toml` names under `[tool.setuptools.cmdclass]`. It leaves the connector's `*_test*` modules (`lakeflow_test.py`, `compare_live_data_test_tool.py` and the rest) out of the prebuilt wheel, the same files the merge tool leaves out of the generated source. |
 | `keyless_star_probe_test_tool.py` | Live end-to-end probe of keyless tables keyed with `primary.keys: "*"`: SCD1, SCD2 and change-log destinations through DML and schema changes (see below). |
+| `orders/` | Live test of a keyless one-to-many child table that holds identical rows: Informix tables and workload, an append-only bronze pipeline, a silver pipeline that rebuilds the table from its change log, and a comparison with the source (see below). |
 
 ## Keyless whole-row-key probe
 
@@ -124,3 +125,38 @@ Findings:
 - **Exact copies (phase 10)** behave as documented: they collapse to one row, and a
   change to one copy at the source removes the shared row from the target while the
   other copy stays at the source.
+
+## Orders test (keyless child table with identical rows)
+
+`orders/` checks that a keyless table's change log and the silver table rebuilt from it
+hold every source row the right number of times, while the source changes during the
+snapshot. `orders` has a primary key; `order_items` has none, has a non-unique index on
+`order_id`, and holds exact duplicates. The workload only ever deletes all of an order's
+items and inserts new ones, in one transaction or several, or inserts without deleting.
+
+| File | Purpose |
+| --- | --- |
+| `orders_setup.sh`, `orders_lib.sh` | Create and seed the two tables in `testdb` (300 orders, about a third of the item rows written two or three times). |
+| `orders_workload.sh` | The workload, one transaction a second for the given minutes (default 15). |
+| `orders_fingerprint.sh` | Source side of the comparison: `order_items` summed up in 25 buckets. |
+| `orders_bronze_test_ingest.py` | Bronze pipeline source: both tables append-only; `order_items` with `snapshot.scan: keyset(order_id)`. |
+| `orders_silver.sql` | Silver pipeline source: `orders` by AUTO CDC; `order_items` from a count per distinct row (+1 for `r`, `c` and `u` rows, -1 for `d`) expanded back into rows. |
+| `orders_bronze_pipeline.json`, `orders_silver_pipeline.json` | Pipeline settings to fill in and create the two pipelines with. |
+| `orders_run.sh` | Bronze full refresh during the workload, bronze updates until it has ended and drained, then a silver full refresh. |
+| `orders_compare_test_tool.py` | Compares the silver table with the fingerprint; prints `MATCH` or `MISMATCH` and exits 1 on a difference. |
+
+Steps:
+
+1. Copy `orders_lib.sh`, `orders_setup.sh`, `orders_workload.sh` and `orders_fingerprint.sh`
+   into the Informix container and run `orders_setup.sh` there.
+2. Put `orders_bronze_test_ingest.py` and `orders_silver.sql` in the workspace, fill in the
+   two pipeline JSON files and create the pipelines
+   (`databricks pipelines create --json @orders_bronze_pipeline.json`).
+3. Start `orders_workload.sh 15` in the container and, while it runs,
+   `orders_run.sh <bronze id> <silver id> <workload end, UTC HHMMSS> [profile]`.
+4. After the workload has ended, save the output of `orders_fingerprint.sh` to a file and
+   run `orders_compare_test_tool.py <file> --warehouse-id <id> --silver <catalog>.orders_silver
+   --bronze <catalog>.orders_bronze`.
+
+The tables are captured by CDC once the bronze pipeline has run; a restart of the demo
+container rebuilds `testdb` without them.

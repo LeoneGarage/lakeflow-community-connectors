@@ -1,0 +1,12 @@
+{
+  "name": "informix-orders-silver",
+  "catalog": "<catalog>",
+  "schema": "orders_silver",
+  "serverless": true,
+  "continuous": false,
+  "development": true,
+  "channel": "CURRENT",
+  "root_path": "<workspace folder holding orders_silver.sql>",
+  "libraries": [{"file": {"path": "<workspace path of orders_silver.sql>"}}],
+  "configuration": {"bronze_schema": "<catalog>.orders_bronze"}
+}

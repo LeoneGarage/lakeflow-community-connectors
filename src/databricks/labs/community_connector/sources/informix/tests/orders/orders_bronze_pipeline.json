@@ -1,0 +1,12 @@
+{
+  "name": "informix-orders-bronze",
+  "catalog": "<catalog>",
+  "schema": "orders_bronze",
+  "serverless": true,
+  "continuous": false,
+  "development": true,
+  "channel": "CURRENT",
+  "root_path": "<workspace path of this repository's Git folder>/src",
+  "libraries": [{"file": {"path": "<workspace path of orders_bronze_test_ingest.py>"}}],
+  "configuration": {"pipelines.enableTypeWidening": "true"}
+}
