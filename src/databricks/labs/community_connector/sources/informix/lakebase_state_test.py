@@ -163,6 +163,13 @@ class _FakeCursor:
         if "SELECT record FROM state_records" in text:
             self._select_record(args)
             return
+        if (
+            text.startswith("DELETE FROM state_records")
+            and isinstance(args, dict)
+            and "pipeline_scope_pattern" in args
+        ):
+            self._delete_obsolete_scopes(args)
+            return
         if text.startswith("DELETE FROM"):
             self._result = []
             return
@@ -528,6 +535,30 @@ class _FakeCursor:
             and key[1].startswith(prefix)
             and self._database.record_types.get(key) == "cdc-spill-run"
         ]
+
+    def _delete_obsolete_scopes(self, args: dict) -> None:
+        # The records under a key prefix whose scope is another update of the pipeline:
+        # neither the current one nor the one retained.
+        prefix = args["record_key_pattern"].removesuffix("%")
+        updates = args["pipeline_scope_pattern"].removesuffix("%")
+        deleted = []
+        with self._database.lock:
+            for key, raw in list(self._database.records.items()):
+                if key[0] != args["namespace"] or not key[1].startswith(prefix):
+                    continue
+                try:
+                    scope = json.loads(raw).get("scope")
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if (
+                    isinstance(scope, str)
+                    and scope.startswith(updates)
+                    and scope != args["current_scope"]
+                    and scope != args["retained_scope"]
+                ):
+                    self._forget_record(key)
+                    deleted.append((key[1],))
+        self._result = deleted
 
     def _forget_record(self, key: tuple[str, str]) -> None:
         self._database.records.pop(key, None)

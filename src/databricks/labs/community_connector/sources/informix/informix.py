@@ -17863,6 +17863,22 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 and _PIPELINE_SCOPE.fullmatch(candidate) is not None
             ):
                 retained_scope = candidate
+        else:
+            # No offset yet, but an earlier update's index-ordered scan may be on record
+            # for this read to take up (see _adopted_scan_scope): it runs under that
+            # update's scope, from the starting position recorded there. Deleting that
+            # record sent the scan to a new starting position, past its own snapshot LSN,
+            # and so back to the table's first row.
+            with contextlib.suppress(Exception):
+                pointer = self._read_progress_file(self._scan_pointer_path(table, current))
+                candidate = None if pointer is None else pointer.get("scope")
+                if (
+                    isinstance(candidate, str)
+                    and candidate != current
+                    and candidate.startswith(f"{pipeline_id}_@_")
+                    and _PIPELINE_SCOPE.fullmatch(candidate) is not None
+                ):
+                    retained_scope = candidate
         deleted = self._state_op_with_reconnect(
             lambda: delete_obsolete_scoped_state_records(
                 self._lakebase_connection(),

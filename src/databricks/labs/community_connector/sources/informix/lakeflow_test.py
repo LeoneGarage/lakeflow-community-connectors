@@ -2369,11 +2369,14 @@ class LakeflowContractTests(unittest.TestCase):
         first.set_registration_scope(scope)
         with (
             mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0),
-            self.assertRaises(Exception),
+            self.assertRaisesRegex(Exception, "the connection is lost"),
         ):
             first.read_table("app.orders", {}, options)
         self.assertEqual(cursors, [None, [2], "failed"])
         del cursors[:]
+        # The log has moved on by the time the next update reads: a starting position
+        # taken afresh would be past the snapshot LSN of the scan that failed.
+        bridge.now += 3 * 4096
         return bridge, options, cursors
 
     def _snapshot_ids(self, connector, options):
