@@ -17,7 +17,8 @@ STORED AS SCD TYPE 1;
 -- How many copies of each distinct row exist now: +1 per snapshot (r), insert (c) or
 -- updated (u) row, -1 per delete (d) row. An UPDATE of a keyless table lands as a d row
 -- with the old values followed by a u row with the new ones.
-CREATE OR REFRESH MATERIALIZED VIEW order_items_counts (
+-- Private: only order_items below reads it, so it is not published to the catalog.
+CREATE OR REFRESH PRIVATE MATERIALIZED VIEW order_items_counts (
   -- An operation this view does not know can't be netted, so the refresh fails instead.
   CONSTRAINT known_changes_only EXPECT (other_changes = 0) ON VIOLATION FAIL UPDATE,
   -- A delete with no matching insert means bronze is missing history.

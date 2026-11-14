@@ -69,11 +69,17 @@ def main() -> int:
         "silver orders, count / highest id:",
         query(f"SELECT count(*), max(id) FROM {args.silver}.orders"),
     )
+    # order_items_counts is private to the silver pipeline, so its counts are taken
+    # again here from the bronze change log it reads.
     print(
-        "counts view, groups / copies / fewest copies / unknown changes:",
+        "counts per distinct row, groups / copies / fewest copies / unknown changes:",
         query(
-            "SELECT count(*), sum(copies), min(copies), sum(other_changes) "
-            f"FROM {args.silver}.order_items_counts"
+            "SELECT count(*), sum(copies), min(copies), sum(other_changes) FROM (SELECT "
+            "sum(CASE WHEN _informix_op IN ('r', 'c', 'u') THEN 1 "
+            "WHEN _informix_op = 'd' THEN -1 ELSE 0 END) AS copies, "
+            "sum(CASE WHEN _informix_op IN ('r', 'c', 'u', 'd') THEN 0 ELSE 1 END) "
+            f"AS other_changes FROM {args.bronze}.order_items "
+            "GROUP BY order_id, sku, qty, price, note HAVING copies <> 0 OR other_changes <> 0)"
         ),
     )
     print(

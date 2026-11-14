@@ -142,7 +142,7 @@ already have. No update changes `order_id`, the column the snapshot pages by.
 | `orders_workload.sh` | The workload, one transaction a second for the given minutes (default 15). |
 | `orders_fingerprint.sh` | Source side of the comparison: `order_items` summed up in 25 buckets. |
 | `orders_bronze_test_ingest.py` | Bronze pipeline source: both tables append-only; `order_items` with `snapshot.scan: keyset`, under which the connector picks the index on `order_id`. |
-| `orders_silver.sql` | Silver pipeline source: `orders` by AUTO CDC; `order_items` from a count per distinct row (+1 for `r`, `c` and `u` rows, -1 for `d`) expanded back into rows. |
+| `orders_silver.sql` | Silver pipeline source: `orders` by AUTO CDC; `order_items` from a count per distinct row (+1 for `r`, `c` and `u` rows, -1 for `d`) expanded back into rows. The counts are a private view, kept out of the catalog. |
 | `orders_bronze_pipeline.json`, `orders_silver_pipeline.json` | Pipeline settings to fill in and create the two pipelines with. |
 | `orders_run.sh` | Bronze full refresh during the workload, bronze updates until it has ended and drained, then a silver full refresh. |
 | `orders_compare_test_tool.py` | Compares the silver table with the fingerprint; prints `MATCH` or `MISMATCH` and exits 1 on a difference. |
