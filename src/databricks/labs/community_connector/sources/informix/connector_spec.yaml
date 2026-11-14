@@ -1312,7 +1312,8 @@ connection:
       type: string
       required: false
       description: >-
-        The most bytes requested in one Informix SmartLOB CDC read. Default `32000`.
+        The most bytes requested in one Informix SmartLOB CDC read. Default `32000`;
+        minimum `128`, the smallest read Informix accepts.
         Informix returns a read only when the bytes asked for have arrived, 256
         records are waiting, or the session has been idle for `cdc.timeout`, so each
         poll starts with a 128-byte read, doubles the size while reads come back full

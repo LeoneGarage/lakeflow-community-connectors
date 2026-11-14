@@ -542,11 +542,17 @@ _INDEX_SCAN_KEY_TYPES = frozenset(
     "INTEGER INT SMALLINT BIGINT INT8 SERIAL SERIAL8 BIGSERIAL DECIMAL MONEY DATE CHAR VARCHAR "
     "LVARCHAR".split()
 )
-# Rows read ahead of the change follower, which holds them until it has passed them.
+# Rows read between two looks at the table's changes while the scan runs.
 _INDEX_SCAN_FOLLOW_ROWS = 200_000
-# An idle session reports the position of the last checkpoint, so the proof that it has read
-# through the end of the scan can take a checkpoint interval to arrive.
+# How long a poll for changes may go without getting there, and how long the scan waits at
+# its end for proof that the log was read through it. An idle session reports the position
+# of the last checkpoint, so on a quiet table the proof takes until the next one; the scan
+# does not wait for it longer than this, and the stream then fails on a change the proof
+# would have brought (see _drop_scanned_changes).
 _INDEX_SCAN_FOLLOW_SECONDS = 600
+_INDEX_SCAN_PROOF_SECONDS = 120
+# The most rows one index key may have: they are read and staged together.
+_INDEX_SCAN_KEY_ROWS = 1_000_000
 _INDEX_SCAN_SETTLE_ATTEMPTS = 5
 
 # Where snapshot page payloads are written. ``fuse`` uses the UC Volume FUSE mount
@@ -8252,7 +8258,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             (_CDC_SPILL_RECORDS_OPTION, str(_DEFAULT_CDC_SPILL_RECORDS), 0),
             ("cdc.max.poll.records", "200000", 1),
             ("cdc.max.poll.bytes", "0", 0),
-            ("cdc.read.bytes", "32000", 1),
+            ("cdc.read.bytes", "32000", 128),
             ("authentication.pam.max.rounds", "16", 1),
             (
                 "max.concurrent.connections",
@@ -8847,6 +8853,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                         effective_start = {
                             k: v for k, v in effective_start.items() if k != "handoff_seeded"
                         }
+                if table.primary_keys and _snapshot_scan_columns(
+                    table_options.get(
+                        _SNAPSHOT_SCAN_OPTION, self.options.get(_SNAPSHOT_SCAN_OPTION, "")
+                    )
+                ):
+                    # 432: Option snapshot.scan=keyset(...) names columns to
+                    # page '{}' by, but the table has a key and pages by that;
+                    # change the key with primary.keys instead
+                    raise InformixError(_m(432, table.exposed_name))
                 self._touch_table_state(table)
                 self._maybe_sweep_stale_snapshot_stages(table)
                 _ensure_materializable(table, table_options)
@@ -13143,7 +13158,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 [found[at] if down is None else down for at, (_name, down) in enumerate(named)],
             )
         for columns, directions, nunique in () if named else listed:
-            rank = (nunique, -len(columns))
+            # The catalog's count of distinct keys, which is 0 until statistics are run:
+            # among equals, more columns make smaller groups.
+            rank = (nunique, len(columns))
             if all(column.lower() in usable for column in columns) and (
                 chosen is None or rank > chosen[0]
             ):
@@ -13212,16 +13229,19 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         pages: list[tuple[tuple | None, int, int, int | None]] = []
         bounds: list[tuple] = []
 
-        def follow(target: int, proof: bool = False) -> None:
+        def follow(target: int, proof: bool = False, strict: bool = True) -> None:
             # Read the table's changes until every commit at or below ``target`` is in, and
             # sort them. An idle poll is taken to mean that, as the stream takes it, but a
             # session can go idle before it has handed over what is there, and a server that
             # has stopped handing changes over only ever goes idle. With ``proof`` the poll
             # must report having read up to ``target``, or bring a later commit. An idle
             # session reports the last checkpoint's position, so on a quiet table that takes
-            # until the next checkpoint.
+            # until the next checkpoint. When it is not ``strict``, the wait for proof is
+            # short and an idle poll is taken in the end.
             nonlocal start, last_commit
-            deadline = time.monotonic() + _INDEX_SCAN_FOLLOW_SECONDS
+            deadline = time.monotonic() + (
+                _INDEX_SCAN_FOLLOW_SECONDS if strict else _INDEX_SCAN_PROOF_SECONDS
+            )
             while True:
                 records = bridge.read_changes([capture], start, timeout, _DEFAULT_CDC_MAX_RECORDS)
                 committed, caught_up, open_begin, reached = _transaction_batch(records)
@@ -13266,6 +13286,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 if last_commit > target or (caught_up and (not proof or (reached or 0) >= target)):
                     break
                 if time.monotonic() > deadline:
+                    if caught_up and not strict:
+                        break
                     # 435: The index-ordered snapshot stopped waiting for
                     # Informix CDC to reach the snapshot's position for '{}'
                     # after {} seconds
@@ -13301,6 +13323,21 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 key_descending=descending,
                 isolation=isolation,
             )
+            orders = [_index_scan_order(_index_scan_key(row, keys), descending) for row in rows]
+            if any(later < earlier for earlier, later in zip(orders, orders[1:])) or (
+                orders and bounds and not bounds[-1] < orders[0]
+            ):
+                # The page lookup of a change's key relies on it.
+                # 433: The index-ordered snapshot of a keyless table does not
+                # support {} on '{}'; set snapshot.scan=cursor to read the table
+                # without index order
+                raise InformixError(
+                    _m(
+                        433,
+                        "index values that Informix does not sort by their characters",
+                        table.exposed_name,
+                    )
+                )
             more = len(rows) >= page_size
             bound = None
             if more:
@@ -13310,6 +13347,18 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 if _index_scan_key(rows[0], keys) == last:
                     cursor = [rows[-1][name] for name in keys]
                     rows = bridge.key_rows(table.identity, names, keys, cursor, isolation)
+                    if len(rows) > _INDEX_SCAN_KEY_ROWS:
+                        # 433: The index-ordered snapshot of a keyless
+                        # table does not support {} on '{}'; set
+                        # snapshot.scan=cursor to read the table without
+                        # index order
+                        raise InformixError(
+                            _m(
+                                433,
+                                f"more than {_INDEX_SCAN_KEY_ROWS} rows under one index value",
+                                table.exposed_name,
+                            )
+                        )
                 else:
                     while _index_scan_key(rows[-1], keys) == last:
                         rows.pop()
@@ -13333,9 +13382,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 held = 0
             if not more:
                 break
-        # Every change that committed during the scan must be in before any key is settled:
-        # the follower is shown to have read the log past the page the scan ended on.
-        follow(bridge.current_lsn(), proof=True)
+        # Every change that committed during the scan should be in before any key is
+        # settled: the follower waits to be shown to have read the log past the page the
+        # scan ended on. A quiet table shows it only at the next checkpoint, so the wait is
+        # bounded; a change it misses then is one the stream fails on.
+        follow(bridge.current_lsn(), proof=True, strict=False)
+        decided: list[int] = []
         suppress: list[int] = []
         for _attempt in range(_INDEX_SCAN_SETTLE_ATTEMPTS):
             if not doubt:
@@ -13395,6 +13447,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     # for the key do not fit the key's changes
                     raise InformixError(_m(436, table.exposed_name))
                 suppress.extend(seen)
+                decided.extend(event[3] for event in unsure)
                 del doubt[key], events[key]
         if doubt:
             # 434: The index-ordered snapshot could not settle {} key(s) of '{}' after
@@ -13406,19 +13459,23 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         scan["index_scan"] = {
             "keys": list(keys),
             "descending": list(descending),
-            # Each page's last key, with the position before its read: a change to a key of
-            # the page that committed at or below it is in the page.
+            # Each page's last key, with the positions before and after its read. A change
+            # to a key of the page that committed at or below the first is in the page. One
+            # that committed between the two was settled, and is listed: dropped if the
+            # scan saw it, kept if not.
             "pages": [
                 [
                     None
                     if bound is None
                     else _encode_snapshot_stage_value(_index_scan_plain(bound)),
                     before,
+                    after,
                 ]
-                for bound, before, _after, _index in pages
+                for bound, before, after, _index in pages
             ],
             "end": max(after for _bound, _before, after, _index in pages),
-            "suppress": sorted(suppress),
+            "suppress": sorted(set(suppress)),
+            "keep": sorted(set(decided) - set(suppress)),
         }
         return boundary
 
@@ -13428,36 +13485,43 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         #
         # The snapshot's manifest names them: every change to a key that committed at or
         # below the position before that key's page was read, and the changes listed by
-        # their own log positions. Nothing above the scan's end is dropped.
+        # their own log positions. Nothing above the scan's end is dropped. A change that
+        # committed between the two positions of its key's read, and is not among those the
+        # scan settled, reached the scan's follower too late: it may be in the page or not,
+        # so the read fails for a full refresh. The manifest is the snapshot's update's; the
+        # stream's offsets name that update (scan_scope, see _read_stream) until the stream
+        # is past the scan's end, since a later update's offsets carry its own scope.
 
-        if table.primary_keys or not transactions or self._snapshot_cursor_scan(options):
+        if table.primary_keys or self._snapshot_cursor_scan(options):
             return transactions
-        scope = self._offset_scopes(checkpoint)[1]
-        schema_id = str(checkpoint.get("schema_id"))
+        scope = checkpoint.get("scan_scope") or self._offset_scopes(checkpoint)[1]
+        schema_id = str(checkpoint.get("scan_schema") or checkpoint.get("schema_id"))
         cache = self.__dict__.setdefault("_index_scans", {})
         cached = (table.identity, scope, schema_id)
         if cached not in cache:
             manifest = self._read_snapshot_stage_manifest(table, scope, schema_id) or {}
             recorded = manifest.get("index_scan")
-            if recorded and int(checkpoint["commit_lsn"]) < int(recorded["end"]):
-                descending = recorded["descending"]
-                cache[cached] = (
-                    recorded["keys"],
-                    descending,
-                    [
-                        _index_scan_order(tuple(_decode_snapshot_stage_value(page[0])), descending)
-                        for page in recorded["pages"]
-                        if page[0] is not None
-                    ],
-                    [int(page[1]) for page in recorded["pages"]],
-                    int(recorded["end"]),
-                    frozenset(int(lsn) for lsn in recorded["suppress"]),
-                )
-            else:
-                cache[cached] = None
-        if cache[cached] is None:
+            cache[cached] = recorded and (
+                recorded["keys"],
+                recorded["descending"],
+                [
+                    _index_scan_order(
+                        tuple(_decode_snapshot_stage_value(page[0])), recorded["descending"]
+                    )
+                    for page in recorded["pages"]
+                    if page[0] is not None
+                ],
+                [(int(page[1]), int(page[2])) for page in recorded["pages"]],
+                int(recorded["end"]),
+                frozenset(int(lsn) for lsn in recorded["suppress"]),
+                frozenset(int(lsn) for lsn in recorded["keep"]),
+            )
+        live = self.__dict__.setdefault("_index_scan_live", {})
+        if not cache[cached]:
+            live[table.identity] = None
             return transactions
-        keys, descending, bounds, befores, end, suppress = cache[cached]
+        keys, descending, bounds, reads, end, suppress, keep = cache[cached]
+        live[table.identity] = (scope, schema_id, end)
         kept = []
         for tx in transactions:
             if tx.commit_lsn > end:
@@ -13475,11 +13539,17 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 row = record.get("after") or record.get("row") or record.get("before")
                 if row is not None:
                     order = _index_scan_order(_index_scan_key(row, keys), descending)
-                    if (
-                        _lsn(record) in suppress
-                        or tx.commit_lsn <= befores[bisect.bisect_left(bounds, order)]
-                    ):
+                    before, after = reads[bisect.bisect_left(bounds, order)]
+                    lsn = _lsn(record)
+                    if lsn in suppress or tx.commit_lsn <= before:
                         continue
+                    if tx.commit_lsn <= after and lsn not in keep:
+                        # 438: A change to keyless table '{}' committed
+                        # while its snapshot was reading the rows it
+                        # applies to, and reached Informix CDC only after
+                        # the snapshot was staged, so the change log may
+                        # hold it twice or not at all; run a full refresh
+                        raise InformixError(_m(438, table.exposed_name))
                 records.append(record)
             records = tuple(records)
             kept.append(tx if len(records) == len(tx.records) else replace(tx, records=records))
@@ -15372,6 +15442,22 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             time.sleep(min(_SHARED_VIEW_WAIT_POLL_SECONDS, remaining))
 
     def _read_stream(self, table: Table, start: dict, options: dict[str, str], deletes: bool):
+        # Docstring: One stream batch (see _read_stream_batch). Until the stream is past the
+        # end of a keyless table's index-ordered scan, its offset names the update that took
+        # the snapshot, whose manifest says which changes to drop (_drop_scanned_changes).
+
+        rows, end = self._read_stream_batch(table, start, options, deletes)
+        live = self.__dict__.get("_index_scan_live", {})
+        # Only once this process has looked for the manifest: until then the offset keeps
+        # what it carries.
+        if isinstance(end, dict) and table.identity in live:
+            scan = live[table.identity]
+            end = {k: v for k, v in end.items() if k not in ("scan_scope", "scan_schema")}
+            if scan and int(end.get("commit_lsn", 0)) < scan[2]:
+                end["scan_scope"], end["scan_schema"] = scan[0], scan[1]
+        return rows, end
+
+    def _read_stream_batch(self, table: Table, start: dict, options: dict[str, str], deletes: bool):
         checkpoint = _validated_offset(start)
         pipeline_scope = self._pipeline_scope()
         # A daemon reader owns this shard's Informix I/O: it supplies the schema, log
@@ -17081,7 +17167,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     ) -> None:
         # Docstring: Clean obsolete scopes without deleting state referenced by Spark.
 
-        if checkpoint and checkpoint.get("stage_scope"):
+        if checkpoint and (checkpoint.get("stage_scope") or checkpoint.get("scan_scope")):
             # A handoff relocation is still serving staged pages that live under the
             # capturing flow's scope (carried on stage_scope). That scope's records --
             # the snapshot manifest above all -- must survive until the serve completes,

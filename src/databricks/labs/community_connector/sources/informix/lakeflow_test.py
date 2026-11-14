@@ -2119,20 +2119,158 @@ class LakeflowContractTests(unittest.TestCase):
             transactions,
         )
 
-    def test_an_index_scan_fails_when_cdc_stops_handing_changes_over(self):
-        # A server whose CDC has stalled answers every poll as an idle one. Taken for
-        # "nothing changed", that would leave changes the scan saw to be replayed. The scan
-        # ends by asking for proof the log was read through its end, which a stalled session
-        # cannot give: it reports no progress.
-        source = _IndexScanSource(random_module.Random(4))
-        source.read_changes = lambda captures, start, timeout, max_records: [
-            {"op": "TIMEOUT", "lsn": start}
-        ]
+    def test_the_stream_drops_scanned_changes_in_later_updates_too(self):
+        # End to end through read_table. The snapshot's manifest says which changes the
+        # scan already holds, and it is stored under the scope of the update that took the
+        # snapshot. A later update stamps its own scope on the offsets it writes, so until
+        # the stream is past the scan's end its offsets also name the snapshot's update:
+        # without that, the second batch of a later update finds no manifest and replays
+        # changes the snapshot holds.
+        class Bridge(FakeBridge):
+            def __init__(self):
+                super().__init__()
+                self.tables[0]["primary_keys"] = []
+                self.rows = [{"id": 1, "value": "a"}, {"id": 2, "value": "b"}]
+
+            def table_indexes(self, identity):
+                return [(["id"], [False], 2)]
+
+            def buffered_logging(self):
+                return False
+
+            def boundary_lsn(self):
+                # The snapshot LSN is 90; the page is read once the log is at 100.
+                lsn, self.now = self.now, max(self.now, 100)
+                return lsn
+
+            def snapshot_chunk(self, *args, isolation=None, **kwargs):
+                return super().snapshot_chunk(*args, **kwargs)
+
+            def key_rows(self, identity, columns, keys, values, isolation):
+                return [dict(row) for row in self.rows if row["id"] == values[0]]
+
+            def read_changes(self, tables, start_lsn, timeout_seconds, max_records):
+                return list(self.changes) + [{"op": "TIMEOUT", "lsn": self.now}]
+
+        def insert(tx, lsn, key):
+            return [
+                {"op": "BEGIN", "tx_id": tx, "lsn": lsn},
+                {"op": "INSERT", "tx_id": tx, "lsn": lsn + 1, "row": {"id": key, "value": "x"}},
+                {"op": "COMMIT", "tx_id": tx, "lsn": lsn + 2},
+            ]
+
+        bridge = Bridge()
+        # Row 2 was inserted just after the snapshot LSN and before the page was read: the
+        # snapshot holds it, and the stream is handed it again.
+        bridge.changes = insert(1, 91, 2)
+        options = {"snapshot.mode": "initial"}
+        first = self.connector(bridge, registration_scope="update-a")
+        rows, offset = first.read_table("app.orders", {}, options)
+        self.assertEqual([(row["id"], row["_informix_op"]) for row in rows], [(1, "r"), (2, "r")])
+        while offset.get("phase") != "stream":
+            more, offset = first.read_table("app.orders", offset, options)
+            self.assertEqual(list(more), [])
+        rows, offset = first.read_table("app.orders", offset, options)
+        self.assertEqual(list(rows), [])
+        scope = offset["scan_scope"]
+        self.assertEqual(offset["commit_lsn"], "93")
+
+        # A later update. Its first batch: another change the page holds.
+        later = self.connector(bridge, registration_scope="update-b")
+        bridge.changes += insert(2, 94, 4)
+        rows, offset = later.read_table("app.orders", offset, options)
+        self.assertEqual(list(rows), [])
+        self.assertNotEqual(offset["pipeline_scope"], scope)
+        self.assertEqual(offset["scan_scope"], scope)
+        # Its second batch: one more the page holds, and one from after the scan.
+        bridge.now = 300
+        bridge.changes += insert(3, 97, 5) + insert(4, 201, 3)
+        rows, offset = later.read_table("app.orders", offset, options)
+        self.assertEqual([(row["id"], row["_informix_op"]) for row in rows], [(3, "c")])
+        # Past the scan's end the offset is an ordinary one again.
+        self.assertNotIn("scan_scope", offset)
+        self.assertNotIn("scan_schema", offset)
+
+    def test_an_index_key_reads_the_same_from_a_row_a_staged_row_and_the_manifest(self):
+        # A change's key is matched to staged rows read back from a page, and to the page
+        # bounds the manifest stores as JSON: decimals, dates and padded characters must
+        # come back equal to the values a source row carries.
+        raw = {
+            "amount": Decimal("10.50"),
+            "day": date(2026, 11, 14),
+            "code": "ab   ",
+            "id": 7,
+        }
+        keys = list(raw)
+        key = informix_module._index_scan_key(raw, keys)
+        staged = informix_module._decode_snapshot_stage_value(
+            informix_module._encode_snapshot_stage_value(informix_module._framework_row(raw))
+        )
+        self.assertEqual(informix_module._index_scan_key(staged, keys), key)
+        descending = [False, True, False, True]
+        order = informix_module._index_scan_order(key, descending)
+        stored = json.loads(
+            json.dumps(
+                informix_module._encode_snapshot_stage_value(
+                    informix_module._index_scan_plain(order)
+                )
+            )
+        )
+        self.assertEqual(tuple(informix_module._decode_snapshot_stage_value(stored)), key)
+        # A descending column orders the other way.
+        later = informix_module._index_scan_order((*key[:3], 8), descending)
+        self.assertLess(later, order)
+
+    def test_the_stream_fails_on_a_change_a_stalled_cdc_kept_from_the_scan(self):
+        # A server whose CDC has stalled answers every poll as an idle one, and a quiet
+        # table's session proves nothing until the next checkpoint. So the scan waits for
+        # proof only so long, then takes the idle poll. A change that committed while its
+        # key's page was read, and that the scan never got, may be in the page or not: the
+        # stream fails on it, for a full refresh, instead of guessing.
+        failed = 0
+        for seed in range(12):
+            source = _IndexScanSource(random_module.Random(seed))
+            real = source.read_changes
+            source.read_changes = lambda captures, start, timeout, max_records: [
+                {"op": "TIMEOUT", "lsn": start}
+            ]
+            with mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0):
+                boundary, staged, scan, connector, table = self._index_scan(source, 5)
+            self.assertEqual(scan["index_scan"]["suppress"], [])
+            transactions = informix_module._transaction_batch(real(None, boundary, 1, 256))[0]
+            connector._read_snapshot_stage_manifest = lambda *_, scan=scan: scan
+            connector._offset_scopes = lambda checkpoint: ("scope", "scope")
+            try:
+                connector._drop_scanned_changes(
+                    table, {"commit_lsn": str(boundary), "schema_id": "s"}, {}, transactions
+                )
+            except InformixError as error:
+                self.assertIn("run a full refresh", str(error))
+                failed += 1
+        self.assertGreater(failed, 0)
+
+    def test_an_index_scan_fails_on_keys_that_do_not_come_in_the_order_it_assumes(self):
+        # A change's key is looked up among the pages by order, so the keys must sort for
+        # the connector as they do for Informix. A collation that disagrees shows as a page
+        # whose keys are out of order.
+        source = _IndexScanSource(random_module.Random(3), transactions=0)
+        source.indexes = [(["id"], [True], 20)]  # the source still returns ascending rows
+        source.key_index_directions = lambda identity, columns: [True]
+        chunk = source.snapshot_chunk
+        source.snapshot_chunk = lambda *args, key_descending=None, **kwargs: chunk(
+            *args, key_descending=[False], **kwargs
+        )
+        with self.assertRaisesRegex(InformixError, "does not sort by their characters"):
+            self._index_scan(source, 50)
+
+    def test_an_index_scan_refuses_an_index_value_with_too_many_rows(self):
+        source = _IndexScanSource(random_module.Random(3), transactions=0)
+        source.rows = [{"id": 7, "value": "a"} for _ in range(9)]
         with (
-            mock.patch.object(informix_module, "_INDEX_SCAN_FOLLOW_SECONDS", 0),
-            self.assertRaisesRegex(InformixError, "stopped waiting for Informix CDC"),
+            mock.patch.object(informix_module, "_INDEX_SCAN_KEY_ROWS", 8),
+            self.assertRaisesRegex(InformixError, "more than 8 rows under one index value"),
         ):
-            self._index_scan(source, 5)
+            self._index_scan(source, 3)
 
     def test_a_keyless_snapshot_pages_by_its_most_selective_index_unless_told_not_to(self):
         table = Table.parse(_table(primary_keys=()), "demo")
