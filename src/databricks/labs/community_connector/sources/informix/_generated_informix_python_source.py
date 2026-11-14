@@ -32,6 +32,7 @@ from typing import (
     Protocol,
     Sequence,
 )
+import collections
 import dataclasses
 import io
 import itertools
@@ -6298,17 +6299,19 @@ def register_lakeflow_source(spark):
     _SNAPSHOT_SCAN_OPTION = "snapshot.scan"
     _SNAPSHOT_SCAN_KEYSET = "keyset"
     _SNAPSHOT_SCAN_CURSOR = "cursor"
-    # ``index`` is for a keyless table, whose rows a change cannot be matched to. Its snapshot
-    # and its change stream then overlap: the snapshot position is the start of a log page, so
-    # the stream replays every transaction on that page, and a non-locking scan also sees
-    # changes made while it runs. A keyed target merges the overlap away; a change log keeps
-    # it as duplicate or missing rows. This scan pages by the table's most selective index
-    # and follows the table's changes while it reads, so that each change is either taken back
-    # out of the snapshot (the scan saw it and the stream replays it), left alone (the scan
-    # had passed its key), or, when it committed during the read of its own key, settled by
-    # reading that key again. See _index_scan_snapshot.
-    _SNAPSHOT_SCAN_INDEX = "index"
-    _SNAPSHOT_SCANS = frozenset({_SNAPSHOT_SCAN_KEYSET, _SNAPSHOT_SCAN_CURSOR, _SNAPSHOT_SCAN_INDEX})
+    # A keyless table has no key to page by, and a change cannot be matched to one of its rows.
+    # Its snapshot and its change stream then overlap: the snapshot position is the start of a
+    # log page, so the stream replays every transaction on that page, and a non-locking scan
+    # also sees changes made while it runs. A keyed target merges the overlap away; a change
+    # log keeps it as duplicate or missing rows. So under ``keyset`` a keyless table's snapshot
+    # pages by the table's most selective index, or by the columns ``keyset(a, b desc)`` names,
+    # and follows the table's changes while it reads, so that the stream can leave out each
+    # change the scan saw: one that committed before its key's page was read, or, when it
+    # committed during that read, one the rows staged for the key show the scan saw. See
+    # _index_scan_snapshot and _drop_scanned_changes. Without an index it can page by, the
+    # table is read through the cursor instead, as under ``cursor``, with a warning; with named
+    # columns it fails instead.
+    _SNAPSHOT_SCANS = frozenset({_SNAPSHOT_SCAN_KEYSET, _SNAPSHOT_SCAN_CURSOR})
     # Index key columns it can page by: Python orders their values as Informix does.
     _INDEX_SCAN_KEY_TYPES = frozenset(
         "INTEGER INT SMALLINT BIGINT INT8 SERIAL SERIAL8 BIGSERIAL DECIMAL MONEY DATE CHAR VARCHAR "
@@ -9903,17 +9906,37 @@ def register_lakeflow_source(spark):
         # snapshot read itself, so a malformed value fails before any read.
 
         value = str(raw).strip().lower()
+        if _snapshot_scan_columns(raw) is not None:
+            return _SNAPSHOT_SCAN_KEYSET
         if value not in _SNAPSHOT_SCANS:
             # 63: Option '{}' must be one of: {}, {}
             raise ValueError(
                 _m(
                     63,
                     _SNAPSHOT_SCAN_OPTION,
-                    _SNAPSHOT_SCAN_KEYSET,
-                    f"{_SNAPSHOT_SCAN_CURSOR}, {_SNAPSHOT_SCAN_INDEX}",
+                    f"{_SNAPSHOT_SCAN_KEYSET}, keyset(column [asc|desc], ...)",
+                    _SNAPSHOT_SCAN_CURSOR,
                 )
             )
         return value
+
+
+    def _snapshot_scan_columns(raw: object) -> list[tuple[str, bool | None]] | None:
+        # Docstring: The columns ``snapshot.scan=keyset(a, b desc)`` names for a keyless table's
+        # snapshot to page by, each with its direction (True is descending, None is unsaid), or
+        # None for any other value. An empty list or a malformed column is no such value.
+
+        match = re.fullmatch(r"keyset\s*\((.*)\)", str(raw).strip(), re.IGNORECASE | re.DOTALL)
+        if match is None:
+            return None
+        columns: list[tuple[str, bool | None]] = []
+        for part in match.group(1).split(","):
+            words = part.split()
+            direction = words[1].lower() if len(words) == 2 else None
+            if not 1 <= len(words) <= 2 or direction not in (None, "asc", "desc"):
+                return None
+            columns.append((words[0], None if direction is None else direction == "desc"))
+        return columns
 
 
     class _Descending:
@@ -9934,6 +9957,24 @@ def register_lakeflow_source(spark):
             return self.value >= other.value
 
         __hash__ = None  # type: ignore[assignment]
+
+
+    def _index_scan_key(row: dict[str, Any], keys: Sequence[str]) -> tuple:
+        # Docstring: A row's index key as an index-ordered snapshot compares it: the values the
+        # connector emits, a character one without the padding a CHAR carries.
+
+        return tuple(
+            value.rstrip(" ") if isinstance(value, str) else value
+            for value in (_framework_value(row[key]) for key in keys)
+        )
+
+
+    def _index_scan_order(key: Sequence[Any], descending: Sequence[bool]) -> tuple:
+        return tuple(_Descending(value) if down else value for value, down in zip(key, descending))
+
+
+    def _index_scan_plain(order: Sequence[Any]) -> list:
+        return [value.value if isinstance(value, _Descending) else value for value in order]
 
 
     def _validate_nonneg_float_option(options: dict[str, str], name: str) -> None:
@@ -17781,7 +17822,9 @@ def register_lakeflow_source(spark):
             page_count: int,
             row_count: int,
             first_upper_pk: str | None = None,
+            scanned: dict[str, Any] | None = None,
         ) -> dict[str, Any]:
+            # scanned is what a keyless table's index-ordered scan recorded for the stream.
             # first_upper_pk is page 0's header upper_pk as sorted-key JSON text, so the first
             # microbatch's end offset can be built without reading the page. Text, because the
             # jsonb column reorders nested keys and the offset must match the page's byte for byte.
@@ -17790,6 +17833,7 @@ def register_lakeflow_source(spark):
                 self._snapshot_manifest_namespace(table, pipeline_scope, schema_id),
                 {
                     **recorded,
+                    **(scanned or {}),
                     "created_at": time.time(),
                     "page_count": page_count,
                     "row_count": row_count,
@@ -18696,15 +18740,9 @@ def register_lakeflow_source(spark):
                 # overlaps the next page fetch with the previous page's shape+upload through
                 # a bounded background uploader; the counters stage_page owns are then read
                 # only after the pipeline is joined below.
-                index_scan = not table.primary_keys and (
-                    _snapshot_scan_value(
-                        options.get(
-                            _SNAPSHOT_SCAN_OPTION,
-                            self.options.get(_SNAPSHOT_SCAN_OPTION, _SNAPSHOT_SCAN_KEYSET),
-                        )
-                    )
-                    == _SNAPSHOT_SCAN_INDEX
-                )
+                scanned: dict[str, Any] = {}
+                scan_index = self._scan_index(table, options)
+                index_scan = scan_index is not None
                 pipeline = (
                     _AsyncStagePipeline(stage_page)
                     if not index_scan and self._should_pipeline_staging(scan_keys)
@@ -18714,7 +18752,18 @@ def register_lakeflow_source(spark):
                 try:
                     snapshot_lsn, rows = (
                         (
-                            self._index_scan_snapshot(table, options, page_size, max_rows, stage_page),
+                            self._index_scan_snapshot(
+                                table,
+                                options,
+                                scan_index,
+                                page_size,
+                                max_rows,
+                                stage_page,
+                                lambda lsn, index: self._stream_staged_page(
+                                    table, pipeline_scope, schema_id, lsn, index
+                                )[1],
+                                scanned,
+                            ),
                             [],
                         )
                         if index_scan
@@ -18786,6 +18835,7 @@ def register_lakeflow_source(spark):
                     page_count,
                     row_count,
                     first_upper_pk,
+                    scanned,
                 )
                 if page_count == 0:
                     return iter(()), _offset(
@@ -18800,60 +18850,124 @@ def register_lakeflow_source(spark):
                     )
                 return self._staged_snapshot_result(table, pipeline_scope, schema_id, manifest, 0)
 
-        def _index_scan_snapshot(self, table, options, page_size, max_rows, stage_page) -> int:
-            # Docstring: Stage a keyless table exactly as it was at the returned snapshot LSN.
+        def _scan_index(self, table, options) -> tuple[list[str], list[bool]] | None:
+            # Docstring: The index a keyless table's snapshot pages by, as its columns and their
+            # directions, or None when it reads through the one cursor instead.
             #
-            # The stream replays every transaction that committed after that LSN, so the staged
-            # rows must hold none of those changes. The table is read a page at a time in the
-            # order of an index, each key whole within one read, with the log position sampled
-            # before the read (rounded down to its log page) and after it (rounded up). The
-            # table's changes are read from the snapshot LSN on as the scan goes. A change that
-            # committed before the read of its key's page is in the page: it is undone there,
-            # an insert by dropping one identical row and a delete by adding the row back. One
-            # that committed after the read is not in the page and is left to the stream. One
-            # that committed between the two samples may be either, unless it had been read from
-            # the log before the page was, so its key is read again
-            # until a read has no change to that key between its own two samples, and every
-            # change to it since the snapshot LSN is then undone. Rows of one key are held until
-            # the changes have been followed past the read that returned them.
+            # ``snapshot.scan=cursor`` asks for the cursor. ``snapshot.scan=keyset(a, b desc)``
+            # names the columns to page by, and may give their directions. Otherwise the table is
+            # paged by the index with the most distinct keys among those on ingested NOT NULL
+            # columns of a type whose values Python orders as Informix does. It cannot be when
+            # there is none, with a filter (the scan and the stream would have to agree on it row
+            # by row), or on a
+            # database that logs buffered (a commit is visible there before CDC can hand it
+            # over). With named columns the snapshot then fails; otherwise the table falls back
+            # to the cursor, with a warning that its change log can hold the overlap.
 
+            raw = options.get(
+                _SNAPSHOT_SCAN_OPTION, self.options.get(_SNAPSHOT_SCAN_OPTION, _SNAPSHOT_SCAN_KEYSET)
+            )
+            requested = _snapshot_scan_value(raw)
+            named = _snapshot_scan_columns(raw)
+            if table.primary_keys:
+                if named:
+                    # 432: Option snapshot.scan=keyset(...) names columns to page '{}'
+                    # by, but the table has a key and pages by that; change the key
+                    # with primary.keys instead
+                    raise InformixError(_m(432, table.exposed_name))
+                return None
             bridge = self._bridge
-            if table.row_filter is not None or _snapshot_filter(options):
-                # 433: snapshot.scan=index does not support {} on '{}'
-                raise InformixError(_m(433, "a row or snapshot filter", table.exposed_name))
-            if bridge.buffered_logging():
-                # 433: snapshot.scan=index does not support {} on '{}'
-                raise InformixError(_m(433, "a database with buffered logging", table.exposed_name))
-            timeout = self._table_int_option(options, "cdc.timeout", 5, minimum=1)
+            indexes = getattr(bridge, "table_indexes", None)
+            if requested == _SNAPSHOT_SCAN_CURSOR or not (named or callable(indexes)):
+                return None
+            listed = indexes(table.identity) if callable(indexes) else []
             usable = {
-                column.name
+                column.name.lower(): column.name
                 for column in table.columns
                 if not column.nullable and column.type_name in _INDEX_SCAN_KEY_TYPES
             }
             chosen = None
-            for columns, directions, nunique in bridge.table_indexes(table.identity):
+            if named:
+                # The columns the option names, in the directions it gives; one it leaves unsaid
+                # takes the direction of an index that starts with these columns, else ascending.
+                for name, _direction in named:
+                    if name.lower() not in usable:
+                        # 433: The index-ordered snapshot of a keyless table does
+                        # not support {} on '{}'; set snapshot.scan=cursor to read
+                        # the table without index order
+                        raise InformixError(
+                            _m(
+                                433,
+                                f"column {name}, which is not an ingested NOT NULL column of "
+                                "integer, decimal, date or character type,",
+                                table.exposed_name,
+                            )
+                        )
+                names = [usable[name.lower()] for name, _direction in named]
+                found = next(
+                    (
+                        directions
+                        for columns, directions, _n in listed
+                        if columns[: len(names)] == names
+                    ),
+                    [False] * len(names),
+                )
+                chosen = (
+                    None,
+                    names,
+                    [found[at] if down is None else down for at, (_name, down) in enumerate(named)],
+                )
+            for columns, directions, nunique in () if named else listed:
                 rank = (nunique, -len(columns))
-                if all(column in usable for column in columns) and (chosen is None or rank > chosen[0]):
+                if all(column.lower() in usable for column in columns) and (
+                    chosen is None or rank > chosen[0]
+                ):
                     chosen = (rank, columns, directions)
-            if chosen is None:
-                # 432: Table '{}' has no index that snapshot.scan=index can page by: it needs an index
-                # on ingested NOT NULL columns of integer, decimal, date or character type
-                raise InformixError(_m(432, table.exposed_name))
-            _rank, keys, descending = chosen
+            if table.row_filter is not None or _snapshot_filter(options):
+                reason = "a row or snapshot filter"
+            elif chosen is None:
+                reason = None
+            elif bridge.buffered_logging():
+                reason = "a database with buffered logging"
+            else:
+                return list(chosen[1]), list(chosen[2])
+            if named:
+                # 433: The index-ordered snapshot of a keyless table does not support {}
+                # on '{}'; set snapshot.scan=cursor to read the table without index order
+                raise InformixError(_m(433, reason, table.exposed_name))
+            # 437: Informix snapshot of keyless table '{}' reads without index order because it has
+            # {}; a row that changes during the snapshot can then be in its change log twice, or
+            # not at all
+            logging.getLogger(__name__).warning(
+                _m(437, table.exposed_name, reason or "no index the snapshot can page by")
+            )
+            return None
+
+        def _index_scan_snapshot(
+            self, table, options, index, page_size, max_rows, stage_page, staged_rows, scan
+        ) -> int:
+            # Docstring: Stage a keyless table by an index and record, in ``scan``, which of its
+            # changes the stream must not replay; returns the snapshot LSN.
+            #
+            # The stream replays every transaction that committed after the snapshot LSN, and the
+            # scan has already seen some of them: the snapshot LSN is rounded down to its log
+            # page, and the scan takes no locks. The table is read a page at a time in the order
+            # of an index, each key whole within one read, and staged as read, with the log
+            # position sampled before the read (rounded down to its log page) and after it
+            # (rounded up). A change that committed before the read of its key's page is in the
+            # page, so the stream drops it (see _drop_scanned_changes); so is one the follower
+            # held when the read began. One that committed after the read is not in the page.
+            # One that committed between the two samples may be either: its key is read again
+            # until a read has no change to that key between its own two samples, and the rows
+            # staged for it, read back, show which of those changes the scan saw. Those are
+            # dropped by their own log positions. ``scan`` goes into the snapshot's manifest.
+
+            bridge = self._bridge
+            timeout = self._table_int_option(options, "cdc.timeout", 5, minimum=1)
+            keys, descending = index
             names = [column.name for column in table.columns]
             isolation = _SNAPSHOT_ISOLATION_SQL[_DEFAULT_SNAPSHOT_ISOLATION]
             capture = _capture_descriptor(table, _client_encoding(self.options))
-
-            def key_of(row):
-                return tuple(
-                    value.rstrip(" ") if isinstance(value, str) else value
-                    for value in (row[key] for key in keys)
-                )
-
-            def order_of(key):
-                return tuple(
-                    _Descending(value) if down else value for value, down in zip(key, descending)
-                )
 
             def token(row):
                 shaped = _framework_row(_coerce_variable_decimal_values(row, table, options))
@@ -18861,19 +18975,26 @@ def register_lakeflow_source(spark):
 
             boundary = bridge.boundary_lsn()
             start = last_commit = boundary
-            # Per key, its changes since the boundary in commit order: (commit LSN, +1 for an
-            # inserted image or -1 for a deleted one, the row's token, the row).
-            changes: dict[tuple, list[tuple[int, int, str, dict]]] = {}
+            # Changes read from the log and not sorted yet, per key: (commit LSN, +1 for an
+            # inserted image or -1 for a deleted one, the row's token, the change's own LSN,
+            # its operation). ``events`` keeps those of the keys in doubt, whose index values
+            # ``doubt`` holds for reading them again.
+            fresh: dict[tuple, list[tuple[int, int, str, int, str]]] = {}
+            events: dict[tuple, list[tuple[int, int, str, int, str]]] = {}
+            doubt: dict[tuple, list] = {}
+            # Each page read, in scan order: its last key's order (None for the last page), the
+            # positions before and after its read, and its staged page's index (None if empty).
+            pages: list[tuple[tuple | None, int, int, int | None]] = []
+            bounds: list[tuple] = []
 
             def follow(target: int, proof: bool = False) -> None:
-                # Read the table's changes until every commit at or below ``target`` is in. An
-                # idle poll is taken to mean that, as the stream takes it, but a session can go
-                # idle before it has handed over what is there, and a server that has stopped
-                # handing changes over only ever goes idle. So the scan ends with ``proof``: the
-                # poll must report having read up to ``target``, or bring a later commit. An idle
+                # Read the table's changes until every commit at or below ``target`` is in, and
+                # sort them. An idle poll is taken to mean that, as the stream takes it, but a
+                # session can go idle before it has handed over what is there, and a server that
+                # has stopped handing changes over only ever goes idle. With ``proof`` the poll
+                # must report having read up to ``target``, or bring a later commit. An idle
                 # session reports the last checkpoint's position, so on a quiet table that takes
-                # until the next checkpoint. A change that arrives by then for rows already
-                # staged fails the snapshot (see drop_staged).
+                # until the next checkpoint.
                 nonlocal start, last_commit
                 deadline = time.monotonic() + _INDEX_SCAN_FOLLOW_SECONDS
                 while True:
@@ -18886,108 +19007,48 @@ def register_lakeflow_source(spark):
                         for record in tx.records:
                             op = _operation(record)
                             if op == "TRUNCATE":
-                                # 433: snapshot.scan=index does not support {} on '{}'
+                                # 433: The index-ordered snapshot of a
+                                # keyless table does not support {} on
+                                # '{}'; set snapshot.scan=cursor to read
+                                # the table without index order
                                 raise InformixError(_m(433, "TRUNCATE", table.exposed_name))
                             before = record.get("before", record.get("row") if op == "DELETE" else None)
                             after = record.get("after", record.get("row") if op == "INSERT" else None)
                             for row, sign in ((before, -1), (after, 1)):
                                 if row is not None:
-                                    changes.setdefault(key_of(row), []).append(
-                                        (tx.commit_lsn, sign, token(row), row)
+                                    key = _index_scan_key(row, keys)
+                                    fresh.setdefault(key, []).append(
+                                        (tx.commit_lsn, sign, token(row), _lsn(record), op)
                                     )
+                                    if key not in doubt and key not in raw:
+                                        raw[key] = [row[name] for name in keys]
                     # As the stream restarts: at the oldest open BEGIN, else the last commit.
                     start = open_begin if open_begin is not None else max(start, last_commit)
                     if last_commit > target or (caught_up and (not proof or (reached or 0) >= target)):
-                        return
+                        break
                     if time.monotonic() > deadline:
-                        # 435: snapshot.scan=index stopped waiting for Informix CDC to reach the
-                        # snapshot's position for '{}' after {} seconds
+                        # 435: The index-ordered snapshot stopped waiting for
+                        # Informix CDC to reach the snapshot's position for '{}'
+                        # after {} seconds
                         raise InformixError(_m(435, table.exposed_name, _INDEX_SCAN_FOLLOW_SECONDS))
-
-            def undo(rows, events):
-                # ``rows`` without ``events``, latest first; None if an inserted row is not there.
-                rows = list(rows)
-                tokens = [token(row) for row in rows]
-                for _commit, sign, row_token, row in reversed(events):
-                    if sign < 0:
-                        rows.append(row)
-                        tokens.append(row_token)
-                    elif row_token in tokens:
-                        index = tokens.index(row_token)
-                        del rows[index], tokens[index]
-                    else:
-                        return None
-                return rows
-
-            staged: list[dict] = []
-            counts = [0, 0]  # pages staged, rows emitted
-
-            def emit(rows, flush=False):
-                staged.extend(rows)
-                counts[1] += len(rows)
-                if max_rows and counts[1] > max_rows:
-                    # 52: Initial snapshot exceeds snapshot.max.rows={}
-                    raise InformixError(_m(52, max_rows))
-                while len(staged) >= page_size or (flush and staged):
-                    stage_page(boundary, counts[0], staged[:page_size])
-                    del staged[:page_size]
-                    counts[0] += 1
-
-            doubt: set[tuple] = set()
-            # Read pages not followed past yet: (before, after, rows by key, last key's order).
-            pages: list[tuple[int, int, dict, tuple | None]] = []
-
-            # Each staged page's bound and the position sampled after its read, in scan order
-            # (the last page has no bound), and the same position for each key read again.
-            bounds: list[tuple] = []
-            afters: list[int] = []
-            resolved: dict[tuple, int] = {}
-
-            def drop_staged() -> None:
-                # A change to a key whose rows are staged is the stream's alone. One that
-                # committed before those rows were read should have been taken out of them: it
-                # reached the follower too late, so the snapshot is not known to be exact.
-                for key in [key for key in changes if key not in doubt]:
-                    page = bisect.bisect_left(bounds, order_of(key))
-                    if key in resolved:
-                        limit = resolved[key]
-                    elif page < len(afters):
-                        limit = afters[page]
-                    else:
+                for key, changed in fresh.items():
+                    if key in doubt:
+                        events[key].extend(changed)
                         continue
-                    if any(event[0] <= limit for event in changes.pop(key)):
-                        # 436: snapshot.scan=index read a change to '{}' from Informix CDC after
-                        # staging the rows it applies to, so the snapshot is not known to be
-                        # exact; Informix CDC fell behind the scan
-                        raise InformixError(_m(436, table.exposed_name))
+                    page = bisect.bisect_left(bounds, _index_scan_order(key, descending))
+                    # A key not read yet: its page will hold these changes, and its read will
+                    # start after the follower held them, so the stream drops them.
+                    if page < len(pages):
+                        _bound, before, after, _index = pages[page]
+                        if any(before < event[0] <= after for event in changed):
+                            doubt[key] = raw[key]
+                            events[key] = [event for event in changed if event[0] > before]
+                fresh.clear()
+                raw.clear()
 
-            def settle_pages() -> None:
-                follow(pages[-1][1])
-                drop_staged()
-                for before, after, groups, bound in pages:
-                    for key in [key for key in changes if key not in doubt]:
-                        if bound is not None and not order_of(key) <= bound:
-                            continue
-                        events = changes.pop(key)
-                        rows = None
-                        if not any(before < event[0] <= after for event in events):
-                            seen = [event for event in events if event[0] <= before]
-                            rows = undo(groups.get(key, ()), seen)
-                        if rows is None:
-                            doubt.add(key)
-                            changes[key] = events
-                            groups.pop(key, None)
-                        else:
-                            groups[key] = rows
-                    for rows in groups.values():
-                        emit(rows)
-                    afters.append(after)
-                    if bound is not None:
-                        bounds.append(bound)
-                pages.clear()
-
+            raw: dict[tuple, list] = {}
             cursor = None
-            held = 0
+            held = total = staged_pages = 0
             while True:
                 # A commit the follower already holds was made before this read, wherever it
                 # sits in the log page the read's own position is rounded down to.
@@ -19001,68 +19062,179 @@ def register_lakeflow_source(spark):
                     key_descending=descending,
                     isolation=isolation,
                 )
-                groups: dict[tuple, list[dict]] = {}
-                for row in rows:
-                    groups.setdefault(key_of(row), []).append(row)
                 more = len(rows) >= page_size
                 bound = None
                 if more:
                     # The last key may go on past the page: read it whole if it is the only
                     # one, else leave it to the next page.
-                    last = rows[-1]
-                    if len(groups) == 1:
-                        cursor = [last[key] for key in keys]
-                        groups = {
-                            key_of(last): bridge.key_rows(
-                                table.identity, names, keys, cursor, isolation
-                            )
-                        }
+                    last = _index_scan_key(rows[-1], keys)
+                    if _index_scan_key(rows[0], keys) == last:
+                        cursor = [rows[-1][name] for name in keys]
+                        rows = bridge.key_rows(table.identity, names, keys, cursor, isolation)
                     else:
-                        del groups[key_of(last)]
-                        last = groups[next(reversed(groups))][0]
-                        cursor = [last[key] for key in keys]
-                    bound = order_of(key_of(last))
-                pages.append((max(before, known), bridge.current_lsn(), groups, bound))
+                        while _index_scan_key(rows[-1], keys) == last:
+                            rows.pop()
+                        cursor = [rows[-1][name] for name in keys]
+                        last = _index_scan_key(rows[-1], keys)
+                    bound = _index_scan_order(last, descending)
+                after = bridge.current_lsn()
+                total += len(rows)
+                if max_rows and total > max_rows:
+                    # 52: Initial snapshot exceeds snapshot.max.rows={}
+                    raise InformixError(_m(52, max_rows))
+                if rows:
+                    stage_page(boundary, staged_pages, rows)
+                pages.append((bound, max(before, known), after, staged_pages if rows else None))
+                staged_pages += bool(rows)
+                if bound is not None:
+                    bounds.append(bound)
                 held += len(rows)
-                if not more or held >= _INDEX_SCAN_FOLLOW_ROWS:
-                    settle_pages()
+                if more and held >= _INDEX_SCAN_FOLLOW_ROWS:
+                    follow(after)
                     held = 0
                 if not more:
                     break
-            for attempt in range(_INDEX_SCAN_SETTLE_ATTEMPTS):
+            # Every change that committed during the scan must be in before any key is settled:
+            # the follower is shown to have read the log past the page the scan ended on.
+            follow(bridge.current_lsn(), proof=True)
+            suppress: list[int] = []
+            for _attempt in range(_INDEX_SCAN_SETTLE_ATTEMPTS):
                 if not doubt:
                     break
-                follow(0)
                 before = max(bridge.boundary_lsn(), last_commit)
                 read = {
-                    key: bridge.key_rows(table.identity, names, keys, list(key), isolation)
-                    for key in doubt
+                    key: collections.Counter(
+                        token(row)
+                        for row in bridge.key_rows(table.identity, names, keys, values, isolation)
+                    )
+                    for key, values in doubt.items()
                 }
                 after = bridge.current_lsn()
-                follow(after)
-                drop_staged()
-                for key, rows in read.items():
-                    events = changes.get(key, [])
-                    if any(before < event[0] <= after for event in events):
+                follow(after, proof=True)
+                for key, state in read.items():
+                    changed = events[key]
+                    if any(before < event[0] <= after for event in changed):
                         continue
-                    rows = undo(rows, [event for event in events if event[0] <= before])
-                    if rows is not None:
-                        emit(rows)
-                        doubt.discard(key)
-                        changes.pop(key, None)
-                        resolved[key] = after
+                    _bound, read_before, read_after, index = pages[
+                        bisect.bisect_left(bounds, _index_scan_order(key, descending))
+                    ]
+                    unsure = [event for event in changed if event[0] <= read_after]
+                    if any(event[4] == "UPDATE" for event in unsure):
+                        # 433: The index-ordered snapshot of a keyless table does
+                        # not support {} on '{}'; set snapshot.scan=cursor to read
+                        # the table without index order
+                        raise InformixError(
+                            _m(433, "an UPDATE of a key while it is read", table.exposed_name)
+                        )
+                    # What the scan staged for the key, less what the key holds now, plus every
+                    # change since its read began: the net of the unsure changes the scan saw.
+                    saw = collections.Counter(
+                        json.dumps({name: row[name] for name in names}, sort_keys=True, default=str)
+                        for row in (() if index is None else staged_rows(boundary, index))
+                        if _index_scan_key(row, keys) == key
+                    )
+                    saw.subtract(state)
+                    for event in changed:
+                        if event[0] <= before:
+                            saw[event[2]] += event[1]
+                    for event in unsure:
+                        if saw[event[2]] * event[1] > 0:
+                            saw[event[2]] -= event[1]
+                            suppress.append(event[3])
+                    if any(saw.values()):
+                        # 436: The index-ordered snapshot cannot tell which
+                        # changes to a key of '{}' its scan saw: the rows staged
+                        # for the key do not fit the key's changes
+                        raise InformixError(_m(436, table.exposed_name))
+                    del doubt[key], events[key]
             if doubt:
-                # 434: snapshot.scan=index could not settle {} key(s) of '{}' after {} re-reads because
-                # they kept changing; run the snapshot when the table is quieter
+                # 434: The index-ordered snapshot could not settle {} key(s) of '{}' after
+                # {} re-reads because they kept changing; run the snapshot when the table
+                # is quieter, or set snapshot.scan=cursor
                 raise InformixError(
                     _m(434, len(doubt), table.exposed_name, _INDEX_SCAN_SETTLE_ATTEMPTS)
                 )
-            # The follower must be shown to have read the log through the end of the scan: past
-            # the page the log was on then, since positions are known only to the page.
-            follow(bridge.current_lsn(), proof=True)
-            drop_staged()
-            emit((), flush=True)
+            scan["index_scan"] = {
+                "keys": list(keys),
+                "descending": list(descending),
+                # Each page's last key, with the position before its read: a change to a key of
+                # the page that committed at or below it is in the page.
+                "pages": [
+                    [
+                        None
+                        if bound is None
+                        else _encode_snapshot_stage_value(_index_scan_plain(bound)),
+                        before,
+                    ]
+                    for bound, before, _after, _index in pages
+                ],
+                "end": max(after for _bound, _before, after, _index in pages),
+                "suppress": sorted(suppress),
+            }
             return boundary
+
+        def _drop_scanned_changes(self, table, checkpoint, options, transactions):
+            # Docstring: ``transactions`` without the changes a keyless table's index-ordered
+            # snapshot already holds (see _index_scan_snapshot).
+            #
+            # The snapshot's manifest names them: every change to a key that committed at or
+            # below the position before that key's page was read, and the changes listed by
+            # their own log positions. Nothing above the scan's end is dropped.
+
+            if table.primary_keys or not transactions or self._snapshot_cursor_scan(options):
+                return transactions
+            scope = self._offset_scopes(checkpoint)[1]
+            schema_id = str(checkpoint.get("schema_id"))
+            cache = self.__dict__.setdefault("_index_scans", {})
+            cached = (table.identity, scope, schema_id)
+            if cached not in cache:
+                manifest = self._read_snapshot_stage_manifest(table, scope, schema_id) or {}
+                recorded = manifest.get("index_scan")
+                if recorded and int(checkpoint["commit_lsn"]) < int(recorded["end"]):
+                    descending = recorded["descending"]
+                    cache[cached] = (
+                        recorded["keys"],
+                        descending,
+                        [
+                            _index_scan_order(tuple(_decode_snapshot_stage_value(page[0])), descending)
+                            for page in recorded["pages"]
+                            if page[0] is not None
+                        ],
+                        [int(page[1]) for page in recorded["pages"]],
+                        int(recorded["end"]),
+                        frozenset(int(lsn) for lsn in recorded["suppress"]),
+                    )
+                else:
+                    cache[cached] = None
+            if cache[cached] is None:
+                return transactions
+            keys, descending, bounds, befores, end, suppress = cache[cached]
+            kept = []
+            for tx in transactions:
+                if tx.commit_lsn > end:
+                    kept.append(tx)
+                    continue
+                if tx.spilled:
+                    # 433: The index-ordered snapshot of a keyless table does not
+                    # support {} on '{}'; set snapshot.scan=cursor to read the table
+                    # without index order
+                    raise InformixError(
+                        _m(433, "a transaction over cdc.spill.records during it", table.exposed_name)
+                    )
+                records = []
+                for record in tx.records:
+                    row = record.get("after") or record.get("row") or record.get("before")
+                    if row is not None:
+                        order = _index_scan_order(_index_scan_key(row, keys), descending)
+                        if (
+                            _lsn(record) in suppress
+                            or tx.commit_lsn <= befores[bisect.bisect_left(bounds, order)]
+                        ):
+                            continue
+                    records.append(record)
+                records = tuple(records)
+                kept.append(tx if len(records) == len(tx.records) else replace(tx, records=records))
+            return kept
 
         @staticmethod
         def _validate_unl_source_options(options: dict[str, str]) -> None:
@@ -21162,7 +21334,9 @@ def register_lakeflow_source(spark):
                 )
                 table = self._refresh_table_schema(table, fingerprint)
                 committed, caught_up, open_begin, reached = _transaction_batch(raw_records)
-            recovered = _recover(committed, checkpoint)
+            recovered = self._drop_scanned_changes(
+                table, checkpoint, options, _recover(committed, checkpoint)
+            )
             output: list[dict[str, Any]] = []
             end = dict(start)
             end["pipeline_scope"] = pipeline_scope

@@ -1996,47 +1996,118 @@ class LakeflowContractTests(unittest.TestCase):
         # connector's own loop bound.
         self.assertEqual(requested, [256])
 
-    def test_an_index_scan_stages_a_keyless_table_as_it_was_at_its_snapshot_position(self):
-        # snapshot.scan=index: a keyless change log's snapshot must hold none of the changes
-        # the stream replays (commits after the snapshot LSN), or the two overlap as
-        # duplicate or missing rows. The source here commits transactions at random between
-        # every call the scan makes, and reports its log position to the page only, as
-        # Informix does. Whatever the interleaving, the staged rows plus every transaction
-        # the stream is handed from the snapshot LSN must give the final table, duplicates
-        # included.
+    def _index_scan(self, source, page_size, **patches):
+        """Run snapshot.scan=index over ``source``: (snapshot LSN, staged rows, what the scan
+        recorded for the stream, the connector). Pages go through the staging codec, as the
+        rows read back for a key in doubt do."""
         table = Table.parse(_table(primary_keys=()), "demo")
-        for seed in range(60):
+        connector = self.connector(source)
+        pages: dict[int, list[dict]] = {}
+        scan: dict = {}
+
+        def stage_page(lsn, index, rows):
+            self.assertEqual(index, len(pages))
+            pages[index] = [
+                informix_module._decode_snapshot_stage_value(
+                    informix_module._encode_snapshot_stage_value(
+                        informix_module._shape_snapshot(row, lsn, table, {})
+                    )
+                )
+                for row in rows
+            ]
+
+        boundary = connector._index_scan_snapshot(
+            table,
+            {},
+            connector._scan_index(table, {}),
+            page_size,
+            0,
+            stage_page,
+            lambda lsn, index: iter(pages[index]),
+            scan,
+        )
+        staged = [row for index in sorted(pages) for row in pages[index]]
+        return boundary, staged, scan, connector, table
+
+    def test_an_index_scan_and_the_stream_after_it_add_up_to_the_table(self):
+        # snapshot.scan=index: a keyless change log's snapshot and the stream that replays
+        # every commit after its snapshot LSN must not overlap, or the log holds duplicate
+        # or missing rows. The source here commits transactions at random between every
+        # call the scan makes, and reports its log position to the page only, as Informix
+        # does. Whatever the interleaving, the staged rows plus the changes the stream keeps
+        # must give the final table, duplicates included.
+        dropped = 0
+        for seed in range(80):
             random = random_module.Random(seed)
             source = _IndexScanSource(random, descending=seed % 3 == 0)
-            connector = self.connector(source)
-            staged: list[dict] = []
-            pages: list[int] = []
-
-            def stage_page(lsn, index, rows, staged=staged, pages=pages):
-                pages.append(index)
-                staged.extend(rows)
-
-            boundary = connector._index_scan_snapshot(
-                table, {}, random.choice([3, 5, 50]), 0, stage_page
+            boundary, staged, scan, connector, table = self._index_scan(
+                source, random.choice([3, 5, 50])
             )
-
-            expected = collections.Counter(source.rows_as_text())
-            for begin, sign, row in source.log_changes():
-                if begin > boundary:
-                    expected[row] -= sign
-            self.assertEqual(
-                collections.Counter(_IndexScanSource.text(row) for row in staged),
-                +expected,
-                f"seed {seed}",
+            records = source.read_changes(None, boundary, 1, 256)
+            transactions = informix_module._transaction_batch(records)[0]
+            connector._read_snapshot_stage_manifest = lambda *_: scan
+            connector._offset_scopes = lambda checkpoint: ("scope", "scope")
+            kept = connector._drop_scanned_changes(
+                table,
+                {"commit_lsn": str(boundary), "schema_id": "s"},
+                {},
+                transactions,
             )
-            self.assertEqual(pages, list(range(len(pages))))
+            self.assertEqual([tx.commit_lsn for tx in kept], [tx.commit_lsn for tx in transactions])
+            result = collections.Counter(_IndexScanSource.text(row) for row in staged)
+            for tx in kept:
+                for record in tx.records:
+                    result[_IndexScanSource.text(record["row"])] += (
+                        1 if record["op"] == "INSERT" else -1
+                    )
+            dropped += sum(len(tx.records) for tx in transactions) - sum(
+                len(tx.records) for tx in kept
+            )
+            self.assertEqual(+result, collections.Counter(source.rows_as_text()), f"seed {seed}")
+            self.assertFalse(-result, f"seed {seed}")
+        # The interleavings do overlap: without the dropped changes the sums are wrong.
+        self.assertGreater(dropped, 100)
+
+    def test_the_stream_keeps_every_change_once_past_an_index_scans_end(self):
+        source = _IndexScanSource(random_module.Random(7))
+        boundary, _staged, scan, connector, table = self._index_scan(source, 5)
+        end = scan["index_scan"]["end"]
+        transactions = informix_module._transaction_batch(
+            [
+                {"op": "BEGIN", "tx_id": 1, "lsn": end + 1},
+                {"op": "INSERT", "tx_id": 1, "lsn": end + 2, "row": {"id": 1, "value": "a"}},
+                {"op": "COMMIT", "tx_id": 1, "lsn": end + 3},
+            ]
+        )[0]
+        connector._read_snapshot_stage_manifest = lambda *_: scan
+        connector._offset_scopes = lambda checkpoint: ("scope", "scope")
+        kept = connector._drop_scanned_changes(
+            table,
+            {"commit_lsn": str(boundary), "schema_id": "s"},
+            {},
+            transactions,
+        )
+        self.assertEqual(kept, transactions)
+        # A table read through the cursor, or one with a key, asks for no manifest.
+        connector._read_snapshot_stage_manifest = None
+        self.assertIs(
+            connector._drop_scanned_changes(
+                table, {"commit_lsn": "1"}, {"snapshot.scan": "cursor"}, transactions
+            ),
+            transactions,
+        )
+        self.assertIs(
+            connector._drop_scanned_changes(
+                Table.parse(_table(), "demo"), {"commit_lsn": "1"}, {}, transactions
+            ),
+            transactions,
+        )
 
     def test_an_index_scan_fails_when_cdc_stops_handing_changes_over(self):
         # A server whose CDC has stalled answers every poll as an idle one. Taken for
-        # "nothing changed", that would stage changes the stream replays later. The scan
+        # "nothing changed", that would leave changes the scan saw to be replayed. The scan
         # ends by asking for proof the log was read through its end, which a stalled session
         # cannot give: it reports no progress.
-        table = Table.parse(_table(primary_keys=()), "demo")
         source = _IndexScanSource(random_module.Random(4))
         source.read_changes = lambda captures, start, timeout, max_records: [
             {"op": "TIMEOUT", "lsn": start}
@@ -2045,47 +2116,86 @@ class LakeflowContractTests(unittest.TestCase):
             mock.patch.object(informix_module, "_INDEX_SCAN_FOLLOW_SECONDS", 0),
             self.assertRaisesRegex(InformixError, "stopped waiting for Informix CDC"),
         ):
-            self.connector(source)._index_scan_snapshot(table, {}, 5, 0, lambda *_: None)
+            self._index_scan(source, 5)
 
-    def test_an_index_scan_fails_on_a_change_it_is_handed_too_late(self):
-        # CDC hands over a change only after the page it applies to was staged, although
-        # it committed before that page was read.
+    def test_a_keyless_snapshot_pages_by_its_most_selective_index_unless_told_not_to(self):
         table = Table.parse(_table(primary_keys=()), "demo")
-        source = _IndexScanSource(random_module.Random(5), transactions=0)
-        source.tx_id = 1
-        source._write("BEGIN")
-        source._write("INSERT", row={"id": 1, "value": "late"})
-        source._write("COMMIT")
-        source.rows.append({"id": 1, "value": "late"})
-        held, polls = list(source.log), []
-        source.log = []
+        source = _IndexScanSource(random_module.Random(1))
+        source.indexes = [(["id"], [True], 5), (["id", "value"], [False, False], 9)]
+        connector = self.connector(source)
+        # value is nullable, so only the index on id will do, in its own direction.
+        self.assertEqual(connector._scan_index(table, {}), (["id"], [True]))
+        self.assertEqual(
+            connector._scan_index(table, {"snapshot.scan": "keyset"}), (["id"], [True])
+        )
+        self.assertIsNone(connector._scan_index(table, {"snapshot.scan": "cursor"}))
+        # A keyed table pages by its key, and columns named for it are a mistake.
+        keyed = Table.parse(_table(), "demo")
+        self.assertIsNone(connector._scan_index(keyed, {}))
+        with self.assertRaisesRegex(InformixError, "has a key and pages by that"):
+            connector._scan_index(keyed, {"snapshot.scan": "keyset(id)"})
 
-        def read_changes(captures, start, timeout, max_records):
-            polls.append(start)
-            if len(polls) == 2:
-                source.log = held
-            return _IndexScanSource.read_changes(source, captures, start, timeout, max_records)
+    def test_a_keyless_snapshot_pages_by_the_columns_the_option_names(self):
+        raw = _table(primary_keys=())
+        raw["columns"].append({"name": "region", "type_name": "CHAR", "nullable": False})
+        table = Table.parse(raw, "demo")
+        source = _IndexScanSource(random_module.Random(1))
+        source.indexes = [(["id"], [False], 99), (["region", "id"], [True, False], 5)]
+        connector = self.connector(source)
 
-        source.read_changes = read_changes
-        source.boundary_lsn = lambda: 0
-        with self.assertRaisesRegex(InformixError, "after staging the rows it applies to"):
-            self.connector(source)._index_scan_snapshot(table, {}, 5, 0, lambda *_: None)
+        def scan(value):
+            return connector._scan_index(table, {"snapshot.scan": value})
 
-    def test_an_index_scan_needs_an_index_on_not_null_columns(self):
+        # Named columns replace the choice of the most selective index. A direction left
+        # unsaid is that of an index starting with the columns, else ascending.
+        self.assertEqual(scan("keyset(region)"), (["region"], [True]))
+        self.assertEqual(scan("KEYSET( Region , id desc )"), (["region", "id"], [True, True]))
+        self.assertEqual(scan("keyset(region asc, id)"), (["region", "id"], [False, False]))
+        self.assertEqual(scan("keyset(id, region)"), (["id", "region"], [False, False]))
+        # A column that cannot be paged by fails the snapshot: the option asked for it.
+        for value in ("keyset(value)", "keyset(missing)"):
+            with self.assertRaisesRegex(InformixError, "does not support column"):
+                scan(value)
+        for value in (
+            "keyset()",
+            "keyset(id sideways)",
+            "keyset(id desc nulls)",
+            "index",
+            "index(id)",
+        ):
+            with self.assertRaisesRegex(ValueError, "must be one of"):
+                scan(value)
+        # Naming columns needs no index listing from the bridge.
+        del source.indexes
+        source.table_indexes = None
+        self.assertEqual(scan("keyset(id desc)"), (["id"], [True]))
+
+    def test_a_keyless_snapshot_without_a_usable_index_falls_back_to_the_cursor(self):
         table = Table.parse(_table(primary_keys=()), "demo")
         source = _IndexScanSource(random_module.Random(1))
         source.indexes = [(["value"], [False], 9)]  # nullable column
-        with self.assertRaisesRegex(InformixError, "no index that snapshot.scan=index"):
-            self.connector(source)._index_scan_snapshot(table, {}, 5, 0, lambda *_: None)
+        connector = self.connector(source)
+        with self.assertLogs(informix_module.__name__, "WARNING") as logs:
+            self.assertIsNone(connector._scan_index(table, {}))
+        self.assertIn("reads without index order because it has no index", logs.output[0])
+        source.indexes = [(["id"], [False], 9)]
+        source.buffered_logging = lambda: True
+        with self.assertLogs(informix_module.__name__, "WARNING") as logs:
+            self.assertIsNone(connector._scan_index(table, {}))
+        self.assertIn("a database with buffered logging", logs.output[0])
+        # With columns named, the snapshot fails instead of falling back.
+        with self.assertRaisesRegex(InformixError, "does not support a database with buffered"):
+            connector._scan_index(table, {"snapshot.scan": "keyset(id)"})
+        # A bridge that cannot list indexes reads through the cursor, as before.
+        self.assertIsNone(self.connector(FakeBridge())._scan_index(table, {}))
 
     def test_an_index_scan_fails_when_a_key_never_stops_changing(self):
-        table = Table.parse(_table(primary_keys=()), "demo")
         source = _IndexScanSource(random_module.Random(2), transactions=10**9, hot_key=3)
         with (
             mock.patch.object(informix_module, "_INDEX_SCAN_SETTLE_ATTEMPTS", 3),
             self.assertRaisesRegex(InformixError, "could not settle 1 key"),
         ):
-            self.connector(source)._index_scan_snapshot(table, {}, 5, 0, lambda *_: None)
+            self._index_scan(source, 5)
 
     def test_a_poll_starts_with_a_small_read_and_sizes_the_next_by_how_the_last_went(self):
         # Informix returns a CDC read only when the bytes asked for have arrived, the
