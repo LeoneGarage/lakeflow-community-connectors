@@ -20262,15 +20262,19 @@ def register_lakeflow_source(spark):
                     # on a wide table that is most of it.
                     select = sum(len(name) + 3 for name in names) + len(table.identity) + 40
                     for values in lookups:
-                        length = select + sum(
+                        where = sum(
                             len(str(value)) + len(column) + 8 for value, column in zip(values, columns)
                         )
-                        if length > _INDEX_SCAN_LOOKUP_CHARS:
-                            # Too long to send whole: its index value alone finds the row.
+                        if where > _INDEX_SCAN_LOOKUP_CHARS:
+                            # Its values are too long to send: its index value alone finds
+                            # the row. The column list is no reason to: it is sent either way.
                             queries.append((list(keys), [values[: len(keys)]]))
                             room = 0
                             continue
-                        if not room or length > room or len(queries[-1][1]) >= size:
+                        length = select + where
+                        # A table so wide that one SELECT passes the budget still gets its
+                        # rows one to a query, each by its key.
+                        if room <= 0 or length > room or len(queries[-1][1]) >= size:
                             queries.append((columns, []))
                             room = _INDEX_SCAN_LOOKUP_CHARS
                         queries[-1][1].append(values)

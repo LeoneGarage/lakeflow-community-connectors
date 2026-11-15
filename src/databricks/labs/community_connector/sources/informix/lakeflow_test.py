@@ -2805,6 +2805,18 @@ class LakeflowContractTests(unittest.TestCase):
         ):
             self._index_scan(source, 3, table=table, options={"append.only.ingestion": "true"})
         self.assertEqual(set(calls), {(("id",), 1)})
+        # A budget the column list alone passes, as on a very wide table, but not the
+        # values: each row still goes by its key, one to a query.
+        calls.clear()
+        source = _KeyedIndexScanSource(random_module.Random(9003), transactions=60)
+        read = source.rows_by_values
+        source.rows_by_values = counted
+        with (
+            mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0),
+            mock.patch.object(informix_module, "_INDEX_SCAN_LOOKUP_CHARS", 60),
+        ):
+            self._index_scan(source, 3, table=table, options={"append.only.ingestion": "true"})
+        self.assertEqual(set(calls), {(("id", "value"), 1)})
 
     def test_an_index_with_a_variable_scale_decimal_is_not_paged_by(self):
         # A DECIMAL(p) with no scale is staged as decimal.variable.type shapes it, a string
