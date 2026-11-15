@@ -1,7 +1,8 @@
 #!/bin/bash
 # order_items workload: "delete all of an order's items, then insert new ones", "insert without deleting", and
 # updates of an order's items by order_id (all of them, some of them, or to the values they already have).
-# No update touches order_id: the bronze snapshot pages by it, and such an update during the snapshot fails it.
+# No update touches order_id, the column the bronze snapshot pages by. The connector takes such an update during
+# the snapshot (the stream emits the half of it the pages lack), but this workload does not exercise that.
 # Usage (inside the Informix container, next to orders_lib.sh): orders_workload.sh [minutes, default 15]
 export INFORMIXDIR=${INFORMIXDIR:-/opt/ibm/informix} INFORMIXSERVER=${INFORMIXSERVER:-informix}
 export PATH="$INFORMIXDIR/bin:$PATH" DBACCNOIGN=1     # DBACCNOIGN: an error rolls the transaction back

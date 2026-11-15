@@ -1,13 +1,15 @@
-"""Compare the orders test's silver order_items with the source.
+"""Compare the orders test's silver order_items tables with the source.
 
 The source side is the output of orders_fingerprint.sh, saved to a file: order_items summed
-up in 25 buckets. The same sums are taken over the silver table; every bucket must match,
-which it only does if silver holds each source row the right number of times.
+up in 25 buckets. The same sums are taken over each silver table, the materialized view
+order_items and the foreachBatch sink's Delta table order_items_delta; every bucket must
+match, which it only does if the table holds each source row the right number of times.
 
     python orders_compare_test_tool.py <fingerprint file> --warehouse-id <id> \\
-        [--profile DEFAULT] [--silver <catalog>.orders_silver] [--bronze <catalog>.orders_bronze]
+        [--profile DEFAULT] [--silver <catalog>.orders_silver] [--bronze <catalog>.orders_bronze] \\
+        [--tables order_items,order_items_delta]
 
-Exits 1 when a bucket differs.
+Exits 1 when a bucket of any table differs, or a table cannot be read (`ERROR`).
 """
 
 from __future__ import annotations
@@ -28,6 +30,11 @@ def main() -> int:
     parser.add_argument("--profile", default="DEFAULT", help="Databricks CLI profile")
     parser.add_argument("--silver", default="main.orders_silver", help="silver catalog.schema")
     parser.add_argument("--bronze", default="main.orders_bronze", help="bronze catalog.schema")
+    parser.add_argument(
+        "--tables",
+        default="order_items,order_items_delta",
+        help="comma-separated tables to compare, in the silver schema unless qualified",
+    )
     args = parser.parse_args()
 
     def query(statement: str) -> list[list]:
@@ -39,32 +46,45 @@ def main() -> int:
             for line in lines
             if line.strip()
         ]
-    silver = [
-        [float(value) for value in row]
-        for row in query(
-            "SELECT order_id % 25, count(*), sum(order_id), sum(qty), sum(price), "
-            f"sum(order_id * qty * price), count(note) FROM {args.silver}.order_items "
-            "GROUP BY 1 ORDER BY 1"
+    matched = True
+    for name in (name.strip() for name in args.tables.split(",")):
+        if not name:
+            continue
+        table = name if "." in name else f"{args.silver}.{name}"
+        try:
+            silver = [
+                [float(value) for value in row]
+                for row in query(
+                    "SELECT order_id % 25, count(*), sum(order_id), sum(qty), sum(price), "
+                    f"sum(order_id * qty * price), count(note) FROM {table} "
+                    "GROUP BY 1 ORDER BY 1"
+                )
+            ]
+        except Exception as error:  # pylint: disable=broad-except
+            # A table that is not there, say: the other tables are still compared. Not a
+            # MISMATCH, which is a difference in the data, but the run still fails.
+            matched = False
+            print(f"ERROR {table}: cannot be read: {error}")
+            continue
+        differing = [(a, b) for a, b in zip(source, silver) if a != b]
+        same = not differing and len(source) == len(silver)
+        matched = matched and same
+        print(
+            "MATCH" if same else "MISMATCH",
+            f"{table}: buckets {len(source)}/{len(silver)}, differing {len(differing)},",
+            f"source rows {sum(row[1] for row in source):.0f},",
+            f"silver rows {sum(row[1] for row in silver):.0f}",
         )
-    ]
-    differing = [(a, b) for a, b in zip(source, silver) if a != b]
-    matched = not differing and len(source) == len(silver)
-    print(
-        "MATCH" if matched else "MISMATCH",
-        f"buckets {len(source)}/{len(silver)}, differing {len(differing)},",
-        f"source rows {sum(row[1] for row in source):.0f},",
-        f"silver rows {sum(row[1] for row in silver):.0f}",
-    )
-    for a, b in differing[:5]:
-        print(" source", a)
-        print(" silver", b)
-    print(
-        "silver duplicate groups / most copies / rows in them:",
-        query(
-            f"SELECT count(*), max(c), sum(c) FROM (SELECT count(*) c FROM {args.silver}."
-            "order_items GROUP BY order_id, sku, qty, price, note HAVING count(*) > 1)"
-        ),
-    )
+        for a, b in differing[:5]:
+            print(" source", a)
+            print(" silver", b)
+        print(
+            f"{table} duplicate groups / most copies / rows in them:",
+            query(
+                f"SELECT count(*), max(c), sum(c) FROM (SELECT count(*) c FROM {table} "
+                "GROUP BY order_id, sku, qty, price, note HAVING count(*) > 1)"
+            ),
+        )
     print(
         "silver orders, count / highest id:",
         query(f"SELECT count(*), max(id) FROM {args.silver}.orders"),

@@ -33,129 +33,137 @@ _ap.add_argument(
     "--pipeline-id", help=f"Pipeline to time (default: the one named {PIPELINE_NAME})."
 )
 _ap.add_argument("--profile", default=PROFILE, help=f"Databricks CLI profile (default {PROFILE}).")
-_ARGS = _ap.parse_args()
-WH = resolve_warehouse(_ARGS.profile, _ARGS.warehouse_id)
-PIPELINE_ID = resolve_pipeline(_ARGS.profile, pipeline_id=_ARGS.pipeline_id)
-TARGET = resolve_target(_ARGS.profile, PIPELINE_ID)
-# "large" commit = snapshot chunk. Default snapshot.page.size is large; CDC batches
-# are bounded by max.records.per.batch (small). Use a threshold well above CDC batch
-# size to separate chunk-writes from streamed changes.
-CHUNK_MIN = 500
 
 
-def api(m, p, pl=None):
-    a = ["databricks", "api", m, p, "--profile", _ARGS.profile]
-    if pl is not None:
-        a += ["--json", json.dumps(pl)]
-    return json.loads(subprocess.run(a, capture_output=True, text=True, check=True).stdout)
+def main() -> None:
+    # Everything below talks to the workspace: only when run, not on import.
+    _ARGS = _ap.parse_args()
+    WH = resolve_warehouse(_ARGS.profile, _ARGS.warehouse_id)
+    PIPELINE_ID = resolve_pipeline(_ARGS.profile, pipeline_id=_ARGS.pipeline_id)
+    TARGET = resolve_target(_ARGS.profile, PIPELINE_ID)
+    # "large" commit = snapshot chunk. Default snapshot.page.size is large; CDC batches
+    # are bounded by max.records.per.batch (small). Use a threshold well above CDC batch
+    # size to separate chunk-writes from streamed changes.
+    CHUNK_MIN = 500
 
 
-def q(stmt):
-    d = api(
-        "post",
-        "/api/2.0/sql/statements",
-        {"warehouse_id": WH, "wait_timeout": "50s", "statement": stmt},
-    )
-    sid = d["statement_id"]
-    st = d["status"]["state"]
-    while st in ("PENDING", "RUNNING"):
-        time.sleep(2)
-        d = api("get", f"/api/2.0/sql/statements/{sid}")
+    def api(m, p, pl=None):
+        a = ["databricks", "api", m, p, "--profile", _ARGS.profile]
+        if pl is not None:
+            a += ["--json", json.dumps(pl)]
+        return json.loads(subprocess.run(a, capture_output=True, text=True, check=True).stdout)
+
+
+    def q(stmt):
+        d = api(
+            "post",
+            "/api/2.0/sql/statements",
+            {"warehouse_id": WH, "wait_timeout": "50s", "statement": stmt},
+        )
+        sid = d["statement_id"]
         st = d["status"]["state"]
-    if st != "SUCCEEDED":
-        raise RuntimeError(d["status"])
-    return d.get("result", {}).get("data_array", [])
+        while st in ("PENDING", "RUNNING"):
+            time.sleep(2)
+            d = api("get", f"/api/2.0/sql/statements/{sid}")
+            st = d["status"]["state"]
+        if st != "SUCCEEDED":
+            raise RuntimeError(d["status"])
+        return d.get("result", {}).get("data_array", [])
 
 
-def newest_update_start():
-    update = api("get", f"/api/2.0/pipelines/{PIPELINE_ID}/updates?max_results=1")["updates"][0]
-    started = datetime.fromtimestamp(int(update["creation_time"]) / 1000, UTC)
-    return started.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    def newest_update_start():
+        update = api("get", f"/api/2.0/pipelines/{PIPELINE_ID}/updates?max_results=1")["updates"][0]
+        started = datetime.fromtimestamp(int(update["creation_time"]) / 1000, UTC)
+        return started.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-RUN_START = _ARGS.run_start or newest_update_start()
+    RUN_START = _ARGS.run_start or newest_update_start()
 
 
-def rows_written(op, mj):
-    if not mj:
-        return 0
-    try:
-        m = json.loads(mj)
-    except (TypeError, ValueError):
-        return 0
-    if op == "MERGE":
+    def rows_written(op, mj):
+        if not mj:
+            return 0
+        try:
+            m = json.loads(mj)
+        except (TypeError, ValueError):
+            return 0
+        if op == "MERGE":
+            return sum(
+                int(m.get(k, "0") or 0)
+                for k in ("numTargetRowsInserted", "numTargetRowsUpdated", "numTargetRowsDeleted")
+            )
         return sum(
             int(m.get(k, "0") or 0)
-            for k in ("numTargetRowsInserted", "numTargetRowsUpdated", "numTargetRowsDeleted")
+            for k in ("numOutputRows", "numInsertedRows", "numUpdatedRows", "numDeletedRows")
         )
-    return sum(
-        int(m.get(k, "0") or 0)
-        for k in ("numOutputRows", "numInsertedRows", "numUpdatedRows", "numDeletedRows")
-    )
 
 
-def analyze(t):
-    hist = q(
-        f"SELECT timestamp, operation, operationMetrics FROM (DESCRIBE HISTORY {TARGET}.`{t}`) WHERE timestamp >= '{RUN_START}' ORDER BY timestamp"
-    )
-    last_chunk_ts = None
-    max_chunk = 0
-    n_chunk = 0
-    first_stream_after = None
-    rows = []
-    for ts, op, mj in hist:
-        n = rows_written(op, mj)
-        rows.append((ts, n))
-    # last commit with a snapshot-sized write
-    for ts, n in rows:
-        if n >= CHUNK_MIN:
-            last_chunk_ts = ts
-            max_chunk = max(max_chunk, n)
-            n_chunk += 1
-    # first non-chunk (stream) write strictly after the last chunk
-    if last_chunk_ts is not None:
+    def analyze(t):
+        hist = q(
+            f"SELECT timestamp, operation, operationMetrics FROM (DESCRIBE HISTORY {TARGET}.`{t}`) WHERE timestamp >= '{RUN_START}' ORDER BY timestamp"
+        )
+        last_chunk_ts = None
+        max_chunk = 0
+        n_chunk = 0
+        first_stream_after = None
+        rows = []
+        for ts, op, mj in hist:
+            n = rows_written(op, mj)
+            rows.append((ts, n))
+        # last commit with a snapshot-sized write
         for ts, n in rows:
-            if ts > last_chunk_ts and n > 0:
-                first_stream_after = ts
-                break
-    return t, last_chunk_ts, n_chunk, max_chunk, first_stream_after
+            if n >= CHUNK_MIN:
+                last_chunk_ts = ts
+                max_chunk = max(max_chunk, n)
+                n_chunk += 1
+        # first non-chunk (stream) write strictly after the last chunk
+        if last_chunk_ts is not None:
+            for ts, n in rows:
+                if ts > last_chunk_ts and n > 0:
+                    first_stream_after = ts
+                    break
+        return t, last_chunk_ts, n_chunk, max_chunk, first_stream_after
 
 
-res = {}
-with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
-    for f in concurrent.futures.as_completed({ex.submit(analyze, t): t for t in TABLES}):
-        t, lc, nc, mx, fs = f.result()
-        res[t] = (lc, nc, mx, fs)
+    res = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
+        for f in concurrent.futures.as_completed({ex.submit(analyze, t): t for t in TABLES}):
+            t, lc, nc, mx, fs = f.result()
+            res[t] = (lc, nc, mx, fs)
 
 
-def syd(z):
-    if z is None:
-        return "-"
-    return (
-        datetime.fromisoformat(z.replace("Z", "+00:00")).astimezone(SYD).strftime("%m-%d %H:%M:%S")
-    )
+    def syd(z):
+        if z is None:
+            return "-"
+        return (
+            datetime.fromisoformat(z.replace("Z", "+00:00")).astimezone(SYD).strftime("%m-%d %H:%M:%S")
+        )
 
 
-print(f"Run started: {syd(RUN_START)} AEST ({RUN_START})\n")
-print(
-    f"{'table':20} {'chunk commits':>13} {'max chunk rows':>15} {'last chunk write':>18} {'-> first stream':>18}"
-)
-print("-" * 90)
-overall_switch = None
-had_incremental = False
-for t in TABLES:
-    lc, nc, mx, fs = res[t]
-    if nc > 0:
-        had_incremental = True
-    if lc and (overall_switch is None or lc > overall_switch):
-        overall_switch = lc
-    print(f"{t:20} {nc:>13} {mx:>15,} {syd(lc):>18} {syd(fs):>18}")
-print("-" * 90)
-if had_incremental:
+    print(f"Run started: {syd(RUN_START)} AEST ({RUN_START})\n")
     print(
-        f"LAST table finished incremental (last chunk write): {syd(overall_switch)} AEST ({overall_switch})"
+        f"{'table':20} {'chunk commits':>13} {'max chunk rows':>15} {'last chunk write':>18} {'-> first stream':>18}"
     )
-else:
-    print(
-        "No snapshot-sized commits in this run window: the last run resumed in STREAM phase (no incremental)."
-    )
+    print("-" * 90)
+    overall_switch = None
+    had_incremental = False
+    for t in TABLES:
+        lc, nc, mx, fs = res[t]
+        if nc > 0:
+            had_incremental = True
+        if lc and (overall_switch is None or lc > overall_switch):
+            overall_switch = lc
+        print(f"{t:20} {nc:>13} {mx:>15,} {syd(lc):>18} {syd(fs):>18}")
+    print("-" * 90)
+    if had_incremental:
+        print(
+            f"LAST table finished incremental (last chunk write): {syd(overall_switch)} AEST ({overall_switch})"
+        )
+    else:
+        print(
+            "No snapshot-sized commits in this run window: the last run resumed in STREAM phase (no incremental)."
+        )
+
+
+if __name__ == "__main__":
+    main()
