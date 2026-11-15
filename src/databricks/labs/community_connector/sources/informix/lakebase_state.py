@@ -415,8 +415,15 @@ def _workspace_credentials(options: dict[str, str]) -> tuple[str, str]:
                 "lakebase.workspace.host/lakebase.workspace.token or install databricks-sdk"
             ) from error
         client = WorkspaceClient()
-        host = host or client.config.host
-        token = token or client.config.authenticate()["Authorization"].split(" ", 1)[1]
+        host = host or client.config.host or ""
+        if not token:
+            scheme, _, value = str((client.config.authenticate() or {}).get("Authorization", "")).partition(" ")
+            token = value.strip() if scheme.lower() == "bearer" else ""
+        if not host or not token:
+            raise LakebaseStateError(
+                "Lakebase state needs a workspace host and a bearer token; set "
+                "lakebase.workspace.host/lakebase.workspace.token"
+            )
     return host, token
 
 

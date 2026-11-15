@@ -1011,6 +1011,35 @@ class SqliPacketTests(unittest.TestCase):
         self.assertEqual(resolve.call_count, 1)
         self.assertEqual(connect_once.call_args_list[-1].args[-1], "8.8.8.8")
 
+    def test_a_redirected_client_reconnects_from_its_configured_endpoint(self):
+        # A reconnect on the same client must start at the endpoint it was configured
+        # with. Remembering the redirect's target as its own, the next connect went
+        # straight there: the target was no longer validated as a redirect, and a
+        # connection manager could not name a new one after a failover.
+        client = InformixSqliClient(
+            "origin",
+            9088,
+            "db",
+            "user",
+            "secret",
+            server_name="origin",
+            redirect_enabled=True,
+            redirect_allowlist=frozenset({("target", 9089)}),
+        )
+        for _attempt in range(2):
+            with (
+                patch.object(
+                    client,
+                    "_connect_once",
+                    side_effect=(SqliRedirect("redirect:x:srv:target:9089"), None),
+                ) as connect_once,
+                patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("8.8.8.8", 9089))]),
+            ):
+                client.connect()
+            self.assertEqual(connect_once.call_args_list[0].args[:2], ("origin", 9088))
+            self.assertEqual((client.hostname, client.port, client.server_name), ("origin", 9088, "origin"))
+            self.assertEqual((client.connected_hostname, client.connected_port), ("target", 9089))
+
     def test_redirect_retries_each_validated_dns_address(self):
         client = InformixSqliClient(
             "origin",

@@ -3326,6 +3326,81 @@ class LakeflowContractTests(unittest.TestCase):
         with mock.patch.dict(module._INFORMIX_REGISTRATION_CONTEXT, {"scope": None, "request": None}):
             self.assertNotIn("_driver_registration", connector.__getstate__())
 
+    def test_a_read_with_no_start_offset_is_a_first_read(self):
+        # The interface passes None for the first call of the first run, and a batch
+        # read always does.
+        connector = self.connector(FakeBridge())
+        rows, offset = connector.read_table("app.orders", None, {})
+        self.assertEqual([row["id"] for row in rows], [1, 2])
+        self.assertIn("phase", offset)
+        deletes, _offset = self.connector(FakeBridge()).read_table_deletes("app.orders", None, {})
+        self.assertEqual(list(deletes), [])
+
+    def test_validating_an_offset_leaves_the_callers_offset_as_it_was(self):
+        connector = self.connector(FakeBridge())
+        _rows, offset = connector.read_table("app.orders", {}, {})
+        nested = {**offset, "phase": "stream", "incremental": {"chunk_lsn": 5, "boundary_lsn": 9}}
+        before = json.dumps(nested, sort_keys=True, default=str)
+        try:
+            informix_module._validated_offset(nested)
+        except ValueError:
+            pass
+        self.assertEqual(json.dumps(nested, sort_keys=True, default=str), before)
+
+    def test_a_table_option_left_empty_is_one_not_set(self):
+        # A form sends "" for a field nobody filled in. Read as set, an empty table
+        # option shadowed the connection's value with the default, or failed as an
+        # invalid one. Only "" counts: blanks are something typed, and the escape
+        # character's empty value means something.
+        clean = informix_module._options_set
+        options = {"snapshot.mode": "", "snapshot.unl.escape": "", "snapshot.unl.delimiter": "\t", "primary.keys": " ", "x": "1"}
+        self.assertEqual(
+            clean(options),
+            {"snapshot.unl.escape": "", "snapshot.unl.delimiter": "\t", "primary.keys": " ", "x": "1"},
+        )
+        same = {"x": "1"}
+        self.assertIs(clean(same), same)
+        self.assertIsNone(clean(None))
+        connector = self.connector(FakeBridge(), **{"append.delete.tombstones": "false"})
+        self.assertFalse(connector._append_delete_tombstones({}))
+        metadata = connector.read_table_metadata(
+            "app.orders", {"append.delete.tombstones": "", "snapshot.mode": "", "snapshot.scan": ""}
+        )
+        self.assertEqual(metadata["primary_keys"], ["id"])
+        # A tab is a delimiter, at the connection too.
+        tabbed = self.connector(FakeBridge(), **{"snapshot.unl.delimiter": "\t"})
+        self.assertEqual(tabbed.options["snapshot.unl.delimiter"], "\t")
+
+    def test_an_idle_shard_and_an_idle_drain_worker_end(self):
+        # Each belongs to one update. A process kept warm over many updates kept a thread
+        # for every shard and drain pool it had ever had.
+        key = ("namespace", "scope-idle", "upsert", 0)
+        shard = informix_module._SharedCdcShard()
+        with (
+            mock.patch.dict(informix_module._SHARED_CDC_SHARDS, {key: shard}),
+            mock.patch.dict(informix_module._SHARED_CDC_THREADS, {key: threading.current_thread()}),
+            mock.patch.object(informix_module, "_SHARED_CDC_IDLE_EXIT_SECONDS", 0),
+        ):
+            informix_module._run_shared_cdc_shard(shard, key)  # returns: nobody reads it
+            self.assertNotIn(key, informix_module._SHARED_CDC_SHARDS)
+            self.assertNotIn(key, informix_module._SHARED_CDC_THREADS)
+        pool = informix_module._SnapshotDrainPool()
+        with (
+            mock.patch.dict(informix_module._SNAPSHOT_DRAIN_POOLS, {key: pool}),
+            mock.patch.dict(informix_module._SNAPSHOT_DRAIN_THREADS, {key: []}),
+            mock.patch.object(informix_module, "_SNAPSHOT_DRAIN_IDLE_EXIT_SECONDS", 0),
+            mock.patch.object(informix_module, "_SNAPSHOT_DRAIN_IDLE_SECONDS", 0.01),
+        ):
+            worker = threading.Thread(
+                target=informix_module._run_snapshot_drain_worker, args=(pool, key), daemon=True
+            )
+            informix_module._SNAPSHOT_DRAIN_THREADS[key].append(worker)
+            worker.start()
+            worker.join(5)
+            self.assertFalse(worker.is_alive())
+            self.assertNotIn(key, informix_module._SNAPSHOT_DRAIN_POOLS)
+            self.assertNotIn(key, informix_module._SNAPSHOT_DRAIN_THREADS)
+
     def test_a_page_descriptor_names_the_moved_rows_its_page_leaves_out(self):
         # The partitioned reader's driver plans a batch of staged pages as descriptors. An
         # executor has no manifest, so the descriptor of a page that leaves moved rows out
@@ -19536,6 +19611,27 @@ class SharedCdcShardTests(unittest.TestCase):
         self.id_a = self.table_a.native_identity
         self.id_b = self.table_b.native_identity
 
+    def test_a_second_flow_of_the_same_table_is_left_to_read_directly(self):
+        # Where several processes share a shard, two flows can read one table with the
+        # same layout (two destinations, say). The table has one buffer, cut at one
+        # checkpoint: the flow further on dropped transactions the other had yet to
+        # read. The first flow keeps the table's place; the second is refused, and reads
+        # directly, until the first has stopped polling.
+        shard = _SharedCdcShard()
+        capture = _capture_descriptor(self.table_a)
+        self.assertIsNot(shard.subscribe(self.id_a, self.table_a, capture, 100, 100, "one"), False)
+        self.assertIs(shard.subscribe(self.id_a, self.table_a, capture, 500, 500, "two"), False)
+        self.assertEqual(shard.subscribers[self.id_a]["checkpoint"], 100)
+        self.assertEqual(shard.subscribers[self.id_a]["owner"], "one")
+        # The owner goes on as before, and a caller that names no flow is not refused.
+        self.assertIsNot(shard.subscribe(self.id_a, self.table_a, capture, 200, 100, "one"), False)
+        self.assertIsNot(shard.subscribe(self.id_a, self.table_a, capture, 200, 100), False)
+        shard.subscribe(self.id_a, self.table_a, capture, 200, 100, "one")
+        # Once the first has stopped polling for longer than the shard keeps it.
+        shard.subscribers[self.id_a]["last_seen"] -= shard.subscriber_ttl + 1
+        self.assertIsNot(shard.subscribe(self.id_a, self.table_a, capture, 500, 500, "two"), False)
+        self.assertEqual(shard.subscribers[self.id_a]["owner"], "two")
+
     def _shard_with_two_tables(self):
         shard = _SharedCdcShard()
         shard.subscribe(self.id_a, self.table_a, _capture_descriptor(self.table_a), 0, 0)
@@ -20478,6 +20574,26 @@ class HostSharedCdcTests(unittest.TestCase):
         endpoints = informix_module._HostShardEndpoints(self.directory)
         self.endpoints.append(endpoints)
         return endpoints
+
+    def test_a_leader_gives_an_idle_shard_up(self):
+        # A shard belongs to one update of a pipeline. A process kept warm over many
+        # updates held a lock, a listening socket and two files for every shard it had
+        # ever led. Once a shard has no reader the leader lets go of them, and whoever
+        # polls next leads it.
+        leader = self.process()
+        self.assertTrue(
+            informix_module._host_shard_try_lead(leader, self.KEY, lambda: None, self.CONFIG)
+        )
+        _lock_path, socket_path, key_path = leader.paths(self.KEY)
+        self.assertTrue(os.path.exists(socket_path) and os.path.exists(key_path))
+        informix_module._host_shard_stop_leading(leader, self.KEY)
+        self.assertNotIn(self.KEY, leader.leading)
+        self.assertFalse(os.path.exists(socket_path) or os.path.exists(key_path))
+        informix_module._host_shard_stop_leading(leader, self.KEY)  # again: nothing to do
+        other = self.process()
+        self.assertTrue(
+            informix_module._host_shard_try_lead(other, self.KEY, lambda: None, self.CONFIG)
+        )
 
     @staticmethod
     def _die(endpoints):
@@ -22186,6 +22302,47 @@ class FairSlotQueueWiringTests(unittest.TestCase):
 
                 self.assertEqual(bridge._acquire_connection_slot.call_count, 1 + retried)
 
+    def test_a_claim_reopens_a_dropped_state_connection_within_its_wait(self):
+        # Lakebase can drop the state connection more than once in a long wait for a
+        # slot. Each further claim gets what is left of the wait, not the whole of it
+        # again, and after a few reopenings the error stands.
+        try:
+            import psycopg2  # noqa: PLC0415
+        except ImportError:
+            self.skipTest("psycopg2 not installed in this environment")
+
+        reaped = psycopg2.OperationalError("SSL SYSCALL error: EOF detected")
+        bridge = self._bridge()
+        bridge.transport = mock.Mock()
+        bridge.options["connection.wait.timeout.seconds"] = "100"
+        budgets = []
+
+        def claim(budget):
+            budgets.append(budget)
+            bridge._lakebase_conn = mock.Mock(closed=2)
+            if len(budgets) < 3:
+                raise reaped
+
+        bridge._lakebase_conn = mock.Mock(closed=2)
+        bridge._acquire_connection_slot = claim
+        bridge._ensure_connected()
+        self.assertEqual(len(budgets), 3)
+        self.assertTrue(all(budget is not None and budget <= 100 for budget in budgets[1:]))
+        bridge = self._bridge()
+        bridge.transport = mock.Mock()
+        bridge._lakebase_conn = mock.Mock(closed=2)
+
+        def always(budget):
+            bridge._lakebase_conn = mock.Mock(closed=2)
+            raise reaped
+
+        bridge._acquire_connection_slot = mock.Mock(side_effect=always)
+        with self.assertRaises(psycopg2.OperationalError):
+            bridge._ensure_connected()
+        self.assertEqual(
+            bridge._acquire_connection_slot.call_count, informix_module._SLOT_CLAIM_RECONNECTS + 1
+        )
+
     def test_a_slot_is_released_over_a_reopened_state_connection(self):
         # The lease heartbeat has its own connection, so the bridge's sits idle through a
         # long read and can be reaped by the time the slot is released. The release
@@ -23354,6 +23511,22 @@ class UnloadHelperTests(unittest.TestCase):
         # The record parser then decodes the escaped newline back into the value.
         fields = informix_module._parse_unload_fields(self._ESCAPED_RECORDS[1].decode())
         self.assertEqual(fields, ["2", "line one\nline two", "back\\slash"])
+
+    def test_unloads_empty_string_is_an_empty_string(self):
+        # As a live server unloads them: || for a NULL, |\ | for an empty VARCHAR or
+        # LVARCHAR, | | for one blank. The escaped space read as a blank, so an empty value
+        # landed as " ", and as a key it matched none of the row's later changes.
+        fields = informix_module._parse_unload_fields("1||\\ | |a |\\  |x\\ |\n")
+        self.assertEqual(fields, ["1", "", " ", " ", "a ", "  ", "x "])
+        value = informix_module._unload_value
+        for type_name in ("VARCHAR", "NVARCHAR", "LVARCHAR"):
+            self.assertIsNone(value(fields[1], type_name))
+            self.assertEqual(value(fields[2], type_name), "")
+            self.assertEqual(value(fields[3], type_name), " ")
+            self.assertEqual(value(fields[5], type_name), "  ")
+        # A CHAR's padding is dropped either way.
+        self.assertEqual(value(fields[2], "CHAR"), "")
+        self.assertEqual(value(fields[3], "CHAR"), "")
 
     def test_unl_byte_splits_never_cut_at_an_escaped_newline(self):
         # Every cut point must land after an *unescaped* newline, including when the
@@ -26455,6 +26628,18 @@ class ColumnTransformTests(_TableOptionTestCase):
         self.assertEqual(type(fields["value"].dataType).__name__, "IntegerType")
         self.assertEqual([row["value"] for row in snapshot], [1, 1])
 
+    def test_a_transform_result_outside_64_bits_is_refused(self):
+        # ABS of the lowest INT8, or a BIGINT rounded up past the highest: no 64-bit
+        # column holds the result, and it failed far from its cause, in Spark's row
+        # conversion.
+        rows = [{"id": 1, "big": 5}, {"id": 2, "big": 1 << 63}]
+        transforms = (("big", None, "big"),)
+        with mock.patch.object(informix_module, "_expression_value", lambda operand, row, ctx: row["big"]):
+            shaped = informix_module._transformed_rows(iter(rows[:1]), transforms, {})
+            self.assertEqual(list(shaped), [{"id": 1, "big": 5}])
+            with self.assertRaisesRegex(InformixError, "outside the range of a 64-bit integer"):
+                list(informix_module._transformed_rows(iter(rows), transforms, {}))
+
     def test_nvl_falls_back_in_the_column_type(self):
         options = {"transform_columns": '{"extra": "NVL(extra, 0)"}'}
         bridge = _ProjectingBridge()
@@ -26466,6 +26651,12 @@ class ColumnTransformTests(_TableOptionTestCase):
         self.assertIs(type(upserts[0]["extra"]), int)  # not the Decimal the literal parsed to
         with self.assertRaisesRegex(InformixError, "whole numbers only"):
             connector._table("app.orders", {"transform_columns": '{"extra": "NVL(extra, 1.5)"}'})
+        # Nor one the column's type cannot hold: left to the first NULL row to show.
+        with self.assertRaisesRegex(InformixError, "more than a .* column holds"):
+            connector._table(
+                "app.orders", {"transform_columns": '{"extra": "NVL(extra, 99999999999999999999)"}'}
+            )
+        connector._table("app.orders", {"transform_columns": '{"extra": "NVL(extra, 32767)"}'})
         number = informix_module._number_for_column
         column = informix_module.Column.parse
         decimal = column({"name": "p", "type_name": "DECIMAL", "precision": 10, "scale": 2})

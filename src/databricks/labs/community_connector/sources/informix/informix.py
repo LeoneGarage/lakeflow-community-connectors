@@ -466,6 +466,12 @@ _SHARED_CDC_SUBSCRIBER_TTL_SECONDS = 300.0
 # Idle back-off between reads once a shard has drained its log, so a caught-up daemon
 # does not busy-spin (and releases its connection slot for consumer bootstrap).
 _SHARED_CDC_IDLE_POLL_SECONDS = 1.0
+# A shard with no subscriber for this long, or a snapshot-drain worker with no job, ends:
+# its thread, and for a shard this process leads its lock and socket, are given back. A
+# shard and a drain pool belong to one update of a pipeline, so a process kept warm over
+# many updates would otherwise hold one set of each for every update it has seen.
+_SHARED_CDC_IDLE_EXIT_SECONDS = 600.0
+_SNAPSHOT_DRAIN_IDLE_EXIT_SECONDS = 600.0
 # A bounded read whose shard view does not yet show it done waits for the shard's next read,
 # holding no connection slot, rather than opening a session of its own: for two of the
 # shard's reads (each waits out cdc.timeout about twice) and a margin, re-taking the view
@@ -579,6 +585,9 @@ _INDEX_SCAN_SETTLE_ATTEMPTS = 5
 # moved rows, the manifests as the stream uses them, which scans the stream is still
 # within, and the scan records already discarded. None goes to a worker or outlives the
 # registration it was read under.
+# How many times a claim of a connection slot reopens a state connection Lakebase
+# dropped, as the other state operations do.
+_SLOT_CLAIM_RECONNECTS = 3
 _SCAN_CACHES = ("_moved_rows", "_index_scans", "_index_scan_live", "_scan_progress_forgotten")
 # How many rows of a table keyed by primary.keys may change index value during the scan:
 # each is left out of the pages and read once more at the end, and the manifest names it.
@@ -1532,7 +1541,12 @@ def _informix_available_now_base(base: type, spark_session: Any | None = None) -
                     setter(update_request)
                 options = getattr(reader, "options", {})
                 table = options.get("tableName", "<unknown>")
-                role = "delete" if options.get("isDeleteFlow") == "true" else "upsert"
+                is_delete = getattr(reader.lakeflow_connect, "_is_delete_flow", None)
+                role = (
+                    "delete"
+                    if (is_delete() if callable(is_delete) else options.get("isDeleteFlow") == "true")
+                    else "upsert"
+                )
                 # 10: Informix CDC reader initialized: scope={} table={} role={}
                 logging.getLogger(__name__).info(
                     _m(10, registration_scope, table, role),
@@ -1940,17 +1954,31 @@ class PurePythonInformixBridge:
             if not bypass_capacity and getattr(self, "_lakebase_slot", None) is None:
                 budget = self.options.get(_CONNECTION_ATTEMPT_BUDGET_OPTION)
                 budget = float(budget) if budget else None
-                try:
-                    self._acquire_connection_slot(budget)
-                except connection_lost_error_types():
-                    # Lakebase reaped the state connection while this bridge sat idle
-                    # between reads, which psycopg reports only once a query fails:
-                    # reopen it and claim again. A live connection's error is real.
-                    connection = getattr(self, "_lakebase_conn", None)
-                    if connection is not None and not connection.closed:
-                        raise
-                    self._lakebase_conn = None
-                    self._acquire_connection_slot(budget)
+                # Lakebase can reap the state connection while this bridge sits idle
+                # between reads, or drop it during a long wait for a slot, which psycopg
+                # reports only once a query fails: reopen it and claim again. A live
+                # connection's error is real. The wait as a whole keeps its limit: each
+                # further claim gets what is left of it, not the whole of it again.
+                limit = float(
+                    self.options.get(
+                        "connection.wait.timeout.seconds",
+                        str(_DEFAULT_CONNECTION_WAIT_TIMEOUT_SECONDS),
+                    )
+                )
+                limit = limit if budget is None else min(limit, budget)
+                started, remaining = time.monotonic(), budget
+                for attempt in range(_SLOT_CLAIM_RECONNECTS + 1):
+                    try:
+                        self._acquire_connection_slot(remaining)
+                        break
+                    except connection_lost_error_types():
+                        connection = getattr(self, "_lakebase_conn", None)
+                        if connection is not None and not connection.closed:
+                            raise
+                        if attempt >= _SLOT_CLAIM_RECONNECTS:
+                            raise
+                        self._lakebase_conn = None
+                        remaining = max(limit - (time.monotonic() - started), 1.0)
             try:
                 self._connect_transport()
                 self._connected = True
@@ -3316,6 +3344,10 @@ class PurePythonInformixBridge:
                 return
             except Exception as error:  # pylint: disable=broad-except
                 if not _is_timeout_error(error) or attempt >= _VALIDATE_LSN_RETRY_MAX_RETRIES:
+                    raise
+                lease_lost = getattr(self, "_connection_lease_lost", None)
+                if lease_lost is not None and lease_lost.is_set():
+                    # The connection slot is gone: another reader may hold it already.
                     raise
                 delay = min(
                     _VALIDATE_LSN_RETRY_BASE_SECONDS * (2**attempt),
@@ -5312,6 +5344,16 @@ def _transformed_rows(rows: Iterator[dict], transforms: tuple | None, context: d
         for name, _, operand in transforms:
             if name in out:
                 value = _expression_value(operand, out, context)
+                if (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and not -(1 << 63) <= value < (1 << 63)
+                ):
+                    # ABS of the lowest INT8, or a BIGINT rounded up past the highest:
+                    # no 64-bit column holds it, and Informix refuses it too.
+                    # 451: Transform of column {} gives {}, which is outside the range of
+                    # a 64-bit integer
+                    raise InformixError(_m(451, name, value))
                 out[name] = _framework_value(value)
         return out
 
@@ -5510,6 +5552,28 @@ def _expression_kind(
         if integral and fallback != fallback.to_integral_value():
             # 104: Option '{}' gives {} the fallback {} for {}, which holds whole numbers only
             raise InformixError(_m(104, option, name, fallback, column.name))
+        # And one the column's type can hold. Left unchecked, the mistake showed only
+        # when a row with a NULL arrived, as a failed batch.
+        rank = _INTEGER_RANKS.get(column.type_name)
+        if rank is not None:
+            limit = Decimal((1 << (16, 32, 64)[rank - 1] - 1) - 1)
+        elif (
+            column.type_name.split("(", 1)[0].strip() in {"DECIMAL", "NUMERIC", "MONEY"}
+            and column.precision is not None
+            and column.scale is not None
+            and not _is_variable_scale_decimal(column)
+        ):
+            limit = Decimal(10) ** (column.precision - column.scale) - Decimal(1).scaleb(
+                -column.scale
+            )
+        else:
+            limit = None
+        if limit is not None and abs(fallback) > limit:
+            # 450: Option '{}' gives {} the fallback {} for {}, which is more than a {}
+            # column holds
+            raise InformixError(
+                _m(450, option, name, fallback, column.name, column.type_name)
+            )
     _check_function_literals(name, [literal[1] for literal in literals], option)
     return kind if result == "same" else result
 
@@ -7278,9 +7342,24 @@ class _SharedCdcShard:
 
     # ---- consumer side ------------------------------------------------------
 
-    def subscribe(self, identity, table, capture, checkpoint_commit_lsn, floor_lsn):
+    def subscribe(self, identity, table, capture, checkpoint_commit_lsn, floor_lsn, owner=None):
+        # ``owner`` names the flow asking, where several processes share the shard
+        # (cdc.shared.session=host). Returns False when another flow holds the table's
+        # place: this one then reads directly.
         with self.condition:
             existing = self.subscribers.get(identity)
+            if (
+                existing is not None
+                and owner is not None
+                and existing.get("owner") not in (None, owner)
+                and time.monotonic() - existing["last_seen"] <= self.subscriber_ttl
+            ):
+                # A second flow reading the same table with the same layout (two
+                # destinations, say). The table has one buffer, cut at one checkpoint:
+                # served to both, the flow further on dropped transactions the other had
+                # yet to read, which it then never saw, or each start-over wiped the
+                # other's coverage. The first keeps the shard until it stops polling.
+                return False
             if (
                 existing is not None
                 and existing["capture"] == capture
@@ -7333,6 +7412,7 @@ class _SharedCdcShard:
                 # at or below its floor (see _covered). Preserved across re-subscribes;
                 # a TTL eviction drops the entry and so resets it.
                 "covered_from": None if existing is None else existing.get("covered_from"),
+                "owner": owner,
             }
             self.subscribers[identity] = entry
             # Drop what the consumer has durably consumed, as a view does. A consumer on
@@ -7576,7 +7656,7 @@ def _shared_cdc_shard(
         if thread is None or not thread.is_alive():
             thread = threading.Thread(
                 target=_run_shared_cdc_shard,
-                args=(shard,),
+                args=(shard, key),
                 daemon=True,
                 name=f"informix-shared-cdc-{key[-2]}-{key[-1]}",
             )
@@ -7749,11 +7829,20 @@ def _unwire_view(data: dict[str, Any]) -> "_SharedCdcSnapshot":
     )
 
 
-def _host_shard_local_poll(key, reader_factory, config, identity, table, capture, commit, floor):
-    # Docstring: Subscribe to and read this process's own shard, as process mode does.
+# Names this process to a shard several processes share: each flow's reader runs in a
+# process of its own.
+_SHARD_OWNER = secrets.token_hex(8)
+
+
+def _host_shard_local_poll(
+    key, reader_factory, config, identity, table, capture, commit, floor, owner=None
+):
+    # Docstring: Subscribe to and read this process's own shard, as process mode does;
+    # None for a flow the shard does not serve because another holds the table's place.
 
     shard = _shared_cdc_shard(key, reader_factory=reader_factory, **config)
-    shard.subscribe(identity, table, capture, commit, floor)
+    if shard.subscribe(identity, table, capture, commit, floor, owner or _SHARD_OWNER) is False:
+        return None
     return shard.snapshot(identity, commit)
 
 
@@ -7815,6 +7904,7 @@ def _host_shard_serve(
                     request["capture"],
                     request["commit"],
                     request["floor"],
+                    request.get("owner"),
                 )
                 after = request.get("after")
                 if view is not None and after is not None:
@@ -7887,6 +7977,27 @@ def _host_shard_accept(
             daemon=True,
             name=f"informix-host-shard-serve-{key[-2]}-{key[-1]}",
         ).start()
+
+
+def _host_shard_stop_leading(endpoints: _HostShardEndpoints, key: tuple) -> None:
+    # Docstring: Give up leading a shard nobody reads any more: close its listener, remove
+    # its socket and key files, and release its lock. A follower that polls later finds
+    # no leader and leads it itself. The lock file stays: removing it could let two
+    # processes lock different files of the same name.
+
+    with endpoints.lock:
+        leading = endpoints.leading.pop(key, None)
+        if leading is None:
+            return
+        with contextlib.suppress(Exception):
+            leading["listener"].close()
+        with contextlib.suppress(Exception):
+            _lock_path, socket_path, key_path = endpoints.paths(key)
+            for path in (socket_path, key_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
+        with contextlib.suppress(OSError):
+            os.close(leading["lock_fd"])
 
 
 def _host_shard_try_lead(
@@ -8042,6 +8153,7 @@ def _host_shard_poll(
         "commit": commit,
         "floor": floor,
         "after": held[-1].commit_lsn if held else None,
+        "owner": _SHARD_OWNER,
     }
     try:
         status, payload = _host_shard_request(endpoints, key, request)
@@ -8237,18 +8349,46 @@ def _close_shared_cdc_reader(reader) -> None:
         logging.getLogger(__name__).debug(_m(154), exc_info=True)
 
 
-def _run_shared_cdc_shard(shard: _SharedCdcShard) -> None:
+def _retire_shared_cdc_shard(key: tuple, shard: _SharedCdcShard) -> bool:
+    # Docstring: Take an idle shard out of the registry, and give up leading it for other
+    # processes; False when a subscriber has come back. A consumer that asks for the
+    # shard afterwards gets a new one, with a new thread.
+
+    with _shared_cdc_registry_lock():
+        with shard.condition:
+            if shard.live_subscribers():
+                return False
+        if _SHARED_CDC_SHARDS.get(key) is shard:
+            _SHARED_CDC_SHARDS.pop(key, None)
+            _SHARED_CDC_THREADS.pop(key, None)
+    _host_shard_stop_leading(_HOST_SHARD_ENDPOINTS, key)
+    return True
+
+
+def _run_shared_cdc_shard(shard: _SharedCdcShard, key: tuple | None = None) -> None:
     # Docstring: Daemon loop for one shard: read the shared CDC session, fetch schema + log
     # bounds, and publish. Holds one connection slot only across consecutive productive
     # reads; releases it before any idle wait so consumer bootstrap can use the slot.
+    # Ends once the shard has had no subscriber for _SHARED_CDC_IDLE_EXIT_SECONDS.
 
     logger = logging.getLogger(__name__)
     reader = None
+    idle_since: float | None = None
     try:
         while True:
             with shard.condition:
                 subscribers = shard.live_subscribers()
                 have_subscribers = bool(subscribers)
+            if have_subscribers:
+                idle_since = None
+            elif key is not None:
+                idle_since = idle_since or time.monotonic()
+                if (
+                    time.monotonic() - idle_since >= _SHARED_CDC_IDLE_EXIT_SECONDS
+                    and _retire_shared_cdc_shard(key, shard)
+                ):
+                    return
+            with shard.condition:
                 throttled = have_subscribers and any(
                     len(buf) >= shard.buffer_cap for buf in shard.buffers.values()
                 )
@@ -8477,7 +8617,7 @@ def _snapshot_drain_pool(key, *, reader_factory, thread_count) -> _SnapshotDrain
         while len(threads) < thread_count:
             thread = threading.Thread(
                 target=_run_snapshot_drain_worker,
-                args=(pool,),
+                args=(pool, key),
                 daemon=True,
                 name=f"informix-snapshot-drain-{key[-1]}-{index}",
             )
@@ -8497,7 +8637,26 @@ def _close_snapshot_drain_reader(reader) -> None:
         logging.getLogger(__name__).debug(_m(156), exc_info=True)
 
 
-def _run_snapshot_drain_worker(pool: _SnapshotDrainPool) -> None:
+def _retire_snapshot_drain_worker(key: tuple, pool: _SnapshotDrainPool) -> bool:
+    # Docstring: Take this idle worker out of its pool's registry, and the pool with its
+    # last one; False when a job has arrived. A consumer that asks for the pool
+    # afterwards gets its workers started again.
+
+    with _snapshot_drain_registry_lock():
+        with pool.condition:
+            if pool.queue or pool.pending:
+                return False
+        threads = _SNAPSHOT_DRAIN_THREADS.get(key)
+        if threads is not None:
+            threads[:] = [thread for thread in threads if thread is not threading.current_thread()]
+            if not threads:
+                _SNAPSHOT_DRAIN_THREADS.pop(key, None)
+                if _SNAPSHOT_DRAIN_POOLS.get(key) is pool:
+                    _SNAPSHOT_DRAIN_POOLS.pop(key, None)
+    return True
+
+
+def _run_snapshot_drain_worker(pool: _SnapshotDrainPool, key: tuple | None = None) -> None:
     # Docstring: Daemon loop: pull one drain job, run the inline snapshot drain under a private
     # reader (staging pages and publishing the manifest durably), then close the reader to
     # release its slot. A failure is recorded on the job so the waiting consumer re-raises
@@ -8506,9 +8665,23 @@ def _run_snapshot_drain_worker(pool: _SnapshotDrainPool) -> None:
 
     logger = logging.getLogger(__name__)
     while True:
+        idle_since = time.monotonic()
+        while True:
+            with pool.condition:
+                if not pool.queue:
+                    pool.condition.wait(timeout=_SNAPSHOT_DRAIN_IDLE_SECONDS)
+                if pool.queue:
+                    break
+            # No job for a long while: the worker ends, unless one arrives just now.
+            if (
+                key is not None
+                and time.monotonic() - idle_since >= _SNAPSHOT_DRAIN_IDLE_EXIT_SECONDS
+                and _retire_snapshot_drain_worker(key, pool)
+            ):
+                return
         with pool.condition:
-            while not pool.queue:
-                pool.condition.wait(timeout=_SNAPSHOT_DRAIN_IDLE_SECONDS)
+            if not pool.queue:
+                continue
             job_key = pool.queue.popleft()
             job = pool.jobs.get(job_key)
             factory = pool.reader_factory
@@ -8644,6 +8817,26 @@ class _DeferredStagedPage:
         return next(self._rows)
 
 
+def _options_set(options: Any) -> Any:
+    # Docstring: ``options`` without the ones left empty. An empty value is one not set: a
+    # form sends "" for a field nobody filled in. Read as set, it shadowed the
+    # connection's value with the default, or failed as an invalid one. The escape
+    # character is the one whose empty value means something. Only "" counts: a value of
+    # blanks is something typed, and is judged as given (a tab is a delimiter, and a
+    # column list of one blank is a mistake to report). The same object when none is empty.
+    try:
+        empty = {
+            name
+            for name, value in options.items()
+            if isinstance(value, str) and value == "" and name.lower() != _UNL_ESCAPE_OPTION
+        }
+    except (TypeError, AttributeError):
+        return options
+    if not empty:
+        return options
+    return {name: value for name, value in options.items() if name not in empty}
+
+
 class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     # Docstring: Pure-Python connector live-validated on disposable Informix 15.
     #
@@ -8661,6 +8854,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 if isinstance(value, str)
                 and not value.strip()
                 and name.lower() != _UNL_ESCAPE_OPTION
+                # A delimiter of one blank character, a tab say, is a delimiter.
+                and not (name.lower() == _UNL_DELIMITER_OPTION and value != "")
             ]:
                 del options[name]
         super().__init__(options)
@@ -9130,6 +9325,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             return sorted(self._table_map())
 
     def get_table_schema(self, table_name: str, table_options: dict[str, str]) -> StructType:
+        table_options = _options_set(table_options)
         with self._metadata_access():
             table = self._registration_table(table_name, table_options)
             _ensure_materializable(table, table_options)
@@ -9177,6 +9373,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             return StructType(fields)
 
     def read_table_metadata(self, table_name: str, table_options: dict[str, str]) -> dict:
+        table_options = _options_set(table_options)
         with self._metadata_session_lock, self._metadata_access():
             table = self._registration_table(table_name, table_options)
             _ensure_materializable(table, table_options)
@@ -9284,6 +9481,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def read_table(
         self, table_name: str, start_offset: dict, table_options: dict[str, str]
     ) -> tuple[Iterator[dict], dict]:
+        table_options = _options_set(table_options)
         rows, offset = self._read_upserts(table_name, start_offset, table_options)
 
         def columns():
@@ -9297,6 +9495,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # Docstring: ``read_table`` under source column names; rename_columns is applied
         # only where rows leave the connector.
 
+        # The interface passes None on the first call of the first run, and a batch
+        # read always does.
+        start_offset = start_offset or {}
         effective_start = self._effective_start_offset(start_offset)
         snapshot_mode = self._snapshot_mode(table_options)
         self._publish_checkpoint_channel_start_before_capacity(
@@ -9816,6 +10017,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         table_options: dict[str, str],
         start_offset: dict | None = None,
     ) -> dict:
+        table_options = _options_set(table_options)
         start_offset = start_offset or {}
         effective_start = self._effective_start_offset(start_offset)
         end = self._served_offset(table_name, table_options, start_offset, effective_start)
@@ -10040,6 +10242,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         start_offset: dict | None = None,
         end_offset: dict | None = None,
     ) -> Sequence[dict]:
+        table_options = _options_set(table_options)
         if start_offset is None and end_offset is None:
             # Batch read. Not partitioned here -- raising makes LakeflowBatchReader
             # fall back to read_table (a single non-partitioned batch).
@@ -10099,6 +10302,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def read_partition(
         self, table_name: str, partition: dict, table_options: dict[str, str]
     ) -> Iterator[dict]:
+        table_options = _options_set(table_options)
         rows = self._read_partition_rows(partition, table_options)
         return self._output_rows(rows, table_options, lambda: _descriptor_columns(partition))
 
@@ -10220,6 +10424,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def read_table_deletes(
         self, table_name: str, start_offset: dict, table_options: dict[str, str]
     ) -> tuple[Iterator[dict], dict]:
+        table_options = _options_set(table_options)
         rows, offset = self._read_deletes(table_name, start_offset, table_options)
 
         def columns():
@@ -10232,6 +10437,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     ) -> tuple[Iterator[dict], dict]:
         # Docstring: ``read_table_deletes`` under source column names.
 
+        # The interface passes None on the first call of the first run, and a batch
+        # read always does.
+        start_offset = start_offset or {}
         effective_start = self._effective_start_offset(start_offset)
         snapshot_mode = self._snapshot_mode(table_options)
         # An uncheckpointed delete reader cannot do useful source work until its
@@ -19861,25 +20069,41 @@ def _parse_unload_fields(
     values: list[str] = []
     value: list[str] = []
     escaped = False
+    # Whether the field so far is one escaped space and nothing else: UNLOAD's form of
+    # an empty VARCHAR or LVARCHAR (see _UnloadEmpty).
+    empty = False
+
+    def field() -> str:
+        return _UnloadEmpty(" ") if empty else "".join(value)
+
     # The line's own terminator only: a carriage return before it may be data.
     line = line[:-1] if line.endswith("\n") else line
     line = line[:-1] if line.endswith("\r") else line
     for character in line:
         if escape and escaped:
+            empty = character == " " and not value
             value.append({"n": "\n", "r": "\r", "t": "\t"}.get(character, character))
             escaped = False
         elif escape and character == escape:
             escaped = True
         elif character == delimiter:
-            values.append("".join(value))
-            value = []
+            values.append(field())
+            value, empty = [], False
         else:
+            empty = False
             value.append(character)
     # Short of ``fields``, an empty final field is real: HPL writes no trailing delimiter,
     # so a NULL last column leaves the record ending in a delimiter, as UNLOAD's does.
     if value or (fields is not None and len(values) < fields):
-        values.append("".join(value))
+        values.append(field())
     return values
+
+
+class _UnloadEmpty(str):
+    # Docstring: An UNLOAD field that was one escaped space, which is how UNLOAD writes an
+    # empty VARCHAR, NVARCHAR or LVARCHAR (probed on 14.10: ``|\ |`` for '', ``| |`` for
+    # one blank, ``||`` for a NULL). It is the space it decodes to for every other use.
+    pass
 
 
 def _unload_value(text: str, type_name: str, qualifier: int | None = None) -> Any:
@@ -19896,6 +20120,10 @@ def _unload_value(text: str, type_name: str, qualifier: int | None = None) -> An
     if text == "":
         return None
     upper = type_name.upper()
+    if isinstance(text, _UnloadEmpty) and upper in {"VARCHAR", "NVARCHAR", "LVARCHAR"}:
+        # Read as the space, an empty value landed as a blank, and as a key it then
+        # matched none of the row's later changes, which carry the empty string.
+        return ""
     if upper in {"CHAR", "NCHAR"}:
         # The live decoders drop CHAR's blank padding; an extract may keep it.
         return text.rstrip(" ")
@@ -21395,6 +21623,11 @@ def _validated_offset(offset: dict[str, Any]) -> dict[str, Any]:
             # 404: Informix snapshot offset has an invalid snapshot.record_index
             raise ValueError(_m(404))
     incremental = result.get("incremental")
+    if isinstance(incremental, dict):
+        # A copy: the values normalized below would otherwise change in the caller's
+        # offset too, and an offset used as a lookup key afterwards no longer matched
+        # the one Spark hands back.
+        incremental = result["incremental"] = dict(incremental)
     if incremental is not None:
         if phase != "stream":
             # 405: Informix incremental snapshot state requires the stream phase

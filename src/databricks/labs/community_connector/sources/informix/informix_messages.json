@@ -448,5 +448,7 @@
 "Informix did not allow newlines in quoted strings for this session ({}); a string value that holds a newline fails with SQL error -282",
 "Option 'database' must be a plain Informix database name (letters, digits, underscores and $, not starting with a digit): {!r}",
 "Option '{}' is not accepted: a connection option cannot name code to load",
-"Option 'snapshot.filter' must close every parenthesis it opens, and open every one it closes"
+"Option 'snapshot.filter' must close every parenthesis it opens, and open every one it closes",
+"Option '{}' gives {} the fallback {} for {}, which is more than a {} column holds",
+"Transform of column {} gives {}, which is outside the range of a 64-bit integer"
 ]

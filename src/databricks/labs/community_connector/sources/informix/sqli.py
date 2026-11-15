@@ -1288,7 +1288,12 @@ class InformixSqliClient:
                         raise selected
                 else:
                     self._connect_once(host, port, server, deadline, None)
-                self.hostname, self.port, self.server_name = host, port, server
+                # Where this session ended up, apart from where the client was told to
+                # connect: a reconnect starts from the configured endpoint again, so a
+                # redirect's target is validated each time and a connection manager can
+                # name a new one after a failover.
+                self.connected_hostname, self.connected_port = host, port
+                self.connected_server_name = server
                 return self
             except SqliRedirect as redirect:
                 self._reset_connection_state()
