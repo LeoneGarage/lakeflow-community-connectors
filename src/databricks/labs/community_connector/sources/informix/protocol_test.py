@@ -1,6 +1,7 @@
 """Source-local golden tests for bytecode-verified protocol layouts."""
 
 import base64
+import inspect
 import io
 import ssl
 import struct
@@ -584,6 +585,30 @@ class SqliPacketTests(unittest.TestCase):
             self.assertEqual(
                 decode_value(memoryview(bytes.fromhex("78202020")), column, null_byte=mode), ("x", 4)
             )
+
+    def test_a_padded_varchar_is_read_by_its_length_byte(self):
+        # What a live server sent for a VARCHAR(10) with IFX_PAD_VARCHAR on: a slot of one
+        # length byte and ten more, the value followed by spaces. A NULL is length 1 and
+        # a NUL; an empty value is length 0. Read as ten bytes of text, the value came
+        # back with its length byte in front and without its last character.
+        column = ResultColumn("v", 0, 13, 0, 10)
+        for frame, value in (
+            ("0100000000000000000000", None),
+            ("0020202020202020202020", ""),
+            ("0261622020202020202020", "ab"),
+            ("0361622020202020202020", "ab "),
+            ("0a30313233343536373839", "0123456789"),
+        ):
+            self.assertEqual(
+                _decode_result_value(bytes.fromhex(frame), column, "utf-8", True, "null"), value
+            )
+
+    def test_pad_varchar_asks_the_server_to_pad(self):
+        # The fixed layout padVarchar reads is sent only to a session that asks for it.
+        import databricks.labs.community_connector.sources.informix.sqli as sqli_module
+
+        source = inspect.getsource(sqli_module.InformixSqliClient)
+        self.assertIn('properties["IFX_PAD_VARCHAR"] = "1"', source)
 
     def test_a_null_char_is_a_null_under_every_null_byte_mode(self):
         # Informix sends a NULL CHAR as a NUL followed by spaces (probed live: 00 20 20
@@ -1354,17 +1379,19 @@ class SqliPacketTests(unittest.TestCase):
 
     def test_padded_varchar_beside_an_lvarchar_is_length_prefixed(self):
         # A live server sends a tuple holding an LVARCHAR or BOOLEAN in the variable
-        # layout, VARCHARs length-prefixed, even under padVarchar; reading the VARCHAR
-        # as padded ran every later column out of the payload.
+        # layout. Under padVarchar the session asks for padded VARCHARs, and each one in
+        # such a tuple is its length byte and then the column's full width, the value
+        # followed by spaces: read as ending with its value, every later column ran out
+        # of the payload.
         payload = (
-            b"\x02ab"
+            b"\x02ab" + b" " * 8
             + b"\x00"
             + struct.pack(">i", 5)
             + b"hello"
             + b"\x00"
             + struct.pack(">i", 1)
             + b"\x01"
-            + b"\x01z"
+            + b"\x01z" + b" " * 9
         )
         transcript = struct.pack(">hi", 0, len(payload)) + payload
         if len(payload) & 1:

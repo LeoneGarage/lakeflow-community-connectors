@@ -14452,8 +14452,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 size = _INDEX_SCAN_LOOKUP_ROWS if comparable else 1
                 queries: list[tuple[list[str], list[tuple]]] = []
                 room = 0
+                # Each set of values is a SELECT of its own within the statement (see
+                # rows_by_values), so it costs the column list and the table's name too:
+                # on a wide table that is most of it.
+                select = sum(len(name) + 3 for name in names) + len(table.identity) + 40
                 for values in lookups:
-                    length = sum(
+                    length = select + sum(
                         len(str(value)) + len(column) + 8 for value, column in zip(values, columns)
                     )
                     if length > _INDEX_SCAN_LOOKUP_CHARS:

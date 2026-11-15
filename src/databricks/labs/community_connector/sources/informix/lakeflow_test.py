@@ -2787,10 +2787,11 @@ class LakeflowContractTests(unittest.TestCase):
         source.rows_by_values = counted
         with (
             mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0),
-            mock.patch.object(informix_module, "_INDEX_SCAN_LOOKUP_CHARS", 60),
+            mock.patch.object(informix_module, "_INDEX_SCAN_LOOKUP_CHARS", 230),
         ):
             self._index_scan(source, 3, table=table, options={"append.only.ingestion": "true"})
-        # About 30 characters a row: two to a query at most.
+        # Each row is a SELECT of its own in the statement: about 75 characters of column
+        # list and table name and 30 of values. Two to a query at most.
         self.assertTrue(calls)
         self.assertEqual({keys for keys, _count in calls}, {("id", "value")})
         self.assertLessEqual(max(count for _keys, count in calls), 2)

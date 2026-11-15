@@ -1050,8 +1050,12 @@ def _decode_result_value_raw(
         value = struct.unpack(">i", data[:4])[0]
         return None if value == -(1 << 31) else date(1899, 12, 31) + timedelta(days=value)
     if kind in {13, 16}:
-        if pad_varchar:
-            return _decode_text(data[: column.encoded_length], encoding).rstrip(" \0")
+        # Length-prefixed, padded or not. With IFX_PAD_VARCHAR the server sends each
+        # value in a slot of one length byte and the column's full width, the value
+        # followed by spaces (probed on 14.10: 02 61 62 20 ... for 'ab' in a
+        # VARCHAR(10), 00 20 ... for '', 01 00 00 ... for a NULL): the length byte says
+        # where the value ends, so its own trailing spaces are kept and the padding is
+        # not. Without it the slot ends with the value.
         if not data:
             raise SqliProtocolError("truncated variable VARCHAR")
         size = data[0]
@@ -1348,6 +1352,12 @@ class InformixSqliClient:
             "IFX_UPDDESC": "1",
             "NODEFDAC": "no",
         }
+        if self.pad_varchar:
+            # padVarchar reads rows in the fixed layout, where every VARCHAR has a slot
+            # of its full width. The server sends that layout only when the session
+            # asks for it; without this a padded read fails on the first row (seen
+            # live: the row is shorter than the layout says).
+            properties["IFX_PAD_VARCHAR"] = "1"
         request = encode_normal_auth_request(
             self.user,
             self.password,
@@ -1913,7 +1923,9 @@ class InformixSqliClient:
         result = {}
         if variable_layout is None:
             variable_layout = self._variable_tuples(description)
-        # A variable tuple carries its VARCHARs length-prefixed even under padVarchar.
+        # Every VARCHAR is read by its length byte, padded or not (see
+        # _decode_result_value_raw); ``padded`` only tells the decoder which layout the
+        # row came in.
         padded = self.pad_varchar and not variable_layout
         cursor = 0
         for index, column in enumerate(description.columns):
@@ -1922,7 +1934,12 @@ class InformixSqliClient:
             if variable_layout and kind in {13, 16}:
                 if start >= len(payload):
                     raise SqliProtocolError("truncated variable VARCHAR tuple")
-                limit = start + 1 + payload[start]
+                # Under padVarchar the session asks for padded VARCHARs, and a variable
+                # tuple carries them padded too: the length byte, then the column's full
+                # width (seen live: a VARCHAR(10) holding '' took 11 bytes beside an
+                # LVARCHAR). Without it the slot ends with the value.
+                width = (column.encoded_length & 0xFF) if self.pad_varchar else payload[start]
+                limit = start + 1 + width
             elif variable_layout and kind in {40, 41, 43, 45, 46}:
                 if start + 5 > len(payload):
                     raise SqliProtocolError("truncated complex variable tuple")

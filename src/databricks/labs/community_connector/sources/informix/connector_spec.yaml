@@ -301,10 +301,11 @@ connection:
       type: string
       required: false
       description: >
-        Selects fixed-width padded decoding for ordinary SQL VARCHAR/NVARCHAR
-        snapshot and metadata results. Default `false`; truthy values are `1`,
-        `true`, and `yes` (case-insensitive). It does not change native CDC
-        VARCHAR framing. Use only when the server negotiates padded tuples.
+        Asks Informix to send each SQL VARCHAR/NVARCHAR in a slot of its full
+        width (the session sets IFX_PAD_VARCHAR) and reads snapshot and metadata
+        results in that fixed layout. Default `false`; truthy values are `1`,
+        `true`, and `yes` (case-insensitive). The values read are the same
+        either way, and it does not change native CDC VARCHAR framing.
 
     - name: table.include.list
       type: string
@@ -518,7 +519,9 @@ connection:
         connection scope; a single character, default `|` (Informix UNLOAD). Set it when
         the extract is HPL DELIMITED output whose job uses a non-pipe delimiter -- unlike
         UNLOAD, HPL does not honor DBDELIMITER, so the delimiter is whatever the ipload job
-        set. The record terminator is always a newline. Only meaningful with
+        set. An HPL extract whose last column can be NULL needs a delimiter other than `|`:
+        such a row ends in the delimiter, which under `|` reads as a truncated UNLOAD record
+        and fails. The record terminator is always a newline. Only meaningful with
         `snapshot.source`; must differ from `snapshot.unl.escape`.
 
     - name: snapshot.unl.escape
