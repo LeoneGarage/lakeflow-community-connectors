@@ -1021,6 +1021,12 @@ def _decode_result_value_raw(
 ) -> object:
     kind = _effective_result_kind(column)
     if kind in {0, 15}:  # CHAR, NCHAR
+        # A NULL has no flag of its own: Informix sends it as a NUL followed by spaces
+        # (probed on 14.10: 00 20 20 ... for a NULL CHAR(8)), where an empty value is
+        # all spaces. Told here, so that it is a NULL under every string.null.byte mode
+        # and not an empty string or a lone NUL.
+        if column.encoded_length and data[:1] == b"\x00":
+            return None
         return _decode_text(data[: column.encoded_length], encoding).rstrip(" ")
     if kind == 1:
         value = struct.unpack(">h", data[:2])[0]

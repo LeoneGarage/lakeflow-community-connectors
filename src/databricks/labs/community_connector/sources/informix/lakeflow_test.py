@@ -4116,7 +4116,9 @@ class LakeflowContractTests(unittest.TestCase):
 
     def test_the_bridge_reads_rows_by_several_sets_of_values_in_one_query(self):
         # The rows an index-ordered scan reads again, each by its index and key values. A
-        # NULL among them is asked for as one, so the index still finds the row.
+        # NULL among them is asked for as one. Each set is a SELECT of its own, joined by
+        # UNION ALL: Informix finds each by the index, where one SELECT with the sets
+        # joined by OR reads the whole table (probed on the demo server).
         bridge = object.__new__(PurePythonInformixBridge)
         bridge.options = {}
         bridge.transport = mock.Mock(spec=["execute"])
@@ -4136,11 +4138,24 @@ class LakeflowContractTests(unittest.TestCase):
             [call.args for call in bridge.transport.execute.call_args_list],
             [
                 (
-                    "SELECT FIRST 9 a,b,c FROM demo:app.t "
-                    "WHERE (a = ? AND c IS NULL) OR (a = ? AND c = ?)",
+                    "SELECT a,b,c FROM demo:app.t WHERE (a = ? AND c IS NULL) "
+                    "UNION ALL SELECT a,b,c FROM demo:app.t WHERE (a = ? AND c = ?)",
                     (7, 8, "y"),
                 )
             ],
+        )
+        # One set alone, which may be a whole index value, takes the limit.
+        with (
+            mock.patch.object(bridge, "_ensure_connected"),
+            mock.patch.object(
+                bridge, "_repeatable_read_transaction", return_value=contextlib.nullcontext()
+            ),
+        ):
+            bridge.transport.execute.return_value = [(7,)]
+            bridge.rows_by_values("demo.app.t", ["a"], ["a"], [(7,)], "X", 9)
+        self.assertEqual(
+            bridge.transport.execute.call_args.args,
+            ("SELECT FIRST 9 a FROM demo:app.t WHERE (a = ?)", (7,)),
         )
 
     def test_an_index_scan_fails_on_a_value_the_connector_reads_as_null(self):
@@ -6531,6 +6546,44 @@ class LakeflowContractTests(unittest.TestCase):
         )
         self.assertNotIn("ORDER BY", bridge.transport.sql[-2])
         self.assertEqual([page for _, _, page in consumed], [[{"id": 1}, {"id": 2}], [{"id": 3}]])
+
+    def test_a_new_session_allows_newlines_in_string_values(self):
+        # By default Informix refuses a quoted string that holds a newline (-282), which
+        # ends the session too, and a keyset bound or a looked-up key can hold one. Each
+        # new session allows them. Probed live: the procedure must go as a command, and
+        # a refusal ends the session, so the bridge connects again and asks no more.
+        class Transport:
+            def __init__(self, refuse=False):
+                self.refuse, self.calls = refuse, []
+
+            def connect(self):
+                self.calls.append("connect")
+
+            def close(self):
+                self.calls.append("close")
+
+            def execute_command(self, sql):
+                self.calls.append(sql)
+                if self.refuse:
+                    raise RuntimeError("no such routine")
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.transport = Transport()
+        bridge._connect_transport()
+        self.assertEqual(
+            bridge.transport.calls, ["connect", "EXECUTE PROCEDURE ifx_allow_newline('t')"]
+        )
+        bridge.transport = Transport(refuse=True)
+        with self.assertLogs(informix_module.__name__, level="WARNING") as logged:
+            bridge._connect_transport()
+        self.assertIn("did not allow newlines", logged.output[0])
+        self.assertEqual(
+            bridge.transport.calls,
+            ["connect", "EXECUTE PROCEDURE ifx_allow_newline('t')", "close", "connect"],
+        )
+        bridge.transport.calls.clear()
+        bridge._connect_transport()
+        self.assertEqual(bridge.transport.calls, ["connect"])
 
     def test_a_key_that_cannot_be_paged_by_is_read_through_one_cursor(self):
         # A DATETIME, INTERVAL, float or BOOLEAN key has no keyset bound to render. Paging

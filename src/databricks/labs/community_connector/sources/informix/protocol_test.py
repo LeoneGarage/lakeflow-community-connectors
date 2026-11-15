@@ -567,6 +567,21 @@ class SqliPacketTests(unittest.TestCase):
             "/* mutation */\n-- owned SQL\nUPDATE t SET value = 1"
         )
 
+    def test_a_null_char_is_a_null_under_every_null_byte_mode(self):
+        # Informix sends a NULL CHAR as a NUL followed by spaces (probed live: 00 20 20
+        # ... for CHAR(8)) and an empty one as spaces. Left to the NUL sanitizer, the NULL
+        # was one only under string.null.byte=null: an empty string under "empty" and a
+        # lone NUL under "keep".
+        column = ResultColumn("client", 0, 0, 0, 8)
+        for mode in ("null", "empty", "keep"):
+            self.assertIsNone(
+                _decode_result_value(b"\x00" + b" " * 7, column, "utf-8", null_byte=mode)
+            )
+            self.assertEqual(_decode_result_value(b" " * 8, column, "utf-8", null_byte=mode), "")
+            self.assertEqual(
+                _decode_result_value(b"C0000001", column, "utf-8", null_byte=mode), "C0000001"
+            )
+
     def test_connector_sql_renders_a_boolean_as_its_informix_literal(self):
         # Informix has no cast from an integer to a BOOLEAN: its literals are 't' and 'f'.
         self.assertEqual(

@@ -4843,6 +4843,12 @@ def register_lakeflow_source(spark):
     ) -> object:
         kind = _effective_result_kind(column)
         if kind in {0, 15}:  # CHAR, NCHAR
+            # A NULL has no flag of its own: Informix sends it as a NUL followed by spaces
+            # (probed on 14.10: 00 20 20 ... for a NULL CHAR(8)), where an empty value is
+            # all spaces. Told here, so that it is a NULL under every string.null.byte mode
+            # and not an empty string or a lone NUL.
+            if column.encoded_length and data[:1] == b"\x00":
+                return None
             return _decode_text(data[: column.encoded_length], encoding).rstrip(" ")
         if kind == 1:
             value = struct.unpack(">h", data[:2])[0]
@@ -7705,6 +7711,28 @@ def register_lakeflow_source(spark):
             connect = getattr(self.transport, "connect", None)
             if connect:
                 connect()
+            # Informix takes a string value as a quoted literal within the statement, and by
+            # default (ALLOW_NEWLINE 0) refuses one that holds a newline with -282, which
+            # also ends the session. A keyset bound or a looked-up key can hold one. The
+            # procedure allows them for this session (probed on 14.10: it must be sent as a
+            # command, and a value with a newline then compares as any other).
+            command = getattr(self.transport, "execute_command", None)
+            if not callable(command) or self.__dict__.get("_newline_refused"):
+                return
+            try:
+                command("EXECUTE PROCEDURE ifx_allow_newline('t')")
+            except Exception as error:  # pylint: disable=broad-except
+                # An error ends the session: connect again, and do not ask a second time.
+                self._newline_refused = True
+                # 446: Informix did not allow newlines in quoted strings for this session
+                # ({}); a string value that holds a newline fails with SQL error -282
+                logging.getLogger(__name__).warning(_m(446, error))
+                close = getattr(self.transport, "close", None)
+                if callable(close):
+                    with contextlib.suppress(Exception):
+                        close()
+                if connect:
+                    connect()
 
         @staticmethod
         def _connection_identity_from(source: dict[str, Any]) -> str:
@@ -8799,8 +8827,9 @@ def register_lakeflow_source(spark):
         @_serialized_sqli_operation
         def rows_by_values(self, identity, columns, keys, value_sets, isolation, limit=None):
             # Docstring: Every row whose ``keys`` columns equal one of ``value_sets``, a None
-            # in one standing for a NULL, or the first ``limit`` of them, read at ``isolation``
-            # in one query.
+            # in one standing for a NULL, read at ``isolation`` in one query; for a single
+            # set, the first ``limit`` of its rows. The sets must differ: a row is returned
+            # once for each set it matches.
 
             self._ensure_connected()
             database, owner, name = _split_identity(identity)
@@ -8810,14 +8839,22 @@ def register_lakeflow_source(spark):
                     raise InformixError(_m(43, identifier))
             if not value_sets:
                 return []
-            # A NULL is asked for as one: no value equals it.
+            # One SELECT a set of values, joined by UNION ALL: Informix finds each by the
+            # index. Asked for as one SELECT with the sets joined by OR, it reads the whole
+            # table (probed on 14.10: SEQUENTIAL SCAN for the OR, INDEX PATH with a lower
+            # index filter for each branch of the UNION ALL, a NULL's included). A NULL is
+            # asked for as one: no value equals it. The limit is for a single set, which
+            # may be an index value alone; a set that names a row by its key is small.
+            select = (
+                f"SELECT {f'FIRST {int(limit)} ' if limit and len(value_sets) == 1 else ''}"
+                f"{','.join(_sql_identifier(column) for column in columns)} "
+                f"FROM {database}:{_sql_identifier(owner)}.{_sql_identifier(name)} WHERE "
+            )
             with self._repeatable_read_transaction(isolation):
                 rows = self.transport.execute(
-                    f"SELECT {f'FIRST {int(limit)} ' if limit else ''}"
-                    f"{','.join(_sql_identifier(column) for column in columns)} "
-                    f"FROM {database}:{_sql_identifier(owner)}.{_sql_identifier(name)} WHERE "
-                    + " OR ".join(
-                        "("
+                    " UNION ALL ".join(
+                        select
+                        + "("
                         + " AND ".join(
                             f"{_sql_identifier(key)} " + ("IS NULL" if value is None else "= ?")
                             for key, value in zip(keys, values, strict=True)
