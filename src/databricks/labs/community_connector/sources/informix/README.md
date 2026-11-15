@@ -57,6 +57,7 @@ The pure-Python protocol implementation has completed authentication, query, dis
 - The Informix CDC API installed by an administrator. Run `$INFORMIXDIR/etc/syscdcv1.sql` (commonly with `dbaccess sysadmin`) to create the `syscdcv1` database and `cdc_*` routines.
 - A normal username/password account that can read source catalog metadata and selected tables, use the required `syscdcv1` routines, and enable full-row logging. The validated reference setup grants DBA-level access to `syscdcv1`.
 - The connector's message text deployed with its source. It is kept in `informix_messages.json`, next to `informix.py` and the merged `_generated_informix_python_source.py`, rather than in the code Spark ships to each worker, and each worker reads it from there. A deployment of this folder (a Git folder or the connector's wheel) includes it, and so does a zip of the sources imported from the archive; one that copies only the merged file must copy it too, or messages are reported by number.
+- One of two ways of registering the connector with Spark. `register(spark, "informix")` loads the merged single file, which Spark ships to every process whole. `spark.dataSource.register(InformixDataSource)`, with the connector's wheel installed, ships only the class's name: each process imports the connector from the wheel, and the pipeline's identity and the workspace credentials, which only the driver has, travel with the class and its readers. Both behave alike; the second has no limit on the connector's size.
 - The exact `INFORMIXSERVER` value. `DB_LOCALE` defaults to `en_US.819` and `CLIENT_LOCALE` defaults to `en_US.utf8`; override either when the source requires another locale because the connector does not discover them.
 
 The connector enables full-row logging for captured tables and leaves it enabled when a finite poll ends, avoiding capture gaps between polls. Ensure this operational change is acceptable on the source system.
@@ -574,8 +575,9 @@ letting the snapshot choose an index. Each may be followed by `asc` or `desc`; a
 without one takes its direction from an index that starts with the named columns, or
 ascending if there is none. The order only affects speed: it should match an index, or
 every page sorts the rest of the table. With named columns the snapshot fails instead of
-falling back: when a named column is not ingested, is nullable or has another type, and in
-the cases above. Naming columns for a table that has a key of its own is rejected; change
+falling back: when a named column is not ingested or has another type, when a column is
+named twice, when more than a million rows have a NULL in a named column, and in the
+cases above. Naming columns for a table that has a key of its own is rejected; change
 the key with `primary.keys`.
 
 A table with no primary key and no unique index that the connector uses as its key, but
@@ -648,9 +650,28 @@ Requirements and limits:
 - An index value the connector reads as NULL while Informix does not fails the snapshot:
   a character value holding a NUL byte, under the default `string.null.byte=null`.
 - One index value may have at most a million rows: they are read and staged together.
-- A `TRUNCATE` during the snapshot fails it. So does an `UPDATE` that changes one of the
-  columns the snapshot pages by, and a transaction larger than `cdc.spill.records` that
-  commits during the scan. Set `snapshot.scan: cursor` if a table cannot avoid these.
+- A `TRUNCATE` during the snapshot fails it. So does a transaction larger than
+  `cdc.spill.records` that commits during the scan. Set `snapshot.scan: cursor` if a
+  table cannot avoid these.
+- An `UPDATE` that changes one of the columns the snapshot pages by moves its row from
+  one index value to another, and the scan can have read either before the update and
+  the other after it. For a keyless table the two halves are settled apart: the row
+  leaving the old value and the row arriving at the new one. Where the pages hold one
+  half only, the stream emits the other alone, so such an update can land as a `d` row
+  with no `u` row after it, or as a `c` row with the new values. With delete tombstones
+  on, the change log still nets to the table. With them off a lone removal lands
+  nothing, as any delete does.
+- A table keyed by `primary.keys` on the append path cannot take a half of such an
+  update, since its rows are told apart by that key: the pages could hold one row under
+  both index values, or under the new one with a later change. A row that changes index
+  value during the scan, by an update or by a delete and an insert of the same key, is
+  left out of the pages it was read into and read once more
+  when the scan ends, into a page of its own, and the stream emits its changes from that
+  read on. The snapshot holds each row once. Up to 10,000 rows may change index value
+  during one scan; more fail the snapshot, as does a row that keeps changing through
+  twenty of those reads, and one that cannot be found again by its index and key values
+  or is found twice, as when the `primary.keys` columns are not unique. An update that changes the key as well is two rows, and lands as
+  described above for a keyless table.
 - A key that keeps changing through five re-reads fails the snapshot; run it when the
   table is quieter.
 - The snapshot ends by waiting until Informix CDC shows it has read the log past the end

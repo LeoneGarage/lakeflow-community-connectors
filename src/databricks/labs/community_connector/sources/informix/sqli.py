@@ -811,7 +811,8 @@ def _connector_sql(sql: str, parameters: tuple) -> str:
         if isinstance(value, InformixDatetimeLiteral):
             literal = _partial_datetime_sql(value.value, value.qualifier)
         elif isinstance(value, bool):
-            literal = "1" if value else "0"
+            # A BOOLEAN's literals: Informix has no cast from an integer to one.
+            literal = "'t'" if value else "'f'"
         elif isinstance(value, int):
             literal = str(value)
         elif isinstance(value, Decimal):

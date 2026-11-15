@@ -440,5 +440,9 @@
 "A change to keyless table '{}' committed while its snapshot was reading the rows it applies to, and reached Informix CDC only after the snapshot was staged, so the change log may hold it twice or not at all; run a full refresh",
 "Informix snapshot of '{}' continues the index-ordered scan an earlier update of this pipeline began: {} staged pages with {} rows are kept",
 "Informix snapshot of '{}' discards the index-ordered scan an earlier update of this pipeline began ({}); its staged pages are not used",
-"Cannot record the progress of the index-ordered snapshot of '{}' ({}); a restart reads the table from its first row again"
+"Cannot record the progress of the index-ordered snapshot of '{}' ({}); a restart reads the table from its first row again",
+"The index-ordered snapshot of '{}' found more than {} rows changing index value during it; run the snapshot when the table is quieter, or set snapshot.scan=cursor",
+"The index-ordered snapshot could not settle the {} row(s) of '{}' that changed index value during it after {} re-reads because they kept changing; run the snapshot when the table is quieter, or set snapshot.scan=cursor",
+"The index-ordered snapshot of '{}' could not read again, each by its index and key values, the {} row(s) that changed index value during it; set snapshot.scan=cursor to read the table without index order",
+"Informix offset has an invalid scan_scope or scan_schema; run a full refresh with this connector version"
 ]

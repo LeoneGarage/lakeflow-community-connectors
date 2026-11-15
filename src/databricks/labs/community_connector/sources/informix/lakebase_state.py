@@ -661,33 +661,6 @@ def revoke_stale_staging_tokens(
                 _LOGGER.debug("Could not revoke stale staging token %s", token_id, exc_info=True)
 
 
-def store_staging_secret(api: _WorkspaceApi, scope: str, key: str, value: str) -> None:
-    # Docstring: Persist the current staging token as a workspace secret (best-effort).
-    #
-    # The secret is a durable record for rotation/audit and cross-restart recovery;
-    # it is *not* the reader's bootstrap source (reading a secret would itself need a
-    # token). Staging always uses the in-process token carried in _CAPTURED_WORKSPACE,
-    # so a failure to write the secret does not stop staging.
-
-    try:
-        api.request("POST", "/api/2.0/secrets/scopes/create", {"scope": scope})
-    except WorkspaceHttpError as error:
-        # 400 RESOURCE_ALREADY_EXISTS is the normal steady-state; anything else is
-        # non-fatal here because the in-process token still works.
-        if error.status_code not in (400, 409):
-            _LOGGER.debug("Could not create secret scope %s", scope, exc_info=True)
-    except LakebaseStateError:
-        _LOGGER.debug("Could not create secret scope %s", scope, exc_info=True)
-    try:
-        api.request(
-            "POST",
-            "/api/2.0/secrets/put",
-            {"scope": scope, "key": key, "string_value": value},
-        )
-    except LakebaseStateError:
-        _LOGGER.debug("Could not store staging-token secret", exc_info=True)
-
-
 class StagingCredentialProvider:
     # Docstring: Supplies a Files-API bearer token, refreshing it before it can expire.
     #
@@ -695,9 +668,10 @@ class StagingCredentialProvider:
     # credential the reader could carry from the driver (the captured runtime
     # credential). Every later refresh, at half-life, uses the *current minted
     # token* to mint its successor, so no ambient identity is needed after startup
-    # (the reader process has none). Each mint also refreshes the durable secret and
-    # revokes this provider's previous token and the pipeline's earlier updates' tokens
-    # (see revoke_stale_staging_tokens). Refresh is lazy -- checked on each
+    # (the reader process has none). Each mint also revokes this provider's previous
+    # token and the pipeline's earlier updates' tokens (see
+    # revoke_stale_staging_tokens). The token is held in this process only: it is never
+    # written anywhere, a workspace secret included. Refresh is lazy -- checked on each
     # ``bearer()`` call -- so there is no background thread to manage; page writes
     # call ``bearer()`` often enough to refresh well within the half-life.
     #
@@ -714,8 +688,6 @@ class StagingCredentialProvider:
         pipeline_id: str,
         *,
         lifetime_seconds: int = _DEFAULT_STAGING_TOKEN_LIFETIME_SECONDS,
-        secret_scope: str | None = None,
-        secret_key: str | None = None,
         clock: Any = time.monotonic,
         update_id: str = "",
     ) -> None:
@@ -725,8 +697,6 @@ class StagingCredentialProvider:
         self._update_id = update_id
         self._lifetime_seconds = max(_STAGING_TOKEN_MIN_LIFETIME_SECONDS, int(lifetime_seconds))
         self._refresh_after = self._lifetime_seconds * _STAGING_TOKEN_REFRESH_FRACTION
-        self._secret_scope = secret_scope
-        self._secret_key = secret_key
         self._clock = clock
         self._lock = threading.Lock()
         self._token: str | None = None
@@ -786,12 +756,9 @@ class StagingCredentialProvider:
         self.rejected = False
         lifetime = min(self._lifetime_seconds, granted) if granted else self._lifetime_seconds
         self._refresh_after = lifetime * _STAGING_TOKEN_REFRESH_FRACTION
-        # Durability/rotation with the new token: store the secret and revoke this
-        # provider's previous token and earlier updates' tokens. Both are best-effort
-        # inside their helpers.
+        # Rotation with the new token: revoke this provider's previous token and
+        # earlier updates' tokens, best-effort inside the helper.
         new_api = _WorkspaceApi(self._host, token)
-        if self._secret_scope and self._secret_key:
-            store_staging_secret(new_api, self._secret_scope, self._secret_key, token)
         revoke_stale_staging_tokens(new_api, self._pipeline_id, self._update_id, predecessor_id)
 
 

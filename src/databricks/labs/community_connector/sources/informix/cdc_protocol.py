@@ -352,13 +352,20 @@ def _decode_value_bytes(data: memoryview, column: ColumnDescriptor) -> tuple[Any
     if kind == "LVARCHAR":
         _need(data, 3)
         length = struct.unpack_from(">h", data)[0]
-        if length < 0:
+        # The length counts the null flag that follows it, so it is never below one. A
+        # frame that says otherwise, flags a value with a payload as NULL, or carries an
+        # unknown flag on a bare one is not an LVARCHAR: it fails here, as a BOOLEAN with
+        # a bad flag does, so that a read of a reused log is told from a real value.
+        if length < 1:
             raise CdcProtocolError(f"invalid LVARCHAR length {length}")
         _need(data, length + 2)
-        if length == 1 and data[2] == 1:
-            return None, 3
-        if length == 1 and data[2] == 0:
-            return "", 3
+        flag = data[2]
+        if flag == 1 and length != 1:
+            raise CdcProtocolError("null LVARCHAR has a payload")
+        if length == 1:
+            if flag not in {0, 1}:
+                raise CdcProtocolError(f"invalid LVARCHAR null flag {flag}")
+            return (None if flag else ""), 3
         return bytes(data[3 : length + 2]).decode(column.encoding), length + 2
     if kind in {"DECIMAL", "NUMERIC", "MONEY"}:
         if column.precision is None or column.scale is None:

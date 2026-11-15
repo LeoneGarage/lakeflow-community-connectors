@@ -988,13 +988,20 @@ def register_lakeflow_source(spark):
         if kind == "LVARCHAR":
             _need(data, 3)
             length = struct.unpack_from(">h", data)[0]
-            if length < 0:
+            # The length counts the null flag that follows it, so it is never below one. A
+            # frame that says otherwise, flags a value with a payload as NULL, or carries an
+            # unknown flag on a bare one is not an LVARCHAR: it fails here, as a BOOLEAN with
+            # a bad flag does, so that a read of a reused log is told from a real value.
+            if length < 1:
                 raise CdcProtocolError(f"invalid LVARCHAR length {length}")
             _need(data, length + 2)
-            if length == 1 and data[2] == 1:
-                return None, 3
-            if length == 1 and data[2] == 0:
-                return "", 3
+            flag = data[2]
+            if flag == 1 and length != 1:
+                raise CdcProtocolError("null LVARCHAR has a payload")
+            if length == 1:
+                if flag not in {0, 1}:
+                    raise CdcProtocolError(f"invalid LVARCHAR null flag {flag}")
+                return (None if flag else ""), 3
             return bytes(data[3 : length + 2]).decode(column.encoding), length + 2
         if kind in {"DECIMAL", "NUMERIC", "MONEY"}:
             if column.precision is None or column.scale is None:
@@ -1924,33 +1931,6 @@ def register_lakeflow_source(spark):
                     _LOGGER.debug("Could not revoke stale staging token %s", token_id, exc_info=True)
 
 
-    def store_staging_secret(api: _WorkspaceApi, scope: str, key: str, value: str) -> None:
-        # Docstring: Persist the current staging token as a workspace secret (best-effort).
-        #
-        # The secret is a durable record for rotation/audit and cross-restart recovery;
-        # it is *not* the reader's bootstrap source (reading a secret would itself need a
-        # token). Staging always uses the in-process token carried in _CAPTURED_WORKSPACE,
-        # so a failure to write the secret does not stop staging.
-
-        try:
-            api.request("POST", "/api/2.0/secrets/scopes/create", {"scope": scope})
-        except WorkspaceHttpError as error:
-            # 400 RESOURCE_ALREADY_EXISTS is the normal steady-state; anything else is
-            # non-fatal here because the in-process token still works.
-            if error.status_code not in (400, 409):
-                _LOGGER.debug("Could not create secret scope %s", scope, exc_info=True)
-        except LakebaseStateError:
-            _LOGGER.debug("Could not create secret scope %s", scope, exc_info=True)
-        try:
-            api.request(
-                "POST",
-                "/api/2.0/secrets/put",
-                {"scope": scope, "key": key, "string_value": value},
-            )
-        except LakebaseStateError:
-            _LOGGER.debug("Could not store staging-token secret", exc_info=True)
-
-
     class StagingCredentialProvider:
         # Docstring: Supplies a Files-API bearer token, refreshing it before it can expire.
         #
@@ -1958,9 +1938,10 @@ def register_lakeflow_source(spark):
         # credential the reader could carry from the driver (the captured runtime
         # credential). Every later refresh, at half-life, uses the *current minted
         # token* to mint its successor, so no ambient identity is needed after startup
-        # (the reader process has none). Each mint also refreshes the durable secret and
-        # revokes this provider's previous token and the pipeline's earlier updates' tokens
-        # (see revoke_stale_staging_tokens). Refresh is lazy -- checked on each
+        # (the reader process has none). Each mint also revokes this provider's previous
+        # token and the pipeline's earlier updates' tokens (see
+        # revoke_stale_staging_tokens). The token is held in this process only: it is never
+        # written anywhere, a workspace secret included. Refresh is lazy -- checked on each
         # ``bearer()`` call -- so there is no background thread to manage; page writes
         # call ``bearer()`` often enough to refresh well within the half-life.
         #
@@ -1977,8 +1958,6 @@ def register_lakeflow_source(spark):
             pipeline_id: str,
             *,
             lifetime_seconds: int = _DEFAULT_STAGING_TOKEN_LIFETIME_SECONDS,
-            secret_scope: str | None = None,
-            secret_key: str | None = None,
             clock: Any = time.monotonic,
             update_id: str = "",
         ) -> None:
@@ -1988,8 +1967,6 @@ def register_lakeflow_source(spark):
             self._update_id = update_id
             self._lifetime_seconds = max(_STAGING_TOKEN_MIN_LIFETIME_SECONDS, int(lifetime_seconds))
             self._refresh_after = self._lifetime_seconds * _STAGING_TOKEN_REFRESH_FRACTION
-            self._secret_scope = secret_scope
-            self._secret_key = secret_key
             self._clock = clock
             self._lock = threading.Lock()
             self._token: str | None = None
@@ -2049,12 +2026,9 @@ def register_lakeflow_source(spark):
             self.rejected = False
             lifetime = min(self._lifetime_seconds, granted) if granted else self._lifetime_seconds
             self._refresh_after = lifetime * _STAGING_TOKEN_REFRESH_FRACTION
-            # Durability/rotation with the new token: store the secret and revoke this
-            # provider's previous token and earlier updates' tokens. Both are best-effort
-            # inside their helpers.
+            # Rotation with the new token: revoke this provider's previous token and
+            # earlier updates' tokens, best-effort inside the helper.
             new_api = _WorkspaceApi(self._host, token)
-            if self._secret_scope and self._secret_key:
-                store_staging_secret(new_api, self._secret_scope, self._secret_key, token)
             revoke_stale_staging_tokens(new_api, self._pipeline_id, self._update_id, predecessor_id)
 
 
@@ -4659,7 +4633,8 @@ def register_lakeflow_source(spark):
             if isinstance(value, InformixDatetimeLiteral):
                 literal = _partial_datetime_sql(value.value, value.qualifier)
             elif isinstance(value, bool):
-                literal = "1" if value else "0"
+                # A BOOLEAN's literals: Informix has no cast from an integer to one.
+                literal = "'t'" if value else "'f'"
             elif isinstance(value, int):
                 literal = str(value)
             elif isinstance(value, Decimal):
@@ -6372,6 +6347,24 @@ def register_lakeflow_source(spark):
     # for a table that could page by its key instead.
     _INDEX_SCAN_AUTO_GROUP_ROWS = 1_000
     _INDEX_SCAN_SETTLE_ATTEMPTS = 5
+    # The connector's per-process memory of index-ordered scans, kept as needed: the manifests'
+    # moved rows, the manifests as the stream uses them, which scans the stream is still
+    # within, and the scan records already discarded. None goes to a worker or outlives the
+    # registration it was read under.
+    _SCAN_CACHES = ("_moved_rows", "_index_scans", "_index_scan_live", "_scan_progress_forgotten")
+    # How many rows of a table keyed by primary.keys may change index value during the scan:
+    # each is left out of the pages and read once more at the end, and the manifest names it.
+    _INDEX_SCAN_MOVED_ROWS = 10_000
+    # How many changed rows of such a table the scan keeps the index values of, to tell when
+    # one shows under a second: about 150 bytes a row.
+    _INDEX_SCAN_TRACKED_ROWS = 2_000_000
+    # How many of the rows read again one query asks for, and how many times they are read:
+    # a round reads only the rows that are new or changed since their last read, so it is cheap.
+    # A query's values go to Informix as text within the statement, which has a size limit:
+    # a query takes fewer rows when their values are long.
+    _INDEX_SCAN_LOOKUP_ROWS = 100
+    _INDEX_SCAN_LOOKUP_CHARS = 16_000
+    _INDEX_SCAN_ROW_READS = 20
 
     # Where snapshot page payloads are written. ``fuse`` uses the UC Volume FUSE mount
     # (today's behaviour). ``rest`` writes them through the Files REST API, which never
@@ -6458,8 +6451,6 @@ def register_lakeflow_source(spark):
     )
     _UNLOAD_FLOAT_TYPES = frozenset({"FLOAT", "SMALLFLOAT", "REAL", "DOUBLE", "DOUBLE PRECISION"})
     _SNAPSHOT_STAGING_TOKEN_LIFETIME_OPTION = "snapshot.staging.token.lifetime.seconds"
-    # One secret scope holds every pipeline's current staging token, keyed per pipeline id.
-    _SNAPSHOT_STAGING_SECRET_SCOPE = "informix-snapshot-staging"
     # Walks a completed snapshot stage's removal may take when background page deletes keep
     # cutting it short (see _cleanup_completed_snapshot_stage); each walk removes more.
     _SNAPSHOT_STAGE_CLEANUP_ATTEMPTS = 5
@@ -7187,10 +7178,11 @@ def register_lakeflow_source(spark):
                 options[_REPLAY_CONNECTION_WAIT_BUDGET_OPTION] = previous_wait_budget
 
 
-    def _informix_available_now_base(base: type, spark_session: Any | None = None) -> type:
-        # Docstring: Wrap the generated reader base without changing the shared adapter source.
+    def _registration_identity(spark_session: Any | None) -> tuple[str, str | None]:
+        # Docstring: The scope of this registration, from the pipeline and update the Spark
+        # session runs under (a random one outside a pipeline), and what the update was
+        # started for (see _update_request).
 
-        original_base = getattr(base, "_informix_original_base", base)
         pipeline_id: str | None = None
         update_id: str | None = None
         if spark_session is not None:
@@ -7199,15 +7191,69 @@ def register_lakeflow_source(spark):
                 update_id = spark_session.conf.get("spark.pipelines.updateId", None)
             except (AttributeError, TypeError):
                 pass
-        update_request: str | None = None
         if not pipeline_id or not update_id:
-            registration_scope = secrets.token_hex(16)
-        else:
-            registration_scope = f"{pipeline_id}_@_{update_id}".lower()
-            if _PIPELINE_SCOPE.fullmatch(registration_scope) is None:
-                # 9: Spark pipeline and update IDs must be canonical UUID strings
-                raise ValueError(_m(9))
-            update_request = _update_request(pipeline_id, update_id)
+            return secrets.token_hex(16), None
+        registration_scope = f"{pipeline_id}_@_{update_id}".lower()
+        if _PIPELINE_SCOPE.fullmatch(registration_scope) is None:
+            # 9: Spark pipeline and update IDs must be canonical UUID strings
+            raise ValueError(_m(9))
+        return registration_scope, _update_request(pipeline_id, update_id)
+
+
+    def _driver_registration(spark_session: Any | None = None) -> dict[str, Any]:
+        # Docstring: What the driver knows and no other process can find out, for a connector
+        # registered by its class from an installed package: the registration's scope, what
+        # the update was started for, and the workspace credentials.
+        #
+        # The merged single file carries these in its own globals, which Spark pickles to
+        # every process with the code. A class registered from a package is pickled by name,
+        # and each process imports the module afresh, so they travel with the class instead
+        # (see InformixDataSource) and with each connector instance (see __getstate__). A
+        # process that was handed them hands the same on.
+
+        # The update this session runs, when it says: a driver kept warm between updates, or
+        # one that registers again, must gather anew for the new update. With no session to
+        # ask, a process that was handed these hands the same on.
+        running = None
+        if spark_session is not None:
+            try:
+                pipeline_id = spark_session.conf.get("spark.pipelines.pipelineId", None)
+                update_id = spark_session.conf.get("spark.pipelines.updateId", None)
+                running = f"{pipeline_id}_@_{update_id}".lower() if pipeline_id and update_id else None
+            except (AttributeError, TypeError):
+                pass
+        held = _INFORMIX_REGISTRATION_CONTEXT["scope"]
+        if held is None or (running is not None and running != held):
+            capture_workspace_credentials()
+            scope, request = _registration_identity(spark_session)
+            _INFORMIX_REGISTRATION_CONTEXT["request"] = request
+            _INFORMIX_REGISTRATION_CONTEXT["scope"] = scope
+        return {
+            "scope": _INFORMIX_REGISTRATION_CONTEXT["scope"],
+            "request": _INFORMIX_REGISTRATION_CONTEXT["request"],
+            "workspace": dict(_CAPTURED_WORKSPACE),
+        }
+
+
+    def _install_registration(state: dict[str, Any]) -> None:
+        # Docstring: Take up, in this process, what _driver_registration gathered on the driver.
+        #
+        # Whatever the process held before: Spark keeps its Python workers for the next
+        # update, whose scope, request and credentials are other ones, and a worker that kept
+        # the earlier update's would read under its scope and with a token since expired.
+
+        if state.get("scope"):
+            _INFORMIX_REGISTRATION_CONTEXT["scope"] = state["scope"]
+            _INFORMIX_REGISTRATION_CONTEXT["request"] = state.get("request")
+        if state.get("workspace"):
+            _CAPTURED_WORKSPACE.update(state["workspace"])
+
+
+    def _informix_available_now_base(base: type, spark_session: Any | None = None) -> type:
+        # Docstring: Wrap the generated reader base without changing the shared adapter source.
+
+        original_base = getattr(base, "_informix_original_base", base)
+        registration_scope, update_request = _registration_identity(spark_session)
         _INFORMIX_REGISTRATION_CONTEXT["request"] = update_request
         # Schema discovery constructs connector instances before stream readers
         # exist. Publish this registration's immutable scope early so those
@@ -7417,6 +7463,8 @@ def register_lakeflow_source(spark):
             datetime_primary_key: bool = False,
             page_consumer: Callable[[int, int, list[dict[str, Any]]], None] | None = None,
             snapshot_filter: str | None = None,
+            isolation: str = "REPEATABLE READ",
+            key_descending: Sequence[bool] | None = None,
         ) -> tuple[int, list[dict[str, Any]]]: ...
 
         def snapshot_chunk(
@@ -7455,6 +7503,20 @@ def register_lakeflow_source(spark):
         def release_connection(self) -> None:
             # Docstring: Close a finite poll's source connection and release its capacity lease.
             ...
+
+        def boundary_lsn(self) -> int: ...
+
+        def buffered_logging(self) -> bool: ...
+
+        def table_indexes(self, identity: str) -> list: ...
+
+        def key_rows(
+            self, identity, columns, keys, values, isolation, limit=None, present=(), skip=0
+        ) -> list[dict[str, Any]]: ...
+
+        def rows_by_values(
+            self, identity, columns, keys, value_sets, isolation, limit=None
+        ) -> list[dict[str, Any]]: ...
 
 
     def _serialized_sqli_operation(method: Callable[..., Any]) -> Callable[..., Any]:
@@ -8735,6 +8797,44 @@ def register_lakeflow_source(spark):
             ]
 
         @_serialized_sqli_operation
+        def rows_by_values(self, identity, columns, keys, value_sets, isolation, limit=None):
+            # Docstring: Every row whose ``keys`` columns equal one of ``value_sets``, a None
+            # in one standing for a NULL, or the first ``limit`` of them, read at ``isolation``
+            # in one query.
+
+            self._ensure_connected()
+            database, owner, name = _split_identity(identity)
+            for identifier in (database, owner, name, *columns, *keys):
+                if not _IDENTIFIER.fullmatch(identifier):
+                    # 43: Unsafe snapshot identifier {!r}
+                    raise InformixError(_m(43, identifier))
+            if not value_sets:
+                return []
+            # A NULL is asked for as one: no value equals it.
+            with self._repeatable_read_transaction(isolation):
+                rows = self.transport.execute(
+                    f"SELECT {f'FIRST {int(limit)} ' if limit else ''}"
+                    f"{','.join(_sql_identifier(column) for column in columns)} "
+                    f"FROM {database}:{_sql_identifier(owner)}.{_sql_identifier(name)} WHERE "
+                    + " OR ".join(
+                        "("
+                        + " AND ".join(
+                            f"{_sql_identifier(key)} " + ("IS NULL" if value is None else "= ?")
+                            for key, value in zip(keys, values, strict=True)
+                        )
+                        + ")"
+                        for values in value_sets
+                    ),
+                    tuple(
+                        value for values in value_sets for value in values if value is not None
+                    ),
+                )
+            return [
+                dict(row) if isinstance(row, dict) else dict(zip(columns, row, strict=True))
+                for row in rows
+            ]
+
+        @_serialized_sqli_operation
         def key_index_directions(self, identity, columns):
             # Docstring: Return the per-column DESC flags of an index whose key columns exactly
             # match ``columns`` in order, or ``None`` if no index matches.
@@ -9516,6 +9616,7 @@ def register_lakeflow_source(spark):
             page_consumer=None,
             snapshot_filter=None,
             isolation="REPEATABLE READ",
+            key_descending=None,
         ):
             # Docstring: Read one bounded point-in-time snapshot at ``isolation``.
             #
@@ -9530,10 +9631,13 @@ def register_lakeflow_source(spark):
 
             # Informix SQLI does not expose parameter binding, so keyset pagination
             # must render continuation values as SQL literals. Some valid partial
-            # DATETIME values are rejected when parsed back by Informix (-1263), and a
-            # float key has no exact literal. Within this snapshot transaction,
-            # positional pagination is stable and avoids converting such keys back into SQL.
-            positional_pagination = bool(datetime_primary_key)
+            # DATETIME values are rejected when parsed back by Informix (-1263), a float
+            # key has no exact literal and a BOOLEAN key no order. A table with such a key
+            # is read as one with no key is: through one forward-only cursor. Paging it by
+            # position (SKIP) would run a statement a page, and under an isolation that takes
+            # no locks each sees the rows as they then are: a row deleted below the position
+            # shifts the rest down, and the first row not yet read is never read.
+            unordered = not primary_keys or bool(datetime_primary_key)
 
             self._ensure_connected()
             with self._repeatable_read_transaction(isolation):
@@ -9544,7 +9648,7 @@ def register_lakeflow_source(spark):
                 total_rows = 0
                 page_index = 0
 
-                if not primary_keys:
+                if unordered:
                     database, owner, name = _split_identity(identity)
                     for identifier in (database, owner, name, *columns):
                         if not _IDENTIFIER.fullmatch(identifier):
@@ -9583,7 +9687,6 @@ def register_lakeflow_source(spark):
                     return snapshot_lsn, rows
 
                 after = None
-                skip = 0
                 while True:
                     remaining_rows = max_rows - total_rows if max_rows else page_size
                     page_capacity = min(page_size, remaining_rows)
@@ -9598,8 +9701,9 @@ def register_lakeflow_source(spark):
                         after,
                         page_capacity + 1,
                         remaining_bytes,
-                        skip=skip if positional_pagination else 0,
                         snapshot_filter=snapshot_filter,
+                        # The key index's own directions, so that it serves each page's order.
+                        **({"key_descending": list(key_descending)} if key_descending else {}),
                     )
                     has_more = len(page) > page_capacity
                     if has_more and max_rows and remaining_rows == 0:
@@ -9618,10 +9722,7 @@ def register_lakeflow_source(spark):
                     total_rows += len(accepted)
                     if not has_more:
                         break
-                    if positional_pagination:
-                        skip += len(accepted)
-                    else:
-                        after = [accepted[-1][key] for key in primary_keys]
+                    after = [accepted[-1][key] for key in primary_keys]
                     page_index += 1
                 return snapshot_lsn, rows
 
@@ -9662,10 +9763,10 @@ def register_lakeflow_source(spark):
                 raise InformixError(_m(40, session))
             labels: dict[int, tuple[ColumnDescriptor, ...]] = {}
             captures = []
+            # The socket timeout in force: the session's own for its calls, and for each
+            # read what its size can take.
+            socket_timeout = session_timeout = None
             try:
-                # The socket timeout in force: the session's own for its calls, and for each
-                # read what its size can take.
-                socket_timeout = session_timeout = None
                 if set_socket_timeout is not None:
                     socket_timeout = session_timeout = max(
                         float(previous_socket_timeout or 30), 2 * timeout_seconds + 5.0
@@ -10021,7 +10122,18 @@ def register_lakeflow_source(spark):
             ),
             "tls": _option_bool(options, "encrypt", True),
             "ca_file": options.get("ssl.ca.file"),
-            "pad_varchar": _option_bool(options, "padVarchar", False),
+            # As with the locales above: Spark lowercases option keys, and a copy of the
+            # options into a plain dict (a drain or shard reader's) keeps only that form.
+            # An invalid value is reported under the option's documented name.
+            "pad_varchar": _option_bool(
+                {
+                    "padVarchar": value
+                    for value in [options.get("padvarchar", options.get("padVarchar"))]
+                    if value is not None
+                },
+                "padVarchar",
+                False,
+            ),
             "cdc_timeout": int(options.get("cdc.timeout", "5")),
             "cdc_max_records": int(options.get("cdc.max.records", str(_DEFAULT_CDC_MAX_RECORDS))),
             "stop_logging_on_close": False,
@@ -10078,6 +10190,9 @@ def register_lakeflow_source(spark):
             if not 1 <= len(words) <= 2 or direction not in (None, "asc", "desc"):
                 return None
             columns.append((words[0], None if direction is None else direction == "desc"))
+        # A column named twice names no index, and would be both NULL and not in one read.
+        if len({name.casefold() for name, _direction in columns}) != len(columns):
+            return None
         return columns
 
 
@@ -10112,6 +10227,45 @@ def register_lakeflow_source(spark):
             for value in (_framework_value(row[key]) for key in keys)
         )
         return () if None in values else values
+
+
+    def _index_scan_row_key(
+        row: dict[str, Any], table: Table, options: dict[str, str], names: Sequence[str] | None = None
+    ) -> str:
+        # Docstring: The primary.keys values of a source row, as a staged row holds them; or
+        # those of ``names``, the key columns a scan recorded.
+        names = table.primary_keys if names is None else names
+        # Only the key columns are shaped: a wide row costs no more than a narrow one.
+        shaped = _framework_row(
+            _coerce_variable_decimal_values({name: row[name] for name in names}, table, options)
+        )
+        return json.dumps([shaped[name] for name in names], default=str)
+
+
+    def _index_scan_staged_key(row: dict[str, Any], names: Sequence[str]) -> str:
+        # Docstring: The same of a staged row: _index_scan_row_key of the row it was shaped from.
+        return json.dumps([row[name] for name in names], default=str)
+
+
+    def _moved_rows_of_page(moved: dict[str, Any] | None, page_index: int) -> dict[str, Any] | None:
+        # Docstring: What a staged page leaves out, of the rows its index-ordered scan read again.
+        #
+        # ``moved`` is the manifest's record of them (see _index_scan_snapshot): the rows of a
+        # table keyed by primary.keys that changed index value during the scan are left out of
+        # the pages read under an index value they had, and are in the page that read holds.
+        # None for a page that holds none of them.
+        listed = moved and moved["pages"].get(str(page_index))
+        return {"keys": moved["keys"], "rows": listed} if listed else None
+
+
+    def _without_moved_rows(
+        rows: Iterator[dict[str, Any]], left_out: dict[str, Any] | None
+    ) -> Iterator[dict[str, Any]]:
+        # Docstring: A staged page's rows without those _moved_rows_of_page names.
+        if not left_out:
+            return rows
+        skipped, names = frozenset(left_out["rows"]), left_out["keys"]
+        return (row for row in rows if _index_scan_staged_key(row, names) not in skipped)
 
 
     def _index_scan_order(key: Sequence[Any], descending: Sequence[bool]) -> tuple:
@@ -14417,6 +14571,8 @@ def register_lakeflow_source(spark):
                 self._spill_runs.clear()
                 self._spill_runs_listed.clear()
                 self._trigger_available_now = False
+                for name in _SCAN_CACHES:
+                    self.__dict__.pop(name, None)
             self._registration_scope = scope
 
         def _pipeline_scope(self, checkpoint: dict[str, Any] | None = None) -> str:
@@ -14521,9 +14677,20 @@ def register_lakeflow_source(spark):
             state["_partition_page_batches"] = {}
             state["_spill_runs"] = {}
             state["_spill_runs_listed"] = {}
+            # What this process has read of snapshot manifests and scan records: a worker
+            # gets a page's moved rows from its descriptor, and reads a manifest itself.
+            for name in _SCAN_CACHES:
+                state.pop(name, None)
+            if _generated_trigger_base is None and _INFORMIX_REGISTRATION_CONTEXT["scope"]:
+                # Registered by class from a package: an executor imports this module afresh
+                # and is handed only readers, so what the driver gathered goes with them.
+                state["_driver_registration"] = _driver_registration()
             return state
 
         def __setstate__(self, state: dict[str, Any]) -> None:
+            carried = state.pop("_driver_registration", None)
+            if carried:
+                _install_registration(carried)
             self.__dict__.update(state)
             self._metadata_session_lock = threading.RLock()
 
@@ -15053,11 +15220,26 @@ def register_lakeflow_source(spark):
             manifest = self._read_snapshot_stage_manifest(table, stage_scope, schema_id)
             if manifest is None or int(manifest["snapshot_lsn"]) != snapshot_lsn:
                 return None
+            self._note_moved_rows(table, stage_scope, schema_id, manifest)
             page_count = int(manifest["page_count"])
             if start_page < 0 or start_page >= page_count:
                 return None
             end_page = min(start_page + self._partitioned_pages_per_batch(), page_count)
             return (stage_scope, schema_id, snapshot_lsn, start_page, end_page, page_count)
+
+        def _note_moved_rows(
+            self, table: Table, scope: str, schema_id: str, manifest: dict[str, Any]
+        ) -> dict[str, Any] | None:
+            # Docstring: Keep, for the page descriptors, what a snapshot's manifest records of
+            # the rows its index-ordered scan read again (see _index_scan_snapshot); returns it.
+            #
+            # Every way a batch of staged pages comes about has just read the manifest, so
+            # planning the batch's descriptors need not read it once more.
+            moved = (manifest.get("index_scan") or {}).get("moved")
+            self.__dict__.setdefault("_moved_rows", {})[
+                (table.identity, scope, schema_id, int(manifest["snapshot_lsn"]))
+            ] = moved
+            return moved
 
         def _bootstrap_page_batch(
             self, table: Table, effective_start: dict, end_offset: dict, table_options: dict[str, str]
@@ -15096,6 +15278,7 @@ def register_lakeflow_source(spark):
             manifest = self._read_snapshot_stage_manifest(table, scope, schema_id)
             if manifest is None or int(manifest["snapshot_lsn"]) != lsn:
                 return None
+            self._note_moved_rows(table, scope, schema_id, manifest)
             page_count = int(manifest["page_count"])
             # A snapshot-phase end leaves pages to serve; a stream end served the only page, or
             # none for an empty table. Recognising that here keeps a re-plan in a later update
@@ -15278,7 +15461,7 @@ def register_lakeflow_source(spark):
                 )
                 if expected_fingerprint is not None:
                     end["schema_fingerprint"] = expected_fingerprint
-                return end
+                return self._naming_scan(end, table, stage_scope, schema_id)
             # Non-terminal: last_pk is the boundary page's upper_pk. Read only that one
             # page's header; its row generator is discarded, so no rows are decoded.
             header, _rows = self._stream_staged_page(
@@ -15390,19 +15573,37 @@ def register_lakeflow_source(spark):
                     snapshot_lsn
                 ):
                     end_page = min(int(logged.get("page_index", end_page)), page_count)
-                return [
-                    {
-                        "kind": "page",
-                        "native_identity": table.native_identity,
-                        "exposed_name": table.exposed_name,
-                        "pipeline_scope": scope,
-                        "schema_id": schema_id,
-                        "snapshot_lsn": snapshot_lsn,
-                        "page_index": page_index,
-                        **self._transform_descriptor_fields(table),
-                    }
-                    for page_index in range(start_page, end_page)
-                ]
+                # The rows an index-ordered scan read again are left out of the pages: an
+                # executor has no manifest, so a page's descriptor names those it leaves out.
+                noted = self.__dict__.get("_moved_rows", {})
+                lookup = (table.identity, scope, schema_id, int(snapshot_lsn))
+                if lookup in noted:
+                    moved = noted[lookup]
+                else:
+                    # A batch whose manifest was read elsewhere: read it here. Without it
+                    # the pages cannot be told to leave their moved rows out.
+                    manifest = self._read_snapshot_stage_manifest(table, scope, schema_id)
+                    if manifest is None or int(manifest["snapshot_lsn"]) != int(snapshot_lsn):
+                        # 228: Invalid staged snapshot manifest for '{}'
+                        raise InformixError(_m(228, table.exposed_name))
+                    moved = self._note_moved_rows(table, scope, schema_id, manifest)
+                descriptors = []
+                for page_index in range(start_page, end_page):
+                    left_out = _moved_rows_of_page(moved, page_index)
+                    descriptors.append(
+                        {
+                            "kind": "page",
+                            "native_identity": table.native_identity,
+                            "exposed_name": table.exposed_name,
+                            "pipeline_scope": scope,
+                            "schema_id": schema_id,
+                            "snapshot_lsn": snapshot_lsn,
+                            "page_index": page_index,
+                            **({"moved": left_out} if left_out else {}),
+                            **self._transform_descriptor_fields(table),
+                        }
+                    )
+                return descriptors
             return None
 
         def get_partitions(
@@ -15564,7 +15765,7 @@ def register_lakeflow_source(spark):
                     int(partition["snapshot_lsn"]),
                     int(partition["page_index"]),
                 )
-                yield from rows
+                yield from _without_moved_rows(rows, partition.get("moved"))
                 return
             if kind == "unl_split":
                 # Executor side: read one `.unl` byte split by descriptor only -- no Table
@@ -17429,8 +17630,6 @@ def register_lakeflow_source(spark):
                 token,
                 pipeline_id,
                 lifetime_seconds=lifetime,
-                secret_scope=_SNAPSHOT_STAGING_SECRET_SCOPE,
-                secret_key=pipeline_id,
                 update_id=update_id.strip(),
             )
 
@@ -18054,6 +18253,14 @@ def register_lakeflow_source(spark):
                     raise InformixError(_m(231, table.exposed_name))
                 return header, rows
 
+            # An index-ordered scan of a table keyed by primary.keys leaves the rows that
+            # changed index value during it out of the pages, and reads them once more into a
+            # page of their own (see _index_scan_snapshot).
+            moved = self._note_moved_rows(table, stage_scope, schema_id, manifest)
+
+            def unmoved(rows: Iterator[dict[str, Any]]) -> Iterator[dict[str, Any]]:
+                return _without_moved_rows(rows, _moved_rows_of_page(moved, page_index))
+
             if self._defer_staged_rows and page_index == 0:
                 # The caller (the partitioned reader's first microbatch, or a drain worker)
                 # needs only the end offset; page 0 is read here only if its rows are iterated
@@ -18068,10 +18275,12 @@ def register_lakeflow_source(spark):
                 else:
                     header = read_page()[0]
                 rows = _DeferredStagedPage(
-                    lambda: read_page()[1], (stage_scope, schema_id, snapshot_lsn, 0, 1, page_count)
+                    lambda: unmoved(read_page()[1]),
+                    (stage_scope, schema_id, snapshot_lsn, 0, 1, page_count),
                 )
             else:
                 header, rows = read_page()
+                rows = unmoved(rows)
             # The shared reader replays a batch from its start offset. Receiving
             # page_index=N as that start means Spark has advanced beyond every page
             # below N; retries continue from N, so those earlier immutable pages are
@@ -18126,7 +18335,33 @@ def register_lakeflow_source(spark):
                     schema_id,
                     pipeline_scope,
                 )
+                end = self._naming_scan(end, table, stage_scope, schema_id, manifest)
             return rows, end
+
+        def _naming_scan(
+            self,
+            end: dict[str, Any],
+            table: Table,
+            stage_scope: str,
+            schema_id: str,
+            manifest: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            # Docstring: The stream offset a snapshot ends on, naming the scope its pages were
+            # staged under when it was an index-ordered scan the stream has changes to drop
+            # for.
+            #
+            # The scan's manifest stays under that scope, and the stream needs it until it is
+            # past the scan's end (see _read_stream, which keeps the name until then). An
+            # offset without the name loses it when the flow's scope changes before the
+            # stream's first read: a table.migration relocation, whether it serves the pages
+            # itself or takes the table over right after them, looks for the manifest under
+            # its own scope, finds none and replays the changes the pages hold, and the
+            # cleanup of earlier scopes removes the manifest.
+            if manifest is None:
+                manifest = self._read_snapshot_stage_manifest(table, stage_scope, schema_id)
+            if manifest and manifest.get("index_scan"):
+                end["scan_scope"], end["scan_schema"] = stage_scope, schema_id
+            return end
 
         def _incremental_datetime_chunk_exprs(
             self, table: Table, options: dict[str, str]
@@ -18145,13 +18380,17 @@ def register_lakeflow_source(spark):
 
             if any(
                 column.name in table.primary_keys
-                and (column.type_name == "INTERVAL" or column.type_name in _FLOAT_KEY_TYPES)
+                and (
+                    column.type_name == "INTERVAL"
+                    or column.type_name in _FLOAT_KEY_TYPES
+                    or column.type_name in _BOOLEAN_KEY_TYPES
+                )
                 for column in table.columns
             ):
                 # An INTERVAL key has no order-preserving string cast (a sign and an
-                # unpadded leading field), and a float key has no exact literal for the keyset
-                # bound, so either is copied by the blocking snapshot, whose positional paging
-                # never renders a key back into SQL.
+                # unpadded leading field), a float key has no exact literal for the keyset
+                # bound, and a BOOLEAN key has no order, so each is copied by the blocking
+                # snapshot, whose positional paging never renders a key back into SQL.
                 return {}, False
             datetime_keys = [
                 column
@@ -18817,15 +19056,21 @@ def register_lakeflow_source(spark):
                     page_count = int(manifest["page_count"])
                     if page_count == 0:
                         snapshot_lsn = int(manifest["snapshot_lsn"])
-                        return iter(()), _offset(
-                            snapshot_lsn,
-                            snapshot_lsn,
-                            snapshot_lsn,
-                            None,
-                            "stream",
+                        return iter(()), self._naming_scan(
+                            _offset(
+                                snapshot_lsn,
+                                snapshot_lsn,
+                                snapshot_lsn,
+                                None,
+                                "stream",
+                                table,
+                                schema_id,
+                                pipeline_scope,
+                            ),
                             table,
-                            schema_id,
                             pipeline_scope,
+                            schema_id,
+                            manifest,
                         )
                     return self._staged_snapshot_result(table, pipeline_scope, schema_id, manifest, 0)
                 if not self._is_snapshot_drain_worker():
@@ -18842,15 +19087,21 @@ def register_lakeflow_source(spark):
                     page_count = int(manifest["page_count"])
                     if page_count == 0:
                         snapshot_lsn = int(manifest["snapshot_lsn"])
-                        return iter(()), _offset(
-                            snapshot_lsn,
-                            snapshot_lsn,
-                            snapshot_lsn,
-                            None,
-                            "stream",
+                        return iter(()), self._naming_scan(
+                            _offset(
+                                snapshot_lsn,
+                                snapshot_lsn,
+                                snapshot_lsn,
+                                None,
+                                "stream",
+                                table,
+                                schema_id,
+                                pipeline_scope,
+                            ),
                             table,
-                            schema_id,
                             pipeline_scope,
+                            schema_id,
+                            manifest,
                         )
                     return self._staged_snapshot_result(table, pipeline_scope, schema_id, manifest, 0)
                 # A drain worker drains inline below, on the slot floor of its band.
@@ -18991,6 +19242,13 @@ def register_lakeflow_source(spark):
                             page_consumer=page_consumer,
                             snapshot_filter=_snapshot_predicate(_snapshot_filter(options), table),
                             isolation=self._snapshot_isolation(options),
+                            # A key index with a descending column: each page in its order.
+                            **(
+                                {"key_descending": list(table.key_descending)}
+                                if any(table.key_descending)
+                                and list(scan_keys) == list(table.primary_keys)
+                                else {}
+                            ),
                         )
                     )
                     if pipeline is not None:
@@ -19047,15 +19305,21 @@ def register_lakeflow_source(spark):
                     scanned,
                 )
                 if page_count == 0:
-                    return iter(()), _offset(
-                        snapshot_lsn,
-                        snapshot_lsn,
-                        snapshot_lsn,
-                        None,
-                        "stream",
+                    return iter(()), self._naming_scan(
+                        _offset(
+                            snapshot_lsn,
+                            snapshot_lsn,
+                            snapshot_lsn,
+                            None,
+                            "stream",
+                            table,
+                            schema_id,
+                            pipeline_scope,
+                        ),
                         table,
-                        schema_id,
                         pipeline_scope,
+                        schema_id,
+                        manifest,
                     )
                 return self._staged_snapshot_result(table, pipeline_scope, schema_id, manifest, 0)
 
@@ -19088,11 +19352,18 @@ def register_lakeflow_source(spark):
             # Whether the scan will follow the table's changes (see _index_scan_snapshot): only
             # then does buffered logging matter, or a fallback leave an overlap to warn of.
             follows = not table.primary_keys or self._append_only_table(table, options)
-            listed = indexes(table.identity) if callable(indexes) else []
+            listed = (
+                indexes(table.identity)  # pylint: disable=not-callable
+                if callable(indexes)
+                else []
+            )
+            # Not a DECIMAL(p) with no scale: it is staged as decimal.variable.type shapes it
+            # (a string, a double), and the scan compares staged rows with rows as read.
             usable = {
                 column.name.lower(): column.name
                 for column in table.columns
                 if column.type_name in _INDEX_SCAN_KEY_TYPES
+                and not _is_variable_scale_decimal(column)
             }
             chosen = None
             if named:
@@ -19461,7 +19732,7 @@ def register_lakeflow_source(spark):
             start = last_commit = boundary
             begin, noted = progress or (None, None)
             if begin is not None and not resume:
-                begin(boundary)
+                begin(boundary)  # pylint: disable=not-callable
 
             def note(bound, before, after, staged, count, at) -> None:
                 # Record a page read, for a restart to go on after it.
@@ -19495,6 +19766,17 @@ def register_lakeflow_source(spark):
             # The changes settled, by their own positions: those the scan saw, and all of them.
             suppress: list[int] = []
             decided: list[int] = []
+            # The rows of a table keyed by primary.keys that changed index value during the
+            # scan, by an UPDATE or by a DELETE and an INSERT of the same key. By key: the
+            # row's last image (None once deleted), the commits that changed it since, and
+            # the index values it has had, under which the pages may hold it. The pages can
+            # hold such a row under both index values, or a later change to it under the new
+            # one, so every copy is left out of them and the row is read once more at the
+            # end, into a page of its own (``repair``).
+            relocated: dict[str, list] = {}
+            # The index values every changed row of such a table has had since the snapshot
+            # LSN, by key. A second one makes the row one of those above.
+            had: dict[str, set] = {}
             # Each page read, in scan order: its last key's order (None for the last page), the
             # positions before and after its read, and its staged page's index (None if empty).
             pages: list[tuple[tuple | None, int, int, int | None]] = []
@@ -19550,20 +19832,54 @@ def register_lakeflow_source(spark):
                                 raise InformixError(_m(433, "TRUNCATE", table.exposed_name))
                             before = record.get("before", record.get("row") if op == "DELETE" else None)
                             after = record.get("after", record.get("row") if op == "INSERT" else None)
-                            if None not in (before, after) and _index_scan_key(
+                            # An UPDATE that changes an index value takes a row out of one key
+                            # and puts one into another, and each key's page holds its half or
+                            # does not: a delete under the old key, named by the before-image's
+                            # own position, and an insert under the new one.
+                            moved = None not in (before, after) and _index_scan_key(
                                 before, keys
-                            ) != _index_scan_key(after, keys):
-                                # 433: The index-ordered snapshot of a
-                                # keyless table does not support {} on
-                                # '{}'; set snapshot.scan=cursor to read
-                                # the table without index order
-                                raise InformixError(
-                                    _m(
-                                        433,
-                                        "an UPDATE of an index column during it",
-                                        table.exposed_name,
-                                    )
-                                )
+                            ) != _index_scan_key(after, keys)
+                            named = [None, None]
+                            if table.primary_keys:
+                                named = [
+                                    None if row is None else _index_scan_row_key(row, table, options)
+                                    for row in (before, after)
+                                ]
+                                for name, row, image in zip(named, (None, after), (before, after)):
+                                    if name is None:
+                                        continue
+                                    if name not in had and len(had) >= _INDEX_SCAN_TRACKED_ROWS:
+                                        # 433: The index-ordered snapshot of a
+                                        # keyless table does not support {} on
+                                        # '{}'; set snapshot.scan=cursor to read
+                                        # the table without index order
+                                        raise InformixError(
+                                            _m(
+                                                433,
+                                                f"more than {_INDEX_SCAN_TRACKED_ROWS} rows "
+                                                "changing during it, for a table keyed by "
+                                                "primary.keys,",
+                                                table.exposed_name,
+                                            )
+                                        )
+                                    seen = had.setdefault(name, set())
+                                    seen.add(_index_scan_key(image, keys))
+                                    # Under a second index value, by an UPDATE or by a DELETE
+                                    # and an INSERT of the same key: read again at the end.
+                                    if len(seen) > 1 and name not in relocated:
+                                        if len(relocated) >= _INDEX_SCAN_MOVED_ROWS:
+                                            # 442: The index-ordered snapshot of
+                                            # '{}' found more than {} rows changing
+                                            # index value during it; run the
+                                            # snapshot when the table is quieter, or
+                                            # set snapshot.scan=cursor
+                                            raise InformixError(
+                                                _m(442, table.exposed_name, _INDEX_SCAN_MOVED_ROWS)
+                                            )
+                                        relocated[name] = [None, [], seen]
+                                    if name in relocated:
+                                        relocated[name][0] = row
+                                        relocated[name][1].append(tx.commit_lsn)
                             for row, sign in ((before, -1), (after, 1)):
                                 if row is not None:
                                     key = _index_scan_key(row, keys)
@@ -19572,9 +19888,10 @@ def register_lakeflow_source(spark):
                                             tx.commit_lsn,
                                             sign,
                                             token(row),
-                                            _lsn(record),
-                                            op,
+                                            _before_lsn(record) if moved and sign < 0 else _lsn(record),
+                                            ("DELETE" if sign < 0 else "INSERT") if moved else op,
                                             tx.commit_time,
+                                            named[sign > 0],
                                         )
                                     )
                                     if key not in doubt and key not in raw:
@@ -19598,6 +19915,10 @@ def register_lakeflow_source(spark):
                         # changes faster than its changes are read
                         raise InformixError(_m(435, table.exposed_name, _INDEX_SCAN_FOLLOW_SECONDS))
                 for key, changed in fresh.items():
+                    # A row read again at the end is in no page: its changes settle no key.
+                    changed = [event for event in changed if event[6] not in relocated]
+                    if not changed:
+                        continue
                     if key in settled:
                         # A change the key's last read may have held, handed over only now:
                         # the key was settled without it. One the source's clock puts after
@@ -19805,19 +20126,123 @@ def register_lakeflow_source(spark):
             # checkpoint, so the wait is bounded; a change it misses then is one the stream
             # fails on.
             follow(bridge.current_lsn(), proof=True)
-            for _attempt in range(_INDEX_SCAN_SETTLE_ATTEMPTS):
+            # The rows of ``relocated`` read again, by key: the follower's last commit before
+            # the row's read, the position after it, the rows found, and whether the row was
+            # there to find.
+            repair: dict[str, tuple[int, int, list, bool]] = {}
+
+            def unrepaired() -> list[str]:
+                # The rows not read again yet, or changed between the positions of their read.
+                return [
+                    name
+                    for name, (_image, commits, _had) in relocated.items()
+                    if name not in repair
+                    or any(repair[name][0] < commit <= repair[name][1] for commit in commits)
+                    # Not found where its last change left it, or found twice: a change the
+                    # follower has not been handed yet may explain it.
+                    or len(repair[name][2]) != repair[name][3]
+                ]
+
+            # The keys in doubt and the rows read again each get their own number of reads.
+            key_reads = row_reads = 0
+            while True:
                 if not doubt:
+                    again = unrepaired()
+                    if not again or row_reads >= _INDEX_SCAN_ROW_READS:
+                        break
+                    row_reads += 1
+                    # Each row is where its last change left it. A change the follower did
+                    # not hold yet shows in the poll after the read, and that row is read
+                    # once more; the others' reads stand.
+                    held_before = last_commit
+                    # By its index value and its key together, so that the index finds the
+                    # row and nothing else of that value is read; by the index value alone
+                    # when a key column is of a type the scan does not compare. Whatever a
+                    # read returns, a row counts only under its own key.
+                    # Nor a DECIMAL(p) with no scale: its packed value has no literal Informix
+                    # takes (0 is 0E-134, which written out is longer than a number may be).
+                    comparable = all(
+                        column.type_name in _INDEX_SCAN_KEY_TYPES
+                        and not _is_variable_scale_decimal(column)
+                        for column in table.columns
+                        if column.name in table.primary_keys
+                    )
+                    columns = list(dict.fromkeys([*keys, *(table.primary_keys if comparable else ())]))
+                    found: dict[str, list] = {name: [] for name in again}
+                    # Each set of values once: two rows can share an index value.
+                    lookups = list(
+                        dict.fromkeys(
+                            tuple(relocated[name][0][column] for column in columns)
+                            for name in again
+                            if relocated[name][0] is not None
+                        )
+                    )
+                    # A query for many rows when each is found by its key; one at a time when
+                    # only its index value leads to it, which can hold many rows.
+                    size = _INDEX_SCAN_LOOKUP_ROWS if comparable else 1
+                    queries: list[tuple[list[str], list[tuple]]] = []
+                    room = 0
+                    for values in lookups:
+                        length = sum(
+                            len(str(value)) + len(column) + 8 for value, column in zip(values, columns)
+                        )
+                        if length > _INDEX_SCAN_LOOKUP_CHARS:
+                            # Too long to send whole: its index value alone finds the row.
+                            queries.append((list(keys), [values[: len(keys)]]))
+                            room = 0
+                            continue
+                        if not room or length > room or len(queries[-1][1]) >= size:
+                            queries.append((columns, []))
+                            room = _INDEX_SCAN_LOOKUP_CHARS
+                        queries[-1][1].append(values)
+                        room -= length
+                    filled: set[str] = set()
+                    for by, value_sets in queries:
+                        batch: dict[str, list] = {}
+                        for row in bridge.rows_by_values(
+                            table.identity,
+                            names,
+                            by,
+                            value_sets,
+                            isolation,
+                            _INDEX_SCAN_KEY_ROWS + 1,
+                        ):
+                            batch.setdefault(_index_scan_row_key(row, table, options), []).append(row)
+                        for name, rows_found in batch.items():
+                            # Informix compares character values without their trailing
+                            # spaces, so a later query can return a row an earlier one did.
+                            if name in found and name not in filled:
+                                found[name] = rows_found
+                        filled.update(batch)
+                        if self._drain_progress is not None:
+                            # The reader is not hung while these go on.
+                            self._drain_progress()
+                    read_after = bridge.current_lsn()
+                    for name in again:
+                        repair[name] = (
+                            held_before,
+                            read_after,
+                            found[name],
+                            relocated[name][0] is not None,
+                        )
+                    follow(read_after, proof=True)
+                    continue
+                if key_reads >= _INDEX_SCAN_SETTLE_ATTEMPTS:
                     break
+                key_reads += 1
                 before = max(bridge.boundary_lsn(), last_commit)
                 read = {
-                    key: collections.Counter(
-                        token(row)
+                    key: [
+                        (
+                            token(row),
+                            _index_scan_row_key(row, table, options) if table.primary_keys else None,
+                        )
                         for row in (
                             null_rows()
                             if values is None
                             else bridge.key_rows(table.identity, names, keys, values, isolation)
                         )
-                    )
+                    ]
                     for key, values in doubt.items()
                 }
                 after = bridge.current_lsn()
@@ -19825,11 +20250,16 @@ def register_lakeflow_source(spark):
                 # As at the scan's end: the wait for proof is bounded, and a change it misses
                 # is one the scan or the stream fails on.
                 follow(after, proof=True)
-                for key, state in read.items():
-                    changed = events[key]
+                for key, found in read.items():
+                    # The rows read again at the end take no part: they are left out of the
+                    # pages, and of what this key holds and how it changed.
+                    state = collections.Counter(
+                        shaped for shaped, name in found if name not in relocated
+                    )
+                    changed = [event for event in events[key] if event[6] not in relocated]
                     if any(before < event[0] <= after for event in changed):
                         continue
-                    _bound, read_before, read_after, index = pages[
+                    _bound, read_before, read_after, staged_at = pages[
                         bisect.bisect_left(bounds, _index_scan_order(key, descending))
                     ]
                     unsure = [event for event in changed if event[0] <= read_after]
@@ -19837,8 +20267,12 @@ def register_lakeflow_source(spark):
                     # change since its read began: the net of the unsure changes the scan saw.
                     saw = collections.Counter(
                         json.dumps({name: row[name] for name in names}, sort_keys=True, default=str)
-                        for row in (() if index is None else staged_rows(boundary, index))
+                        for row in (() if staged_at is None else staged_rows(boundary, staged_at))
                         if _index_scan_key(row, keys) == key
+                        and not (
+                            relocated
+                            and _index_scan_staged_key(row, table.primary_keys) in relocated
+                        )
                     )
                     saw.subtract(state)
                     for event in changed:
@@ -19883,6 +20317,52 @@ def register_lakeflow_source(spark):
                 raise InformixError(
                     _m(434, len(doubt), table.exposed_name, _INDEX_SCAN_SETTLE_ATTEMPTS)
                 )
+            if unrepaired():
+                amiss = [
+                    name
+                    for name, read in repair.items()
+                    if len(read[2]) != read[3]
+                    and not any(read[0] < commit <= read[1] for commit in relocated[name][1])
+                ]
+                if amiss:
+                    # Unchanged during its last read and still not found where its last
+                    # change left it, or found twice: its copies are left out of the pages,
+                    # so the row would be lost or doubled.
+                    # 444: The index-ordered snapshot of '{}' could not read again, each by
+                    # its index and key values, the {} row(s) that changed index value during
+                    # it; set snapshot.scan=cursor to read the table without index order
+                    raise InformixError(_m(444, table.exposed_name, len(amiss)))
+                # 443: The index-ordered snapshot could not settle the {} row(s) of '{}'
+                # that changed index value during it after {} re-reads because they kept
+                # changing; run the snapshot when the table is quieter, or set
+                # snapshot.scan=cursor
+                raise InformixError(
+                    _m(443, len(unrepaired()), table.exposed_name, _INDEX_SCAN_ROW_READS)
+                )
+            moved_rows = None
+            if relocated:
+                # Not counted against snapshot.max.rows again: the pages counted these rows.
+                found_rows = [row for _held, _after, rows, _there in repair.values() for row in rows]
+                if found_rows:
+                    stage_page(boundary, staged_pages, found_rows)
+                # Each row is left out of the pages read under an index value it has had.
+                by_page: dict[str, list[str]] = {}
+                for name, (_image, _commits, values_had) in sorted(relocated.items()):
+                    for staged_at in {
+                        pages[bisect.bisect_left(bounds, _index_scan_order(key, descending))][3]
+                        for key in values_had
+                    } - {None}:
+                        by_page.setdefault(str(staged_at), []).append(name)
+                moved_rows = {
+                    "keys": list(table.primary_keys),
+                    # Each row with the positions of its read: a change to it is in the page
+                    # that holds the row now if the follower held it before the read, and none
+                    # committed between that and the position after it.
+                    "rows": {name: [repair[name][0], repair[name][1]] for name in sorted(repair)},
+                    # The pages each row is left out of, and the page that holds them now.
+                    "pages": by_page,
+                    "page": staged_pages if found_rows else None,
+                }
             scan["index_scan"] = follows and {
                 "keys": list(keys),
                 "descending": list(descending),
@@ -19903,7 +20383,9 @@ def register_lakeflow_source(spark):
                 "end": max(
                     [after for _bound, _before, after, _index in pages]
                     + [position for position, _clock in settled.values()]
+                    + ([after for _held, after in moved_rows["rows"].values()] if moved_rows else [])
                 ),
+                "moved": moved_rows,
                 "suppress": sorted(set(suppress)),
                 "keep": sorted(set(decided) - set(suppress)),
                 # A settled key's read went on until this position: its window ends there.
@@ -19935,6 +20417,8 @@ def register_lakeflow_source(spark):
             if (table.primary_keys and not table.key_only_from_option) or self._snapshot_cursor_scan(
                 options
             ):
+                # No scan to be within: an offset stops naming one (see _read_stream).
+                self.__dict__.setdefault("_index_scan_live", {})[table.identity] = None
                 return transactions
             scope = checkpoint.get("scan_scope") or self._offset_scopes(checkpoint)[1]
             schema_id = str(checkpoint.get("scan_schema") or checkpoint.get("schema_id"))
@@ -19962,17 +20446,74 @@ def register_lakeflow_source(spark):
                         tuple(_decode_snapshot_stage_value(key)): int(position)
                         for key, position in recorded.get("settled", ())
                     },
+                    recorded.get("moved"),
+                    (recorded.get("moved") or {}).get("rows") or {},
                 )
             live = self.__dict__.setdefault("_index_scan_live", {})
             if not cache[cached]:
                 live[table.identity] = None
                 return transactions
-            keys, descending, bounds, reads, end, suppress, keep, finished, settled = cache[cached]
+            (
+                keys,
+                descending,
+                bounds,
+                reads,
+                end,
+                suppress,
+                keep,
+                finished,
+                settled,
+                moved,
+                relocated,
+            ) = cache[cached]
             # A poll that went idle past the scan's end with nothing at or below it has seen the
             # last change the scan could hold: a quiet table's offset stays where it is, and
             # would name the snapshot's update for good.
             past = (reached or 0) > end and all(tx.commit_lsn > end for tx in transactions)
             live[table.identity] = None if past else (scope, schema_id, end)
+
+            def held(tx, row, lsn) -> bool:
+                # Whether the scan's pages hold the change to ``row`` named by ``lsn``.
+                window = relocated and relocated.get(
+                    _index_scan_row_key(row, table, options, moved["keys"])
+                )
+                if window:
+                    # A row read again at the scan's end, into the page that holds it now:
+                    # that page has what the follower held before the row's read.
+                    if tx.commit_lsn <= window[0]:
+                        return True
+                    if tx.commit_lsn <= window[1] and not (
+                        finished and tx.commit_time and tx.commit_time > finished
+                    ):
+                        # 438: A change to keyless table '{}' committed
+                        # while its snapshot was reading the rows it
+                        # applies to, and reached Informix CDC only after
+                        # the snapshot was staged, so the change log may
+                        # hold it twice or not at all; run a full refresh
+                        raise InformixError(_m(438, table.exposed_name))
+                    return False
+                key = _index_scan_key(row, keys)
+                order = _index_scan_order(key, descending)
+                before, after = reads[bisect.bisect_left(bounds, order)]
+                after = max(after, settled.get(key, 0))
+                if lsn in suppress or tx.commit_lsn <= before:
+                    return True
+                # In the read's window and not settled: the scan's follower never got
+                # it. By the clock it may still have committed after the scan, on the
+                # log page the scan ended on.
+                if (
+                    tx.commit_lsn <= after
+                    and lsn not in keep
+                    and not (finished and tx.commit_time and tx.commit_time > finished)
+                ):
+                    # 438: A change to keyless table '{}' committed
+                    # while its snapshot was reading the rows it
+                    # applies to, and reached Informix CDC only after
+                    # the snapshot was staged, so the change log may
+                    # hold it twice or not at all; run a full refresh
+                    raise InformixError(_m(438, table.exposed_name))
+                return False
+
             kept = []
             for tx in transactions:
                 if tx.commit_lsn > end:
@@ -19985,34 +20526,55 @@ def register_lakeflow_source(spark):
                     raise InformixError(
                         _m(433, "a transaction over cdc.spill.records during it", table.exposed_name)
                     )
-                records = []
+
+                records, halved = [], False
                 for record in tx.records:
-                    row = record.get("after") or record.get("row") or record.get("before")
-                    if row is not None:
-                        key = _index_scan_key(row, keys)
-                        order = _index_scan_order(key, descending)
-                        before, after = reads[bisect.bisect_left(bounds, order)]
-                        after = max(after, settled.get(key, 0))
-                        lsn = _lsn(record)
-                        if lsn in suppress or tx.commit_lsn <= before:
-                            continue
-                        # In the read's window and not settled: the scan's follower never got
-                        # it. By the clock it may still have committed after the scan, on the
-                        # log page the scan ended on.
+                    old, new = record.get("before"), record.get("after")
+                    if None not in (old, new):
+                        # An UPDATE that changed an index value took its row out of one key
+                        # and put it into another, and the scan can hold either half without
+                        # the other: the before-image is then named by its own position. The
+                        # half the pages do not hold goes on alone, as the DELETE or the
+                        # INSERT it is to that key.
+                        same = _index_scan_key(old, keys) == _index_scan_key(new, keys)
+                        gone = held(tx, old, _lsn(record) if same else _before_lsn(record))
+                        come = held(tx, new, _lsn(record))
                         if (
-                            tx.commit_lsn <= after
-                            and lsn not in keep
-                            and not (finished and tx.commit_time and tx.commit_time > finished)
+                            gone != come
+                            and table.primary_keys
+                            and _index_scan_row_key(old, table, options)
+                            == _index_scan_row_key(new, table, options)
                         ):
+                            # One row by primary.keys cannot take a half. The scan reads
+                            # such a row again, so this is an UPDATE its follower never got.
                             # 438: A change to keyless table '{}' committed
                             # while its snapshot was reading the rows it
                             # applies to, and reached Informix CDC only after
                             # the snapshot was staged, so the change log may
                             # hold it twice or not at all; run a full refresh
                             raise InformixError(_m(438, table.exposed_name))
+                        if gone or come:
+                            if not (gone and come):
+                                half = {
+                                    name: value
+                                    for name, value in record.items()
+                                    if name not in {"before", "after", "before_lsn"}
+                                }
+                                if gone:
+                                    half.update(op="INSERT", row=new)
+                                else:
+                                    half.update(op="DELETE", row=old, lsn=_before_lsn(record))
+                                records.append(half)
+                                halved = True
+                            continue
+                    else:
+                        row = new or record.get("row") or old
+                        if row is not None and held(tx, row, _lsn(record)):
+                            continue
                     records.append(record)
                 records = tuple(records)
-                kept.append(tx if len(records) == len(tx.records) else replace(tx, records=records))
+                whole = len(records) == len(tx.records) and not halved
+                kept.append(tx if whole else replace(tx, records=records))
             return kept
 
         @staticmethod
@@ -24120,7 +24682,12 @@ def register_lakeflow_source(spark):
     # snapshot pages them by position instead: partial DATETIME and INTERVAL literals don't
     # all parse back, and a float has no exact decimal literal (nor any rendering at all).
     _FLOAT_KEY_TYPES = frozenset({"FLOAT", "SMALLFLOAT"})
-    _LITERAL_UNSAFE_KEY_TYPES = frozenset({"DATETIME", "INTERVAL", *_FLOAT_KEY_TYPES})
+    # A BOOLEAN has no order to page by: Informix compares it for equality only, and its
+    # literals are 't' and 'f', which a bound value is not rendered as.
+    _BOOLEAN_KEY_TYPES = frozenset({"BOOLEAN", "BOOL"})
+    _LITERAL_UNSAFE_KEY_TYPES = frozenset(
+        {"DATETIME", "INTERVAL", *_FLOAT_KEY_TYPES, *_BOOLEAN_KEY_TYPES}
+    )
 
 
     def _datetime_qualifier_supported(qualifier: int) -> bool:
@@ -24629,7 +25196,15 @@ def register_lakeflow_source(spark):
                 # 355: column '{}' value {!r} is not a valid decimal
                 raise InformixError(_m(355, column.name, value)) from error
         if kind == "string":
-            return format(value, "f")
+            # The packed form keeps the zeros of its unused base-100 digits (0 arrives as
+            # 0E-134, 5 as 5.0000): the text is the number without them. A zero is "0"
+            # whatever its sign, and the default context's 28 digits would round a
+            # DECIMAL(32).
+            if not value:
+                return "0"
+            with localcontext() as decimal_context:
+                decimal_context.prec = 80
+                return format(value.normalize(), "f")
         if kind == "double":
             return float(value)
         if kind == "integer":
@@ -24642,7 +25217,11 @@ def register_lakeflow_source(spark):
         # decimal(p,s): quantize to the target scale and confirm it fits precision.
         quantum = Decimal(1).scaleb(-(scale or 0))
         try:
-            quantized = value.quantize(quantum, rounding=ROUND_DOWN)
+            # Not under the default context: its 28 digits cannot hold eleven integer digits
+            # at scale 18, which decimal(38,18) can.
+            with localcontext() as decimal_context:
+                decimal_context.prec = 80
+                quantized = value.quantize(quantum, rounding=ROUND_DOWN)
         except InvalidOperation as error:
             # 357: column '{}' value {} cannot be represented as decimal({},{})
             raise InformixError(_m(357, column.name, (format(value, "f")), precision, scale)) from error
@@ -26210,6 +26789,18 @@ def register_lakeflow_source(spark):
             if phase != "snapshot":
                 # 396: Informix offset stage_scope requires the snapshot phase
                 raise ValueError(_m(396))
+        # scan_scope and scan_schema name the update whose index-ordered scan the stream is
+        # still within: they lead to that scan's manifest, so both must be well formed.
+        scan_scope, scan_schema = result.get("scan_scope"), result.get("scan_schema")
+        if (scan_scope is not None or scan_schema is not None) and not (
+            isinstance(scan_scope, str)
+            and _PIPELINE_SCOPE.fullmatch(scan_scope) is not None
+            and isinstance(scan_schema, str)
+            and re.fullmatch(r"[0-9a-f]{32}", scan_schema)
+        ):
+            # 445: Informix offset has an invalid scan_scope or scan_schema; run a full
+            # refresh with this connector version
+            raise ValueError(_m(445))
         trigger_generation = result.get("trigger_generation")
         if trigger_generation is not None and (
             not isinstance(trigger_generation, str)

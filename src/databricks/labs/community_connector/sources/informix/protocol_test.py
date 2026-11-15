@@ -145,6 +145,14 @@ class FrameTests(unittest.TestCase):
             decode_value(memoryview(b"\x00\x01\x01"), ColumnDescriptor("v", "LVARCHAR")),
             (None, 3),
         )
+        column = ColumnDescriptor("v", "LVARCHAR")
+        self.assertEqual(decode_value(memoryview(b"\x00\x01\x00"), column), ("", 3))
+        self.assertEqual(decode_value(memoryview(b"\x00\x03\x00ab"), column), ("ab", 5))
+        # Frames no LVARCHAR has: no room for the flag, a NULL with a payload, and an
+        # unknown flag on a value with none.
+        for frame in (b"\x00\x00\x00", b"\x00\x03\x01ab", b"\x00\x01\x07"):
+            with self.assertRaises(CdcProtocolError):
+                decode_value(memoryview(frame), column)
         self.assertEqual(
             decode_value(memoryview(b"\x01\x00"), ColumnDescriptor("v", "VARCHAR")),
             (None, 2),
@@ -557,6 +565,13 @@ class SqliPacketTests(unittest.TestCase):
             client.execute("/* mutation */\n-- owned SQL\nUPDATE t SET value = ?", (1,))
         execute_command.assert_called_once_with(
             "/* mutation */\n-- owned SQL\nUPDATE t SET value = 1"
+        )
+
+    def test_connector_sql_renders_a_boolean_as_its_informix_literal(self):
+        # Informix has no cast from an integer to a BOOLEAN: its literals are 't' and 'f'.
+        self.assertEqual(
+            _connector_sql("SELECT * FROM t WHERE a = ? AND b = ? AND n = ?", (True, False, 1)),
+            "SELECT * FROM t WHERE a = 't' AND b = 'f' AND n = 1",
         )
 
     def test_connector_sql_ignores_question_marks_in_literals_and_comments(self):

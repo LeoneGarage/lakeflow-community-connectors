@@ -65,6 +65,9 @@ if "pyspark.sql.types" not in sys.modules:
         pass
 
     sql.Row = Row
+    # The connector's package registers its data source through the framework, which
+    # imports the session class by name.
+    sql.SparkSession = type("SparkSession", (), {"getActiveSession": staticmethod(lambda: None)})
     for name in (
         "DataSource",
         "DataSourceReader",
@@ -614,9 +617,19 @@ class _IndexScanSource:
     PAGE = 64
 
     def __init__(
-        self, random, *, transactions=40, hot_key=None, descending=False, quiet=False, nulls=False
+        self,
+        random,
+        *,
+        transactions=40,
+        hot_key=None,
+        descending=False,
+        quiet=False,
+        nulls=False,
+        moves=False,
     ):
         self.random = random
+        # Some transactions change the id of a key's rows: an UPDATE of the index column.
+        self.moves = moves
         # Some rows have no id: the index column is nullable.
         self.nulls = nulls
         # A quiet log: nothing but the table's own changes moves it, so it stays on one
@@ -694,6 +707,16 @@ class _IndexScanSource:
             key = self._key()
             self._write("BEGIN")
             kind = self.random.random()
+            if self.moves and kind < 0.3:
+                # UPDATE ... SET id = other WHERE id = key, for some of the key's rows.
+                other = self._key()
+                for row in [row for row in self.rows if row["id"] == key]:
+                    if self.random.random() < 0.7:
+                        self._write("BEFORE_UPDATE", row=dict(row))
+                        row["id"], row["value"] = other, self.random.choice("abc")
+                        self._write("AFTER_UPDATE", row=dict(row))
+                self._write("COMMIT")
+                continue
             if kind < 0.2 and not self.hot_key:
                 # UPDATE ... WHERE id = key: every row of the key, some to the value it has.
                 for row in [row for row in self.rows if row["id"] == key]:
@@ -766,11 +789,30 @@ class _IndexScanSource:
 
     def key_rows(self, identity, columns, keys, values, isolation, limit=None, present=(), skip=0):
         self._tick()
-        wanted = None if values is None else values[0]
-        assert list(keys) == ["id"] and not present
+        assert list(keys)[0] == "id" and not present
         # A read past the first ``skip`` rows only asks whether there are more than that.
         self.null_reads = getattr(self, "null_reads", 0) + (values is None and not skip)
-        rows = [dict(row) for row in self.rows if row["id"] == wanted][skip:]
+        # Every key column equal to its value, or, with no values, a NULL in any of them.
+        rows = [
+            dict(row)
+            for row in self.rows
+            if (
+                any(row[key] is None for key in keys)
+                if values is None
+                else all(row[key] == value for key, value in zip(keys, values))
+            )
+        ][skip:]
+        self._tick()
+        return rows
+
+    def rows_by_values(self, identity, columns, keys, value_sets, isolation, limit=None):
+        self._tick()
+        assert list(keys)[0] == "id" and value_sets
+        rows = [
+            dict(row)
+            for row in self.rows
+            if any(all(row[key] == value for key, value in zip(keys, values)) for values in value_sets)
+        ]
         self._tick()
         return rows
 
@@ -811,6 +853,62 @@ class _IndexScanSource:
             self._write("COMMIT", tx=tx)
         begins = {r["tx_id"]: r["lsn"] for r in self.log if r["op"] == "BEGIN"}
         return [dict(record) for record in self.log if begins[record["tx_id"]] >= start]
+
+
+class _KeyedIndexScanSource(_IndexScanSource):
+    """The same table with a third column: ``value`` names each row, as a primary.keys
+    option says, ``id`` is still the indexed column and ``note`` the rest of the row. Its
+    transactions insert, delete and update single rows; an update can change the index
+    value, the name, the note, or several of them."""
+
+    def __init__(self, random, **kwargs):
+        super().__init__(random, **kwargs)
+        self.names = 0
+        self.freed: list[str] = []
+        self.rows = [
+            {"id": random.randint(1, 20), "value": self._name(), "note": random.choice("ab")}
+            for _ in range(30)
+        ]
+
+    def _name(self):
+        # Now and then the name of a row deleted earlier, which may be in a page still.
+        if self.freed and self.random.random() < 0.5:
+            return self.freed.pop(self.random.randrange(len(self.freed)))
+        self.names += 1
+        return f"r{self.names}"
+
+    @staticmethod
+    def text(row):
+        return f"{row['id']}|{row['value']}|{row['note']}"
+
+    def rows_as_text(self):
+        return [self.text(row) for row in self.rows]
+
+    def _tick(self):
+        while self.left > 0 and self.random.random() < 0.6:
+            self.left -= 1
+            self.tx_id += 1
+            self._write("BEGIN")
+            kind = self.random.random()
+            row = self.random.choice(self.rows) if self.rows else None
+            if row is None or kind < 0.15:
+                row = {"id": self._key(), "value": self._name(), "note": self.random.choice("ab")}
+                self.rows.insert(self.random.randint(0, len(self.rows)), row)
+                self._write("INSERT", row=dict(row))
+            elif kind < 0.3:
+                self.rows.remove(row)
+                self.freed.append(row["value"])
+                self._write("DELETE", row=dict(row))
+            else:
+                self._write("BEFORE_UPDATE", row=dict(row))
+                if kind < 0.8:
+                    row["id"] = self._key()
+                if kind < 0.4 or kind > 0.9:
+                    self.freed.append(row["value"])
+                    row["value"] = self._name()
+                row["note"] = self.random.choice("abc")
+                self._write("AFTER_UPDATE", row=dict(row))
+            self._write("COMMIT")
 
 
 class _KeylessIndexBridge(FakeBridge):
@@ -1862,6 +1960,20 @@ class LakeflowContractTests(unittest.TestCase):
                 )
                 self.assertIn(type_name, informix_module._LITERAL_UNSAFE_KEY_TYPES)
 
+    def test_a_boolean_key_is_copied_by_the_blocking_snapshot(self):
+        # Informix compares a BOOLEAN for equality only and writes it 't' or 'f', so a key
+        # with one has no keyset bound to render: it pages by position.
+        for type_name in ("BOOLEAN", "BOOL"):
+            with self.subTest(type_name=type_name):
+                raw = _table()
+                raw["columns"][0] = {"name": "id", "type_name": type_name}
+                table = Table.parse(raw, "demo")
+                connector = self.connector(FakeBridge())
+                self.assertEqual(
+                    connector._incremental_datetime_chunk_exprs(table, {}), ({}, False)
+                )
+                self.assertIn(type_name, informix_module._LITERAL_UNSAFE_KEY_TYPES)
+
     def test_catalog_enables_implemented_scalar_cdc_types(self):
         for type_id in (17, 18, 43):
             with self.subTest(type_id=type_id):
@@ -2274,6 +2386,746 @@ class LakeflowContractTests(unittest.TestCase):
         # The interleavings do overlap: without the dropped changes the sums are wrong.
         self.assertGreater(dropped, 100)
         self.assertGreater(settled_nulls, 5)
+
+    def test_an_index_scan_adds_up_when_updates_change_the_index_value(self):
+        # An UPDATE of the index column takes a row out of one key and puts it into another.
+        # The scan may have read either key before the update and the other after it: the
+        # row is then in two pages, or in none. Each key settles its own half, and the
+        # stream passes on the half the pages do not hold, as a DELETE or an INSERT.
+        halves = collections.Counter()
+        for seed in range(160):
+            random = random_module.Random(5000 + seed)
+            source = _IndexScanSource(
+                random,
+                descending=seed % 3 == 0,
+                quiet=seed % 3 == 1,
+                nulls=seed % 2 == 0,
+                moves=True,
+            )
+            with mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0):
+                boundary, staged, scan, connector, table = self._index_scan(
+                    source, random.choice([3, 5, 50])
+                )
+            transactions = informix_module._transaction_batch(source.history(boundary))[0]
+            connector._read_snapshot_stage_manifest = lambda *_: scan
+            connector._offset_scopes = lambda checkpoint: ("scope", "scope")
+            kept = connector._drop_scanned_changes(
+                table, {"commit_lsn": str(boundary), "schema_id": "s"}, {}, transactions
+            )
+            moved = {
+                position
+                for tx in transactions
+                for record in tx.records
+                if record["op"] == "UPDATE" and record["before"]["id"] != record["after"]["id"]
+                for position in (record["lsn"], record["before_lsn"])
+            }
+            result = collections.Counter(_IndexScanSource.text(row) for row in staged)
+            for tx in kept:
+                for record in tx.records:
+                    if record["op"] == "UPDATE":
+                        result[_IndexScanSource.text(record["before"])] -= 1
+                        result[_IndexScanSource.text(record["after"])] += 1
+                        continue
+                    self.assertNotIn("before_lsn", record)
+                    result[_IndexScanSource.text(record["row"])] += (
+                        1 if record["op"] == "INSERT" else -1
+                    )
+                    halves[record["op"]] += record["lsn"] in moved
+            self.assertEqual(+result, collections.Counter(source.rows_as_text()), f"seed {seed}")
+            self.assertFalse(-result, f"seed {seed}")
+        # Both halves do go on alone: the removal from a key read early, and the arrival
+        # in one read early.
+        self.assertGreater(halves["DELETE"], 10)
+        self.assertGreater(halves["INSERT"], 10)
+
+    def test_the_stream_passes_on_the_half_of_an_index_update_the_scan_lacks(self):
+        # Two pages: ids up to 5, read between 100 and 110, and the rest, read between 200
+        # and 210. An UPDATE that committed at 150 moved a row between them.
+        scan = {
+            "index_scan": {
+                "keys": ["id"],
+                "descending": [False],
+                "pages": [
+                    [informix_module._encode_snapshot_stage_value([5]), 100, 110],
+                    [None, 200, 210],
+                ],
+                "end": 210,
+                "suppress": [],
+                "keep": [],
+                "settled": [],
+                "time": None,
+            }
+        }
+
+        def kept(table, old, new, value="b"):
+            connector = self.connector(_IndexScanSource(random_module.Random(1)))
+            connector._read_snapshot_stage_manifest = lambda *_: scan
+            connector._offset_scopes = lambda checkpoint: ("scope", "scope")
+            transactions = informix_module._transaction_batch(
+                [
+                    {"op": "BEGIN", "tx_id": 1, "lsn": 140},
+                    {"op": "BEFORE_UPDATE", "tx_id": 1, "lsn": 141, "row": {"id": old, "value": "a"}},
+                    {"op": "AFTER_UPDATE", "tx_id": 1, "lsn": 142, "row": {"id": new, "value": value}},
+                    {"op": "COMMIT", "tx_id": 1, "lsn": 150},
+                ]
+            )[0]
+            (tx,) = connector._drop_scanned_changes(
+                table, {"commit_lsn": "90", "schema_id": "s"}, {}, transactions
+            )
+            return list(tx.records)
+
+        keyless = Table.parse(_table(primary_keys=()), "demo")
+        # Out of the page read earlier, into the one read later: the pages hold the row
+        # twice, so its removal goes on, at the before-image's position.
+        self.assertEqual(
+            kept(keyless, 3, 8),
+            [{"op": "DELETE", "tx_id": 1, "lsn": 141, "row": {"id": 3, "value": "a"}}],
+        )
+        # The other way round no page holds it: its arrival goes on.
+        self.assertEqual(
+            kept(keyless, 8, 3),
+            [{"op": "INSERT", "tx_id": 1, "lsn": 142, "row": {"id": 3, "value": "b"}}],
+        )
+        # A move within the page read later is in that page whole, and one within the
+        # page read earlier is in neither part of it.
+        self.assertEqual(kept(keyless, 8, 9), [])
+        self.assertEqual([record["op"] for record in kept(keyless, 3, 4)], ["UPDATE"])
+        # One row by primary.keys cannot take a half. The scan reads such a row again, so
+        # an UPDATE the stream finds with one half held is one the scan's follower never
+        # got: it asks for a full refresh. An UPDATE that changes the key as well is two
+        # rows, and each takes its half.
+        by_id = dataclasses.replace(keyless, primary_keys=("id",), key_only_from_option=True)
+        self.assertEqual([record["op"] for record in kept(by_id, 3, 8)], ["DELETE"])
+        named = dataclasses.replace(keyless, primary_keys=("value",), key_only_from_option=True)
+        self.assertEqual([record["op"] for record in kept(named, 3, 8)], ["DELETE"])
+        for old, new in ((3, 8), (8, 3)):
+            with self.assertRaisesRegex(InformixError, "run a full refresh"):
+                kept(named, old, new, value="a")
+        self.assertEqual([record["op"] for record in kept(named, 3, 4)], ["UPDATE"])
+        self.assertEqual(kept(named, 8, 9), [])
+
+    def test_an_index_scan_reads_a_moved_row_of_a_keyed_table_once_more(self):
+        # A table keyed by primary.keys on the append path follows its changes during the
+        # scan too, and its rows are told apart by that key. An UPDATE of the index column
+        # can leave one row in two pages, or in a page that already holds a later change
+        # to it, and no half of the UPDATE puts that right. Every copy of such a row is
+        # left out of the pages, the row is read once more at the end into a page of its
+        # own, and the stream keeps its changes from that read on. The snapshot then holds
+        # each row once, and with the stream it nets to the table exactly.
+        repaired = moved_rows = 0
+        for seed in range(200):
+            random = random_module.Random(9000 + seed)
+            source = _KeyedIndexScanSource(
+                random, descending=seed % 3 == 0, quiet=seed % 3 == 1, nulls=seed % 2 == 0
+            )
+            raw = _table(primary_keys=())
+            raw["columns"][0]["nullable"] = source.nulls
+            raw["columns"].append({"name": "note", "type_name": "VARCHAR", "length": 20})
+            table = dataclasses.replace(
+                Table.parse(raw, "demo"), primary_keys=("value",), key_only_from_option=True
+            )
+            options = {"append.only.ingestion": "true"}
+            pages: dict = {}
+            with mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0):
+                boundary, _staged, scan, connector, table = self._index_scan(
+                    source, random.choice([3, 5, 50]), table=table, options=options, pages=pages
+                )
+            moved = scan["index_scan"]["moved"]
+            served = [
+                row
+                for index in sorted(pages)
+                for row in pages[index]
+                if not moved
+                or json.dumps([row["value"]]) not in moved["pages"].get(str(index), ())
+            ]
+            # The page they were read into again holds them, and leaves none of them out.
+            self.assertTrue(not moved or str(moved["page"]) not in moved["pages"])
+            names = collections.Counter(row["value"] for row in served)
+            self.assertEqual(set(names.values()) - {1}, set(), f"seed {seed}")
+            repaired += bool(moved and moved["page"] is not None)
+            moved_rows += len(moved["rows"]) if moved else 0
+            transactions = informix_module._transaction_batch(source.history(boundary))[0]
+            connector._read_snapshot_stage_manifest = lambda *_: scan
+            connector._offset_scopes = lambda checkpoint: ("scope", "scope")
+            kept = connector._drop_scanned_changes(
+                table, {"commit_lsn": str(boundary), "schema_id": "s"}, options, transactions
+            )
+            result = collections.Counter(source.text(row) for row in served)
+            for tx in kept:
+                for record in tx.records:
+                    before = record.get(
+                        "before", record.get("row") if record["op"] == "DELETE" else None
+                    )
+                    after = record.get(
+                        "after", record.get("row") if record["op"] == "INSERT" else None
+                    )
+                    if before is not None:
+                        result[source.text(before)] -= 1
+                    if after is not None:
+                        result[source.text(after)] += 1
+            self.assertEqual(+result, collections.Counter(source.rows_as_text()), f"seed {seed}")
+            self.assertFalse(-result, f"seed {seed}")
+        self.assertGreater(repaired, 50)
+        self.assertGreater(moved_rows, 200)
+
+    def test_an_index_scan_taken_up_after_a_failure_reads_its_moved_rows_again(self):
+        # A scan of a keyed table that fails, while paging or while reading rows again at
+        # its end, is taken up from its recorded pages. The follower reads the changes
+        # from the snapshot LSN once more, so it finds the rows that changed index value
+        # again, and reads them into their page anew.
+        resumed = repaired = 0
+        for seed in range(80):
+            random = random_module.Random(11000 + seed)
+            source = _KeyedIndexScanSource(random, descending=seed % 3 == 0, nulls=seed % 2 == 0)
+            source.minimum_lsn = lambda: 0
+            raw = _table(primary_keys=())
+            raw["columns"][0]["nullable"] = source.nulls
+            raw["columns"].append({"name": "note", "type_name": "VARCHAR", "length": 20})
+            table = dataclasses.replace(
+                Table.parse(raw, "demo"), primary_keys=("value",), key_only_from_option=True
+            )
+            options = {"append.only.ingestion": "true"}
+            page_size = random.choice([3, 5])
+            # Half fail on a page read, half on a read of single rows after the pages.
+            name = "snapshot_chunk" if seed % 2 else "rows_by_values"
+            read, calls = getattr(source, name), []
+            fail_at = random.randint(2, 6) if seed % 2 else random.randint(1, 2)
+
+            def failing(*args, _read=read, _calls=calls, _fail_at=fail_at, **kwargs):
+                _calls.append(1)
+                if len(_calls) == _fail_at:
+                    raise RuntimeError("the connection is lost")
+                return _read(*args, **kwargs)
+
+            setattr(source, name, failing)
+            pages: dict = {}
+            with mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0):
+                try:
+                    self._index_scan(
+                        source,
+                        page_size,
+                        table=table,
+                        options=options,
+                        pages=pages,
+                        resumable=f"keyed-{seed}",
+                    )
+                    continue
+                except RuntimeError:
+                    pass
+                first = dict(pages)
+                boundary, _staged, scan, connector, table = self._index_scan(
+                    source,
+                    page_size,
+                    table=table,
+                    options=options,
+                    pages=pages,
+                    resumable=f"keyed-{seed}",
+                )
+            resumed += bool(first)
+            for index, rows in first.items():
+                self.assertEqual(pages[index], rows, f"seed {seed}")
+            moved = scan["index_scan"]["moved"]
+            repaired += bool(moved and moved["page"] is not None)
+            served = [
+                row
+                for index in sorted(pages)
+                for row in pages[index]
+                if not moved
+                or json.dumps([row["value"]]) not in moved["pages"].get(str(index), ())
+            ]
+            names = collections.Counter(row["value"] for row in served)
+            self.assertEqual(set(names.values()) - {1}, set(), f"seed {seed}")
+            transactions = informix_module._transaction_batch(source.history(boundary))[0]
+            connector._read_snapshot_stage_manifest = lambda *_, _scan=scan: _scan
+            connector._offset_scopes = lambda checkpoint: ("scope", "scope")
+            kept = connector._drop_scanned_changes(
+                table, {"commit_lsn": str(boundary), "schema_id": "s"}, options, transactions
+            )
+            result = collections.Counter(source.text(row) for row in served)
+            for tx in kept:
+                for record in tx.records:
+                    before = record.get(
+                        "before", record.get("row") if record["op"] == "DELETE" else None
+                    )
+                    after = record.get(
+                        "after", record.get("row") if record["op"] == "INSERT" else None
+                    )
+                    if before is not None:
+                        result[source.text(before)] -= 1
+                    if after is not None:
+                        result[source.text(after)] += 1
+            self.assertEqual(+result, collections.Counter(source.rows_as_text()), f"seed {seed}")
+            self.assertFalse(-result, f"seed {seed}")
+        self.assertGreater(resumed, 20)
+        self.assertGreater(repaired, 10)
+
+    def test_moved_rows_are_read_again_by_index_value_when_a_key_is_not_comparable(self):
+        # A primary.keys column of a type the scan does not compare (a DATETIME, say)
+        # leaves the index value to find a moved row by. Two moved rows can share one:
+        # the value is read once, and each row counts once.
+        repaired = 0
+        for seed in range(60):
+            random = random_module.Random(13000 + seed)
+            source = _KeyedIndexScanSource(random, nulls=seed % 2 == 0)
+            raw = _table(primary_keys=())
+            raw["columns"][0]["nullable"] = source.nulls
+            raw["columns"].append({"name": "note", "type_name": "VARCHAR", "length": 20})
+            table = dataclasses.replace(
+                Table.parse(raw, "demo"), primary_keys=("value",), key_only_from_option=True
+            )
+            options = {"append.only.ingestion": "true"}
+            calls = []
+            read = source.rows_by_values
+
+            def counted(identity, columns, keys, value_sets, *args, _read=read, _calls=calls):
+                _calls.append((tuple(keys), len(value_sets)))
+                return _read(identity, columns, keys, value_sets, *args)
+
+            source.rows_by_values = counted
+            pages: dict = {}
+            with (
+                mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0),
+                mock.patch.object(informix_module, "_INDEX_SCAN_KEY_TYPES", frozenset({"INTEGER"})),
+            ):
+                boundary, _staged, scan, connector, table = self._index_scan(
+                    source, random.choice([3, 5]), table=table, options=options, pages=pages
+                )
+            # Each query is for one index value alone.
+            self.assertEqual(set(calls) - {(("id",), 1)}, set(), f"seed {seed}")
+            moved = scan["index_scan"]["moved"]
+            repaired += bool(moved and moved["page"] is not None)
+            served = [
+                row
+                for index in sorted(pages)
+                for row in pages[index]
+                if not moved
+                or json.dumps([row["value"]]) not in moved["pages"].get(str(index), ())
+            ]
+            names = collections.Counter(row["value"] for row in served)
+            self.assertEqual(set(names.values()) - {1}, set(), f"seed {seed}")
+        self.assertGreater(repaired, 15)
+
+    def test_long_moved_rows_are_looked_up_a_few_to_a_query(self):
+        # A lookup's values are sent as text within the statement, which Informix bounds.
+        # Rows with long key values go fewer to a query, and one too long to send at all
+        # is found by its index value alone.
+        source = _KeyedIndexScanSource(random_module.Random(9003), transactions=60)
+        raw = _table(primary_keys=())
+        raw["columns"].append({"name": "note", "type_name": "VARCHAR", "length": 20})
+        table = dataclasses.replace(
+            Table.parse(raw, "demo"), primary_keys=("value",), key_only_from_option=True
+        )
+        calls = []
+        read = source.rows_by_values
+
+        def counted(identity, columns, keys, value_sets, *args):
+            calls.append((tuple(keys), len(value_sets)))
+            return read(identity, columns, keys, value_sets, *args)
+
+        source.rows_by_values = counted
+        with (
+            mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0),
+            mock.patch.object(informix_module, "_INDEX_SCAN_LOOKUP_CHARS", 60),
+        ):
+            self._index_scan(source, 3, table=table, options={"append.only.ingestion": "true"})
+        # About 30 characters a row: two to a query at most.
+        self.assertTrue(calls)
+        self.assertEqual({keys for keys, _count in calls}, {("id", "value")})
+        self.assertLessEqual(max(count for _keys, count in calls), 2)
+        calls.clear()
+        source = _KeyedIndexScanSource(random_module.Random(9003), transactions=60)
+        read = source.rows_by_values
+        source.rows_by_values = counted
+        with (
+            mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0),
+            mock.patch.object(informix_module, "_INDEX_SCAN_LOOKUP_CHARS", 5),
+        ):
+            self._index_scan(source, 3, table=table, options={"append.only.ingestion": "true"})
+        self.assertEqual(set(calls), {(("id",), 1)})
+
+    def test_an_index_with_a_variable_scale_decimal_is_not_paged_by(self):
+        # A DECIMAL(p) with no scale is staged as decimal.variable.type shapes it, a string
+        # or a double, and the scan compares staged rows with rows as it reads them: an
+        # index on such a column is passed over.
+        source = _IndexScanSource(random_module.Random(1), transactions=0)
+        raw = _table(primary_keys=())
+        raw["columns"][0] = {"name": "id", "type_name": "DECIMAL", "precision": 10, "scale": 255}
+        table = Table.parse(raw, "demo")
+        self.assertTrue(informix_module._is_variable_scale_decimal(table.columns[0]))
+        self.assertIsNone(self.connector(source)._scan_index(table, {}))
+        raw["columns"][0] = {"name": "id", "type_name": "DECIMAL", "precision": 10, "scale": 2}
+        self.assertIsNotNone(self.connector(source)._scan_index(Table.parse(raw, "demo"), {}))
+
+    def test_a_variable_scale_decimal_lands_as_text_without_padding_zeros(self):
+        # The packed form keeps the zeros of its unused digits: 0 decodes as 0E-134.
+        column = Table.parse(_table(), "demo").columns[0]
+        for value, text in (
+            ("0E-134", "0"),
+            ("5.0000", "5"),
+            ("1E+2", "100"),
+            ("-2.50", "-2.5"),
+            ("-0.0", "0"),
+            # Every digit of a DECIMAL(32): the default context keeps 28.
+            ("12345678901234567890123456789012", "12345678901234567890123456789012"),
+            ("0.12345678901234567890123456789012", "0.12345678901234567890123456789012"),
+        ):
+            self.assertEqual(
+                informix_module._coerce_variable_decimal_value(
+                    Decimal(value), column, ("string", None, None)
+                ),
+                text,
+            )
+
+    def test_a_variable_scale_decimal_keeps_its_digits_as_decimal_38_18(self):
+        # Eleven integer digits at scale 18 are 29 digits, which decimal(38,18) holds and
+        # the default decimal context does not.
+        column = Table.parse(_table(), "demo").columns[0]
+        coerce = informix_module._coerce_variable_decimal_value
+        self.assertEqual(
+            coerce(Decimal("10000000000"), column, ("decimal", 38, 18)),
+            Decimal("10000000000.000000000000000000"),
+        )
+        self.assertEqual(
+            coerce(Decimal("12345678901234567890.123456789012345678"), column, ("decimal", 38, 18)),
+            Decimal("12345678901234567890.123456789012345678"),
+        )
+        with self.assertRaisesRegex(InformixError, "exceeds decimal"):
+            coerce(Decimal("123456789012345678901"), column, ("decimal", 38, 18))
+
+    def test_an_index_scans_snapshot_ends_on_an_offset_that_names_its_scan(self):
+        # An index-ordered scan's manifest says which changes the stream must drop, and it
+        # stays under the scope the pages were staged under. The offset the snapshot ends
+        # on names that scope, so that a flow whose own scope changes before the stream's
+        # first read (a table.migration relocation) still finds the manifest, and the
+        # cleanup of earlier scopes keeps it.
+        connector = self.connector()
+        table = connector._table("app.orders", {})
+        scope, schema = "11111111-2222-3333-4444-555555555555_@_66666666-7777-8888-9999-000000000000", "5" * 32
+        reads = []
+
+        def manifest(*args):
+            reads.append(args[1:])
+            return {"index_scan": {"keys": ["id"]}}
+
+        connector._read_snapshot_stage_manifest = manifest
+        end = connector._naming_scan({}, table, scope, schema)
+        self.assertEqual(end, {"scan_scope": scope, "scan_schema": schema})
+        self.assertEqual(reads, [(scope, schema)])
+        # A manifest in hand is not read again, and a snapshot that was no such scan, or
+        # that followed no changes, names nothing.
+        self.assertEqual(connector._naming_scan({}, table, scope, schema, {}), {})
+        self.assertEqual(connector._naming_scan({}, table, scope, schema, {"index_scan": False}), {})
+        self.assertEqual(len(reads), 1)
+
+    def test_a_snapshot_scan_names_each_column_once(self):
+        self.assertIsNone(informix_module._snapshot_scan_columns("keyset(id, id)"))
+        self.assertIsNone(informix_module._snapshot_scan_columns("keyset(id, ID desc)"))
+        self.assertEqual(
+            informix_module._snapshot_scan_columns("keyset(id, value desc)"),
+            [("id", None), ("value", True)],
+        )
+
+    def test_an_offset_naming_a_scan_must_name_it_well(self):
+        connector = self.connector(FakeBridge())
+        _rows, offset = connector.read_table("app.orders", {}, {})
+        scope = offset["pipeline_scope"]
+        good = {**offset, "scan_scope": scope, "scan_schema": "5" * 32}
+        self.assertEqual(informix_module._validated_offset(good)["scan_scope"], scope)
+        for bad in (
+            {**offset, "scan_scope": "../elsewhere", "scan_schema": "5" * 32},
+            {**offset, "scan_scope": scope, "scan_schema": "s"},
+            {**offset, "scan_scope": scope},
+        ):
+            with self.assertRaisesRegex(ValueError, "invalid scan_scope or scan_schema"):
+                informix_module._validated_offset(bad)
+
+    def test_what_a_process_read_of_scans_is_not_shipped_or_kept_across_registrations(self):
+        # The moved rows of a manifest can be ten thousand keys, and Spark pickles the
+        # data source to every worker under a size limit.
+        connector = self.connector(FakeBridge())
+        for name in informix_module._SCAN_CACHES:
+            connector.__dict__[name] = {"filled": True}
+        self.assertFalse(set(informix_module._SCAN_CACHES) & set(connector.__getstate__()))
+        connector.set_registration_scope(
+            "11111111-2222-3333-4444-555555555555_@_66666666-7777-8888-9999-000000000000"
+        )
+        self.assertFalse(set(informix_module._SCAN_CACHES) & set(connector.__dict__))
+
+    def test_the_class_registered_from_the_package_carries_what_the_driver_knows(self):
+        # spark.dataSource.register(InformixDataSource): Spark pickles a class from a
+        # package by name, and each process imports the connector afresh. Only the driver
+        # knows the pipeline and update and holds workspace credentials, so pickling the
+        # class gathers them, and unpickling it installs them where they are missing.
+        import databricks.labs.community_connector.sources.informix as package
+
+        try:
+            from pyspark.serializers import CloudPickleSerializer
+        except ImportError:  # no PySpark here: the standard pickler takes the same path
+            CloudPickleSerializer = lambda: pickle  # noqa: E731
+
+        scope = "11111111-2222-3333-4444-555555555555_@_66666666-7777-8888-9999-000000000000"
+
+        class Conf:
+            def get(self, key, default=None):
+                pipeline, update = scope.split("_@_")
+                return {
+                    "spark.pipelines.pipelineId": pipeline,
+                    "spark.pipelines.updateId": update,
+                }.get(key, default)
+
+        session = mock.Mock(conf=Conf())
+        module = package.informix
+        context, workspace = module._INFORMIX_REGISTRATION_CONTEXT, module._CAPTURED_WORKSPACE
+
+        def capture():
+            workspace.update(host="https://ws", token="driver-token")
+
+        with (
+            mock.patch.dict(context, {"scope": None, "request": None}),
+            mock.patch.dict(workspace, {}, clear=True),
+            mock.patch.object(package, "_active_spark_session", return_value=session),
+            mock.patch.object(module, "_update_request", return_value="full_refresh") as asked,
+            mock.patch.object(module, "capture_workspace_credentials", side_effect=capture),
+        ):
+            data = CloudPickleSerializer().dumps(package.InformixDataSource)
+            asked.assert_called_once_with(*scope.split("_@_"))
+            # Another process: nothing gathered yet.
+            context.update(scope=None, request=None)
+            workspace.clear()
+            self.assertIs(CloudPickleSerializer().loads(data), package.InformixDataSource)
+            self.assertEqual(context, {"scope": scope, "request": "full_refresh"})
+            self.assertEqual(workspace, {"host": "https://ws", "token": "driver-token"})
+            # A process that was handed them hands the same on, and asks nothing again.
+            again = CloudPickleSerializer().dumps(package.InformixDataSource)
+            asked.assert_called_once()
+            context.update(scope=None, request=None)
+            CloudPickleSerializer().loads(again)
+            self.assertEqual(context["scope"], scope)
+            # A driver kept warm registers again under the next update: gathered anew.
+            later = scope[:-1] + "1"
+            session.conf = mock.Mock(
+                get=lambda key, default=None: dict(
+                    zip(("spark.pipelines.pipelineId", "spark.pipelines.updateId"), later.split("_@_"))
+                ).get(key, default)
+            )
+            asked.return_value = "continue"
+            workspace.update(token="stale-token")
+            capture_later = mock.Mock(side_effect=lambda: workspace.update(token="fresh-token"))
+            with mock.patch.object(module, "capture_workspace_credentials", capture_later):
+                data = CloudPickleSerializer().dumps(package.InformixDataSource)
+            self.assertEqual(asked.call_count, 2)
+            capture_later.assert_called_once()
+            # A worker Spark kept from the earlier update takes the new update's up.
+            context.update(scope=scope, request="full_refresh")
+            workspace.update(token="stale-token")
+            CloudPickleSerializer().loads(data)
+            self.assertEqual(context, {"scope": later, "request": "continue"})
+            self.assertEqual(workspace["token"], "fresh-token")
+        # The lookup by source name still finds the class.
+        from databricks.labs.community_connector.sparkpds import find_data_source
+
+        self.assertIs(find_data_source("informix"), package.InformixDataSource)
+
+    def test_readers_of_the_packaged_class_take_the_connectors_hooks(self):
+        # The merged single file wraps the framework's readers as it defines them. The
+        # packaged class hands out readers of its own with the same hooks: the scope and
+        # the update's request reach the connector, a triggered run is told to it, and a
+        # replay stops at the end Spark logged.
+        import databricks.labs.community_connector.sources.informix as package
+
+        scope = "11111111-2222-3333-4444-555555555555_@_66666666-7777-8888-9999-000000000000"
+        module = package.informix
+        connector = mock.Mock(options={})
+        options = {"tableName": "app.orders"}
+        with mock.patch.dict(
+            module._INFORMIX_REGISTRATION_CONTEXT, {"scope": scope, "request": "continue"}
+        ):
+            simple = package.InformixStreamReader(options, None, connector)
+            partitioned = package.InformixPartitionedStreamReader(options, None, connector)
+        self.assertEqual(
+            connector.set_registration_scope.call_args_list, [mock.call(scope), mock.call(scope)]
+        )
+        connector.set_update_request.assert_called_with("continue")
+        simple.prepareForTriggerAvailableNow()
+        partitioned.prepareForTriggerAvailableNow()
+        self.assertEqual(connector.prepare_for_trigger_available_now.call_count, 2)
+        with mock.patch.object(package, "_replay_between_offsets", return_value=iter(())) as replay:
+            simple.readBetweenOffsets({"a": 1}, {"a": 2})
+        self.assertEqual(replay.call_args.args[:2], ({"a": 1}, {"a": 2}))
+        # The data source picks the reader by whether the table is read in partitions.
+        source = object.__new__(package.InformixDataSource)
+        source.options, source.lakeflow_connect = options, connector
+        connector.is_partitioned.return_value = True
+        self.assertIsInstance(source.streamReader(None), package.InformixPartitionedStreamReader)
+        self.assertIsInstance(source.simpleStreamReader(None), package.InformixStreamReader)
+        connector.is_partitioned.return_value = False
+        with self.assertRaises(Exception):
+            source.streamReader(None)
+
+    def test_pad_varchar_is_read_under_the_name_spark_hands_it_on_as(self):
+        # Spark lowercases option keys. The reader's own options answer to either form,
+        # but a copy into a plain dict, as a drain or shard reader gets, keeps the
+        # lowercased one only.
+        config = informix_module._bridge_config
+        base = {"hostname": "h", "user": "u", "password": "p", "server": "s", "database": "d"}
+        self.assertFalse(config(base)["pad_varchar"])
+        self.assertTrue(config({**base, "padVarchar": "true"})["pad_varchar"])
+        self.assertTrue(config({**base, "padvarchar": "true"})["pad_varchar"])
+        with self.assertRaisesRegex(ValueError, "'padVarchar'"):
+            config({**base, "padvarchar": "maybe"})
+
+    def test_a_connector_from_the_package_carries_the_registration_to_executors(self):
+        # An executor is handed readers, not the class, and imports the module afresh: the
+        # connector's pickled state brings what the driver gathered.
+        connector = self.connector(FakeBridge())
+        module = informix_module
+        scope = connector._pipeline_scope()
+        with (
+            mock.patch.dict(module._INFORMIX_REGISTRATION_CONTEXT, {"scope": scope, "request": None}),
+            mock.patch.dict(module._CAPTURED_WORKSPACE, {"host": "https://ws", "token": "t"}, clear=True),
+        ):
+            state = connector.__getstate__()
+            self.assertEqual(state["_driver_registration"]["scope"], scope)
+            module._INFORMIX_REGISTRATION_CONTEXT.update(scope=None)
+            module._CAPTURED_WORKSPACE.clear()
+            restored = object.__new__(type(connector))
+            restored.__setstate__(dict(state))
+            self.assertEqual(module._INFORMIX_REGISTRATION_CONTEXT["scope"], scope)
+            self.assertEqual(module._CAPTURED_WORKSPACE, {"host": "https://ws", "token": "t"})
+            self.assertNotIn("_driver_registration", restored.__dict__)
+        # With no registration to carry, nothing is added.
+        with mock.patch.dict(module._INFORMIX_REGISTRATION_CONTEXT, {"scope": None, "request": None}):
+            self.assertNotIn("_driver_registration", connector.__getstate__())
+
+    def test_a_page_descriptor_names_the_moved_rows_its_page_leaves_out(self):
+        # The partitioned reader's driver plans a batch of staged pages as descriptors. An
+        # executor has no manifest, so the descriptor of a page that leaves moved rows out
+        # names them, and the other pages' descriptors carry nothing.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 6)]
+        connector = self._partitioned_connector(
+            bridge,
+            **{"snapshot.page.size": "1", "stream.partitioned.snapshot.pages.per.batch": "3"},
+        )
+        first = connector.latest_offset("app.orders", {}, {})
+        second = connector.latest_offset("app.orders", {}, first)
+        moved = {
+            "keys": ["id"],
+            "rows": {"[2]": [1, 2]},
+            "pages": {"1": ["[2]"]},
+            "page": 4,
+        }
+        real_manifest = connector._read_snapshot_stage_manifest
+        reads = []
+
+        def manifest(*args):
+            reads.append(args)
+            return {**real_manifest(*args), "index_scan": {"moved": moved}}
+
+        connector._read_snapshot_stage_manifest = manifest
+        connector.__dict__.pop("_moved_rows", None)
+        partitions = connector.get_partitions("app.orders", {}, first, second)
+        # Planning the batch reads the manifest once: the descriptors take the moved rows
+        # from that read.
+        self.assertEqual(len(reads), 1)
+        self.assertEqual([part["page_index"] for part in partitions], [1, 2, 3])
+        self.assertEqual(partitions[0]["moved"], {"keys": ["id"], "rows": ["[2]"]})
+        self.assertFalse(any("moved" in part for part in partitions[1:]))
+        served = [
+            row["id"]
+            for part in partitions
+            for row in connector.read_partition("app.orders", part, {})
+        ]
+        # Page 1 holds id 2, which it leaves out.
+        self.assertEqual(served, [3, 4])
+
+    def test_half_of_an_index_update_lands_as_the_delete_or_insert_it_is(self):
+        # What the stream passes on for a keyless table when the scan holds one half of
+        # an UPDATE that changed an index value: a DELETE of the old row or an INSERT of
+        # the new one. They land as any DELETE or INSERT does, under a row_filter too.
+        connector = self.connector(FakeBridge())
+        keyless = dataclasses.replace(connector._table("app.orders", {}), primary_keys=())
+        filtered = dataclasses.replace(
+            connector._table("app.orders", {"row_filter": "id > 5"}), primary_keys=()
+        )
+        transaction = informix_module.CommittedTransaction
+
+        def landed(table, record, tombstones=True):
+            record = dict(record, table="demo:app.orders", tx_id=7)
+            rows = informix_module._project_transaction(
+                transaction(7, 100, 150, 100, (record,)), table, False, tombstones=tombstones
+            )
+            return [(row["id"], row[informix_module.OP]) for row in rows]
+
+        gone = {"op": "DELETE", "lsn": 141, "row": {"id": 3, "value": "a"}}
+        come = {"op": "INSERT", "lsn": 142, "row": {"id": 8, "value": "b"}}
+        self.assertEqual(landed(keyless, gone), [(3, "d")])
+        self.assertEqual(landed(keyless, come), [(8, "c")])
+        # Without tombstones a removal lands nothing, as any DELETE.
+        self.assertEqual(landed(keyless, gone, tombstones=False), [])
+        # The filter keeps the row that is in it and drops the one that is not.
+        self.assertEqual(landed(filtered, gone), [])
+        self.assertEqual(landed(filtered, come), [(8, "c")])
+
+    def test_an_index_scan_refuses_too_many_moved_rows_of_a_keyed_table(self):
+        source = _KeyedIndexScanSource(random_module.Random(9001), transactions=200)
+        raw = _table(primary_keys=())
+        raw["columns"].append({"name": "note", "type_name": "VARCHAR", "length": 20})
+        table = dataclasses.replace(
+            Table.parse(raw, "demo"), primary_keys=("value",), key_only_from_option=True
+        )
+        with (
+            mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0),
+            mock.patch.object(informix_module, "_INDEX_SCAN_MOVED_ROWS", 2),
+            self.assertRaisesRegex(InformixError, "more than 2 rows changing index value"),
+        ):
+            self._index_scan(source, 3, table=table, options={"append.only.ingestion": "true"})
+
+    def test_a_staged_page_is_served_without_the_rows_an_index_scan_read_again(self):
+        connector = self.connector()
+        table = dataclasses.replace(
+            connector._table("app.orders", {}), primary_keys=("value",), key_only_from_option=True
+        )
+        scope, schema_id = connector._pipeline_scope(), "schema-moved"
+        rows = [{"id": 1, "value": "a"}, {"id": 2, "value": "b"}]
+        again = [{"id": 9, "value": "a"}]
+        connector._publish_snapshot_stage_page(table, scope, schema_id, 100, 0, rows, None)
+        connector._publish_snapshot_stage_page(table, scope, schema_id, 100, 1, again, None)
+        manifest = {
+            "page_count": 2,
+            "snapshot_lsn": "100",
+            "index_scan": {
+                "moved": {
+                    "keys": ["value"],
+                    "rows": {'["a"]': [100, 110]},
+                    "pages": {"0": ['["a"]']},
+                    "page": 1,
+                }
+            },
+        }
+        served, _end = connector._staged_snapshot_result(table, scope, schema_id, manifest, 0)
+        self.assertEqual(list(served), rows[1:])
+        # The partitioned reader's executors read pages by descriptor, with no manifest:
+        # the descriptor of every page but that one names the rows.
+        page = {
+            "kind": "page",
+            "native_identity": table.native_identity,
+            "exposed_name": table.exposed_name,
+            "pipeline_scope": scope,
+            "schema_id": schema_id,
+            "snapshot_lsn": 100,
+            "page_index": 0,
+        }
+        left_out = informix_module._moved_rows_of_page(manifest["index_scan"]["moved"], 0)
+        self.assertEqual(left_out, {"keys": ["value"], "rows": ['["a"]']})
+        self.assertIsNone(informix_module._moved_rows_of_page(manifest["index_scan"]["moved"], 1))
+        self.assertEqual(
+            list(connector._read_partition_rows({**page, "moved": left_out}, {})), rows[1:]
+        )
+        self.assertEqual(list(connector._read_partition_rows({**page, "page_index": 1}, {})), again)
+        # Serving the next page removes the one before it.
+        served, _end = connector._staged_snapshot_result(table, scope, schema_id, manifest, 1)
+        self.assertEqual(list(served), again)
 
     def test_an_index_scan_taken_up_after_a_failure_still_adds_up_to_the_table(self):
         # The scan records each page it has read. A second attempt goes on after the last
@@ -3259,6 +4111,35 @@ class LakeflowContractTests(unittest.TestCase):
                 ),
                 ("SELECT a,b FROM demo:app.t WHERE a = ?", (7,)),
                 ("SELECT SKIP 1000 FIRST 1 a FROM demo:app.t WHERE (a IS NULL)", ()),
+            ],
+        )
+
+    def test_the_bridge_reads_rows_by_several_sets_of_values_in_one_query(self):
+        # The rows an index-ordered scan reads again, each by its index and key values. A
+        # NULL among them is asked for as one, so the index still finds the row.
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.transport = mock.Mock(spec=["execute"])
+        bridge.transport.execute.return_value = [(7, "x", None)]
+        with (
+            mock.patch.object(bridge, "_ensure_connected"),
+            mock.patch.object(
+                bridge, "_repeatable_read_transaction", return_value=contextlib.nullcontext()
+            ),
+        ):
+            rows = bridge.rows_by_values(
+                "demo.app.t", ["a", "b", "c"], ["a", "c"], [(7, None), (8, "y")], "X", 9
+            )
+            self.assertEqual(bridge.rows_by_values("demo.app.t", ["a"], ["a"], [], "X"), [])
+        self.assertEqual(rows, [{"a": 7, "b": "x", "c": None}])
+        self.assertEqual(
+            [call.args for call in bridge.transport.execute.call_args_list],
+            [
+                (
+                    "SELECT FIRST 9 a,b,c FROM demo:app.t "
+                    "WHERE (a = ? AND c IS NULL) OR (a = ? AND c = ?)",
+                    (7, 8, "y"),
+                )
             ],
         )
 
@@ -5650,6 +6531,82 @@ class LakeflowContractTests(unittest.TestCase):
         )
         self.assertNotIn("ORDER BY", bridge.transport.sql[-2])
         self.assertEqual([page for _, _, page in consumed], [[{"id": 1}, {"id": 2}], [{"id": 3}]])
+
+    def test_a_key_that_cannot_be_paged_by_is_read_through_one_cursor(self):
+        # A DATETIME, INTERVAL, float or BOOLEAN key has no keyset bound to render. Paging
+        # it by position would run a statement a page, and at an isolation that takes no
+        # locks a row deleted below the position shifts the rest down, so that the first
+        # row not yet read never is. One forward-only cursor reads the table instead, and
+        # no statement asks for an order or skips rows.
+        class TransactionalTransport:
+            def __init__(self):
+                self.sql = []
+
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                del parameters, max_result_bytes
+                self.sql.append(sql)
+                if "sysmaster:sysdatabases" in sql:
+                    return [{"is_ansi": 0}]
+                if "sysmaster:syslogs" in sql:
+                    return [{"uniqid": 2, "used": 3}]
+                return []
+
+            def execute_pages(self, sql, parameters, page_size, consumer):
+                self.sql.append(sql)
+                consumer([{"at": "13:00"}, {"at": "13:01"}])
+                consumer([{"at": "13:02"}])
+
+            def execute_command(self, sql):
+                self.sql.append(f"COMMAND:{sql}")
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {"database": "demo"}
+        bridge.config = {"database": "demo"}
+        bridge.transport = TransactionalTransport()
+        consumed = []
+        bridge.consistent_snapshot(
+            "demo.app.events",
+            ["at"],
+            ["at"],
+            2,
+            100,
+            1 << 20,
+            datetime_primary_key=True,
+            page_consumer=lambda boundary, index, page: consumed.append(page),
+            isolation="COMMITTED READ LAST COMMITTED",
+        )
+        self.assertEqual(consumed, [[{"at": "13:00"}, {"at": "13:01"}], [{"at": "13:02"}]])
+        selects = [sql for sql in bridge.transport.sql if sql.startswith("SELECT at FROM")]
+        self.assertEqual(selects, ["SELECT at FROM demo:app.events"])
+        self.assertFalse([sql for sql in bridge.transport.sql if "SKIP" in sql or "ORDER BY" in sql])
+
+    def test_a_consistent_snapshot_pages_in_the_key_indexs_own_directions(self):
+        # A key index with a descending column serves each page's order only when the page
+        # asks for that order: the directions reach every page read.
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {"database": "demo"}
+        bridge.config = {"database": "demo"}
+        pages = [[{"a": 1, "b": 9}, {"a": 1, "b": 8}, {"a": 2, "b": 7}], [{"a": 2, "b": 7}]]
+        with (
+            mock.patch.object(bridge, "_ensure_connected"),
+            mock.patch.object(
+                bridge, "_repeatable_read_transaction", return_value=contextlib.nullcontext()
+            ),
+            mock.patch.object(bridge, "boundary_lsn", return_value=100),
+            mock.patch.object(bridge, "snapshot_page", side_effect=pages) as page,
+        ):
+            bridge.consistent_snapshot(
+                "demo.app.t", ["a", "b"], ["a", "b"], 2, 0, 0, key_descending=[False, True]
+            )
+            self.assertEqual(
+                [call.kwargs.get("key_descending") for call in page.call_args_list],
+                [[False, True], [False, True]],
+            )
+            self.assertEqual([call.args[3] for call in page.call_args_list], [None, [1, 8]])
+            page.reset_mock(side_effect=True)
+            page.side_effect = [[{"a": 1, "b": 9}]]
+            bridge.consistent_snapshot("demo.app.t", ["a", "b"], ["a", "b"], 2, 0, 0)
+            self.assertNotIn("key_descending", page.call_args.kwargs)
 
     def test_column_defaults_reports_only_non_null_defaults(self):
         # DEFAULT NULL (type N) leaves existing rows NULL, exactly like no default.
@@ -20753,7 +21710,10 @@ class FairSlotQueueWiringTests(unittest.TestCase):
         # Lakebase reaps an idle connection, and psycopg says so only when a query fails.
         # A bridge idle between reads reopens it and claims again rather than failing the
         # read; an error on a connection that is still open is real and propagates.
-        import psycopg2
+        try:
+            import psycopg2  # noqa: PLC0415
+        except ImportError:
+            self.skipTest("psycopg2 not installed in this environment")
 
         reaped = psycopg2.OperationalError("SSL SYSCALL error: EOF detected")
         for closed, retried in ((2, True), (0, False)):
@@ -20776,7 +21736,10 @@ class FairSlotQueueWiringTests(unittest.TestCase):
         # The lease heartbeat has its own connection, so the bridge's sits idle through a
         # long read and can be reaped by the time the slot is released. The release
         # reopens it rather than leaving the slot held until its lease expires.
-        import psycopg2
+        try:
+            import psycopg2  # noqa: PLC0415
+        except ImportError:
+            self.skipTest("psycopg2 not installed in this environment")
 
         # The advisory backlog-hint write can also leave the connection open but in a
         # failed transaction, which a release over it would fail on in the same way.

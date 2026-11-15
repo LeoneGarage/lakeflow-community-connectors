@@ -34,5 +34,7 @@ packages = ["databricks.labs.community_connector.sources.informix"]
 [tool.setuptools.cmdclass]
 build_py = "tests.wheel_build_test_tool.BuildPy"
 
+# Named one by one: a pattern would also pack whatever file of that kind is left beside
+# the code, such as a local configuration or a comparison's output.
 [tool.setuptools.package-data]
-"*" = ["*.json", "*.md", "*.yaml"]
+"*" = ["informix_messages.json", "connector_spec.yaml", "README.md", "informix_api_doc.md"]

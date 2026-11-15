@@ -2687,22 +2687,19 @@ class StagingCredentialProviderTests(unittest.TestCase):
         with self.assertRaises(lakebase_state.StagingTokenUnavailable):
             provider.bearer()
 
-    def test_mint_stores_secret_and_revokes_earlier_updates(self):
+    def test_mint_revokes_earlier_updates_and_stores_the_token_nowhere(self):
+        # The token lives in the process that minted it. Nothing reads a stored copy, so
+        # none is written: no secret scope is created and no secret put.
         api = _StagingTokenApi()
         api.token_infos = [
             {"token_id": "old", "comment": "informix-snapshot-staging:pipe-1:upd-1"},
             {"token_id": "sibling", "comment": "informix-snapshot-staging:pipe-1:upd-2"},
         ]
-        provider, _ = self._provider(
-            api,
-            clock=lambda: 0.0,
-            secret_scope="informix",
-            secret_key="pipe-1",
-            update_id="upd-2",
-        )
+        provider, _ = self._provider(api, clock=lambda: 0.0, update_id="upd-2")
         provider.bearer()
-        self.assertIn(("informix", "pipe-1", "dapi-1"), api.secrets)
         self.assertEqual(api.deleted, ["old"])
+        self.assertEqual((api.scopes, api.secrets), ([], []))
+        self.assertFalse([path for _method, path, _body in api.calls if "/secrets/" in path])
 
     def test_refresh_revokes_its_own_previous_token_but_no_sibling(self):
         api = _StagingTokenApi()
