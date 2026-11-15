@@ -339,6 +339,12 @@ def _decode_value_bytes(data: memoryview, column: ColumnDescriptor) -> tuple[Any
         return bool(marker), 2
     if kind in {"CHAR", "NCHAR"}:
         _need(data, column.length)
+        # A NULL has no flag of its own: a change record carries it as a NUL followed by
+        # spaces (probed on 14.10: 00 20 20 ... for a NULL CHAR(8)), as a query result
+        # does, and an empty value as spaces. Told here, so that it is a NULL under every
+        # string.null.byte mode.
+        if column.length and data[0] == 0:
+            return None, column.length
         return bytes(data[: column.length]).decode(column.encoding).rstrip(" "), column.length
     if kind in {"VARCHAR", "NVARCHAR"}:
         _need(data, 1)
@@ -354,17 +360,20 @@ def _decode_value_bytes(data: memoryview, column: ColumnDescriptor) -> tuple[Any
         length = struct.unpack_from(">h", data)[0]
         # The length counts the null flag that follows it, so it is never below one. A
         # frame that says otherwise, flags a value with a payload as NULL, or carries an
-        # unknown flag on a bare one is not an LVARCHAR: it fails here, as a BOOLEAN with
-        # a bad flag does, so that a read of a reused log is told from a real value.
+        # unknown flag is not an LVARCHAR: it fails here, as a BOOLEAN with a bad flag
+        # does, so that a read of a reused log is told from a real value.
         if length < 1:
             raise CdcProtocolError(f"invalid LVARCHAR length {length}")
         _need(data, length + 2)
+        # The flag is 0 for a value of any length and 1 for a NULL (probed on 14.10:
+        # 00 06 00 "hello", 00 29 00 and forty characters, 00 01 00 for an empty value,
+        # 00 01 01 for a NULL).
         flag = data[2]
+        if flag not in {0, 1}:
+            raise CdcProtocolError(f"invalid LVARCHAR null flag {flag}")
         if flag == 1 and length != 1:
             raise CdcProtocolError("null LVARCHAR has a payload")
         if length == 1:
-            if flag not in {0, 1}:
-                raise CdcProtocolError(f"invalid LVARCHAR null flag {flag}")
             return (None if flag else ""), 3
         return bytes(data[3 : length + 2]).decode(column.encoding), length + 2
     if kind in {"DECIMAL", "NUMERIC", "MONEY"}:

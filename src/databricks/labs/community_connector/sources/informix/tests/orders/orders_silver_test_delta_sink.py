@@ -77,11 +77,21 @@ def write_orders(session, where=None):
 
 
 def marked(session):
-    # Whether the table exists and is the one this stream wrote.
-    if not session.catalog.tableExists(TARGET):
+    # Whether the table exists and is the one this stream wrote. Asked through SQL: a
+    # serverless pipeline does not allow spark.catalog.tableExists.
+    try:
+        properties = session.sql(f"SHOW TBLPROPERTIES {TARGET}").collect()
+    except Exception:  # no such table
         return False
-    properties = session.sql(f"SHOW TBLPROPERTIES {TARGET}").collect()
     return any(row.key == MARKER and row.value == STREAM for row in properties)
+
+
+def holds_rows(session, table):
+    # Whether the table has a row; None when it cannot be read (it is not there yet).
+    try:
+        return bool(session.sql(f"SELECT 1 FROM {table} LIMIT 1").collect())
+    except Exception:
+        return None
 
 
 def write_all(session):
@@ -116,10 +126,5 @@ def order_items_delta_flow():
 
 # A bronze table that is not there yet is left to the flow above to report, and a table
 # this stream did not write is left alone: the first batch replaces it.
-if (
-    marked(spark)
-    and spark.catalog.tableExists(BRONZE)
-    and spark.read.table(BRONZE).isEmpty()
-    and not spark.read.table(TARGET).isEmpty()
-):
+if marked(spark) and holds_rows(spark, BRONZE) is False and holds_rows(spark, TARGET):
     spark.sql(f"TRUNCATE TABLE {TARGET}")

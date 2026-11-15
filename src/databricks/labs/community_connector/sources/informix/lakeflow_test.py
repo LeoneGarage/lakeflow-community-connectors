@@ -861,13 +861,13 @@ class _KeyedIndexScanSource(_IndexScanSource):
     transactions insert, delete and update single rows; an update can change the index
     value, the name, the note, or several of them."""
 
-    def __init__(self, random, **kwargs):
+    def __init__(self, random, rows=30, **kwargs):
         super().__init__(random, **kwargs)
         self.names = 0
         self.freed: list[str] = []
         self.rows = [
             {"id": random.randint(1, 20), "value": self._name(), "note": random.choice("ab")}
-            for _ in range(30)
+            for _ in range(rows)
         ]
 
     def _name(self):
@@ -2567,6 +2567,68 @@ class LakeflowContractTests(unittest.TestCase):
             self.assertFalse(-result, f"seed {seed}")
         self.assertGreater(repaired, 50)
         self.assertGreater(moved_rows, 200)
+
+    def test_an_index_scan_of_a_keyed_table_ends_while_its_rows_keep_moving(self):
+        # A table whose rows never stop changing index value. Only a move the pages may
+        # hold makes a row one to read again: a row that moves after the last page was
+        # read is in the pages once, as it was, and the stream brings the move. Counting
+        # those too, every round of reads ended with rows that had just moved, and the
+        # snapshot failed after twenty (seen live on a table under a steady workload).
+        for seed in range(6):
+            random = random_module.Random(15000 + seed)
+            # Many rows, so that there is always one that has not moved yet.
+            source = _KeyedIndexScanSource(
+                random,
+                rows=600,
+                transactions=6000,
+                descending=seed % 3 == 0,
+                nulls=seed % 2 == 0,
+            )
+            raw = _table(primary_keys=())
+            raw["columns"][0]["nullable"] = source.nulls
+            raw["columns"].append({"name": "note", "type_name": "VARCHAR", "length": 20})
+            table = dataclasses.replace(
+                Table.parse(raw, "demo"), primary_keys=("value",), key_only_from_option=True
+            )
+            options = {"append.only.ingestion": "true"}
+            pages: dict = {}
+            with mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0):
+                boundary, _staged, scan, connector, table = self._index_scan(
+                    source, 100, table=table, options=options, pages=pages
+                )
+            # The workload was still going when the scan ended.
+            self.assertGreater(source.left, 1000, f"seed {seed}")
+            moved = scan["index_scan"]["moved"]
+            served = [
+                row
+                for index in sorted(pages)
+                for row in pages[index]
+                if not moved
+                or json.dumps([row["value"]]) not in moved["pages"].get(str(index), ())
+            ]
+            names = collections.Counter(row["value"] for row in served)
+            self.assertEqual(set(names.values()) - {1}, set(), f"seed {seed}")
+            transactions = informix_module._transaction_batch(source.history(boundary))[0]
+            connector._read_snapshot_stage_manifest = lambda *_, _scan=scan: _scan
+            connector._offset_scopes = lambda checkpoint: ("scope", "scope")
+            kept = connector._drop_scanned_changes(
+                table, {"commit_lsn": str(boundary), "schema_id": "s"}, options, transactions
+            )
+            result = collections.Counter(source.text(row) for row in served)
+            for tx in kept:
+                for record in tx.records:
+                    before = record.get(
+                        "before", record.get("row") if record["op"] == "DELETE" else None
+                    )
+                    after = record.get(
+                        "after", record.get("row") if record["op"] == "INSERT" else None
+                    )
+                    if before is not None:
+                        result[source.text(before)] -= 1
+                    if after is not None:
+                        result[source.text(after)] += 1
+            self.assertEqual(+result, collections.Counter(source.rows_as_text()), f"seed {seed}")
+            self.assertFalse(-result, f"seed {seed}")
 
     def test_an_index_scan_taken_up_after_a_failure_reads_its_moved_rows_again(self):
         # A scan of a keyed table that fails, while paging or while reading rows again at

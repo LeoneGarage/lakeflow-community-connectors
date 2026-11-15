@@ -14035,6 +14035,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # The index values every changed row of such a table has had since the snapshot
         # LSN, by key. A second one makes the row one of those above.
         had: dict[str, set] = {}
+        # The position after the last page read, once every page has been read. A row that
+        # changes index value after it is in the pages as it was before, once, and the
+        # stream brings the change: only a change the pages may hold makes a row one to
+        # read again. Without this a table whose rows keep changing index value would
+        # hand the scan new rows to read again for as long as it follows the changes
+        # (seen live: 20 rounds of reads, each ending with rows that had just moved).
+        scanned_to: int | None = None
         # Each page read, in scan order: its last key's order (None for the last page), the
         # positions before and after its read, and its staged page's index (None if empty).
         pages: list[tuple[tuple | None, int, int, int | None]] = []
@@ -14124,7 +14131,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                                 seen.add(_index_scan_key(image, keys))
                                 # Under a second index value, by an UPDATE or by a DELETE
                                 # and an INSERT of the same key: read again at the end.
-                                if len(seen) > 1 and name not in relocated:
+                                if (
+                                    len(seen) > 1
+                                    and name not in relocated
+                                    and (scanned_to is None or tx.commit_lsn <= scanned_to)
+                                ):
                                     if len(relocated) >= _INDEX_SCAN_MOVED_ROWS:
                                         # 442: The index-ordered snapshot of
                                         # '{}' found more than {} rows changing
@@ -14383,6 +14394,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # scan ended on. A quiet table on a busy server shows it only at the next
         # checkpoint, so the wait is bounded; a change it misses then is one the stream
         # fails on.
+        scanned_to = max((after for _bound, _before, after, _index in pages), default=boundary)
         follow(bridge.current_lsn(), proof=True)
         # The rows of ``relocated`` read again, by key: the follower's last commit before
         # the row's read, the position after it, the rows found, and whether the row was

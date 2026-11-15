@@ -150,7 +150,10 @@ class FrameTests(unittest.TestCase):
         self.assertEqual(decode_value(memoryview(b"\x00\x03\x00ab"), column), ("ab", 5))
         # Frames no LVARCHAR has: no room for the flag, a NULL with a payload, and an
         # unknown flag on a value with none.
-        for frame in (b"\x00\x00\x00", b"\x00\x03\x01ab", b"\x00\x01\x07"):
+        # The frames a live server sent for 'hello', forty characters, '', and a NULL.
+        self.assertEqual(decode_value(memoryview(bytes.fromhex("00060068656c6c6f")), column), ("hello", 8))
+        self.assertEqual(decode_value(memoryview(bytes.fromhex("002900") + b"x" * 40), column), ("x" * 40, 43))
+        for frame in (b"\x00\x00\x00", b"\x00\x03\x01ab", b"\x00\x01\x07", b"\x00\x03\x07ab"):
             with self.assertRaises(CdcProtocolError):
                 decode_value(memoryview(frame), column)
         self.assertEqual(
@@ -566,6 +569,21 @@ class SqliPacketTests(unittest.TestCase):
         execute_command.assert_called_once_with(
             "/* mutation */\n-- owned SQL\nUPDATE t SET value = 1"
         )
+
+    def test_a_null_char_in_a_change_record_is_a_null_under_every_null_byte_mode(self):
+        # As a live server sent them: 00 20 20 20 for a NULL CHAR(4), spaces for an empty
+        # one, the text padded with spaces otherwise.
+        column = ColumnDescriptor("nc", "CHAR", 4)
+        for mode in ("null", "empty", "keep"):
+            self.assertEqual(
+                decode_value(memoryview(bytes.fromhex("00202020")), column, null_byte=mode), (None, 4)
+            )
+            self.assertEqual(
+                decode_value(memoryview(bytes.fromhex("20202020")), column, null_byte=mode), ("", 4)
+            )
+            self.assertEqual(
+                decode_value(memoryview(bytes.fromhex("78202020")), column, null_byte=mode), ("x", 4)
+            )
 
     def test_a_null_char_is_a_null_under_every_null_byte_mode(self):
         # Informix sends a NULL CHAR as a NUL followed by spaces (probed live: 00 20 20
