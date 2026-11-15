@@ -822,8 +822,13 @@ def _connector_sql(sql: str, parameters: tuple) -> str:
             if len(literal) > 32767:
                 raise ValueError("Informix DECIMAL parameter exceeds SQL literal bound")
         elif isinstance(value, datetime):
+            # A decoded year-1 value carries UTC (see cdc_protocol's datetime rendering):
+            # an Informix DATETIME has no zone, so UTC is its wall clock. Any other
+            # zone is not one the connector made.
             if value.tzinfo is not None:
-                raise ValueError("Informix DATETIME parameters must be timezone-free")
+                if value.utcoffset():
+                    raise ValueError("Informix DATETIME parameters must be timezone-free")
+                value = value.replace(tzinfo=None)
             fraction = value.microsecond // 10
             literal = f"DATETIME({value:%Y-%m-%d %H:%M:%S}.{fraction:05d}) " "YEAR TO FRACTION(5)"
         elif isinstance(value, date):
@@ -1968,10 +1973,10 @@ class InformixSqliClient:
         #
         # One answer for both the fetch request and the tuple decode. An LVARCHAR or
         # opaque column (types 40, 41, 43, 46; BOOLEAN is one, also typed 45) always makes
-        # the layout variable, and its VARCHARs then come length-prefixed, padVarchar or
-        # not: a live server sent them so even for the fixed fetch, which the decode had
-        # read as padded. Otherwise VARCHARs make it variable unless padVarchar asks for
-        # padding. The kinds match the ones _read_tuple reads as variable envelopes.
+        # the layout variable, padVarchar or not. Otherwise VARCHARs make it variable
+        # unless padVarchar asks for the fixed one. Under padVarchar a VARCHAR is padded
+        # to its full width in either layout (see _read_tuple). The kinds match the ones
+        # _read_tuple reads as variable envelopes.
 
         return any(
             (column.type_code & 0xFF) in {40, 41, 43, 45, 46}

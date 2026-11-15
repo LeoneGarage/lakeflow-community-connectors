@@ -1548,6 +1548,60 @@ class LakebaseProjectNamingTests(unittest.TestCase):
         api.request.assert_any_call("DELETE", "/api/2.0/postgres/projects/informix-state-old")
         connection.close.assert_called_once()
 
+    def test_the_project_sweep_reads_every_page_and_as_the_state_role(self):
+        # The listing comes in pages, and the records belong to the state role: the
+        # provisioning identity takes that role to read them, granting it to itself first
+        # where it must.
+        lakebase_state.LakebaseState._project_gc_checked.clear()
+        state = lakebase_state.LakebaseState({}, "current")
+        api = mock.MagicMock()
+        api.request.side_effect = [
+            {"projects": [{"name": "projects/other"}], "next_page_token": "p/2"},
+            {"projects": [{"name": "projects/informix-state-old"}]},
+            {"name": "operations/delete"},
+        ]
+        state._api_client = mock.Mock(return_value=api)
+        connection = mock.MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = (1, 1, 1.0)
+        refused = [True]
+
+        def execute(statement, *args):
+            if statement == "SET ROLE informix_state_user" and refused:
+                refused.clear()
+                raise RuntimeError("permission denied to set role")
+
+        cursor.execute.side_effect = execute
+        state._open = mock.Mock(return_value=connection)
+        state._admin_user = mock.Mock(return_value="admin")
+        with (
+            mock.patch.object(
+                lakebase_state,
+                "_endpoint_facts",
+                return_value={"endpoint": "endpoint", "host": "host"},
+            ),
+            mock.patch.object(lakebase_state, "generate_credential", return_value="token"),
+            mock.patch.object(lakebase_state.time, "time", return_value=100_000_000),
+        ):
+            self.assertEqual(state.collect_unused_projects(90, 24), 1)
+        self.assertEqual(
+            [call.args[:2] for call in api.request.call_args_list[:2]],
+            [
+                ("GET", "/api/2.0/postgres/projects"),
+                ("GET", "/api/2.0/postgres/projects?page_token=p%2F2"),
+            ],
+        )
+        statements = [call.args[0] for call in cursor.execute.call_args_list[:3]]
+        self.assertEqual(
+            statements,
+            [
+                "SET ROLE informix_state_user",
+                "GRANT informix_state_user TO CURRENT_USER",
+                "SET ROLE informix_state_user",
+            ],
+        )
+        connection.rollback.assert_called_once()
+
     def test_a_deleted_project_is_skipped_and_a_failed_delete_does_not_fail_the_read(self):
         # A deleted project lingers in the list with no endpoint; waiting for one would block
         # the read that runs the GC. A delete that fails is skipped like any other candidate.
@@ -2700,6 +2754,39 @@ class StagingCredentialProviderTests(unittest.TestCase):
         self.assertEqual(api.deleted, ["old"])
         self.assertEqual((api.scopes, api.secrets), ([], []))
         self.assertFalse([path for _method, path, _body in api.calls if "/secrets/" in path])
+
+    def test_one_process_an_update_revokes_the_earlier_updates_tokens(self):
+        # Every flow process of an update mints at once. Each used to list the tokens and
+        # delete every earlier update's, the same ones as its siblings. The one that
+        # takes the update's claim does it now; the others leave them.
+        earlier = [
+            {"token_id": "old", "comment": "informix-snapshot-staging:pipe-1:upd-1"},
+            {"token_id": "sibling", "comment": "informix-snapshot-staging:pipe-1:upd-2"},
+        ]
+        for claimed, deleted in ((True, ["old"]), (False, [])):
+            api = _StagingTokenApi()
+            api.token_infos = list(earlier)
+            asked = []
+            provider, _ = self._provider(
+                api,
+                clock=lambda: 0.0,
+                update_id="upd-2",
+                sweeps_earlier_updates=lambda claimed=claimed: asked.append(1) or claimed,
+            )
+            provider.bearer()
+            self.assertEqual((asked, api.deleted), ([1], deleted))
+        # A claim that cannot be asked is taken as held: a token left behind lives a day.
+        api = _StagingTokenApi()
+        api.token_infos = list(earlier)
+
+        def broken():
+            raise RuntimeError("Lakebase is away")
+
+        provider, _ = self._provider(
+            api, clock=lambda: 0.0, update_id="upd-2", sweeps_earlier_updates=broken
+        )
+        provider.bearer()
+        self.assertEqual(api.deleted, ["old"])
 
     def test_refresh_revokes_its_own_previous_token_but_no_sibling(self):
         api = _StagingTokenApi()

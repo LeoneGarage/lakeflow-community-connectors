@@ -463,6 +463,9 @@ class _OfflineLakebase:
 
         from databricks.labs.community_connector.sources.informix import lakebase_state
 
+        # A process keeps one staging credential provider an update; each test is its own.
+        informix_module._STAGING_PROVIDERS.clear()
+
         facts = {
             "endpoint": "projects/offline/branches/production/endpoints/primary",
             "host": "offline.invalid",
@@ -2540,6 +2543,10 @@ class LakeflowContractTests(unittest.TestCase):
             ]
             # The page they were read into again holds them, and leaves none of them out.
             self.assertTrue(not moved or str(moved["page"]) not in moved["pages"])
+            # The scan says how many staged copies the pages leave out, so that the
+            # snapshot's row count is that of the rows served.
+            staged_count = sum(len(rows) for rows in pages.values())
+            self.assertEqual(staged_count - scan.get("left_out_rows", 0), len(served), f"seed {seed}")
             names = collections.Counter(row["value"] for row in served)
             self.assertEqual(set(names.values()) - {1}, set(), f"seed {seed}")
             repaired += bool(moved and moved["page"] is not None)
@@ -2891,6 +2898,88 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(connector._naming_scan({}, table, scope, schema, {}), {})
         self.assertEqual(connector._naming_scan({}, table, scope, schema, {"index_scan": False}), {})
         self.assertEqual(len(reads), 1)
+
+    def test_a_snapshot_source_is_held_to_a_volume_path_without_traversal(self):
+        # A pipeline author sets snapshot.source per table. It is read as files, on the
+        # mount or through the Files API, so it gets the staging location's rule: a path
+        # that steps out with ".." could name a file of the compute's own, or another
+        # workspace API under the caller's token.
+        connector = self.connector(FakeBridge())
+        for bad in ("/Volumes/../../api/2.0/token/list", "/Volumes/main/s/v/../../../x", "relative/x"):
+            with self.assertRaises(ValueError):
+                connector._table_snapshot_source({"snapshot.source": bad})
+            with self.assertRaises(ValueError):
+                type(connector)._validate_unl_source_options({"snapshot.source": bad})
+        self.assertEqual(
+            connector._table_snapshot_source({"snapshot.source": "/Volumes/main/s/v/extract/"}),
+            "/Volumes/main/s/v/extract",
+        )
+        self.assertIsNone(connector._table_snapshot_source({}))
+        with self.assertRaises(ValueError):
+            informix_module._unl_split_read_chunk({"path": "/Volumes/main/s/v/../x.unl"})
+
+    def test_keys_with_a_year_one_datetime_compare_with_any_other(self):
+        # A decoded year-1 DATETIME carries UTC and any other no zone; Python will not
+        # compare the two, and a key column can hold both.
+        early = datetime(1, 1, 1, tzinfo=timezone.utc)
+        later = datetime(2026, 1, 1)
+        order = informix_module._order_key
+        self.assertLess(order([early], []), order([later], []))
+        self.assertLess(order([later], [True]), order([early], [True]))
+
+    def test_the_database_name_is_a_plain_identifier(self):
+        # It goes into every statement unquoted, before the colon.
+        base = {"hostname": "h", "user": "u", "password": "p", "server": "s"}
+        for name in ("testdb", "stores_demo", "db$1"):
+            self.assertEqual(informix_module._bridge_config({**base, "database": name})["database"], name)
+        for name in ("a.b", "x:y", "db name", "1db", "db;drop"):
+            with self.assertRaisesRegex(ValueError, "plain Informix database name"):
+                informix_module._bridge_config({**base, "database": name})
+
+    def test_round_to_a_negative_digit_widens_an_integer(self):
+        # 2147483647 rounded to the thousand is 2147484000, past the largest INTEGER: the
+        # column lands as a BIGINT. Rounding to no digit, or to decimals, cannot pass it.
+        column = Table.parse(_table(), "demo").columns[0]
+        kind = lambda *literals: type(  # noqa: E731
+            informix_module._transform_spark_type(
+                ("call", "ROUND", ["id", *[("number", value) for value in literals]]), column, {}
+            )
+        ).__name__
+        self.assertEqual(kind(-3), "LongType")
+        self.assertEqual(kind(), "IntegerType")
+        self.assertEqual(kind(2), "IntegerType")
+
+    def test_no_connection_option_names_code_to_load(self):
+        # bridge.factory and transport.factory imported a module and handed its callable
+        # every connection option, passwords included: whoever could set an option could
+        # run code on the compute. Both are refused now; a test injects a bridge in code.
+        base = {"hostname": "h", "user": "u", "password": "p", "server": "s", "database": "d"}
+        with self.assertRaisesRegex(ValueError, "'transport.factory' is not accepted"):
+            PurePythonInformixBridge({**base, "transport.factory": "os:getcwd"})
+        connector = self.connector(FakeBridge())
+        connector.options["bridge.factory"] = "os:getcwd"
+        connector._bridge_instance = None
+        with self.assertRaisesRegex(ValueError, "'bridge.factory' is not accepted"):
+            connector._bridge  # pylint: disable=pointless-statement
+
+    def test_a_blank_port_is_the_default_port(self):
+        base = {"hostname": "h", "user": "u", "password": "p", "server": "s", "database": "d"}
+        self.assertEqual(informix_module._bridge_config({**base, "port": ""})["port"], 9088)
+        self.assertEqual(informix_module._bridge_config({**base, "port": "9089"})["port"], 9089)
+
+    def test_a_process_keeps_one_staging_credential_provider_an_update(self):
+        # A drain worker makes a reader a table and a shard daemon one a burst. Each
+        # reader minting its own token left a day-long token behind every time: they
+        # share one provider now, by host, pipeline, update and lifetime.
+        options = {"lakebase.workspace.host": "https://ws", "lakebase.workspace.token": "t"}
+        first = self.connector(FakeBridge(), **options)
+        second = self.connector(FakeBridge(), **options)
+        provider = first._build_staging_credential_provider(required=True)
+        self.assertIs(second._build_staging_credential_provider(required=True), provider)
+        other = self.connector(FakeBridge(), registration_scope="another-update", **options)
+        self.assertIsNot(other._build_staging_credential_provider(required=True), provider)
+        # Never shipped to a worker: a provider holds a token and a lock.
+        self.assertEqual(pickle.loads(pickle.dumps(informix_module._STAGING_PROVIDERS)), {})
 
     def test_a_snapshot_scan_names_each_column_once(self):
         self.assertIsNone(informix_module._snapshot_scan_columns("keyset(id, id)"))
@@ -19104,6 +19193,45 @@ class ConnectionSlotLeaseLossTests(unittest.TestCase):
         )
         self.assertEqual(released, [True])
 
+    def test_an_operation_that_outlives_the_shutdown_still_finds_its_lease_lost(self):
+        # The shutdown waits a bounded time for the operation in flight, then closes the
+        # transport under it. Clearing the loss then let that operation return a result
+        # read without a slot, or take the closed socket for a network drop and retry in
+        # place. The loss now stands until an operation has seen it; the next connects.
+        bridge = self._bridge()
+        bridge._release_connection_slot = lambda: None
+        started, proceed = threading.Event(), threading.Event()
+
+        @informix_module._serialized_sqli_operation
+        def operation(self, wait):
+            if wait:
+                started.set()
+                proceed.wait(5)
+            return "rows"
+
+        outcome = []
+
+        def run():
+            try:
+                outcome.append(operation(bridge, True))
+            except Exception as error:  # the test reports what the operation got
+                outcome.append(error)
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        self.assertTrue(started.wait(5))
+        with mock.patch.object(informix_module, "_POISON_OPERATION_LOCK_SECONDS", 0.05):
+            bridge._poison_connection_slot_lease()
+        # Closed under the operation, and the loss still stands for it.
+        bridge.transport.close.assert_called_once()
+        self.assertTrue(bridge._connection_lease_lost.is_set())
+        proceed.set()
+        worker.join(5)
+        self.assertIsInstance(outcome[0], ConnectionCapacityUnavailable)
+        # Seen once: the next operation is free to connect afresh.
+        self.assertFalse(bridge._connection_lease_lost.is_set())
+        self.assertEqual(operation(bridge, False), "rows")
+
     def test_heartbeat_reports_lease_loss_when_renewal_is_rejected(self):
         bridge = self._bridge()
         reported = []
@@ -19387,6 +19515,32 @@ class SharedCdcShardTests(unittest.TestCase):
         view = shard.snapshot(self.id_a, 0)
         self.assertEqual([tx.tx_id for tx in view.committed], [1])
         self.assertEqual(view.fingerprint, _schema_fingerprint(self.table_a))
+
+    def test_a_second_column_selection_of_a_table_does_not_take_over_its_shard_entry(self):
+        # Two flows of one pipeline can read a table with different include_columns or
+        # exclude_columns, so with different captures. That looked like a schema change:
+        # each flow's poll dropped the other's buffer and coverage, and neither was ever
+        # served by the shard. The shard keeps the first one's, and the other reads
+        # directly; a real schema change of the first flow still starts the table over.
+        shard = self._shard_with_two_tables()
+        shard.ingest(self._two_table_stream(), self._schema_map(), 1, 106, 0)
+        narrowed = informix_module._apply_column_selection(self.table_a, ("include", ("id",)))
+        self.assertNotEqual(_capture_descriptor(narrowed), _capture_descriptor(self.table_a))
+
+        for _poll in range(3):
+            shard.subscribe(self.id_a, narrowed, _capture_descriptor(narrowed), 0, 0)
+            shard.subscribe(self.id_a, self.table_a, _capture_descriptor(self.table_a), 0, 0)
+
+        self.assertIs(shard.subscribers[self.id_a]["table"], self.table_a)
+        self.assertEqual(len(shard.buffers[self.id_a]), 1)
+        view = shard.snapshot(self.id_a, 0)
+        self.assertEqual([tx.tx_id for tx in view.committed], [1])
+        self.assertEqual(view.fingerprint, _schema_fingerprint(self.table_a))
+        # The table itself changing, under the same selection, is still taken as that.
+        changed = dataclasses.replace(self.table_a, columns=self.table_a.columns[:1])
+        shard.subscribe(self.id_a, changed, _capture_descriptor(changed), 0, 0)
+        self.assertIs(shard.subscribers[self.id_a]["table"], changed)
+        self.assertFalse(shard.buffers.get(self.id_a))
 
     def test_per_table_cursor_blocks_reread_duplicates(self):
         shard = self._shard_with_two_tables()

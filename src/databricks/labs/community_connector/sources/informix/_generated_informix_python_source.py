@@ -1969,6 +1969,7 @@ def register_lakeflow_source(spark):
             lifetime_seconds: int = _DEFAULT_STAGING_TOKEN_LIFETIME_SECONDS,
             clock: Any = time.monotonic,
             update_id: str = "",
+            sweeps_earlier_updates: Any = None,
         ) -> None:
             self._host = host.rstrip("/")
             self._bootstrap_token = bootstrap_token
@@ -1977,6 +1978,10 @@ def register_lakeflow_source(spark):
             self._lifetime_seconds = max(_STAGING_TOKEN_MIN_LIFETIME_SECONDS, int(lifetime_seconds))
             self._refresh_after = self._lifetime_seconds * _STAGING_TOKEN_REFRESH_FRACTION
             self._clock = clock
+            # Asked once, at the first mint: whether this process is the one to revoke the
+            # tokens of the pipeline's earlier updates. Every flow process of an update
+            # starts at once, and without it each listed and deleted every one of them.
+            self._sweeps_earlier_updates = sweeps_earlier_updates
             self._lock = threading.Lock()
             self._token: str | None = None
             self._token_id = ""
@@ -2035,10 +2040,23 @@ def register_lakeflow_source(spark):
             self.rejected = False
             lifetime = min(self._lifetime_seconds, granted) if granted else self._lifetime_seconds
             self._refresh_after = lifetime * _STAGING_TOKEN_REFRESH_FRACTION
-            # Rotation with the new token: revoke this provider's previous token and
-            # earlier updates' tokens, best-effort inside the helper.
-            new_api = _WorkspaceApi(self._host, token)
-            revoke_stale_staging_tokens(new_api, self._pipeline_id, self._update_id, predecessor_id)
+            # Rotation with the new token: revoke this provider's previous token and, when
+            # this process is the one to, earlier updates' tokens; best-effort inside the
+            # helper. A refresh has only its own predecessor to revoke.
+            earlier = not predecessor_id
+            if earlier and self._sweeps_earlier_updates is not None:
+                try:
+                    earlier = bool(self._sweeps_earlier_updates())
+                except Exception:  # pylint: disable=broad-except
+                    # Not knowing, sweep: a token left behind lives until it expires.
+                    _LOGGER.debug("Could not claim the staging token sweep", exc_info=True)
+            if earlier or predecessor_id:
+                revoke_stale_staging_tokens(
+                    _WorkspaceApi(self._host, token),
+                    self._pipeline_id,
+                    self._update_id if earlier else "",
+                    predecessor_id,
+                )
 
 
     class WorkspaceFilesApi:
@@ -2476,6 +2494,12 @@ def register_lakeflow_source(spark):
             self._project_id = options.get(
                 "lakebase.project.id", ""
             ).strip() or project_id_for_connection(connection_identity)
+            # The id goes into workspace API paths and queries as it is.
+            if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", self._project_id) is None:
+                raise LakebaseStateError(
+                    "lakebase.project.id must be 1 to 63 lowercase letters, digits or hyphens, "
+                    "starting with a letter or digit"
+                )
             self._min_cu = float(options.get("lakebase.autoscale.min.cu", _DEFAULT_MIN_CU))
             self._max_cu = float(options.get("lakebase.autoscale.max.cu", _DEFAULT_MAX_CU))
             self._suspend_seconds = int(
@@ -2636,13 +2660,26 @@ def register_lakeflow_source(spark):
             # Housekeeping on the read path, run a day apart by default: a listing that fails
             # (the reader's workspace token can have expired by then) skips this sweep rather
             # than failing the read, as a failed project below is skipped too.
+            projects: list = []
             try:
                 api = self._api_client()
-                response = api.request("GET", "/api/2.0/postgres/projects") or {}
+                path = "/api/2.0/postgres/projects"
+                # Every page of the listing: a workspace with many projects has more than one.
+                for _page in range(1000):
+                    response = api.request("GET", path) or {}
+                    if isinstance(response, list):
+                        projects += response
+                        break
+                    projects += response.get("projects") or []
+                    token = response.get("next_page_token")
+                    if not token:
+                        break
+                    path = "/api/2.0/postgres/projects?page_token=" + urllib.parse.quote(
+                        str(token), safe=""
+                    )
             except Exception:
                 _LOGGER.warning("Skipping Lakebase project GC: listing projects failed", exc_info=True)
                 return 0
-            projects = response if isinstance(response, list) else response.get("projects", [])
             deleted = 0
             for project in projects:
                 name = str((project or {}).get("name") or (project or {}).get("id") or "")
@@ -2658,6 +2695,22 @@ def register_lakeflow_source(spark):
                     facts = _endpoint_facts(api, project_id, deadline=time.monotonic() + 60)
                     token = generate_credential(api, facts["endpoint"])
                     connection = self._open(facts, self._admin_user(), token)
+                    # The records belong to the state role, and the provisioning identity
+                    # holds CREATEROLE, not superuser: it reads them as that role where it
+                    # may take it, granting itself the role it created first if need be.
+                    # Where it may not (another identity's project) the read below fails
+                    # and the candidate is skipped.
+                    for statements in (
+                        (f"SET ROLE {STATE_ROLE}",),
+                        (f"GRANT {STATE_ROLE} TO CURRENT_USER", f"SET ROLE {STATE_ROLE}"),
+                    ):
+                        try:
+                            with connection.cursor() as cursor:
+                                for statement in statements:
+                                    cursor.execute(statement)
+                            break
+                        except Exception:  # pylint: disable=broad-except
+                            connection.rollback()
                     with connection.cursor() as cursor:
                         cursor.execute(
                             """
@@ -3860,7 +3913,9 @@ def register_lakeflow_source(spark):
             _LOGGER.debug("Could not resolve the calling identity from the workspace", exc_info=True)
             return ""
         body = response or {}
-        return str(body.get("userName") or body.get("id") or "").strip()
+        # A service principal has no userName: its OAuth role in Lakebase is its application
+        # id, not the numeric id SCIM gives it.
+        return str(body.get("userName") or body.get("applicationId") or body.get("id") or "").strip()
 
 
     ########################################################
@@ -4653,8 +4708,13 @@ def register_lakeflow_source(spark):
                 if len(literal) > 32767:
                     raise ValueError("Informix DECIMAL parameter exceeds SQL literal bound")
             elif isinstance(value, datetime):
+                # A decoded year-1 value carries UTC (see cdc_protocol's datetime rendering):
+                # an Informix DATETIME has no zone, so UTC is its wall clock. Any other
+                # zone is not one the connector made.
                 if value.tzinfo is not None:
-                    raise ValueError("Informix DATETIME parameters must be timezone-free")
+                    if value.utcoffset():
+                        raise ValueError("Informix DATETIME parameters must be timezone-free")
+                    value = value.replace(tzinfo=None)
                 fraction = value.microsecond // 10
                 literal = f"DATETIME({value:%Y-%m-%d %H:%M:%S}.{fraction:05d}) " "YEAR TO FRACTION(5)"
             elif isinstance(value, date):
@@ -5799,10 +5859,10 @@ def register_lakeflow_source(spark):
             #
             # One answer for both the fetch request and the tuple decode. An LVARCHAR or
             # opaque column (types 40, 41, 43, 46; BOOLEAN is one, also typed 45) always makes
-            # the layout variable, and its VARCHARs then come length-prefixed, padVarchar or
-            # not: a live server sent them so even for the fixed fetch, which the decode had
-            # read as padded. Otherwise VARCHARs make it variable unless padVarchar asks for
-            # padding. The kinds match the ones _read_tuple reads as variable envelopes.
+            # the layout variable, padVarchar or not. Otherwise VARCHARs make it variable
+            # unless padVarchar asks for the fixed one. Under padVarchar a VARCHAR is padded
+            # to its full width in either layout (see _read_tuple). The kinds match the ones
+            # _read_tuple reads as variable envelopes.
 
             return any(
                 (column.type_code & 0xFF) in {40, 41, 43, 45, 46}
@@ -6483,6 +6543,25 @@ def register_lakeflow_source(spark):
     )
     _UNLOAD_FLOAT_TYPES = frozenset({"FLOAT", "SMALLFLOAT", "REAL", "DOUBLE", "DOUBLE PRECISION"})
     _SNAPSHOT_STAGING_TOKEN_LIFETIME_OPTION = "snapshot.staging.token.lifetime.seconds"
+    # How long an update's claim on revoking earlier updates' staging tokens holds: for good,
+    # as far as the update goes.
+    _STAGING_TOKEN_SWEEP_CLAIM_SECONDS = 30 * 86400
+
+
+    class _StagingProviders(dict):
+        # Docstring: This process's staging credential providers, by host, pipeline, update and
+        # token lifetime. Never shipped: Spark pickles the merged source's globals to every
+        # worker, and a provider holds a token and a lock, so it pickles as empty.
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.lock = threading.Lock()
+
+        def __reduce__(self):
+            return (_StagingProviders, ())
+
+
+    _STAGING_PROVIDERS = _StagingProviders()
     # Walks a completed snapshot stage's removal may take when background page deletes keep
     # cutting it short (see _cleanup_completed_snapshot_stage); each walk removes more.
     _SNAPSHOT_STAGE_CLEANUP_ATTEMPTS = 5
@@ -7560,17 +7639,30 @@ def register_lakeflow_source(spark):
                 return method(self, *args, **kwargs)
             with lock:
                 lease_lost = getattr(self, "_connection_lease_lost", None)
-                if lease_lost is not None and lease_lost.is_set():
+
+                def lost() -> bool:
+                    # Whether the lease is lost. A shutdown that gave up waiting for this
+                    # lock leaves the loss standing for an operation to see (see
+                    # _poison_connection_slot_lease): the one that sees it after the shutdown
+                    # is over takes it down, so that the next can connect afresh.
+                    if lease_lost is None or not lease_lost.is_set():
+                        return False
+                    if getattr(self, "_lease_loss_unseen", False):
+                        self._lease_loss_unseen = False
+                        lease_lost.clear()
+                    return True
+
+                if lost():
                     # 12: Informix connection-capacity lease was lost before the SQLI operation
                     raise ConnectionCapacityUnavailable(_m(12))
                 try:
                     result = method(self, *args, **kwargs)
                 except BaseException as error:
-                    if lease_lost is not None and lease_lost.is_set():
+                    if lost():
                         # 13: Informix connection-capacity lease was lost during the SQLI operation
                         raise ConnectionCapacityUnavailable(_m(13)) from error
                     raise
-                if lease_lost is not None and lease_lost.is_set():
+                if lost():
                     # 13: Informix connection-capacity lease was lost during the SQLI operation
                     raise ConnectionCapacityUnavailable(_m(13))
                 return result
@@ -7620,8 +7712,8 @@ def register_lakeflow_source(spark):
     class PurePythonInformixBridge:
         # Docstring: Pure-Python SQLI/CDC bridge validated against disposable Informix 15.
         #
-        # Tests can inject ``transport.factory=module:callable`` without changing
-        # Lakeflow or CDC decoding code.
+        # A test gives it a transport of its own by setting ``transport`` on an instance, or
+        # replaces the bridge with set_bridge_factory: no connection option names code to load.
 
         def __init__(self, options: dict[str, str]) -> None:
             self.options = options
@@ -7633,39 +7725,36 @@ def register_lakeflow_source(spark):
             # Resolved once and applied in both decode paths: the CDC decode via decode_frame
             # (see read_changes) and the snapshot/query decode inside the SQLI client.
             self._null_byte = _null_byte_mode(options)
-            factory_path = options.get("transport.factory")
-            if factory_path:
-                self.transport = _load_factory(factory_path)(options)
-            else:
-                provider_path = options.get("authentication.provider.factory")
-                provider = (
-                    _load_factory(provider_path)(options)
-                    if provider_path
-                    else PasswordAuthenticationProvider(
-                        self.config["password"], options.get("authentication.pam.echo.response")
-                    )
+            _refuse_code_loading_options(options)
+            provider_path = options.get("authentication.provider.factory")
+            provider = (
+                _load_factory(provider_path)(options)
+                if provider_path
+                else PasswordAuthenticationProvider(
+                    self.config["password"], options.get("authentication.pam.echo.response")
                 )
-                self.transport = InformixSqliClient(
-                    self.config["hostname"],
-                    self.config["port"],
-                    self.config["database"],
-                    self.config["user"],
-                    self.config["password"],
-                    server_name=self.config["server"],
-                    db_locale=self.config["db_locale"],
-                    client_locale=self.config["client_locale"],
-                    tls=self.config["tls"],
-                    ca_file=self.config["ca_file"],
-                    pad_varchar=self.config["pad_varchar"],
-                    null_byte=self._null_byte,
-                    authentication_mode=authentication,
-                    authentication_provider=provider,
-                    pam_max_rounds=int(options.get("authentication.pam.max.rounds", "16")),
-                    login_timeout=float(options.get("authentication.login.timeout", "30")),
-                    redirect_enabled=_option_bool(options, "redirect.enabled", False),
-                    redirect_allowlist=_redirect_allowlist(options.get("redirect.allowlist", "")),
-                    redirect_max=int(options.get("redirect.max", "3")),
-                )
+            )
+            self.transport = InformixSqliClient(
+                self.config["hostname"],
+                self.config["port"],
+                self.config["database"],
+                self.config["user"],
+                self.config["password"],
+                server_name=self.config["server"],
+                db_locale=self.config["db_locale"],
+                client_locale=self.config["client_locale"],
+                tls=self.config["tls"],
+                ca_file=self.config["ca_file"],
+                pad_varchar=self.config["pad_varchar"],
+                null_byte=self._null_byte,
+                authentication_mode=authentication,
+                authentication_provider=provider,
+                pam_max_rounds=int(options.get("authentication.pam.max.rounds", "16")),
+                login_timeout=float(options.get("authentication.login.timeout", "30")),
+                redirect_enabled=_option_bool(options, "redirect.enabled", False),
+                redirect_allowlist=_redirect_allowlist(options.get("redirect.allowlist", "")),
+                redirect_max=int(options.get("redirect.max", "3")),
+            )
             self._connected = False
             self._connect_lock = threading.Lock()
             self._operation_lock = threading.RLock()
@@ -8262,6 +8351,8 @@ def register_lakeflow_source(spark):
                 lease_lost.set()
             operation_lock = getattr(self, "_operation_lock", None)
             context: Any = contextlib.nullcontext()
+            # Whether an operation is still in flight when the transport is closed under it.
+            in_flight = False
             if operation_lock is not None:
                 # Bound the wait for the active operation. The lease is already
                 # published as lost, so the operation's wrapper will discard its result
@@ -8275,6 +8366,7 @@ def register_lakeflow_source(spark):
                     context = contextlib.ExitStack()
                     context.callback(operation_lock.release)
                 else:
+                    in_flight = True
                     # 25: Informix connection-slot lease loss could not take the operation lock within
                     # {:.0f}s; closing the transport while an operation is still in flight: {}
                     logging.getLogger(__name__).warning(
@@ -8299,7 +8391,14 @@ def register_lakeflow_source(spark):
                     finally:
                         self._release_connection_slot()
                         if lease_lost is not None:
-                            lease_lost.clear()
+                            if in_flight:
+                                # The operation still running must find the lease lost when
+                                # it ends, or it would return a result read without a slot,
+                                # or take the closed socket for a network drop and retry in
+                                # place. The loss stands until an operation has seen it.
+                                self._lease_loss_unseen = True
+                            else:
+                                lease_lost.clear()
 
         @classmethod
         def _remove_connection_slot_tree(cls, path: str) -> None:
@@ -10160,9 +10259,15 @@ def register_lakeflow_source(spark):
         if missing:
             # 61: Missing required Informix option(s): {}
             raise ValueError(_m(61, (", ".join(missing))))
+        if _BARE_IDENTIFIER.fullmatch(str(options["database"])) is None:
+            # The database goes into every statement as it is, before the colon: it cannot be
+            # quoted there as an owner, table or column name is.
+            # 447: Option 'database' must be a plain Informix database name (letters, digits,
+            # underscores and $, not starting with a digit): {!r}
+            raise ValueError(_m(447, options["database"]))
         return {
             "hostname": options["hostname"],
-            "port": int(options.get("port", "9088")),
+            "port": int(options.get("port") or 9088),
             "database": options["database"],
             "user": options["user"],
             "password": options["password"],
@@ -10497,6 +10602,14 @@ def register_lakeflow_source(spark):
         # unaffected. Otherwise DESC columns are wrapped so tuple comparison reproduces
         # the index's own scan order.
 
+        # A decoded year-1 DATETIME carries UTC and every other one no zone, and Python
+        # refuses to compare the two: the zone is dropped, the wall clock being the value.
+        values = [
+            value.replace(tzinfo=None)
+            if isinstance(value, datetime) and value.tzinfo is not None
+            else value
+            for value in values
+        ]
         if not descending or not any(descending):
             return tuple(values)
         return tuple(
@@ -11009,6 +11122,12 @@ def register_lakeflow_source(spark):
         if name == "ROUND" and isinstance(inner, DecimalType):
             # Rounding up can carry into one more integer digit (999.99 to 1000).
             return DecimalType(min(inner.precision + 1, 38), inner.scale)
+        if name == "ROUND" and isinstance(inner, IntegerType):
+            # To a negative digit it can pass the largest INTEGER (2147483647 to the
+            # thousand is 2147484000): the column lands as a BIGINT then.
+            literals = operand[2][1:]
+            if literals and int(literals[0][1]) < 0:
+                return LongType()
         return inner
 
 
@@ -12993,6 +13112,17 @@ def register_lakeflow_source(spark):
                     # changes the capture): the shard keeps the first one's table, buffer and
                     # coverage, and this one reads directly, rejecting the view's layout.
                     return
+                if (
+                    existing is not None
+                    and existing["capture"] != capture
+                    and existing["table"].column_selection != table.column_selection
+                ):
+                    # Another flow reading the table with other columns (include_columns or
+                    # exclude_columns): its capture differs for good, not because the table
+                    # changed. Taking it for a schema change, each flow dropped the other's
+                    # buffer and coverage at every poll, and neither was ever served. The
+                    # shard keeps the first one's, and this one reads directly.
+                    return
                 if existing is not None and existing["capture"] != capture:
                     # The table's columns changed (its consumer moved to a new schema): what
                     # was buffered under the old capture lacks the new columns, so drop it and
@@ -14508,7 +14638,7 @@ def register_lakeflow_source(spark):
             if not 0 <= daemon_reservation < slot_count:
                 # 17: Option '{}' must be >= 0 and < max.concurrent.connections ({})
                 raise ValueError(_m(17, _DAEMON_RESERVATION_OPTION, slot_count))
-            port = int(options.get("port", "9088"))
+            port = int(options.get("port") or 9088)
             if not 1 <= port <= 65535:
                 # 164: Option 'port' must be between 1 and 65535
                 raise ValueError(_m(164))
@@ -14760,9 +14890,8 @@ def register_lakeflow_source(spark):
         @property
         def _bridge(self) -> InformixBridge:
             if self._bridge_instance is None:
-                factory_path = self.options.get("bridge.factory")
-                factory = _load_factory(factory_path) if factory_path else _bridge_factory
-                self._bridge_instance = factory(self.options)
+                _refuse_code_loading_options(self.options)
+                self._bridge_instance = _bridge_factory(self.options)
             return self._bridge_instance
 
         @contextlib.contextmanager
@@ -17484,7 +17613,7 @@ def register_lakeflow_source(spark):
                 (
                     "v2",
                     self.options.get("hostname", "").strip().rstrip(".").casefold(),
-                    str(int(self.options.get("port", "9088"))),
+                    str(int(self.options.get("port") or 9088)),
                     self.options.get("server", "").strip(),
                     self.options.get("database", "").strip(),
                 )
@@ -17688,13 +17817,38 @@ def register_lakeflow_source(spark):
                 _DEFAULT_STAGING_TOKEN_LIFETIME_SECONDS,
                 minimum=_STAGING_TOKEN_MIN_LIFETIME_SECONDS,
             )
-            return StagingCredentialProvider(
-                host,
-                token,
-                pipeline_id,
-                lifetime_seconds=lifetime,
-                update_id=update_id.strip(),
-            )
+            update_id = update_id.strip()
+
+            def sweeps_earlier_updates() -> bool:
+                # One process an update revokes the earlier updates' tokens: the first to
+                # take the update's claim in Lakebase.
+                claim = f"{self._table_state_keys_for('')[0]}/staging-token-sweep/{pipeline_id}/{update_id}"
+                return self._state_op_with_reconnect(
+                    lambda: claim_staging_sweep(
+                        self._lakebase_connection(),
+                        self._lakebase_state_namespace(),
+                        claim,
+                        _STAGING_TOKEN_SWEEP_CLAIM_SECONDS,
+                    ),
+                    operation="staging token sweep claim",
+                )
+
+            # One provider, and so one token, for this process and update: a drain worker
+            # makes a reader a table and a shard daemon one a burst, and each minting its own
+            # left a day-long token behind every time.
+            key = (host, pipeline_id, update_id, lifetime)
+            with _STAGING_PROVIDERS.lock:
+                provider = _STAGING_PROVIDERS.get(key)
+                if provider is None:
+                    provider = _STAGING_PROVIDERS[key] = StagingCredentialProvider(
+                        host,
+                        token,
+                        pipeline_id,
+                        lifetime_seconds=lifetime,
+                        update_id=update_id,
+                        sweeps_earlier_updates=sweeps_earlier_updates if update_id else None,
+                    )
+            return provider
 
         def _publish_snapshot_stage_page(
             self,
@@ -19204,7 +19358,9 @@ def register_lakeflow_source(spark):
                             raise
                         # 249: Cannot materialize consistent snapshot rows for '{}'
                         raise InformixError(_m(249, table.exposed_name)) from error
-                    if max_bytes:
+                    # Not the page of rows an index-ordered scan read again: the pages they
+                    # are left out of counted them already.
+                    if max_bytes and not scanned.get("moved_rows_page"):
                         shaped_bytes += _deep_size(shaped)
                         if shaped_bytes > max_bytes:
                             # 250: Initial shaped snapshot exceeds snapshot.max.bytes={}
@@ -19357,6 +19513,10 @@ def register_lakeflow_source(spark):
                 self._publish_snapshot_boundary(
                     table, schema_id, high_water, snapshot_lsn, pipeline_scope
                 )
+                # The rows a scan read again are in the count twice, once for each page that
+                # holds them: the manifest counts the rows the pages serve.
+                scanned.pop("moved_rows_page", None)
+                row_count -= scanned.pop("left_out_rows", 0)
                 manifest = self._publish_snapshot_stage_manifest(
                     table,
                     pipeline_scope,
@@ -20427,6 +20587,7 @@ def register_lakeflow_source(spark):
                 # Not counted against snapshot.max.rows again: the pages counted these rows.
                 found_rows = [row for _held, _after, rows, _there in repair.values() for row in rows]
                 if found_rows:
+                    scan["moved_rows_page"] = True
                     stage_page(boundary, staged_pages, found_rows)
                 # Each row is left out of the pages read under an index value it has had.
                 by_page: dict[str, list[str]] = {}
@@ -20436,6 +20597,12 @@ def register_lakeflow_source(spark):
                         for key in values_had
                     } - {None}:
                         by_page.setdefault(str(staged_at), []).append(name)
+                # How many staged copies the pages leave out, for the snapshot's row count.
+                scan["left_out_rows"] = sum(
+                    _index_scan_staged_key(row, table.primary_keys) in listed
+                    for at, listed in ((at, set(names_at)) for at, names_at in by_page.items())
+                    for row in staged_rows(boundary, int(at))
+                )
                 moved_rows = {
                     "keys": list(table.primary_keys),
                     # Each row with the positions of its read: a change to it is in the page
@@ -20664,9 +20831,13 @@ def register_lakeflow_source(spark):
         def _validate_unl_source_options(options: dict[str, str]) -> None:
             # Docstring: Eagerly validate the connection-level `.unl` source options (per-table too).
 
-            if _SNAPSHOT_SOURCE_OPTION in options and not str(options[_SNAPSHOT_SOURCE_OPTION]).strip():
-                # 257: Option '{}' must be a non-empty path
-                raise ValueError(_m(257, _SNAPSHOT_SOURCE_OPTION))
+            if _SNAPSHOT_SOURCE_OPTION in options:
+                if not str(options[_SNAPSHOT_SOURCE_OPTION]).strip():
+                    # 257: Option '{}' must be a non-empty path
+                    raise ValueError(_m(257, _SNAPSHOT_SOURCE_OPTION))
+                _validated_volume_location(
+                    str(options[_SNAPSHOT_SOURCE_OPTION]).strip(), _SNAPSHOT_SOURCE_OPTION, options
+                )
             if _SNAPSHOT_BOUNDARY_LSN_OPTION in options:
                 raw = str(options[_SNAPSHOT_BOUNDARY_LSN_OPTION]).strip()
                 if not raw or not raw.isdigit():
@@ -20680,7 +20851,12 @@ def register_lakeflow_source(spark):
                 _SNAPSHOT_SOURCE_OPTION
             )
             value = str(value).strip() if value is not None else ""
-            return value or None
+            if not value:
+                return None
+            # A pipeline author sets this per table. Held to the staging location's rule (an
+            # absolute Volume path with no traversal), so that it cannot name a file of the
+            # compute's own, or step out of the Files API's path into another workspace API.
+            return _validated_volume_location(value, _SNAPSHOT_SOURCE_OPTION, self.options)
 
         def _source_utc_time(self) -> int | None:
             # Docstring: Best-effort source-server UTC epoch seconds for a snapshot row's commit time.
@@ -24162,7 +24338,7 @@ def register_lakeflow_source(spark):
                 identity = "\0".join(
                     (
                         self.options.get("hostname", "").strip().rstrip(".").casefold(),
-                        str(int(self.options.get("port", "9088"))),
+                        str(int(self.options.get("port") or 9088)),
                         self.options.get("server", "").strip().casefold(),
                     )
                 )
@@ -24352,7 +24528,7 @@ def register_lakeflow_source(spark):
                 (
                     "v2",
                     self.options.get("hostname", "").strip().rstrip(".").casefold(),
-                    str(int(self.options.get("port", "9088"))),
+                    str(int(self.options.get("port") or 9088)),
                     self.options.get("server", "").strip(),
                     self.options.get("database", "").strip(),
                 )
@@ -24500,16 +24676,32 @@ def register_lakeflow_source(spark):
     InformixConnect = InformixLakeflowConnect
 
 
-    def _load_factory(path: str) -> Callable[[dict[str, str]], InformixBridge]:
+    def _refuse_code_loading_options(options: dict[str, str]) -> None:
+        # Docstring: Fail on ``bridge.factory`` or ``transport.factory``.
+        #
+        # Both named a module to import and a callable to hand every connection option to, the
+        # passwords among them, and nothing but a test's own wiring ever needed them: whoever
+        # could set a connection option could run code of their choosing on the compute. A
+        # test replaces the bridge with set_bridge_factory, or sets a bridge's transport.
+        for name in ("bridge.factory", "transport.factory"):
+            if options.get(name):
+                # 448: Option '{}' is not accepted: a connection option cannot name code to
+                # load
+                raise ValueError(_m(448, name))
+
+
+    def _load_factory(path: str) -> Callable[[dict[str, str]], Any]:
+        # Docstring: The callable ``authentication.provider.factory`` names, an option for an
+        # administrator-reviewed PAM exchange (see the README).
         module_name, separator, attribute = path.partition(":")
         if not separator:
             module_name, separator, attribute = path.rpartition(".")
         if not module_name or not attribute:
-            # 332: bridge.factory must be 'module:callable'
+            # 332: authentication.provider.factory must be 'module:callable'
             raise ValueError(_m(332))
         factory = getattr(importlib.import_module(module_name), attribute)
         if not callable(factory):
-            # 333: Bridge factory {!r} is not callable
+            # 333: Factory {!r} is not callable
             raise TypeError(_m(333, path))
         return factory
 
@@ -25751,6 +25943,9 @@ def register_lakeflow_source(spark):
         token = partition.get("token")
         host = partition.get("host")
         path = partition["path"]
+        if not os.path.isabs(path) or ".." in path.split("/"):
+            # 117: Option '{}' must not contain traversal
+            raise ValueError(_m(117, _SNAPSHOT_SOURCE_OPTION))
 
         def local(offset: int, length: int) -> bytes:
             with open(path, "rb") as handle:

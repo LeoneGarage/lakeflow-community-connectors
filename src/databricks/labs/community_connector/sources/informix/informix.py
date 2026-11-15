@@ -678,6 +678,25 @@ _UNLOAD_INT_TYPES = frozenset(
 )
 _UNLOAD_FLOAT_TYPES = frozenset({"FLOAT", "SMALLFLOAT", "REAL", "DOUBLE", "DOUBLE PRECISION"})
 _SNAPSHOT_STAGING_TOKEN_LIFETIME_OPTION = "snapshot.staging.token.lifetime.seconds"
+# How long an update's claim on revoking earlier updates' staging tokens holds: for good,
+# as far as the update goes.
+_STAGING_TOKEN_SWEEP_CLAIM_SECONDS = 30 * 86400
+
+
+class _StagingProviders(dict):
+    # Docstring: This process's staging credential providers, by host, pipeline, update and
+    # token lifetime. Never shipped: Spark pickles the merged source's globals to every
+    # worker, and a provider holds a token and a lock, so it pickles as empty.
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lock = threading.Lock()
+
+    def __reduce__(self):
+        return (_StagingProviders, ())
+
+
+_STAGING_PROVIDERS = _StagingProviders()
 # Walks a completed snapshot stage's removal may take when background page deletes keep
 # cutting it short (see _cleanup_completed_snapshot_stage); each walk removes more.
 _SNAPSHOT_STAGE_CLEANUP_ATTEMPTS = 5
@@ -1755,17 +1774,30 @@ def _serialized_sqli_operation(method: Callable[..., Any]) -> Callable[..., Any]
             return method(self, *args, **kwargs)
         with lock:
             lease_lost = getattr(self, "_connection_lease_lost", None)
-            if lease_lost is not None and lease_lost.is_set():
+
+            def lost() -> bool:
+                # Whether the lease is lost. A shutdown that gave up waiting for this
+                # lock leaves the loss standing for an operation to see (see
+                # _poison_connection_slot_lease): the one that sees it after the shutdown
+                # is over takes it down, so that the next can connect afresh.
+                if lease_lost is None or not lease_lost.is_set():
+                    return False
+                if getattr(self, "_lease_loss_unseen", False):
+                    self._lease_loss_unseen = False
+                    lease_lost.clear()
+                return True
+
+            if lost():
                 # 12: Informix connection-capacity lease was lost before the SQLI operation
                 raise ConnectionCapacityUnavailable(_m(12))
             try:
                 result = method(self, *args, **kwargs)
             except BaseException as error:
-                if lease_lost is not None and lease_lost.is_set():
+                if lost():
                     # 13: Informix connection-capacity lease was lost during the SQLI operation
                     raise ConnectionCapacityUnavailable(_m(13)) from error
                 raise
-            if lease_lost is not None and lease_lost.is_set():
+            if lost():
                 # 13: Informix connection-capacity lease was lost during the SQLI operation
                 raise ConnectionCapacityUnavailable(_m(13))
             return result
@@ -1815,8 +1847,8 @@ def _resolve_snapshot_reader_threads(options: dict[str, str]) -> int:
 class PurePythonInformixBridge:
     # Docstring: Pure-Python SQLI/CDC bridge validated against disposable Informix 15.
     #
-    # Tests can inject ``transport.factory=module:callable`` without changing
-    # Lakeflow or CDC decoding code.
+    # A test gives it a transport of its own by setting ``transport`` on an instance, or
+    # replaces the bridge with set_bridge_factory: no connection option names code to load.
 
     def __init__(self, options: dict[str, str]) -> None:
         self.options = options
@@ -1828,39 +1860,36 @@ class PurePythonInformixBridge:
         # Resolved once and applied in both decode paths: the CDC decode via decode_frame
         # (see read_changes) and the snapshot/query decode inside the SQLI client.
         self._null_byte = _null_byte_mode(options)
-        factory_path = options.get("transport.factory")
-        if factory_path:
-            self.transport = _load_factory(factory_path)(options)
-        else:
-            provider_path = options.get("authentication.provider.factory")
-            provider = (
-                _load_factory(provider_path)(options)
-                if provider_path
-                else PasswordAuthenticationProvider(
-                    self.config["password"], options.get("authentication.pam.echo.response")
-                )
+        _refuse_code_loading_options(options)
+        provider_path = options.get("authentication.provider.factory")
+        provider = (
+            _load_factory(provider_path)(options)
+            if provider_path
+            else PasswordAuthenticationProvider(
+                self.config["password"], options.get("authentication.pam.echo.response")
             )
-            self.transport = InformixSqliClient(
-                self.config["hostname"],
-                self.config["port"],
-                self.config["database"],
-                self.config["user"],
-                self.config["password"],
-                server_name=self.config["server"],
-                db_locale=self.config["db_locale"],
-                client_locale=self.config["client_locale"],
-                tls=self.config["tls"],
-                ca_file=self.config["ca_file"],
-                pad_varchar=self.config["pad_varchar"],
-                null_byte=self._null_byte,
-                authentication_mode=authentication,
-                authentication_provider=provider,
-                pam_max_rounds=int(options.get("authentication.pam.max.rounds", "16")),
-                login_timeout=float(options.get("authentication.login.timeout", "30")),
-                redirect_enabled=_option_bool(options, "redirect.enabled", False),
-                redirect_allowlist=_redirect_allowlist(options.get("redirect.allowlist", "")),
-                redirect_max=int(options.get("redirect.max", "3")),
-            )
+        )
+        self.transport = InformixSqliClient(
+            self.config["hostname"],
+            self.config["port"],
+            self.config["database"],
+            self.config["user"],
+            self.config["password"],
+            server_name=self.config["server"],
+            db_locale=self.config["db_locale"],
+            client_locale=self.config["client_locale"],
+            tls=self.config["tls"],
+            ca_file=self.config["ca_file"],
+            pad_varchar=self.config["pad_varchar"],
+            null_byte=self._null_byte,
+            authentication_mode=authentication,
+            authentication_provider=provider,
+            pam_max_rounds=int(options.get("authentication.pam.max.rounds", "16")),
+            login_timeout=float(options.get("authentication.login.timeout", "30")),
+            redirect_enabled=_option_bool(options, "redirect.enabled", False),
+            redirect_allowlist=_redirect_allowlist(options.get("redirect.allowlist", "")),
+            redirect_max=int(options.get("redirect.max", "3")),
+        )
         self._connected = False
         self._connect_lock = threading.Lock()
         self._operation_lock = threading.RLock()
@@ -2457,6 +2486,8 @@ class PurePythonInformixBridge:
             lease_lost.set()
         operation_lock = getattr(self, "_operation_lock", None)
         context: Any = contextlib.nullcontext()
+        # Whether an operation is still in flight when the transport is closed under it.
+        in_flight = False
         if operation_lock is not None:
             # Bound the wait for the active operation. The lease is already
             # published as lost, so the operation's wrapper will discard its result
@@ -2470,6 +2501,7 @@ class PurePythonInformixBridge:
                 context = contextlib.ExitStack()
                 context.callback(operation_lock.release)
             else:
+                in_flight = True
                 # 25: Informix connection-slot lease loss could not take the operation lock within
                 # {:.0f}s; closing the transport while an operation is still in flight: {}
                 logging.getLogger(__name__).warning(
@@ -2494,7 +2526,14 @@ class PurePythonInformixBridge:
                 finally:
                     self._release_connection_slot()
                     if lease_lost is not None:
-                        lease_lost.clear()
+                        if in_flight:
+                            # The operation still running must find the lease lost when
+                            # it ends, or it would return a result read without a slot,
+                            # or take the closed socket for a network drop and retry in
+                            # place. The loss stands until an operation has seen it.
+                            self._lease_loss_unseen = True
+                        else:
+                            lease_lost.clear()
 
     @classmethod
     def _remove_connection_slot_tree(cls, path: str) -> None:
@@ -4355,9 +4394,15 @@ def _bridge_config(options: dict[str, str]) -> dict[str, Any]:
     if missing:
         # 61: Missing required Informix option(s): {}
         raise ValueError(_m(61, (", ".join(missing))))
+    if _BARE_IDENTIFIER.fullmatch(str(options["database"])) is None:
+        # The database goes into every statement as it is, before the colon: it cannot be
+        # quoted there as an owner, table or column name is.
+        # 447: Option 'database' must be a plain Informix database name (letters, digits,
+        # underscores and $, not starting with a digit): {!r}
+        raise ValueError(_m(447, options["database"]))
     return {
         "hostname": options["hostname"],
-        "port": int(options.get("port", "9088")),
+        "port": int(options.get("port") or 9088),
         "database": options["database"],
         "user": options["user"],
         "password": options["password"],
@@ -4692,6 +4737,14 @@ def _order_key(values: Sequence[Any], descending: Sequence[bool]) -> tuple:
     # unaffected. Otherwise DESC columns are wrapped so tuple comparison reproduces
     # the index's own scan order.
 
+    # A decoded year-1 DATETIME carries UTC and every other one no zone, and Python
+    # refuses to compare the two: the zone is dropped, the wall clock being the value.
+    values = [
+        value.replace(tzinfo=None)
+        if isinstance(value, datetime) and value.tzinfo is not None
+        else value
+        for value in values
+    ]
     if not descending or not any(descending):
         return tuple(values)
     return tuple(
@@ -5204,6 +5257,12 @@ def _transform_spark_type(operand: str | tuple, column: "Column", options: dict[
     if name == "ROUND" and isinstance(inner, DecimalType):
         # Rounding up can carry into one more integer digit (999.99 to 1000).
         return DecimalType(min(inner.precision + 1, 38), inner.scale)
+    if name == "ROUND" and isinstance(inner, IntegerType):
+        # To a negative digit it can pass the largest INTEGER (2147483647 to the
+        # thousand is 2147484000): the column lands as a BIGINT then.
+        literals = operand[2][1:]
+        if literals and int(literals[0][1]) < 0:
+            return LongType()
     return inner
 
 
@@ -7188,6 +7247,17 @@ class _SharedCdcShard:
                 # changes the capture): the shard keeps the first one's table, buffer and
                 # coverage, and this one reads directly, rejecting the view's layout.
                 return
+            if (
+                existing is not None
+                and existing["capture"] != capture
+                and existing["table"].column_selection != table.column_selection
+            ):
+                # Another flow reading the table with other columns (include_columns or
+                # exclude_columns): its capture differs for good, not because the table
+                # changed. Taking it for a schema change, each flow dropped the other's
+                # buffer and coverage at every poll, and neither was ever served. The
+                # shard keeps the first one's, and this one reads directly.
+                return
             if existing is not None and existing["capture"] != capture:
                 # The table's columns changed (its consumer moved to a new schema): what
                 # was buffered under the old capture lacks the new columns, so drop it and
@@ -8703,7 +8773,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         if not 0 <= daemon_reservation < slot_count:
             # 17: Option '{}' must be >= 0 and < max.concurrent.connections ({})
             raise ValueError(_m(17, _DAEMON_RESERVATION_OPTION, slot_count))
-        port = int(options.get("port", "9088"))
+        port = int(options.get("port") or 9088)
         if not 1 <= port <= 65535:
             # 164: Option 'port' must be between 1 and 65535
             raise ValueError(_m(164))
@@ -8955,9 +9025,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     @property
     def _bridge(self) -> InformixBridge:
         if self._bridge_instance is None:
-            factory_path = self.options.get("bridge.factory")
-            factory = _load_factory(factory_path) if factory_path else _bridge_factory
-            self._bridge_instance = factory(self.options)
+            _refuse_code_loading_options(self.options)
+            self._bridge_instance = _bridge_factory(self.options)
         return self._bridge_instance
 
     @contextlib.contextmanager
@@ -11679,7 +11748,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             (
                 "v2",
                 self.options.get("hostname", "").strip().rstrip(".").casefold(),
-                str(int(self.options.get("port", "9088"))),
+                str(int(self.options.get("port") or 9088)),
                 self.options.get("server", "").strip(),
                 self.options.get("database", "").strip(),
             )
@@ -11883,13 +11952,38 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             _DEFAULT_STAGING_TOKEN_LIFETIME_SECONDS,
             minimum=_STAGING_TOKEN_MIN_LIFETIME_SECONDS,
         )
-        return StagingCredentialProvider(
-            host,
-            token,
-            pipeline_id,
-            lifetime_seconds=lifetime,
-            update_id=update_id.strip(),
-        )
+        update_id = update_id.strip()
+
+        def sweeps_earlier_updates() -> bool:
+            # One process an update revokes the earlier updates' tokens: the first to
+            # take the update's claim in Lakebase.
+            claim = f"{self._table_state_keys_for('')[0]}/staging-token-sweep/{pipeline_id}/{update_id}"
+            return self._state_op_with_reconnect(
+                lambda: claim_staging_sweep(
+                    self._lakebase_connection(),
+                    self._lakebase_state_namespace(),
+                    claim,
+                    _STAGING_TOKEN_SWEEP_CLAIM_SECONDS,
+                ),
+                operation="staging token sweep claim",
+            )
+
+        # One provider, and so one token, for this process and update: a drain worker
+        # makes a reader a table and a shard daemon one a burst, and each minting its own
+        # left a day-long token behind every time.
+        key = (host, pipeline_id, update_id, lifetime)
+        with _STAGING_PROVIDERS.lock:
+            provider = _STAGING_PROVIDERS.get(key)
+            if provider is None:
+                provider = _STAGING_PROVIDERS[key] = StagingCredentialProvider(
+                    host,
+                    token,
+                    pipeline_id,
+                    lifetime_seconds=lifetime,
+                    update_id=update_id,
+                    sweeps_earlier_updates=sweeps_earlier_updates if update_id else None,
+                )
+        return provider
 
     def _publish_snapshot_stage_page(
         self,
@@ -13399,7 +13493,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                         raise
                     # 249: Cannot materialize consistent snapshot rows for '{}'
                     raise InformixError(_m(249, table.exposed_name)) from error
-                if max_bytes:
+                # Not the page of rows an index-ordered scan read again: the pages they
+                # are left out of counted them already.
+                if max_bytes and not scanned.get("moved_rows_page"):
                     shaped_bytes += _deep_size(shaped)
                     if shaped_bytes > max_bytes:
                         # 250: Initial shaped snapshot exceeds snapshot.max.bytes={}
@@ -13552,6 +13648,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             self._publish_snapshot_boundary(
                 table, schema_id, high_water, snapshot_lsn, pipeline_scope
             )
+            # The rows a scan read again are in the count twice, once for each page that
+            # holds them: the manifest counts the rows the pages serve.
+            scanned.pop("moved_rows_page", None)
+            row_count -= scanned.pop("left_out_rows", 0)
             manifest = self._publish_snapshot_stage_manifest(
                 table,
                 pipeline_scope,
@@ -14622,6 +14722,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # Not counted against snapshot.max.rows again: the pages counted these rows.
             found_rows = [row for _held, _after, rows, _there in repair.values() for row in rows]
             if found_rows:
+                scan["moved_rows_page"] = True
                 stage_page(boundary, staged_pages, found_rows)
             # Each row is left out of the pages read under an index value it has had.
             by_page: dict[str, list[str]] = {}
@@ -14631,6 +14732,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     for key in values_had
                 } - {None}:
                     by_page.setdefault(str(staged_at), []).append(name)
+            # How many staged copies the pages leave out, for the snapshot's row count.
+            scan["left_out_rows"] = sum(
+                _index_scan_staged_key(row, table.primary_keys) in listed
+                for at, listed in ((at, set(names_at)) for at, names_at in by_page.items())
+                for row in staged_rows(boundary, int(at))
+            )
             moved_rows = {
                 "keys": list(table.primary_keys),
                 # Each row with the positions of its read: a change to it is in the page
@@ -14859,9 +14966,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _validate_unl_source_options(options: dict[str, str]) -> None:
         # Docstring: Eagerly validate the connection-level `.unl` source options (per-table too).
 
-        if _SNAPSHOT_SOURCE_OPTION in options and not str(options[_SNAPSHOT_SOURCE_OPTION]).strip():
-            # 257: Option '{}' must be a non-empty path
-            raise ValueError(_m(257, _SNAPSHOT_SOURCE_OPTION))
+        if _SNAPSHOT_SOURCE_OPTION in options:
+            if not str(options[_SNAPSHOT_SOURCE_OPTION]).strip():
+                # 257: Option '{}' must be a non-empty path
+                raise ValueError(_m(257, _SNAPSHOT_SOURCE_OPTION))
+            _validated_volume_location(
+                str(options[_SNAPSHOT_SOURCE_OPTION]).strip(), _SNAPSHOT_SOURCE_OPTION, options
+            )
         if _SNAPSHOT_BOUNDARY_LSN_OPTION in options:
             raw = str(options[_SNAPSHOT_BOUNDARY_LSN_OPTION]).strip()
             if not raw or not raw.isdigit():
@@ -14875,7 +14986,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             _SNAPSHOT_SOURCE_OPTION
         )
         value = str(value).strip() if value is not None else ""
-        return value or None
+        if not value:
+            return None
+        # A pipeline author sets this per table. Held to the staging location's rule (an
+        # absolute Volume path with no traversal), so that it cannot name a file of the
+        # compute's own, or step out of the Files API's path into another workspace API.
+        return _validated_volume_location(value, _SNAPSHOT_SOURCE_OPTION, self.options)
 
     def _source_utc_time(self) -> int | None:
         # Docstring: Best-effort source-server UTC epoch seconds for a snapshot row's commit time.
@@ -18357,7 +18473,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             identity = "\0".join(
                 (
                     self.options.get("hostname", "").strip().rstrip(".").casefold(),
-                    str(int(self.options.get("port", "9088"))),
+                    str(int(self.options.get("port") or 9088)),
                     self.options.get("server", "").strip().casefold(),
                 )
             )
@@ -18547,7 +18663,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             (
                 "v2",
                 self.options.get("hostname", "").strip().rstrip(".").casefold(),
-                str(int(self.options.get("port", "9088"))),
+                str(int(self.options.get("port") or 9088)),
                 self.options.get("server", "").strip(),
                 self.options.get("database", "").strip(),
             )
@@ -18695,16 +18811,32 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
 InformixConnect = InformixLakeflowConnect
 
 
-def _load_factory(path: str) -> Callable[[dict[str, str]], InformixBridge]:
+def _refuse_code_loading_options(options: dict[str, str]) -> None:
+    # Docstring: Fail on ``bridge.factory`` or ``transport.factory``.
+    #
+    # Both named a module to import and a callable to hand every connection option to, the
+    # passwords among them, and nothing but a test's own wiring ever needed them: whoever
+    # could set a connection option could run code of their choosing on the compute. A
+    # test replaces the bridge with set_bridge_factory, or sets a bridge's transport.
+    for name in ("bridge.factory", "transport.factory"):
+        if options.get(name):
+            # 448: Option '{}' is not accepted: a connection option cannot name code to
+            # load
+            raise ValueError(_m(448, name))
+
+
+def _load_factory(path: str) -> Callable[[dict[str, str]], Any]:
+    # Docstring: The callable ``authentication.provider.factory`` names, an option for an
+    # administrator-reviewed PAM exchange (see the README).
     module_name, separator, attribute = path.partition(":")
     if not separator:
         module_name, separator, attribute = path.rpartition(".")
     if not module_name or not attribute:
-        # 332: bridge.factory must be 'module:callable'
+        # 332: authentication.provider.factory must be 'module:callable'
         raise ValueError(_m(332))
     factory = getattr(importlib.import_module(module_name), attribute)
     if not callable(factory):
-        # 333: Bridge factory {!r} is not callable
+        # 333: Factory {!r} is not callable
         raise TypeError(_m(333, path))
     return factory
 
@@ -19946,6 +20078,9 @@ def _unl_split_read_chunk(partition: dict) -> Callable[[int, int], bytes]:
     token = partition.get("token")
     host = partition.get("host")
     path = partition["path"]
+    if not os.path.isabs(path) or ".." in path.split("/"):
+        # 117: Option '{}' must not contain traversal
+        raise ValueError(_m(117, _SNAPSHOT_SOURCE_OPTION))
 
     def local(offset: int, length: int) -> bytes:
         with open(path, "rb") as handle:

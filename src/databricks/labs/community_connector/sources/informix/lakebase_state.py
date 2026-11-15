@@ -82,6 +82,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -690,6 +691,7 @@ class StagingCredentialProvider:
         lifetime_seconds: int = _DEFAULT_STAGING_TOKEN_LIFETIME_SECONDS,
         clock: Any = time.monotonic,
         update_id: str = "",
+        sweeps_earlier_updates: Any = None,
     ) -> None:
         self._host = host.rstrip("/")
         self._bootstrap_token = bootstrap_token
@@ -698,6 +700,10 @@ class StagingCredentialProvider:
         self._lifetime_seconds = max(_STAGING_TOKEN_MIN_LIFETIME_SECONDS, int(lifetime_seconds))
         self._refresh_after = self._lifetime_seconds * _STAGING_TOKEN_REFRESH_FRACTION
         self._clock = clock
+        # Asked once, at the first mint: whether this process is the one to revoke the
+        # tokens of the pipeline's earlier updates. Every flow process of an update
+        # starts at once, and without it each listed and deleted every one of them.
+        self._sweeps_earlier_updates = sweeps_earlier_updates
         self._lock = threading.Lock()
         self._token: str | None = None
         self._token_id = ""
@@ -756,10 +762,23 @@ class StagingCredentialProvider:
         self.rejected = False
         lifetime = min(self._lifetime_seconds, granted) if granted else self._lifetime_seconds
         self._refresh_after = lifetime * _STAGING_TOKEN_REFRESH_FRACTION
-        # Rotation with the new token: revoke this provider's previous token and
-        # earlier updates' tokens, best-effort inside the helper.
-        new_api = _WorkspaceApi(self._host, token)
-        revoke_stale_staging_tokens(new_api, self._pipeline_id, self._update_id, predecessor_id)
+        # Rotation with the new token: revoke this provider's previous token and, when
+        # this process is the one to, earlier updates' tokens; best-effort inside the
+        # helper. A refresh has only its own predecessor to revoke.
+        earlier = not predecessor_id
+        if earlier and self._sweeps_earlier_updates is not None:
+            try:
+                earlier = bool(self._sweeps_earlier_updates())
+            except Exception:  # pylint: disable=broad-except
+                # Not knowing, sweep: a token left behind lives until it expires.
+                _LOGGER.debug("Could not claim the staging token sweep", exc_info=True)
+        if earlier or predecessor_id:
+            revoke_stale_staging_tokens(
+                _WorkspaceApi(self._host, token),
+                self._pipeline_id,
+                self._update_id if earlier else "",
+                predecessor_id,
+            )
 
 
 class WorkspaceFilesApi:
@@ -1197,6 +1216,12 @@ class LakebaseState:
         self._project_id = options.get(
             "lakebase.project.id", ""
         ).strip() or project_id_for_connection(connection_identity)
+        # The id goes into workspace API paths and queries as it is.
+        if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", self._project_id) is None:
+            raise LakebaseStateError(
+                "lakebase.project.id must be 1 to 63 lowercase letters, digits or hyphens, "
+                "starting with a letter or digit"
+            )
         self._min_cu = float(options.get("lakebase.autoscale.min.cu", _DEFAULT_MIN_CU))
         self._max_cu = float(options.get("lakebase.autoscale.max.cu", _DEFAULT_MAX_CU))
         self._suspend_seconds = int(
@@ -1357,13 +1382,26 @@ class LakebaseState:
         # Housekeeping on the read path, run a day apart by default: a listing that fails
         # (the reader's workspace token can have expired by then) skips this sweep rather
         # than failing the read, as a failed project below is skipped too.
+        projects: list = []
         try:
             api = self._api_client()
-            response = api.request("GET", "/api/2.0/postgres/projects") or {}
+            path = "/api/2.0/postgres/projects"
+            # Every page of the listing: a workspace with many projects has more than one.
+            for _page in range(1000):
+                response = api.request("GET", path) or {}
+                if isinstance(response, list):
+                    projects += response
+                    break
+                projects += response.get("projects") or []
+                token = response.get("next_page_token")
+                if not token:
+                    break
+                path = "/api/2.0/postgres/projects?page_token=" + urllib.parse.quote(
+                    str(token), safe=""
+                )
         except Exception:
             _LOGGER.warning("Skipping Lakebase project GC: listing projects failed", exc_info=True)
             return 0
-        projects = response if isinstance(response, list) else response.get("projects", [])
         deleted = 0
         for project in projects:
             name = str((project or {}).get("name") or (project or {}).get("id") or "")
@@ -1379,6 +1417,22 @@ class LakebaseState:
                 facts = _endpoint_facts(api, project_id, deadline=time.monotonic() + 60)
                 token = generate_credential(api, facts["endpoint"])
                 connection = self._open(facts, self._admin_user(), token)
+                # The records belong to the state role, and the provisioning identity
+                # holds CREATEROLE, not superuser: it reads them as that role where it
+                # may take it, granting itself the role it created first if need be.
+                # Where it may not (another identity's project) the read below fails
+                # and the candidate is skipped.
+                for statements in (
+                    (f"SET ROLE {STATE_ROLE}",),
+                    (f"GRANT {STATE_ROLE} TO CURRENT_USER", f"SET ROLE {STATE_ROLE}"),
+                ):
+                    try:
+                        with connection.cursor() as cursor:
+                            for statement in statements:
+                                cursor.execute(statement)
+                        break
+                    except Exception:  # pylint: disable=broad-except
+                        connection.rollback()
                 with connection.cursor() as cursor:
                     cursor.execute(
                         """
@@ -2581,4 +2635,6 @@ def _current_user_from_captured_credential(options: dict[str, str]) -> str:
         _LOGGER.debug("Could not resolve the calling identity from the workspace", exc_info=True)
         return ""
     body = response or {}
-    return str(body.get("userName") or body.get("id") or "").strip()
+    # A service principal has no userName: its OAuth role in Lakebase is its application
+    # id, not the numeric id SCIM gives it.
+    return str(body.get("userName") or body.get("applicationId") or body.get("id") or "").strip()

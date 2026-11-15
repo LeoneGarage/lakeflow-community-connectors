@@ -6,7 +6,7 @@ import io
 import ssl
 import struct
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import Mock, patch
 
@@ -649,8 +649,19 @@ class SqliPacketTests(unittest.TestCase):
             "SELECT * FROM t WHERE d > MDY(7,24,2026) AND ts > "
             "DATETIME(2026-07-24 01:02:03.12345) YEAR TO FRACTION(5)",
         )
+        # A decoded year-1 DATETIME carries UTC, so that Spark can take it: as a key
+        # bound it is its wall clock. Any other zone is not the connector's.
+        self.assertEqual(
+            _connector_sql(
+                "SELECT * FROM t WHERE ts > ?", (datetime(1, 1, 1, tzinfo=timezone.utc),)
+            ),
+            "SELECT * FROM t WHERE ts > DATETIME(0001-01-01 00:00:00.00000) YEAR TO FRACTION(5)",
+        )
         with self.assertRaisesRegex(ValueError, "timezone-free"):
-            _connector_sql("SELECT * FROM t WHERE ts > ?", (datetime.now(timezone.utc),))
+            _connector_sql(
+                "SELECT * FROM t WHERE ts > ?",
+                (datetime(2026, 1, 1, tzinfo=timezone(timedelta(hours=10))),),
+            )
 
         self.assertEqual(
             _connector_sql(

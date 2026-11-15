@@ -331,8 +331,8 @@
 "Immutable schema-node table mismatch for '{}'",
 "Invalid {} in Informix immutable record for {}",
 "Duplicate exposed table name {}",
-"bridge.factory must be 'module:callable'",
-"Bridge factory {!r} is not callable",
+"authentication.provider.factory must be 'module:callable'",
+"Factory {!r} is not callable",
 "Unsupported Informix catalog coltype {} for {}",
 "{} must be an integer, not {!r}",
 "{} is outside the unsigned 64-bit LSN domain",
@@ -445,5 +445,7 @@
 "The index-ordered snapshot could not settle the {} row(s) of '{}' that changed index value during it after {} re-reads because they kept changing; run the snapshot when the table is quieter, or set snapshot.scan=cursor",
 "The index-ordered snapshot of '{}' could not read again, each by its index and key values, the {} row(s) that changed index value during it; set snapshot.scan=cursor to read the table without index order",
 "Informix offset has an invalid scan_scope or scan_schema; run a full refresh with this connector version",
-"Informix did not allow newlines in quoted strings for this session ({}); a string value that holds a newline fails with SQL error -282"
+"Informix did not allow newlines in quoted strings for this session ({}); a string value that holds a newline fails with SQL error -282",
+"Option 'database' must be a plain Informix database name (letters, digits, underscores and $, not starting with a digit): {!r}",
+"Option '{}' is not accepted: a connection option cannot name code to load"
 ]

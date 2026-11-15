@@ -1408,7 +1408,9 @@ name to an expression over that column:
 - **Types:** a transform lands as its result's type: strings for string functions,
   `MASK`, and `HASH`; integers for `LENGTH`, `CHAR_LENGTH`, `YEAR`, `MONTH`, `DAY`, and
   `WEEKDAY`; and the column's own type otherwise. `ROUND` on a decimal adds one digit of
-  precision, since rounding up can carry. A transformed column is nullable when its source
+  precision, since rounding up can carry, and `ROUND` of an `INTEGER` to a negative digit
+  lands as a `BIGINT` for the same reason (2147483647 to the thousand is 2147484000). A
+  transformed column is nullable when its source
   column is, or when `NULLIFY` or `SUBSTR` (NULL past the end) can produce NULL; `HASH` on
   a `NOT NULL` key keeps it `NOT NULL`. `NVL` and `COALESCE` fall back to a value of the
   column's own type, so on an integer column, or over `LENGTH`, `CHAR_LENGTH`, `YEAR`,
