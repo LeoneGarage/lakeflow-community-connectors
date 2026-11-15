@@ -712,6 +712,12 @@ class StagingCredentialProvider:
         # ``auto`` staging transport can fall back to FUSE; cleared by the next mint.
         self.rejected = False
 
+    def sweep_claim(self, sweeps_earlier_updates: Any) -> None:
+        # Docstring: Install how this provider asks whether its process is the one to
+        # revoke earlier updates' tokens: each reader that takes the provider up gives
+        # its own, so the provider asks through one in use.
+        self._sweeps_earlier_updates = sweeps_earlier_updates
+
     def bearer(self) -> str:
         with self._lock:
             now = self._clock()
@@ -1235,7 +1241,7 @@ class LakebaseState:
             or self._provision_timeout_seconds <= 0
         ):
             raise ValueError("Option 'lakebase.provision.timeout.seconds' must be > 0")
-        self._database = options.get("lakebase.database", _DEFAULT_DATABASE)
+        self._database = options.get("lakebase.database", "").strip() or _DEFAULT_DATABASE
         # Two distinct identities, deliberately separate.
         #
         # The *state* identity is long-lived and does all ordinary state access, so
@@ -1451,8 +1457,11 @@ class LakebaseState:
                     continue
                 connection.close()
                 connection = None
+                # On a read's path: the delete is asked for and given a minute, not the
+                # quarter of an hour provisioning may take. It goes on at the server.
                 api.await_operation(
-                    api.request("DELETE", f"/api/2.0/postgres/projects/{project_id}")
+                    api.request("DELETE", f"/api/2.0/postgres/projects/{project_id}"),
+                    deadline=time.monotonic() + 60,
                 )
             except Exception:
                 _LOGGER.warning(

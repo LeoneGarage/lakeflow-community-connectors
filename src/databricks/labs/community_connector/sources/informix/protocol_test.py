@@ -625,6 +625,29 @@ class SqliPacketTests(unittest.TestCase):
                 _decode_result_value(b"C0000001", column, "utf-8", null_byte=mode), "C0000001"
             )
 
+    def test_connector_sql_renders_a_decimal_within_informixs_32_digits(self):
+        # A DECIMAL(p) with no scale decodes with the zeros of its unused digits: 0 would
+        # be 164 characters long. The literal is the number without them.
+        for value, literal in (
+            ("0E-134", "0"),
+            ("-0.0", "0"),
+            ("1." + "0" * 32, "1"),
+            ("12345678901234567890123456789012", "12345678901234567890123456789012"),
+            ("1E+120", "1E+120"),
+            ("-2.50", "-2.5"),
+        ):
+            self.assertEqual(
+                _connector_sql("SELECT 1 FROM t WHERE k > ?", (Decimal(value),)),
+                f"SELECT 1 FROM t WHERE k > {literal}",
+            )
+
+    def test_connector_sql_pads_the_year_of_a_datetime(self):
+        # strftime's %Y leaves a year below 1000 unpadded on Linux.
+        self.assertEqual(
+            _connector_sql("SELECT 1 FROM t WHERE t > ?", (datetime(1, 1, 1, 2, 3, 4, 500000),)),
+            "SELECT 1 FROM t WHERE t > DATETIME(0001-01-01 02:03:04.50000) YEAR TO FRACTION(5)",
+        )
+
     def test_connector_sql_renders_a_boolean_as_its_informix_literal(self):
         # Informix has no cast from an integer to a BOOLEAN: its literals are 't' and 'f'.
         self.assertEqual(
@@ -677,7 +700,7 @@ class SqliPacketTests(unittest.TestCase):
                 "SELECT * FROM t WHERE amount > ?",
                 (Decimal("123.4500"),),
             ),
-            "SELECT * FROM t WHERE amount > 123.4500",
+            "SELECT * FROM t WHERE amount > 123.45",
         )
         with self.assertRaisesRegex(ValueError, "must be finite"):
             _connector_sql("SELECT * FROM t WHERE amount > ?", (Decimal("NaN"),))

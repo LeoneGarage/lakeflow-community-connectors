@@ -2981,6 +2981,127 @@ class LakeflowContractTests(unittest.TestCase):
         # Never shipped to a worker: a provider holds a token and a lock.
         self.assertEqual(pickle.loads(pickle.dumps(informix_module._STAGING_PROVIDERS)), {})
 
+    def test_hash_reads_a_year_one_timestamp_as_it_lands(self):
+        # A column's year-1 value lands as text with a UTC zone (naive, it overflows
+        # PySpark's zone conversion), and HASH sees that text. One a transform makes, the
+        # fallback of an NVL say, is a datetime: it must hash the same.
+        text = informix_module._hash_text
+        landed = informix_module._framework_value(datetime(1, 1, 1))
+        self.assertEqual(landed, "0001-01-01T00:00:00+00:00")
+        self.assertEqual(text(datetime(1, 1, 1)), text(landed))
+        self.assertEqual(text(datetime(1, 1, 1, tzinfo=timezone.utc)), text(landed))
+        self.assertEqual(text(datetime(2024, 1, 2, 3, 4, 5)), "2024-01-02T03:04:05")
+
+    def test_a_parameter_left_blank_is_one_not_set(self):
+        # A form sends "" for a field nobody filled in. A number or a flag read from it
+        # would fail at once or, later, on a worker. The escape character is the one
+        # whose blank means something: no escape processing.
+        blank = {"port": "", "cdc.timeout": " ", "padVarchar": "", "lakebase.database": ""}
+        connector = self.connector(FakeBridge(), **blank, **{"snapshot.unl.escape": ""})
+        for name in blank:
+            self.assertNotIn(name, connector.options)
+        self.assertEqual(connector.options["snapshot.unl.escape"], "")
+        with self.assertRaisesRegex(ValueError, "lakebase.password"):
+            self.connector(FakeBridge(), **{"lakebase.password": ""})
+
+    def test_the_state_projects_capacity_is_checked_at_construction(self):
+        # Not when a worker first provisions the project.
+        self.connector(
+            FakeBridge(),
+            **{"lakebase.autoscale.min.cu": "1", "lakebase.autoscale.max.cu": "4"},
+        )
+        for options, message in (
+            ({"lakebase.autoscale.min.cu": "4", "lakebase.autoscale.max.cu": "1"}, "no greater"),
+            ({"lakebase.autoscale.min.cu": "0"}, "positive"),
+            ({"lakebase.autoscale.max.cu": "many"}, "must be numbers"),
+            ({"lakebase.suspend.timeout.seconds": "-1"}, ">= 0"),
+        ):
+            with self.assertRaisesRegex(ValueError, message):
+                self.connector(FakeBridge(), **options)
+
+    def test_one_process_an_interval_looks_for_unused_projects(self):
+        # The look opens a connection to every other connector project in the workspace,
+        # which wakes each one's suspended endpoint. A claim in Lakebase lets one flow
+        # process of the pipeline do it, not every one of them.
+        scope = "11111111-2222-3333-4444-555555555555_@_66666666-7777-8888-9999-000000000000"
+        for won in (False, True):
+            connector = self.connector(
+                FakeBridge(), **{"state.gc.drop.unused.projects": "true"}
+            )
+            connector.set_registration_scope(scope)
+            table = connector._table("app.orders", {})
+            connector._lakebase_state = mock.Mock()
+            asked = []
+
+            def state_op(call, operation, _won=won, _asked=asked):
+                _asked.append(operation)
+                return _won if operation == "project cleanup claim" else 0
+
+            connector._state_op_with_reconnect = state_op
+            connector._activity_touched.clear()
+            self.assertEqual(connector._pipeline_scope(), scope)
+            connector._touch_table_state(table)
+            self.assertIn("project cleanup claim", asked)
+            self.assertEqual(connector._lakebase_state.collect_unused_projects.called, won)
+
+    def test_a_staging_provider_asks_through_the_reader_that_last_took_it_up(self):
+        # One provider a process and update outlives the reader that made it. What it
+        # keeps of a reader is replaced by each reader that takes it up, so it never asks
+        # through one closed since.
+        provider = informix_module.StagingCredentialProvider("https://ws", "token", "pipe")
+        first, second = (lambda: True), (lambda: False)
+        provider.sweep_claim(first)
+        provider.sweep_claim(second)
+        self.assertIs(provider._sweeps_earlier_updates, second)
+        provider.sweep_claim(None)
+        self.assertIsNone(provider._sweeps_earlier_updates)
+
+    def test_a_snapshot_filter_keeps_its_parentheses_to_itself(self):
+        # The filter goes into the query in parentheses, joined to the paging bounds by
+        # AND. One that closes a parenthesis it did not open ends that grouping, and an
+        # OR after it reads rows past the bounds on every page.
+        check = informix_module._snapshot_filter
+        self.assertEqual(
+            check({"snapshot.filter": "(a = 1 OR b = ')') AND c IN (1, 2)"}),
+            "(a = 1 OR b = ')') AND c IN (1, 2)",
+        )
+        for bad in ("status = 'A') OR (status = 'B'", "(a = 1", "a = 1)"):
+            with self.assertRaisesRegex(ValueError, "close every parenthesis"):
+                check({"snapshot.filter": bad})
+
+    def test_an_unload_boolean_is_true_false_or_an_error(self):
+        value = informix_module._unload_value
+        self.assertIs(value("t", "BOOLEAN"), True)
+        self.assertIs(value(" F ", "BOOLEAN"), False)
+        self.assertIsNone(value("", "BOOLEAN"))
+        for bad in ("2", "N/A", "SKU-1"):
+            with self.assertRaisesRegex(ValueError, "invalid BOOLEAN"):
+                value(bad, "BOOLEAN")
+
+    def test_an_unload_line_loses_only_its_terminator(self):
+        # A carriage return before the line's own end may be the last column's data.
+        fields = informix_module._parse_unload_fields
+        self.assertEqual(fields("1|x\r\r\n", delimiter="|", escape="\\"), ["1", "x\r"])
+        self.assertEqual(fields("1|x|\r\n", delimiter="|", escape="\\"), ["1", "x"])
+        self.assertEqual(fields("1|x|\n", delimiter="|", escape="\\"), ["1", "x"])
+
+    def test_a_lost_lease_does_not_outlive_the_read_that_lost_it(self):
+        # A lease shutdown that could not wait for the running operation leaves the loss
+        # standing for that operation to see. If none does, releasing the connection
+        # takes it down: both locks are held then, so nobody is left to see it, and the
+        # next read's first operation would otherwise fail before it could claim a slot.
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge._operation_lock = threading.RLock()
+        bridge._connect_lock = threading.RLock()
+        bridge._connection_lease_lost = threading.Event()
+        bridge._connection_lease_lost.set()
+        bridge._lease_loss_unseen = True
+        bridge._connected = False
+        bridge._release_connection_slot = lambda: None
+        bridge.release_connection()
+        self.assertFalse(bridge._connection_lease_lost.is_set())
+        self.assertFalse(bridge._lease_loss_unseen)
+
     def test_a_snapshot_scan_names_each_column_once(self):
         self.assertIsNone(informix_module._snapshot_scan_columns("keyset(id, id)"))
         self.assertIsNone(informix_module._snapshot_scan_columns("keyset(id, ID desc)"))
@@ -4244,10 +4365,12 @@ class LakeflowContractTests(unittest.TestCase):
             return value / 0
 
         fails.__code__ = informix_module._lines_only(fails.__code__)
+        frame = None
         try:
             fails()
         except ZeroDivisionError as error:
             frame = traceback.extract_tb(error.__traceback__)[-1]
+        self.assertIsNotNone(frame)
         self.assertEqual(frame.lineno, fails.__code__.co_firstlineno + 2)
 
     def test_the_bridge_reads_the_rows_with_a_null_in_an_index_column(self):
@@ -4515,8 +4638,10 @@ class LakeflowContractTests(unittest.TestCase):
         progress: list = []
         connector = self.connector(bridge)
         connector._drain_progress = lambda: progress.append(len(polls))
-        self.connector = lambda *args, **kwargs: connector
-        with mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0):
+        with (
+            mock.patch.object(self, "connector", lambda *args, **kwargs: connector),
+            mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0),
+        ):
             self._index_scan(bridge, 50, table=table)
         self.assertTrue(polls)
         self.assertEqual(progress, list(range(1, len(polls) + 1)))
@@ -20512,7 +20637,8 @@ class HostSharedCdcTests(unittest.TestCase):
         with mock.patch("fcntl.flock", side_effect=PermissionError("flock not permitted")):
             with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
                 self.assertIsNone(self.poll(endpoints))
-        self.assertIn("sharing within the process", logs.output[0])
+        # Among the warnings: a shard thread an earlier test left running can log too.
+        self.assertTrue(any("sharing within the process" in line for line in logs.output))
         self.cover()
         self.assertEqual([tx.tx_id for tx in self.poll(endpoints).committed], [5])
         self.assertNotIn(self.KEY, endpoints.leading)
@@ -20527,7 +20653,9 @@ class HostSharedCdcTests(unittest.TestCase):
                 endpoints = informix_module._HostShardEndpoints(directory)
                 with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
                     self.assertIsNone(self.poll(endpoints))
-                self.assertIn("sharing within the process", logs.output[0])
+                self.assertTrue(
+                    any("sharing within the process" in line for line in logs.output)
+                )
                 self.assertFalse(endpoints.leading)
                 self.cover()
                 self.assertEqual([tx.tx_id for tx in self.poll(endpoints).committed], [5])
@@ -26364,6 +26492,27 @@ class ColumnTransformTests(_TableOptionTestCase):
         fields = {f.name: f for f in connector.get_table_schema("app.orders", options).fields}
         self.assertFalse(fields["id"].nullable)
         self.assertTrue(fields["value"].nullable)
+        # A NOT NULL character column can land a NULL under the default
+        # string.null.byte=null (a value holding a NUL byte is one), and the delete flow
+        # sends a key and nothing else: the schema says so, and no more than that.
+        raw = _wide_table()
+        for column in raw["columns"]:
+            column["nullable"] = False
+        bridge = _ProjectingBridge()
+        bridge.tables = [raw]
+
+        def nullable(**extra):
+            reader = self.keyed(bridge) if not extra else self.connector(bridge, **extra)
+            return {f.name: f.nullable for f in reader.get_table_schema("app.orders", {}).fields}
+
+        by_default = nullable()
+        self.assertFalse(by_default["id"])
+        self.assertTrue(by_default["value"])
+        kept = nullable(**{"string.null.byte": "keep"})
+        self.assertFalse(kept["id"] or kept["value"])
+        deleted = nullable(**{"string.null.byte": "keep", "isDeleteFlow": "true"})
+        self.assertFalse(deleted["id"])
+        self.assertTrue(deleted["value"])
         parsed = informix_module._column_transforms(
             {
                 "transform_columns": '{"a": "UPPER(MASK(a))", "b": "LOWER(SUBSTR(b, 3))", '

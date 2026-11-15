@@ -22,7 +22,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from enum import Enum, auto
 from typing import BinaryIO, Callable, Protocol
 
@@ -818,7 +818,20 @@ def _connector_sql(sql: str, parameters: tuple) -> str:
         elif isinstance(value, Decimal):
             if not value.is_finite():
                 raise ValueError("Informix DECIMAL parameters must be finite")
-            literal = format(value, "f")
+            # A DECIMAL(p) with no scale decodes with the zeros of its unused digits (0 as
+            # 0E-162, 1 as 1 with 32 zeros). The literal is the number without them, and
+            # in exponent form when it is still longer than a DECIMAL's 32 digits.
+            # Informix 14.10 took the long forms too (probed: 164 characters of zeros,
+            # and 1 with 42 zeros); the short one says the same and reads as a number.
+            if not value:
+                literal = "0"
+            else:
+                with localcontext() as decimal_context:
+                    decimal_context.prec = 80
+                    plain = value.normalize()
+                literal = format(plain, "f")
+                if sum(character.isdigit() for character in literal) > 32:
+                    literal = format(plain, "E")
             if len(literal) > 32767:
                 raise ValueError("Informix DECIMAL parameter exceeds SQL literal bound")
         elif isinstance(value, datetime):
@@ -830,7 +843,13 @@ def _connector_sql(sql: str, parameters: tuple) -> str:
                     raise ValueError("Informix DATETIME parameters must be timezone-free")
                 value = value.replace(tzinfo=None)
             fraction = value.microsecond // 10
-            literal = f"DATETIME({value:%Y-%m-%d %H:%M:%S}.{fraction:05d}) " "YEAR TO FRACTION(5)"
+            # Each part by itself: strftime's %Y does not pad a year below 1000 on
+            # Linux, and a year-1 value would read 1-01-01.
+            literal = (
+                f"DATETIME({value.year:04d}-{value.month:02d}-{value.day:02d} "
+                f"{value.hour:02d}:{value.minute:02d}:{value.second:02d}.{fraction:05d}) "
+                "YEAR TO FRACTION(5)"
+            )
         elif isinstance(value, date):
             # DATE(string) is interpreted through the session's DBDATE setting.
             # MDY uses numeric components and is therefore locale-independent.

@@ -36,6 +36,7 @@ import tempfile
 import threading
 import time
 import types
+import weakref
 import zipfile
 import zlib
 from collections import deque
@@ -2497,6 +2498,8 @@ class PurePythonInformixBridge:
             # release, and this covers the residue: a reader whose operation
             # outlives the lease still gets its transport closed and slot freed
             # here rather than leaving the lease poisoned indefinitely.
+            # Taken with a time limit and handed to the stack below, which a with cannot do.
+            # pylint: disable-next=consider-using-with
             if operation_lock.acquire(timeout=_POISON_OPERATION_LOCK_SECONDS):
                 context = contextlib.ExitStack()
                 context.callback(operation_lock.release)
@@ -2513,6 +2516,12 @@ class PurePythonInformixBridge:
                 # transport after the active operation exits
                 logging.getLogger(__name__).error(_m(26))
                 self._connected = False
+                if in_flight and lease_lost is not None:
+                    # The operation still running must find the lease lost when it ends,
+                    # or it would return a result read without a slot, or take the closed
+                    # socket for a network drop and retry in place. Said before the
+                    # close: the close is what wakes that operation, and it looks at once.
+                    self._lease_loss_unseen = True
                 try:
                     close = getattr(self.transport, "close", None)
                     if close is not None:
@@ -2525,15 +2534,9 @@ class PurePythonInformixBridge:
                     )
                 finally:
                     self._release_connection_slot()
-                    if lease_lost is not None:
-                        if in_flight:
-                            # The operation still running must find the lease lost when
-                            # it ends, or it would return a result read without a slot,
-                            # or take the closed socket for a network drop and retry in
-                            # place. The loss stands until an operation has seen it.
-                            self._lease_loss_unseen = True
-                        else:
-                            lease_lost.clear()
+                    # With an operation in flight the loss stands until one has seen it.
+                    if lease_lost is not None and not in_flight:
+                        lease_lost.clear()
 
     @classmethod
     def _remove_connection_slot_tree(cls, path: str) -> None:
@@ -2562,6 +2565,14 @@ class PurePythonInformixBridge:
         context = operation_lock if operation_lock is not None else contextlib.nullcontext()
         with context:
             with self._connect_lock:
+                # Both locks held: no operation runs and no lease shutdown is under way,
+                # so a lost lease left standing has nobody left to see it. Taken down
+                # here, or the next read's first operation would fail on it before it
+                # could claim a slot.
+                lease_lost = getattr(self, "_connection_lease_lost", None)
+                if lease_lost is not None:
+                    lease_lost.clear()
+                self._lease_loss_unseen = False
                 if not self._connected:
                     self._release_connection_slot()
                     return
@@ -4378,6 +4389,8 @@ class PurePythonInformixBridge:
                     )
 
 
+# A variable that holds the bridge's class, so that tests can put another in its place.
+# pylint: disable-next=invalid-name
 _bridge_factory: Callable[[dict[str, str]], InformixBridge] = PurePythonInformixBridge
 
 
@@ -4888,6 +4901,18 @@ def _snapshot_filter(options: dict[str, str]) -> str | None:
         # 76: Option 'snapshot.filter' cannot hold a {{...}} comment, a ? placeholder, or an
         # unclosed quote outside its quoted literals
         raise ValueError(_m(76))
+    # The predicate goes into the query within parentheses, joined to the paging bounds
+    # by AND. One that closes a parenthesis it did not open would end that grouping: an
+    # OR after it then reads rows past the bounds, on every page.
+    depth = 0
+    for character in bare:
+        depth += (character == "(") - (character == ")")
+        if depth < 0:
+            break
+    if depth:
+        # 449: Option 'snapshot.filter' must close every parenthesis it opens, and open
+        # every one it closes
+        raise ValueError(_m(449))
     return predicate
 
 
@@ -5555,7 +5580,10 @@ def _hash_text(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, datetime):
-        return value.replace(tzinfo=None).isoformat()
+        # As the value lands (see _framework_value): a column's year-1 value reaches here
+        # as that text, zone and all, and one a transform made (the fallback of an NVL)
+        # must hash the same.
+        return _framework_value(value.replace(tzinfo=None))
     if isinstance(value, date):
         return value.isoformat()
     if isinstance(value, (bytes, bytearray)):
@@ -8605,6 +8633,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     # serverless Lakeflow pipeline execution have been exercised.
 
     def __init__(self, options: dict[str, str]) -> None:
+        # A parameter left blank is one not set: a form sends "" for a field nobody
+        # filled in, and a number or flag read from "" would fail here or, later, on a
+        # worker. The escape character is the one whose blank means something.
+        with contextlib.suppress(TypeError, AttributeError):
+            for name in [
+                name
+                for name, value in options.items()
+                if isinstance(value, str) and not value.strip() and name != _UNL_ESCAPE_OPTION
+            ]:
+                del options[name]
         super().__init__(options)
         # The Volume now stores exactly one thing: snapshot page payloads. It has
         # no default to fall back on, because there is no longer a shared state
@@ -8691,6 +8729,24 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         ):
             if int(options.get(name, default)) < minimum:
                 raise ValueError(f"Option '{name}' must be >= {minimum}")
+        # The state project's capacity, checked here rather than when a worker first
+        # provisions it.
+        try:
+            low = float(options.get("lakebase.autoscale.min.cu", 0.5))
+            high = float(options.get("lakebase.autoscale.max.cu", 2.0))
+            suspend = int(options.get("lakebase.suspend.timeout.seconds", 60))
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "Options 'lakebase.autoscale.min.cu', 'lakebase.autoscale.max.cu' and "
+                "'lakebase.suspend.timeout.seconds' must be numbers"
+            ) from error
+        if not (math.isfinite(low) and math.isfinite(high) and 0 < low <= high):
+            raise ValueError(
+                "Options 'lakebase.autoscale.min.cu' and 'lakebase.autoscale.max.cu' must be "
+                "positive, with the minimum no greater than the maximum"
+            )
+        if suspend < 0:
+            raise ValueError("Option 'lakebase.suspend.timeout.seconds' must be >= 0")
         # Startup jitter is a float (fractional seconds), validated here rather than in the
         # integer loop above; 0 disables it.
         _validate_nonneg_float_option(options, _CONNECTION_STARTUP_JITTER_OPTION)
@@ -9062,17 +9118,33 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 name: operand
                 for name, _, operand in _recorded_transforms(table.column_transforms) or ()
             }
-            fields = [
-                StructField(
-                    renames.get(column.name, column.name),
+            # A NOT NULL column can still land a NULL two ways. The delete flow sends a
+            # key and nothing else. And under string.null.byte=null a character value
+            # that holds a NUL byte is a NULL. Spark plans on what the schema says cannot
+            # be NULL, so it says what can.
+            deletes = self._is_delete_flow()
+            nulled = _null_byte_mode(self.options) == "null"
+            fields = []
+            for column in table.columns:
+                kind = (
                     _transform_spark_type(transforms[column.name], column, table_options)
                     if column.name in transforms
-                    else _spark_type(column, table_options),
-                    column.nullable
-                    or (column.name in transforms and _transform_may_null(transforms[column.name])),
+                    else _spark_type(column, table_options)
                 )
-                for column in table.columns
-            ]
+                fields.append(
+                    StructField(
+                        renames.get(column.name, column.name),
+                        kind,
+                        column.nullable
+                        or (
+                            column.name in transforms
+                            and _transform_may_null(transforms[column.name])
+                        )
+                        or (deletes and column.name not in table.primary_keys)
+                        # By the column as read: a transform of such a value gets the NULL.
+                        or (nulled and isinstance(_spark_type(column, table_options), StringType)),
+                    )
+                )
             fields.extend(
                 (
                     StructField(CURSOR, StringType(), False),
@@ -11953,15 +12025,24 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             minimum=_STAGING_TOKEN_MIN_LIFETIME_SECONDS,
         )
         update_id = update_id.strip()
+        # The provider outlives this reader (one a process and update), so what it keeps
+        # of the reader is a weak reference, replaced by each reader that takes the
+        # provider up: it then asks through one that is in use, never one closed since,
+        # whose state connection it would open again with nobody left to close it.
+        reader = weakref.ref(self)
 
         def sweeps_earlier_updates() -> bool:
             # One process an update revokes the earlier updates' tokens: the first to
             # take the update's claim in Lakebase.
-            claim = f"{self._table_state_keys_for('')[0]}/staging-token-sweep/{pipeline_id}/{update_id}"
-            return self._state_op_with_reconnect(
+            current = reader()
+            if current is None:
+                return True
+            root = current._table_state_keys_for("")[0]
+            claim = f"{root}/staging-token-sweep/{pipeline_id}/{update_id}"
+            return current._state_op_with_reconnect(
                 lambda: claim_staging_sweep(
-                    self._lakebase_connection(),
-                    self._lakebase_state_namespace(),
+                    current._lakebase_connection(),
+                    current._lakebase_state_namespace(),
                     claim,
                     _STAGING_TOKEN_SWEEP_CLAIM_SECONDS,
                 ),
@@ -11981,8 +12062,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     pipeline_id,
                     lifetime_seconds=lifetime,
                     update_id=update_id,
-                    sweeps_earlier_updates=sweeps_earlier_updates if update_id else None,
                 )
+            provider.sweep_claim(sweeps_earlier_updates if update_id else None)
         return provider
 
     def _publish_snapshot_stage_page(
@@ -14529,8 +14610,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 # row and nothing else of that value is read; by the index value alone
                 # when a key column is of a type the scan does not compare. Whatever a
                 # read returns, a row counts only under its own key.
-                # Nor a DECIMAL(p) with no scale: its packed value has no literal Informix
-                # takes (0 is 0E-134, which written out is longer than a number may be).
+                # Nor a DECIMAL(p) with no scale: it is staged as decimal.variable.type
+                # shapes it, so the row's key as read and as staged can differ in form.
                 comparable = all(
                     column.type_name in _INDEX_SCAN_KEY_TYPES
                     and not _is_variable_scale_decimal(column)
@@ -18579,7 +18660,19 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 # 325: Option 'state.gc.project.retention.days' must be >= state.gc.retention.days
                 raise ValueError(_m(325))
             state = getattr(self, "_lakebase_state", None)
-            if state is not None:
+            # One process of the pipeline an interval: the look opens a connection to
+            # every other connector project in the workspace, which wakes each one's
+            # suspended endpoint, and every flow process doing so would wake them all
+            # that many times over.
+            if state is not None and self._state_op_with_reconnect(
+                lambda: claim_staging_sweep(
+                    self._lakebase_connection(),
+                    self._lakebase_state_namespace(),
+                    f"{self._table_state_keys_for('')[0]}/project-gc",
+                    interval_hours * 3600,
+                ),
+                operation="project cleanup claim",
+            ):
                 state.collect_unused_projects(project_retention_days, interval_hours)
 
     def _cleanup_previous_update_scopes(
@@ -19734,7 +19827,10 @@ def _parse_unload_fields(
     values: list[str] = []
     value: list[str] = []
     escaped = False
-    for character in line.rstrip("\n").rstrip("\r"):
+    # The line's own terminator only: a carriage return before it may be data.
+    line = line[:-1] if line.endswith("\n") else line
+    line = line[:-1] if line.endswith("\r") else line
+    for character in line:
         if escape and escaped:
             value.append({"n": "\n", "r": "\r", "t": "\t"}.get(character, character))
             escaped = False
@@ -19791,7 +19887,13 @@ def _unload_value(text: str, type_name: str, qualifier: int | None = None) -> An
                 continue
         return datetime.fromisoformat(text)
     if upper == "BOOLEAN":
-        return text.strip().lower() in {"t", "true", "1", "y"}
+        # Anything else is no BOOLEAN: a misaligned field must fail, not read as false.
+        flag = text.strip().lower()
+        if flag in {"t", "true", "1", "y"}:
+            return True
+        if flag in {"f", "false", "0", "n"}:
+            return False
+        raise ValueError(f"invalid BOOLEAN value {text!r}")
     if upper == "INTERVAL":
         # UNLOAD right-aligns an INTERVAL in its field width ("  -5 10:30:00"); the
         # trimmed text is exactly what the snapshot and CDC decoders produce.
