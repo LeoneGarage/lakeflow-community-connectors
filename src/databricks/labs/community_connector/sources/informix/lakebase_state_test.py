@@ -1602,6 +1602,36 @@ class LakebaseProjectNamingTests(unittest.TestCase):
         )
         connection.rollback.assert_called_once()
 
+    def test_a_project_whose_state_role_cannot_be_taken_is_left_alone(self):
+        # Another identity's project: neither taking the state role nor granting it works.
+        # Its state is then not read as some other role, which would fail with a warning
+        # on every sweep, and nothing is deleted.
+        lakebase_state.LakebaseState._project_gc_checked.clear()
+        state = lakebase_state.LakebaseState({}, "current")
+        api = mock.MagicMock()
+        api.request.side_effect = [{"projects": [{"name": "projects/informix-state-other"}]}]
+        state._api_client = mock.Mock(return_value=api)
+        connection = mock.MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.execute.side_effect = RuntimeError("permission denied")
+        state._open = mock.Mock(return_value=connection)
+        state._admin_user = mock.Mock(return_value="admin")
+        with (
+            mock.patch.object(
+                lakebase_state,
+                "_endpoint_facts",
+                return_value={"endpoint": "endpoint", "host": "host"},
+            ),
+            mock.patch.object(lakebase_state, "generate_credential", return_value="token"),
+            self.assertNoLogs(lakebase_state.__name__, level="WARNING"),
+        ):
+            self.assertEqual(state.collect_unused_projects(90, 24), 0)
+        statements = [call.args[0] for call in cursor.execute.call_args_list]
+        self.assertFalse([text for text in statements if "state_records" in text])
+        self.assertEqual(api.request.call_count, 1)
+        connection.commit.assert_not_called()
+        connection.close.assert_called_once()
+
     def test_a_deleted_project_is_skipped_and_a_failed_delete_does_not_fail_the_read(self):
         # A deleted project lingers in the list with no endpoint; waiting for one would block
         # the read that runs the GC. A delete that fails is skipped like any other candidate.

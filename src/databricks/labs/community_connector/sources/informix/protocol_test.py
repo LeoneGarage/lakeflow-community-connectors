@@ -648,6 +648,49 @@ class SqliPacketTests(unittest.TestCase):
             "SELECT 1 FROM t WHERE t > DATETIME(0001-01-01 02:03:04.50000) YEAR TO FRACTION(5)",
         )
 
+    def test_an_abrupt_close_shuts_the_socket_down_first_and_writes_nothing(self):
+        # Closing under an operation another thread still has in flight (a lost
+        # connection-slot lease). That reader holds the buffered stream's lock while it
+        # waits on the socket, so closing the stream first would wait out its timeout;
+        # shutting the socket down ends the read at once. And no goodbye is written into
+        # the middle of its statement.
+        calls = []
+
+        class Stream:
+            def __init__(self, name):
+                self.name = name
+
+            def write(self, data):
+                calls.append((self.name, "write"))
+
+            def flush(self):
+                calls.append((self.name, "flush"))
+
+            def close(self):
+                calls.append((self.name, "close"))
+
+        class Socket:
+            def shutdown(self, how):
+                calls.append(("socket", "shutdown"))
+
+            def close(self):
+                calls.append(("socket", "close"))
+
+        for abrupt, expected in (
+            (True, [("socket", "shutdown"), ("in", "close"), ("out", "close"), ("socket", "close")]),
+            (
+                False,
+                [("out", "write"), ("out", "flush"), ("in", "close"), ("out", "close"), ("socket", "close")],
+            ),
+        ):
+            calls.clear()
+            client = InformixSqliClient("host", 9088, "db", "user", "password")
+            client._input, client._output, client._socket = Stream("in"), Stream("out"), Socket()
+            client.state = ConnectionState.DATABASE_OPEN
+            client.close(abrupt=abrupt)
+            self.assertEqual(calls, expected)
+            self.assertEqual(client.state, ConnectionState.CLOSED)
+
     def test_connector_sql_renders_a_boolean_as_its_informix_literal(self):
         # Informix has no cast from an integer to a BOOLEAN: its literals are 't' and 'f'.
         self.assertEqual(

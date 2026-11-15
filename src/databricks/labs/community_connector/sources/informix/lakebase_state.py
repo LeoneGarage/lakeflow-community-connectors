@@ -1436,9 +1436,19 @@ class LakebaseState:
                         with connection.cursor() as cursor:
                             for statement in statements:
                                 cursor.execute(statement)
+                        # Kept: a role set in a transaction that is rolled back is
+                        # unset again, and so is a grant.
+                        connection.commit()
                         break
                     except Exception:  # pylint: disable=broad-except
                         connection.rollback()
+                else:
+                    # Another identity's project: its state cannot be read as its role,
+                    # so nothing says it is unused. Not this sweep's to delete.
+                    _LOGGER.debug(
+                        "Leaving Lakebase project %s: its state role cannot be taken", project_id
+                    )
+                    continue
                 with connection.cursor() as cursor:
                     cursor.execute(
                         """

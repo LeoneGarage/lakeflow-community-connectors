@@ -15,7 +15,6 @@ from databricks.labs.community_connector.sources.informix.informix import (
 
 from databricks.labs.community_connector.sparkpds import LakeflowSource
 from databricks.labs.community_connector.sparkpds.lakeflow_datasource import (
-    IS_DELETE_FLOW,
     TABLE_NAME,
     LakeflowPartitionedStreamReader,
     LakeflowStreamReader,
@@ -31,7 +30,7 @@ def _take_up_registration(reader) -> None:
         return
     reader.lakeflow_connect.set_registration_scope(scope)
     reader.lakeflow_connect.set_update_request(_INFORMIX_REGISTRATION_CONTEXT["request"])
-    role = "delete" if reader.options.get(IS_DELETE_FLOW) == "true" else "upsert"
+    role = "delete" if reader.lakeflow_connect._is_delete_flow() else "upsert"
     # 10: Informix CDC reader initialized: scope={} table={} role={}
     table = reader.options.get(TABLE_NAME, "<unknown>")
     logging.getLogger(__name__).info(_m(10, scope, table, role))

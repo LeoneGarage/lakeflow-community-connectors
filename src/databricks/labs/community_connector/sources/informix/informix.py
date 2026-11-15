@@ -2524,7 +2524,14 @@ class PurePythonInformixBridge:
                     self._lease_loss_unseen = True
                 try:
                     close = getattr(self.transport, "close", None)
-                    if close is not None:
+                    if close is not None and in_flight:
+                        # Under an operation still reading: the socket is shut down
+                        # first, which is what wakes it (see InformixSqliClient.close).
+                        try:
+                            close(abrupt=True)
+                        except TypeError:  # a transport whose close takes no such word
+                            close()
+                    elif close is not None:
                         close()
                 except Exception:
                     # 27: Failed to close SQLI transport after connection-slot lease loss
@@ -2723,8 +2730,10 @@ class PurePythonInformixBridge:
             )
             for row in rows:
                 versions[int(_field(row, "tabid", 0))] = (
-                    str(_field(row, "owner", 1)).strip(),
-                    str(_field(row, "tabname", 2)).strip(),
+                    # The padding of a CHAR column only: a delimited name can begin
+                    # with a space.
+                    str(_field(row, "owner", 1)).rstrip(" "),
+                    str(_field(row, "tabname", 2)).rstrip(" "),
                     int(_field(row, "version", 3)),
                 )
         return versions
@@ -4458,7 +4467,8 @@ def _bridge_config(options: dict[str, str]) -> dict[str, Any]:
 
 def _option_bool(options: dict[str, str], name: str, default: bool) -> bool:
     value = options.get(name)
-    if value is None:
+    if value is None or not value.strip():
+        # A blank is a setting not made.
         return default
     normalized = value.strip().lower()
     if normalized in {"1", "true", "yes"}:
@@ -5676,7 +5686,9 @@ def _apply_function(name: str, value: Any, literals: list, context: dict) -> Any
             return moment.isoweekday() % 7  # Informix: 0 is Sunday
         return getattr(moment, name.lower())
     with localcontext() as decimal_context:
-        decimal_context.prec = 80
+        # Wide enough for a DECIMAL(p) with no scale, whose values run from 1E-130 to
+        # 1E+126: rounding one to a whole number takes over a hundred digits.
+        decimal_context.prec = 200
         # A float by the digits it shows (1.15, not its binary 1.1499...), as
         # _hash_number_text reads one, so a half rounds as the documentation says.
         number = Decimal(repr(value)) if isinstance(value, float) else Decimal(value)
@@ -6019,7 +6031,10 @@ def _parse_row_filter(text: str) -> tuple:
 def _row_filter_literal_text(literal: tuple) -> str:
     kind, value = literal
     if kind == "number":
-        return format(value.normalize(), "f")
+        # Not under the default context: its 28 digits would round a longer literal.
+        with localcontext() as decimal_context:
+            decimal_context.prec = 200
+            return format(value.normalize(), "f")
     if kind == "string":
         return "'" + value.replace("'", "''") + "'"
     if kind == "bool":
@@ -8140,7 +8155,10 @@ class _ShardCatalog:
         for identity, table in known.items():
             version = None
             found = versions.get(_table_id(table)) if versions is not None else None
-            if found is not None and found[:2] == (table.owner.strip(), table.name.strip()):
+            if found is not None and found[:2] == (
+                table.owner.rstrip(" "),
+                table.name.rstrip(" "),
+            ):
                 version = found[2]
             entry = self.entries.get(identity)
             if entry is None or version is None or entry[0] != version:
@@ -8640,7 +8658,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             for name in [
                 name
                 for name, value in options.items()
-                if isinstance(value, str) and not value.strip() and name != _UNL_ESCAPE_OPTION
+                if isinstance(value, str)
+                and not value.strip()
+                and name.lower() != _UNL_ESCAPE_OPTION
             ]:
                 del options[name]
         super().__init__(options)
@@ -9519,7 +9539,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         )
 
     def _is_delete_flow(self) -> bool:
-        return self.options.get(_IS_DELETE_FLOW_OPTION) == "true"
+        # Spark hands option keys on lowercased. Its own options answer to either form,
+        # but a plain-dict copy of them, as a drain or shard reader gets, keeps only the
+        # lowercased one: read by the documented name alone, a delete flow's copy would
+        # take itself for the upsert flow.
+        options = self.options
+        value = options.get(_IS_DELETE_FLOW_OPTION)
+        if value is None:
+            value = options.get(_IS_DELETE_FLOW_OPTION.lower())
+        return value == "true"
 
     @staticmethod
     def _partition_offset_key(start_offset: dict | None) -> str:
@@ -16622,7 +16650,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 time.sleep(delay)
                 attempt += 1
 
-    def _state_op_with_reconnect(self, thunk, *, operation: str):
+    def _state_op_with_reconnect(self, thunk, *, operation: str) -> Any:
         # Docstring: Run one Lakebase state read/write, retrying in place on a dropped connection.
         #
         # A state connection reaped while idle (typically across a long wait for
@@ -17971,7 +17999,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         minimum: int,
         maximum: int | None = None,
     ) -> int:
-        value = int(table_options.get(name, self.options.get(name, str(default))))
+        # A blank is a setting not made, in a table's options as in the connection's.
+        raw = table_options.get(name)
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            raw = self.options.get(name)
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            raw = str(default)
+        value = int(raw)
         if value < minimum:
             raise ValueError(f"Option '{name}' must be >= {minimum}")
         if maximum is not None and value > maximum:

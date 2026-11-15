@@ -8,6 +8,7 @@ fail-closed where the recovered evidence is incomplete.
 
 from __future__ import annotations
 
+import contextlib
 import io
 import ipaddress
 import logging
@@ -2055,8 +2056,17 @@ class InformixSqliClient:
         self.close()
         self.state = ConnectionState.POISONED
 
-    def close(self) -> None:
-        if self.state == ConnectionState.DATABASE_OPEN and self._output is not None:
+    def close(self, abrupt: bool = False) -> None:
+        # ``abrupt`` closes under an operation another thread still has in flight (a
+        # lost connection-slot lease). Nothing is written then: the goodbye would land
+        # in the middle of that operation's statement. And the socket is shut down
+        # before anything is closed: the reader holds the buffered stream's lock while
+        # it waits on the socket, so closing the stream first would wait for that read
+        # to time out by itself, where the shutdown ends it at once.
+        if abrupt and self._socket is not None:
+            with contextlib.suppress(OSError):
+                self._socket.shutdown(socket.SHUT_RDWR)
+        elif self.state == ConnectionState.DATABASE_OPEN and self._output is not None:
             try:
                 self._output.write(struct.pack(">hh", SQ_EXIT, SQ_EOT))
                 self._output.flush()

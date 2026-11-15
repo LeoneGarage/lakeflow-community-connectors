@@ -3247,6 +3247,50 @@ class LakeflowContractTests(unittest.TestCase):
         with self.assertRaises(Exception):
             source.streamReader(None)
 
+    def test_a_delete_flow_is_told_under_the_name_spark_hands_it_on_as(self):
+        # Spark lowercases option keys, and a plain-dict copy of its options, as a drain
+        # or shard reader gets, keeps the lowercased one only: read by the documented
+        # name alone, a delete flow's copy would take itself for the upsert flow.
+        connector = self.connector(FakeBridge())
+        for options, expected in (
+            ({"isDeleteFlow": "true"}, True),
+            ({"isdeleteflow": "true"}, True),
+            ({"isdeleteflow": "false"}, False),
+            ({}, False),
+        ):
+            connector.options = options
+            self.assertEqual(connector._is_delete_flow(), expected, options)
+
+    def test_a_blank_table_option_is_a_setting_not_made(self):
+        # A form sends "" for a field nobody filled in. The connection's blanks are
+        # dropped as the connector starts; a table's must read as unset as well.
+        connector = self.connector(FakeBridge())
+        self.assertEqual(
+            connector._table_int_option({"snapshot.page.size": " "}, "snapshot.page.size", 7, minimum=1),
+            7,
+        )
+        self.assertTrue(informix_module._option_bool({"flag": ""}, "flag", True))
+        self.assertFalse(informix_module._option_bool({"flag": " "}, "flag", False))
+        with self.assertRaises(ValueError):
+            informix_module._option_bool({"flag": "maybe"}, "flag", False)
+
+    def test_numbers_past_eighty_digits_and_long_literals_keep_their_digits(self):
+        # A DECIMAL(p) with no scale runs from 1E-130 to 1E+126: rounding one to a whole
+        # number takes over a hundred digits, more than the context these ran under.
+        huge = Decimal("1.234E+99")
+        context = {"encoding": "utf-8", "hash_key": b""}
+        self.assertEqual(informix_module._apply_function("ROUND", huge, [], context), huge)
+        self.assertEqual(informix_module._apply_function("TRUNC", huge, ["2"], context), huge)
+        self.assertEqual(
+            informix_module._apply_function("MOD", huge, ["7"], context), Decimal(int(huge) % 7)
+        )
+        # A row_filter literal longer than the default context's 28 digits.
+        literal = Decimal("1234567890123456789012345678901234.5")
+        self.assertEqual(
+            informix_module._row_filter_literal_text(("number", literal)),
+            "1234567890123456789012345678901234.5",
+        )
+
     def test_pad_varchar_is_read_under_the_name_spark_hands_it_on_as(self):
         # Spark lowercases option keys. The reader's own options answer to either form,
         # but a copy into a plain dict, as a drain or shard reader gets, keeps the
