@@ -201,11 +201,14 @@ pipeline_spec = {
                 },
             }
         },
+        # Keyless, as the production table it copies: keyed on the whole row, as there.
         {
             "table": {
                 "source_table": "tw221d",
                 "table_configuration": {
                     "qualified_source_table": "informix.tw221d",
+                    "primary.keys": "*",
+                    "snapshot.scan": "cursor",
                 },
             }
         },
