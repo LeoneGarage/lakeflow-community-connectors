@@ -1740,7 +1740,8 @@ class LakeflowContractTests(unittest.TestCase):
                         pending.append(cell.cell_contents)
         shape_delete, table = reached["_shape_delete"], reached["Table"]
         self.assertEqual(shape_delete.__qualname__, "_shape_delete")
-        self.assertEqual(shape_delete.__code__.co_qualname, "_shape_delete")
+        if sys.version_info >= (3, 11):  # a Python 3.10 code object carries no qualname
+            self.assertEqual(shape_delete.__code__.co_qualname, "_shape_delete")
         self.assertEqual(shape_delete.__annotations__, {})
         self.assertEqual(table.__qualname__, "Table")
         self.assertEqual(table.parse.__qualname__, "Table.parse")
@@ -1752,6 +1753,10 @@ class LakeflowContractTests(unittest.TestCase):
                 if line.strip()
                 == "# src/databricks/labs/community_connector/sparkpds/lakeflow_datasource.py"
             )
+        if sys.version_info < (3, 11):
+            # No co_qualname, and a function made at run time (the reader hooks
+            # __init_subclass__ installs) takes its qualname from a string constant.
+            return
         prefixed = sorted(
             name
             for name, value in reached.items()
@@ -6169,8 +6174,12 @@ class LakeflowContractTests(unittest.TestCase):
         transport = FakeCdcTransport([chunk])
         bridge = object.__new__(PurePythonInformixBridge)
         # Sized to trip after the first transaction commits but before the
-        # second one can finish, which is the interleaving that matters here.
-        bridge.options = {"cdc.max.poll.bytes": "1000"}
+        # second one can finish, which is the interleaving that matters here:
+        # room for the first transaction and the second's BEGIN, so it trips at
+        # the INSERT. Taken from the poll's own estimate, as sys.getsizeof differs
+        # by Python version (a fixed 1000 tripped before the COMMIT on 3.10).
+        bound = sum(len(record) + informix_module._deep_size(dict(record)) for record in chunk[:3])
+        bridge.options = {"cdc.max.poll.bytes": str(bound)}
         bridge.transport = transport
         capture = {
             "identity": "demo:app.orders",
@@ -18417,6 +18426,24 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(second, first)
 
+    def test_the_first_reader_takes_the_trigger_boundary_it_elected_at_once(self):
+        # The publish returns the elected record: no pause and second read to learn it.
+        connector = self.connector(FakeBridge())
+        _, checkpoint = connector.read_table("app.orders", {}, {})
+        table = Table.parse(_table(), "demo")
+        with (
+            mock.patch.object(
+                informix_module, "_sleep_with_backoff", side_effect=AssertionError("slept")
+            ),
+            mock.patch.object(
+                connector, "_read_immutable_head", wraps=connector._read_immutable_head
+            ) as reads,
+        ):
+            high_water, generation = connector._shared_trigger_boundary(table, checkpoint)
+        self.assertEqual(high_water, 90)
+        self.assertRegex(generation, "^[0-9a-f]{32}$")
+        self.assertEqual(reads.call_count, 1)
+
     def test_a_reader_past_the_trigger_boundary_is_bounded_by_its_own_position(self):
         # The delete reader set the boundary at 100 before the upsert reader took its
         # snapshot at 101: the upsert reader has nothing to read up to the boundary, and
@@ -19139,6 +19166,108 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(list(rows), [])
         self.assertEqual(again["commit_lsn"], "70")
         self.assertNotIn("floor_seed", again)
+
+    def test_a_floor_the_delete_reader_turned_down_takes_no_connection_slot_again(self):
+        # The floor is another column layout's (or out of the log): the reader can't start
+        # there, and its later tries wait for the upsert reader as before, without taking a
+        # connection slot to find that out again.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        reader(2, "full_refresh").read_table("app.orders", {}, {})
+        bridge.tables[0]["columns"].append({"name": "extra", "type_name": "INTEGER"})
+        delete = reader(3)
+
+        _, waiting = delete.read_table_deletes("app.orders", {}, {})
+        self.assertNotIn("commit_lsn", waiting)
+        with mock.patch.object(
+            delete, "_capacity_attempt", side_effect=AssertionError("took a slot")
+        ):
+            _, still = delete.read_table_deletes("app.orders", waiting, {})
+        self.assertNotIn("commit_lsn", still)
+
+    def test_a_seeded_delete_position_is_told_superseded_by_the_floor_alone(self):
+        # A full refresh since replaced the floor the position started at: the reader starts
+        # again at the new floor before this update's upsert reader has read, rather than
+        # read on from a position the rebuilt source may no longer hold.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        _, old = reader(2, "full_refresh").read_table("app.orders", {}, {})
+        _, seeded = reader(3).read_table_deletes("app.orders", {}, {})
+        self.assertEqual(seeded["floor_seed"], old["pipeline_scope"])
+        bridge.now = 120
+        _, new = reader(4, "full_refresh").read_table("app.orders", {}, {})
+        self.assertEqual(new["commit_lsn"], "120")
+
+        _, again = reader(5).read_table_deletes("app.orders", seeded, {})
+
+        self.assertEqual(again["commit_lsn"], "120")
+        self.assertEqual(again["floor_seed"], new["pipeline_scope"])
+        with self.assertRaisesRegex(ValueError, "invalid floor_seed"):
+            informix_module._validated_offset({**again, "floor_seed": "not a scope"})
+
+    def test_a_replay_repeats_a_batch_read_under_a_floor_replaced_since(self):
+        # The batch read deletes under the floor it started at; a full refresh replaced the
+        # floor before it committed. Its replay reads the same range again: started at the
+        # new floor instead, it never reached the end Spark logged, on every restart.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        reader(2, "full_refresh").read_table("app.orders", {}, {})
+        delete = reader(3)
+        _, seeded = delete.read_table_deletes("app.orders", {}, {})
+        bridge.now = 110
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 101},
+            {"op": "DELETE", "tx_id": 7, "lsn": 102, "row": {"id": 1, "value": "a"}},
+            {"op": "COMMIT", "tx_id": 7, "lsn": 103},
+        ]
+        _, logged = delete.read_table_deletes("app.orders", seeded, {})
+        self.assertEqual(logged["commit_lsn"], "103")
+        bridge.now = 120
+        _, new = reader(4, "full_refresh").read_table("app.orders", {}, {})
+        later = reader(5)
+        later.read_table("app.orders", new, {})  # this update's upsert start is published
+        replay_options = {}
+
+        replayed = list(
+            informix_module._replay_between_offsets(
+                seeded,
+                logged,
+                lambda offset: later.read_table_deletes("app.orders", offset, replay_options),
+                replay_options,
+                later.options,
+            )
+        )
+
+        self.assertEqual([(row["id"], row["_informix_op"]) for row in replayed], [(1, "d")])
+
+    def test_a_seeded_delete_position_keeps_its_mark_where_the_pipeline_has_no_floor(self):
+        # A table.migration seed carries a position another pipeline's floor confirmed to a
+        # pipeline that has taken no snapshot of its own: it reads on, rather than start
+        # again and lose the deletes between the two pipelines' checkpoints.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        reader(2, "full_refresh").read_table("app.orders", {}, {})
+        _, seeded = reader(3).read_table_deletes("app.orders", {}, {})
+        other = self.connector(bridge)
+        other.set_registration_scope(f"{uuid.UUID(int=99)}_@_{uuid.UUID(int=4)}")
+        other.set_update_request("continue")
+        # Its upsert flow, migrated too, has read in this update: the start that made the
+        # reader weigh the floor, and the absent one read as replaced.
+        table = other._table("app.orders", {})
+        other._publish_upsert_channel_start(
+            table, 101, "1" * 32, _schema_fingerprint(table), other._pipeline_scope()
+        )
+        bridge.now = 110
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 101},
+            {"op": "DELETE", "tx_id": 7, "lsn": 102, "row": {"id": 1, "value": "a"}},
+            {"op": "COMMIT", "tx_id": 7, "lsn": 103},
+        ]
+
+        rows, end = other.read_table_deletes("app.orders", seeded, {})
+
+        self.assertEqual([(row["id"], row["_informix_op"]) for row in rows], [(1, "d")])
+        self.assertEqual(end["floor_seed"], seeded["floor_seed"])
 
     def test_a_triggered_delete_reader_sets_the_boundary_its_upsert_reader_then_shares(self):
         # A delete flow started ahead of its upsert flow does not wait for it, in a flow
@@ -19907,6 +20036,56 @@ class IncrementalSnapshotTests(unittest.TestCase):
 
         self.assertEqual(delivered, list(range(81, 90)) + [90, 100])
         self.assertNotIn("incremental", reached)
+
+    def test_a_first_batch_replayed_in_a_later_update_leaves_the_delete_floor(self):
+        # The replay of an incremental copy's or a cdc_only start's first batch establishes
+        # a newer boundary, but Spark goes on from the end it logged. Published as the delete
+        # floor, that boundary started the delete flow above a delete made in between, and
+        # the row stayed in the target. The floor stays the logged batch's.
+        for mode in ("incremental", "cdc_only"):
+            with self.subTest(mode=mode):
+                bridge = FakeBridge()
+                bridge.rows = [{"id": index * 10, "value": str(index)} for index in range(1, 11)]
+                options = {"snapshot.mode": mode, "snapshot.page.size": "4"}
+                pipeline = f"{uuid.UUID(int=31 if mode == 'cdc_only' else 32)}"
+
+                def reader(update, bridge=bridge, pipeline=pipeline):
+                    connector = self.connector(bridge, **{"snapshot.page.size": "4"})
+                    connector.set_registration_scope(f"{pipeline}_@_{uuid.UUID(int=update)}")
+                    connector.set_update_request("continue")
+                    return connector
+
+                _, end = reader(2).read_table("app.orders", {}, dict(options))
+                self.assertEqual(end["commit_lsn"], "90")
+                bridge.now = 130
+                bridge.changes = [
+                    {"op": "BEGIN", "tx_id": 7, "lsn": 101},
+                    {"op": "DELETE", "tx_id": 7, "lsn": 102, "row": {"id": 10, "value": "1"}},
+                    {"op": "COMMIT", "tx_id": 7, "lsn": 103},
+                ]
+                later = reader(3)
+                replay_options = dict(options)
+                list(
+                    informix_module._replay_between_offsets(
+                        {},
+                        end,
+                        lambda offset, later=later, replay_options=replay_options: later.read_table(
+                            "app.orders", offset, replay_options
+                        ),
+                        replay_options,
+                        later.options,
+                    )
+                )
+                table = Table.parse(_table(), "demo")
+                floor = later._read_immutable_head(
+                    later._immutable_namespace(table, "delete-floor", pipeline)
+                )
+                self.assertEqual(floor["start_lsn"], "90")
+
+                _, seeded = later.read_table_deletes("app.orders", {}, dict(options))
+                self.assertEqual(seeded["commit_lsn"], "90")
+                rows, _ = later.read_table_deletes("app.orders", seeded, dict(options))
+                self.assertEqual([(row["id"], row["_informix_op"]) for row in rows], [(10, "d")])
 
     def test_a_mid_copy_replay_in_a_later_update_keeps_its_batchs_bound(self):
         # Rows from the cursor Spark logged up were deleted before a later update replayed
@@ -28833,7 +29012,10 @@ class ColumnTransformTests(_TableOptionTestCase):
             "exposed_name": "app.orders",
             "primary_keys": ["id"],
         }
-        with self.assertRaisesRegex(InformixError, "NULL in NOT NULL key column id"):
+        # The table reads as app.orders, not '""."app.orders"' (owner and name split).
+        with self.assertRaisesRegex(
+            InformixError, r"A row of 'app\.orders' has NULL in NOT NULL key column id"
+        ):
             list(connector.read_partition("app.orders", partition, {}))
         # A descriptor from before the key rode along reads as before.
         del partition["primary_keys"]

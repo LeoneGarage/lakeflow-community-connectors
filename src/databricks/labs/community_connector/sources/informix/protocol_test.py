@@ -853,6 +853,41 @@ class SqliPacketTests(unittest.TestCase):
 
         self.assertEqual(client._input.tell(), len(transcript))
 
+    def test_a_connection_lost_mid_operation_is_a_transport_error(self):
+        # A reset, a close without TLS close_notify, or a read timeout raises an OSError
+        # from the socket, not the truncated-stream error a clean end gives: the readers'
+        # reconnect loops, which catch SqliProtocolError, let it fail the read. It is a
+        # transport error now, with the socket's error as its cause.
+        import ssl
+
+        for lost in (
+            ConnectionResetError(104, "Connection reset by peer"),
+            ssl.SSLEOFError(8, "EOF occurred in violation of protocol"),
+            TimeoutError("The read operation timed out"),
+        ):
+            with self.subTest(lost=type(lost).__name__):
+                client = InformixSqliClient("host", 9088, "db", "user", "password")
+                with (
+                    patch.object(
+                        client, "_require_open", return_value=(io.BytesIO(), io.BytesIO())
+                    ),
+                    patch.object(client, "_read_query_group", side_effect=lost),
+                    patch.object(client, "_poison") as poison,
+                    self.assertRaises(SqliTransportError) as raised,
+                ):
+                    client.execute("SELECT value FROM t")
+                self.assertIs(raised.exception.__cause__, lost)
+                poison.assert_called_once()
+        # Anything else is raised as it was.
+        client = InformixSqliClient("host", 9088, "db", "user", "password")
+        with (
+            patch.object(client, "_require_open", return_value=(io.BytesIO(), io.BytesIO())),
+            patch.object(client, "_read_query_group", side_effect=ValueError("bad")),
+            patch.object(client, "_poison"),
+            self.assertRaises(ValueError),
+        ):
+            client.execute("SELECT value FROM t")
+
     def test_execute_enforces_incremental_decoded_result_byte_bound(self):
         client = InformixSqliClient("host", 9088, "db", "user", "password")
         description = ResultDescription(2, 7, 4, (ResultColumn("value", 0, 2, 0, 4),))

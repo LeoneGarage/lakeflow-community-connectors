@@ -96,10 +96,16 @@ reader therefore does not wait where the pipeline already has a delete floor for
 table: it starts at the floor at once. (Waiting, a triggered update ended the flow after a
 few empty batches with no offset, in every update, and the table's deletes were never
 applied.) It keeps a mark of which snapshot the floor was until the upsert reader has
-published this update's start. If the floor is another snapshot's by then (a full
-refresh ended before the table's flows ran, and this update snapshots it), the delete
-reader starts again at the new floor. In a full refresh, on the first run, or where the
-floor's column layout is not the table's current one, the delete reader waits as
+published this update's start. If the floor is another snapshot's (a full refresh ended
+before the table's flows ran, and this update snapshots it), the delete reader starts
+again at the new floor, without waiting for that start; the replay of a batch it read
+under the earlier floor reads that range again. A pipeline with no floor of its own, one
+a `table.migration` seed came to, keeps the mark and reads on. A replayed first batch of
+a table, which may establish a newer boundary than the batch had, leaves the floor as
+that batch published it, since Spark goes on from where the batch ended. In a full
+refresh (a refresh of selected tables counts as one for every table, see below), on the
+first run, or where the floor's column layout is not the table's current one, the delete
+reader waits as
 described above; if a triggered update ends before the upsert reader has published, the
 next update starts the delete reader at the floor, so its deletes arrive one update late
 and none are lost. In a triggered update, whichever of a table's two readers comes first
@@ -713,7 +719,10 @@ A full refresh does not take the earlier scan up. Spark gives an update no setti
 says it is a full refresh, so the connector asks the pipelines API once, on the driver,
 when the pipeline starts. An update started as a full refresh, of the pipeline or of
 selected tables, discards the record, so no later update returns to those pages, and
-reads the table from its first row. An automatic retry of a failed full refresh carries
+reads the table from its first row. A refresh of selected tables counts as a full refresh
+for every table of the pipeline, the ones not selected included: the API names the
+selection by destination table, which the connector can't tie to its source table, so
+those tables' scans start over too, and their delete flows wait for this update's start. An automatic retry of a failed full refresh carries
 on with what that full refresh began. The record is also discarded, and the table read
 from the start, when:
 

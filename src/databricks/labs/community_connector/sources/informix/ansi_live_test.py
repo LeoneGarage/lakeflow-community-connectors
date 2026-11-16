@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import unittest
 from datetime import date, datetime
 from decimal import Decimal
@@ -14,6 +15,18 @@ def _without_pad_varchar(options: dict[str, str]) -> dict[str, str]:
     # The bridge reads the lowercase "padvarchar" first, as Spark hands options over: an
     # override under "padVarchar" beside it was ignored.
     return {name: value for name, value in options.items() if name.lower() != "padvarchar"}
+
+
+# Seconds' fraction; group 1 is its digits.
+_ISO_FRACTION = re.compile(r"(?<=:\d\d)\.(\d{1,6})(?!\d)")
+
+
+def _iso_datetime(text: str) -> datetime:
+    # Python 3.10's fromisoformat takes a fraction of 3 or 6 digits only, and an
+    # Informix FRACTION(5) value has 5: pad it to microseconds first.
+    return datetime.fromisoformat(
+        _ISO_FRACTION.sub(lambda match: "." + match.group(1).ljust(6, "0"), text, count=1)
+    )
 
 
 def _live_config() -> dict[str, str]:
@@ -426,7 +439,7 @@ class ScalarTypesLiveTest(unittest.TestCase):
     def _values_equal(cls, actual: object, expected: object) -> bool:
         if isinstance(actual, datetime) and isinstance(expected, str):
             try:
-                return actual == datetime.fromisoformat(expected)
+                return actual == _iso_datetime(expected)
             except ValueError:
                 return False
         if (

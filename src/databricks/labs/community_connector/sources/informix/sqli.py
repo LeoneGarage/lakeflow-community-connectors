@@ -735,6 +735,23 @@ def encode_lodata_read(descriptor: int, requested: int) -> bytes:
     )
 
 
+# What a socket raises when the connection is lost mid-operation: a reset or a close
+# without TLS close_notify (an NLB idle reset, a PrivateLink drop, a server crash), a write
+# to a closed peer, a read timeout. read_exact raises SqliTransportError only for a clean
+# end of stream.
+_CONNECTION_LOSS = (ConnectionError, TimeoutError, ssl.SSLError)
+
+
+def _raise_connection_loss(error: BaseException) -> None:
+    # Docstring: Raise ``error`` as the SqliTransportError it is when it is a lost
+    # connection, so the readers' reconnect loops, which catch SqliProtocolError, retry it
+    # in place as they do a truncated stream. The socket error is kept as its cause, where
+    # the timeout checks look (_is_timeout_error).
+
+    if isinstance(error, _CONNECTION_LOSS):
+        raise SqliTransportError(f"SQLI connection lost: {error!r}") from error
+
+
 def read_exact(stream: BinaryIO, size: int) -> bytes:
     if size < 0 or size > MAX_PACKET:
         raise SqliProtocolError(f"unsafe exact-read size {size}")
@@ -1748,8 +1765,9 @@ class InformixSqliClient:
                 output_stream.flush()
                 self._read_query_group(description)
                 return rows
-            except Exception:
+            except Exception as error:
                 self._poison()
+                _raise_connection_loss(error)
                 raise
 
     def execute_pages(
@@ -1828,8 +1846,9 @@ class InformixSqliClient:
                 self._read_query_group(description)
                 if pending:
                     page_consumer(pending)
-            except Exception:
+            except Exception as error:
                 self._poison()
+                _raise_connection_loss(error)
                 raise
 
     def execute_command(self, sql: str) -> None:
@@ -1843,8 +1862,9 @@ class InformixSqliClient:
                 )
                 output_stream.flush()
                 self._read_status_group(require_done=True)
-            except Exception:
+            except Exception as error:
                 self._poison()
+                _raise_connection_loss(error)
                 raise
 
     def _close_query(self, description, rows, output_stream):
@@ -2107,8 +2127,9 @@ class InformixSqliClient:
                             f"at {error[2]} during LODATA: {error[3]}"
                         )
                     raise SqliProtocolError(f"unexpected SQLI message {code} during LODATA")
-            except Exception:
+            except Exception as error:
                 self._poison()
+                _raise_connection_loss(error)
                 raise
 
     def _poison(self) -> None:
