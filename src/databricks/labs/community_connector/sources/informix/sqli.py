@@ -2027,6 +2027,20 @@ class InformixSqliClient:
                     f"tuple column {column.name!r} slice [{start}:{limit}] "
                     f"exceeds payload size {len(payload)}"
                 )
+            if not variable_layout:
+                # A fixed-layout row shorter than its description left the last column a
+                # short slice: a CHAR decoded what was there and a number failed as a
+                # struct.error, which no SqliProtocolError retry catches. A VARCHAR has
+                # no fixed width to hold it to.
+                try:
+                    width = _fixed_result_size(column)
+                except SqliDescriptorNotImplemented:
+                    width = 0
+                if limit - start < width:
+                    raise SqliProtocolError(
+                        f"tuple column {column.name!r} slice [{start}:{limit}] is shorter "
+                        f"than its {width}-byte width"
+                    )
             result[column.name] = _decode_result_value(
                 payload[start:limit], column, self._text_encoding, padded, self.null_byte
             )

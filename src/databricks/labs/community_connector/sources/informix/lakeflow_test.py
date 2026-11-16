@@ -2445,6 +2445,45 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertGreater(halves["DELETE"], 10)
         self.assertGreater(halves["INSERT"], 10)
 
+    def test_another_tables_changes_in_a_shared_transaction_are_left_to_the_projection(self):
+        # A shared shard hands each table the whole transaction. Read as this table's, the
+        # other table's row, without the index column, failed with a KeyError (and one with
+        # it named a change the manifest did not, for a full refresh).
+        scan = {
+            "index_scan": {
+                "keys": ["id"],
+                "descending": [False],
+                "pages": [[None, 100, 110]],
+                "end": 210,
+                "suppress": [],
+                "keep": [],
+                "settled": [],
+                "time": None,
+            }
+        }
+        connector = self.connector(_IndexScanSource(random_module.Random(1)))
+        connector._read_snapshot_stage_manifest = lambda *_: scan
+        connector._offset_scopes = lambda checkpoint: ("scope", "scope")
+        keyless = Table.parse(_table(primary_keys=()), "demo")
+        other = {
+            "op": "INSERT",
+            "tx_id": 1,
+            "lsn": 151,
+            "table": "demo.app.audit",
+            "row": {"note": "x"},
+        }
+        transactions = informix_module._transaction_batch(
+            [
+                {"op": "BEGIN", "tx_id": 1, "lsn": 150},
+                other,
+                {"op": "COMMIT", "tx_id": 1, "lsn": 152},
+            ]
+        )[0]
+        (tx,) = connector._drop_scanned_changes(
+            keyless, {"commit_lsn": "90", "schema_id": "s"}, {}, transactions
+        )
+        self.assertEqual(list(tx.records), [other])
+
     def test_the_stream_passes_on_the_half_of_an_index_update_the_scan_lacks(self):
         # Two pages: ids up to 5, read between 100 and 110, and the rest, read between 200
         # and 210. An UPDATE that committed at 150 moved a row between them.
@@ -3295,15 +3334,25 @@ class LakeflowContractTests(unittest.TestCase):
             self.assertEqual(connector._is_delete_flow(), expected, options)
 
     def test_a_blank_table_option_is_a_setting_not_made(self):
-        # A form sends "" for a field nobody filled in. The connection's blanks are
-        # dropped as the connector starts; a table's must read as unset as well.
+        # A form sends "" for a field nobody filled in. The connection's empty values are
+        # dropped as the connector starts; a table's must read as unset as well. One of
+        # blanks is judged as given, as the constructor judges it, and fails by its name.
         connector = self.connector(FakeBridge())
         self.assertEqual(
             connector._table_int_option(
-                {"snapshot.page.size": " "}, "snapshot.page.size", 7, minimum=1
+                {"snapshot.page.size": ""}, "snapshot.page.size", 7, minimum=1
             ),
             7,
         )
+        with self.assertRaisesRegex(ValueError, "'snapshot.page.size' must be a whole number"):
+            connector._table_int_option(
+                {"snapshot.page.size": " "}, "snapshot.page.size", 7, minimum=1
+            )
+        # And at registration, not when the stream first reads it.
+        with self.assertRaisesRegex(ValueError, "'cdc.max.records' must be <= 256"):
+            connector.read_table_metadata("app.orders", {"cdc.max.records": "300"})
+        with self.assertRaisesRegex(ValueError, "'snapshot.split.bytes' must be a whole number"):
+            connector.read_table_metadata("app.orders", {"snapshot.split.bytes": "1MB"})
         self.assertTrue(informix_module._option_bool({"flag": ""}, "flag", True))
         self.assertFalse(informix_module._option_bool({"flag": " "}, "flag", False))
         with self.assertRaises(ValueError):
@@ -6373,6 +6422,31 @@ class LakeflowContractTests(unittest.TestCase):
             ):
                 self.connector(FakeBridge(), **{option: value, **extra})
 
+    def test_options_read_only_deep_inside_a_read_are_checked_as_the_connector_starts(self):
+        # Each was read only as a bridge or the Lakebase state was first made, or a table's
+        # state touched: the mistake failed a running flow. A name in mixed case, as a
+        # caller constructing the connector directly may write it, is the same option.
+        for options, message in (
+            ({"lakebase.provision.timeout.seconds": "soon"}, "must be a number"),
+            ({"lakebase.provision.timeout.seconds": "0"}, "must be > 0"),
+            ({"lakebase.project.id": "Not_An_Id"}, "lakebase.project.id must be"),
+            ({"padVarchar": "maybe"}, "padVarchar"),
+            ({"redirect.allowlist": "host-without-port"}, "host:numeric-port"),
+            ({"bridge.factory": "module:make"}, "cannot name code to load"),
+            ({"Transport.Factory": "module:make"}, "'transport.factory' is not accepted"),
+            ({"state.gc.drop.unused.projects": "maybe"}, "must be true or false"),
+            ({"state.gc.project.retention.days": "soon"}, "must be an integer"),
+            (
+                {"state.gc.retention.days": "30", "state.gc.project.retention.days": "7"},
+                "must be >= state.gc.retention.days",
+            ),
+        ):
+            with self.subTest(options=options), self.assertRaisesRegex(Exception, message):
+                self.connector(FakeBridge(), **options)
+        connector = self.connector(FakeBridge(), **{"State.GC.Drop.Unused.Projects": "True"})
+        self.assertEqual(connector.options.get("state.gc.drop.unused.projects"), "True")
+        self.assertEqual(informix_module._state_gc_project_settings(connector.options), 90)
+
     def test_a_table_named_on_the_connection_is_refused(self):
         # qualified_source_table on the connection reached the reads, which read that table,
         # while the metadata read the pipeline's source_table.
@@ -6974,6 +7048,8 @@ class LakeflowContractTests(unittest.TestCase):
         bridge = object.__new__(PurePythonInformixBridge)
         bridge.options = {}
         bridge.transport = SnapshotTransport()
+        # Both key columns NOT NULL: no DATETIME column, nothing nullable.
+        bridge._paging_column_cache = {("app", "tw305"): ({}, frozenset())}
 
         bridge.snapshot_page(
             "demo.app.tw305",
@@ -7009,6 +7085,8 @@ class LakeflowContractTests(unittest.TestCase):
         bridge = object.__new__(PurePythonInformixBridge)
         bridge.options = {}
         bridge.transport = SnapshotTransport()
+        # Both key columns NOT NULL: no DATETIME column, nothing nullable.
+        bridge._paging_column_cache = {("app", "tw305"): ({}, frozenset())}
 
         bridge.snapshot_page(
             "demo.app.tw305",
@@ -7026,6 +7104,81 @@ class LakeflowContractTests(unittest.TestCase):
             "ORDER BY hpolicy DESC,clm_no",
         )
         self.assertEqual(bridge.transport.parameters, (100, 100, 100, 34))
+
+    def test_snapshot_page_keeps_the_nulls_of_a_nullable_descending_key_column(self):
+        # Informix sorts NULL lowest, so a descending column's NULLs come after every
+        # value. A page that ended on a value went on with "clm_no < ?" (and a descending
+        # leading column's seek "hpolicy <= ?"), which passed over every NULL-keyed row
+        # still to read. A nullable descending column (allow.nullable.index) keeps them;
+        # the ascending one doesn't need to (its NULLs were read first).
+        class SnapshotTransport:
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                del max_result_bytes
+                self.sql = sql
+                self.parameters = parameters
+                return []
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.transport = SnapshotTransport()
+        described = {
+            "columns": [
+                {"name": "hpolicy", "type_name": "INTEGER", "length": 4, "nullable": True},
+                {"name": "clm_no", "type_name": "INTEGER", "length": 4, "nullable": True},
+            ]
+        }
+        with mock.patch.object(bridge, "_describe_table", return_value=described):
+            bridge.snapshot_page(
+                "demo.app.tw305",
+                ["hpolicy", "clm_no"],
+                ["hpolicy", "clm_no"],
+                [100, 34],
+                500,
+                key_descending=[False, True],
+            )
+            self.assertEqual(
+                bridge.transport.sql,
+                "SELECT {+FIRST_ROWS(500)} FIRST 500 hpolicy,clm_no FROM demo:app.tw305 "
+                "WHERE hpolicy >= ? AND ((hpolicy > ?) OR "
+                "(hpolicy = ? AND (clm_no < ? OR clm_no IS NULL))) "
+                "ORDER BY hpolicy,clm_no DESC",
+            )
+            self.assertEqual(bridge.transport.parameters, (100, 100, 100, 34))
+
+            bridge.snapshot_page(
+                "demo.app.tw305",
+                ["hpolicy", "clm_no"],
+                ["hpolicy", "clm_no"],
+                [100, 34],
+                500,
+                key_descending=[True, False],
+            )
+            self.assertEqual(
+                bridge.transport.sql,
+                "SELECT {+FIRST_ROWS(500)} FIRST 500 hpolicy,clm_no FROM demo:app.tw305 "
+                "WHERE (hpolicy <= ? OR hpolicy IS NULL) AND "
+                "(((hpolicy < ? OR hpolicy IS NULL)) OR (hpolicy = ? AND clm_no > ?)) "
+                "ORDER BY hpolicy DESC,clm_no",
+            )
+            self.assertEqual(bridge.transport.parameters, (100, 100, 100, 34))
+
+    def test_order_key_puts_a_null_where_informix_sorts_it(self):
+        # Python refused to compare None with a value, so a nullable key's page holding a
+        # NULL failed its bound check with a TypeError. Informix sorts NULL lowest: first
+        # ascending, last descending, and text keys compare blank-padded around it.
+        order_key = informix_module._order_key
+        for ascending in ([5], ["a"]):
+            self.assertLess(order_key([None], ()), order_key(ascending, ()))
+            self.assertGreater(order_key(ascending, ()), order_key([None], ()))
+            self.assertGreater(order_key([None], (True,)), order_key(ascending, (True,)))
+            self.assertLess(order_key(ascending, (True,)), order_key([None], (True,)))
+        self.assertEqual(order_key([None, 1], ()), order_key([None, 1], ()))
+        self.assertLess(order_key([None, 1], ()), order_key([None, 2], ()))
+        keys = [[3, "b"], [None, "a"], [3, None], [1, "z"]]
+        self.assertEqual(
+            sorted(keys, key=lambda key: order_key(key, (False, True))),
+            [[None, "a"], [1, "z"], [3, "b"], [3, None]],
+        )
 
     def test_snapshot_page_refuses_to_page_past_a_null_key_value(self):
         # A NULL cursor value (allow.nullable.index, primary.keys) went into "id > ?" and
@@ -8304,6 +8457,26 @@ class LakeflowContractTests(unittest.TestCase):
             PurePythonInformixBridge._read_connection_backlog_hint_at(options),
             555,
         )
+
+    def test_a_waiter_reads_hints_with_the_state_of_its_current_options(self):
+        # The waiter's state was cached by the endpoint alone and kept on a failure: in a
+        # warm process a changed lakebase.password failed every sweep's login until the
+        # process ended.
+        options = {"hostname": "h", "database": "d", "user": "u", "password": "p"}
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = options
+        with mock.patch.object(PurePythonInformixBridge, "current_lsn", return_value=555):
+            bridge._publish_connection_backlog_hint()
+        read = PurePythonInformixBridge._read_connection_backlog_hint_at
+        self.assertEqual(read(options), 555)
+        self.assertEqual(read({**options, "lakebase.password": "changed"}), 555)
+        self.assertEqual(len(informix_module._LAKEBASE_WAITER_STATE), 2)
+        with mock.patch.object(
+            informix_module, "read_backlog_hints", side_effect=OSError("connection lost")
+        ):
+            self.assertIsNone(read(options))
+        self.assertEqual(len(informix_module._LAKEBASE_WAITER_STATE), 1)
+        self.assertEqual(read(options), 555)
 
     def test_backlog_hint_never_regresses(self):
         # GREATEST is what lets every holder publish without electing one per
@@ -24105,6 +24278,54 @@ class UnloadHelperTests(unittest.TestCase):
         apply('{"qty": "NVL(ROUND(qty, -3), 2147484000)"}')
         with self.assertRaisesRegex(InformixError, "more than a INT column holds"):
             apply('{"qty": "NVL(qty, 2147484000)"}')
+
+    def test_an_nvl_fallback_on_a_variable_decimal_is_judged_by_the_table_options(self):
+        # The fallback was checked with no options, and a variable-scale DECIMAL not at
+        # all: under decimal.variable.type integer 1.5 passed and was cut to 1, and a
+        # fallback past the type's digits failed only when a NULL arrived.
+        columns = [
+            {"name": "id", "type_name": "INTEGER", "length": 4, "nullable": False},
+            {"name": "vcol", "type_name": "DECIMAL", "precision": 16, "scale": 255},
+        ]
+        table = Table.parse({**_table(), "columns": columns}, "demo")
+
+        def apply(transforms, options):
+            return informix_module._apply_column_transforms(
+                table,
+                informix_module._column_transforms({"transform_columns": transforms}),
+                None,
+                options=options,
+            )
+
+        with self.assertRaisesRegex(InformixError, "holds whole numbers only"):
+            apply('{"vcol": "NVL(vcol, 1.5)"}', {"decimal.variable.type": "integer"})
+        with self.assertRaisesRegex(InformixError, "more than a DECIMAL\\(5,2\\) column"):
+            apply('{"vcol": "NVL(vcol, 1000)"}', {"decimal.variable.type": "decimal(5,2)"})
+        # The default DECIMAL(38,18) has 20 integer digits; ROUND to 0 places frees the
+        # other 18 (DECIMAL(38,0)), so 10^20 fits the one and not the other.
+        with self.assertRaisesRegex(InformixError, "more than a DECIMAL\\(38,18\\) column"):
+            apply('{"vcol": "NVL(vcol, 100000000000000000000)"}', {})
+        apply('{"vcol": "NVL(ROUND(vcol, 0), 100000000000000000000)"}', {})
+        # A schema refresh, with no table options to go by, leaves the type unchecked.
+        apply('{"vcol": "NVL(vcol, 100000000000000000000)"}', None)
+
+    def test_an_nvl_fallback_lands_as_the_inner_expression_does(self):
+        # It was coerced to the column's own type: 10^20 for NVL(ROUND(vcol, 0), ...) went
+        # into the DECIMAL(38,18) vcol is, and failed the batch, where the transform lands
+        # as DECIMAL(38,0).
+        column = informix_module.Column.parse(
+            {"name": "vcol", "type_name": "DECIMAL", "precision": 16, "scale": 255}
+        )
+        context = {"columns": {"vcol": column}, "options": {}}
+        operand = ("fn", "ROUND", ("vcol", ("number", Decimal(0))))
+        value = informix_module._fallback_value(Decimal("1e20"), operand, context)
+        self.assertEqual(value, Decimal("100000000000000000000"))
+        self.assertEqual(value.as_tuple().exponent, 0)
+        # The plain column keeps its own type.
+        self.assertEqual(
+            informix_module._fallback_value(Decimal("1.5"), "vcol", context).as_tuple().exponent,
+            -18,
+        )
 
     def test_a_password_login_does_not_run_a_pam_provider_factory(self):
         # The factory answers PAM challenges only: under a password login it was imported

@@ -1662,6 +1662,27 @@ class SqliPacketTests(unittest.TestCase):
             ):
                 client._read_tuple(description)
 
+    def test_a_fixed_tuple_shorter_than_its_columns_is_refused(self):
+        # The last column of a short fixed-layout row took what was left: a CHAR decoded a
+        # prefix as the value, an INTEGER failed as a struct.error.
+        for column, payload in (
+            (ResultColumn("qty", 2, 2, 0, 4), b"\x00\x01\x00\x02"),
+            (ResultColumn("code", 2, 0, 0, 6), b"\x00\x01abc "),
+        ):
+            transcript = struct.pack(">hi", 0, len(payload)) + payload
+            if len(payload) & 1:
+                transcript += b"\x00"
+            client = InformixSqliClient("host", 9088, "db", "user", "password")
+            client._input = io.BytesIO(transcript)
+            description = ResultDescription(
+                2, 7, 2 + _fixed_result_size(column), (ResultColumn("id", 0, 1, 0, 2), column)
+            )
+            with (
+                self.subTest(column=column.name),
+                self.assertRaisesRegex(SqliProtocolError, "shorter than its"),
+            ):
+                client._read_tuple(description, variable_layout=False)
+
     def test_live_feature62_prepare_and_fixed_open_fetch_goldens(self):
         prepare = encode_prepare("x" * 38, parameter_count=0, long_sql_length=True)
         self.assertEqual(len(prepare), 52)

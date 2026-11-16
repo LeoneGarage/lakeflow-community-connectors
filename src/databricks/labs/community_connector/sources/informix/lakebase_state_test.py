@@ -1465,7 +1465,7 @@ class LakebaseStateRecordTests(unittest.TestCase):
         connection.commit.assert_called_once()
 
 
-def _answer_sweep_queries(cursor, recent=(False, False, False, False)):
+def _answer_sweep_queries(cursor, recent=(False, False, False, False, False)):
     """Answer a project sweep's two queries: table activity long ago, then whether anything
     else moved within the retention (nothing, unless ``recent`` says so)."""
 
@@ -1618,16 +1618,58 @@ class LakebaseProjectNamingTests(unittest.TestCase):
         api.request.assert_any_call("DELETE", "/api/2.0/postgres/projects/informix-state-old")
         connection.close.assert_called_once()
 
+    def test_a_candidate_project_is_read_in_the_database_its_state_is_in(self):
+        # Opened in this connection's lakebase.database alone, a project another connection
+        # kept on the default database was never swept; one in neither is left alone.
+        for databases, deleted in (({"custom": False, "databricks_postgres": True}, 1), ({}, 0)):
+            with self.subTest(databases=databases):
+                lakebase_state.LakebaseState._project_gc_checked.clear()
+                state = lakebase_state.LakebaseState({"lakebase.database": "custom"}, "current")
+                api = mock.MagicMock()
+                api.request.side_effect = [
+                    {"projects": [{"name": "projects/informix-state-old"}]},
+                    {"name": "operations/delete"},
+                ]
+                state._api_client = mock.Mock(return_value=api)
+                opened = []
+
+                def open_database(facts, user, token, database=None, databases=databases):
+                    opened.append(database)
+                    if database not in databases:
+                        raise RuntimeError(f'database "{database}" does not exist')
+                    connection = mock.MagicMock()
+                    cursor = connection.cursor.return_value.__enter__.return_value
+                    _answer_sweep_queries(cursor)
+                    if not databases[database]:
+                        cursor.fetchone.side_effect = None
+                        cursor.fetchone.return_value = (False,)
+                    return connection
+
+                state._open = open_database
+                state._admin_user = mock.Mock(return_value="admin")
+                with (
+                    mock.patch.object(
+                        lakebase_state,
+                        "_endpoint_facts",
+                        return_value={"endpoint": "endpoint", "host": "host"},
+                    ),
+                    mock.patch.object(lakebase_state, "generate_credential", return_value="token"),
+                    mock.patch.object(lakebase_state.time, "time", return_value=100_000_000),
+                ):
+                    self.assertEqual(state.collect_unused_projects(90, 24), deleted)
+                self.assertEqual(opened, ["custom", "databricks_postgres"])
+
     def test_a_project_with_recent_activity_of_another_kind_is_kept(self):
         # Table activity alone said a project was idle while a reader used it: a stream
         # outside a pipeline records none, and a pipeline resumed after a long stop waits
-        # for a slot first. A renewed lease, a waiting reader, a backlog hint or a new state
-        # record within the retention keeps it.
+        # for a slot first. A renewed lease, a waiting reader, a backlog hint, a new state
+        # record or a parked CDC handoff within the retention keeps it.
         for recent in (
-            (True, False, False, False),
-            (False, True, False, False),
-            (False, False, True, False),
-            (False, False, False, True),
+            (True, False, False, False, False),
+            (False, True, False, False, False),
+            (False, False, True, False, False),
+            (False, False, False, True, False),
+            (False, False, False, False, True),
         ):
             with self.subTest(recent=recent):
                 lakebase_state.LakebaseState._project_gc_checked.clear()
@@ -1697,7 +1739,9 @@ class LakebaseProjectNamingTests(unittest.TestCase):
                 ("GET", "/api/2.0/postgres/projects?page_token=p%2F2"),
             ],
         )
-        statements = [call.args[0] for call in cursor.execute.call_args_list[:3]]
+        statements = [
+            call.args[0] for call in cursor.execute.call_args_list if "pg_class" not in call.args[0]
+        ][:3]
         self.assertEqual(
             statements,
             [
@@ -1733,7 +1777,10 @@ class LakebaseProjectNamingTests(unittest.TestCase):
         ):
             self.assertEqual(state.collect_unused_projects(90, 24), 0)
         statements = [call.args[0] for call in cursor.execute.call_args_list]
-        self.assertFalse([text for text in statements if "state_records" in text])
+        # The catalog probe for the state's table aside, which reads no record.
+        self.assertFalse(
+            [text for text in statements if "state_records" in text and "pg_class" not in text]
+        )
         self.assertEqual(api.request.call_count, 1)
         connection.commit.assert_not_called()
         connection.close.assert_called_once()

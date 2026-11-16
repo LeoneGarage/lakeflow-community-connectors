@@ -1230,6 +1230,27 @@ def _stale_provisioning_error(error: BaseException) -> bool:
     )
 
 
+def validate_lakebase_options(options: dict[str, str]) -> None:
+    # Docstring: Fail on a lakebase.project.id or lakebase.provision.timeout.seconds the
+    # state could not use. The connector checks them as it starts: they were checked only
+    # as the state was first opened, deep inside a read.
+
+    project_id = options.get("lakebase.project.id", "").strip()
+    # The id goes into workspace API paths and queries as it is.
+    if project_id and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", project_id) is None:
+        raise LakebaseStateError(
+            "lakebase.project.id must be 1 to 63 lowercase letters, digits or hyphens, "
+            "starting with a letter or digit"
+        )
+    raw = options.get("lakebase.provision.timeout.seconds", _DEFAULT_PROVISION_TIMEOUT_SECONDS)
+    try:
+        timeout = float(raw)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Option 'lakebase.provision.timeout.seconds' must be a number") from error
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("Option 'lakebase.provision.timeout.seconds' must be > 0")
+
+
 class LakebaseState:
     # Docstring: Connection factory and provisioning entry point for Lakebase state.
     #
@@ -1262,12 +1283,7 @@ class LakebaseState:
         self._project_id = options.get(
             "lakebase.project.id", ""
         ).strip() or project_id_for_connection(connection_identity)
-        # The id goes into workspace API paths and queries as it is.
-        if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", self._project_id) is None:
-            raise LakebaseStateError(
-                "lakebase.project.id must be 1 to 63 lowercase letters, digits or hyphens, "
-                "starting with a letter or digit"
-            )
+        validate_lakebase_options({**options, "lakebase.project.id": self._project_id})
         self._min_cu = float(options.get("lakebase.autoscale.min.cu", _DEFAULT_MIN_CU))
         self._max_cu = float(options.get("lakebase.autoscale.max.cu", _DEFAULT_MAX_CU))
         self._suspend_seconds = int(
@@ -1276,11 +1292,6 @@ class LakebaseState:
         self._provision_timeout_seconds = float(
             options.get("lakebase.provision.timeout.seconds", _DEFAULT_PROVISION_TIMEOUT_SECONDS)
         )
-        if (
-            not math.isfinite(self._provision_timeout_seconds)
-            or self._provision_timeout_seconds <= 0
-        ):
-            raise ValueError("Option 'lakebase.provision.timeout.seconds' must be > 0")
         self._database = options.get("lakebase.database", "").strip() or _DEFAULT_DATABASE
         # Two distinct identities, deliberately separate.
         #
@@ -1487,7 +1498,12 @@ class LakebaseState:
                 # A candidate is read on a live read's path: wait briefly, not for provisioning.
                 facts = _endpoint_facts(api, project_id, deadline=time.monotonic() + 60)
                 token = generate_credential(api, facts["endpoint"])
-                connection = self._open(facts, self._admin_user(), token)
+                connection = self._open_state_database(facts, token)
+                if connection is None:
+                    _LOGGER.debug(
+                        "Leaving Lakebase project %s: no connector state found in it", project_id
+                    )
+                    continue
                 # The records belong to the state role, and the provisioning identity
                 # holds CREATEROLE, not superuser: it reads them as that role where it
                 # may take it, granting itself the role it created first if need be.
@@ -1534,7 +1550,8 @@ class LakebaseState:
                 # stream outside a pipeline records none, and a pipeline resumed after a
                 # long stop waits for a slot before it records any. Anything else that
                 # moved within the retention keeps it: a lease renewed, a reader waiting,
-                # a backlog hint, a state record written.
+                # a backlog hint, a state record written, a stream's position parked for
+                # a migration.
                 with connection.cursor() as cursor:
                     cursor.execute(
                         """
@@ -1546,9 +1563,11 @@ class LakebaseState:
                           EXISTS (SELECT 1 FROM backlog_hints
                                   WHERE updated_at > now() - %s * interval '1 day'),
                           EXISTS (SELECT 1 FROM state_records
+                                  WHERE created_at > now() - %s * interval '1 day'),
+                          EXISTS (SELECT 1 FROM cdc_handoff
                                   WHERE created_at > now() - %s * interval '1 day')
                         """,
-                        (float(retention_days),) * 4,
+                        (float(retention_days),) * 5,
                     )
                     recent = cursor.fetchone()
                 if any(recent):
@@ -1574,6 +1593,42 @@ class LakebaseState:
             deleted += 1
         return deleted
 
+    def _open_state_database(self, facts: dict[str, Any], token: str) -> Any:
+        # Docstring: A connection, as the provisioning identity, to the database of another
+        # connector project that holds its state: this connection's lakebase.database, else
+        # the default one. None when neither does.
+        #
+        # The project was named by another connection, which may have set another
+        # lakebase.database: with this connection's alone, a project on the default one
+        # was never swept. One on a third name is left alone, as unreadable.
+
+        failure: Exception | None = None
+        for database in dict.fromkeys((self._database, _DEFAULT_DATABASE)):
+            try:
+                connection = self._open(facts, self._admin_user(), token, database=database)
+            except Exception as error:  # pylint: disable=broad-except
+                failure = error
+                continue
+            try:
+                # The catalog, which any role may read; the records are read as the state
+                # role (see collect_unused_projects).
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT count(*) FROM pg_catalog.pg_class WHERE relname = 'state_records'"
+                    )
+                    found = bool(cursor.fetchone()[0])
+                connection.commit()
+            except Exception:  # pylint: disable=broad-except
+                # No telling: the state role, taken next, decides as before.
+                connection.rollback()
+                return connection
+            if found:
+                return connection
+            connection.close()
+        if failure is not None:
+            raise failure
+        return None
+
     def _admin_user(self) -> str:
         # Docstring: Return the role name used for provisioning.
         #
@@ -1594,12 +1649,15 @@ class LakebaseState:
             return self._open(facts, self._admin_user(), self._admin_password)
         return self._open(facts, self._admin_user(), self._credential())
 
-    def _open(self, facts: dict[str, Any], user: str, password: str) -> Any:
-        # Docstring: Connect as ``user``, waking a suspended endpoint if needed.
+    def _open(
+        self, facts: dict[str, Any], user: str, password: str, database: str | None = None
+    ) -> Any:
+        # Docstring: Connect as ``user`` to ``database`` (lakebase.database by default),
+        # waking a suspended endpoint if needed.
 
         parameters = {
             "host": facts["host"],
-            "dbname": self._database,
+            "dbname": database or self._database,
             "user": user,
             "password": password,
             "sslmode": "require",

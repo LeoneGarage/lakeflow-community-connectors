@@ -492,10 +492,10 @@ def normalize(value: Any, data_type: str) -> str | None:
         timestamp = text.replace("T", " ").replace("Z", "+00:00")
         if "." in timestamp:
             head, fraction = timestamp.split(".", 1)
-            suffix = ""
-            if "+" in fraction:
-                fraction, suffix = fraction.split("+", 1)
-                suffix = "+" + suffix
+            # The zone after the fraction, either sign: a session west of UTC gave
+            # "...56.123-05:00", whose "-05" was taken for more of the fraction.
+            digits = len(fraction) - len(fraction.lstrip("0123456789"))
+            fraction, suffix = fraction[:digits], fraction[digits:]
             timestamp = f"{head}.{(fraction + '000000')[:6]}{suffix}"
         parsed = datetime_module.datetime.fromisoformat(timestamp)
         if parsed.tzinfo is not None:

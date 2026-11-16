@@ -635,8 +635,11 @@ Requirements and limits:
   zero until `UPDATE STATISTICS` has run; among equals the index with more columns is
   used. Name the columns with `keyset(...)` to choose yourself.
 - The snapshot relies on index values sorting for the connector as they do for Informix.
-  It checks that each page arrives in that order and fails if one does not, which a
-  character column in a case-insensitive database or with control characters can cause.
+  It checks that each page arrives in that order and fails if one does not. Informix
+  orders CHAR, VARCHAR and LVARCHAR by their bytes and the connector by character, which
+  agree in UTF-8 and ISO 8859-1 databases; in another codeset a character index column
+  can fail the check. NCHAR and NVARCHAR columns, which collate by locale (and ignore case
+  in an `NLSCASE INSENSITIVE` database), are not used as index-scan columns.
 - An index value the connector reads as NULL while Informix does not fails the snapshot:
   a character value holding a NUL byte, under the default `string.null.byte=null`.
 - One index value may have at most a million rows: they are read and staged together.

@@ -2512,6 +2512,27 @@ def register_lakeflow_source(spark):
         )
 
 
+    def validate_lakebase_options(options: dict[str, str]) -> None:
+        # Docstring: Fail on a lakebase.project.id or lakebase.provision.timeout.seconds the
+        # state could not use. The connector checks them as it starts: they were checked only
+        # as the state was first opened, deep inside a read.
+
+        project_id = options.get("lakebase.project.id", "").strip()
+        # The id goes into workspace API paths and queries as it is.
+        if project_id and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", project_id) is None:
+            raise LakebaseStateError(
+                "lakebase.project.id must be 1 to 63 lowercase letters, digits or hyphens, "
+                "starting with a letter or digit"
+            )
+        raw = options.get("lakebase.provision.timeout.seconds", _DEFAULT_PROVISION_TIMEOUT_SECONDS)
+        try:
+            timeout = float(raw)
+        except (TypeError, ValueError) as error:
+            raise ValueError("Option 'lakebase.provision.timeout.seconds' must be a number") from error
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("Option 'lakebase.provision.timeout.seconds' must be > 0")
+
+
     class LakebaseState:
         # Docstring: Connection factory and provisioning entry point for Lakebase state.
         #
@@ -2544,12 +2565,7 @@ def register_lakeflow_source(spark):
             self._project_id = options.get(
                 "lakebase.project.id", ""
             ).strip() or project_id_for_connection(connection_identity)
-            # The id goes into workspace API paths and queries as it is.
-            if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", self._project_id) is None:
-                raise LakebaseStateError(
-                    "lakebase.project.id must be 1 to 63 lowercase letters, digits or hyphens, "
-                    "starting with a letter or digit"
-                )
+            validate_lakebase_options({**options, "lakebase.project.id": self._project_id})
             self._min_cu = float(options.get("lakebase.autoscale.min.cu", _DEFAULT_MIN_CU))
             self._max_cu = float(options.get("lakebase.autoscale.max.cu", _DEFAULT_MAX_CU))
             self._suspend_seconds = int(
@@ -2558,11 +2574,6 @@ def register_lakeflow_source(spark):
             self._provision_timeout_seconds = float(
                 options.get("lakebase.provision.timeout.seconds", _DEFAULT_PROVISION_TIMEOUT_SECONDS)
             )
-            if (
-                not math.isfinite(self._provision_timeout_seconds)
-                or self._provision_timeout_seconds <= 0
-            ):
-                raise ValueError("Option 'lakebase.provision.timeout.seconds' must be > 0")
             self._database = options.get("lakebase.database", "").strip() or _DEFAULT_DATABASE
             # Two distinct identities, deliberately separate.
             #
@@ -2769,7 +2780,12 @@ def register_lakeflow_source(spark):
                     # A candidate is read on a live read's path: wait briefly, not for provisioning.
                     facts = _endpoint_facts(api, project_id, deadline=time.monotonic() + 60)
                     token = generate_credential(api, facts["endpoint"])
-                    connection = self._open(facts, self._admin_user(), token)
+                    connection = self._open_state_database(facts, token)
+                    if connection is None:
+                        _LOGGER.debug(
+                            "Leaving Lakebase project %s: no connector state found in it", project_id
+                        )
+                        continue
                     # The records belong to the state role, and the provisioning identity
                     # holds CREATEROLE, not superuser: it reads them as that role where it
                     # may take it, granting itself the role it created first if need be.
@@ -2816,7 +2832,8 @@ def register_lakeflow_source(spark):
                     # stream outside a pipeline records none, and a pipeline resumed after a
                     # long stop waits for a slot before it records any. Anything else that
                     # moved within the retention keeps it: a lease renewed, a reader waiting,
-                    # a backlog hint, a state record written.
+                    # a backlog hint, a state record written, a stream's position parked for
+                    # a migration.
                     with connection.cursor() as cursor:
                         cursor.execute(
                             """
@@ -2828,9 +2845,11 @@ def register_lakeflow_source(spark):
                               EXISTS (SELECT 1 FROM backlog_hints
                                       WHERE updated_at > now() - %s * interval '1 day'),
                               EXISTS (SELECT 1 FROM state_records
+                                      WHERE created_at > now() - %s * interval '1 day'),
+                              EXISTS (SELECT 1 FROM cdc_handoff
                                       WHERE created_at > now() - %s * interval '1 day')
                             """,
-                            (float(retention_days),) * 4,
+                            (float(retention_days),) * 5,
                         )
                         recent = cursor.fetchone()
                     if any(recent):
@@ -2856,6 +2875,42 @@ def register_lakeflow_source(spark):
                 deleted += 1
             return deleted
 
+        def _open_state_database(self, facts: dict[str, Any], token: str) -> Any:
+            # Docstring: A connection, as the provisioning identity, to the database of another
+            # connector project that holds its state: this connection's lakebase.database, else
+            # the default one. None when neither does.
+            #
+            # The project was named by another connection, which may have set another
+            # lakebase.database: with this connection's alone, a project on the default one
+            # was never swept. One on a third name is left alone, as unreadable.
+
+            failure: Exception | None = None
+            for database in dict.fromkeys((self._database, _DEFAULT_DATABASE)):
+                try:
+                    connection = self._open(facts, self._admin_user(), token, database=database)
+                except Exception as error:  # pylint: disable=broad-except
+                    failure = error
+                    continue
+                try:
+                    # The catalog, which any role may read; the records are read as the state
+                    # role (see collect_unused_projects).
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            "SELECT count(*) FROM pg_catalog.pg_class WHERE relname = 'state_records'"
+                        )
+                        found = bool(cursor.fetchone()[0])
+                    connection.commit()
+                except Exception:  # pylint: disable=broad-except
+                    # No telling: the state role, taken next, decides as before.
+                    connection.rollback()
+                    return connection
+                if found:
+                    return connection
+                connection.close()
+            if failure is not None:
+                raise failure
+            return None
+
         def _admin_user(self) -> str:
             # Docstring: Return the role name used for provisioning.
             #
@@ -2876,12 +2931,15 @@ def register_lakeflow_source(spark):
                 return self._open(facts, self._admin_user(), self._admin_password)
             return self._open(facts, self._admin_user(), self._credential())
 
-        def _open(self, facts: dict[str, Any], user: str, password: str) -> Any:
-            # Docstring: Connect as ``user``, waking a suspended endpoint if needed.
+        def _open(
+            self, facts: dict[str, Any], user: str, password: str, database: str | None = None
+        ) -> Any:
+            # Docstring: Connect as ``user`` to ``database`` (lakebase.database by default),
+            # waking a suspended endpoint if needed.
 
             parameters = {
                 "host": facts["host"],
-                "dbname": self._database,
+                "dbname": database or self._database,
                 "user": user,
                 "password": password,
                 "sslmode": "require",
@@ -6024,6 +6082,20 @@ def register_lakeflow_source(spark):
                         f"tuple column {column.name!r} slice [{start}:{limit}] "
                         f"exceeds payload size {len(payload)}"
                     )
+                if not variable_layout:
+                    # A fixed-layout row shorter than its description left the last column a
+                    # short slice: a CHAR decoded what was there and a number failed as a
+                    # struct.error, which no SqliProtocolError retry catches. A VARCHAR has
+                    # no fixed width to hold it to.
+                    try:
+                        width = _fixed_result_size(column)
+                    except SqliDescriptorNotImplemented:
+                        width = 0
+                    if limit - start < width:
+                        raise SqliProtocolError(
+                            f"tuple column {column.name!r} slice [{start}:{limit}] is shorter "
+                            f"than its {width}-byte width"
+                        )
                 result[column.name] = _decode_result_value(
                     payload[start:limit], column, self._text_encoding, padded, self.null_byte
                 )
@@ -6940,8 +7012,8 @@ def register_lakeflow_source(spark):
     # A waiter holds no slot and has no bridge, so it cannot borrow a bridge's
     # Postgres connection. These caches give the waiter path one state handle and one
     # connection per endpoint per process, keyed by endpoint identity.
-    _LAKEBASE_WAITER_STATE: dict[str, Any] = {}
-    _LAKEBASE_WAITER_CONNECTION: dict[str, Any] = {}
+    _LAKEBASE_WAITER_STATE: dict[tuple, Any] = {}
+    _LAKEBASE_WAITER_CONNECTION: dict[tuple, Any] = {}
     # Created on demand rather than at import, and held in a dict rather than a bare
     # module global. Two constraints meet here. Spark cloudpickles the reader class to
     # its workers, and a lock alive at serialization time makes that fail outright
@@ -8307,25 +8379,35 @@ def register_lakeflow_source(spark):
 
             identity = cls._connection_identity_from(options)
             namespace = hashlib.sha256(identity.encode()).hexdigest()[:24]
+            key = None
             try:
                 with _lakebase_waiter_lock():
-                    state = _LAKEBASE_WAITER_STATE.get(namespace)
+                    # Keyed by the endpoint and what the state was provisioned for: the
+                    # project, database and a digest of the password. By the endpoint alone a
+                    # warm process kept the state of an old lakebase.password or project, and
+                    # every sweep failed its login until the process ended.
+                    fresh = LakebaseState(options, identity)
+                    key = (namespace, *fresh._provision_key())
+                    state = _LAKEBASE_WAITER_STATE.get(key)
                     if state is None:
-                        state = LakebaseState(options, identity)
+                        state = fresh
                         state.provision()
-                        _LAKEBASE_WAITER_STATE[namespace] = state
-                    connection = _LAKEBASE_WAITER_CONNECTION.get(namespace)
+                        _LAKEBASE_WAITER_STATE[key] = state
+                    connection = _LAKEBASE_WAITER_CONNECTION.get(key)
                     if connection is None or getattr(connection, "closed", False):
                         connection = state.connect()
-                        _LAKEBASE_WAITER_CONNECTION[namespace] = connection
+                        _LAKEBASE_WAITER_CONNECTION[key] = connection
                     hints = read_backlog_hints(
                         connection, namespace, max_age_seconds=_CONNECTION_HINT_MAX_AGE_SECONDS
                     )
                 return hints.get(_LAKEBASE_ENDPOINT_HINT_KEY)
             except Exception:
                 with _lakebase_waiter_lock():
-                    # Drop a connection that may be broken so the next read reopens.
-                    broken = _LAKEBASE_WAITER_CONNECTION.pop(namespace, None)
+                    # Drop a connection that may be broken so the next read reopens, and the
+                    # state it came from: the next one provisions again, from the process's
+                    # cache when nothing changed.
+                    broken = _LAKEBASE_WAITER_CONNECTION.pop(key, None)
+                    _LAKEBASE_WAITER_STATE.pop(key, None)
                 if broken is not None:
                     with contextlib.suppress(Exception):
                         broken.close()
@@ -9796,7 +9878,7 @@ def register_lakeflow_source(spark):
                         raise InformixError(_m(461, _join_identity(owner, name), key))
                 bound_after = list(after)
                 if any(isinstance(value, str) for value in after):
-                    datetimes = self._datetime_qualifiers(owner, name)
+                    datetimes = self._paging_column_facts(owner, name)[0]
                     for index, key in enumerate(primary_keys):
                         # DATETIME keys chunked by expression compare as strings, so
                         # they must not be rewritten into a native DATETIME literal.
@@ -9828,26 +9910,42 @@ def register_lakeflow_source(spark):
                 #     provably redundant;
                 #   * the leading cursor value must be non-NULL: `k1 >= NULL` is UNKNOWN
                 #     for every row and would return an empty page (a nullable leading
-                #     column under allow.nullable.index can resume from NULL). Rows whose
-                #     leading value IS NULL are already excluded by the OR-form itself
-                #     (NULL > ? / NULL < ? are UNKNOWN), so the bound removes exactly the
-                #     same rows the OR-form does -- it never drops a row the OR-form keeps.
+                #     column under allow.nullable.index can resume from NULL). The bound
+                #     keeps the rows whose leading value IS NULL exactly when the OR-form
+                #     does (a nullable descending column, below), so it never drops a row
+                #     the OR-form keeps.
+                #
+                # Informix sorts NULL lowest: first in an ascending column, so behind any
+                # cursor value, but last in a descending one, so still to read after a page
+                # that ended on a value. "< ?" alone passed over them. A descending column the
+                # catalog holds nullable (allow.nullable.index, primary.keys) adds "OR IS NULL";
+                # a NOT NULL one, every real primary key, keeps the plain comparison.
+                nullable = (
+                    self._paging_column_facts(owner, name)[1]
+                    if any(is_descending(index) for index in range(len(primary_keys)))
+                    else frozenset()
+                )
+
+                def comparison_term(index: int, comparison: str) -> str:
+                    key = primary_keys[index]
+                    term = f"{order_term(key)} {comparison} ?"
+                    if is_descending(index) and key in nullable:
+                        return f"({term} OR {order_term(key)} IS NULL)"
+                    return term
+
                 if primary_keys and primary_keys[0] not in chunk_exprs and bound_after[0] is not None:
-                    seek_comparison = "<=" if is_descending(0) else ">="
-                    predicates.append(f"{order_term(primary_keys[0])} {seek_comparison} ?")
+                    predicates.append(comparison_term(0, "<=" if is_descending(0) else ">="))
                     parameters.append(bound_after[0])
                 clauses = []
-                for index, key in enumerate(primary_keys):
+                for index in range(len(primary_keys)):
                     prefix = " AND ".join(
                         f"{order_term(previous)} = ?" for previous in primary_keys[:index]
                     )
                     # "Next in scan order" is a larger value for an ASC column and a
                     # smaller one for a DESC column, so the keyset comparison flips to
                     # match the index direction.
-                    comparison = "<" if is_descending(index) else ">"
-                    clauses.append(
-                        f"({prefix + ' AND ' if prefix else ''}{order_term(key)} {comparison} ?)"
-                    )
+                    term = comparison_term(index, "<" if is_descending(index) else ">")
+                    clauses.append(f"({prefix + ' AND ' if prefix else ''}{term})")
                     parameters.extend(bound_after[: index + 1])
                 predicates.append("(" + " OR ".join(clauses) + ")")
             if predicates:
@@ -9872,24 +9970,31 @@ def register_lakeflow_source(spark):
                 for row in rows
             ]
 
-        def _datetime_qualifiers(self, owner: str, name: str) -> dict[str, int]:
-            # Docstring: The table's DATETIME columns and their qualifiers, described once per bridge.
+        def _paging_column_facts(self, owner: str, name: str) -> tuple[dict[str, int], frozenset]:
+            # Docstring: The table's DATETIME columns with their qualifiers, and its nullable
+            # columns, described once per bridge.
             #
-            # A keyset page needs them to bind a string cursor value as a DATETIME literal.
-            # Describing the table on every page of a CHAR-keyed table cost catalog queries
-            # inside each page's transaction. The connector pages with key metadata it read
-            # when the snapshot began, so caching these adds no staleness of its own.
+            # A keyset page needs the first to bind a string cursor value as a DATETIME literal
+            # and the second to keep a descending key column's NULLs. Describing the table on
+            # every page cost catalog queries inside each page's transaction. The connector
+            # pages with key metadata it read when the snapshot began, so caching these adds
+            # no staleness of its own.
 
-            cache = getattr(self, "_datetime_qualifier_cache", None)
+            cache = getattr(self, "_paging_column_cache", None)
             if cache is None:
-                cache = self._datetime_qualifier_cache = {}
+                cache = self._paging_column_cache = {}
             if (owner, name) not in cache:
                 table = self._describe_table(owner, name)
-                cache[(owner, name)] = {
-                    str(column["name"]): int(column["length"])
-                    for column in table["columns"]
-                    if column["type_name"] == "DATETIME"
-                }
+                cache[(owner, name)] = (
+                    {
+                        str(column["name"]): int(column["length"])
+                        for column in table["columns"]
+                        if column["type_name"] == "DATETIME"
+                    },
+                    frozenset(
+                        str(column["name"]) for column in table["columns"] if column.get("nullable")
+                    ),
+                )
             return cache[(owner, name)]
 
         @contextlib.contextmanager
@@ -10699,18 +10804,8 @@ def register_lakeflow_source(spark):
             ),
             "tls": _option_bool(options, "encrypt", True),
             "ca_file": options.get("ssl.ca.file"),
-            # As with the locales above: Spark lowercases option keys, and a copy of the
-            # options into a plain dict (a drain or shard reader's) keeps only that form.
-            # An invalid value is reported under the option's documented name.
-            "pad_varchar": _option_bool(
-                {
-                    "padVarchar": value
-                    for value in [options.get("padvarchar", options.get("padVarchar"))]
-                    if value is not None
-                },
-                "padVarchar",
-                False,
-            ),
+            # As with the locales above (see _pad_varchar_option).
+            "pad_varchar": _pad_varchar_option(options),
             "cdc_timeout": int(options.get("cdc.timeout", "5")),
             "cdc_max_records": int(options.get("cdc.max.records", str(_DEFAULT_CDC_MAX_RECORDS))),
             "stop_logging_on_close": False,
@@ -10887,6 +10982,47 @@ def register_lakeflow_source(spark):
             # 'state.gc.retention.days' ({} days): a sweep could then remove a live table's state
             raise ValueError(_m(460, options.get("state.gc.interval.hours"), retention_days))
         return retention_days, interval_hours
+
+
+    def _state_gc_project_settings(options: dict[str, str]) -> int | None:
+        # Docstring: state.gc.project.retention.days, checked, when
+        # state.gc.drop.unused.projects is on; None when it is off.
+        #
+        # Both were read only when a table's state was touched, so a mistake surfaced after
+        # the pipeline had started, or never while dropping stayed off; "True " failed as
+        # neither true nor false.
+
+        try:
+            drop = _option_bool(options, "state.gc.drop.unused.projects", False)
+        except ValueError as error:
+            # 323: Option 'state.gc.drop.unused.projects' must be true or false
+            raise ValueError(_m(323)) from error
+        try:
+            project_retention_days = int(
+                options.get("state.gc.project.retention.days", _DEFAULT_STATE_GC_PROJECT_RETENTION_DAYS)
+            )
+        except (TypeError, ValueError) as error:
+            # 324: Option 'state.gc.project.retention.days' must be an integer
+            raise ValueError(_m(324)) from error
+        if project_retention_days < _state_gc_settings(options)[0]:
+            # 325: Option 'state.gc.project.retention.days' must be >= state.gc.retention.days
+            raise ValueError(_m(325))
+        return project_retention_days if drop else None
+
+
+    # The whole-number options a table may set, as (name, default, minimum, maximum) the way
+    # the reads take them (InformixLakeflowConnect._table_int_option).
+    _TABLE_INT_OPTIONS = (
+        ("snapshot.page.size", _DEFAULT_SNAPSHOT_PAGE_SIZE, 1, None),
+        ("keyless.snapshot.page.size", _DEFAULT_KEYLESS_SNAPSHOT_PAGE_SIZE, 1, None),
+        ("snapshot.max.rows", 0, 0, None),
+        ("snapshot.max.bytes", 0, 0, None),
+        ("cdc.timeout", 5, 1, None),
+        ("cdc.max.records", _DEFAULT_CDC_MAX_RECORDS, 1, 256),
+        ("max.records.per.batch", _DEFAULT_MAX_RECORDS_PER_BATCH, 1, None),
+        (_UNL_GZIP_RECORDS_OPTION, 0, 0, None),
+        (_UNL_SPLIT_BYTES_OPTION, _UNL_SPLIT_TARGET_BYTES, 1, None),
+    )
 
 
     def _parsed_option(options: dict[str, str], name: str, default: Any, kind: type = int) -> Any:
@@ -11087,8 +11223,11 @@ def register_lakeflow_source(spark):
             else value
             for value in values
         ]
-        # Text in Informix's order: blank-padded (see _PadSpace).
-        values = [_PadSpace(value) if isinstance(value, str) else value for value in values]
+        # Text in Informix's order: blank-padded (see _PadSpace); a NULL below every value.
+        values = [
+            _PadSpace(value) if isinstance(value, str) else (_NULL_LOWEST if value is None else value)
+            for value in values
+        ]
         if not descending or not any(descending):
             return tuple(values)
         return tuple(
@@ -11127,17 +11266,58 @@ def register_lakeflow_source(spark):
         def __hash__(self) -> int:
             return hash(self.text.rstrip(" "))
 
+        # Against what isn't text (a NULL key's _NullLowest) NotImplemented goes back, so the
+        # reflected operation decides.
         def __lt__(self, other: object) -> bool:
-            return self._compare(other) < 0
+            result = self._compare(other)
+            return result if result is NotImplemented else result < 0
 
         def __le__(self, other: object) -> bool:
-            return self._compare(other) <= 0
+            result = self._compare(other)
+            return result if result is NotImplemented else result <= 0
 
         def __gt__(self, other: object) -> bool:
-            return self._compare(other) > 0
+            result = self._compare(other)
+            return result if result is NotImplemented else result > 0
 
         def __ge__(self, other: object) -> bool:
-            return self._compare(other) >= 0
+            result = self._compare(other)
+            return result if result is NotImplemented else result >= 0
+
+
+    class _NullLowest:
+        # Docstring: A NULL key value where Informix sorts it: below every value, so first in
+        # an ascending column and, wrapped in _DescendingKey, last in a descending one.
+        #
+        # Python refuses to compare None with a value, so a page of a nullable key
+        # (allow.nullable.index, primary.keys) holding a NULL failed its bound check with a
+        # TypeError.
+
+        __slots__ = ()
+
+        def __eq__(self, other: object) -> bool:
+            return isinstance(other, _NullLowest)
+
+        def __ne__(self, other: object) -> bool:
+            return not isinstance(other, _NullLowest)
+
+        def __hash__(self) -> int:
+            return 0
+
+        def __lt__(self, other: object) -> bool:
+            return not isinstance(other, _NullLowest)
+
+        def __le__(self, other: object) -> bool:
+            return True
+
+        def __gt__(self, other: object) -> bool:
+            return False
+
+        def __ge__(self, other: object) -> bool:
+            return isinstance(other, _NullLowest)
+
+
+    _NULL_LOWEST = _NullLowest()
 
 
     def _select_unique_index_key(
@@ -11602,12 +11782,19 @@ def register_lakeflow_source(spark):
 
 
     def _apply_column_transforms(
-        table: Table, transforms: tuple | None, key: str | None, *, key_id: str | None = None
+        table: Table,
+        transforms: tuple | None,
+        key: str | None,
+        *,
+        key_id: str | None = None,
+        options: dict[str, str] | None = None,
     ) -> Table:
         # Docstring: Validate ``transforms`` against ``table`` and record their canonical form.
         #
         # ``key`` is the transform.hash.key connection option, required when HASH is used;
         # a schema refresh, which carries a validated table forward, passes its ``key_id``.
+        # ``options``, the table's options, give a variable-scale DECIMAL its type (see
+        # _expression_kind); a schema refresh has none to pass.
 
         option = _TRANSFORM_COLUMNS_OPTION
         if transforms is None:
@@ -11623,7 +11810,9 @@ def register_lakeflow_source(spark):
             if _expression_column(operand) != name:
                 # 95: Option '{}' for {} reads {}; an expression may only read the column it replaces
                 raise InformixError(_m(95, option, name, _expression_column(operand)))
-            _expression_kind(operand, columns, option, table.exposed_name, filtering=False)
+            _expression_kind(
+                operand, columns, option, table.exposed_name, filtering=False, options=options
+            )
             uses_hash = uses_hash or "HASH" in _operand_functions(operand)
             # By the parsed expression, not its text: a name canonical text quotes ("date",
             # "a+b") made HASH("date") differ from HASH(date), and refused a hashed key.
@@ -11856,11 +12045,14 @@ def register_lakeflow_source(spark):
         table_name: str,
         *,
         filtering: bool,
+        options: dict[str, str] | None = None,
     ) -> str:
         # Docstring: The kind ``operand`` evaluates to, failing on anything ill-typed.
         #
         # A column of a type a filter cannot compare has kind "other", which only HASH and
-        # NULLIFY accept; in a filter such a column fails outright.
+        # NULLIFY accept; in a filter such a column fails outright. ``options``, the table's,
+        # give a variable-scale DECIMAL the type NVL's fallback is checked against; without
+        # them that type is unknown and not checked.
 
         if isinstance(operand, str):
             column = columns.get(operand)
@@ -11877,7 +12069,9 @@ def register_lakeflow_source(spark):
         if filtering and not in_filters:
             # 100: Option '{}' cannot use {}, which only transform_columns applies
             raise InformixError(_m(100, option, name))
-        kind = _expression_kind(arguments[0], columns, option, table_name, filtering=filtering)
+        kind = _expression_kind(
+            arguments[0], columns, option, table_name, filtering=filtering, options=options
+        )
         if kind not in inputs:
             # 101: Option '{}' cannot apply {} to a {} value
             raise InformixError(_m(101, option, name, kind))
@@ -11901,8 +12095,10 @@ def register_lakeflow_source(spark):
             # Judged by the type the inner expression lands as, which the fallback lands as
             # too, not the column's: NVL(LENGTH(name), 5000000000) on a VARCHAR passed and
             # then failed a batch as an int, and NVL(ROUND(int_col, -3), 2147484000), which
-            # lands as a BIGINT, was refused.
-            inner = _transform_spark_type(arguments[0], column, {})
+            # lands as a BIGINT, was refused. A variable-scale DECIMAL lands as the table's
+            # decimal options give it (decimal.variable.type: integer is a BIGINT), and ROUND
+            # of one can free integer digits (to DECIMAL(38,0) from the default 38,18).
+            inner = _transform_spark_type(arguments[0], column, options or {})
             integral = (
                 isinstance(inner, (IntegerType, LongType))
                 or column.type_name in _INTEGER_RANKS
@@ -11917,16 +12113,24 @@ def register_lakeflow_source(spark):
                 raise InformixError(_m(104, option, name, fallback, column.name))
             # And one that type can hold. Left unchecked, the mistake showed only when a row
             # with a NULL arrived, as a failed batch. A variable-scale DECIMAL's type is the
-            # decimal options' to say, so it is not checked here.
+            # decimal options' to say, so it is checked only when they are known.
             if isinstance(inner, IntegerType):
                 limit = Decimal((1 << 31) - 1)
             elif isinstance(inner, LongType):
                 limit = Decimal((1 << 63) - 1)
-            elif isinstance(inner, DecimalType) and not _is_variable_scale_decimal(column):
-                limit = Decimal(10) ** (inner.precision - inner.scale) - Decimal(1).scaleb(-inner.scale)
+            elif isinstance(inner, DecimalType) and (
+                options is not None or not _is_variable_scale_decimal(column)
+            ):
+                # Past Python's 28 digits: at them DECIMAL(38,18)'s 10^20 - 10^-18 is 10^20.
+                with localcontext() as decimal_context:
+                    decimal_context.prec = 80
+                    limit = Decimal(10) ** (inner.precision - inner.scale) - Decimal(1).scaleb(
+                        -inner.scale
+                    )
             else:
                 limit = None
-            if limit is not None and abs(fallback) > limit:
+            # copy_abs, not abs(): that rounds to the context's 28 digits as well.
+            if limit is not None and fallback.copy_abs() > limit:
                 # 450: Option '{}' gives {} the fallback {} for {}, which is more than a {}
                 # column holds
                 raise InformixError(
@@ -12208,7 +12412,22 @@ def register_lakeflow_source(spark):
         column = (columns or {}).get(_expression_column(operand))
         if column is None:
             return literal
-        return _number_for_column(literal, column, context.get("options") or {})
+        options = context.get("options") or {}
+        if not isinstance(operand, str):
+            # A function can land in another type than its column (see _transform_spark_type),
+            # and the fallback lands as the function's values do: ROUND(vcol, 0) is a
+            # DECIMAL(38,0) where vcol is a DECIMAL(38,18), and 10^20 fits the one, not the
+            # other; ROUND(int_col, -3) can be a BIGINT.
+            inner = _transform_spark_type(operand, column, options)
+            if isinstance(inner, (IntegerType, LongType)):
+                return int(literal)
+            if isinstance(inner, DecimalType) and inner.scale != getattr(
+                _spark_type(column, options), "scale", None
+            ):
+                with localcontext() as decimal_context:
+                    decimal_context.prec = 80
+                    return literal.quantize(Decimal(1).scaleb(-inner.scale))
+        return _number_for_column(literal, column, options)
 
 
     def _number_for_column(value: Decimal, column: "Column", options: dict[str, str]) -> Any:
@@ -13068,6 +13287,14 @@ def register_lakeflow_source(spark):
                 raise
         finally:
             os.close(directory)
+
+
+    def _pad_varchar_option(options: dict[str, str]) -> bool:
+        # Docstring: padVarchar, under either spelling: Spark lowercases option keys, and a
+        # copy of the options into a plain dict (a drain or shard reader's) keeps only that
+        # form. An invalid value is reported under the option's documented name.
+        value = options.get("padvarchar", options.get("padVarchar"))
+        return _option_bool({} if value is None else {"padVarchar": value}, "padVarchar", False)
 
 
     def _redirect_allowlist(value: str) -> frozenset[tuple[str, int]]:
@@ -15272,6 +15499,15 @@ def register_lakeflow_source(spark):
                     if isinstance(value, str) and value == "" and name.lower() != _UNL_ESCAPE_OPTION
                 ]:
                     del options[name]
+            # Under the names Spark hands them over in, lowercased, as a table's options are
+            # (_options_set): constructed directly, "Bridge.Factory" or "Primary.Keys" passed the
+            # refusals that look for the lowercase name, and every other option read as unset.
+            with contextlib.suppress(TypeError, AttributeError):
+                if any(isinstance(name, str) and name != name.lower() for name in options):
+                    options = {
+                        name.lower() if isinstance(name, str) else name: value
+                        for name, value in options.items()
+                    }
             super().__init__(options)
             # The Volume now stores exactly one thing: snapshot page payloads. It has
             # no default to fall back on, because there is no longer a shared state
@@ -15429,6 +15665,13 @@ def register_lakeflow_source(spark):
             _option_bool(options, _PROMOTE_UNIQUE_INDEX_OPTION, True)
             _option_bool(options, _SNAPSHOT_STAGING_PIPELINE_OPTION, True)
             _option_bool(options, _PARTITIONED_STREAM_OPTION, True)
+            # Read only as a bridge or the Lakebase state is first made, or a table's state is
+            # touched, deep inside a read: checked here instead.
+            _refuse_code_loading_options(options)
+            _redirect_allowlist(options.get("redirect.allowlist", ""))
+            _pad_varchar_option(options)
+            validate_lakebase_options(options)
+            _state_gc_project_settings(options)
             staging_transport = (
                 str(
                     options.get(_SNAPSHOT_STAGING_TRANSPORT_OPTION, _DEFAULT_SNAPSHOT_STAGING_TRANSPORT)
@@ -15822,6 +16065,9 @@ def register_lakeflow_source(spark):
         def read_table_metadata(self, table_name: str, table_options: dict[str, str]) -> dict:
             table_options = _options_set(table_options)
             self._refuse_connection_table_options(table_options)
+            # A table's whole-number options failed only when the stream first read them.
+            for name, default, minimum, maximum in _TABLE_INT_OPTIONS:
+                self._table_int_option(table_options, name, default, minimum=minimum, maximum=maximum)
             with self._metadata_session_lock, self._metadata_access():
                 table = self._registration_table(table_name, table_options)
                 _ensure_materializable(table, table_options)
@@ -17930,6 +18176,7 @@ def register_lakeflow_source(spark):
                 _column_transforms(table_options),
                 self.options.get(_TRANSFORM_HASH_KEY_OPTION)
                 or table_options.get(_TRANSFORM_HASH_KEY_OPTION),
+                options=table_options,
             )
             return _apply_column_renames(table, _column_renames(table_options))
 
@@ -21776,7 +22023,11 @@ def register_lakeflow_source(spark):
                 if tx.commit_lsn > end:
                     kept.append(tx)
                     continue
-                if tx.spilled:
+                # A shared shard hands each table the whole transaction, other tables' changes
+                # included: those are the projection's to leave out. Read as this table's, a
+                # row without its index columns failed, and one with them named a change the
+                # manifest did not, for a full refresh.
+                if any(_record_matches(part, table) for part in tx.spilled):
                     # 433: The index-ordered snapshot of a keyless table does not
                     # support {} on '{}'; set snapshot.scan=cursor to read the table
                     # without index order
@@ -21786,6 +22037,9 @@ def register_lakeflow_source(spark):
 
                 records, halved = [], False
                 for record in tx.records:
+                    if not _record_matches(record, table):
+                        records.append(record)
+                        continue
                     old, new = record.get("before"), record.get("after")
                     if None not in (old, new):
                         # An UPDATE that changed an index value took its row out of one key
@@ -24780,13 +25034,17 @@ def register_lakeflow_source(spark):
             minimum: int,
             maximum: int | None = None,
         ) -> int:
-            # A blank is a setting not made, in a table's options as in the connection's.
+            # An empty value is a setting not made, in a table's options as in the
+            # connection's; one of blanks is judged as given, as the constructor judges it.
             raw = table_options.get(name)
-            if raw is None or (isinstance(raw, str) and not raw.strip()):
+            if raw is None or raw == "":
                 raw = self.options.get(name)
-            if raw is None or (isinstance(raw, str) and not raw.strip()):
+            if raw is None or raw == "":
                 raw = str(default)
-            value = int(raw)
+            try:
+                value = int(raw)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"Option '{name}' must be a whole number") from error
             if value < minimum:
                 raise ValueError(f"Option '{name}' must be >= {minimum}")
             if maximum is not None and value > maximum:
@@ -25447,24 +25705,8 @@ def register_lakeflow_source(spark):
                 # 322: Collected {} stale Informix Lakebase state records
                 logging.getLogger(__name__).info(_m(322, deleted))
             self._maybe_sweep_connection_staging(touch_seconds)
-            drop_projects = self.options.get("state.gc.drop.unused.projects", "false").lower()
-            if drop_projects not in {"true", "false"}:
-                # 323: Option 'state.gc.drop.unused.projects' must be true or false
-                raise ValueError(_m(323))
-            if drop_projects == "true":
-                try:
-                    project_retention_days = int(
-                        self.options.get(
-                            "state.gc.project.retention.days",
-                            _DEFAULT_STATE_GC_PROJECT_RETENTION_DAYS,
-                        )
-                    )
-                except (TypeError, ValueError) as error:
-                    # 324: Option 'state.gc.project.retention.days' must be an integer
-                    raise ValueError(_m(324)) from error
-                if project_retention_days < retention_days:
-                    # 325: Option 'state.gc.project.retention.days' must be >= state.gc.retention.days
-                    raise ValueError(_m(325))
+            project_retention_days = _state_gc_project_settings(self.options)
+            if project_retention_days is not None:
                 state = getattr(self, "_lakebase_state", None)
                 # One process of the pipeline an interval: the look opens a connection to
                 # every other connector project in the workspace, which wakes each one's
@@ -28593,13 +28835,15 @@ def register_lakeflow_source(spark):
 
     def _shorten_merged_definitions(namespace: dict[str, Any]) -> None:
         # Docstring: In the merged single file, strip ``register_lakeflow_source.<locals>.``
-        # from every definition's qualname, drop function annotations, and keep lines but not
-        # columns in each code object's location table (see _lines_only).
+        # from every definition's qualname, drop function annotations and docstrings, and keep
+        # lines but not columns in each code object's location table (see _lines_only).
         #
         # The merge nests the whole connector inside register_lakeflow_source, so Spark
         # pickles every function and class by value. Each function carries that prefix twice
         # (on the function and on its code object, nested code included) and an annotations
-        # dict nothing reads at run time: about 67 KB of the 1 MiB the planner accepts.
+        # dict nothing reads at run time: about 67 KB of the 1 MiB the planner accepts. A
+        # function's docstring goes along as its __doc__ beside the copy in its code, and a
+        # class's (a dataclass's is its whole signature) in its dict: some 11 KB more.
         # Tracebacks still show each function's name, file and line. Imported as a module,
         # nothing carries the prefix, so this changes nothing.
         prefix = "register_lakeflow_source.<locals>."
@@ -28634,12 +28878,15 @@ def register_lakeflow_source(spark):
                     value.__code__ = shorten(value.__code__)
                     value.__qualname__ = value.__qualname__.removeprefix(prefix)
                     value.__annotations__ = {}
+                    value.__doc__ = None
                     for cell in value.__closure__ or ():
                         with contextlib.suppress(ValueError):  # an unfilled cell
                             visit(cell.cell_contents)
             elif isinstance(value, type):
                 if value.__qualname__.startswith(prefix):
                     value.__qualname__ = value.__qualname__.removeprefix(prefix)
+                    with contextlib.suppress(AttributeError, TypeError):
+                        value.__doc__ = None
                     for member in list(vars(value).values()):
                         visit(member)
             elif isinstance(value, dict):
