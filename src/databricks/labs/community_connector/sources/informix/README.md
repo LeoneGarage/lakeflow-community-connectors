@@ -1002,11 +1002,11 @@ the table, unless it is part of the key, which fails the table; `primary.keys: "
 
 | Goal | Table configuration | The target holds | Watch out for |
 |---|---|---|---|
-| A change log (the default) | none | One row per change | Updates carry only new values, so current state can't be rebuilt |
+| A change log (the default) | none | One row per change; each update as `d` then `u` | Current state is rebuilt by counting rows; `append.delete.tombstones: "false"` rules that out |
 | Current state, unique columns | `primary.keys: "col_a,col_b"`, or a `UNIQUE` index | Merged rows | The key must be unique per row |
 | Current state, whole row | `primary.keys: "*"` and `snapshot.scan: cursor` | Merged rows | Duplicate rows collapse; a column added with a default needs a full refresh |
 | Current state with soft deletes | a key, as above, and `scd_type: SCD_TYPE_2` | Every version; deleted ones closed, not removed | Old versions accumulate |
-| A change log you can rebuild state from | `primary.keys: "*"`, `append.only.ingestion: "true"` and `scd_type: APPEND_ONLY` | One row per change; each update as `d` then `u` | Readers need the current-state query below |
+| A change log keyed on the whole row | `primary.keys: "*"`, `append.only.ingestion: "true"` and `scd_type: APPEND_ONLY` | One row per change; each update as `d` then `u` | Readers need the current-state query below |
 | A small table re-read each run | `append.only.ingestion: "false"`, and `primary_keys` in the pipeline spec | The whole table, merged by those keys | Each run re-reads every row, capped by `snapshot.max.rows` |
 
 ### The default change log
@@ -1199,8 +1199,10 @@ QUALIFY row_number() OVER (
 ) = 1 AND _informix_op <> 'd'
 ```
 
-This query doesn't work on the default keyless log, where an update doesn't mark
-the old row as removed.
+The same query works on the default keyless log, which also lands each update's
+old row as a `d` row, as long as its rows are unique as a whole. With exact
+duplicate rows, rebuild by counting instead (see
+[The default change log](#the-default-change-log)).
 
 Setting only `scd_type: APPEND_ONLY` on a keyed table is not the same. The target
 becomes an append table, but the connector stays on the keyed path, so deletes
