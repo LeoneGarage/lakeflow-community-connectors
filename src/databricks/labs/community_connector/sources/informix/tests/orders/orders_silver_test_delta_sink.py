@@ -45,7 +45,7 @@ STREAM = f"{PIPELINE}:{BRONZE}"
 # an operation or a column added to one belongs in the other. orders_compare_test_tool.py
 # compares both tables with the source, so a difference between them shows there.
 REBUILD = """
-SELECT inline(array_repeat(struct(order_id, sku, qty, price, note), CAST(CASE
+SELECT inline(array_repeat(struct(order_id, sku, qty, price, note, updated_at), CAST(CASE
     WHEN other_changes <> 0 THEN raise_error(concat(
       'order_items_delta: an operation other than r, c, u or d for order ',
       CAST(order_id AS STRING)))
@@ -54,13 +54,13 @@ SELECT inline(array_repeat(struct(order_id, sku, qty, price, note), CAST(CASE
       CAST(order_id AS STRING)))
     ELSE copies END AS INT)))
 FROM (
-  SELECT order_id, sku, qty, price, note,
+  SELECT order_id, sku, qty, price, note, updated_at,
     sum(CASE WHEN _informix_op IN ('r', 'c', 'u') THEN 1
              WHEN _informix_op = 'd' THEN -1 ELSE 0 END) AS copies,
     sum(CASE WHEN _informix_op IN ('r', 'c', 'u', 'd') THEN 0 ELSE 1 END) AS other_changes
   FROM {bronze}
   WHERE {where}
-  GROUP BY order_id, sku, qty, price, note)
+  GROUP BY order_id, sku, qty, price, note, updated_at)
 """
 
 

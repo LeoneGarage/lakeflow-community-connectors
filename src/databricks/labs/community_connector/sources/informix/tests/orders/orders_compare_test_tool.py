@@ -3,7 +3,8 @@
 The source side is the output of orders_fingerprint.sh, saved to a file: order_items summed
 up in 25 buckets. The same sums are taken over each silver table, the materialized view
 order_items and the foreachBatch sink's Delta table order_items_delta; every bucket must
-match, which it only does if the table holds each source row the right number of times.
+match, which it only does if the table holds each source row the right number of times,
+updated_at included (by its day and its time of day to the 10 microseconds).
 
     python orders_compare_test_tool.py <fingerprint file> --warehouse-id <id> \\
         [--profile DEFAULT] [--silver <catalog>.orders_silver] [--bronze <catalog>.orders_bronze] \\
@@ -56,8 +57,9 @@ def main() -> int:
                 [float(value) for value in row]
                 for row in query(
                     "SELECT order_id % 25, count(*), sum(order_id), sum(qty), sum(price), "
-                    f"sum(order_id * qty * price), count(note) FROM {table} "
-                    "GROUP BY 1 ORDER BY 1"
+                    "sum(order_id * qty * price), count(note), sum(day(updated_at)), "
+                    "sum(CAST(date_format(updated_at, 'HHmmssSSSSS') AS BIGINT)) "
+                    f"FROM {table} GROUP BY 1 ORDER BY 1"
                 )
             ]
         except Exception as error:  # pylint: disable=broad-except
@@ -82,7 +84,7 @@ def main() -> int:
             f"{table} duplicate groups / most copies / rows in them:",
             query(
                 f"SELECT count(*), max(c), sum(c) FROM (SELECT count(*) c FROM {table} "
-                "GROUP BY order_id, sku, qty, price, note HAVING count(*) > 1)"
+                "GROUP BY order_id, sku, qty, price, note, updated_at HAVING count(*) > 1)"
             ),
         )
     print(
@@ -99,7 +101,8 @@ def main() -> int:
             "WHEN _informix_op = 'd' THEN -1 ELSE 0 END) AS copies, "
             "sum(CASE WHEN _informix_op IN ('r', 'c', 'u', 'd') THEN 0 ELSE 1 END) "
             f"AS other_changes FROM {args.bronze}.order_items "
-            "GROUP BY order_id, sku, qty, price, note HAVING copies <> 0 OR other_changes <> 0)"
+            "GROUP BY order_id, sku, qty, price, note, updated_at "
+            "HAVING copies <> 0 OR other_changes <> 0)"
         ),
     )
     print(

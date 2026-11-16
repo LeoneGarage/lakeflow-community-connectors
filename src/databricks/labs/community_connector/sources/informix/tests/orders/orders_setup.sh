@@ -1,5 +1,7 @@
 #!/bin/bash
 # Creates orders (keyed) and order_items (no key, indexed on order_id, FK to orders) in testdb and seeds them.
+# order_items.updated_at is stamped by every insert and update, as an application keeping a
+# last-update time does; no statement of the workload matches rows on it.
 # Run inside the Informix container as a user that can run dbaccess, next to orders_lib.sh.
 export INFORMIXDIR=${INFORMIXDIR:-/opt/ibm/informix} INFORMIXSERVER=${INFORMIXSERVER:-informix}
 export PATH="$INFORMIXDIR/bin:$PATH" DBACCNOIGN=1
@@ -15,7 +17,8 @@ CREATE TABLE order_items (
   sku      CHAR(8) NOT NULL,
   qty      INT NOT NULL,
   price    DECIMAL(10,2) NOT NULL,
-  note     VARCHAR(20)
+  note     VARCHAR(20),
+  updated_at DATETIME YEAR TO FRACTION(5) NOT NULL
 ) LOCK MODE ROW;
 CREATE INDEX ix_order_items_order_id ON order_items (order_id);
 ALTER TABLE order_items ADD CONSTRAINT FOREIGN KEY (order_id) REFERENCES orders (id) CONSTRAINT fk_order_items_order;
@@ -30,4 +33,4 @@ SQL
 } > /tmp/orders_seed.sql
 dbaccess testdb /tmp/orders_seed.sql >/tmp/orders_seed.out 2>&1; echo "seed rc=$?"
 echo "SELECT COUNT(*) orders FROM orders; SELECT COUNT(*) items FROM order_items;
-SELECT COUNT(*) dup_groups FROM (SELECT order_id, sku, qty, price, note, COUNT(*) c FROM order_items GROUP BY 1,2,3,4,5 HAVING COUNT(*) > 1);" | dbaccess testdb - 2>&1 | grep -v "^$"
+SELECT COUNT(*) dup_groups FROM (SELECT order_id, sku, qty, price, note, updated_at, COUNT(*) c FROM order_items GROUP BY 1,2,3,4,5,6 HAVING COUNT(*) > 1);" | dbaccess testdb - 2>&1 | grep -v "^$"
