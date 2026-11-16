@@ -1626,7 +1626,10 @@ def register_lakeflow_source(spark):
 
             client = WorkspaceClient()
             header = client.config.authenticate() or {}
-            token = str(header.get("Authorization", "")).split(" ", 1)[-1]
+            # A bearer token only, as _workspace_credentials takes one: the value of a Basic
+            # header was kept and later sent as a bearer token.
+            scheme, _, value = str(header.get("Authorization", "")).partition(" ")
+            token = value.strip() if scheme.lower() == "bearer" else ""
             host = str(client.config.host or "")
             if host and token:
                 _CAPTURED_WORKSPACE["host"] = host
@@ -1931,6 +1934,17 @@ def register_lakeflow_source(spark):
         # tokens it did not create), and an orphaned token expires on its own, so a
         # failure here is logged and swallowed rather than blocking startup.
 
+        if not update_id:
+            # A refresh, with only its predecessor to go, whose id it knows: no listing of
+            # every token in the workspace to find it.
+            if predecessor_id:
+                try:
+                    api.request("POST", "/api/2.0/token/delete", {"token_id": predecessor_id})
+                except LakebaseStateError:
+                    _LOGGER.debug(
+                        "Could not revoke stale staging token %s", predecessor_id, exc_info=True
+                    )
+            return
         pipeline_comment = staging_token_comment(pipeline_id)
         current = staging_token_comment(pipeline_id, update_id)
         try:
@@ -2640,13 +2654,21 @@ def register_lakeflow_source(spark):
                     suspend_seconds=self._suspend_seconds,
                     deadline=deadline,
                 )
+                # connect() below reads them; until the schema is set up they are provisional.
                 self._facts = facts
-                self._ensure_password_login(facts)
-                connection = self.connect()
                 try:
-                    ensure_schema(connection)
-                finally:
-                    connection.close()
+                    self._ensure_password_login(facts)
+                    connection = self.connect()
+                    try:
+                        ensure_schema(connection)
+                    finally:
+                        connection.close()
+                except BaseException:
+                    # Kept, a later connect() took them as provisioned and reached a database
+                    # whose role or schema setup had failed (UndefinedTable on every query):
+                    # the next one provisions again.
+                    self._facts = None
+                    raise
                 LakebaseState._provisioned[key] = facts
                 return facts
             except LakebaseStateError as error:
@@ -3054,8 +3076,13 @@ def register_lakeflow_source(spark):
     # Release carries the same guard, for a sharper reason: without it a zombie's
     # late release would free a slot its successor legitimately holds, over-issuing
     # capacity. On the Volume this hazard is what the mutating- marker guarded.
+    #
+    # renewed_at keeps the time of the release: a free slot is claimed by its NULL owner
+    # alone, and the unused-project sweep reads renewed_at as activity. Set to NULL, every
+    # slot of a stream outside a pipeline, which records no table activity, read as unused
+    # between its microbatches, and its project could be dropped under it.
     _RELEASE_SLOT = """
-    UPDATE conn_slots SET owner = NULL, scope = NULL, renewed_at = NULL
+    UPDATE conn_slots SET owner = NULL, scope = NULL, renewed_at = now()
     WHERE namespace = %(namespace)s AND slot_id = %(slot_id)s
       AND owner = %(owner)s AND epoch = %(epoch)s
     RETURNING slot_id
@@ -8157,6 +8184,15 @@ def register_lakeflow_source(spark):
                     )
                     limit = limit if budget is None else min(limit, budget)
                     started, remaining = time.monotonic(), budget
+                    # A daemon with no budget of its own waits by turnover: its limit is a
+                    # window without any slot changing hands, begun again at each claim (see
+                    # _acquire_connection_slot), not a span of wall-clock time to share out.
+                    # Given what was left of that time, at least a second, a claim after a
+                    # long wait on a pool turning over failed within that second.
+                    turnover = budget is None and any(
+                        self.options.get(marker) == "true"
+                        for marker in (_DAEMON_SLOT_MARKER_OPTION, _SNAPSHOT_DAEMON_SLOT_MARKER_OPTION)
+                    )
                     for attempt in range(_SLOT_CLAIM_RECONNECTS + 1):
                         try:
                             self._acquire_connection_slot(remaining)
@@ -8168,7 +8204,9 @@ def register_lakeflow_source(spark):
                             if attempt >= _SLOT_CLAIM_RECONNECTS:
                                 raise
                             self._lakebase_conn = None
-                            remaining = max(limit - (time.monotonic() - started), 1.0)
+                            remaining = (
+                                None if turnover else max(limit - (time.monotonic() - started), 1.0)
+                            )
                 try:
                     self._connect_transport()
                     self._connected = True
@@ -13515,6 +13553,7 @@ def register_lakeflow_source(spark):
                 decimal_default=(
                     None if raw.get("decimal_default") is None else str(raw["decimal_default"])
                 ),
+                key_wildcard_except=tuple(str(name) for name in raw.get("key_wildcard_except") or ()),
             )
 
 
@@ -15672,6 +15711,19 @@ def register_lakeflow_source(spark):
             _pad_varchar_option(options)
             validate_lakebase_options(options)
             _state_gc_project_settings(options)
+            self._snapshot_mode({})
+            _option_bool(options, _TABLE_MIGRATION_OPTION, False)
+            _option_bool(options, "snapshot.incremental.datetime.as.string", True)
+            # The record splitter scans an extract's bytes for the escape: one byte in its
+            # codeset, CLIENT_LOCALE's ("é" passed here under UTF-8 and failed split planning).
+            _unl_escape_byte(
+                _unl_char(
+                    options.get(_UNL_ESCAPE_OPTION, _UNL_DEFAULT_ESCAPE),
+                    _UNL_ESCAPE_OPTION,
+                    allow_empty=True,
+                ),
+                _client_encoding(options),
+            )
             staging_transport = (
                 str(
                     options.get(_SNAPSHOT_STAGING_TRANSPORT_OPTION, _DEFAULT_SNAPSHOT_STAGING_TRANSPORT)
@@ -16071,11 +16123,24 @@ def register_lakeflow_source(spark):
             with self._metadata_session_lock, self._metadata_access():
                 table = self._registration_table(table_name, table_options)
                 _ensure_materializable(table, table_options)
+                # The pipeline reads every table's metadata through this one connector. Two of
+                # its tables naming one Informix table (qualified_source_table) would share
+                # every record and staged page kept for it, which are the Informix table's
+                # and the update's: one flow served the other's differently filtered pages,
+                # or deleted pages and spills the other had yet to read.
+                sources = self.__dict__.setdefault("_metadata_sources", {})
+                other = sources.setdefault(table.native_identity, table_name)
+                if other != table_name:
+                    # 462: Tables '{}' and '{}' of this pipeline both read Informix table {},
+                    # and two flows of one table would share its change and snapshot state;
+                    # read each Informix table through one source_table per pipeline
+                    raise InformixError(_m(462, other, table_name, table.exposed_name))
                 # Only consulted on the append path (tombstones) or at snapshot time
                 # (scan), but validated for every table so a malformed value fails at
                 # registration rather than on a later read.
                 self._append_delete_tombstones(table_options)
                 self._snapshot_cursor_scan(table_options)
+                self._check_table_read_options(table, table_options)
                 if self._append_only_table(table, table_options):
                     # Report a cursor even though no primary key is exposed: the
                     # cursor is what makes the framework treat this as an
@@ -16101,6 +16166,34 @@ def register_lakeflow_source(spark):
                         "ingestion_type": "cdc_with_deletes",
                     }
                 return result
+
+        def _check_table_read_options(self, table: Table, table_options: dict[str, str]) -> None:
+            # Docstring: Fail at registration on a table option its reads would fail on: they
+            # were read only when the flow first used them, after the pipeline had started.
+
+            mode = self._snapshot_mode(table_options)
+            migration = self._table_migration(table_options)
+            _option_bool(table_options, "snapshot.incremental.datetime.as.string", True)
+            _option_bool(table_options, _ALLOW_NULLABLE_INDEX_OPTION, False)
+            self._append_only_mode(table_options)
+            _snapshot_filter(table_options)
+            self._snapshot_isolation(table_options)
+            self._validate_unl_source_options(table_options)
+            self._table_snapshot_source(table_options)
+            _, escape = self._unl_field_format(table_options)
+            _unl_escape_byte(escape, _client_encoding(self.options))
+            if migration:
+                # A migrating table records and stops whatever its mode (see _read_handoff).
+                return
+            if self._append_only_table(table, table_options):
+                configured = table_options.get("snapshot.mode", self.options.get("snapshot.mode"))
+                if configured is not None and mode not in {"initial", "cdc_only"}:
+                    # 274: Append-only table '{}' supports only snapshot.mode=initial or
+                    # snapshot.mode=cdc_only
+                    raise ValueError(_m(274, table.exposed_name))
+            elif not _cdc_capable(table) and mode in {"cdc_only", "recovery"}:
+                # 170: snapshot.mode={} requires a CDC-capable table; '{}' is snapshot-only
+                raise ValueError(_m(170, mode, table.exposed_name))
 
         def _refuse_connection_table_options(self, table_options: dict[str, str]) -> None:
             # Docstring: Fail a table option set on the connection rather than in the table's
@@ -26703,6 +26796,8 @@ def register_lakeflow_source(spark):
                     key_changed or (op == "UPDATE" and not entered and not table.primary_keys)
                 ):
                     output.append(_shape_tombstone(before, table, record, tx, lsn=_before_lsn(record)))
+                if after is not None and table.primary_keys:
+                    _refuse_null_key(after, table)
                 output.append(_shape_change(after, record, tx, "u" if op == "UPDATE" else "c"))
             elif op == "DELETE" and tombstones:
                 output.append(_shape_tombstone(before, table, record, tx))
@@ -26724,6 +26819,26 @@ def register_lakeflow_source(spark):
             # 349: Missing before/after image for {}
             raise InformixError(_m(349, table.exposed_name))
         return tuple(row.get(pk) for pk in table.primary_keys)
+
+
+    def _refuse_null_key(row: dict[str, Any], table: Table) -> None:
+        # Docstring: Fail on a NULL in a NOT NULL key column of a keyed table's snapshot row or
+        # upsert, as the delete channel does (_shape_delete).
+        #
+        # Under string.null.byte=null a key string holding a NUL byte reads as NULL: "a\x00"
+        # and "b\x00" both landed as the key NULL, one target row, and only a later delete
+        # of one of them failed.
+
+        nullable: set[str] | None = None
+        for pk in table.primary_keys:
+            if pk in row and row[pk] is None:
+                if nullable is None:
+                    nullable = {column.name for column in table.columns if column.nullable}
+                if pk not in nullable:
+                    # 463: A row of '{}' has NULL in NOT NULL key column {}, which would merge
+                    # distinct keys into one: '{}=null' turned a string holding a NUL byte into
+                    # NULL, or the row image is incomplete
+                    raise InformixError(_m(463, table.exposed_name, pk, _NULL_BYTE_OPTION))
 
 
     def _shape_change(row, record, tx, op, *, lsn: int | None = None):
@@ -27465,6 +27580,8 @@ def register_lakeflow_source(spark):
         converted = (
             _coerce_variable_decimal_values(row, table, options or {}) if table is not None else row
         )
+        if table is not None and table.primary_keys:
+            _refuse_null_key(converted, table)
         result = _framework_row(converted)
         result.update(
             {
@@ -27872,6 +27989,14 @@ def register_lakeflow_source(spark):
                     else {"decimal_targets": [list(pair) for pair in table.decimal_targets]}
                 ),
                 **({} if table.decimal_default is None else {"decimal_default": table.decimal_default}),
+                # Not fingerprinted (the key it gives is): kept so a replayed step is judged by
+                # the except list it was taken under, not the live one (see
+                # _ensure_compatible_schema_change).
+                **(
+                    {"key_wildcard_except": list(table.key_wildcard_except)}
+                    if table.key_wildcard_except
+                    else {}
+                ),
             },
         }
 
@@ -28062,6 +28187,26 @@ def register_lakeflow_source(spark):
     }
 
 
+    def _spark_type_widened(previous: Any, current: Any) -> bool:
+        # Docstring: Whether Delta type widening takes a column from Spark type ``previous`` to
+        # ``current`` in place: the changes _widened allows, stated on the landed types.
+
+        if isinstance(previous, IntegerType):
+            if isinstance(current, (LongType, DoubleType)):
+                return True
+            return isinstance(current, DecimalType) and current.precision - current.scale >= 10
+        if isinstance(previous, LongType):
+            return isinstance(current, DecimalType) and current.precision - current.scale >= 20
+        if isinstance(previous, FloatType):
+            return isinstance(current, DoubleType)
+        if isinstance(previous, DecimalType) and isinstance(current, DecimalType):
+            return (
+                current.scale >= previous.scale
+                and current.precision - current.scale >= previous.precision - previous.scale
+            )
+        return False
+
+
     def _widened(previous: Column, current: Column) -> bool:
         # Docstring: Whether ``current`` widens ``previous`` so every old value still fits.
         #
@@ -28212,15 +28357,19 @@ def register_lakeflow_source(spark):
             raise InformixError(_m(376, name, _unsupported_column_list(retyped)))
         keys_match = previous.primary_keys == current.primary_keys
         shrunk = False
-        # A wildcard key is the columns in catalog order, less the ``wildcard_except`` names of
-        # a "* except(...)" one (the live table's, since schema history keeps only the key), and
-        # every appended column it doesn't except joins it. A changed except list fails here
-        # as any other key change does.
+        # A wildcard key is the columns in catalog order, less the names a "* except(...)" one
+        # excepts, and every appended column it doesn't except joins it. Each side is judged
+        # by its own except list as recorded with its schema, else (a record from before they
+        # were kept) by ``wildcard_except``, the live table's: by the live list alone, a step
+        # replayed after an edit the README asks for (a dropped column taken out of the list)
+        # read as a key change. A changed except list fails here as any other key change does.
+        previous_except = previous.key_wildcard_except or wildcard_except
+        current_except = current.key_wildcard_except or wildcard_except
         wildcard_shaped = previous.primary_keys == tuple(
-            _wildcard_key(previous.columns, wildcard_except)
+            _wildcard_key(previous.columns, previous_except)
         )
         if not keys_match and extend_wildcard_key and wildcard_shaped:
-            added = tuple(_wildcard_key(additions, wildcard_except))
+            added = tuple(_wildcard_key(additions, current_except))
             removed = {column.name for column in dropped}
             if added and not dropped:
                 keys_match = current.primary_keys == previous.primary_keys + added
@@ -28254,7 +28403,31 @@ def register_lakeflow_source(spark):
             # 378: Informix schema change for '{}' reordered existing columns or added one before them;
             # run a full refresh
             raise InformixError(_m(378, name))
+        # _widened accepts what Delta widens in the column's own landed type. A transform can
+        # land it as another (ROUND(int_col, -3) as a BIGINT), whose change Delta may refuse:
+        # INTEGER to DECIMAL(12,2) is an in-place widening, the BIGINT to the DECIMAL(13,2)
+        # ROUND then gives is not, and the update failed in the destination.
+        transforms = {
+            column: operand
+            for column, _, operand in _recorded_transforms(current.column_transforms) or ()
+        }
         for old, new in zip(survivors, current.columns):
+            if old != new and old.name in transforms and _widened(old, new):
+                landed = _transform_spark_type(transforms[old.name], old, {})
+                landing = _transform_spark_type(transforms[old.name], new, {})
+                if landed != landing and not _spark_type_widened(landed, landing):
+                    # 464: Informix schema change for '{}' widened column {}, whose transform
+                    # lands it as {} and would now land it as {}, which Delta can't widen in
+                    # place; run a full refresh
+                    raise InformixError(
+                        _m(
+                            464,
+                            name,
+                            old.name,
+                            landed.simpleString().upper(),
+                            landing.simpleString().upper(),
+                        )
+                    )
             if old == new or _widened(old, new):
                 continue
             if not _shortened(old, new):

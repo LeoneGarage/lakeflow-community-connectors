@@ -3544,6 +3544,39 @@ class LakeflowContractTests(unittest.TestCase):
         # Page 1 holds id 2, which it leaves out.
         self.assertEqual(served, [3, 4])
 
+    def test_a_null_in_a_not_null_key_fails_snapshots_and_upserts_as_it_fails_deletes(self):
+        # Under string.null.byte=null a key string holding a NUL byte reads as NULL: such
+        # keys all merged into the one key NULL, and only a later delete failed.
+        connector = self.connector(FakeBridge())
+        keyed = connector._table("app.orders", {})
+        self.assertEqual(keyed.primary_keys, ("id",))
+        self.assertFalse(next(c for c in keyed.columns if c.name == "id").nullable)
+        record = {
+            "op": "INSERT",
+            "lsn": 141,
+            "row": {"id": None, "value": "a"},
+            "table": "demo:app.orders",
+            "tx_id": 7,
+        }
+        transaction = informix_module.CommittedTransaction(7, 100, 150, 100, (record,))
+        with self.assertRaisesRegex(InformixError, "NULL in NOT NULL key column id"):
+            informix_module._project_transaction(transaction, keyed, False)
+        with self.assertRaisesRegex(InformixError, "NULL in NOT NULL key column id"):
+            informix_module._shape_snapshot({"id": None, "value": "a"}, 100, keyed, {})
+        # A nullable key column (primary.keys, allow.nullable.index) takes the NULL.
+        nullable = dataclasses.replace(
+            keyed,
+            columns=tuple(
+                dataclasses.replace(c, nullable=True) if c.name == "id" else c
+                for c in keyed.columns
+            ),
+        )
+        rows = informix_module._project_transaction(transaction, nullable, False)
+        self.assertEqual([row["id"] for row in rows], [None])
+        self.assertIsNone(
+            informix_module._shape_snapshot({"id": None, "value": "a"}, 100, nullable, {})["id"]
+        )
+
     def test_half_of_an_index_update_lands_as_the_delete_or_insert_it_is(self):
         # What the stream passes on for a keyless table when the scan holds one half of
         # an UPDATE that changed an index value: a DELETE of the old row or an INSERT of
@@ -6446,6 +6479,47 @@ class LakeflowContractTests(unittest.TestCase):
         connector = self.connector(FakeBridge(), **{"State.GC.Drop.Unused.Projects": "True"})
         self.assertEqual(connector.options.get("state.gc.drop.unused.projects"), "True")
         self.assertEqual(informix_module._state_gc_project_settings(connector.options), 90)
+
+    def test_two_pipeline_tables_reading_one_informix_table_are_refused(self):
+        # Their flows would share every record and staged page kept for the Informix
+        # table in an update: one served the other's differently filtered snapshot, or
+        # deleted pages and spills the other had yet to read.
+        connector = self.connector(FakeBridge())
+        connector.read_table_metadata("orders", {"qualified_source_table": "app.orders"})
+        connector.read_table_metadata("orders", {"qualified_source_table": "app.orders"})
+        with self.assertRaisesRegex(
+            InformixError, "Tables 'orders' and 'orders_log' of this pipeline both read"
+        ):
+            connector.read_table_metadata(
+                "orders_log", {"qualified_source_table": "app.orders", "row_filter": "id > 1"}
+            )
+
+    def test_a_tables_read_options_are_checked_at_registration(self):
+        # Each failed only when the flow first read it, after the pipeline had started.
+        connector = self.connector(FakeBridge())
+        for options, message in (
+            ({"snapshot.mode": "sometimes"}, "Unsupported snapshot.mode"),
+            ({"table.migration": "maybe"}, "table.migration"),
+            ({"snapshot.incremental.datetime.as.string": "maybe"}, "datetime.as.string"),
+            ({"allow.nullable.index": "maybe"}, "allow.nullable.index"),
+            ({"snapshot.isolation": "dirty"}, "snapshot.isolation"),
+            ({"snapshot.filter": "id > 1; DROP TABLE x"}, "without comments or semicolons"),
+            ({"snapshot.boundary.lsn": "soon"}, "non-negative integer"),
+            ({"snapshot.unl.escape": "é"}, "single byte"),
+        ):
+            with self.subTest(options=options), self.assertRaisesRegex(Exception, message):
+                connector.read_table_metadata("app.orders", options)
+        connector, _ = self._keyless_connector()
+        with self.assertRaisesRegex(ValueError, "supports only snapshot.mode=initial"):
+            connector.read_table_metadata("app.orders", {"snapshot.mode": "incremental"})
+        # And the connection's, as the connector starts.
+        for options, message in (
+            ({"snapshot.mode": "sometimes"}, "Unsupported snapshot.mode"),
+            ({"table.migration": "maybe"}, "table.migration"),
+            ({"snapshot.unl.escape": "é"}, "single byte"),
+        ):
+            with self.subTest(connection=options), self.assertRaisesRegex(Exception, message):
+                self.connector(FakeBridge(), **options)
 
     def test_a_table_named_on_the_connection_is_refused(self):
         # qualified_source_table on the connection reached the reads, which read that table,
@@ -23193,6 +23267,37 @@ class FairSlotQueueWiringTests(unittest.TestCase):
             bridge._acquire_connection_slot.call_count, informix_module._SLOT_CLAIM_RECONNECTS + 1
         )
 
+    def test_a_daemon_claim_after_a_dropped_state_connection_keeps_its_turnover_window(self):
+        # A daemon waits by turnover, its limit a window without any slot changing hands.
+        # Reopened after a long wait, its claim got what was left of the limit in
+        # wall-clock time, at least a second, and failed a pool that was turning over.
+        try:
+            import psycopg2  # noqa: PLC0415
+        except ImportError:
+            self.skipTest("psycopg2 not installed in this environment")
+
+        reaped = psycopg2.OperationalError("SSL SYSCALL error: EOF detected")
+        for marker in (
+            informix_module._DAEMON_SLOT_MARKER_OPTION,
+            informix_module._SNAPSHOT_DAEMON_SLOT_MARKER_OPTION,
+        ):
+            with self.subTest(marker=marker):
+                bridge = self._bridge()
+                bridge.transport = mock.Mock()
+                bridge.options[marker] = "true"
+                budgets = []
+
+                def claim(budget, bridge=bridge, budgets=budgets):
+                    budgets.append(budget)
+                    bridge._lakebase_conn = mock.Mock(closed=2)
+                    if len(budgets) < 2:
+                        raise reaped
+
+                bridge._lakebase_conn = mock.Mock(closed=2)
+                bridge._acquire_connection_slot = claim
+                bridge._ensure_connected()
+                self.assertEqual(budgets, [None, None])
+
     def test_a_slot_is_released_over_a_reopened_state_connection(self):
         # The lease heartbeat has its own connection, so the bridge's sits idle through a
         # long read and can be reaped by the time the slot is released. The release
@@ -27174,6 +27279,87 @@ class SchemaEvolutionTests(_TableOptionTestCase):
                 carried = dataclasses.replace(fresh, primary_keys=("k",), key_override=True)
                 with self.assertRaisesRegex(InformixError, "dropped key column k"):
                     informix_module._ensure_compatible_schema_change(previous, carried)
+
+    def test_a_widening_is_judged_by_the_type_a_transform_lands_as(self):
+        # INTEGER to DECIMAL(12,2) widens an IntegerType in place, but ROUND(qty, -3) lands
+        # qty as a BIGINT, and the DECIMAL(13,2) it lands as after the change is no widening
+        # of that: the update failed in the destination.
+        ensure = informix_module._ensure_compatible_schema_change
+        integer = self.column("qty", "INTEGER", 4)
+        decimal = {
+            "name": "qty",
+            "type_name": "DECIMAL",
+            "precision": 12,
+            "scale": 2,
+            "nullable": True,
+        }
+        for transform, accepted in (
+            (None, True),
+            ("ROUND(qty, -3)", False),
+            ("ROUND(qty)", True),
+            ("HASH(qty)", True),
+        ):
+            with self.subTest(transform=transform):
+                before = self.table([self.ID, integer])
+                after = self.table([self.ID, decimal])
+                if transform is not None:
+                    transforms = informix_module._column_transforms(
+                        {"transform_columns": json.dumps({"qty": transform})}
+                    )
+                    before = informix_module._apply_column_transforms(before, transforms, "k" * 16)
+                    after = dataclasses.replace(
+                        after,
+                        column_transforms=before.column_transforms,
+                        transform_key_id=before.transform_key_id,
+                    )
+                if accepted:
+                    ensure(before, after)
+                else:
+                    with self.assertRaisesRegex(
+                        InformixError, "lands it as BIGINT and would now land it as DECIMAL"
+                    ):
+                        ensure(before, after)
+
+    def test_a_replayed_step_is_judged_by_the_except_list_it_was_taken_under(self):
+        # Under "* except(note, audit_ts)" a nullable column joined the key, then note was
+        # dropped and taken out of the list, as the README asks. A reader still before the
+        # first step judged it by the live list ("* except(audit_ts)"), read note as a key
+        # column, and failed it as a key change.
+        def wildcard(columns, keys, excepted):
+            return dataclasses.replace(
+                self.table(columns, keys=keys),
+                key_override=True,
+                key_wildcard=True,
+                key_wildcard_except=excepted,
+            )
+
+        name, note, audit = self.column("name"), self.column("note"), self.column("audit_ts")
+        gen0 = wildcard([self.ID, name, note, audit], ("id", "name"), ("note", "audit_ts"))
+        gen1 = wildcard(
+            [self.ID, name, note, audit, self.column("c")],
+            ("id", "name", "c"),
+            ("note", "audit_ts"),
+        )
+        # The except list now goes with a recorded schema, outside its fingerprint.
+        state = informix_module._schema_state(gen0, 100)
+        recorded = informix_module._table_from_schema_state(state, "demo")
+        self.assertEqual(recorded.key_wildcard_except, ("note", "audit_ts"))
+        self.assertEqual(
+            informix_module._schema_fingerprint(recorded),
+            informix_module._schema_fingerprint(dataclasses.replace(gen0, key_wildcard_except=())),
+        )
+        informix_module._ensure_compatible_schema_change(
+            recorded, gen1, extend_wildcard_key=True, wildcard_except=("audit_ts",)
+        )
+        # A record from before the lists were kept falls back to the live one.
+        legacy = dataclasses.replace(recorded, key_wildcard_except=())
+        with self.assertRaisesRegex(InformixError, "changed table identity or primary keys"):
+            informix_module._ensure_compatible_schema_change(
+                legacy,
+                dataclasses.replace(gen1, key_wildcard_except=()),
+                extend_wildcard_key=True,
+                wildcard_except=("audit_ts",),
+            )
 
 
 class RowFilterTests(_TableOptionTestCase):

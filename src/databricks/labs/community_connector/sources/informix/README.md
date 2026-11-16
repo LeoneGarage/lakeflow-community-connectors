@@ -1290,7 +1290,7 @@ Full definitions are in [Connection parameters](#connection-parameters).
 }
 ```
 
-Supported source-specific table options are `qualified_source_table`, `decimal.variable.type`, `decimal.variable.column.type`, `snapshot.mode`, `snapshot.source`, `snapshot.boundary.lsn`, `snapshot.split.bytes`, `snapshot.gzip.records.per.batch`, `snapshot.unl.delimiter`, `snapshot.unl.escape`, `snapshot.page.size`, `keyless.snapshot.page.size`, `snapshot.filter`, `row_filter`, `include_columns`, `exclude_columns`, `rename_columns`, `transform_columns`, `snapshot.isolation`, `snapshot.scan`, `snapshot.incremental.datetime.as.string`, `snapshot.max.rows`, `snapshot.max.bytes`, `append.only.ingestion`, `append.delete.tombstones`, `max.records.per.batch`, `cdc.timeout`, `cdc.max.records`, `primary.keys`, `allow.nullable.index`, and `table.migration`. `qualified_source_table` maps the pipeline's logical table name to an Informix `owner.table` name. Standard destination, SCD, key, sequence, and clustering options remain available.
+Supported source-specific table options are `qualified_source_table`, `decimal.variable.type`, `decimal.variable.column.type`, `snapshot.mode`, `snapshot.source`, `snapshot.boundary.lsn`, `snapshot.split.bytes`, `snapshot.gzip.records.per.batch`, `snapshot.unl.delimiter`, `snapshot.unl.escape`, `snapshot.page.size`, `keyless.snapshot.page.size`, `snapshot.filter`, `row_filter`, `include_columns`, `exclude_columns`, `rename_columns`, `transform_columns`, `snapshot.isolation`, `snapshot.scan`, `snapshot.incremental.datetime.as.string`, `snapshot.max.rows`, `snapshot.max.bytes`, `append.only.ingestion`, `append.delete.tombstones`, `max.records.per.batch`, `cdc.timeout`, `cdc.max.records`, `primary.keys`, `allow.nullable.index`, and `table.migration`. `qualified_source_table` maps the pipeline's logical table name to an Informix `owner.table` name. A pipeline reads each Informix table through one `source_table` only: a second one naming the same table fails as the pipeline starts, because their flows would share the table's change and snapshot state. To land a table in two forms, use two pipelines. Standard destination, SCD, key, sequence, and clustering options remain available.
 
 ### Table-only options
 
@@ -1431,8 +1431,11 @@ an object from column name to an expression over that column:
   transformed column is nullable when its source
   column is, or when `NULLIFY` or `SUBSTR` (NULL past the end) can produce NULL; `HASH` on
   a `NOT NULL` key keeps it `NOT NULL`. `NVL` and `COALESCE` fall back to a value of the
-  column's own type, so on an integer column, or over `LENGTH`, `CHAR_LENGTH`, `YEAR`,
-  `MONTH`, `DAY`, or `WEEKDAY`, the fallback must be a whole number.
+  type the expression inside them lands as, under the table's decimal options: over an
+  integer column, `LENGTH`, `CHAR_LENGTH`, `YEAR`, `MONTH`, `DAY`, or `WEEKDAY`, or a
+  variable-scale `DECIMAL` under `decimal.variable.type: integer`, the fallback must be a
+  whole number, and it must fit that type (a `DECIMAL(5,2)` holds up to 999.99). It is
+  rounded to that type's scale, so `NVL(ROUND(vcol, 0), 1.5)` lands 2.
 - **Order:** `row_filter`, the column selection, and the key options see source values;
   `rename_columns` applies after, so a renamed column's transform still uses its source
   name. Change images, deletes, and append-path tombstones are transformed like
@@ -1525,7 +1528,7 @@ on change images. That limits it to:
   | `SUBSTR(s, start[, length])` | strings | `start` from 1; a start past the end gives NULL |
   | `REPLACE(s, from[, to])` | strings | `to` defaults to `''` |
   | `LPAD(s, n, pad)`, `RPAD(s, n, pad)` | strings | a longer value is cut to `n` |
-  | `NVL(x, value)`, `COALESCE(x, value)` | any | `value` replaces NULL, padded like a `CHAR` column; in a transform it takes the column's own type |
+  | `NVL(x, value)`, `COALESCE(x, value)` | any | `value` replaces NULL, padded like a `CHAR` column; in a transform it takes the type `x` lands as |
   | `ABS(n)`, `ROUND(n[, digits])`, `TRUNC(n[, digits])` | numbers | `ROUND` rounds halves away from zero; a float is taken by the digits it shows, so `ROUND(1.15, 1)` is 1.2; `digits` from -32 to 32 |
   | `MOD(n, divisor)` | numbers | truncates both to integers first, so `MOD(2.5, 3)` is 2 |
   | `YEAR(d)`, `MONTH(d)`, `DAY(d)`, `WEEKDAY(d)` | `DATE`, `DATETIME` | `WEEKDAY` counts from 0 for Sunday |
@@ -2122,9 +2125,11 @@ Requirements and caveats:
 
 - A Postgres driver — `psycopg2` **or** `psycopg` (v3) — must be importable on the
   compute that runs the connector, plus permission to create Lakebase projects.
-  `psycopg2` is preinstalled on classic Databricks runtimes, but **serverless
-  pipeline compute may have neither**. When it does not, add a **prebuilt binary
-  wheel** to the pipeline's environment dependencies: `psycopg2-binary` (matches the
+  The connector wheel depends on `psycopg[binary]`, so a pipeline that installs it has
+  one. `psycopg2` is preinstalled on classic Databricks runtimes, but **serverless
+  pipeline compute may have neither**, which matters to a pipeline that loads the merged
+  single-file source instead of the wheel. Add a **prebuilt binary wheel** to its
+  environment dependencies: `psycopg2-binary` (matches the
   connector's first-choice import) or `psycopg[binary]`. Do **not** use plain
   `psycopg` — it is a source distribution that compiles against `libpq` and needs
   `pg_config` at install time, which pipeline clusters lack, so the install fails

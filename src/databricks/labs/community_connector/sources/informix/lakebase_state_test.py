@@ -367,7 +367,7 @@ class _FakeCursor:
                 return
             row["owner"] = None
             row["scope"] = None
-            row["renewed_at"] = None
+            row["renewed_at"] = self._database.now()
             self._result = [(args["slot_id"],)]
 
     # -- slot_waiters -------------------------------------------------------
@@ -901,6 +901,18 @@ class LakebaseSlotTests(unittest.TestCase):
         self.assertTrue(lakebase_state.heartbeat_slot(self.connection, slot))
         self.assertTrue(lakebase_state.release_slot(self.connection, slot))
         self.assertIsNone(self.database.slots[("ns", slot.slot_id)]["owner"])
+
+    def test_a_released_slot_keeps_the_time_of_its_release_and_is_free(self):
+        # Set to NULL on release, renewed_at said nothing of a stream between microbatches,
+        # and the unused-project sweep, which reads it as activity, could drop the project
+        # of one running outside a pipeline. The free slot is claimed by its NULL owner.
+        slot = self.acquire("holder")
+        lakebase_state.release_slot(self.connection, slot)
+        row = self.database.slots[("ns", slot.slot_id)]
+        self.assertIsNone(row["owner"])
+        self.assertIsNotNone(row["renewed_at"])
+        self.assertIn("renewed_at = now()", lakebase_state._RELEASE_SLOT)
+        self.assertIsNotNone(self.acquire("next"))
 
     def test_release_is_not_repeatable(self):
         slot = self.acquire("holder")
@@ -1540,6 +1552,36 @@ class LakebaseProjectNamingTests(unittest.TestCase):
         self.assertEqual(len(schemas), 3)
         # The cache holds the password only as a digest.
         self.assertNotIn("rotated", repr(lakebase_state.LakebaseState._provisioned))
+
+    def test_a_provisioning_that_fails_part_way_leaves_nothing_to_connect_with(self):
+        # The project's facts were kept once found: a schema setup that then failed left a
+        # later connect() reaching a database without the state's tables.
+        lakebase_state.LakebaseState._provisioned.clear()
+        self.addCleanup(lakebase_state.LakebaseState._provisioned.clear)
+        state = lakebase_state.LakebaseState(
+            {"lakebase.project.id": "shared", "lakebase.password": "pw"}, "id"
+        )
+        state._api_client = mock.Mock()
+        state._ensure_password_login = mock.Mock()
+        state._open = mock.Mock(return_value=mock.MagicMock())
+        failures = [RuntimeError("could not create table"), None]
+
+        def setup(connection):
+            failure = failures.pop(0)
+            if failure is not None:
+                raise failure
+
+        with (
+            mock.patch.object(lakebase_state, "ensure_project", return_value={"host": "h"}),
+            mock.patch.object(lakebase_state, "ensure_schema", side_effect=setup),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "could not create table"):
+                state.provision()
+            self.assertIsNone(state._facts)
+            self.assertEqual(lakebase_state.LakebaseState._provisioned, {})
+            state.connect()
+        self.assertEqual(failures, [])
+        self.assertEqual(state._facts, {"host": "h"})
 
     def test_a_connect_the_provisioning_no_longer_fits_provisions_again(self):
         # A rejected password or a host that no longer resolves means the cached provisioning
@@ -2405,6 +2447,26 @@ class LakebaseCredentialCaptureTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(lakebase_state.capture_workspace_credentials(), {})
 
+    def test_only_a_bearer_token_is_captured(self):
+        # The value of any Authorization header was kept, a Basic one included, and later
+        # sent as a bearer token.
+        for header, captured in (
+            ("Basic dXNlcjpwYXNz", {}),
+            ("Bearer driver-token", {"host": "https://ws.example", "token": "driver-token"}),
+        ):
+            with self.subTest(header=header.split()[0]):
+                lakebase_state._CAPTURED_WORKSPACE.clear()
+                client = mock.Mock()
+                client.config.host = "https://ws.example"
+                client.config.authenticate.return_value = {"Authorization": header}
+                sdk = types.ModuleType("databricks.sdk")
+                sdk.WorkspaceClient = mock.Mock(return_value=client)
+                with (
+                    mock.patch.dict(os.environ, {"DATABRICKS_RUNTIME_VERSION": "16.4"}),
+                    mock.patch.dict(sys.modules, {"databricks.sdk": sdk}),
+                ):
+                    self.assertEqual(lakebase_state.capture_workspace_credentials(), captured)
+
     def test_captured_credentials_are_preferred_over_ambient_resolution(self):
         lakebase_state._CAPTURED_WORKSPACE.update(
             {"host": "https://captured.example", "token": "captured-token"}
@@ -2819,6 +2881,8 @@ class StagingTokenTests(unittest.TestCase):
         ]
         lakebase_state.revoke_stale_staging_tokens(api, "pipe-1", "", predecessor_id="previous")
         self.assertEqual(api.deleted, ["previous"])
+        # By its id: a refresh no longer lists every token in the workspace to find it.
+        self.assertNotIn("GET", [call[0] for call in api.calls])
 
     def test_revoke_swallows_list_failure(self):
         api = _StagingTokenApi()

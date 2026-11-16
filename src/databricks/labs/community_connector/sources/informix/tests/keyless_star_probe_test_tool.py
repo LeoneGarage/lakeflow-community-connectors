@@ -1562,7 +1562,11 @@ def _canonical(rows: collections.Counter) -> collections.Counter:
     def value(text: str | None) -> str | None:
         if text is None or not re.fullmatch(r"-?\d+\.\d+", text):
             return text
-        return format(decimal.Decimal(text).normalize(), "f")
+        # Past the default context's 28 digits, which rounded a long value; one zero.
+        with decimal.localcontext() as context:
+            context.prec = 100
+            number = decimal.Decimal(text)
+            return "0" if number == 0 else format(number.normalize(), "f")
 
     canonical: collections.Counter = collections.Counter()
     for row, n in rows.items():

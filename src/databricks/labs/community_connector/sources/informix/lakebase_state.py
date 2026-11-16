@@ -344,7 +344,10 @@ def capture_workspace_credentials() -> dict[str, str]:
 
         client = WorkspaceClient()
         header = client.config.authenticate() or {}
-        token = str(header.get("Authorization", "")).split(" ", 1)[-1]
+        # A bearer token only, as _workspace_credentials takes one: the value of a Basic
+        # header was kept and later sent as a bearer token.
+        scheme, _, value = str(header.get("Authorization", "")).partition(" ")
+        token = value.strip() if scheme.lower() == "bearer" else ""
         host = str(client.config.host or "")
         if host and token:
             _CAPTURED_WORKSPACE["host"] = host
@@ -649,6 +652,17 @@ def revoke_stale_staging_tokens(
     # tokens it did not create), and an orphaned token expires on its own, so a
     # failure here is logged and swallowed rather than blocking startup.
 
+    if not update_id:
+        # A refresh, with only its predecessor to go, whose id it knows: no listing of
+        # every token in the workspace to find it.
+        if predecessor_id:
+            try:
+                api.request("POST", "/api/2.0/token/delete", {"token_id": predecessor_id})
+            except LakebaseStateError:
+                _LOGGER.debug(
+                    "Could not revoke stale staging token %s", predecessor_id, exc_info=True
+                )
+        return
     pipeline_comment = staging_token_comment(pipeline_id)
     current = staging_token_comment(pipeline_id, update_id)
     try:
@@ -1358,13 +1372,21 @@ class LakebaseState:
                 suspend_seconds=self._suspend_seconds,
                 deadline=deadline,
             )
+            # connect() below reads them; until the schema is set up they are provisional.
             self._facts = facts
-            self._ensure_password_login(facts)
-            connection = self.connect()
             try:
-                ensure_schema(connection)
-            finally:
-                connection.close()
+                self._ensure_password_login(facts)
+                connection = self.connect()
+                try:
+                    ensure_schema(connection)
+                finally:
+                    connection.close()
+            except BaseException:
+                # Kept, a later connect() took them as provisioned and reached a database
+                # whose role or schema setup had failed (UndefinedTable on every query):
+                # the next one provisions again.
+                self._facts = None
+                raise
             LakebaseState._provisioned[key] = facts
             return facts
         except LakebaseStateError as error:
@@ -1772,8 +1794,13 @@ RETURNING slot_id
 # Release carries the same guard, for a sharper reason: without it a zombie's
 # late release would free a slot its successor legitimately holds, over-issuing
 # capacity. On the Volume this hazard is what the mutating- marker guarded.
+#
+# renewed_at keeps the time of the release: a free slot is claimed by its NULL owner
+# alone, and the unused-project sweep reads renewed_at as activity. Set to NULL, every
+# slot of a stream outside a pipeline, which records no table activity, read as unused
+# between its microbatches, and its project could be dropped under it.
 _RELEASE_SLOT = """
-UPDATE conn_slots SET owner = NULL, scope = NULL, renewed_at = NULL
+UPDATE conn_slots SET owner = NULL, scope = NULL, renewed_at = now()
 WHERE namespace = %(namespace)s AND slot_id = %(slot_id)s
   AND owner = %(owner)s AND epoch = %(epoch)s
 RETURNING slot_id

@@ -298,10 +298,20 @@ def source_export_command(args: argparse.Namespace, run_id: str) -> str:
         f"AND t.owner='{source_owner}' "
         "ORDER BY t.tabname,c.colno;"
     )
+    # UNLOAD pads an INTERVAL with leading blanks ("  -5 10:30:00"), which the connector
+    # lands trimmed as a string: these columns compare trimmed (see normalize).
+    sql_statements.append(
+        f"UNLOAD TO '{remote}/interval_columns.unl' DELIMITER '|' "
+        "SELECT t.tabname,c.colname FROM systables t,syscolumns c "
+        f"WHERE c.tabid=t.tabid AND t.tabname IN ({table_literals}) "
+        f"AND t.owner='{source_owner}' AND MOD(c.coltype,256)=14;"
+    )
     sql = "\n".join(sql_statements) + "\n"
     encoded_sql = __import__("base64").b64encode(sql.encode()).decode()
+    # DBDATE=Y4MD- writes a DATE as ISO, as the README's extract scripts do.
     environment = (
         "-e INFORMIXDIR=/opt/ibm/informix "
+        "-e DBDATE=Y4MD- "
         f"-e INFORMIXSERVER={shlex.quote(args.informix_server)} "
         "-e LD_LIBRARY_PATH=/opt/ibm/informix/lib:/opt/ibm/informix/lib/esql"
     )
@@ -481,13 +491,18 @@ def normalize(value: Any, data_type: str) -> str | None:
     text = str(value)
     if not text and data_type != "STRING":
         return None
-    if data_type.startswith("DECIMAL"):
-        number = decimal.Decimal(text)
-        return "0" if number == 0 else format(number.normalize(), "f")
+    if data_type.startswith("DECIMAL") or data_type in {"FLOAT", "DOUBLE"}:
+        # Past the default context's 28 digits, which rounded a DECIMAL(32) or (38) value
+        # and let two that differ compare equal; and one zero, which a FLOAT also writes
+        # as -0.0.
+        with decimal.localcontext() as context:
+            context.prec = 100
+            number = decimal.Decimal(text)
+            return "0" if number == 0 else format(number.normalize(), "f")
     if data_type in {"INT", "BIGINT", "SMALLINT", "TINYINT"}:
         return str(int(text))
-    if data_type in {"FLOAT", "DOUBLE"}:
-        return format(decimal.Decimal(text).normalize(), "f")
+    if data_type == "INTERVAL":
+        return text.strip()
     if data_type == "TIMESTAMP":
         timestamp = text.replace("T", " ").replace("Z", "+00:00")
         if "." in timestamp:
@@ -795,6 +810,12 @@ def main() -> int:
                 continue
             columns[row["table_name"]].append(row["column_name"])
             types[row["table_name"]][row["column_name"]] = row["data_type"].upper()
+        intervals = source_root / "interval_columns.unl"
+        if intervals.exists():
+            for line in intervals.read_text(encoding=UNLOAD_ENCODING).splitlines():
+                values = parse_unload_line(line)
+                if len(values) == 2 and values[1] in types.get(values[0], {}):
+                    types[values[0]][values[1]] = "INTERVAL"
         missing_schema = sorted(set(args.tables) - set(columns))
         if missing_schema:
             raise RuntimeError(f"Destination tables are missing: {missing_schema}")

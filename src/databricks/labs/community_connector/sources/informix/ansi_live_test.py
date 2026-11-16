@@ -10,6 +10,12 @@ from decimal import Decimal
 from pathlib import Path
 
 
+def _without_pad_varchar(options: dict[str, str]) -> dict[str, str]:
+    # The bridge reads the lowercase "padvarchar" first, as Spark hands options over: an
+    # override under "padVarchar" beside it was ignored.
+    return {name: value for name, value in options.items() if name.lower() != "padvarchar"}
+
+
 def _live_config() -> dict[str, str]:
     inline = os.environ.get("CONNECTOR_TEST_CONFIG_JSON")
     path = os.environ.get("CONNECTOR_TEST_CONFIG_PATH")
@@ -85,7 +91,7 @@ class ScalarTypesLiveTest(unittest.TestCase):
         table_name = options.get("scalar.types.test.table")
         if not table_name or table_name.count(".") != 1:
             self.fail("scalar.types.test.table must be an owner.table name")
-        bridge = PurePythonInformixBridge({**options, "padVarchar": "false"})
+        bridge = PurePythonInformixBridge({**_without_pad_varchar(options), "padVarchar": "false"})
         padded_bridge = None
         writer = None
         primary_error = None
@@ -124,7 +130,9 @@ class ScalarTypesLiveTest(unittest.TestCase):
                 )
                 self._assert_scalar_types(snapshot_row, scalar_columns, expected)
 
-            padded_bridge = PurePythonInformixBridge({**options, "padVarchar": "true"})
+            padded_bridge = PurePythonInformixBridge(
+                {**_without_pad_varchar(options), "padVarchar": "true"}
+            )
             padded_rows = padded_bridge.snapshot_page(identity, columns, (), None, 100)
             for expected in (expected_snapshot, expected_null_snapshot):
                 padded_row = self._matching_row(padded_rows, expected)
