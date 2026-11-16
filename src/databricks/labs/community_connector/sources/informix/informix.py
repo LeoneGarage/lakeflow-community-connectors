@@ -977,6 +977,9 @@ _REPLAY_STOP_PK_OPTION = "_informix.replay.stop.pk"
 # was re-established instead (a start the log no longer retains, under auto_snapshot):
 # _replay_between_offsets then holds it to an initial range's terms. Never persisted.
 _REPLAY_REESTABLISHED = "_informix.replay.reestablished"
+# The end a replayed initial range logged, as JSON: a file snapshot's first batch is
+# served again at the boundary that end names (_replayed_unl_boundary).
+_REPLAY_INITIAL_END_OPTION = "_informix.replay.initial.end"
 # Distinguish JSON null (replay the copy-completing range through max_pk) from
 # an absent option (ordinary one-page incremental read).
 _REPLAY_DRAIN_TO_MAX_PK = object()
@@ -1222,6 +1225,28 @@ def _snapshot_position(offset: Any) -> tuple | None:
     )
 
 
+def _replay_reader_range(reader, start, end):
+    # Docstring: The simple stream reader's readBetweenOffsets, for the merged file's
+    # readers and the wheel's alike: ``[start, end)`` replayed bounded at ``end``, and a
+    # staged snapshot's first batch served from its stage (_staged_first_batch_start,
+    # which tells a delete flow's connector by its own options).
+
+    connector = reader.lakeflow_connect
+    staged = getattr(connector, "_staged_first_batch_start", None)
+
+    def staged_start(end_offset):
+        return staged(reader.options.get("tableName"), end_offset, reader.options)
+
+    return _replay_between_offsets(
+        start,
+        end,
+        reader.read,
+        reader.options,
+        getattr(connector, "options", {}),
+        staged_start if callable(staged) else None,
+    )
+
+
 def _replay_between_offsets(start, end, read, options, connector_options, staged_start=None):
     # Docstring: Replay ``[start, end)`` by reading to ``end`` and stopping there.
     #
@@ -1287,7 +1312,10 @@ def _replay_between_offsets(start, end, read, options, connector_options, staged
     previous = options.get(_REPLAY_STOP_LSN_OPTION)
     previous_pk = options.get(_REPLAY_STOP_PK_OPTION)
     previous_wait_budget = options.get(_REPLAY_CONNECTION_WAIT_BUDGET_OPTION)
+    previous_end = options.get(_REPLAY_INITIAL_END_OPTION)
     options[_REPLAY_STOP_LSN_OPTION] = str(stop)
+    if initial_range:
+        options[_REPLAY_INITIAL_END_OPTION] = json.dumps(end, sort_keys=True)
     if replaying_chunk:
         options[_REPLAY_STOP_PK_OPTION] = stop_pk
     try:
@@ -1478,6 +1506,10 @@ def _replay_between_offsets(start, end, read, options, connector_options, staged
             options.pop(_REPLAY_CONNECTION_WAIT_BUDGET_OPTION, None)
         else:
             options[_REPLAY_CONNECTION_WAIT_BUDGET_OPTION] = previous_wait_budget
+        if previous_end is None:
+            options.pop(_REPLAY_INITIAL_END_OPTION, None)
+        else:
+            options[_REPLAY_INITIAL_END_OPTION] = previous_end
 
 
 def _registration_identity(spark_session: Any | None) -> tuple[str, str | None]:
@@ -1632,21 +1664,7 @@ def _informix_available_now_base(base: type, spark_session: Any | None = None) -
                 # travels through the reader's options, which the framework copies into
                 # table_options on every read.
 
-                staged = getattr(reader.lakeflow_connect, "_staged_first_batch_start", None)
-                staged_start = None
-                if callable(staged) and reader.options.get(_IS_DELETE_FLOW_OPTION) != "true":
-
-                    def staged_start(end_offset):
-                        return staged(reader.options.get("tableName"), end_offset, reader.options)
-
-                return _replay_between_offsets(
-                    start,
-                    end,
-                    reader.read,
-                    reader.options,
-                    getattr(reader.lakeflow_connect, "options", {}),
-                    staged_start,
-                )
+                return _replay_reader_range(reader, start, end)
 
             cls.prepareForTriggerAvailableNow = prepare_for_trigger
             if cls.__name__ == "LakeflowStreamReader":
@@ -1697,11 +1715,6 @@ class ConnectionCapacityUnavailable(InformixError):
 
 class SharedStateAccessUnavailable(InformixError):
     # Docstring: A transient permissions failure prevented access to shared state.
-    pass
-
-
-class TriggerBoundaryUnavailable(InformixError):
-    # Docstring: The owning upsert reader has not published this update's boundary yet.
     pass
 
 
@@ -2601,36 +2614,43 @@ class PurePythonInformixBridge:
             on_lease_lost()
 
         connection: Any = None
-        first_failure: float | None = None
+        # The lease runs from its last renewal: Postgres frees the slot for another
+        # reader that long after renewed_at. Timed from the first failed renewal instead,
+        # at least a heartbeat later, the transport outlived the lease by up to a minute.
+        # Started here, as the slot was just acquired.
+        renewed = time.monotonic()
         try:
             while not stop.wait(_CONNECTION_SLOT_HEARTBEAT_SECONDS):
                 try:
                     if connection is None or connection.closed:
-                        connection = self._lakebase().connect()
+                        # No longer than the lease has left, or a connect waiting out its
+                        # own timeout outlived it.
+                        left = _CONNECTION_SLOT_LEASE_SECONDS - (time.monotonic() - renewed)
+                        connection = self._lakebase().connect(timeout=max(1.0, left))
                     if not heartbeat_slot(connection, slot):
                         # The guard rejected us: the lease was reclaimed and now
                         # belongs to someone else. Nothing to retry.
                         report_lease_lost()
                         return
-                    first_failure = None
+                    renewed = time.monotonic()
                 except Exception:
                     now = time.monotonic()
-                    if first_failure is None:
-                        first_failure = now
                     try:
                         if connection is not None:
                             connection.close()
                     except Exception:
                         pass
                     connection = None
-                    # A transient error must not drop a healthy lease, but one
-                    # that outlasts the lease means another reader may already
-                    # have reclaimed the slot, so the transport has to go.
-                    if now - first_failure >= _CONNECTION_SLOT_LEASE_SECONDS:
-                        # 22: Informix Lakebase slot renewal failed for {:.0f}s; treating the lease
-                        # as lost: {}
+                    # A transient error must not drop a healthy lease, but once the next
+                    # renewal would come after the lease has run out, another reader may
+                    # reclaim the slot first, so the transport has to go now.
+                    if now - renewed + _CONNECTION_SLOT_HEARTBEAT_SECONDS >= (
+                        _CONNECTION_SLOT_LEASE_SECONDS
+                    ):
+                        # 22: Informix Lakebase slot not renewed for {:.0f}s, and its lease runs
+                        # out before the next renewal; treating the lease as lost: {}
                         logging.getLogger(__name__).warning(
-                            _m(22, now - first_failure, slot),
+                            _m(22, now - renewed, slot),
                             exc_info=True,
                         )
                         report_lease_lost()
@@ -10030,7 +10050,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         table_options = _options_set(table_options)
         with self._metadata_access():
             table = self._registration_table(table_name, table_options)
-            _ensure_materializable(table, table_options)
+            _ensure_materializable(table, self._with_connection_scan(table_options))
             renames = dict(table.column_renames or ())
             transforms = {
                 name: operand
@@ -10082,7 +10102,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             self._table_int_option(table_options, name, default, minimum=minimum, maximum=maximum)
         with self._metadata_session_lock, self._metadata_access():
             table = self._registration_table(table_name, table_options)
-            _ensure_materializable(table, table_options)
+            _ensure_materializable(table, self._with_connection_scan(table_options))
             # The pipeline reads every table's metadata through this one connector. Two of
             # its tables naming one Informix table (qualified_source_table) would share
             # every record and staged page kept for it, which are the Informix table's
@@ -10351,7 +10371,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                         }
                 self._touch_table_state(table)
                 self._maybe_sweep_stale_snapshot_stages(table)
-                _ensure_materializable(table, table_options)
+                _ensure_materializable(table, self._with_connection_scan(table_options))
                 # A staged snapshot's checkpoint too, mid-serve: it names the snapshot's LSN
                 # and schema, which its first batch published for the update that took it.
                 if (
@@ -10365,7 +10385,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                         int(checkpoint.get("begin_lsn") or checkpoint["commit_lsn"]),
                         str(checkpoint["schema_id"]),
                         str(checkpoint["schema_fingerprint"]),
-                        self._pipeline_scope(),
+                        self._pipeline_scope(checkpoint),
                     )
                 if self._append_only_table(table, table_options):
                     # Append-only has exactly two states: establish the boundary once,
@@ -11360,6 +11380,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             and snapshot_mode not in {"initial_only", "recovery"}
             and not self._table_migration(table_options)
             and not self._upsert_channel_start_exists(table_name, table_options)
+            # With a snapshot floor to start at, it need not wait (_delete_floor_seed).
+            and not self._delete_floor_recorded(table_name, table_options)
         ):
             return iter(()), self._schema_node_fallback_offset(start_offset)
         replaying = self._replay_stop_lsn(table_options) is not None
@@ -11433,10 +11455,6 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 return self._volume_failure_result(
                     error, read_again, table_options, attempt_index, start_offset
                 )
-            except TriggerBoundaryUnavailable:
-                if self._replay_stop_lsn(table_options) is not None:
-                    raise
-                return iter(()), self._trigger_boundary_retry_offset(start_offset)
             except SchemaTransitionUnavailable:
                 if self._replay_stop_lsn(table_options) is not None:
                     raise
@@ -12470,6 +12488,137 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         snapshot_mode: str = "initial",
         bootstrap_offset: dict | None = None,
     ) -> tuple[Iterator[dict], dict]:
+        # A position seeded at the snapshot floor (_delete_floor_seed) carries the floor's
+        # update until the upsert reader's start shows which snapshot the target holds.
+        seeded = (start_offset or {}).get("floor_seed")
+        if seeded is not None:
+            start_offset, seeded = self._confirmed_floor_seed(
+                self._table(table_name, table_options), start_offset
+            )
+        rows, end = self._read_table_deletes_from(
+            table_name,
+            start_offset,
+            table_options,
+            snapshot_mode=snapshot_mode,
+            bootstrap_offset=bootstrap_offset,
+        )
+        if seeded is not None and end.get("commit_lsn") is not None:
+            end = {**end, "floor_seed": seeded}
+        return rows, end
+
+    def _delete_floor_recorded(self, table_name: str, table_options: dict[str, str]) -> bool:
+        # Docstring: Whether this pipeline has a snapshot floor a delete reader with no
+        # checkpoint may start at, told without opening Informix (see
+        # _upsert_channel_start_exists).
+
+        if self._update_request == "full_refresh":
+            return False
+        identity = self._native_table_state_identity(
+            table_options.get("qualified_source_table", table_name)
+        )
+        if identity is None:
+            return False
+        _, connection_key, table_key = identity
+        record_key = "/".join(
+            (connection_key, table_key, "delete-floor", self._pipeline_id(self._pipeline_scope()))
+        )
+        record = self._state_op_with_reconnect(
+            lambda: read_state_record(self._lakebase_connection(), connection_key, record_key),
+            operation="delete-floor probe",
+        )
+        return isinstance(record, dict) and isinstance(record.get("snapshot_scope"), str)
+
+    def _delete_floor_seed(self, table: Table) -> dict | None:
+        # Docstring: The offset a delete reader with no checkpoint starts at before the
+        # upsert reader has published this update's start: this pipeline's snapshot floor.
+        #
+        # A triggered update runs at most so many flows at once, and a delete flow whose
+        # upsert flow is still queued found no start to wait for: it gave up after
+        # _SCHEMA_NODE_FALLBACK_RETRIES empty batches, the update ended it with no
+        # checkpoint, and every later triggered update ended it at once. Its table's
+        # deletes, and the old rows of key-changing updates, were then never applied (seen
+        # live: half the tables of a triggered run). The floor is the LSN the target's rows
+        # were snapshotted at, so the deletes after it are the ones the target lacks, and an
+        # earlier start only reads again what the sequence column makes harmless.
+        #
+        # Not in a full refresh, whose snapshot is still to come, nor where the floor's
+        # layout is not today's (the reader would have steps to take that the upsert reader
+        # records): those wait as before. An update the pipelines API can't say the purpose
+        # of starts there too: the floor of a target a full refresh has since emptied is
+        # told later, by its update (_confirmed_floor_seed), and the deletes read before
+        # that are older than the rows the new snapshot lands, which they leave alone.
+
+        if self._update_request == "full_refresh":
+            return None
+        record = self._read_immutable_head(
+            self._immutable_namespace(
+                table, "delete-floor", self._pipeline_id(self._pipeline_scope())
+            )
+        )
+        if record is None or not isinstance(record.get("snapshot_scope"), str):
+            return None
+        self._validate_immutable_record_header(record, "delete-floor", table.exposed_name)
+        schema_id, fingerprint = record.get("schema_id"), _schema_fingerprint(table)
+        if (
+            record.get("table") != table.native_identity
+            or record.get("fingerprint") != fingerprint
+            or not isinstance(schema_id, str)
+            or not re.fullmatch(r"[0-9a-f]{32}", schema_id)
+        ):
+            return None
+        floor = self._immutable_lsn(record, "start_lsn", table.exposed_name)
+        if not self._bridge.minimum_lsn() <= floor <= self._bridge.current_lsn():
+            return None
+        # 297: Informix delete channel for '{}' starts at the snapshot floor {} without
+        # waiting for the upsert reader: it has no checkpoint, and the floor is this
+        # pipeline's last snapshot of the table
+        logging.getLogger(__name__).info(_m(297, table.exposed_name, floor))
+        return {
+            **_offset(
+                floor, floor, floor, None, "stream", table, schema_id, self._pipeline_scope()
+            ),
+            "update_fingerprint": fingerprint,
+            "floor_seed": record["snapshot_scope"],
+        }
+
+    def _confirmed_floor_seed(self, table: Table, start_offset: dict) -> tuple[dict, str | None]:
+        # Docstring: A floor-seeded delete position checked against the upsert reader's
+        # start, once this update has one: ``(offset to read from, floor update still to
+        # check)``.
+        #
+        # The upsert reader publishes a new snapshot's floor before its start
+        # (_publish_snapshot_boundary), so a start with the floor unchanged means the
+        # target still holds the snapshot the position was seeded from: the mark is
+        # dropped. A floor another update has written means the target was emptied and
+        # snapshotted again (a full refresh that ended before this table's flows ran, then
+        # this update): the position belongs to the old snapshot, on a rebuilt source
+        # perhaps to another log, and the reader starts again as one with no checkpoint.
+
+        seeded = start_offset["floor_seed"]
+        if self._read_upsert_channel_start(table, self._pipeline_scope()) is None:
+            return start_offset, seeded
+        record = self._read_immutable_head(
+            self._immutable_namespace(
+                table, "delete-floor", self._pipeline_id(self._pipeline_scope())
+            )
+        )
+        current = None if record is None else record.get("snapshot_scope")
+        if current == seeded:
+            return {k: v for k, v in start_offset.items() if k != "floor_seed"}, None
+        # 291: Informix delete channel for '{}' started at a snapshot floor that update {}
+        # has since replaced; it starts again at the new one
+        logging.getLogger(__name__).warning(_m(291, table.exposed_name, current))
+        return {}, None
+
+    def _read_table_deletes_from(
+        self,
+        table_name: str,
+        start_offset: dict,
+        table_options: dict[str, str],
+        *,
+        snapshot_mode: str = "initial",
+        bootstrap_offset: dict | None = None,
+    ) -> tuple[Iterator[dict], dict]:
         # ``start_offset`` has already been through _effective_start_offset, which
         # collapses an all-advisory offset to {} so a retry looks like a fresh
         # bootstrap positionally. The bootstrap deferral counter lives in exactly such
@@ -12478,7 +12627,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         bootstrap_offset = start_offset if bootstrap_offset is None else bootstrap_offset
         table = self._table(table_name, table_options)
         self._touch_table_state(table)
-        _ensure_materializable(table, table_options)
+        _ensure_materializable(table, self._with_connection_scan(table_options))
         if self._append_only_table(table, table_options):
             # The framework does not open a delete flow for ingestion_type="append",
             # so reaching here means the two sides disagree about this table. Returning
@@ -12507,7 +12656,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 # upsert reader publishes the position it is *actually* using in
                 # this update.  Inferring from current_lsn or a scope-independent
                 # schema node can start ahead of a resumed upsert checkpoint and
-                # permanently skip old-key deletes after a cancelled refresh.
+                # permanently skip old-key deletes after a cancelled refresh. The
+                # pipeline's snapshot floor is never ahead of it: with one, start there.
+                seed = self._delete_floor_seed(table)
+                if seed is not None:
+                    return iter(()), seed
                 return iter(()), self._schema_node_fallback_offset(bootstrap_offset)
             high_water, schema_id, fingerprint = channel_start
             # The upsert channel-start records the upsert reader's *resume* position
@@ -13199,8 +13352,17 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
 
         # One provider, and so one token, for this process and update: a drain worker
         # makes a reader a table and a shard daemon one a burst, and each minting its own
-        # left a day-long token behind every time.
-        key = (host, pipeline_id, update_id, lifetime)
+        # left a day-long token behind every time. An explicit lakebase.workspace.token is
+        # an identity of its own, as a digest: two connections with different ones shared
+        # the first one's token. The runtime's own credential is not, as the driver
+        # captures it afresh every 15 minutes; the provider takes each capture up, so that
+        # a rejected token is replaced through one that has not expired (refresh).
+        identity = (
+            hashlib.sha256(self.options["lakebase.workspace.token"].encode("utf-8")).hexdigest()
+            if explicit
+            else ""
+        )
+        key = (host, pipeline_id, update_id, lifetime, identity)
         with _STAGING_PROVIDERS.lock:
             provider = _STAGING_PROVIDERS.get(key)
             if provider is None:
@@ -13211,6 +13373,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     lifetime_seconds=lifetime,
                     update_id=update_id,
                 )
+            else:
+                provider.take_bootstrap(token)
             provider.sweep_claim(sweeps_earlier_updates if update_id else None)
         return provider
 
@@ -14078,7 +14242,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 table, None, options, pipeline_scope_override=pipeline_scope_override
             )
         incremental = checkpoint.get("incremental")
-        if isinstance(incremental, dict) and self._incremental_bound_is_foreign(incremental):
+        # A replay repeats a batch an earlier update logged, its change-log range and copy
+        # chunk alike, so it reads with the bound that batch had: the change log it repeats
+        # began before that bound was captured, and carries every row inserted above it.
+        # Captured again, a bound lowered by rows deleted at the table's top since ended the
+        # copy short of the cursor Spark logged, and the replay failed on every restart.
+        if (
+            isinstance(incremental, dict)
+            and self._replay_stop_lsn(options) is None
+            and self._incremental_bound_is_foreign(incremental)
+        ):
             # A bound from an earlier update was captured before this update's CDC
             # start, which would orphan rows inserted in between. Recapture it --
             # and only it, since the cursor still names rows this table holds.
@@ -14681,7 +14854,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # resumes at the boundary and _recover discards anything at/below it. The whole
             # extract serves in one microbatch (rows stream lazily, so driver memory stays
             # bounded); a restart before the offset commits simply replays it (idempotent).
-            table, schema_id, snapshot_lsn = self._pin_unl_boundary(table, options, pipeline_scope)
+            replayed = self._replayed_unl_boundary(table, options)
+            if replayed is not None:
+                table, schema_id, snapshot_lsn, pipeline_scope = replayed
+            else:
+                table, schema_id, snapshot_lsn = self._pin_unl_boundary(
+                    table, options, pipeline_scope
+                )
             rows = self._serve_unl_snapshot(table, options, snapshot_lsn)
             return rows, _offset(
                 snapshot_lsn,
@@ -14985,6 +15164,17 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 )
             return self._staged_snapshot_result(table, pipeline_scope, schema_id, manifest, 0)
 
+    def _with_connection_scan(self, table_options: dict[str, str]) -> dict[str, str]:
+        # Docstring: ``table_options`` with the connection's snapshot.scan where they set
+        # none, as the snapshot reads it (_scan_index): checked on the table options alone,
+        # keyset(...) set on the connection passed the check that refuses it on a keyed
+        # table.
+
+        scan = self.options.get(_SNAPSHOT_SCAN_OPTION)
+        if scan is None or _SNAPSHOT_SCAN_OPTION in table_options:
+            return table_options
+        return {**table_options, _SNAPSHOT_SCAN_OPTION: scan}
+
     def _scan_index(self, table, options) -> tuple[list[str], list[bool]] | None:
         # Docstring: The index a keyless table's snapshot pages by, as its columns and their
         # directions, or None when it reads through the one cursor instead.
@@ -15127,12 +15317,25 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
 
     @staticmethod
     def _read_progress_file(path: str) -> dict[str, Any] | None:
+        # A dropped mount is not a missing record: read as one, it discarded a scan's
+        # progress or cut its resume short. It goes to the read's mount retry instead.
         try:
             with open(path, encoding="utf-8") as handle:
                 value = json.load(handle)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as error:
+            if _dropped_mount_error(error) is not None:
+                raise
             return None
         return value if isinstance(value, dict) else None
+
+    @staticmethod
+    def _progress_file_exists(path: str) -> bool:
+        # Not os.path.exists, which reads a dropped mount as a missing file.
+        try:
+            os.stat(path)
+        except FileNotFoundError:
+            return False
+        return True
 
     @staticmethod
     def _latest_progress_file(directory: str) -> str:
@@ -15145,14 +15348,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         def page(number: int) -> str:
             return os.path.join(directory, f"{number:08d}.json")
 
-        if not os.path.exists(page(0)):
+        exists = InformixLakeflowConnect._progress_file_exists
+        if not exists(page(0)):
             return os.path.join(directory, "head.json")
         low, high = 0, 1
-        while os.path.exists(page(high)):
+        while exists(page(high)):
             low, high = high, high * 2
         while high - low > 1:
             middle = (low + high) // 2
-            if os.path.exists(page(middle)):
+            if exists(page(middle)):
                 low = middle
             else:
                 high = middle
@@ -15218,7 +15422,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 elif self._bridge.minimum_lsn() > int(pointer["initial"]):
                     # That update's capture began there, and its changes are read again.
                     why = "the log it began in is no longer kept"
-            except (KeyError, OSError, TypeError, ValueError):
+            except (KeyError, OSError, TypeError, ValueError) as error:
+                if _dropped_mount_error(error) is not None:
+                    raise
                 why = "its record cannot be read"
         if why is None:
             return recorded
@@ -15267,16 +15473,18 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     break
         except (KeyError, TypeError, ValueError):
             return None
-        # A page staged after the last one recorded is read again: its file gives way.
-        shutil.rmtree(
-            os.path.join(
-                self._snapshot_stage_namespace(table, scope, schema_id),
-                "runs",
-                str(boundary),
-                f"page-{staged:08d}",
-            ),
-            True,
+        # A page staged after the last one recorded is read again: its file gives way, and
+        # so do any after it, or staging that page again conflicted with what was there.
+        runs = os.path.join(
+            self._snapshot_stage_namespace(table, scope, schema_id), "runs", str(boundary)
         )
+        try:
+            names = os.listdir(runs)
+        except FileNotFoundError:
+            names = []
+        for name in names:
+            if name.startswith("page-") and name[5:].isdigit() and int(name[5:]) >= staged:
+                shutil.rmtree(os.path.join(runs, name), True)
         # 439: Informix snapshot of '{}' continues the index-ordered scan an earlier
         # update of this pipeline began: {} staged pages with {} rows are kept
         logging.getLogger(__name__).info(_m(439, table.exposed_name, staged, rows))
@@ -16632,6 +16840,44 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         self._pin_unl_extract(table, options, pipeline_scope, schema_id, boundary)
         return table, schema_id, boundary
 
+    def _replayed_unl_boundary(
+        self, table: Table, options: dict[str, str]
+    ) -> tuple[Table, str, int, str] | None:
+        # Docstring: Where a replayed first batch of a file snapshot was served, as (table,
+        # schema id, LSN, scope), else None.
+        #
+        # A self-pinned boundary pinned again by the update replaying the batch was a newer
+        # LSN than the end Spark goes on from: the extract's rows were stamped with it, so
+        # the changes up to it lost to them on the sequence column, and the pipeline's
+        # delete floor moved past deletes the target lacks. The partitioned reader serves
+        # such a batch again from the pin it logged (_served_partitions); so does this,
+        # from the manifest pinned at the end's LSN, against which the extract is checked.
+
+        raw = options.get(_REPLAY_INITIAL_END_OPTION)
+        if raw is None:
+            return None
+        try:
+            end = _validated_offset(json.loads(raw))
+        except (TypeError, ValueError):
+            return None
+        lsn = int(end["commit_lsn"])
+        if (
+            end["phase"] != "stream"
+            or {int(end["begin_lsn"]), int(end["change_lsn"])} != {lsn}
+            or end.get("tx_id") is not None
+            or "incremental" in end
+        ):
+            return None
+        scope, schema_id = str(end["pipeline_scope"]), str(end["schema_id"])
+        record = self._read_immutable_head(self._unl_extract_namespace(table, scope, schema_id))
+        if record is None or str(record.get("snapshot_lsn")) != str(lsn):
+            return None
+        self._validate_immutable_record_header(record, "unl-extract", table.exposed_name)
+        table = self._refresh_table_schema(table, end.get("schema_fingerprint"))
+        paths = [entry["path"] for entry in self._unl_extract_files(table, options)]
+        self._verify_unl_extract(table, options, scope, schema_id, lsn, paths)
+        return table, schema_id, lsn, scope
+
     def _unl_extract_namespace(self, table: Table, pipeline_scope: str, schema_id: str) -> str:
         return self._immutable_namespace(table, "unl-extract", pipeline_scope, schema_id)
 
@@ -17346,7 +17592,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # _recover's strict ``commit_lsn > C`` filter keeping the seam gapless and
         # duplicate-free.
 
-        _ensure_materializable(table, options)
+        _ensure_materializable(table, self._with_connection_scan(options))
         table = self._refresh_table_schema(table, None)
         pipeline_scope = self._pipeline_scope()
         if self._table_migration(options):
@@ -17406,7 +17652,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         )
 
     def _read_snapshot_only(self, table: Table, options: dict[str, str]):
-        _ensure_materializable(table, options)
+        _ensure_materializable(table, self._with_connection_scan(options))
         table = self._refresh_table_schema(table, None)
         fingerprint = _schema_fingerprint(table)
         # PK-less tables cannot be seek-paginated safely.  Read exactly once;
@@ -18193,7 +18439,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # that is where this consumer now is, the quiet advance having taken it there
             # before the shard's next read. Within the boundary's page is done as well.
             bound, _ = self._shared_trigger_boundary(
-                table, checkpoint, owner=not deletes, current_lsn=view.current_lsn
+                table, checkpoint, current_lsn=view.current_lsn
             )
             started = view.read_start_lsn
             if view.current_lsn >= bound and (
@@ -18224,7 +18470,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
 
     def _read_stream_batch(self, table: Table, start: dict, options: dict[str, str], deletes: bool):
         checkpoint = _validated_offset(start)
-        pipeline_scope = self._pipeline_scope()
+        pipeline_scope = self._pipeline_scope(checkpoint)
         # A daemon reader owns this shard's Informix I/O: it supplies the schema, log
         # bounds, and change records, so a steady-state poll touches Informix for
         # nothing. A None view (daemon not ready yet, or a schema transition in flight)
@@ -18345,12 +18591,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         trigger_generation: str | None = None
         # A replay reproduces a committed [start, end) range bounded by its end offset
         # (``replay_stop`` below). It must NOT consult the shared trigger boundary: that
-        # boundary is published per update scope by the upsert (owner) reader, so after a
-        # driver restart a replay -- planned in a fresh scope -- finds no boundary for the
-        # replayed generation, and the delete (non-owner) reader's _shared_trigger_boundary
-        # raises TriggerBoundaryUnavailable, which is fatal inside get_partitions
-        # (planPartitions has no latestOffset retry). The replay's own committed end LSN is
-        # the correct stop and is applied below, so skip the live handshake while replaying.
+        # boundary is per update scope, so after a driver restart a replay -- planned in a
+        # fresh scope -- would bound the replayed range by a boundary of its own update
+        # instead of the end Spark logged. The replay's own committed end LSN is the
+        # correct stop and is applied below, so skip the live handshake while replaying.
         # A normal (non-replay) read has no replay stop and takes the boundary as before.
         replay_stop = self._replay_stop_lsn(options)
         if replay_stop is None:
@@ -18365,7 +18609,6 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             stop_lsn, trigger_generation = self._shared_trigger_boundary(
                 table,
                 checkpoint,
-                owner=not deletes,
                 current_lsn=shared_view.current_lsn if shared_view is not None else None,
             )
             trigger_high_water = stop_lsn
@@ -18757,14 +19000,22 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         table: Table,
         checkpoint: dict[str, Any],
         *,
-        owner: bool,
         current_lsn: int | None = None,
     ) -> tuple[int, str]:
         # One pipeline update owns exactly one immutable per-table boundary.
         # Upsert and delete checkpoints may legitimately have different prior
         # generations after retries or cancellation, so predecessor identity
         # must not partition their current-update coordination.
+        #
+        # Whichever of the table's two readers comes first sets it. Set by the upsert
+        # reader alone, a delete flow started ahead of its upsert flow yielded until that
+        # one had read, in one of the few flow slots a triggered update has: with enough
+        # tables the waiting delete flows could take every slot from the upsert flows they
+        # waited for. A reader whose position is already past the boundary -- an upsert
+        # reader whose snapshot was taken after the delete reader set it -- has nothing
+        # to read up to it: its own position is its bound for this trigger.
         scope = self._pipeline_scope(checkpoint)
+        position = int(checkpoint.get("commit_lsn", 0))
         cached = self._trigger_boundaries.get(table.identity)
         if cached is not None:
             high_water, generation, cached_scope = cached
@@ -18774,12 +19025,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 # Keep returning the same frozen boundary in this reader
                 # instance; a new pipeline update constructs a new reader and
                 # legitimately advances from generation as its predecessor.
-                if high_water < int(checkpoint.get("commit_lsn", 0)):
-                    # 291: Cached trigger boundary {} precedes checkpoint LSN {} for '{}'
-                    raise InformixError(
-                        _m(291, high_water, checkpoint.get("commit_lsn"), table.exposed_name)
-                    )
-                return high_water, generation
+                return max(high_water, position), generation
             self._trigger_boundaries.pop(table.identity, None)
         namespace = self._immutable_namespace(table, "triggers", "scopes", scope)
         deadline = time.monotonic() + int(
@@ -18799,9 +19045,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 if not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{32}", generation):
                     # 293: Invalid shared trigger generation for '{}'
                     raise InformixError(_m(293, table.exposed_name))
-                if trigger.get("scope") != scope or high_water < int(
-                    checkpoint.get("commit_lsn", 0)
-                ):
+                if trigger.get("scope") != scope:
                     # 294: Invalid immutable trigger identity for '{}'
                     raise InformixError(_m(294, table.exposed_name))
                 self._trigger_boundaries[table.identity] = (
@@ -18809,35 +19053,30 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     generation,
                     scope,
                 )
-                return high_water, generation
-            if owner:
-                candidate_high_water = (
-                    current_lsn if current_lsn is not None else self._bridge.current_lsn()
+                return max(high_water, position), generation
+            candidate_high_water = (
+                current_lsn if current_lsn is not None else self._bridge.current_lsn()
+            )
+            if candidate_high_water < int(checkpoint["commit_lsn"]):
+                # 295: Current LSN {} precedes checkpoint LSN {} for '{}'
+                raise InformixError(
+                    _m(295, candidate_high_water, checkpoint["commit_lsn"], table.exposed_name)
                 )
-                if candidate_high_water < int(checkpoint["commit_lsn"]):
-                    # 295: Current LSN {} precedes checkpoint LSN {} for '{}'
-                    raise InformixError(
-                        _m(295, candidate_high_water, checkpoint["commit_lsn"], table.exposed_name)
-                    )
-                self._publish_immutable_head(
-                    namespace,
-                    {
-                        "created_at": time.time(),
-                        "generation": secrets.token_hex(16),
-                        "high_water": str(candidate_high_water),
-                        "scope": scope,
-                    },
-                    record_type="trigger",
-                )
-                if time.monotonic() >= deadline:
-                    # 296: Timed out waiting for the upsert reader to publish a triggered boundary
-                    # for '{}' in update scope '{}'
-                    raise InformixError(_m(296, table.exposed_name, scope))
-                delay = _sleep_with_backoff(deadline, delay)
-                continue
-            # 297: The upsert reader has not published the triggered boundary for '{}' in update
-            # scope '{}' yet
-            raise TriggerBoundaryUnavailable(_m(297, table.exposed_name, scope))
+            self._publish_immutable_head(
+                namespace,
+                {
+                    "created_at": time.time(),
+                    "generation": secrets.token_hex(16),
+                    "high_water": str(candidate_high_water),
+                    "scope": scope,
+                },
+                record_type="trigger",
+            )
+            if time.monotonic() >= deadline:
+                # 296: Timed out publishing the triggered boundary for '{}' in update scope '{}'
+                raise InformixError(_m(296, table.exposed_name, scope))
+            delay = _sleep_with_backoff(deadline, delay)
+            continue
 
     def _ensure_recorded_path_to_live(
         self, table: Table, node_table: Table, node_id: str, rules: dict[str, Any]
@@ -19052,9 +19291,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 # the entire pool and the publication can never happen: a genuine deadlock,
                 # broken only by this deadline expiring and failing the flow.
                 #
-                # Yield instead, exactly as the other two non-owner coordination
-                # points do (_shared_table_lsn returns None via wait=False, and
-                # _shared_trigger_boundary raises TriggerBoundaryUnavailable). The
+                # Yield instead, as the other non-owner coordination point does
+                # (_shared_table_lsn returns None via wait=False). The
                 # caller converts this into an unchanged-offset empty batch, which
                 # releases the slot and lets the owning upsert reader acquire one.
                 #
@@ -19538,7 +19776,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     )
             cached = replace(cached, primary_keys=key)
             _ensure_selected_keys(cached)
-            _ensure_materializable(cached, table_options)
+            _ensure_materializable(cached, self._with_connection_scan(table_options))
             if self._append_only_table(cached, table_options) or not _cdc_capable(cached):
                 return True
         identity = self._native_table_state_identity(exposed)
@@ -19608,7 +19846,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         if identity is None:
             return
         native_identity, connection_key, table_key = identity
-        scope = self._pipeline_scope()
+        scope = self._pipeline_scope(checkpoint)
         start_lsn = int(checkpoint.get("begin_lsn") or checkpoint["commit_lsn"])
         schema_id = str(checkpoint["schema_id"])
         fingerprint = str(checkpoint["schema_fingerprint"])
@@ -19779,6 +20017,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         ):
             # 317: Invalid immutable snapshot boundary for '{}'
             raise InformixError(_m(317, table.exposed_name))
+        # Durable floor for a delete flow's bootstrap. The per-scope upsert channel-start
+        # below is GC'd with its update scope and records the upsert *resume* position,
+        # which drifts forward across restarts; this floor is keyed by schema id and
+        # pipeline id so it survives scope cleanup and restarts while staying isolated
+        # per pipeline, and is forward-moving so a later resnapshot advances it. It is the
+        # LSN the current destination rows were captured at -- the correct lower bound for
+        # replaying deletes (see the bootstrap path in _read_table_deletes_attempt).
+        self._publish_delete_snapshot_floor(table, schema_id, snapshot_lsn, pipeline_scope)
+        # The floor first: a delete reader that started at an earlier snapshot's floor takes
+        # this update's start as the sign that the floor is settled (_confirmed_floor_seed).
         # Publish only once the strategy has finalized its safe handoff:
         # incremental snapshots pass initial_lsn == snapshot_lsn, while a
         # blocking consistent snapshot may finish later and must seed deletes
@@ -19790,14 +20038,6 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             _schema_fingerprint(table),
             pipeline_scope,
         )
-        # Durable floor for a delete flow's bootstrap. The per-scope upsert channel-start
-        # above is GC'd with its update scope and records the upsert *resume* position,
-        # which drifts forward across restarts; this floor is keyed by schema id and
-        # pipeline id so it survives scope cleanup and restarts while staying isolated
-        # per pipeline, and is forward-moving so a later resnapshot advances it. It is the
-        # LSN the current destination rows were captured at -- the correct lower bound for
-        # replaying deletes (see the bootstrap path in _read_table_deletes_attempt).
-        self._publish_delete_snapshot_floor(table, schema_id, snapshot_lsn, pipeline_scope)
 
     def _find_immutable_schema_record(
         self, table: Table, schema_id: str, scope: str
@@ -22178,14 +22418,16 @@ def _carry_table_options(fresh: Table, previous: Table) -> Table:
     if previous.key_override:
         # A wildcard key is re-expanded to the fresh columns instead of kept as listed.
         fresh = _carry_key_override(fresh, previous)
-    elif previous.key_from_nullable_index:
+    elif previous.key_from_nullable_index and not fresh.primary_keys and fresh.nullable_index_key:
         # The catalog re-derives the table as key-less (no all-NOT-NULL index), so without
         # this the promoted key -- and its directions -- would be dropped and the
-        # key-order guard would trip mid-copy.
+        # key-order guard would trip mid-copy. Promoted again from this read, as the
+        # option does: copied from the earlier one, an index dropped or replaced since, or
+        # a primary key added, read as no change, and the key drift went unseen.
         fresh = replace(
             fresh,
-            primary_keys=previous.primary_keys,
-            key_descending=previous.key_descending,
+            primary_keys=fresh.nullable_index_key,
+            key_descending=fresh.nullable_index_descending,
             key_from_nullable_index=True,
         )
     _ensure_key_columns_exist(fresh)
@@ -23125,7 +23367,6 @@ __all__ = [
     "InformixBridge",
     "InformixError",
     "SharedStateAccessUnavailable",
-    "TriggerBoundaryUnavailable",
     "SchemaTransitionUnavailable",
     "PurePythonInformixBridge",
     "LogRetentionError",

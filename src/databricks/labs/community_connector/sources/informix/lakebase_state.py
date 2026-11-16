@@ -744,6 +744,12 @@ class StagingCredentialProvider:
         # ``auto`` staging transport can fall back to FUSE; cleared by the next mint.
         self.rejected = False
 
+    def take_bootstrap(self, bootstrap_token: str) -> None:
+        # Docstring: Take up a newer bootstrap credential for :meth:`refresh`: a reader's,
+        # captured since this provider was made.
+        with self._lock:
+            self._bootstrap_token = bootstrap_token
+
     def sweep_claim(self, sweeps_earlier_updates: Any) -> None:
         # Docstring: Install how this provider asks whether its process is the one to
         # revoke earlier updates' tokens: each reader that takes the provider up gives
@@ -1449,19 +1455,25 @@ class LakebaseState:
             self._token_minted_at = now
         return self._token
 
-    def connect(self) -> Any:
+    def connect(self, timeout: float | None = None) -> Any:
         # Docstring: Open a Postgres connection, waking a suspended endpoint if needed.
         #
         # ``psycopg2`` is preinstalled on the Databricks runtime; ``psycopg`` (v3)
         # is accepted as an alternative so the module also works where only that
-        # is present.
+        # is present. ``timeout`` shortens the connect timeout, for a caller with less
+        # time than that left (a slot lease's renewal).
 
         facts = self._facts or self.provision()
         # Always the state role: its password needs no control-plane call and
         # cannot expire mid-stream. The admin identity is reached only through
         # ``_connect_as_admin``, during provisioning.
         try:
-            return self._open(facts, self._user_id, self._password)
+            return self._open(
+                facts,
+                self._user_id,
+                self._password,
+                **({} if timeout is None else {"timeout": timeout}),
+            )
         except Exception as error:
             if _stale_provisioning_error(error):
                 # The project was re-created under another host since this process
@@ -1675,7 +1687,13 @@ class LakebaseState:
         return self._open(facts, self._admin_user(), self._credential())
 
     def _open(
-        self, facts: dict[str, Any], user: str, password: str, database: str | None = None
+        self,
+        facts: dict[str, Any],
+        user: str,
+        password: str,
+        database: str | None = None,
+        *,
+        timeout: float | None = None,
     ) -> Any:
         # Docstring: Connect as ``user`` to ``database`` (lakebase.database by default),
         # waking a suspended endpoint if needed.
@@ -1686,7 +1704,10 @@ class LakebaseState:
             "user": user,
             "password": password,
             "sslmode": "require",
-            "connect_timeout": _CONNECT_TIMEOUT_SECONDS,
+            # libpq takes whole seconds, and reads 0 as no limit.
+            "connect_timeout": max(
+                1, int(min(timeout or _CONNECT_TIMEOUT_SECONDS, _CONNECT_TIMEOUT_SECONDS))
+            ),
             **_NO_CLIENT_CERTIFICATE,
         }
         try:
@@ -2499,10 +2520,11 @@ def publish_maximum_lsn_state_record(
     # Docstring: Atomically publish the highest compatible ``start_lsn`` for one key.
     #
     # The scope-independent counterpart of :func:`publish_minimum_lsn_state_record`,
-    # used for the delete-bootstrap snapshot floor: the floor must advance only when a
-    # resnapshot repopulates the destination as-of a later boundary, and stay put
+    # used for the delete-bootstrap snapshot floor: within an update the highest boundary
+    # wins, and a record whose ``snapshot_scope`` differs (a later update's snapshot,
+    # which the destination now holds) replaces it whatever its LSN; it stays put
     # otherwise. PostgreSQL serializes the conflict update so concurrent publishers
-    # converge on the maximum.
+    # converge.
 
     payload = json.dumps(record, sort_keys=True)
     parameters = {

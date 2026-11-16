@@ -78,8 +78,9 @@ bounded. A resume position can sit well past the snapshot the destination rows w
 captured at, and bootstrapping there would skip every delete committed in between
 (including the old-key delete of a primary-key change). The upsert reader therefore
 also records a durable, per-pipeline **delete floor** — the snapshot boundary, keyed by
-table and pipeline id so it survives update-scope cleanup, and moved forward only by a
-later resnapshot — and a bootstrapping delete reader anchors at the lower of the two,
+table and pipeline id so it survives update-scope cleanup; within an update the highest
+of its snapshots wins, and a later update's snapshot replaces it whatever its LSN (a log
+reinitialized, an older extract) — and a bootstrapping delete reader anchors at the lower of the two,
 re-reading a range no delete checkpoint has consumed (idempotent for the target). A
 floor that has aged out of the retained logical log, or that was captured under an
 earlier schema generation, is reported in the event log and the resume position is used
@@ -88,6 +89,21 @@ refresh if the destination must match the source exactly. If the source's logica
 is reinitialized (a server rebuild, `oninit -iy`), a boundary naming a higher `uniqid`
 than the server has reached makes the delete channel wait for a new snapshot generation
 rather than start from an unrelated position.
+
+A pipeline runs only so many flows at once, and can start a table's delete flow well
+before its upsert flow. In an update that is not a full refresh, a bootstrapping delete
+reader therefore does not wait where the pipeline already has a delete floor for the
+table: it starts at the floor at once. (Waiting, a triggered update ended the flow after a
+few empty batches with no offset, in every update, and the table's deletes were never
+applied.) It keeps a mark of which snapshot the floor was until the upsert reader has
+published this update's start. If the floor is another snapshot's by then (a full
+refresh ended before the table's flows ran, and this update snapshots it), the delete
+reader starts again at the new floor. In a full refresh, on the first run, or where the
+floor's column layout is not the table's current one, the delete reader waits as
+described above; if a triggered update ends before the upsert reader has published, the
+next update starts the delete reader at the floor, so its deletes arrive one update late
+and none are lost. In a triggered update, whichever of a table's two readers comes first
+sets the position the update reads up to, so neither waits for the other.
 
 ## Setup
 
@@ -171,7 +187,7 @@ rather than start from an unrelated position.
 | `metadata.max.bytes` | No | `67108864` | Maximum estimated decoded Python bytes retained by an individual catalog query and by complete discovery. Set `0` to disable the limit and byte accounting. |
 | `max.records.per.batch` | No | `10000` | Target maximum projected CDC rows; minimum `1`. A complete transaction may exceed it. |
 | `cdc.timeout` | No | `5` | CDC idle-read timeout in seconds; minimum `1`. Zero is rejected because it can select an unbounded native wait. |
-| `cdc.shared.state.wait.seconds` | No | `300` | Maximum time a delete reader waits for its table's upsert reader to publish initialization, trigger-boundary, or schema-transition state. When the upsert reader refuses a schema change, it records why for the current update, and the delete reader fails at once with that error rather than waiting. Otherwise, in a triggered update, a delete reader still waiting this long for a schema transition fails, naming the upsert reader, whose flow has most likely failed: the update would never end. A continuous update needs no such bound, since one failed flow fails it. It also sets how long a CDC shard keeps a table subscribed after its last poll: a flow that stops polling, or whose process exits, is dropped from its shard after this long, so it can't hold back the shard's restart position. |
+| `cdc.shared.state.wait.seconds` | No | `300` | Maximum time a delete reader waits for its table's upsert reader to publish initialization or schema-transition state. When the upsert reader refuses a schema change, it records why for the current update, and the delete reader fails at once with that error rather than waiting. Otherwise, in a triggered update, a delete reader still waiting this long for a schema transition fails, naming the upsert reader, whose flow has most likely failed: the update would never end. A continuous update needs no such bound, since one failed flow fails it. It also sets how long a CDC shard keeps a table subscribed after its last poll: a flow that stops polling, or whose process exits, is dropped from its shard after this long, so it can't hold back the shard's restart position. |
 | `cdc.max.records` | No | `256` | Soft native record target per CDC session; range `1`–`256`. Defaults to the source's own per-session ceiling because each poll pays a connection slot plus a full CDC session open/activate/close, so a smaller window amortises that fixed cost over less log progress. Once reached, records continue until every transaction already observed commits, rolls back, or Informix returns TIMEOUT. |
 | `cdc.max.frame.bytes` | No | `16777216` | Maximum accepted native CDC frame size (16 MiB by default; minimum `16`). |
 | `cdc.max.transaction.records` | No | `100000` | Maximum change records that all open transactions together hold in memory in one CDC poll. Exceeding it fails without emitting uncommitted data. With `cdc.spill.records` on (the default), a transaction is spilled once it alone holds more than that, and when several interleaved ones together reach this bound the largest is spilled, so the poll fails only with spilling off. |
@@ -711,9 +727,7 @@ on from the committed offset, as before. A scan under `snapshot.max.bytes` keeps
 record and starts over.
 
 A table keyed by `primary.keys` whose snapshot pages by an index is taken up the same
-way. Its delete flow waits, as it does for any snapshot served in a later update, until
-the upsert flow's first read with a committed offset has published where it starts, and
-then begins at the snapshot's position.
+way. Its delete flow begins at the snapshot's position once the scan has recorded it.
 
 ### Checkpoints and log retention
 

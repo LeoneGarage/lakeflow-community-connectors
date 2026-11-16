@@ -136,7 +136,6 @@ from databricks.labs.community_connector.sources.informix.informix import (  # n
     SharedStateAccessUnavailable,
     Table,
     TransactionBuffer,
-    TriggerBoundaryUnavailable,
     UnsupportedChangeError,
     _SharedCdcShard,
     _SharedCdcSnapshot,
@@ -499,7 +498,7 @@ class _OfflineLakebase:
         coordinator.table_caches.clear()
         return self
 
-    def _connect(self, _state=None):
+    def _connect(self, _state=None, timeout=None):
         connection = self._fake._FakeConnection(self.database)
         self.connections.append(connection)
         return connection
@@ -3093,6 +3092,35 @@ class LakeflowContractTests(unittest.TestCase):
         # Never shipped to a worker: a provider holds a token and a lock.
         self.assertEqual(pickle.loads(pickle.dumps(informix_module._STAGING_PROVIDERS)), {})
 
+    def test_a_staging_provider_is_one_explicit_token_and_takes_new_bootstraps_up(self):
+        # Another explicit token is another identity: its own provider and minted token.
+        # The same identity's provider takes up the bootstrap credential the reader has now,
+        # so a token the Files API rejects is replaced through a credential still valid.
+        options = {"lakebase.workspace.host": "https://ws", "lakebase.workspace.token": "t1"}
+        first = self.connector(FakeBridge(), **options)
+        provider = first._build_staging_credential_provider(required=True)
+        other = self.connector(FakeBridge(), **{**options, "lakebase.workspace.token": "t2"})
+        self.assertIsNot(other._build_staging_credential_provider(required=True), provider)
+
+        self.assertIs(
+            self.connector(FakeBridge(), **options)._build_staging_credential_provider(
+                required=True
+            ),
+            provider,
+        )
+
+        def runtime(token):
+            return mock.patch.object(
+                informix_module, "_workspace_credentials", return_value=("https://ws", token)
+            )
+
+        with runtime("captured-first"):
+            ambient = self.connector(FakeBridge())._build_staging_credential_provider(required=True)
+        with runtime("captured-since"):
+            again = self.connector(FakeBridge())._build_staging_credential_provider(required=True)
+        self.assertIs(again, ambient)
+        self.assertEqual(ambient._bootstrap_token, "captured-since")
+
     def test_hash_reads_a_year_one_timestamp_as_it_lands(self):
         # A column's year-1 value lands as text with a UTC zone (naive, it overflows
         # PySpark's zone conversion), and HASH sees that text. One a transform makes, the
@@ -3356,9 +3384,16 @@ class LakeflowContractTests(unittest.TestCase):
         simple.prepareForTriggerAvailableNow()
         partitioned.prepareForTriggerAvailableNow()
         self.assertEqual(connector.prepare_for_trigger_available_now.call_count, 2)
-        with mock.patch.object(package, "_replay_between_offsets", return_value=iter(())) as replay:
+        with mock.patch.object(module, "_replay_between_offsets", return_value=iter(())) as replay:
             simple.readBetweenOffsets({"a": 1}, {"a": 2})
         self.assertEqual(replay.call_args.args[:2], ({"a": 1}, {"a": 2}))
+        # With the connector's hook for a staged snapshot's first batch, as the merged
+        # file's reader has it.
+        staged_start = replay.call_args.args[5]
+        staged_start({"commit_lsn": "90"})
+        connector._staged_first_batch_start.assert_called_once_with(
+            "app.orders", {"commit_lsn": "90"}, options
+        )
         # The data source picks the reader by whether the table is read in partitions.
         source = object.__new__(package.InformixDataSource)
         source.options, source.lakeflow_connect = options, connector
@@ -3903,9 +3938,9 @@ class LakeflowContractTests(unittest.TestCase):
         # primary.keys gives the table a key to merge by and a delete reader of its own.
         # The scan is taken up under the failed update's scope, where its end also publishes
         # the upsert reader's start. The delete reader of this update looks under this
-        # update's scope: it waits until the upsert reader's first read with a committed
-        # offset publishes the start there, as it does for any snapshot served in a later
-        # update, and then begins at the snapshot's position.
+        # update's scope, where there is none yet: it waits until the scan's end has
+        # recorded the snapshot's floor, begins there, and has that confirmed once the
+        # upsert reader's first read with a committed offset publishes this update's start.
         pipeline = uuid.UUID(int=11)
         scopes = [f"{pipeline}_@_{uuid.UUID(int=update)}" for update in (2, 3)]
         bridge, options, cursors = self._failed_index_scan(scopes[0], {"primary.keys": "id"})
@@ -3921,18 +3956,20 @@ class LakeflowContractTests(unittest.TestCase):
         ids = [row["id"] for row in rows]
         self.assertEqual(cursors, [[4], [6]])
         self.assertEqual(offset["pipeline_scope"], scopes[0])
-        deletes, waiting = later.read_table_deletes("app.orders", waiting, options)
+        deletes, seeded = later.read_table_deletes("app.orders", waiting, options)
         self.assertEqual(list(deletes), [])
-        self.assertNotIn("commit_lsn", waiting)
+        self.assertEqual(seeded["floor_seed"], scopes[0])
 
         while offset.get("phase") != "stream":
             rows, offset = later.read_table("app.orders", offset, options)
             ids += [row["id"] for row in rows]
         self.assertEqual(ids, [1, 2, 3, 4, 5, 6, 7])
-        deletes, seeded = later.read_table_deletes("app.orders", waiting, options)
-        self.assertEqual(list(deletes), [])
         self.assertEqual(seeded["phase"], "stream")
         self.assertEqual(seeded["commit_lsn"], offset["commit_lsn"])
+        later.read_table("app.orders", offset, options)
+        deletes, confirmed = later.read_table_deletes("app.orders", seeded, options)
+        self.assertEqual(list(deletes), [])
+        self.assertNotIn("floor_seed", confirmed)
 
     def test_an_index_scan_retries_a_read_whose_connection_dropped_in_place(self):
         # A connection reset during the scan's page read or change poll: the transport is
@@ -4011,32 +4048,71 @@ class LakeflowContractTests(unittest.TestCase):
     def test_a_page_staged_but_not_recorded_gives_way_when_the_scan_is_taken_up(self):
         # The failure fell between staging a page and recording it. The page is read
         # again, and what it holds by then may differ: its staged file must not stand in
-        # the way of the one that replaces it.
-        pipeline = uuid.UUID(int=13)
-        scopes = [f"{pipeline}_@_{uuid.UUID(int=update)}" for update in (2, 3)]
-        bridge, options, cursors = self._failed_index_scan(scopes[0])
-        records = os.path.join(
-            self._shared_state.name, "**", "snapshot-scan", "**", "[0-9]" * 8 + ".json"
-        )
-        recorded = sorted(glob.glob(records, recursive=True))
-        self.assertEqual(
-            [os.path.basename(path) for path in recorded], ["00000000.json", "00000001.json"]
-        )
-        os.remove(recorded[-1])
-        bridge.rows[2]["value"] = "changed since"
+        # the way of the one that replaces it, nor do the files of pages after it.
+        seen: set[str] = set()
+        for unrecorded, read_again in ((1, [[2], [4], [6]]), (2, [None, [2], [4], [6]])):
+            with self.subTest(unrecorded=unrecorded):
+                pipeline = uuid.UUID(int=13 + unrecorded * 100)
+                scopes = [f"{pipeline}_@_{uuid.UUID(int=update)}" for update in (2, 3)]
+                bridge, options, cursors = self._failed_index_scan(scopes[0])
+                records = os.path.join(
+                    self._shared_state.name, "**", "snapshot-scan", "**", "[0-9]" * 8 + ".json"
+                )
+                recorded = sorted(set(glob.glob(records, recursive=True)) - seen)
+                seen.update(recorded)
+                self.assertEqual(
+                    [os.path.basename(path) for path in recorded],
+                    ["00000000.json", "00000001.json"],
+                )
+                for path in recorded[-unrecorded:]:
+                    os.remove(path)
+                bridge.rows[2]["value"] = "changed since"
 
-        later = self.connector(bridge)
-        later.set_registration_scope(scopes[1])
-        later.set_update_request("continue")
-        with mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0):
-            rows, offset = later.read_table("app.orders", {}, options)
-            rows = list(rows)
-            while offset.get("phase") != "stream":
-                more, offset = later.read_table("app.orders", offset, options)
-                rows += list(more)
-        self.assertEqual(cursors, [[2], [4], [6]])
-        self.assertEqual([row["id"] for row in rows], [1, 2, 3, 4, 5, 6, 7])
-        self.assertEqual([row["value"] for row in rows if row["id"] == 3], ["changed since"])
+                later = self.connector(bridge)
+                later.set_registration_scope(scopes[1])
+                later.set_update_request("continue")
+                with mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0):
+                    rows, offset = later.read_table("app.orders", {}, options)
+                    rows = list(rows)
+                    while offset.get("phase") != "stream":
+                        more, offset = later.read_table("app.orders", offset, options)
+                        rows += list(more)
+                self.assertEqual(cursors, read_again)
+                self.assertEqual([row["id"] for row in rows], [1, 2, 3, 4, 5, 6, 7])
+                self.assertEqual(
+                    [row["value"] for row in rows if row["id"] == 3], ["changed since"]
+                )
+
+    def test_a_dropped_mount_reaches_the_retry_rather_than_reading_as_no_progress(self):
+        # ENOTCONN read as a missing record discarded a scan's progress, or cut its
+        # resume short; it goes to the read's dropped-mount retry instead.
+        dropped = OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+        connector = self.connector(_KeylessIndexBridge())
+        table = Table.parse(_table(primary_keys=()), "demo")
+        with mock.patch("builtins.open", side_effect=dropped):
+            with self.assertRaises(OSError):
+                InformixLakeflowConnect._read_progress_file("/Volumes/x/head.json")
+        with mock.patch.object(os, "stat", side_effect=dropped):
+            with self.assertRaises(OSError):
+                InformixLakeflowConnect._latest_progress_file("/Volumes/x")
+        scope = f"{uuid.UUID(int=1)}_@_{uuid.UUID(int=3)}"
+        connector.set_registration_scope(scope)
+        pointer = {
+            "version": informix_module._SCAN_PROGRESS_VERSION,
+            "table": table.native_identity,
+            "scope": f"{uuid.UUID(int=1)}_@_{uuid.UUID(int=2)}",
+            "schema_id": "s",
+            "boundary": 90,
+        }
+        connector.set_update_request("continue")
+        with (
+            mock.patch.object(connector, "_read_progress_file", return_value=pointer),
+            mock.patch.object(connector, "_scan_progress_directory", side_effect=dropped),
+            mock.patch.object(connector, "_discard_scan_progress") as discard,
+        ):
+            with self.assertRaises(OSError):
+                connector._adopted_scan_scope(table, scope)
+        discard.assert_not_called()
 
     def test_an_index_scan_that_cannot_record_its_progress_still_completes(self):
         bridge = _KeylessIndexBridge()
@@ -4068,7 +4144,7 @@ class LakeflowContractTests(unittest.TestCase):
                 with open(os.path.join(directory, f"{number:08d}.json"), "w", encoding="utf-8"):
                     pass
             with mock.patch.object(os, "listdir", side_effect=AssertionError("listed")):
-                with mock.patch.object(os.path, "exists", wraps=os.path.exists) as probes:
+                with mock.patch.object(os, "stat", wraps=os.stat) as probes:
                     self.assertEqual(os.path.basename(latest(directory)), f"{count - 1:08d}.json")
             self.assertLessEqual(probes.call_count, 2 * count.bit_length() + 2)
 
@@ -4867,6 +4943,11 @@ class LakeflowContractTests(unittest.TestCase):
             informix_module._ensure_materializable(keyed, {"snapshot.scan": "keyset(id)"})
         informix_module._ensure_materializable(keyed, {"snapshot.scan": "keyset"})
         informix_module._ensure_materializable(table, {"snapshot.scan": "keyset(id)"})
+        # Set on the connection, it is refused the same way; a table's own value wins.
+        on_connection = self.connector(FakeBridge(), **{"snapshot.scan": "keyset(id)"})
+        with self.assertRaisesRegex(InformixError, "has a key and pages by that"):
+            on_connection.read_table_metadata("app.orders", {})
+        on_connection.read_table_metadata("app.orders", {"snapshot.scan": "keyset"})
 
     def test_a_keyless_snapshot_pages_by_the_columns_the_option_names(self):
         raw = _table(primary_keys=())
@@ -17117,10 +17198,10 @@ class LakeflowContractTests(unittest.TestCase):
         A delete-flow replay after a driver restart must NOT consult the shared trigger
         boundary. That boundary is published per update scope by the upsert (owner)
         reader; a replay planned in a fresh scope finds none for the replayed generation,
-        so _shared_trigger_boundary(owner=False) raises TriggerBoundaryUnavailable --
-        fatal inside get_partitions (planPartitions has no latestOffset retry). The
-        replay is bounded by its own committed end LSN, so it must complete without the
-        live handshake. Patch the boundary to raise and assert the replay never calls it.
+        and setting one would bound the replay by this update's boundary instead of the
+        end Spark logged. The replay is bounded by its own committed end LSN, so it must
+        complete without the live handshake. Patch the boundary to fail and assert the
+        replay never calls it.
         """
 
         connector = self.connector(FakeBridge())
@@ -17132,7 +17213,7 @@ class LakeflowContractTests(unittest.TestCase):
         with mock.patch.object(
             connector,
             "_shared_trigger_boundary",
-            side_effect=TriggerBoundaryUnavailable("boundary not published in this scope"),
+            side_effect=AssertionError("a replay never consults the trigger boundary"),
         ) as boundary:
             rows, _ = connector.read_table_deletes("app.orders", checkpoint, options)
             self.assertEqual(list(rows), [])
@@ -18321,7 +18402,7 @@ class LakeflowContractTests(unittest.TestCase):
         connector = self.connector(bridge)
         _, checkpoint = connector.read_table("app.orders", {}, {})
         table = Table.parse(_table(), "demo")
-        first = connector._shared_trigger_boundary(table, checkpoint, owner=True)
+        first = connector._shared_trigger_boundary(table, checkpoint)
 
         bridge.now = first[0] + 10
         next_checkpoint = {
@@ -18332,19 +18413,20 @@ class LakeflowContractTests(unittest.TestCase):
             "trigger_generation": first[1],
             "trigger_high_water": str(first[0]),
         }
-        second = connector._shared_trigger_boundary(table, next_checkpoint, owner=True)
+        second = connector._shared_trigger_boundary(table, next_checkpoint)
 
         self.assertEqual(second, first)
 
-    def test_trigger_cache_rejects_checkpoint_past_frozen_boundary(self):
+    def test_a_reader_past_the_trigger_boundary_is_bounded_by_its_own_position(self):
+        # The delete reader set the boundary at 100 before the upsert reader took its
+        # snapshot at 101: the upsert reader has nothing to read up to the boundary, and
+        # reads on from 101 in the next update. From the cache and from the record alike.
         connector = self.connector(FakeBridge())
         _, checkpoint = connector.read_table("app.orders", {}, {})
         table = Table.parse(_table(), "demo")
-        connector._trigger_boundaries[table.identity] = (
-            100,
-            "a" * 32,
-            checkpoint["pipeline_scope"],
-        )
+        first = self.connector(FakeBridge())
+        first._bridge.now = 100
+        _, generation = first._shared_trigger_boundary(table, checkpoint)
         checkpoint = {
             **checkpoint,
             "begin_lsn": "101",
@@ -18352,8 +18434,11 @@ class LakeflowContractTests(unittest.TestCase):
             "commit_lsn": "101",
         }
 
-        with self.assertRaisesRegex(InformixError, "Cached trigger boundary"):
-            connector._shared_trigger_boundary(table, checkpoint, owner=True)
+        for _ in ("record", "cache"):
+            self.assertEqual(
+                connector._shared_trigger_boundary(table, checkpoint),
+                (101, generation),
+            )
 
     def test_trigger_boundary_survives_schema_transition_within_update(self):
         bridge = FakeBridge()
@@ -18361,11 +18446,11 @@ class LakeflowContractTests(unittest.TestCase):
         owner = self.connector(bridge)
         _, checkpoint = owner.read_table("app.orders", {}, {})
         table = Table.parse(_table(), "demo")
-        boundary = owner._shared_trigger_boundary(table, checkpoint, owner=True)
+        boundary = owner._shared_trigger_boundary(table, checkpoint)
 
         transitioned = {**checkpoint, "schema_id": "f" * 32}
         delete_reader = self.connector(FakeBridge())
-        recovered = delete_reader._shared_trigger_boundary(table, transitioned, owner=False)
+        recovered = delete_reader._shared_trigger_boundary(table, transitioned)
 
         self.assertEqual(recovered, boundary)
 
@@ -18377,14 +18462,14 @@ class LakeflowContractTests(unittest.TestCase):
         connector.prepare_for_trigger_available_now()
         table = Table.parse(_table(), "demo")
 
-        first = connector._shared_trigger_boundary(table, checkpoint, owner=True)
+        first = connector._shared_trigger_boundary(table, checkpoint)
         bridge.now = 125
         advanced = {
             **checkpoint,
             "trigger_generation": first[1],
             "trigger_high_water": str(first[0]),
         }
-        second = connector._shared_trigger_boundary(table, advanced, owner=True)
+        second = connector._shared_trigger_boundary(table, advanced)
 
         self.assertEqual(second, first)
 
@@ -18447,7 +18532,7 @@ class LakeflowContractTests(unittest.TestCase):
         upsert.read_table("app.orders", upsert_checkpoint, {})
         delete = self.connector(FakeBridge())
         table = Table.parse(_table(), "demo")
-        recovered = delete._shared_trigger_boundary(table, delete_checkpoint, owner=False)
+        recovered = delete._shared_trigger_boundary(table, delete_checkpoint)
 
         self.assertEqual(recovered, upsert._trigger_boundaries[table.identity][:2])
 
@@ -18627,22 +18712,6 @@ class LakeflowContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(InformixError, "Invalid initial_lsn"):
             connector._publish_snapshot_boundary(table, schema_id, 90, 90, scope)
-
-    def test_delete_trigger_missing_boundary_yields_immediately(self):
-        connector = self.connector(FakeBridge())
-        table = Table.parse(_table(), "demo")
-        checkpoint = _stream_offset()
-        with (
-            mock.patch.object(
-                informix_module.os,
-                "scandir",
-                side_effect=AssertionError("trigger history must not be scanned"),
-            ),
-            mock.patch.object(informix_module.time, "sleep") as sleep,
-            self.assertRaisesRegex(TriggerBoundaryUnavailable, "has not published"),
-        ):
-            connector._shared_trigger_boundary(table, checkpoint, owner=False)
-        sleep.assert_not_called()
 
     def test_delete_schema_transition_yields_without_holding_a_slot(self):
         """A delete reader must not sleep on a held slot waiting for the upsert reader.
@@ -18992,22 +19061,106 @@ class LakeflowContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(InformixError, "Schema history .* is missing"):
                     connector._schema_transition(table, checkpoint["schema_id"], 100, owner=True)
 
-    def test_delete_trigger_missing_boundary_advances_retry_checkpoint(self):
-        connector = self.connector(FakeBridge())
-        connector.prepare_for_trigger_available_now()
-        checkpoint = _stream_offset()
+    def _floor_updates(self, bridge):
+        # Readers of one pipeline's updates by number, each update a "continue" one unless
+        # said otherwise.
+        pipeline = uuid.UUID(int=21)
 
-        with mock.patch.object(informix_module.time, "sleep"):
-            rows, first = connector.read_table_deletes("app.orders", checkpoint, {})
-            rows_again, second = connector.read_table_deletes("app.orders", first, {})
+        def reader(update, request="continue"):
+            connector = self.connector(bridge)
+            connector.set_registration_scope(f"{pipeline}_@_{uuid.UUID(int=update)}")
+            connector.set_update_request(request)
+            return connector
+
+        return reader
+
+    def test_a_delete_reader_with_no_checkpoint_starts_at_the_snapshot_floor(self):
+        # A triggered update ran the delete flow before its upsert flow: with no start of
+        # this update to wait for, it gave up, with no checkpoint, in every update. It
+        # starts at the floor of the pipeline's snapshot instead, and so gets the delete
+        # made since, also when its upsert flow has yet to read in this update.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        _, snapshot = reader(2, "full_refresh").read_table("app.orders", {}, {})
+        self.assertEqual(snapshot["phase"], "stream")
+        bridge.now = 120
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 101},
+            {"op": "DELETE", "tx_id": 7, "lsn": 102, "row": {"id": 1, "value": "a"}},
+            {"op": "COMMIT", "tx_id": 7, "lsn": 103},
+        ]
+        later = reader(3)
+        later.prepare_for_trigger_available_now()
+
+        rows, seeded = later.read_table_deletes("app.orders", {}, {})
+        self.assertEqual(list(rows), [])
+        self.assertEqual(seeded["commit_lsn"], snapshot["commit_lsn"])
+        self.assertEqual(seeded["floor_seed"], snapshot["pipeline_scope"])
+        rows, end = later.read_table_deletes("app.orders", seeded, {})
+        self.assertEqual([(row["id"], row["_informix_op"]) for row in rows], [(1, "d")])
+        self.assertEqual(end["floor_seed"], snapshot["pipeline_scope"])
+
+        # The upsert reader's start in this update leaves the floor as it was: confirmed.
+        later.read_table("app.orders", snapshot, {})
+        rows, confirmed = later.read_table_deletes("app.orders", end, {})
+        self.assertEqual(list(rows), [])
+        self.assertNotIn("floor_seed", confirmed)
+        self.assertEqual(confirmed["commit_lsn"], end["commit_lsn"])
+
+    def test_a_delete_reader_waits_for_the_snapshot_of_a_full_refresh(self):
+        # The floor is the last snapshot's, and this update takes another: wait for it. An
+        # update the pipelines API can't say the purpose of starts at the floor.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        reader(2, "full_refresh").read_table("app.orders", {}, {})
+
+        _, waiting = reader(3, "full_refresh").read_table_deletes("app.orders", {}, {})
+        self.assertNotIn("commit_lsn", waiting)
+        _, seeded = reader(4, None).read_table_deletes("app.orders", {}, {})
+        self.assertEqual(seeded["commit_lsn"], "90")
+
+    def test_a_delete_reader_seeded_at_a_replaced_floor_starts_again_at_the_new_one(self):
+        # A full refresh emptied the target and ended before this table's flows ran. The
+        # next update's delete flow, first again, starts at the old snapshot's floor; the
+        # upsert flow then snapshots anew. The delete reader starts again at that floor:
+        # its position was the old snapshot's, on a rebuilt source in another log.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        _, old = reader(2, "full_refresh").read_table("app.orders", {}, {})
+        later = reader(4)
+        _, seeded = later.read_table_deletes("app.orders", {}, {})
+        self.assertEqual(seeded["floor_seed"], old["pipeline_scope"])
+
+        bridge.now = 70  # the rebuilt source's log is behind the old floor
+        _, new = later.read_table("app.orders", {}, {})
+        self.assertEqual(new["commit_lsn"], "70")
+        rows, again = later.read_table_deletes("app.orders", seeded, {})
 
         self.assertEqual(list(rows), [])
-        self.assertEqual(list(rows_again), [])
-        self.assertEqual(first["trigger_boundary_retry_count"], 1)
-        self.assertEqual(second["trigger_boundary_retry_count"], 2)
+        self.assertEqual(again["commit_lsn"], "70")
+        self.assertNotIn("floor_seed", again)
+
+    def test_a_triggered_delete_reader_sets_the_boundary_its_upsert_reader_then_shares(self):
+        # A delete flow started ahead of its upsert flow does not wait for it, in a flow
+        # slot that one may need: it sets the update's boundary itself and reads up to it.
+        bridge = FakeBridge()
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+        delete = self.connector(bridge)
+        delete.prepare_for_trigger_available_now()
+        checkpoint = _stream_offset()
+
+        rows, end = delete.read_table_deletes("app.orders", checkpoint, {})
+
+        self.assertEqual(list(rows), [])
+        self.assertNotIn("trigger_boundary_retry_count", end)
+        self.assertEqual(end["trigger_high_water"], "120")
+        bridge.now = 130
+        upsert = self.connector(bridge)
+        table = Table.parse(_table(), "demo")
         self.assertEqual(
-            {key: value for key, value in second.items() if key != "trigger_boundary_retry_count"},
-            checkpoint,
+            upsert._shared_trigger_boundary(table, checkpoint),
+            (120, end["trigger_generation"]),
         )
 
     def test_delete_trigger_retry_counter_clears_after_owner_publishes(self):
@@ -19019,7 +19172,7 @@ class LakeflowContractTests(unittest.TestCase):
         checkpoint = _stream_offset()
         table = Table.parse(_table(), "demo")
 
-        owner._shared_trigger_boundary(table, checkpoint, owner=True)
+        owner._shared_trigger_boundary(table, checkpoint)
         rows, end = delete.read_table_deletes(
             "app.orders",
             {**checkpoint, "trigger_boundary_retry_count": 4},
@@ -19102,7 +19255,7 @@ class LakeflowContractTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(InformixError, "trigger generation"):
-            connector._shared_trigger_boundary(table, checkpoint, owner=True)
+            connector._shared_trigger_boundary(table, checkpoint)
         self.assertNotIn(table.identity, connector._trigger_boundaries)
 
     def test_trigger_winner_rejects_wrong_scope_and_invalid_lsn(self):
@@ -19130,7 +19283,7 @@ class LakeflowContractTests(unittest.TestCase):
                 )
 
                 with self.assertRaisesRegex(InformixError, message):
-                    connector._shared_trigger_boundary(table, checkpoint, owner=True)
+                    connector._shared_trigger_boundary(table, checkpoint)
 
 
 class IncrementalSnapshotTests(unittest.TestCase):
@@ -19754,6 +19907,42 @@ class IncrementalSnapshotTests(unittest.TestCase):
 
         self.assertEqual(delivered, list(range(81, 90)) + [90, 100])
         self.assertNotIn("incremental", reached)
+
+    def test_a_mid_copy_replay_in_a_later_update_keeps_its_batchs_bound(self):
+        # Rows from the cursor Spark logged up were deleted before a later update replayed
+        # the batch. Its bound captured again fell below that cursor and ended the copy
+        # short of it, failing the replay on every restart; it keeps the batch's bound.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": index * 10, "value": str(index)} for index in range(1, 11)]
+        options = {"snapshot.mode": "incremental", "snapshot.page.size": "4"}
+        pipeline = "11111111-1111-1111-1111-111111111111"
+
+        def reader(update):
+            connector = self.connector(bridge, **{"snapshot.page.size": "4"})
+            connector.set_registration_scope(f"{pipeline}_@_{update}")
+            return connector
+
+        first_update = reader("22222222-2222-2222-2222-222222222222")
+        _, first = first_update.read_table("app.orders", {}, dict(options))
+        _, second = first_update.read_table("app.orders", first, dict(options))
+        self.assertEqual(second["incremental"]["last_pk"], [80])
+        bridge.rows = [row for row in bridge.rows if row["id"] < 80]
+        later = reader("33333333-3333-3333-3333-333333333333")
+        replay_options = dict(options)
+
+        replayed = list(
+            informix_module._replay_between_offsets(
+                first,
+                second,
+                lambda offset: later.read_table("app.orders", offset, replay_options),
+                replay_options,
+                later.options,
+            )
+        )
+
+        self.assertEqual(
+            sorted(row["id"] for row in replayed if row["_informix_op"] == "r"), [50, 60, 70]
+        )
 
     def test_first_incremental_range_replay_uses_the_end_cursor(self):
         bridge = FakeBridge()
@@ -20591,6 +20780,36 @@ class ConnectionSlotLeaseLossTests(unittest.TestCase):
                 bridge._heartbeat_connection_slot(object(), stop, lambda: reported.append(True))
 
         self.assertEqual(reported, [True])
+
+    def test_heartbeat_gives_the_lease_up_before_postgres_frees_it(self):
+        # Postgres frees the slot a lease after its last renewal. Renewals failing from
+        # then on: the lease is given up while the next renewal would still be in time,
+        # not a lease after the first failure, by when another reader may hold the slot.
+        # A reconnect waits no longer than the lease has left.
+        bridge = self._bridge()
+        reported, timeouts, clock = [], [], [0.0]
+        stop = threading.Event()
+        state = mock.Mock()
+
+        def connect(timeout=None):
+            timeouts.append(timeout)
+            raise OSError("Lakebase unreachable")
+
+        state.connect.side_effect = connect
+        bridge._lakebase = lambda: state
+
+        def wait(_seconds):
+            clock[0] += informix_module._CONNECTION_SLOT_HEARTBEAT_SECONDS
+            return False
+
+        stop.wait = wait
+        with mock.patch.object(informix_module.time, "monotonic", lambda: clock[0]):
+            bridge._heartbeat_connection_slot(object(), stop, lambda: reported.append(clock[0]))
+
+        lease = informix_module._CONNECTION_SLOT_LEASE_SECONDS
+        heartbeat = informix_module._CONNECTION_SLOT_HEARTBEAT_SECONDS
+        self.assertEqual(reported, [lease - heartbeat])
+        self.assertEqual(timeouts, [lease - heartbeat * n for n in range(1, len(timeouts) + 1)])
 
     def test_releasing_a_slot_stops_its_heartbeat_thread(self):
         # The regression: release freed the slot but left the heartbeat running.
@@ -24202,6 +24421,29 @@ class NullableIndexPromotionTests(unittest.TestCase):
         self.assertEqual(refreshed.primary_keys, ("code",))
         self.assertTrue(refreshed.key_from_nullable_index)
 
+    def test_refresh_sees_the_promoted_index_dropped(self):
+        # The index the key was promoted from is gone: the refresh reads the table as
+        # key-less, so the change is seen as the key drift it is.
+        connector = object.__new__(InformixLakeflowConnect)
+        connector._tables = None
+        bridge = self._catalog_bridge()
+        connector._bridge_instance = bridge
+        table = informix_module.Table.parse(bridge._describe_table("app", "orders"), "demo")
+        promoted = connector._apply_nullable_index_promotion(
+            table, {"allow.nullable.index": "true"}
+        )
+        execute = bridge.transport.execute
+
+        def without_unique_index(sql, parameters=(), max_result_bytes=None):
+            return [] if "idxtype='U'" in sql else execute(sql, parameters, max_result_bytes)
+
+        bridge.transport.execute = without_unique_index
+
+        refreshed = connector._refresh_table_schema(promoted, None)
+
+        self.assertEqual(refreshed.primary_keys, ())
+        self.assertFalse(refreshed.key_from_nullable_index)
+
     def test_refresh_keeps_an_override_over_a_promoted_key_from_the_table(self):
         # primary.keys applied over a promoted nullable index: the key is not the option's
         # alone, so the snapshot pages by it. The catalog's re-read has no key, and the
@@ -25317,6 +25559,64 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
             self.assertEqual(
                 row[informix_module.COMMIT_TIME],
                 informix_module._commit_time_value(1_700_000_000),
+            )
+
+    def test_a_replayed_first_batch_of_a_file_snapshot_keeps_its_boundary(self):
+        # The simple reader replays a file snapshot's first batch in a later update. With a
+        # self-pinned boundary, that update pinned a newer one: the rows were stamped with
+        # it, past the changes Spark goes on from, and the delete floor moved up. It serves
+        # the extract again at the boundary the logged end names, checked against its pin.
+        source = self._source("1|alpha|\n2|beta|\n")
+        options = {"snapshot.source": source}
+        bridge = FakeBridge()
+        pipeline = "11111111-1111-1111-1111-111111111111"
+
+        def reader(update):
+            connector = self.connector(bridge)
+            connector.set_registration_scope(f"{pipeline}_@_{update}")
+            return connector
+
+        _, end = reader("22222222-2222-2222-2222-222222222222").read_table(
+            "app.orders", {}, dict(options)
+        )
+        self.assertEqual(end["commit_lsn"], "90")
+        bridge.now = 120
+        later = reader("33333333-3333-3333-3333-333333333333")
+        replay_options = dict(options)
+
+        replayed = list(
+            informix_module._replay_between_offsets(
+                {},
+                end,
+                lambda offset: later.read_table("app.orders", offset, replay_options),
+                replay_options,
+                later.options,
+            )
+        )
+
+        self.assertEqual([row["id"] for row in replayed], [1, 2])
+        self.assertEqual(
+            {row[informix_module.CURSOR] for row in replayed},
+            {informix_module._sortable_lsn(90)},
+        )
+        table = Table.parse(_table(), "demo")
+        floor = later._read_immutable_head(
+            later._immutable_namespace(table, "delete-floor", pipeline)
+        )
+        self.assertEqual(floor["start_lsn"], "90")
+        self.assertNotIn(informix_module._REPLAY_INITIAL_END_OPTION, replay_options)
+        # The extract changed since its pin: the replay fails closed.
+        with open(os.path.join(source, "part-000.unl"), "a") as handle:
+            handle.write("3|gamma|\n")
+        with self.assertRaises(InformixError):
+            list(
+                informix_module._replay_between_offsets(
+                    {},
+                    end,
+                    lambda offset: later.read_table("app.orders", offset, replay_options),
+                    replay_options,
+                    later.options,
+                )
             )
 
     def test_unl_row_commit_time_null_without_manifest_boundary_time(self):
@@ -27594,10 +27894,18 @@ class SchemaEvolutionTests(_TableOptionTestCase):
             ),
         ):
             with self.subTest(name):
-                with self.assertRaisesRegex(
-                    InformixError, "Key column\\(s\\) k .* no longer exist"
-                ):
-                    informix_module._carry_table_options(fresh, previous)
+                if previous.key_override:
+                    with self.assertRaisesRegex(
+                        InformixError, "Key column\\(s\\) k .* no longer exist"
+                    ):
+                        informix_module._carry_table_options(fresh, previous)
+                else:
+                    # The index went with its column: the table reads as key-less again,
+                    # a key change the stream refuses.
+                    keyless = informix_module._carry_table_options(fresh, previous)
+                    self.assertEqual(keyless.primary_keys, ())
+                    with self.assertRaisesRegex(InformixError, "primary keys; run a full refresh"):
+                        informix_module._ensure_compatible_schema_change(previous, keyless)
                 carried = dataclasses.replace(fresh, primary_keys=("k",), key_override=True)
                 with self.assertRaisesRegex(InformixError, "dropped key column k"):
                     informix_module._ensure_compatible_schema_change(previous, carried)

@@ -9,7 +9,7 @@ from databricks.labs.community_connector.sources.informix.informix import (
     _driver_registration,
     _install_registration,
     _m,
-    _replay_between_offsets,
+    _replay_reader_range,
 )
 
 
@@ -52,10 +52,9 @@ class InformixStreamReader(LakeflowStreamReader):
     def readBetweenOffsets(self, start: dict, end: dict):
         # The framework's replay is an unbounded read whose end is thrown away, while
         # Spark commits its own: a fresh read that stops sooner would drop what lies
-        # between.
-        return _replay_between_offsets(
-            start, end, self.read, self.options, getattr(self.lakeflow_connect, "options", {})
-        )
+        # between. A staged snapshot's first batch is served from its stage, as in the
+        # merged file (_replay_reader_range).
+        return _replay_reader_range(self, start, end)
 
 
 class InformixPartitionedStreamReader(LakeflowPartitionedStreamReader):
