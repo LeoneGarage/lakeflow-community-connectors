@@ -40,12 +40,13 @@ MARKER = "informix.orders_test.stream"
 PIPELINE = spark.conf.get("spark.pipelines.pipelineId", None) or spark.conf.get("pipelines.id", "")
 STREAM = f"{PIPELINE}:{BRONZE}"
 
-# The counts per distinct row of orders_silver.sql, each row repeated once per copy. A
-# count that fails one of the view's expectations fails the batch. Keep the two in step:
-# an operation or a column added to one belongs in the other. orders_compare_test_tool.py
+# The counts per distinct row of orders_silver.sql, each row repeated once per copy: every
+# source column, every column the connector adds left out (see the view). A count that
+# fails one of the view's expectations fails the batch. Keep the two in step: an operation
+# or a connector column added to one belongs in the other. orders_compare_test_tool.py
 # compares both tables with the source, so a difference between them shows there.
 REBUILD = """
-SELECT inline(array_repeat(struct(order_id, sku, qty, price, note, updated_at), CAST(CASE
+SELECT inline(array_repeat(struct(* EXCEPT (copies, other_changes)), CAST(CASE
     WHEN other_changes <> 0 THEN raise_error(concat(
       'order_items_delta: an operation other than r, c, u or d for order ',
       CAST(order_id AS STRING)))
@@ -54,13 +55,15 @@ SELECT inline(array_repeat(struct(order_id, sku, qty, price, note, updated_at), 
       CAST(order_id AS STRING)))
     ELSE copies END AS INT)))
 FROM (
-  SELECT order_id, sku, qty, price, note, updated_at,
+  SELECT
+    * EXCEPT (_informix_op, _informix_change_lsn, _informix_commit_lsn, _informix_tx_id,
+              _informix_commit_time),
     sum(CASE WHEN _informix_op IN ('r', 'c', 'u') THEN 1
              WHEN _informix_op = 'd' THEN -1 ELSE 0 END) AS copies,
     sum(CASE WHEN _informix_op IN ('r', 'c', 'u', 'd') THEN 0 ELSE 1 END) AS other_changes
   FROM {bronze}
   WHERE {where}
-  GROUP BY order_id, sku, qty, price, note, updated_at)
+  GROUP BY ALL)
 """
 
 
@@ -86,6 +89,14 @@ def marked(session):
     return any(row.key == MARKER and row.value == STREAM for row in properties)
 
 
+def same_columns(session):
+    # Whether the table has the columns a rebuild writes. After a column is added to the
+    # source, and so to bronze, it has not: rewriting a few orders can't fill the column
+    # for the rest, so the table is written whole again, as the views are computed again.
+    rebuilt = session.sql(REBUILD.format(bronze=BRONZE, where="false")).columns
+    return session.table(TARGET).columns == rebuilt
+
+
 def holds_rows(session, table):
     # Whether the table has a row; None when it cannot be read (it is not there yet).
     try:
@@ -103,7 +114,7 @@ def write_all(session):
 @dp.foreach_batch_sink(name="order_items_delta_sink")
 def order_items_delta_sink(df, batch_id):
     session = df.sparkSession
-    if batch_id == 0 or not marked(session):
+    if batch_id == 0 or not marked(session) or not same_columns(session):
         write_all(session)
         return
     limit = ORDERS_PER_WRITE * WRITES_PER_BATCH
