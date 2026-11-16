@@ -458,5 +458,7 @@
 "Could not read the locale of the database from sysmaster ({}); its text is decoded in the codeset of DB_LOCALE without that check",
 "'{}' or '{}' changed for '{}'; run a full refresh so every row lands as the new type",
 "Option 'decimal.variable.column.type' names {}, which is not a variable-scale DECIMAL column '{}' has or selects",
-"Option 'decimal.variable.column.type' names column {} more than once"
+"Option 'decimal.variable.column.type' names column {} more than once",
+"Option 'state.gc.interval.hours' ({}) must be shorter than 'state.gc.retention.days' ({} days): a sweep could then remove a live table's state",
+"The snapshot of {} pages by its key and reached a NULL in key column {}; paging by key can't go past it: set snapshot.scan: cursor for this table"
 ]

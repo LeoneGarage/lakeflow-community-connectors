@@ -287,6 +287,7 @@ def source_export_command(args: argparse.Namespace, run_id: str) -> str:
         "i.part15,i.part16 FROM systables t,sysconstraints c,sysindexes i "
         "WHERE c.tabid=t.tabid AND c.constrtype='P' AND i.tabid=t.tabid "
         f"AND i.idxname=c.idxname AND t.tabname IN ({table_literals}) "
+        f"AND t.owner='{source_owner}' "
         "ORDER BY t.tabname;"
     )
     # The parts above are column numbers: their names, to key the compare by.
@@ -294,6 +295,7 @@ def source_export_command(args: argparse.Namespace, run_id: str) -> str:
         f"UNLOAD TO '{remote}/key_columns.unl' DELIMITER '|' "
         "SELECT t.tabname,c.colno,c.colname FROM systables t,syscolumns c "
         f"WHERE c.tabid=t.tabid AND t.tabname IN ({table_literals}) "
+        f"AND t.owner='{source_owner}' "
         "ORDER BY t.tabname,c.colno;"
     )
     sql = "\n".join(sql_statements) + "\n"

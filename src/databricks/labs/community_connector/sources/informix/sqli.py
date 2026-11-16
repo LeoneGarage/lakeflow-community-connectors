@@ -1386,10 +1386,11 @@ class InformixSqliClient:
             raise
         self.state = ConnectionState.SOCKET_OPEN
         properties = {
-            "CLIENT_LOCALE": self.client_locale,
+            # The defaults the codecs take (informix_locale_encoding) for a locale left None.
+            "CLIENT_LOCALE": self.client_locale or "en_US.utf8",
             "CLNT_PAM_CAPABLE": "1",
             "DBPATH": ".",
-            "DB_LOCALE": self.db_locale,
+            "DB_LOCALE": self.db_locale or "en_US.819",
             # Honor double-quoted delimited identifiers so table/owner names with
             # characters that are not valid undelimited (e.g. "+") can be escaped.
             # Safe here because the connector's SQL uses single-quoted string

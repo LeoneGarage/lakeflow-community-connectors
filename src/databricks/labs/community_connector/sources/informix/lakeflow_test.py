@@ -6353,6 +6353,52 @@ class LakeflowContractTests(unittest.TestCase):
             connector._read_incremental(table, start, {})
         self.assertEqual(seen, [{"id": "expr(id)"}])
 
+    def test_options_that_do_not_parse_are_named(self):
+        for option, value, message in (
+            ("connection.startup.jitter.seconds", "inf", "must be a number >= 0"),
+            ("connection.startup.jitter.seconds", "nan", "must be a number >= 0"),
+            ("port", "nine", "'port' must be a whole number"),
+            (
+                "authentication.login.timeout",
+                "soon",
+                "'authentication.login.timeout' must be a number",
+            ),
+            ("daemon.connection.reservation", "x", "'daemon.connection.reservation' must be"),
+            ("state.gc.interval.hours", "48", "must be shorter than 'state.gc.retention.days'"),
+        ):
+            extra = {"state.gc.retention.days": "2"} if option.startswith("state.gc") else {}
+            with (
+                self.subTest(option=option, value=value),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                self.connector(FakeBridge(), **{option: value, **extra})
+
+    def test_a_table_named_on_the_connection_is_refused(self):
+        # qualified_source_table on the connection reached the reads, which read that table,
+        # while the metadata read the pipeline's source_table.
+        connector, _ = self._keyless_connector(**{"qualified_source_table": "app.other"})
+        with self.assertRaisesRegex(ValueError, "'qualified_source_table' is a table option"):
+            connector.read_table_metadata("app.orders", {})
+
+    def test_a_session_the_server_refused_does_not_send_a_flow_to_the_simple_reader(self):
+        connector = self._partitioned_connector()
+        real = connector._registration_table
+        calls = []
+
+        from databricks.labs.community_connector.sources.informix.sqli import (
+            SqliSessionRejected,
+        )
+
+        def refused_once(name, options):
+            calls.append(name)
+            if len(calls) == 1:
+                raise SqliSessionRejected("-25571")
+            return real(name, options)
+
+        connector._registration_table = refused_once
+        with mock.patch.object(informix_module.time, "sleep"):
+            self.assertTrue(connector.is_partitioned("app.orders"))
+
     def test_a_new_registration_scope_drops_the_staging_client(self):
         # Its token was minted for the update the earlier scope names, which the new
         # update revokes.
@@ -6981,31 +7027,41 @@ class LakeflowContractTests(unittest.TestCase):
         )
         self.assertEqual(bridge.transport.parameters, (100, 100, 100, 34))
 
-    def test_snapshot_page_seek_bound_omitted_for_null_leading_cursor(self):
-        # A NULL leading cursor value (possible under allow.nullable.index) must
-        # NOT emit `k1 >= NULL` -- it is UNKNOWN for every row and would return an
-        # empty page, silently dropping the rest of the table. The OR-form, which
-        # already excludes NULL leading values, is kept as-is.
+    def test_snapshot_page_refuses_to_page_past_a_null_key_value(self):
+        # A NULL cursor value (allow.nullable.index, primary.keys) went into "id > ?" and
+        # failed inside the SQL binder with a TypeError ("= NULL" matches no row anyway).
+        # Paging by key can't go past it: the error says what to set instead.
         class SnapshotTransport:
             def execute(self, sql, parameters=(), max_result_bytes=None):
-                del max_result_bytes
-                self.sql = sql
-                self.parameters = parameters
-                return []
+                raise AssertionError("no query is sent")
 
         bridge = object.__new__(PurePythonInformixBridge)
         bridge.options = {}
         bridge.transport = SnapshotTransport()
 
-        bridge.snapshot_page("demo.app.orders", ["id"], ["id"], [None], 20)
+        with self.assertRaisesRegex(InformixError, "key column id.*snapshot.scan: cursor"):
+            bridge.snapshot_page("demo.app.orders", ["id"], ["id"], [None], 20)
 
-        self.assertEqual(
-            bridge.transport.sql,
-            "SELECT {+FIRST_ROWS(20)} FIRST 20 id FROM demo:app.orders "
-            "WHERE ((id > ?)) ORDER BY id",
-        )
-        self.assertNotIn(">=", bridge.transport.sql)
-        self.assertEqual(bridge.transport.parameters, (None,))
+    def test_the_largest_key_steps_over_a_null_leading_value(self):
+        # Resolving the largest key column by column put a NULL first column into
+        # "k1 = ?", which the SQL binder refused.
+        seen = []
+
+        class Transport:
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                seen.append((sql, parameters))
+                return [{"k1": None}] if len(seen) == 1 else [{"k2": 5}]
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.transport = Transport()
+        with mock.patch.object(
+            bridge, "_repeatable_read_transaction", return_value=contextlib.nullcontext()
+        ):
+            found = bridge._max_key_stepwise("demo:app.orders", ["k1", "k2"], None, [])
+        self.assertEqual(found, [None, 5])
+        self.assertIn("k1 IS NULL", seen[1][0])
+        self.assertEqual(seen[1][1], ())
 
     def test_snapshot_page_seek_bound_omitted_for_chunked_leading_key(self):
         # An order-preserving cast (chunk_exprs) leading key gets no seek bound:
@@ -23989,6 +24045,120 @@ class UnloadHelperTests(unittest.TestCase):
         # An empty escape disables escape processing: a backslash is literal data.
         self.assertEqual(parse("a\\|b", escape=""), ["a\\", "b"])
 
+    def test_a_variable_decimal_type_change_is_told_from_a_column_added(self):
+        def table_of(*names):
+            columns = [{"name": "id", "type_name": "INTEGER", "length": 4, "nullable": False}]
+            columns += [
+                {
+                    "name": n,
+                    "type_name": "DECIMAL",
+                    "length": 32,
+                    "precision": 32,
+                    "scale": 255,
+                    "nullable": True,
+                }
+                for n in names
+            ]
+            return Table.parse({**_table(), "columns": columns}, "demo")
+
+        apply = informix_module._apply_decimal_targets
+        changed = informix_module._decimal_types_changed
+        # Leaving the default is a change: recorded as no entries, not as unknown.
+        on_default = apply(table_of("v1"), {})
+        self.assertTrue(
+            changed(on_default, apply(table_of("v1"), {"decimal.variable.type": "string"}))
+        )
+        # A column added under the same options is none.
+        before = apply(table_of("v1"), {"decimal.variable.type": "string"})
+        after = apply(table_of("v1", "v2"), {"decimal.variable.type": "string"})
+        self.assertFalse(changed(before, after))
+        # Nor is one dropped, or an entry taken out with it.
+        self.assertFalse(changed(after, before))
+        # A schema recorded before the types were takes them up (the caller's None check).
+        self.assertIsNone(table_of("v1").decimal_targets)
+        # A shard refresh gives a column the table gained the table-wide type.
+        carried = informix_module._carry_table_options(table_of("v1", "v2"), before)
+        self.assertEqual(carried.decimal_targets, (("v1", "string"), ("v2", "string")))
+        self.assertEqual(
+            informix_module._schema_fingerprint(carried), informix_module._schema_fingerprint(after)
+        )
+
+    def test_an_nvl_fallback_is_judged_by_the_type_it_lands_as(self):
+        columns = [
+            {"name": "id", "type_name": "INTEGER", "length": 4, "nullable": False},
+            {"name": "name", "type_name": "VARCHAR", "length": 20, "nullable": True},
+            {"name": "qty", "type_name": "INTEGER", "length": 4, "nullable": True},
+        ]
+        table = Table.parse({**_table(), "columns": columns}, "demo")
+
+        def apply(transforms):
+            return informix_module._apply_column_transforms(
+                table,
+                informix_module._column_transforms({"transform_columns": transforms}),
+                None,
+            )
+
+        # LENGTH lands as an int: a fallback past 32 bits passed, then failed a batch.
+        with self.assertRaisesRegex(InformixError, "more than a INT column holds"):
+            apply('{"name": "NVL(LENGTH(name), 5000000000)"}')
+        # ROUND to the thousand lands as a BIGINT: a fallback past 32 bits fits.
+        apply('{"qty": "NVL(ROUND(qty, -3), 2147484000)"}')
+        with self.assertRaisesRegex(InformixError, "more than a INT column holds"):
+            apply('{"qty": "NVL(qty, 2147484000)"}')
+
+    def test_a_password_login_does_not_run_a_pam_provider_factory(self):
+        # The factory answers PAM challenges only: under a password login it was imported
+        # and run all the same, with every option.
+        options = {
+            "hostname": "h",
+            "user": "u",
+            "password": "p",
+            "server": "s",
+            "database": "demo",
+            "authentication.provider.factory": "nowhere:factory",
+        }
+        with (
+            mock.patch.object(informix_module, "_load_factory") as load,
+            self.assertLogs(informix_module.__name__, "WARNING"),
+        ):
+            PurePythonInformixBridge(options)
+        load.assert_not_called()
+        with mock.patch.object(informix_module, "_load_factory") as load:
+            PurePythonInformixBridge({**options, "authentication.mode": "pam"})
+        load.assert_called_once_with("nowhere:factory")
+
+    def test_key_text_is_ordered_as_informix_orders_it(self):
+        # Informix compares CHAR and VARCHAR as if blank-padded: "a\n" before "a", "a " the
+        # same as "a". Python's order put "a\n" after "a", and an incremental copy that
+        # took a key for past its bound ended there with rows uncopied.
+        order = informix_module._order_key
+        self.assertLess(order(("a\n",), ()), order(("a",), ()))
+        self.assertEqual(order(("a ", 1), ()), order(("a", 1), ()))
+        self.assertLess(order(("a ", 1), ()), order(("a", 2), ()))
+        self.assertGreater(order(("b",), ()), order(("a  ",), ()))
+        # Descending columns too, and the index scan's order.
+        self.assertGreater(order(("a\n",), (True,)), order(("a",), (True,)))
+        scan = informix_module._index_scan_order
+        self.assertLess(scan(("a\n",), (False,)), scan(("a",), (False,)))
+        self.assertEqual(informix_module._index_scan_plain(scan(("a ",), (True,))), ["a "])
+
+    def test_an_nchar_keyed_table_is_not_paged_in_python(self):
+        # NCHAR and NVARCHAR order by the locale's collation, which a Python comparison of
+        # the cursor and the bound can't follow: the copy is left to the blocking snapshot.
+        connector = object.__new__(InformixLakeflowConnect)
+        connector.options = {}
+        table = Table.parse(
+            {
+                **_table(primary_keys=("code",)),
+                "columns": [
+                    {"name": "code", "type_name": "NVARCHAR", "length": 10, "nullable": False},
+                    {"name": "value", "type_name": "VARCHAR", "length": 10, "nullable": True},
+                ],
+            },
+            "demo",
+        )
+        self.assertEqual(connector._incremental_datetime_chunk_exprs(table, {}), ({}, False))
+
     def test_the_reserved_names_include_informixs_own_words(self):
         for word in ("true", "sitename", "dbservername", "current_role", "rownum", "cross"):
             self.assertEqual(informix_module._sql_name(word), f'"{word}"')
@@ -24094,14 +24264,21 @@ class UnloadHelperTests(unittest.TestCase):
         ]
         table = Table.parse({**_table(), "columns": columns}, "demo")
         apply = informix_module._apply_decimal_targets
-        self.assertIsNone(apply(table, {}).decimal_targets)
+        # Every type the default: recorded as none, and fingerprinted as before tracking.
+        self.assertEqual(apply(table, {}).decimal_targets, ())
+        self.assertEqual(
+            informix_module._schema_fingerprint(apply(table, {})),
+            informix_module._schema_fingerprint(table),
+        )
         typed = apply(table, {"decimal.variable.type": "string"})
         self.assertEqual(typed.decimal_targets, (("amount", "string"),))
         self.assertNotEqual(
             informix_module._schema_fingerprint(typed), informix_module._schema_fingerprint(table)
         )
         # The default, written out, is no change.
-        self.assertIsNone(apply(table, {"decimal.variable.type": "decimal(38,18)"}).decimal_targets)
+        self.assertEqual(
+            apply(table, {"decimal.variable.type": "decimal(38,18)"}).decimal_targets, ()
+        )
         for raw, message in (
             ("amout:string", "names amout"),
             ("price:string", "names price"),

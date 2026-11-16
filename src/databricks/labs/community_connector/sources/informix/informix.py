@@ -1936,6 +1936,14 @@ class PurePythonInformixBridge:
         self._null_byte = _null_byte_mode(options)
         _refuse_code_loading_options(options)
         provider_path = options.get("authentication.provider.factory")
+        if provider_path and authentication != "pam":
+            # The factory answers PAM challenges only, which a password login never gets:
+            # it was imported and run anyway, with every option, secrets included.
+            logging.getLogger(__name__).warning(
+                "Option 'authentication.provider.factory' is ignored: it is for "
+                "authentication.mode pam"
+            )
+            provider_path = None
         provider = (
             _load_factory(provider_path)(options)
             if provider_path
@@ -3726,6 +3734,15 @@ class PurePythonInformixBridge:
         predicates = [f"({snapshot_filter})"] if snapshot_filter else []
         if after is not None:
             validate_snapshot_arity(after, primary_keys)
+            for key, value in zip(primary_keys, after):
+                if value is None:
+                    # A NULL key value (allow.nullable.index, primary.keys) went into a "= ?"
+                    # or "> ?" and failed inside the SQL binder; "= NULL" would match no
+                    # row anyway. Paging by key cannot go past one.
+                    # 461: The snapshot of {} pages by its key and reached a NULL in key
+                    # column {}; paging by key can't go past it: set snapshot.scan: cursor
+                    # for this table
+                    raise InformixError(_m(461, _join_identity(owner, name), key))
             bound_after = list(after)
             if any(isinstance(value, str) for value in after):
                 datetimes = self._datetime_qualifiers(owner, name)
@@ -4035,6 +4052,11 @@ class PurePythonInformixBridge:
                 predicates = [f"({snapshot_filter})"] if snapshot_filter else []
                 params: list[Any] = []
                 for previous in range(index):
+                    # A nullable key column (allow.nullable.index, primary.keys) can resolve
+                    # to NULL, which no "= ?" matches and the SQL binder refuses.
+                    if resolved[previous] is None:
+                        predicates.append(f"{_sql_name(primary_keys[previous])} IS NULL")
+                        continue
                     predicates.append(f"{_sql_name(primary_keys[previous])} = ?")
                     params.append(resolved[previous])
                 where = f" WHERE {' AND '.join(predicates)}" if predicates else ""
@@ -4774,11 +4796,57 @@ def _without_moved_rows(
 
 
 def _index_scan_order(key: Sequence[Any], descending: Sequence[bool]) -> tuple:
-    return tuple(_Descending(value) if down else value for value, down in zip(key, descending))
+    # Text blank-padded, as Informix orders it (see _PadSpace).
+    return tuple(
+        _Descending(_PadSpace(value) if isinstance(value, str) else value)
+        if down
+        else (_PadSpace(value) if isinstance(value, str) else value)
+        for value, down in zip(key, descending)
+    )
 
 
 def _index_scan_plain(order: Sequence[Any]) -> list:
-    return [value.value if isinstance(value, _Descending) else value for value in order]
+    def plain(value: Any) -> Any:
+        if isinstance(value, _Descending):
+            value = value.value
+        return value.text if isinstance(value, _PadSpace) else value
+
+    return [plain(value) for value in order]
+
+
+def _state_gc_settings(options: dict[str, str]) -> tuple[int, float]:
+    # Docstring: state.gc.retention.days and state.gc.interval.hours, checked.
+
+    try:
+        retention_days = int(
+            options.get("state.gc.retention.days", _DEFAULT_STATE_GC_RETENTION_DAYS)
+        )
+        interval_hours = float(
+            options.get("state.gc.interval.hours", _DEFAULT_STATE_GC_INTERVAL_HOURS)
+        )
+    except (TypeError, ValueError) as error:
+        # 320: Options 'state.gc.retention.days' and 'state.gc.interval.hours' must be numeric
+        raise ValueError(_m(320)) from error
+    if retention_days < 1 or not math.isfinite(interval_hours) or interval_hours <= 0:
+        # 321: Option 'state.gc.retention.days' must be >= 1 and 'state.gc.interval.hours' must
+        # be > 0
+        raise ValueError(_m(321))
+    if interval_hours >= retention_days * 24:
+        # 460: Option 'state.gc.interval.hours' ({}) must be shorter than
+        # 'state.gc.retention.days' ({} days): a sweep could then remove a live table's state
+        raise ValueError(_m(460, options.get("state.gc.interval.hours"), retention_days))
+    return retention_days, interval_hours
+
+
+def _parsed_option(options: dict[str, str], name: str, default: Any, kind: type = int) -> Any:
+    # Docstring: ``options[name]`` (or ``default``) as ``kind``, failing with the option's
+    # name rather than Python's "invalid literal for int()".
+
+    try:
+        return kind(options.get(name, default) if options.get(name) not in (None, "") else default)
+    except (TypeError, ValueError) as error:
+        noun = "a whole number" if kind is int else "a number"
+        raise ValueError(f"Option '{name}' must be {noun}") from error
 
 
 def _validate_nonneg_float_option(options: dict[str, str], name: str) -> None:
@@ -4787,7 +4855,9 @@ def _validate_nonneg_float_option(options: dict[str, str], name: str) -> None:
     if name not in options:
         return
     try:
-        if float(options[name]) < 0:
+        value = float(options[name])
+        # nan and inf passed "< 0" and failed later, inf as a sleep of nan.
+        if not math.isfinite(value) or value < 0:
             raise ValueError
     except (TypeError, ValueError) as error:
         # 64: Option '{}' must be a number >= 0
@@ -4896,6 +4966,9 @@ _ALLOW_NULLABLE_INDEX_OPTION = "allow.nullable.index"
 # The options the connector takes from a table's own options only, never from the
 # connection's (see InformixLakeflowConnect._refuse_connection_table_options).
 _TABLE_ONLY_OPTIONS = (
+    # Which table the configuration is for: on the connection, the reads read it while the
+    # metadata read the pipeline's source_table.
+    "qualified_source_table",
     "decimal.variable.type",
     "decimal.variable.column.type",
     "snapshot.filter",
@@ -4963,11 +5036,57 @@ def _order_key(values: Sequence[Any], descending: Sequence[bool]) -> tuple:
         else value
         for value in values
     ]
+    # Text in Informix's order: blank-padded (see _PadSpace).
+    values = [_PadSpace(value) if isinstance(value, str) else value for value in values]
     if not descending or not any(descending):
         return tuple(values)
     return tuple(
         _DescendingKey(value) if is_desc else value for value, is_desc in zip(values, descending)
     )
+
+
+class _PadSpace:
+    # Docstring: A key's text compared as Informix compares CHAR, VARCHAR and LVARCHAR: as
+    # if the shorter were padded with blanks.
+    #
+    # Python compares by prefix, so "a\n" came after "a", where Informix puts it first (a
+    # newline is below a blank), and "a " after "a", which Informix holds equal. An
+    # incremental copy that took a key for past its bound stopped there, and the rows
+    # after it were never copied. By code point, which is Informix's byte order in ISO
+    # 8859-1 and UTF-8 databases; NCHAR and NVARCHAR, which collate by locale, are not
+    # paged in Python at all (_incremental_datetime_chunk_exprs).
+
+    __slots__ = ("text",)
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def _compare(self, other: object) -> int:
+        other_text = other.text if isinstance(other, _PadSpace) else other
+        if not isinstance(other_text, str):
+            return NotImplemented  # type: ignore[return-value]
+        width = max(len(self.text), len(other_text))
+        mine, theirs = self.text.ljust(width), other_text.ljust(width)
+        return (mine > theirs) - (mine < theirs)
+
+    def __eq__(self, other: object) -> bool:
+        result = self._compare(other)
+        return result is not NotImplemented and result == 0
+
+    def __hash__(self) -> int:
+        return hash(self.text.rstrip(" "))
+
+    def __lt__(self, other: object) -> bool:
+        return self._compare(other) < 0
+
+    def __le__(self, other: object) -> bool:
+        return self._compare(other) <= 0
+
+    def __gt__(self, other: object) -> bool:
+        return self._compare(other) > 0
+
+    def __ge__(self, other: object) -> bool:
+        return self._compare(other) >= 0
 
 
 def _select_unique_index_key(
@@ -5728,33 +5847,40 @@ def _expression_kind(
         # A transform's fallback lands in the column's own type (see _fallback_value), so
         # an integer column, or an integer-result function, takes a whole number only.
         column = columns[_expression_column(operand)]
-        integral = column.type_name in _INTEGER_RANKS or any(
-            inner in _INTEGER_RESULT_FUNCTIONS for inner in _operand_functions(arguments[0])
+        # Judged by the type the inner expression lands as, which the fallback lands as
+        # too, not the column's: NVL(LENGTH(name), 5000000000) on a VARCHAR passed and
+        # then failed a batch as an int, and NVL(ROUND(int_col, -3), 2147484000), which
+        # lands as a BIGINT, was refused.
+        inner = _transform_spark_type(arguments[0], column, {})
+        integral = (
+            isinstance(inner, (IntegerType, LongType))
+            or column.type_name in _INTEGER_RANKS
+            or any(
+                function in _INTEGER_RESULT_FUNCTIONS
+                for function in _operand_functions(arguments[0])
+            )
         )
         fallback = literals[0][1]
         if integral and fallback != fallback.to_integral_value():
             # 104: Option '{}' gives {} the fallback {} for {}, which holds whole numbers only
             raise InformixError(_m(104, option, name, fallback, column.name))
-        # And one the column's type can hold. Left unchecked, the mistake showed only
-        # when a row with a NULL arrived, as a failed batch.
-        rank = _INTEGER_RANKS.get(column.type_name)
-        if rank is not None:
-            limit = Decimal((1 << (16, 32, 64)[rank - 1] - 1) - 1)
-        elif (
-            column.type_name.split("(", 1)[0].strip() in {"DECIMAL", "NUMERIC", "MONEY"}
-            and column.precision is not None
-            and column.scale is not None
-            and not _is_variable_scale_decimal(column)
-        ):
-            limit = Decimal(10) ** (column.precision - column.scale) - Decimal(1).scaleb(
-                -column.scale
-            )
+        # And one that type can hold. Left unchecked, the mistake showed only when a row
+        # with a NULL arrived, as a failed batch. A variable-scale DECIMAL's type is the
+        # decimal options' to say, so it is not checked here.
+        if isinstance(inner, IntegerType):
+            limit = Decimal((1 << 31) - 1)
+        elif isinstance(inner, LongType):
+            limit = Decimal((1 << 63) - 1)
+        elif isinstance(inner, DecimalType) and not _is_variable_scale_decimal(column):
+            limit = Decimal(10) ** (inner.precision - inner.scale) - Decimal(1).scaleb(-inner.scale)
         else:
             limit = None
         if limit is not None and abs(fallback) > limit:
             # 450: Option '{}' gives {} the fallback {} for {}, which is more than a {}
             # column holds
-            raise InformixError(_m(450, option, name, fallback, column.name, column.type_name))
+            raise InformixError(
+                _m(450, option, name, fallback, column.name, inner.simpleString().upper())
+            )
     _check_function_literals(name, [literal[1] for literal in literals], option)
     return kind if result == "same" else result
 
@@ -6998,9 +7124,13 @@ class Table:
     transform_key_id: str | None = None
     # The Spark types decimal.variable.type and decimal.variable.column.type give its
     # variable-scale DECIMAL columns, as sorted (column, type) pairs for those that differ
-    # from the default, or None; fingerprinted like the transforms, since rows already
-    # landed and staged pages hold values of the old type.
+    # from the default: () when every one is the default, None for a schema recorded
+    # before the types were. Fingerprinted when not empty, like the transforms, since rows
+    # already landed and staged pages hold values of the old type.
     decimal_targets: tuple[tuple[str, str], ...] | None = None
+    # decimal.variable.type itself when it is not the default, for a column the table gains
+    # later (_carry_table_options).
+    decimal_default: str | None = None
 
     @property
     def exposed_name(self) -> str:
@@ -7103,6 +7233,9 @@ class Table:
                 None
                 if raw.get("decimal_targets") is None
                 else tuple((str(name), str(target)) for name, target in raw["decimal_targets"])
+            ),
+            decimal_default=(
+                None if raw.get("decimal_default") is None else str(raw["decimal_default"])
             ),
         )
 
@@ -9214,17 +9347,21 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 raise ValueError("Option 'cdc.read.timeout.seconds' must be > 0")
         # Shared-reader thread count defaults to a quarter of the connection budget, so it is
         # validated here rather than in the static-default loop above.
-        if _SHARED_CDC_THREADS_OPTION in options and int(options[_SHARED_CDC_THREADS_OPTION]) < 1:
+        if (
+            _SHARED_CDC_THREADS_OPTION in options
+            and _parsed_option(options, _SHARED_CDC_THREADS_OPTION, 1) < 1
+        ):
             raise ValueError(f"Option '{_SHARED_CDC_THREADS_OPTION}' must be >= 1")
         if (
             _SNAPSHOT_READER_THREADS_OPTION in options
-            and int(options[_SNAPSHOT_READER_THREADS_OPTION]) < 1
+            and _parsed_option(options, _SNAPSHOT_READER_THREADS_OPTION, 1) < 1
         ):
             raise ValueError(f"Option '{_SNAPSHOT_READER_THREADS_OPTION}' must be >= 1")
         # Validate boolean capacity options eagerly (they are otherwise only
         # checked on first read, deep inside a running flow).
         _option_bool(options, "snapshot.incremental.blocking", True)
         _option_bool(options, "connection.backlog.hint.enabled", True)
+        _state_gc_settings(options)
         # Read when the first connection is made, deep inside a read: checked here instead.
         _option_bool(options, "encrypt", True)
         _option_bool(options, "redirect.enabled", False)
@@ -9289,30 +9426,27 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 str(_DEFAULT_MAX_CONCURRENT_CONNECTIONS),
             )
         )
-        daemon_reservation = int(
-            options.get(
-                _DAEMON_RESERVATION_OPTION,
-                str(_DEFAULT_DAEMON_CONNECTION_RESERVATION),
-            )
+        daemon_reservation = _parsed_option(
+            options, _DAEMON_RESERVATION_OPTION, _DEFAULT_DAEMON_CONNECTION_RESERVATION
         )
         # Reject rather than clamp: at slot_count a daemon could never claim a slot,
         # stranding the sharded CDC session and the snapshot drain permanently.
         if not 0 <= daemon_reservation < slot_count:
             # 17: Option '{}' must be >= 0 and < max.concurrent.connections ({})
             raise ValueError(_m(17, _DAEMON_RESERVATION_OPTION, slot_count))
-        port = int(options.get("port") or 9088)
+        port = _parsed_option(options, "port", 9088)
         if not 1 <= port <= 65535:
             # 164: Option 'port' must be between 1 and 65535
             raise ValueError(_m(164))
-        login_timeout = float(options.get("authentication.login.timeout", "30"))
+        login_timeout = _parsed_option(options, "authentication.login.timeout", 30.0, float)
         if not math.isfinite(login_timeout) or login_timeout <= 0:
             # 165: Option 'authentication.login.timeout' must be > 0
             raise ValueError(_m(165))
-        capacity_delay = float(
-            options.get(
-                "capacity.retry.max.delay.seconds",
-                str(_DEFAULT_CAPACITY_RETRY_MAX_DELAY_SECONDS),
-            )
+        capacity_delay = _parsed_option(
+            options,
+            "capacity.retry.max.delay.seconds",
+            _DEFAULT_CAPACITY_RETRY_MAX_DELAY_SECONDS,
+            float,
         )
         if not math.isfinite(capacity_delay) or capacity_delay < 0:
             # 166: Option 'capacity.retry.max.delay.seconds' must be >= 0
@@ -10072,12 +10206,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 with self._metadata_access():
                     table = self._registration_table(table_name, options)
                 return bool(_cdc_capable(table) or self._append_only_table(table, options))
-            except (SqliTransportError, OSError):
-                # A dropped connection, on a stream runner that starts cold: taken for a
-                # failed lookup, it left the flow on the simple reader for the whole update,
-                # and a file snapshot part-way through a serve then failed with 423, which
-                # asks for stream.partitioned=true. Retried as a snapshot read is; a source
-                # that stays down fails the flow, as its reads would.
+            except (SqliProtocolError, OSError):
+                # A dropped connection, or a session the server refused (-25571, its
+                # connections used up while a pipeline starts), on a stream runner that
+                # starts cold: taken for a failed lookup, it left the flow on the simple
+                # reader for the whole update, and a file snapshot part-way through a serve
+                # then failed with 423, which asks for stream.partitioned=true. Retried as a
+                # snapshot read is; a source that stays down fails the flow, as its reads
+                # would.
                 if attempt >= _SNAPSHOT_RECONNECT_MAX_RETRIES:
                     raise
                 reset = getattr(self._bridge, "reset_transport", None)
@@ -13418,13 +13554,18 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 column.type_name == "INTERVAL"
                 or column.type_name in _FLOAT_KEY_TYPES
                 or column.type_name in _BOOLEAN_KEY_TYPES
+                # Ordered by the locale's collation, which a Python comparison of the
+                # cursor and the bound can't follow: past the bound too early, the copy
+                # ended with rows left.
+                or column.type_name in {"NCHAR", "NVARCHAR"}
             )
             for column in table.columns
         ):
             # An INTERVAL key has no order-preserving string cast (a sign and an
             # unpadded leading field), a float key has no exact literal for the keyset
-            # bound, and a BOOLEAN key has no order, so each is copied by the blocking
-            # snapshot, whose positional paging never renders a key back into SQL.
+            # bound, a BOOLEAN key has no order, and an NCHAR or NVARCHAR one the locale's,
+            # so each is copied by the blocking snapshot, whose positional paging never
+            # renders a key back into SQL or compares one in Python.
             return {}, False
         datetime_keys = [
             column
@@ -19216,23 +19357,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         pipeline_id, _, update_id = scope.partition("_@_")
         if not pipeline_id or not update_id:
             return
-        try:
-            retention_days = int(
-                self.options.get("state.gc.retention.days", _DEFAULT_STATE_GC_RETENTION_DAYS)
-            )
-            interval_hours = float(
-                self.options.get("state.gc.interval.hours", _DEFAULT_STATE_GC_INTERVAL_HOURS)
-            )
-        except (TypeError, ValueError) as error:
-            # 320: Options 'state.gc.retention.days' and 'state.gc.interval.hours' must be numeric
-            raise ValueError(_m(320)) from error
-        if retention_days < 1 or not math.isfinite(interval_hours) or interval_hours <= 0:
-            # 321: Option 'state.gc.retention.days' must be >= 1 and 'state.gc.interval.hours' must
-            # be > 0
-            raise ValueError(_m(321))
+        retention_days, interval_hours = _state_gc_settings(self.options)
         cache_key = (table.identity, pipeline_id)
         now = time.monotonic()
-        touch_seconds = interval_hours * 3600
+        # The touch keeps a table's state from the sweep, which deletes what was not
+        # touched within the retention: it comes at least four times a retention, whatever
+        # the sweep's interval. At the interval alone, a day's interval against a day's
+        # retention let a sibling table's sweep take a live table's state between touches.
+        touch_seconds = min(interval_hours * 3600, retention_days * 86400 / 4)
         if now - self._activity_touched.get(cache_key, -math.inf) < touch_seconds:
             return
         prefix = self._immutable_namespace(table)
@@ -19841,6 +19973,7 @@ def _datetime_qualifier_supported(qualifier: int) -> bool:
 
 
 _VARIABLE_DECIMAL_DEFAULT = "decimal(38,18)"
+_VARIABLE_DECIMAL_DEFAULT_TARGET = ("decimal", 38, 18)
 _DECIMAL_TYPE_RE = re.compile(r"^decimal\(\s*(\d+)\s*,\s*(\d+)\s*\)$")
 
 
@@ -19914,8 +20047,9 @@ def _variable_decimal_target(
 
 def _apply_decimal_targets(table: Table, options: dict[str, str]) -> Table:
     # Docstring: Record the types decimal.variable.type and decimal.variable.column.type give
-    # the table's variable-scale DECIMAL columns (Table.decimal_targets), and refuse a
-    # decimal.variable.column.type entry for a column that is not one.
+    # the table's variable-scale DECIMAL columns (Table.decimal_targets, and the table-wide
+    # one as Table.decimal_default), and refuse a decimal.variable.column.type entry for a
+    # column that is not one.
     #
     # A misspelt name was ignored, and the column landed as the default type.
 
@@ -19926,20 +20060,31 @@ def _apply_decimal_targets(table: Table, options: dict[str, str]) -> Table:
             # 458: Option 'decimal.variable.column.type' names {}, which is not a
             # variable-scale DECIMAL column '{}' has or selects
             raise InformixError(_m(458, name, table.exposed_name))
-    default = _parse_variable_decimal_type(
-        _VARIABLE_DECIMAL_DEFAULT, option="decimal.variable.type"
-    )
     targets = []
     for column in variable:
         target = _variable_decimal_target(column, options)
-        if target != default:
-            kind, precision, scale = target
-            text = f"decimal({precision},{scale})" if kind == "decimal" else kind
-            targets.append((column.name, text))
-    recorded = tuple(sorted(targets)) or None
-    if table.decimal_targets == recorded:
+        if target != _VARIABLE_DECIMAL_DEFAULT_TARGET:
+            targets.append((column.name, _variable_decimal_text(target)))
+    table_wide = _parse_variable_decimal_type(
+        options.get("decimal.variable.type", _VARIABLE_DECIMAL_DEFAULT),
+        option="decimal.variable.type",
+    )
+    recorded = tuple(sorted(targets))
+    default = (
+        None
+        if table_wide == _VARIABLE_DECIMAL_DEFAULT_TARGET
+        else _variable_decimal_text(table_wide)
+    )
+    if table.decimal_targets == recorded and table.decimal_default == default:
         return table
-    return replace(table, decimal_targets=recorded)
+    return replace(table, decimal_targets=recorded, decimal_default=default)
+
+
+def _variable_decimal_text(target: tuple[str, int | None, int | None]) -> str:
+    # Docstring: A variable-DECIMAL target as the option writes it.
+
+    kind, precision, scale = target
+    return f"decimal({precision},{scale})" if kind == "decimal" else kind
 
 
 def _validate_variable_decimal_options(options: dict[str, str]) -> None:
@@ -21369,7 +21514,7 @@ def _schema_fingerprint(table: Table) -> str:
         parts += (("column_renames", table.column_renames),)
     if table.column_transforms is not None:
         parts += (("column_transforms", table.column_transforms, table.transform_key_id),)
-    if table.decimal_targets is not None:
+    if table.decimal_targets:
         parts += (("decimal_targets", table.decimal_targets),)
     return hashlib.sha256(repr(parts).encode("utf-8")).hexdigest()
 
@@ -21433,6 +21578,7 @@ def _schema_state(
                 if table.decimal_targets is None
                 else {"decimal_targets": [list(pair) for pair in table.decimal_targets]}
             ),
+            **({} if table.decimal_default is None else {"decimal_default": table.decimal_default}),
         },
     }
 
@@ -21508,10 +21654,21 @@ def _carry_table_options(fresh: Table, previous: Table) -> Table:
     fresh = _apply_row_filter(fresh, previous.row_filter)
     fresh = _apply_column_renames(fresh, previous.column_renames)
     if previous.decimal_targets is not None:
-        # Those of the columns still there: a dropped column takes its entry with it.
-        names = {column.name for column in fresh.columns}
-        kept = tuple(pair for pair in previous.decimal_targets if pair[0] in names)
-        fresh = replace(fresh, decimal_targets=kept or None)
+        # Those of the columns still there: a dropped column takes its entry with it, and
+        # one the table gained takes the table-wide type, which the catalog doesn't know.
+        known = {column.name for column in previous.columns}
+        entries = dict(previous.decimal_targets)
+        targets = []
+        for column in fresh.columns:
+            if not _is_variable_scale_decimal(column):
+                continue
+            if column.name in entries:
+                targets.append((column.name, entries[column.name]))
+            elif column.name not in known and previous.decimal_default is not None:
+                targets.append((column.name, previous.decimal_default))
+        fresh = replace(
+            fresh, decimal_targets=tuple(sorted(targets)), decimal_default=previous.decimal_default
+        )
     carried = _recorded_transforms(previous.column_transforms)
     return _apply_column_transforms(fresh, carried, None, key_id=previous.transform_key_id)
 
@@ -21870,11 +22027,7 @@ def _ensure_compatible_schema_change(
     ):
         # 385: '{}' changed for '{}'; run a full refresh so every row lands under the new names
         raise InformixError(_m(385, _RENAME_COLUMNS_OPTION, name))
-    if (
-        previous.decimal_targets is not None
-        and previous.decimal_targets != current.decimal_targets
-        and not _decimal_targets_cleanup_only(previous, current)
-    ):
+    if previous.decimal_targets is not None and _decimal_types_changed(previous, current):
         # A schema recorded before the types were (None) takes them up. Otherwise rows
         # already landed, and staged pages, hold values of the old type.
         # 457: '{}' or '{}' changed for '{}'; run a full refresh so every row lands as the new
@@ -21882,14 +22035,23 @@ def _ensure_compatible_schema_change(
         raise InformixError(_m(457, "decimal.variable.type", "decimal.variable.column.type", name))
 
 
-def _decimal_targets_cleanup_only(previous: Table, current: Table) -> bool:
-    # Docstring: Whether the variable-DECIMAL types changed only by columns the table no
-    # longer has (an entry left for a dropped column, or taken out after it).
+def _decimal_types_changed(previous: Table, current: Table) -> bool:
+    # Docstring: Whether a variable-scale DECIMAL column both schemas have lands as another
+    # type now.
+    #
+    # Only those columns: one added since takes the options as they are, and one dropped
+    # leaves nothing to compare. A column with no entry is the default, so a table that
+    # left the default for another type is a change (its entries were none before).
 
-    names = {column.name for column in current.columns}
-    before = {name: target for name, target in previous.decimal_targets or () if name in names}
-    after = {name: target for name, target in current.decimal_targets or () if name in names}
-    return before == after
+    def variable(table: Table) -> set[str]:
+        return {column.name for column in table.columns if _is_variable_scale_decimal(column)}
+
+    default = _variable_decimal_text(_VARIABLE_DECIMAL_DEFAULT_TARGET)
+    before, after = dict(previous.decimal_targets or ()), dict(current.decimal_targets or ())
+    return any(
+        before.get(name, default) != after.get(name, default)
+        for name in variable(previous) & variable(current)
+    )
 
 
 def _selection_cleanup_only(previous: Table, current: Table) -> bool:
