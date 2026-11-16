@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import codecs
 import collections
 import contextlib
 import dataclasses
@@ -814,7 +815,9 @@ class _IndexScanSource:
         rows = [
             dict(row)
             for row in self.rows
-            if any(all(row[key] == value for key, value in zip(keys, values)) for values in value_sets)
+            if any(
+                all(row[key] == value for key, value in zip(keys, values)) for values in value_sets
+            )
         ]
         self._tick()
         return rows
@@ -2467,8 +2470,18 @@ class LakeflowContractTests(unittest.TestCase):
             transactions = informix_module._transaction_batch(
                 [
                     {"op": "BEGIN", "tx_id": 1, "lsn": 140},
-                    {"op": "BEFORE_UPDATE", "tx_id": 1, "lsn": 141, "row": {"id": old, "value": "a"}},
-                    {"op": "AFTER_UPDATE", "tx_id": 1, "lsn": 142, "row": {"id": new, "value": value}},
+                    {
+                        "op": "BEFORE_UPDATE",
+                        "tx_id": 1,
+                        "lsn": 141,
+                        "row": {"id": old, "value": "a"},
+                    },
+                    {
+                        "op": "AFTER_UPDATE",
+                        "tx_id": 1,
+                        "lsn": 142,
+                        "row": {"id": new, "value": value},
+                    },
                     {"op": "COMMIT", "tx_id": 1, "lsn": 150},
                 ]
             )[0]
@@ -2538,15 +2551,16 @@ class LakeflowContractTests(unittest.TestCase):
                 row
                 for index in sorted(pages)
                 for row in pages[index]
-                if not moved
-                or json.dumps([row["value"]]) not in moved["pages"].get(str(index), ())
+                if not moved or json.dumps([row["value"]]) not in moved["pages"].get(str(index), ())
             ]
             # The page they were read into again holds them, and leaves none of them out.
             self.assertTrue(not moved or str(moved["page"]) not in moved["pages"])
             # The scan says how many staged copies the pages leave out, so that the
             # snapshot's row count is that of the rows served.
             staged_count = sum(len(rows) for rows in pages.values())
-            self.assertEqual(staged_count - scan.get("left_out_rows", 0), len(served), f"seed {seed}")
+            self.assertEqual(
+                staged_count - scan.get("left_out_rows", 0), len(served), f"seed {seed}"
+            )
             names = collections.Counter(row["value"] for row in served)
             self.assertEqual(set(names.values()) - {1}, set(), f"seed {seed}")
             repaired += bool(moved and moved["page"] is not None)
@@ -2610,8 +2624,7 @@ class LakeflowContractTests(unittest.TestCase):
                 row
                 for index in sorted(pages)
                 for row in pages[index]
-                if not moved
-                or json.dumps([row["value"]]) not in moved["pages"].get(str(index), ())
+                if not moved or json.dumps([row["value"]]) not in moved["pages"].get(str(index), ())
             ]
             names = collections.Counter(row["value"] for row in served)
             self.assertEqual(set(names.values()) - {1}, set(), f"seed {seed}")
@@ -2699,8 +2712,7 @@ class LakeflowContractTests(unittest.TestCase):
                 row
                 for index in sorted(pages)
                 for row in pages[index]
-                if not moved
-                or json.dumps([row["value"]]) not in moved["pages"].get(str(index), ())
+                if not moved or json.dumps([row["value"]]) not in moved["pages"].get(str(index), ())
             ]
             names = collections.Counter(row["value"] for row in served)
             self.assertEqual(set(names.values()) - {1}, set(), f"seed {seed}")
@@ -2767,8 +2779,7 @@ class LakeflowContractTests(unittest.TestCase):
                 row
                 for index in sorted(pages)
                 for row in pages[index]
-                if not moved
-                or json.dumps([row["value"]]) not in moved["pages"].get(str(index), ())
+                if not moved or json.dumps([row["value"]]) not in moved["pages"].get(str(index), ())
             ]
             names = collections.Counter(row["value"] for row in served)
             self.assertEqual(set(names.values()) - {1}, set(), f"seed {seed}")
@@ -2882,7 +2893,10 @@ class LakeflowContractTests(unittest.TestCase):
         # cleanup of earlier scopes keeps it.
         connector = self.connector()
         table = connector._table("app.orders", {})
-        scope, schema = "11111111-2222-3333-4444-555555555555_@_66666666-7777-8888-9999-000000000000", "5" * 32
+        scope, schema = (
+            "11111111-2222-3333-4444-555555555555_@_66666666-7777-8888-9999-000000000000",
+            "5" * 32,
+        )
         reads = []
 
         def manifest(*args):
@@ -2896,7 +2910,9 @@ class LakeflowContractTests(unittest.TestCase):
         # A manifest in hand is not read again, and a snapshot that was no such scan, or
         # that followed no changes, names nothing.
         self.assertEqual(connector._naming_scan({}, table, scope, schema, {}), {})
-        self.assertEqual(connector._naming_scan({}, table, scope, schema, {"index_scan": False}), {})
+        self.assertEqual(
+            connector._naming_scan({}, table, scope, schema, {"index_scan": False}), {}
+        )
         self.assertEqual(len(reads), 1)
 
     def test_a_snapshot_source_is_held_to_a_volume_path_without_traversal(self):
@@ -2905,7 +2921,11 @@ class LakeflowContractTests(unittest.TestCase):
         # that steps out with ".." could name a file of the compute's own, or another
         # workspace API under the caller's token.
         connector = self.connector(FakeBridge())
-        for bad in ("/Volumes/../../api/2.0/token/list", "/Volumes/main/s/v/../../../x", "relative/x"):
+        for bad in (
+            "/Volumes/../../api/2.0/token/list",
+            "/Volumes/main/s/v/../../../x",
+            "relative/x",
+        ):
             with self.assertRaises(ValueError):
                 connector._table_snapshot_source({"snapshot.source": bad})
             with self.assertRaises(ValueError):
@@ -2931,7 +2951,9 @@ class LakeflowContractTests(unittest.TestCase):
         # It goes into every statement unquoted, before the colon.
         base = {"hostname": "h", "user": "u", "password": "p", "server": "s"}
         for name in ("testdb", "stores_demo", "db$1"):
-            self.assertEqual(informix_module._bridge_config({**base, "database": name})["database"], name)
+            self.assertEqual(
+                informix_module._bridge_config({**base, "database": name})["database"], name
+            )
         for name in ("a.b", "x:y", "db name", "1db", "db;drop"):
             with self.assertRaisesRegex(ValueError, "plain Informix database name"):
                 informix_module._bridge_config({**base, "database": name})
@@ -2996,13 +3018,22 @@ class LakeflowContractTests(unittest.TestCase):
         # A form sends "" for a field nobody filled in. A number or a flag read from it
         # would fail at once or, later, on a worker. The escape character is the one
         # whose blank means something: no escape processing.
-        blank = {"port": "", "cdc.timeout": " ", "padVarchar": "", "lakebase.database": ""}
+        blank = {"port": "", "cdc.timeout": "", "padVarchar": "", "lakebase.database": ""}
         connector = self.connector(FakeBridge(), **blank, **{"snapshot.unl.escape": ""})
         for name in blank:
             self.assertNotIn(name, connector.options)
         self.assertEqual(connector.options["snapshot.unl.escape"], "")
         with self.assertRaisesRegex(ValueError, "lakebase.password"):
             self.connector(FakeBridge(), **{"lakebase.password": ""})
+        # Blanks are something typed, judged as given, as in a table's options: a number
+        # of blanks is no number. A tab is still a delimiter.
+        with self.assertRaisesRegex(ValueError, "'cdc.timeout' must be a whole number"):
+            self.connector(FakeBridge(), **{"cdc.timeout": " "})
+        tabbed = self.connector(FakeBridge(), **{"snapshot.unl.delimiter": "\t"})
+        self.assertEqual(tabbed.options["snapshot.unl.delimiter"], "\t")
+        for value, message in (("-1", "must be > 0"), ("soon", "must be a number")):
+            with self.assertRaisesRegex(ValueError, f"cdc.read.timeout.seconds' {message}"):
+                self.connector(FakeBridge(), **{"cdc.read.timeout.seconds": value})
 
     def test_the_state_projects_capacity_is_checked_at_construction(self):
         # Not when a worker first provisions the project.
@@ -3025,9 +3056,7 @@ class LakeflowContractTests(unittest.TestCase):
         # process of the pipeline do it, not every one of them.
         scope = "11111111-2222-3333-4444-555555555555_@_66666666-7777-8888-9999-000000000000"
         for won in (False, True):
-            connector = self.connector(
-                FakeBridge(), **{"state.gc.drop.unused.projects": "true"}
-            )
+            connector = self.connector(FakeBridge(), **{"state.gc.drop.unused.projects": "true"})
             connector.set_registration_scope(scope)
             table = connector._table("app.orders", {})
             connector._lakebase_state = mock.Mock()
@@ -3190,7 +3219,10 @@ class LakeflowContractTests(unittest.TestCase):
             later = scope[:-1] + "1"
             session.conf = mock.Mock(
                 get=lambda key, default=None: dict(
-                    zip(("spark.pipelines.pipelineId", "spark.pipelines.updateId"), later.split("_@_"))
+                    zip(
+                        ("spark.pipelines.pipelineId", "spark.pipelines.updateId"),
+                        later.split("_@_"),
+                    )
                 ).get(key, default)
             )
             asked.return_value = "continue"
@@ -3266,7 +3298,9 @@ class LakeflowContractTests(unittest.TestCase):
         # dropped as the connector starts; a table's must read as unset as well.
         connector = self.connector(FakeBridge())
         self.assertEqual(
-            connector._table_int_option({"snapshot.page.size": " "}, "snapshot.page.size", 7, minimum=1),
+            connector._table_int_option(
+                {"snapshot.page.size": " "}, "snapshot.page.size", 7, minimum=1
+            ),
             7,
         )
         self.assertTrue(informix_module._option_bool({"flag": ""}, "flag", True))
@@ -3310,8 +3344,12 @@ class LakeflowContractTests(unittest.TestCase):
         module = informix_module
         scope = connector._pipeline_scope()
         with (
-            mock.patch.dict(module._INFORMIX_REGISTRATION_CONTEXT, {"scope": scope, "request": None}),
-            mock.patch.dict(module._CAPTURED_WORKSPACE, {"host": "https://ws", "token": "t"}, clear=True),
+            mock.patch.dict(
+                module._INFORMIX_REGISTRATION_CONTEXT, {"scope": scope, "request": None}
+            ),
+            mock.patch.dict(
+                module._CAPTURED_WORKSPACE, {"host": "https://ws", "token": "t"}, clear=True
+            ),
         ):
             state = connector.__getstate__()
             self.assertEqual(state["_driver_registration"]["scope"], scope)
@@ -3323,7 +3361,9 @@ class LakeflowContractTests(unittest.TestCase):
             self.assertEqual(module._CAPTURED_WORKSPACE, {"host": "https://ws", "token": "t"})
             self.assertNotIn("_driver_registration", restored.__dict__)
         # With no registration to carry, nothing is added.
-        with mock.patch.dict(module._INFORMIX_REGISTRATION_CONTEXT, {"scope": None, "request": None}):
+        with mock.patch.dict(
+            module._INFORMIX_REGISTRATION_CONTEXT, {"scope": None, "request": None}
+        ):
             self.assertNotIn("_driver_registration", connector.__getstate__())
 
     def test_a_read_with_no_start_offset_is_a_first_read(self):
@@ -3353,10 +3393,21 @@ class LakeflowContractTests(unittest.TestCase):
         # invalid one. Only "" counts: blanks are something typed, and the escape
         # character's empty value means something.
         clean = informix_module._options_set
-        options = {"snapshot.mode": "", "snapshot.unl.escape": "", "snapshot.unl.delimiter": "\t", "primary.keys": " ", "x": "1"}
+        options = {
+            "snapshot.mode": "",
+            "snapshot.unl.escape": "",
+            "snapshot.unl.delimiter": "\t",
+            "primary.keys": " ",
+            "x": "1",
+        }
         self.assertEqual(
             clean(options),
-            {"snapshot.unl.escape": "", "snapshot.unl.delimiter": "\t", "primary.keys": " ", "x": "1"},
+            {
+                "snapshot.unl.escape": "",
+                "snapshot.unl.delimiter": "\t",
+                "primary.keys": " ",
+                "x": "1",
+            },
         )
         same = {"x": "1"}
         self.assertIs(clean(same), same)
@@ -5573,6 +5624,11 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertIn("full refresh", message)
         # The decode failure is preserved rather than replaced.
         self.assertIsInstance(caught.exception.__cause__, informix_module.CdcProtocolError)
+        # Text that would not decode can as well be a codeset mismatch, so the message
+        # names that remedy too, and the codec it decoded with.
+        self.assertIsInstance(caught.exception.__cause__.__cause__, UnicodeDecodeError)
+        self.assertIn("as utf-8, the codeset of DB_LOCALE", message)
+        self.assertIn("not text in the database's codeset", message)
 
     def test_a_genuine_cdc_frame_still_decodes_through_read_changes(self):
         """The guard must not reject valid records: same label, live log file."""
@@ -5662,6 +5718,44 @@ class LakeflowContractTests(unittest.TestCase):
             bridge.read_changes([capture], 90, 1, 2)
 
         self.assertIn("cleanup also failed", " ".join(caught.exception.__notes__))
+
+    def test_a_read_that_closed_the_client_is_not_followed_by_cleanup_calls(self):
+        # A LODATA read that times out closes the SQLI connection, and the CDC session ends
+        # with it. The cleanup calls after it could fail only for want of a connection,
+        # burying the timeout under notes; none is made.
+        class ClosingTransport(FakeCdcTransport):
+            def __init__(self):
+                super().__init__([])
+                self.state = types.SimpleNamespace(name="DATABASE_OPEN")
+                self.sql = []
+
+            def execute(self, sql, parameters=()):
+                if self.state.name != "DATABASE_OPEN":
+                    raise informix_module.SqliProtocolError("SQLI database session is not open")
+                self.sql.append(sql)
+                return super().execute(sql, parameters)
+
+            def read_lodata(self, descriptor, requested):
+                self.state = types.SimpleNamespace(name="POISONED")
+                raise TimeoutError("The read operation timed out")
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.transport = ClosingTransport()
+        capture = {
+            "identity": "demo:app.orders",
+            "logical_identity": "demo.app.orders",
+            "columns": ["id"],
+            "descriptors": [{"name": "id", "type_name": "INTEGER"}],
+        }
+
+        with self.assertRaises(TimeoutError) as caught:
+            bridge.read_changes([capture, dict(capture, identity="demo:app.items")], 90, 1, 2)
+
+        self.assertFalse(getattr(caught.exception, "__notes__", []))
+        self.assertFalse(
+            any("cdc_endcapture" in sql or "cdc_closesess" in sql for sql in bridge.transport.sql)
+        )
 
     def test_timeout_discards_later_frames_in_the_same_native_chunk(self):
         transport = FakeCdcTransport(
@@ -5916,6 +6010,101 @@ class LakeflowContractTests(unittest.TestCase):
         with self.assertRaisesRegex(InformixError, r"partially applied.*demo:app.orders"):
             bridge.prepare_initial_capture(["demo:app.orders", "demo:app.customers"])
 
+    def test_the_backlog_hint_flag_is_parsed_as_every_flag_is(self):
+        # It was compared with "false" literally, so "False", "0" and "no" left it on.
+        bridge = object.__new__(PurePythonInformixBridge)
+        for value, enabled in (("False", False), ("0", False), ("no", False), ("yes", True)):
+            bridge.options = {"connection.backlog.hint.enabled": value}
+            self.assertIs(bridge._connection_hints_enabled(), enabled, value)
+        bridge.options = {}
+        self.assertTrue(bridge._connection_hints_enabled())
+        bridge.options = {"connection.backlog.hint.enabled": "off"}
+        with self.assertRaisesRegex(ValueError, "connection.backlog.hint.enabled"):
+            bridge._connection_hints_enabled()
+        # Refused when the connector is built, not deep inside a running read.
+        with self.assertRaisesRegex(ValueError, "connection.backlog.hint.enabled"):
+            self.connector(FakeBridge(), **{"connection.backlog.hint.enabled": "off"})
+
+    def test_a_db_locale_of_another_codeset_than_the_databases_is_refused(self):
+        # The server sends text in the database's codeset and the client decodes it in that
+        # of DB_LOCALE. The default en_US.819 on a UTF-8 database decoded without an error
+        # and landed garbled text; the database's own locale is checked when connecting.
+        class Transport:
+            def __init__(self, db_locale, answer):
+                self.db_locale = db_locale
+                self.answer = answer
+                self.sql = []
+                self.connects = 0
+
+            def connect(self):
+                self.connects += 1
+
+            def close(self):
+                pass
+
+            def execute(self, sql, parameters=()):
+                self.sql.append(sql)
+                if isinstance(self.answer, Exception):
+                    raise self.answer
+                return [{"dbs_collate": self.answer}]
+
+        def bridge(transport):
+            made = object.__new__(PurePythonInformixBridge)
+            made.transport = transport
+            made.options = {}
+            made.config = {"database": "testdb"}
+            made._newline_refused = True
+            return made
+
+        wrong = bridge(Transport("en_US.819", "en_US.utf8"))
+        with self.assertRaisesRegex(
+            InformixError, "DB_LOCALE is 'en_US.819' but database 'testdb'"
+        ):
+            wrong._connect_transport()
+        # Refused at every connect, not only the first.
+        with self.assertRaisesRegex(InformixError, "has the locale 'en_US.utf8'"):
+            wrong._connect_transport()
+        # Another name of the same codeset is the same codeset; checked once.
+        alias = bridge(Transport("en_US.utf8", "en_US.57372"))
+        alias._connect_transport()
+        alias._connect_transport()
+        self.assertEqual(len(alias.transport.sql), 1)
+        # A database whose locale can't be read is decoded unchecked, with a warning: the
+        # failed query ended the session, so it connects again.
+        unread = bridge(Transport("en_US.819", RuntimeError("no sysmaster")))
+        with self.assertLogs(informix_module.__name__, "WARNING"):
+            unread._connect_transport()
+        self.assertEqual(unread.transport.connects, 2)
+        unread._connect_transport()
+        self.assertEqual(len(unread.transport.sql), 1)
+        # A locale the connector has no codec for is not taken for another codeset.
+        unknown = bridge(Transport("en_US.819", "ja_JP.sjis-s"))
+        unknown._connect_transport()
+
+    def test_change_records_are_decoded_in_the_database_codeset(self):
+        # A change record carries text as the database holds it, whatever the session's
+        # CLIENT_LOCALE (probed on 14.10), so the capture decodes in DB_LOCALE's codeset.
+        connector = self.connector(
+            FakeBridge(),
+            shared_cdc=True,
+            **{
+                "DB_LOCALE": "en_US.819",
+                "CLIENT_LOCALE": "en_US.utf8",
+                "cdc.shared.session": "process",
+            },
+        )
+        table = connector._table("app.orders", {})
+        shard = mock.Mock()
+        shard.poll.return_value = None
+        with mock.patch.object(informix_module, "_shared_cdc_shard", return_value=shard):
+            connector._shared_cdc_snapshot(
+                table, _stream_offset(), {}, False, connector._pipeline_scope()
+            )
+        capture = shard.poll.call_args.args[2]
+        self.assertEqual(
+            {codecs.lookup(d["encoding"]).name for d in capture["descriptors"]}, {"iso8859-1"}
+        )
+
     def test_initial_lsn_validation_activates_without_reading_lodata(self):
         class ActivationTransport:
             def __init__(self):
@@ -5999,6 +6188,40 @@ class LakeflowContractTests(unittest.TestCase):
         # Returns normally (no raise) despite the teardown timeout.
         bridge.validate_initial_lsn({"identity": "demo:app.orders", "columns": ["id"]}, 80)
         self.assertEqual(reset_calls, [True])
+
+    def test_initial_lsn_validation_survives_a_teardown_timeout_that_closes_the_client(self):
+        # The SQLI client closes its connection when a call times out (POISONED), so the
+        # cdc_closesess after a timed-out cdc_endcapture failed with "session is not open",
+        # not a timeout, and the teardown timeout became fatal. Nothing is called on a
+        # closed client; the validation stands.
+        class ClosingTransport:
+            def __init__(self):
+                self.state = types.SimpleNamespace(name="DATABASE_OPEN")
+                self.sql = []
+
+            def execute(self, sql, parameters=()):
+                if self.state.name != "DATABASE_OPEN":
+                    raise informix_module.SqliProtocolError("SQLI database session is not open")
+                self.sql.append(sql)
+                if "sysenv" in sql:
+                    return [{"env_value": "demo_server"}]
+                if "cdc_opensess" in sql:
+                    return [{"session_id": 7}]
+                if "cdc_endcapture" in sql:
+                    self.state = types.SimpleNamespace(name="POISONED")
+                    raise TimeoutError("The read operation timed out")
+                return [{"status": 0}]
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.transport = ClosingTransport()
+        bridge.options = {}
+        reset_calls = []
+        bridge.reset_transport = lambda: reset_calls.append(True)
+
+        bridge.validate_initial_lsn({"identity": "demo:app.orders", "columns": ["id"]}, 80)
+
+        self.assertEqual(reset_calls, [True])
+        self.assertFalse(any("cdc_closesess" in sql for sql in bridge.transport.sql))
 
     def test_initial_lsn_validation_still_fails_on_non_timeout_cleanup_error(self):
         # A non-timeout cleanup failure with a successful primary is still fatal:
@@ -7039,7 +7262,9 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(consumed, [[{"at": "13:00"}, {"at": "13:01"}], [{"at": "13:02"}]])
         selects = [sql for sql in bridge.transport.sql if sql.startswith("SELECT at FROM")]
         self.assertEqual(selects, ["SELECT at FROM demo:app.events"])
-        self.assertFalse([sql for sql in bridge.transport.sql if "SKIP" in sql or "ORDER BY" in sql])
+        self.assertFalse(
+            [sql for sql in bridge.transport.sql if "SKIP" in sql or "ORDER BY" in sql]
+        )
 
     def test_a_consistent_snapshot_pages_in_the_key_indexs_own_directions(self):
         # A key index with a descending column serves each page's order only when the page
@@ -10621,9 +10846,43 @@ class LakeflowContractTests(unittest.TestCase):
             ]
 
         self.assertEqual(end, sentinel_end)
-        self.assertEqual(partitions, [{"kind": "embedded", "rows": sentinel_rows}])
+        self.assertEqual(
+            partitions, [{"kind": "embedded", "rows": sentinel_rows, "transformed": True}]
+        )
         self.assertEqual(rows, sentinel_rows)
         read_table.assert_called_once()
+
+    def test_an_embedded_partition_carries_transformed_values_only(self):
+        # The descriptor goes from the driver through Spark to an executor. It carried the
+        # rows as read, so the raw values transform_columns keeps out of Spark were in it;
+        # they are transformed on the driver now, and the executor does not do it again.
+        connector = self._partitioned_connector()
+        options = {"transform_columns": '{"value": "UPPER(value)"}'}
+        start = {"phase": "stream", "commit_lsn": "5"}
+        rows = [{"id": 7, "value": "secret"}]
+        with mock.patch.object(
+            connector,
+            "_read_upserts",
+            return_value=(iter(rows), {"phase": "stream", "commit_lsn": "9"}),
+        ):
+            end = connector.latest_offset("app.orders", options, start)
+            partitions = connector.get_partitions("app.orders", options, start, end)
+        self.assertNotIn("secret", json.dumps(partitions))
+        out = [
+            row
+            for part in partitions
+            for row in connector.read_partition("app.orders", part, options)
+        ]
+        self.assertEqual(out, [{"id": 7, "value": "SECRET"}])
+        # A replay after a driver restart (cache empty) is transformed on the driver too.
+        connector._partition_embedded_rows.clear()
+        with mock.patch.object(
+            connector,
+            "_read_upserts",
+            return_value=(iter(rows), {"phase": "stream", "commit_lsn": "9"}),
+        ):
+            replayed = connector.get_partitions("app.orders", options, start, end)
+        self.assertNotIn("secret", json.dumps(replayed))
 
     def test_partitioned_embedded_delete_flow_routes_to_read_table_deletes(self):
         # A delete-channel reader (isDeleteFlow) never page-serves; its embedded
@@ -10660,7 +10919,9 @@ class LakeflowContractTests(unittest.TestCase):
                 "app.orders", {}, start, {"phase": "stream", "commit_lsn": "6"}
             )
 
-        self.assertEqual(partitions, [{"kind": "embedded", "rows": [{"id": 3}]}])
+        self.assertEqual(
+            partitions, [{"kind": "embedded", "rows": [{"id": 3}], "transformed": True}]
+        )
         self.assertEqual(read_table.call_count, 2)  # once in latest_offset, once on miss
 
     def test_partitioned_cache_miss_replay_is_bounded_by_the_committed_end(self):
@@ -10685,7 +10946,8 @@ class LakeflowContractTests(unittest.TestCase):
             partitions = connector.get_partitions("app.orders", {}, start, end)
 
         self.assertEqual(
-            partitions, [{"kind": "embedded", "rows": [{"id": 1}, {"id": 2}, {"id": 3}]}]
+            partitions,
+            [{"kind": "embedded", "rows": [{"id": 1}, {"id": 2}, {"id": 3}], "transformed": True}],
         )
         self.assertNotIn(informix_module._REPLAY_STOP_LSN_OPTION, seen[0])  # normal read
         self.assertEqual(seen[1][informix_module._REPLAY_STOP_LSN_OPTION], "9")  # bounded replay
@@ -10736,7 +10998,9 @@ class LakeflowContractTests(unittest.TestCase):
             partitions = connector.get_partitions("app.orders", {}, start, end)
 
         self.assertEqual(starts, ["5", "5", "6"])
-        self.assertEqual(partitions, [{"kind": "embedded", "rows": [{"id": 1}, {"id": 2}]}])
+        self.assertEqual(
+            partitions, [{"kind": "embedded", "rows": [{"id": 1}, {"id": 2}], "transformed": True}]
+        )
 
     def test_partitioned_cache_miss_replay_routes_the_delete_flow(self):
         connector = self._partitioned_connector(**{"isDeleteFlow": "true"})
@@ -10753,7 +11017,9 @@ class LakeflowContractTests(unittest.TestCase):
             mock.patch.object(connector, "_read_upserts") as upserts,
         ):
             partitions = connector.get_partitions("app.orders", {}, start, end)
-        self.assertEqual(partitions, [{"kind": "embedded", "rows": [{"id": 1}]}])
+        self.assertEqual(
+            partitions, [{"kind": "embedded", "rows": [{"id": 1}], "transformed": True}]
+        )
         self.assertEqual(seen[0][informix_module._REPLAY_STOP_LSN_OPTION], "6")
         upserts.assert_not_called()
 
@@ -12979,7 +13245,7 @@ class LakeflowContractTests(unittest.TestCase):
 
         def poll(shown, options, trigger=False):
             shard = mock.Mock()
-            shard.snapshot.return_value = shown
+            shard.poll.return_value = shown
             connector._trigger_available_now = trigger
             with (
                 mock.patch.object(informix_module, "_shared_cdc_shard", return_value=shard),
@@ -13048,7 +13314,7 @@ class LakeflowContractTests(unittest.TestCase):
                 table, fingerprint, 1, bound, [], True, None, reached, started
             )
             shard = mock.Mock()
-            shard.snapshot.return_value = shown
+            shard.poll.return_value = shown
             with (
                 mock.patch.object(informix_module, "_shared_cdc_shard", return_value=shard),
                 mock.patch.multiple(
@@ -13082,7 +13348,7 @@ class LakeflowContractTests(unittest.TestCase):
         checkpoint["schema_fingerprint"] = _schema_fingerprint(other)
         shown = _SharedCdcSnapshot(other, _schema_fingerprint(other), 1, 200, [], True, None, 120)
         shard = mock.Mock()
-        shard.snapshot.return_value = shown
+        shard.poll.return_value = shown
         with mock.patch.object(informix_module, "_shared_cdc_shard", return_value=shard):
             view = connector._shared_cdc_snapshot(
                 table, checkpoint, {}, False, connector._pipeline_scope()
@@ -13117,7 +13383,7 @@ class LakeflowContractTests(unittest.TestCase):
                 started,
             )
             shard = mock.Mock()
-            shard.snapshot.return_value = shown
+            shard.poll.return_value = shown
             connector._trigger_available_now = True
             with (
                 mock.patch.object(informix_module, "_shared_cdc_shard", return_value=shard),
@@ -13166,8 +13432,8 @@ class LakeflowContractTests(unittest.TestCase):
 
         def poll(*shown, options=None, **wait):
             shard = mock.Mock()
-            shard.snapshot.side_effect = list(shown) if len(shown) > 1 else None
-            shard.snapshot.return_value = shown[0]
+            shard.poll.side_effect = list(shown) if len(shown) > 1 else None
+            shard.poll.return_value = shown[0]
             connector._trigger_available_now = True
             connector._trigger_boundaries[table.identity] = (bound, "a" * 32, scope)
             with (
@@ -13178,7 +13444,7 @@ class LakeflowContractTests(unittest.TestCase):
                 got = connector._shared_cdc_snapshot(
                     table, checkpoint, options or {}, True, connector._pipeline_scope()
                 )
-            return got, shard.snapshot.call_count, time.monotonic() - started
+            return got, shard.poll.call_count, time.monotonic() - started
 
         stale, fresh = view(bound - 1), view(bound)
         got, polls, _ = poll(stale, stale, fresh)
@@ -14432,6 +14698,26 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(metadata["ingestion_type"], "cdc_with_deletes")
         self.assertEqual(metadata["primary_keys"], ["id"])
         self.assertEqual(metadata["cursor_field"], informix_module.CURSOR)
+
+    def test_a_table_option_set_on_the_connection_is_refused(self):
+        # The pipeline reads a table's metadata with its table_configuration alone, but
+        # its reads with the connection's options too. primary.keys on the connection
+        # keyed the stream of a table registered keyless (append, no delete flow), so its
+        # deletes were dropped. Such an option is refused unless the table sets the same.
+        connector, _ = self._keyless_connector(**{"primary.keys": "id"})
+
+        with self.assertRaisesRegex(ValueError, "'primary.keys' is a table option"):
+            connector.read_table_metadata("app.orders", {})
+        with self.assertRaisesRegex(ValueError, "'primary.keys' is a table option"):
+            connector.read_table_metadata("app.orders", {"primary.keys": "id,value"})
+        metadata = connector.read_table_metadata("app.orders", {"primary.keys": "id"})
+        self.assertEqual(metadata["primary_keys"], ["id"])
+        # Every option the connector takes from a table's options alone.
+        for name in informix_module._TABLE_ONLY_OPTIONS:
+            other, _ = self._keyless_connector(**{name: "x"})
+            with self.assertRaises(ValueError) as caught:
+                other.read_table_metadata("app.orders", {})
+            self.assertIn(f"'{name}' is a table option", str(caught.exception))
 
     def test_primary_keys_override_accepts_multiple_columns(self):
         connector, _ = self._keyless_connector()
@@ -19632,6 +19918,29 @@ class SharedCdcShardTests(unittest.TestCase):
         self.assertIsNot(shard.subscribe(self.id_a, self.table_a, capture, 500, 500, "two"), False)
         self.assertEqual(shard.subscribers[self.id_a]["owner"], "two")
 
+    def test_a_flow_refused_its_tables_place_leaves_the_buffer_alone(self):
+        # Two flows of one process reading one table: the second, refused, read directly
+        # but still took a view at its own checkpoint, which cut the first one's buffer, so
+        # the first skipped the transactions in between. A refusal now gives no view at all,
+        # whichever way the second flow differs from the first.
+        shard = _SharedCdcShard()
+        capture = _capture_descriptor(self.table_a)
+        self.assertTrue(shard.subscribe(self.id_a, self.table_a, capture, 0, 0, "one"))
+        shard.subscribe(self.id_b, self.table_b, _capture_descriptor(self.table_b), 0, 0)
+        shard.ingest(self._two_table_stream(), self._schema_map(), 1, 106, 0)
+        filtered = dataclasses.replace(self.table_a, row_filter="id > 1")
+        narrowed = informix_module._apply_column_selection(self.table_a, ("include", ("id",)))
+
+        self.assertIsNone(shard.poll(self.id_a, self.table_a, capture, 500, 500, "two"))
+        self.assertIs(shard.subscribe(self.id_a, filtered, capture, 500, 500, "one"), False)
+        self.assertIsNone(shard.poll(self.id_a, filtered, capture, 500, 500, "one"))
+        self.assertIsNone(
+            shard.poll(self.id_a, narrowed, _capture_descriptor(narrowed), 500, 500, "one")
+        )
+
+        view = shard.poll(self.id_a, self.table_a, capture, 0, 0, "one")
+        self.assertEqual([tx.tx_id for tx in view.committed], [1])
+
     def _shard_with_two_tables(self):
         shard = _SharedCdcShard()
         shard.subscribe(self.id_a, self.table_a, _capture_descriptor(self.table_a), 0, 0)
@@ -20813,9 +21122,7 @@ class HostSharedCdcTests(unittest.TestCase):
                 endpoints = informix_module._HostShardEndpoints(directory)
                 with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
                     self.assertIsNone(self.poll(endpoints))
-                self.assertTrue(
-                    any("sharing within the process" in line for line in logs.output)
-                )
+                self.assertTrue(any("sharing within the process" in line for line in logs.output))
                 self.assertFalse(endpoints.leading)
                 self.cover()
                 self.assertEqual([tx.tx_id for tx in self.poll(endpoints).committed], [5])
@@ -21034,6 +21341,8 @@ class HostSharedCdcTests(unittest.TestCase):
                 "snapshot.staging.location": self._shared_state.name,
                 "lakebase.password": "test-state-password",
                 "stream.partitioned": "false",
+                # The shard's captures here are UTF-8 (_capture_descriptor's default).
+                "DB_LOCALE": "en_US.utf8",
             }
         )
         connector.set_registration_scope(hashlib.sha256(b"host").hexdigest()[:32])
@@ -21147,6 +21456,8 @@ class SharedCdcConsumerSeamTests(unittest.TestCase):
                 "snapshot.staging.location": self._shared_state.name,
                 "lakebase.password": "test-state-password",
                 "cdc.shared.session": "process",
+                # The shard's captures here are UTF-8 (_capture_descriptor's default).
+                "DB_LOCALE": "en_US.utf8",
             }
         )
         connector.set_registration_scope(hashlib.sha256(b"shared").hexdigest()[:32])
@@ -21209,6 +21520,40 @@ class SharedCdcConsumerSeamTests(unittest.TestCase):
         # Steady-state shared read: the consumer sourced schema, LSN bounds, and change
         # records from the shard, so it never touched the Informix bridge.
         self.assertEqual(bridge.calls, [])
+
+    def test_two_flows_of_one_table_in_one_process_do_not_share_its_buffer(self):
+        # cdc.shared.session=process: two connectors (two flows) reading one table with one
+        # layout in one process. The first keeps the table's place; the second reads
+        # directly, and its polls, from further on, leave the first's transactions be.
+        table = Table.parse(_table(), "demo")
+        identity = table.native_identity
+        first, second = self._connector(FakeBridge()), self._connector(FakeBridge())
+        self.assertNotEqual(first._shard_owner, second._shard_owner)
+        shard = _SharedCdcShard()
+        shard.subscribe(identity, table, _capture_descriptor(table), 0, 0, first._shard_owner)
+        shard.ingest(
+            [
+                {"op": "BEGIN", "tx_id": 5, "lsn": 100},
+                {"op": "INSERT", "tx_id": 5, "lsn": 101, "table": table.identity, "row": {"id": 7}},
+                {"op": "COMMIT", "tx_id": 5, "lsn": 102},
+                {"op": "TIMEOUT", "lsn": 103},
+            ],
+            {identity: table},
+            1,
+            103,
+            0,
+        )
+        behind = _stream_offset()
+        ahead = {**behind, "commit_lsn": 102, "begin_lsn": 102}
+
+        with mock.patch.object(informix_module, "_shared_cdc_shard", lambda *a, **k: shard):
+            refused = second._shared_cdc_snapshot(table, ahead, {}, False, second._pipeline_scope())
+            served = first._shared_cdc_snapshot(table, behind, {}, False, first._pipeline_scope())
+
+        self.assertIsNone(refused)
+        self.assertEqual([tx.tx_id for tx in served.committed], [5])
+        # The owner goes with the connector to the process its reader runs in.
+        self.assertEqual(pickle.loads(pickle.dumps(first))._shard_owner, first._shard_owner)
 
     def test_fingerprint_mismatch_falls_back_to_direct_read(self):
         bridge = FakeBridge()
@@ -23367,6 +23712,28 @@ class UnloadHelperTests(unittest.TestCase):
         self.assertEqual(parse("a;;c", delimiter=";"), ["a", "", "c"])
         # An empty escape disables escape processing: a backslash is literal data.
         self.assertEqual(parse("a\\|b", escape=""), ["a\\", "b"])
+
+    def test_an_hpl_record_whose_last_value_ends_in_a_newline_keeps_it(self):
+        # HPL writes no trailing delimiter, so a last value ending in a newline ends the
+        # record in an escaped newline. The record splitter takes the terminator off; the
+        # field parser then took the value's own newline (or carriage return) for it, and
+        # the value lost it.
+        parse = informix_module._parse_unload_fields
+        split = informix_module._unl_split_records
+        records, rest = split(b"1;hello\\\n\n2;cr\\\r\n3;crlf\\\r\\\n\n4;dos\r\n", b"\\")
+        self.assertEqual(rest, b"")
+        # A carriage return the escape precedes is data, one it does not is the terminator's.
+        self.assertEqual(
+            [parse(record.decode(), delimiter=";", fields=2) for record in records],
+            [["1", "hello\n"], ["2", "cr\r"], ["3", "crlf\r\n"], ["4", "dos"]],
+        )
+        # A line passed with its terminator still loses only that.
+        self.assertEqual(parse("1;hello\\\n\n", delimiter=";", fields=2), ["1", "hello\n"])
+        # An escaped escape before the terminator is a literal backslash.
+        self.assertEqual(parse("a\\\\|\n"), ["a\\"])
+        # A record that ends in a lone escape is cut short: refused, not read as data.
+        with self.assertRaisesRegex(InformixError, "lone escape character"):
+            parse("1;hello\\", delimiter=";", fields=2)
 
     def test_unload_value_maps_types_and_empty_to_none(self):
         value = informix_module._unload_value
@@ -26634,7 +27001,9 @@ class ColumnTransformTests(_TableOptionTestCase):
         # conversion.
         rows = [{"id": 1, "big": 5}, {"id": 2, "big": 1 << 63}]
         transforms = (("big", None, "big"),)
-        with mock.patch.object(informix_module, "_expression_value", lambda operand, row, ctx: row["big"]):
+        with mock.patch.object(
+            informix_module, "_expression_value", lambda operand, row, ctx: row["big"]
+        ):
             shaped = informix_module._transformed_rows(iter(rows[:1]), transforms, {})
             self.assertEqual(list(shaped), [{"id": 1, "big": 5}])
             with self.assertRaisesRegex(InformixError, "outside the range of a 64-bit integer"):

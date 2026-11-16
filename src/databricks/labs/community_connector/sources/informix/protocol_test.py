@@ -1,6 +1,7 @@
 """Source-local golden tests for bytecode-verified protocol layouts."""
 
 import base64
+import codecs
 import inspect
 import io
 import ssl
@@ -9,6 +10,8 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import Mock, patch
+
+import databricks.labs.community_connector.sources.informix.sqli as _sqli
 
 from databricks.labs.community_connector.sources.informix.cdc_protocol import (
     CdcFrameParser,
@@ -152,8 +155,12 @@ class FrameTests(unittest.TestCase):
         # Frames no LVARCHAR has: no room for the flag, a NULL with a payload, and an
         # unknown flag on a value with none.
         # The frames a live server sent for 'hello', forty characters, '', and a NULL.
-        self.assertEqual(decode_value(memoryview(bytes.fromhex("00060068656c6c6f")), column), ("hello", 8))
-        self.assertEqual(decode_value(memoryview(bytes.fromhex("002900") + b"x" * 40), column), ("x" * 40, 43))
+        self.assertEqual(
+            decode_value(memoryview(bytes.fromhex("00060068656c6c6f")), column), ("hello", 8)
+        )
+        self.assertEqual(
+            decode_value(memoryview(bytes.fromhex("002900") + b"x" * 40), column), ("x" * 40, 43)
+        )
         for frame in (b"\x00\x00\x00", b"\x00\x03\x01ab", b"\x00\x01\x07", b"\x00\x03\x07ab"):
             with self.assertRaises(CdcProtocolError):
                 decode_value(memoryview(frame), column)
@@ -385,10 +392,10 @@ class FrameTests(unittest.TestCase):
 
     def test_char_result_codeset_mismatch_raises_actionable_error(self):
         # A lone 0xE9 ('é' in Latin-1) is not valid UTF-8. Decoding it as UTF-8
-        # must raise a diagnostic that points at CLIENT_LOCALE rather than a bare
-        # UnicodeDecodeError, so a locale misconfiguration is recognizable.
+        # must raise a diagnostic that points at DB_LOCALE, the codeset text is decoded
+        # in, rather than a bare UnicodeDecodeError.
         column = ResultColumn("owner", 0, 0, 0, 4)
-        with self.assertRaisesRegex(SqliProtocolError, "CLIENT_LOCALE"):
+        with self.assertRaisesRegex(SqliProtocolError, "the codeset of DB_LOCALE"):
             _decode_result_value(b"caf\xe9", column, "utf-8")
 
     def test_ordinary_boolean_null_and_marker_validation(self):
@@ -556,6 +563,37 @@ class SqliPacketTests(unittest.TestCase):
         ):
             self.assertEqual(client.execute("SELECT 1 FROM systables"), [])
 
+    def test_text_after_login_goes_both_ways_in_the_database_codeset(self):
+        # Informix converts no text between the client's locale and the database's (probed
+        # on 14.10): a Latin-1 database's text arrives as Latin-1 bytes whatever
+        # CLIENT_LOCALE says, and a statement's text is stored as sent. So statements go
+        # out, and results are decoded, in DB_LOCALE's codeset; the login keeps the
+        # client's.
+        client = InformixSqliClient(
+            "host",
+            9088,
+            "db",
+            "user",
+            "password",
+            db_locale="en_US.819",
+            client_locale="en_US.utf8",
+        )
+        self.assertEqual(codecs.lookup(client._text_encoding).name, "iso8859-1")
+        self.assertEqual(codecs.lookup(client._encoding).name, "utf-8")
+        output = io.BytesIO()
+        with (
+            patch.object(client, "_require_open", return_value=(io.BytesIO(), output)),
+            patch.object(client, "_read_status_group"),
+        ):
+            client.execute_command("INSERT INTO t VALUES ('é')")
+        self.assertIn("'é'".encode("latin-1"), output.getvalue())
+        self.assertNotIn("é".encode("utf-8"), output.getvalue())
+        column = ResultColumn("v", 0, 0, 0, 4)
+        self.assertEqual(
+            _sqli._decode_result_value(b"\xe9   ", column, client._text_encoding, False, "keep"),
+            "é",
+        )
+
     def test_execute_routes_non_row_statements_to_command_path(self):
         client = InformixSqliClient("host", 9088, "db", "user", "password")
         with patch.object(client, "execute_command") as execute_command:
@@ -577,13 +615,15 @@ class SqliPacketTests(unittest.TestCase):
         column = ColumnDescriptor("nc", "CHAR", 4)
         for mode in ("null", "empty", "keep"):
             self.assertEqual(
-                decode_value(memoryview(bytes.fromhex("00202020")), column, null_byte=mode), (None, 4)
+                decode_value(memoryview(bytes.fromhex("00202020")), column, null_byte=mode),
+                (None, 4),
             )
             self.assertEqual(
                 decode_value(memoryview(bytes.fromhex("20202020")), column, null_byte=mode), ("", 4)
             )
             self.assertEqual(
-                decode_value(memoryview(bytes.fromhex("78202020")), column, null_byte=mode), ("x", 4)
+                decode_value(memoryview(bytes.fromhex("78202020")), column, null_byte=mode),
+                ("x", 4),
             )
 
     def test_a_padded_varchar_is_read_by_its_length_byte(self):
@@ -677,10 +717,19 @@ class SqliPacketTests(unittest.TestCase):
                 calls.append(("socket", "close"))
 
         for abrupt, expected in (
-            (True, [("socket", "shutdown"), ("in", "close"), ("out", "close"), ("socket", "close")]),
+            (
+                True,
+                [("socket", "shutdown"), ("in", "close"), ("out", "close"), ("socket", "close")],
+            ),
             (
                 False,
-                [("out", "write"), ("out", "flush"), ("in", "close"), ("out", "close"), ("socket", "close")],
+                [
+                    ("out", "write"),
+                    ("out", "flush"),
+                    ("in", "close"),
+                    ("out", "close"),
+                    ("socket", "close"),
+                ],
             ),
         ):
             calls.clear()
@@ -1037,7 +1086,9 @@ class SqliPacketTests(unittest.TestCase):
             ):
                 client.connect()
             self.assertEqual(connect_once.call_args_list[0].args[:2], ("origin", 9088))
-            self.assertEqual((client.hostname, client.port, client.server_name), ("origin", 9088, "origin"))
+            self.assertEqual(
+                (client.hostname, client.port, client.server_name), ("origin", 9088, "origin")
+            )
             self.assertEqual((client.connected_hostname, client.connected_port), ("target", 9089))
 
     def test_redirect_retries_each_validated_dns_address(self):
@@ -1490,14 +1541,16 @@ class SqliPacketTests(unittest.TestCase):
         # followed by spaces: read as ending with its value, every later column ran out
         # of the payload.
         payload = (
-            b"\x02ab" + b" " * 8
+            b"\x02ab"
+            + b" " * 8
             + b"\x00"
             + struct.pack(">i", 5)
             + b"hello"
             + b"\x00"
             + struct.pack(">i", 1)
             + b"\x01"
-            + b"\x01z" + b" " * 9
+            + b"\x01z"
+            + b" " * 9
         )
         transcript = struct.pack(">hi", 0, len(payload)) + payload
         if len(payload) & 1:

@@ -427,23 +427,37 @@ def iter_unload_records(text: str) -> list[str]:
     return records
 
 
+class UnloadEmpty(str):
+    """A field that was one escaped space: how UNLOAD writes an empty string (``|\\ |``),
+    where ``||`` is a NULL and ``| |`` one blank. It is the empty string, which the
+    connector lands for it, not the NULL an empty field is."""
+
+
 def parse_unload_line(line: str) -> list[str]:
     values: list[str] = []
     value: list[str] = []
     escaped = False
+    # Whether the field so far is one escaped space and nothing else.
+    empty = False
+
+    def field() -> str:
+        return UnloadEmpty("") if empty else "".join(value)
+
     for character in line.rstrip("\n"):
         if escaped:
+            empty = character == " " and not value
             value.append({"n": "\n", "r": "\r", "t": "\t"}.get(character, character))
             escaped = False
         elif character == "\\":
             escaped = True
         elif character == "|":
-            values.append("".join(value))
-            value = []
+            values.append(field())
+            value, empty = [], False
         else:
+            empty = False
             value.append(character)
     if value:
-        values.append("".join(value))
+        values.append(field())
     return values
 
 
@@ -528,12 +542,23 @@ def compare_table(
             raise RuntimeError(
                 f"{table}:{number} has {len(values)} fields; expected {len(columns)}"
             )
-        # UNLOAD writes a NULL as an empty field, and an empty or all-blank string as a
-        # backslash and a space: an empty field is a NULL whatever the column's type. Read
-        # as an empty string it differed from the destination's NULL in every character
+        # UNLOAD writes a NULL as an empty field, and an empty string as a backslash and a
+        # space (UnloadEmpty): an empty field is a NULL whatever the column's type. Read as
+        # an empty string it differed from the destination's NULL in every character
         # column, which a keyless table's whole-row compare counts as a row missing and a
-        # row too many.
-        source.append(dict(zip(columns, (None if value == "" else value for value in values))))
+        # row too many. The empty string is "", as the connector lands it; read as the
+        # space it decodes to, it differed from the destination's "".
+        source.append(
+            dict(
+                zip(
+                    columns,
+                    (
+                        None if value == "" and not isinstance(value, UnloadEmpty) else value
+                        for value in values
+                    ),
+                )
+            )
+        )
     with destination_pipe.open("w") as handle:
         for row in destination:
             handle.write("|".join(pipe_value(row.get(column)) for column in columns) + "|\n")

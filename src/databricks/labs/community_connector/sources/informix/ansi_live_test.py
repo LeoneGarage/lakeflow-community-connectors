@@ -78,7 +78,7 @@ class ScalarTypesLiveTest(unittest.TestCase):
             PurePythonInformixBridge,
             Table,
             _capture_descriptor,
-            _client_encoding,
+            _database_encoding,
         )
 
         table_name = options.get("scalar.types.test.table")
@@ -114,7 +114,7 @@ class ScalarTypesLiveTest(unittest.TestCase):
                         expected,
                         scalar_columns,
                         option_name,
-                        _client_encoding(options),
+                        _database_encoding(options),
                     )
                 snapshot_row = self._matching_row(rows, expected)
                 self.assertIsNotNone(
@@ -171,12 +171,12 @@ class ScalarTypesLiveTest(unittest.TestCase):
                         expected,
                         scalar_columns,
                         option_name,
-                        _client_encoding(options),
+                        _database_encoding(options),
                     )
                 start_lsn = bridge.boundary_lsn()
                 self._execute_committed(writer, sql)
                 records = bridge.read_changes(
-                    [_capture_descriptor(table, _client_encoding(options))],
+                    [_capture_descriptor(table, _database_encoding(options))],
                     start_lsn,
                     int(options.get("cdc.timeout", "5")),
                     256,

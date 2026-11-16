@@ -105,17 +105,21 @@ connection:
       type: string
       required: false
       description: >
-        Informix database locale sent during SQLI authentication. Default
-        `en_US.819`. Set it explicitly when the database uses another locale;
-        locale discovery is not implemented.
+        The database's locale, sent during SQLI authentication. Default
+        `en_US.819`. Informix sends text as the database holds it, in its
+        codeset, whatever the client's locale, so the connector decodes and sends
+        all text in this locale's codeset. It must name the database's codeset:
+        the connector checks it against sysmaster:sysdbslocale when it connects
+        and fails naming the database's locale otherwise.
 
     - name: CLIENT_LOCALE
       type: string
       required: false
       description: >
-        Informix client locale sent during SQLI authentication. Default
-        `en_US.utf8`. Its codeset selects Python row decoding; set it explicitly
-        when another client encoding is required.
+        The codeset of snapshot.source extract files (.unl, HPL), which dbaccess
+        writes in its own CLIENT_LOCALE; give it the one the extract ran under.
+        Default `en_US.utf8`. Also sent during SQLI authentication. It does not
+        change how text read from Informix is decoded (see DB_LOCALE).
 
     - name: encrypt
       type: string
@@ -579,31 +583,6 @@ connection:
         DATETIME key columns combined with non-DATETIME columns in a composite
         key. Set false to force the blocking snapshot for DATETIME-keyed tables.
 
-    - name: decimal.variable.type
-      type: string
-      required: false
-      description: >
-        Per-table option controlling how Informix variable-scale
-        `DECIMAL(p)`/`NUMERIC(p)` columns (decimal floating point, where `p` is a
-        significant-digit count and the exponent floats) map to a Spark type.
-        Valid values: `string` (lossless canonical strings), `double`
-        (`DoubleType`), `integer` (`LongType`, truncated toward zero), or
-        `decimal(p,s)` (`DecimalType(p,s)`). Default `decimal(38,18)`. Values
-        whose integer part exceeds the chosen `decimal(p,s)` or the 64-bit range
-        of `integer` fail with a clear error. Explicit fixed-scale `DECIMAL(p,s)`
-        columns are unaffected and remain `DecimalType(p,s)`. Set it per table: a
-        connection-level value is not used.
-
-    - name: decimal.variable.column.type
-      type: string
-      required: false
-      description: >
-        Per-table option with comma-separated `column:type` pairs that override
-        `decimal.variable.type` for individual variable-scale decimal columns.
-        `type` accepts the same values as `decimal.variable.type`, including
-        `decimal(p,s)`. Example:
-        `agt_no:decimal(9,0),bnk_acct_no:string`.
-
     - name: snapshot.max.rows
       type: string
       required: false
@@ -612,112 +591,6 @@ connection:
         Default `0` disables the bound because CDC snapshots retain only one
         page in worker memory. Snapshot-only tables remain bounded to `100000`
         rows when this option is `0`.
-
-    - name: snapshot.filter
-      type: string
-      required: false
-      description: >
-        Per-table Informix SQL predicate appended to snapshot SELECT statements,
-        without the WHERE keyword. Applies to blocking, incremental, append-only
-        initial, and snapshot-only copies; subsequent CDC events are not filtered.
-        Semicolons, SQL comments, control characters, and predicates longer than
-        8192 characters are rejected. To filter the change stream as well, use
-        row_filter.
-
-    - name: include_columns
-      type: string
-      required: false
-      description: >
-        Per-table list of the columns to ingest, as a comma-separated list or a JSON
-        array; every other column is left out of the snapshot, the CDC capture, and
-        the destination. A column added to the source later stays out. Key columns
-        must be listed, and so must any column row_filter uses. Every name must be a
-        column of the table; after dropping a listed column at the source, take it
-        out of the list (no full refresh needed). A column of an unsupported type
-        (BYTE, TEXT, BLOB, CLOB, collections) is left out by the connector anyway, with
-        a warning; naming one here fails the table. Changing the selection on a running
-        table fails closed until a full refresh. Mutually exclusive with
-        exclude_columns.
-
-    - name: exclude_columns
-      type: string
-      required: false
-      description: >
-        Per-table list of columns to leave out, as a comma-separated list or a JSON
-        array; every other column is ingested, including ones added to the source
-        later. Otherwise behaves as include_columns: key columns and row_filter
-        columns cannot be excluded, every name must be a column of the table, and
-        changing the list on a running table fails closed until a full refresh.
-        Mutually exclusive with include_columns.
-
-    - name: transform_columns
-      type: string
-      required: false
-      description: >
-        Per-table JSON object from column name to an expression over that column that
-        replaces its value as rows leave the connector (snapshots, files, CDC upserts,
-        deletes, and tombstones), so raw values never reach Spark. Expressions use the
-        row_filter functions plus MASK(s[, keep[, char]]), HASH(x) (HMAC-SHA256 hex
-        keyed by transform.hash.key), and NULLIFY(x), and may read only the column they
-        replace. A key column takes only HASH(column). row_filter and the key options see
-        source values; renames apply after. Changing the transforms on a running table
-        fails closed until a full refresh, except removing the entry for a column
-        dropped at the source.
-
-    - name: rename_columns
-      type: string
-      required: false
-      description: >
-        Per-table destination names for columns, as a JSON object from source name
-        to destination name or comma-separated source:destination pairs. Renames the
-        reported schema, every row, and the reported primary key; every other option
-        still names source columns. Each source must be a selected column; renames
-        apply together, so columns may swap names; a destination name may not clash,
-        ignoring case, with another landed or connector metadata column, nor hold a
-        space or any of ,;{}()=. Changing the renames on a running table fails closed
-        until a full refresh, except removing the entry for a column dropped at the
-        source.
-
-    - name: row_filter
-      type: string
-      required: false
-      description: >
-        Per-table predicate, without the WHERE keyword, that keeps only matching rows
-        in snapshots, file-sourced snapshots, and the change stream. An UPDATE that
-        moves a row into the filter is upserted and one that moves it out is
-        deleted (a tombstone on the append path), so a keyed destination holds
-        exactly the matching rows. Supports comparisons (=, <>, !=, <, <=, >, >=),
-        [NOT] IN, [NOT] BETWEEN, [NOT] LIKE 'pattern' [ESCAPE 'c'], IS [NOT] NULL,
-        AND, OR, NOT, and parentheses, with numbers, 'quoted strings', TRUE/FALSE,
-        DATE 'YYYY-MM-DD', and TIMESTAMP 'YYYY-MM-DD HH:MM:SS[.ffffff]' values, over
-        numeric, CHAR/VARCHAR/LVARCHAR, BOOLEAN, DATE, and YEAR-anchored DATETIME
-        columns; NVARCHAR takes equality tests and LIKE only, and FLOAT columns are
-        rejected. NULL follows SQL's three-valued logic. Strings compare by code point
-        with trailing spaces ignored. LIKE matches as Informix does: % and _ are
-        wildcards, matching is case-sensitive, trailing blanks of the value and the
-        pattern are ignored, and a backslash (or the ESCAPE character) makes the next
-        character literal; a pattern can't end with its escape character. A function
-        can stand in for the column on the left of a test: UPPER, LOWER, TRIM, LTRIM,
-        RTRIM, LENGTH, CHAR_LENGTH, SUBSTR, REPLACE, LPAD, RPAD, NVL, COALESCE, ABS,
-        MOD, ROUND, TRUNC, YEAR, MONTH, DAY, and WEEKDAY, each evaluated as Informix
-        does (see the README); clock- and session-dependent functions are refused.
-        Every column it uses must be selected. Changing the filter on a running table
-        fails closed until a full refresh. Combined with snapshot.filter by AND.
-
-    - name: snapshot.isolation
-      type: string
-      required: false
-      description: >
-        Per-table isolation level for the monolithic `snapshot.mode=initial`
-        full-table snapshot. `committed_read_last_committed` (default) reads the
-        last-committed image of a locked row instead of holding shared locks, so
-        the snapshot does NOT lock the table against writers; but because it no
-        longer freezes the table, rows inserted during the scan can be captured by
-        both the snapshot and the change stream. A keyed table de-duplicates these
-        by primary key; a KEYLESS table cannot, so it may emit DUPLICATE rows. Set
-        `repeatable_read` to restore the exactly-once, table-locking behavior.
-        Tokens are case- and whitespace-insensitive; unknown values are rejected. Set
-        it per table: a connection-level value is not used.
 
     - name: snapshot.scan
       type: string
@@ -809,39 +682,6 @@ connection:
         then dropped. A keyed table on the normal CDC path ignores this option:
         its deletes are applied only through the separate delete flow. Accepts
         `true`/`false`.
-
-    - name: primary.keys
-      type: string
-      required: false
-      description: >
-        Per-table override for the table's primary key, as a comma-separated list
-        (or JSON array) of column names. When set, the connector treats the table
-        as keyed on those columns -- even a physically keyless table -- so it is
-        read as cdc_with_deletes with keyset-paginated snapshots and delete
-        identification, and reports those keys so the pipeline uses them as the
-        destination merge key too (no separate `primary_keys` needed). The columns
-        must exist in the table. You MUST guarantee they are unique per row: a
-        non-unique override corrupts upserts, delete identification, and snapshot
-        pagination. A key column declared nullable may hold NULL: a delete carries
-        the NULL through and the pipeline's delete flow matches NULL key values, so
-        updates and deletes of that row apply normally. A NULL in a NOT NULL key
-        column still fails the pipeline as a broken log record, and a NULL key value
-        can still make a keyset snapshot skip rows or fail (snapshot.scan=cursor
-        avoids that). Leave unset to use the catalog's primary key (or none).
-        Set "*" (or ["*"]) to key on every column, in catalog column order, so the
-        whole row is its identity -- for a keyless table whose rows are unique as a
-        whole. Nullable columns join the wildcard key too, so the NULL behaviour
-        above applies to every nullable column; on an append-only table with
-        snapshot.mode=cdc_only, its default, NULLs are harmless. "* except(c1, c2)"
-        keys on every column but the ones named, so an update that changes only
-        those columns updates the row in place; each name must be a column of the
-        table, matched ignoring case. The wildcard
-        follows the schema: an appended column joins the key. For a table already
-        streaming changes, a nullable column added without a default extends the
-        key without a full refresh; a column added with a default, or while an
-        incremental copy is still running, needs a full refresh. A dropped
-        column leaves the key the same way, from the pipeline's next start; rows that differed only in that column then collapse like exact
-        duplicates.
 
     - name: snapshot.max.bytes
       type: string
@@ -1167,24 +1007,6 @@ connection:
         to keep the old behaviour (only a real primary key makes a table keyed).
         Changing this changes a table's schema fingerprint, so enabling it on an
         already-running key-less table needs a full refresh. Accepts true/false.
-
-    - name: allow.nullable.index
-      type: string
-      required: false
-      description: >
-        Per-table opt-in (default false). When a table has no primary key and no
-        all-NOT-NULL UNIQUE index, setting this true lets a UNIQUE index that
-        includes nullable column(s) stand in as the key, so the table takes the
-        resumable keyed path instead of the one-shot key-less drain. The operator
-        thereby asserts those columns are unique for every row. A row that does hold
-        NULL in one of them is still updated and deleted correctly: as for a
-        primary.keys override, a delete carries the NULL through and the pipeline's
-        delete flow matches NULL key values. What a NULL can still break is keyset
-        snapshot paging, which compares key values and may skip the row or fail;
-        snapshot.scan=cursor avoids that.
-        Only has effect when primary.key.from.unique.index is enabled (the default)
-        and no non-null key exists; an all-NOT-NULL index and an explicit
-        primary.keys option both still win. Accepts true/false.
 
     - name: capacity.retry.max.delay.seconds
       type: string

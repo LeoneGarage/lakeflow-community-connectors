@@ -145,20 +145,20 @@ def informix_locale_encoding(locale: str | None) -> str:
 def _decode_text(raw: bytes, encoding: str) -> str:
     # Docstring: Decode a result string, turning a codeset mismatch into an actionable error.
     #
-    # Informix converts result data from the database codeset to the client codeset
-    # on the wire, so ``encoding`` is the CLIENT_LOCALE codec. A strict decode failure
-    # almost always means CLIENT_LOCALE does not match what the server actually sent
-    # (for example CLIENT_LOCALE left at en_US.utf8 while the server transmits Latin-1
-    # for an en_US.819 database). Surface that as a clear diagnostic instead of a bare
-    # UnicodeDecodeError so the fix -- align CLIENT_LOCALE with the source -- is obvious.
+    # Informix sends text as the database holds it, in its codeset, so ``encoding`` is
+    # the DB_LOCALE codec (see InformixSqliClient._text_encoding). A strict decode
+    # failure means the value's bytes are not text in that codeset: written by a client
+    # that sent another codeset unconverted, or DB_LOCALE naming another codeset than the
+    # database's (the connector checks that when it connects).
 
     try:
         return raw.decode(encoding)
     except UnicodeDecodeError as exc:
         raise SqliProtocolError(
-            f"Could not decode an Informix result string as {encoding!r}; this usually "
-            "means CLIENT_LOCALE does not match the codeset the server is sending "
-            "(align CLIENT_LOCALE with the source database's DB_LOCALE)"
+            f"Could not decode an Informix result string as {encoding!r}, the codeset of "
+            "DB_LOCALE: the database holds a value that is not text in its codeset, "
+            "written by a client that did not convert it, or DB_LOCALE does not name the "
+            "database's locale"
         ) from exc
 
 
@@ -1520,7 +1520,19 @@ class InformixSqliClient:
 
     @property
     def _encoding(self) -> str:
+        # The login's codec: user, password, server and database names go out in it.
         return informix_locale_encoding(self.client_locale)
+
+    @property
+    def _text_encoding(self) -> str:
+        # The codec of every text after login, statements and values both ways: the
+        # database's codeset (DB_LOCALE). The server converts no text between the client's
+        # locale and the database's (probed on 14.10: a session declaring
+        # CLIENT_LOCALE=en_US.utf8 stored and was sent a Latin-1 database's bytes as they
+        # were); a CSDK or JDBC client converts on its own side. Decoded in
+        # CLIENT_LOCALE's codec, a Latin-1 database's text failed under the default
+        # en_US.utf8, and a UTF-8 database's came out garbled under en_US.819.
+        return informix_locale_encoding(self.db_locale or "en_US.819")
 
     def _require_open(self) -> tuple[BinaryIO, BinaryIO]:
         if (
@@ -1631,7 +1643,7 @@ class InformixSqliClient:
         statement_offset = (
             read_int32(self._input) if self.remove_64k_limit else read_smallint(self._input)
         )
-        message = "" if sqlcode == -368 else decode_char(self._input, self._encoding)
+        message = "" if sqlcode == -368 else decode_char(self._input, self._text_encoding)
         return sqlcode, isamcode, statement_offset, message
 
     def execute(
@@ -1649,7 +1661,7 @@ class InformixSqliClient:
         with self._lock:
             try:
                 output_stream.write(
-                    encode_prepare(sql, self._encoding, len(typed), self.remove_64k_limit)
+                    encode_prepare(sql, self._text_encoding, len(typed), self.remove_64k_limit)
                 )
                 output_stream.flush()
                 description, rows, _ = self._read_query_group(None)
@@ -1672,17 +1684,19 @@ class InformixSqliClient:
                 if description is None:
                     return rows
                 cursor_name = f"lc_{description.statement_id}"
-                binds = encode_bind(typed, self._encoding) if typed else b""
+                binds = encode_bind(typed, self._text_encoding) if typed else b""
                 variable = self._variable_tuples(description)
                 if variable:
                     output_stream.write(
                         encode_cursor_open(
-                            description.statement_id, cursor_name, self._encoding, binds
+                            description.statement_id, cursor_name, self._text_encoding, binds
                         )
                     )
                     output_stream.flush()
                     self._read_query_group(description)
-                    output_stream.write(encode_variable_fetch(description, encoding=self._encoding))
+                    output_stream.write(
+                        encode_variable_fetch(description, encoding=self._text_encoding)
+                    )
                     output_stream.flush()
                     _, batch, exhausted = self._read_query_group(description)
                     append_batch(batch)
@@ -1694,7 +1708,7 @@ class InformixSqliClient:
                             description.statement_id,
                             cursor_name,
                             binds,
-                            self._encoding,
+                            self._text_encoding,
                             4096,
                         )
                     )
@@ -1749,7 +1763,7 @@ class InformixSqliClient:
         with self._lock:
             try:
                 output_stream.write(
-                    encode_prepare(sql, self._encoding, len(typed), self.remove_64k_limit)
+                    encode_prepare(sql, self._text_encoding, len(typed), self.remove_64k_limit)
                 )
                 output_stream.flush()
                 description, initial, _ = self._read_query_group(None)
@@ -1763,19 +1777,21 @@ class InformixSqliClient:
                 if variable:
                     output_stream.write(
                         encode_cursor_open(
-                            description.statement_id, cursor_name, self._encoding, b""
+                            description.statement_id, cursor_name, self._text_encoding, b""
                         )
                     )
                     output_stream.flush()
                     self._read_query_group(description)
-                    output_stream.write(encode_variable_fetch(description, encoding=self._encoding))
+                    output_stream.write(
+                        encode_variable_fetch(description, encoding=self._text_encoding)
+                    )
                 else:
                     output_stream.write(
                         encode_fixed_open_fetch(
                             description.statement_id,
                             cursor_name,
                             b"",
-                            self._encoding,
+                            self._text_encoding,
                             4096,
                         )
                     )
@@ -1806,7 +1822,7 @@ class InformixSqliClient:
         with self._lock:
             try:
                 output_stream.write(
-                    encode_simple_command(sql, self._encoding, self.remove_64k_limit)
+                    encode_simple_command(sql, self._text_encoding, self.remove_64k_limit)
                 )
                 output_stream.flush()
                 self._read_status_group(require_done=True)
@@ -1895,8 +1911,8 @@ class InformixSqliClient:
             position = read_int32(self._input)
             type_code = read_smallint(self._input)
             extended_id = read_int32(self._input)
-            extended_owner = decode_char(self._input, self._encoding)
-            extended_name = decode_char(self._input, self._encoding)
+            extended_owner = decode_char(self._input, self._text_encoding)
+            extended_name = decode_char(self._input, self._text_encoding)
             read_smallint(self._input)
             read_smallint(self._input)
             read_int32(self._input)
@@ -1928,7 +1944,7 @@ class InformixSqliClient:
         names = (
             []
             if count == 0 and not names_raw
-            else [item.decode(self._encoding) for item in names_raw.rstrip(b"\0").split(b"\0")]
+            else [item.decode(self._text_encoding) for item in names_raw.rstrip(b"\0").split(b"\0")]
         )
         if len(names) != count or len(set(names)) != count:
             raise SqliProtocolError("descriptor names do not match column count")
@@ -1988,7 +2004,7 @@ class InformixSqliClient:
                     f"exceeds payload size {len(payload)}"
                 )
             result[column.name] = _decode_result_value(
-                payload[start:limit], column, self._encoding, padded, self.null_byte
+                payload[start:limit], column, self._text_encoding, padded, self.null_byte
             )
             cursor = limit
         return result
@@ -2101,6 +2117,7 @@ __all__ = [
     "datetime_order_preserving_cast",
     "AuthenticationProvider",
     "ConnectionState",
+    "InformixDatetimeLiteral",
     "InformixSqliClient",
     "PasswordAuthenticationProvider",
     "SqliDescriptorNotImplemented",
@@ -2110,6 +2127,7 @@ __all__ = [
     "SqliRedirect",
     "SqliUnsupportedAuthentication",
     "TypedBind",
+    "add_informix_exception_note",
     "decode_char",
     "decode_asc_accept",
     "encode_asc_environment",
@@ -2132,6 +2150,7 @@ __all__ = [
     "encode_secondary_info",
     "encode_session_packet",
     "encode_simple_command",
+    "informix_locale_encoding",
     "parse_redirect_detail",
     "read_session_packet",
 ]

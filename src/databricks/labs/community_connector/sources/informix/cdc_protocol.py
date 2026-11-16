@@ -717,6 +717,7 @@ __all__ = [
     "UnsupportedCdcType",
     "datetime_from_text",
     "apply_null_byte",
+    "cdc_routine",
     "decode_frame",
     "decode_interval",
     "interval_layout",
@@ -724,5 +725,6 @@ __all__ = [
     "decode_packed_decimal",
     "decode_row",
     "decode_value",
+    "frame_log_file",
     "validate_snapshot_arity",
 ]

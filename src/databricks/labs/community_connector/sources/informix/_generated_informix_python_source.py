@@ -72,6 +72,7 @@ from pyspark.sql.types import (
 )
 import base64
 import bisect
+import codecs
 import concurrent.futures
 import contextlib
 import errno
@@ -1354,6 +1355,7 @@ def register_lakeflow_source(spark):
         "UnsupportedCdcType",
         "datetime_from_text",
         "apply_null_byte",
+        "cdc_routine",
         "decode_frame",
         "decode_interval",
         "interval_layout",
@@ -1361,6 +1363,7 @@ def register_lakeflow_source(spark):
         "decode_packed_decimal",
         "decode_row",
         "decode_value",
+        "frame_log_file",
         "validate_snapshot_arity",
     ]
 
@@ -1696,7 +1699,9 @@ def register_lakeflow_source(spark):
             client = WorkspaceClient()
             host = host or client.config.host or ""
             if not token:
-                scheme, _, value = str((client.config.authenticate() or {}).get("Authorization", "")).partition(" ")
+                scheme, _, value = str(
+                    (client.config.authenticate() or {}).get("Authorization", "")
+                ).partition(" ")
                 token = value.strip() if scheme.lower() == "bearer" else ""
             if not host or not token:
                 raise LakebaseStateError(
@@ -1948,6 +1953,11 @@ def register_lakeflow_source(spark):
                     _LOGGER.debug("Could not revoke stale staging token %s", token_id, exc_info=True)
 
 
+    # How long a staging token refresh that failed waits before it is tried again; the token
+    # it would have replaced is still valid then (refreshed at half its lifetime).
+    _STAGING_TOKEN_REFRESH_RETRY_SECONDS = 60.0
+
+
     class StagingCredentialProvider:
         # Docstring: Supplies a Files-API bearer token, refreshing it before it can expire.
         #
@@ -1994,6 +2004,8 @@ def register_lakeflow_source(spark):
             self._token: str | None = None
             self._token_id = ""
             self._minted_at = 0.0
+            # When a refresh that failed may be tried again (clock time); 0 until one fails.
+            self._refresh_retry_at = 0.0
             # Set when a token was rejected and nothing could mint a successor, so an
             # ``auto`` staging transport can fall back to FUSE; cleared by the next mint.
             self.rejected = False
@@ -2011,12 +2023,18 @@ def register_lakeflow_source(spark):
                     # First mint uses the carried bootstrap credential; a failure here is
                     # fatal for REST and surfaces as StagingTokenUnavailable to the caller.
                     self._mint(self._bootstrap_token)
-                elif now - self._minted_at >= self._refresh_after:
+                elif now - self._minted_at >= self._refresh_after and now >= self._refresh_retry_at:
                     try:
                         self._mint(self._token)
                     except Exception:  # noqa: BLE001 - keep the still-valid token on refresh failure
+                        # Tried again a minute on, not on the next call: every Files API
+                        # request calls here, each 4 MiB chunk of a read included, and each
+                        # failed refresh is a token request retried up to four times.
+                        self._refresh_retry_at = now + _STAGING_TOKEN_REFRESH_RETRY_SECONDS
                         _LOGGER.warning(
-                            "Snapshot-staging token refresh failed; reusing the current token",
+                            "Snapshot-staging token refresh failed; reusing the current token and "
+                            "trying again in %g s",
+                            _STAGING_TOKEN_REFRESH_RETRY_SECONDS,
                             exc_info=True,
                         )
                 return self._token or ""
@@ -2477,6 +2495,23 @@ def register_lakeflow_source(spark):
         connection.commit()
 
 
+    def _stale_provisioning_error(error: BaseException) -> bool:
+        # Docstring: Whether a failed state connect says the provisioning it used no longer holds:
+        # a rejected password (Postgres words an absent role the same way) or a host that no
+        # longer resolves.
+
+        text = str(error).lower()
+        return any(
+            part in text
+            for part in (
+                "password authentication failed",
+                "could not translate host name",
+                "name or service not known",
+                "nodename nor servname provided",
+            )
+        )
+
+
     class LakebaseState:
         # Docstring: Connection factory and provisioning entry point for Lakebase state.
         #
@@ -2484,7 +2519,8 @@ def register_lakeflow_source(spark):
         # per process behind a lock, so the 60-odd flows a pipeline starts converge on
         # a single set of control-plane calls instead of each issuing their own.
 
-        _provisioned: dict[str, dict[str, Any]] = {}
+        # Keyed by project, database and password (see _provision_key).
+        _provisioned: dict[tuple[str, str, str], dict[str, Any]] = {}
         # Held in a dict and built on first use rather than at class creation. Spark
         # cloudpickles the reader class, and the merged single-file deployment puts this
         # class in the same namespace the reader closes over, so a lock alive at import
@@ -2548,6 +2584,16 @@ def register_lakeflow_source(spark):
         def project_id(self) -> str:
             return self._project_id
 
+        def _provision_key(self) -> tuple[str, str, str]:
+            # Docstring: What one provisioning in this process covers: the project, and the
+            # database and state-role password it made ready. Keyed by the project alone, a
+            # second connection on the project with another lakebase.database, or a changed
+            # lakebase.password in a warm process, skipped the role repair and schema setup and
+            # failed every connect. The password goes in as a digest, not as itself.
+
+            digest = hashlib.sha256(self._password.encode("utf-8")).hexdigest()
+            return (self._project_id, self._database, digest)
+
         def _api_client(self) -> _WorkspaceApi:
             if self._api is None:
                 host, token = _workspace_credentials(self._options)
@@ -2557,7 +2603,8 @@ def register_lakeflow_source(spark):
         def provision(self) -> dict[str, Any]:
             # Docstring: Idempotently ensure the project, endpoint, and schema all exist.
 
-            cached = LakebaseState._provisioned.get(self._project_id)
+            key = self._provision_key()
+            cached = LakebaseState._provisioned.get(key)
             if cached is not None:
                 self._facts = cached
                 return cached
@@ -2569,7 +2616,7 @@ def register_lakeflow_source(spark):
                     f"waiting for the provisioning lock for project {self._project_id}"
                 )
             try:
-                cached = LakebaseState._provisioned.get(self._project_id)
+                cached = LakebaseState._provisioned.get(key)
                 if cached is not None:
                     self._facts = cached
                     return cached
@@ -2589,7 +2636,7 @@ def register_lakeflow_source(spark):
                     ensure_schema(connection)
                 finally:
                     connection.close()
-                LakebaseState._provisioned[self._project_id] = facts
+                LakebaseState._provisioned[key] = facts
                 return facts
             except LakebaseStateError as error:
                 raise LakebaseStateError(
@@ -2659,7 +2706,21 @@ def register_lakeflow_source(spark):
             # Always the state role: its password needs no control-plane call and
             # cannot expire mid-stream. The admin identity is reached only through
             # ``_connect_as_admin``, during provisioning.
-            return self._open(facts, self._user_id, self._password)
+            try:
+                return self._open(facts, self._user_id, self._password)
+            except Exception as error:
+                if _stale_provisioning_error(error):
+                    # The project was re-created under another host since this process
+                    # provisioned it, or the role's password changed under it: provisioned
+                    # once per process, every later connect failed. Forget it, so the next
+                    # connect provisions again and repairs the role. Not for other failures:
+                    # provisioning needs the workspace API, whose credentials a long-running
+                    # reader may no longer hold, where a plain retry would have worked.
+                    key = self._provision_key()
+                    if LakebaseState._provisioned.get(key) is facts:
+                        LakebaseState._provisioned.pop(key, None)
+                    self._facts = None
+                raise
 
         def collect_unused_projects(self, retention_days: int, interval_hours: float) -> int:
             # Docstring: Delete inactive, auto-named connector projects once per scan interval.
@@ -2767,7 +2828,8 @@ def register_lakeflow_source(spark):
                 finally:
                     if connection is not None:
                         connection.close()
-                LakebaseState._provisioned.pop(project_id, None)
+                for key in [key for key in LakebaseState._provisioned if key[0] == project_id]:
+                    LakebaseState._provisioned.pop(key, None)
                 deleted += 1
             return deleted
 
@@ -4057,20 +4119,20 @@ def register_lakeflow_source(spark):
     def _decode_text(raw: bytes, encoding: str) -> str:
         # Docstring: Decode a result string, turning a codeset mismatch into an actionable error.
         #
-        # Informix converts result data from the database codeset to the client codeset
-        # on the wire, so ``encoding`` is the CLIENT_LOCALE codec. A strict decode failure
-        # almost always means CLIENT_LOCALE does not match what the server actually sent
-        # (for example CLIENT_LOCALE left at en_US.utf8 while the server transmits Latin-1
-        # for an en_US.819 database). Surface that as a clear diagnostic instead of a bare
-        # UnicodeDecodeError so the fix -- align CLIENT_LOCALE with the source -- is obvious.
+        # Informix sends text as the database holds it, in its codeset, so ``encoding`` is
+        # the DB_LOCALE codec (see InformixSqliClient._text_encoding). A strict decode
+        # failure means the value's bytes are not text in that codeset: written by a client
+        # that sent another codeset unconverted, or DB_LOCALE naming another codeset than the
+        # database's (the connector checks that when it connects).
 
         try:
             return raw.decode(encoding)
         except UnicodeDecodeError as exc:
             raise SqliProtocolError(
-                f"Could not decode an Informix result string as {encoding!r}; this usually "
-                "means CLIENT_LOCALE does not match the codeset the server is sending "
-                "(align CLIENT_LOCALE with the source database's DB_LOCALE)"
+                f"Could not decode an Informix result string as {encoding!r}, the codeset of "
+                "DB_LOCALE: the database holds a value that is not text in its codeset, "
+                "written by a client that did not convert it, or DB_LOCALE does not name the "
+                "database's locale"
             ) from exc
 
 
@@ -5432,7 +5494,19 @@ def register_lakeflow_source(spark):
 
         @property
         def _encoding(self) -> str:
+            # The login's codec: user, password, server and database names go out in it.
             return informix_locale_encoding(self.client_locale)
+
+        @property
+        def _text_encoding(self) -> str:
+            # The codec of every text after login, statements and values both ways: the
+            # database's codeset (DB_LOCALE). The server converts no text between the client's
+            # locale and the database's (probed on 14.10: a session declaring
+            # CLIENT_LOCALE=en_US.utf8 stored and was sent a Latin-1 database's bytes as they
+            # were); a CSDK or JDBC client converts on its own side. Decoded in
+            # CLIENT_LOCALE's codec, a Latin-1 database's text failed under the default
+            # en_US.utf8, and a UTF-8 database's came out garbled under en_US.819.
+            return informix_locale_encoding(self.db_locale or "en_US.819")
 
         def _require_open(self) -> tuple[BinaryIO, BinaryIO]:
             if (
@@ -5543,7 +5617,7 @@ def register_lakeflow_source(spark):
             statement_offset = (
                 read_int32(self._input) if self.remove_64k_limit else read_smallint(self._input)
             )
-            message = "" if sqlcode == -368 else decode_char(self._input, self._encoding)
+            message = "" if sqlcode == -368 else decode_char(self._input, self._text_encoding)
             return sqlcode, isamcode, statement_offset, message
 
         def execute(
@@ -5561,7 +5635,7 @@ def register_lakeflow_source(spark):
             with self._lock:
                 try:
                     output_stream.write(
-                        encode_prepare(sql, self._encoding, len(typed), self.remove_64k_limit)
+                        encode_prepare(sql, self._text_encoding, len(typed), self.remove_64k_limit)
                     )
                     output_stream.flush()
                     description, rows, _ = self._read_query_group(None)
@@ -5584,17 +5658,19 @@ def register_lakeflow_source(spark):
                     if description is None:
                         return rows
                     cursor_name = f"lc_{description.statement_id}"
-                    binds = encode_bind(typed, self._encoding) if typed else b""
+                    binds = encode_bind(typed, self._text_encoding) if typed else b""
                     variable = self._variable_tuples(description)
                     if variable:
                         output_stream.write(
                             encode_cursor_open(
-                                description.statement_id, cursor_name, self._encoding, binds
+                                description.statement_id, cursor_name, self._text_encoding, binds
                             )
                         )
                         output_stream.flush()
                         self._read_query_group(description)
-                        output_stream.write(encode_variable_fetch(description, encoding=self._encoding))
+                        output_stream.write(
+                            encode_variable_fetch(description, encoding=self._text_encoding)
+                        )
                         output_stream.flush()
                         _, batch, exhausted = self._read_query_group(description)
                         append_batch(batch)
@@ -5606,7 +5682,7 @@ def register_lakeflow_source(spark):
                                 description.statement_id,
                                 cursor_name,
                                 binds,
-                                self._encoding,
+                                self._text_encoding,
                                 4096,
                             )
                         )
@@ -5661,7 +5737,7 @@ def register_lakeflow_source(spark):
             with self._lock:
                 try:
                     output_stream.write(
-                        encode_prepare(sql, self._encoding, len(typed), self.remove_64k_limit)
+                        encode_prepare(sql, self._text_encoding, len(typed), self.remove_64k_limit)
                     )
                     output_stream.flush()
                     description, initial, _ = self._read_query_group(None)
@@ -5675,19 +5751,21 @@ def register_lakeflow_source(spark):
                     if variable:
                         output_stream.write(
                             encode_cursor_open(
-                                description.statement_id, cursor_name, self._encoding, b""
+                                description.statement_id, cursor_name, self._text_encoding, b""
                             )
                         )
                         output_stream.flush()
                         self._read_query_group(description)
-                        output_stream.write(encode_variable_fetch(description, encoding=self._encoding))
+                        output_stream.write(
+                            encode_variable_fetch(description, encoding=self._text_encoding)
+                        )
                     else:
                         output_stream.write(
                             encode_fixed_open_fetch(
                                 description.statement_id,
                                 cursor_name,
                                 b"",
-                                self._encoding,
+                                self._text_encoding,
                                 4096,
                             )
                         )
@@ -5718,7 +5796,7 @@ def register_lakeflow_source(spark):
             with self._lock:
                 try:
                     output_stream.write(
-                        encode_simple_command(sql, self._encoding, self.remove_64k_limit)
+                        encode_simple_command(sql, self._text_encoding, self.remove_64k_limit)
                     )
                     output_stream.flush()
                     self._read_status_group(require_done=True)
@@ -5807,8 +5885,8 @@ def register_lakeflow_source(spark):
                 position = read_int32(self._input)
                 type_code = read_smallint(self._input)
                 extended_id = read_int32(self._input)
-                extended_owner = decode_char(self._input, self._encoding)
-                extended_name = decode_char(self._input, self._encoding)
+                extended_owner = decode_char(self._input, self._text_encoding)
+                extended_name = decode_char(self._input, self._text_encoding)
                 read_smallint(self._input)
                 read_smallint(self._input)
                 read_int32(self._input)
@@ -5840,7 +5918,7 @@ def register_lakeflow_source(spark):
             names = (
                 []
                 if count == 0 and not names_raw
-                else [item.decode(self._encoding) for item in names_raw.rstrip(b"\0").split(b"\0")]
+                else [item.decode(self._text_encoding) for item in names_raw.rstrip(b"\0").split(b"\0")]
             )
             if len(names) != count or len(set(names)) != count:
                 raise SqliProtocolError("descriptor names do not match column count")
@@ -5900,7 +5978,7 @@ def register_lakeflow_source(spark):
                         f"exceeds payload size {len(payload)}"
                     )
                 result[column.name] = _decode_result_value(
-                    payload[start:limit], column, self._encoding, padded, self.null_byte
+                    payload[start:limit], column, self._text_encoding, padded, self.null_byte
                 )
                 cursor = limit
             return result
@@ -6013,6 +6091,7 @@ def register_lakeflow_source(spark):
         "datetime_order_preserving_cast",
         "AuthenticationProvider",
         "ConnectionState",
+        "InformixDatetimeLiteral",
         "InformixSqliClient",
         "PasswordAuthenticationProvider",
         "SqliDescriptorNotImplemented",
@@ -6022,6 +6101,7 @@ def register_lakeflow_source(spark):
         "SqliRedirect",
         "SqliUnsupportedAuthentication",
         "TypedBind",
+        "add_informix_exception_note",
         "decode_char",
         "decode_asc_accept",
         "encode_asc_environment",
@@ -6044,6 +6124,7 @@ def register_lakeflow_source(spark):
         "encode_secondary_info",
         "encode_session_packet",
         "encode_simple_command",
+        "informix_locale_encoding",
         "parse_redirect_detail",
         "read_session_packet",
     ]
@@ -7468,7 +7549,11 @@ def register_lakeflow_source(spark):
                     is_delete = getattr(reader.lakeflow_connect, "_is_delete_flow", None)
                     role = (
                         "delete"
-                        if (is_delete() if callable(is_delete) else options.get("isDeleteFlow") == "true")
+                        if (
+                            is_delete()
+                            if callable(is_delete)
+                            else options.get("isDeleteFlow") == "true"
+                        )
                         else "upsert"
                     )
                     # 10: Informix CDC reader initialized: scope={} table={} role={}
@@ -7596,6 +7681,26 @@ def register_lakeflow_source(spark):
         # neither skipped nor ingested. Run a full refresh to re-establish a restart position in the
         # live log.
         return InformixError(_m(11, location, error, start_lsn, start_lsn >> 32))
+
+
+    def _cdc_text_error(frame: bytes, error: Exception, start_lsn: int) -> InformixError:
+        # Docstring: Explain a CDC record whose text would not decode.
+        #
+        # Two causes look alike here: text that is not in the database's codeset, the one CDC
+        # text is decoded in (a client that wrote another codeset unconverted), and a record
+        # of another table decoded under this capture's layout (see
+        # _stale_capture_label_error). Named alone, the second sent an operator to a full
+        # refresh that could not help with the first.
+
+        log_file = frame_log_file(frame)
+        location = f"logical log {log_file}" if log_file is not None else "an unidentified logical log"
+        encoding = getattr(error.__cause__, "encoding", "the DB_LOCALE codeset")
+        # 454: Unable to decode text in an Informix CDC record from {} as {}, the codeset of
+        # DB_LOCALE: {}. Either the table holds a value that is not text in the database's
+        # codeset, written by a client that did not convert it. Or the record is not of this
+        # capture, which happens when the restart position ({}, logical log {}) lies in a log
+        # file whose space Informix has since reused for other tables: then run a full refresh.
+        return InformixError(_m(454, location, encoding, error, start_lsn, start_lsn >> 32))
 
 
     class UnsupportedChangeError(InformixError):
@@ -7914,6 +8019,7 @@ def register_lakeflow_source(spark):
             connect = getattr(self.transport, "connect", None)
             if connect:
                 connect()
+            self._check_database_locale()
             # Informix takes a string value as a quoted literal within the statement, and by
             # default (ALLOW_NEWLINE 0) refuses one that holds a newline with -282, which
             # also ends the session. A keyset bound or a looked-up key can hold one. The
@@ -7936,6 +8042,60 @@ def register_lakeflow_source(spark):
                         close()
                 if connect:
                     connect()
+
+        def _check_database_locale(self) -> None:
+            # Docstring: Fail a DB_LOCALE whose codeset is not the database's.
+            #
+            # The server sends every text in the database's codeset, and the client decodes it
+            # in that of its DB_LOCALE (InformixSqliClient._text_encoding). The default
+            # en_US.819 on a UTF-8 database decodes without an error, every byte being a
+            # Latin-1 character, and lands garbled text. The database's own locale is in
+            # sysmaster. Checked once per bridge; a client without a DB_LOCALE has nothing to
+            # check.
+
+            if self.__dict__.get("_database_locale_checked"):
+                return
+            configured = getattr(self.transport, "db_locale", None)
+            database = (getattr(self, "config", None) or {}).get("database")
+            execute = getattr(self.transport, "execute", None)
+            if not isinstance(configured, str) or not database or not callable(execute):
+                return
+            try:
+                rows = execute(
+                    "SELECT dbs_collate FROM sysmaster:sysdbslocale WHERE dbs_dbsname = ?",
+                    (database,),
+                )
+            except Exception as error:  # pylint: disable=broad-except
+                # An error ends the session: connect again, and do not ask a second time.
+                self._database_locale_checked = True
+                # 456: Could not read the locale of the database from sysmaster ({}); its
+                # text is decoded in the codeset of DB_LOCALE without that check
+                logging.getLogger(__name__).warning(_m(456, error))
+                close = getattr(self.transport, "close", None)
+                if callable(close):
+                    with contextlib.suppress(Exception):
+                        close()
+                connect = getattr(self.transport, "connect", None)
+                if callable(connect):
+                    connect()
+                return
+            row = rows[0] if isinstance(rows, list) and rows else {}
+            actual = str((row.get("dbs_collate") if isinstance(row, dict) else "") or "").strip()
+            if actual:
+                try:
+                    same = (
+                        codecs.lookup(informix_locale_encoding(actual)).name
+                        == codecs.lookup(informix_locale_encoding(configured)).name
+                    )
+                except (LookupError, ValueError, SqliProtocolError):
+                    # A locale name the connector has no codec for: no telling whether it is
+                    # DB_LOCALE's codeset under another name, so it is not refused.
+                    same = True
+                if not same:
+                    # 455: DB_LOCALE is '{}' but database '{}' has the locale '{}': set DB_LOCALE
+                    # to it, since Informix sends the database's text in its codeset
+                    raise InformixError(_m(455, configured, database, actual))
+            self._database_locale_checked = True
 
         @staticmethod
         def _connection_identity_from(source: dict[str, Any]) -> str:
@@ -7996,7 +8156,8 @@ def register_lakeflow_source(spark):
             return hashlib.sha256(self._connection_identity().encode()).hexdigest()[:24]
 
         def _connection_hints_enabled(self) -> bool:
-            return self.options.get("connection.backlog.hint.enabled", "true") != "false"
+            # Parsed as every other flag is: "False", "0" and "no" turned it off too.
+            return _option_bool(self.options, "connection.backlog.hint.enabled", True)
 
         def _publish_connection_backlog_hint(self) -> None:
             # Docstring: Record the endpoint's current log position for waiters to read.
@@ -9094,9 +9255,7 @@ def register_lakeflow_source(spark):
                         + ")"
                         for values in value_sets
                     ),
-                    tuple(
-                        value for values in value_sets for value in values if value is not None
-                    ),
+                    tuple(value for values in value_sets for value in values if value is not None),
                 )
             return [
                 dict(row) if isinstance(row, dict) else dict(zip(columns, row, strict=True))
@@ -9394,16 +9553,19 @@ def register_lakeflow_source(spark):
                 except Exception as error:
                     cleanup_errors.append(error)
                     cleanup_timed_out = cleanup_timed_out or _is_timeout_error(error)
-            try:
-                _expect_zero(
-                    self.transport.execute(
-                        f"EXECUTE FUNCTION {cdc_routine('cdc_closesess')}(?)", (session,)
-                    ),
-                    "cdc_closesess",
-                )
-            except Exception as error:
-                cleanup_errors.append(error)
-                cleanup_timed_out = cleanup_timed_out or _is_timeout_error(error)
+            if not _transport_closed(self.transport):
+                # A failed call closes the SQLI connection, and the CDC session ends with it:
+                # cdc_closesess would then fail only for want of a connection.
+                try:
+                    _expect_zero(
+                        self.transport.execute(
+                            f"EXECUTE FUNCTION {cdc_routine('cdc_closesess')}(?)", (session,)
+                        ),
+                        "cdc_closesess",
+                    )
+                except Exception as error:
+                    cleanup_errors.append(error)
+                    cleanup_timed_out = cleanup_timed_out or _is_timeout_error(error)
             if set_socket_timeout is not None and previous_socket_timeout is not None:
                 try:
                     set_socket_timeout(float(previous_socket_timeout))
@@ -10183,6 +10345,8 @@ def register_lakeflow_source(spark):
                                 frame, labels, null_byte=getattr(self, "_null_byte", "keep")
                             )
                         except CdcProtocolError as error:
+                            if isinstance(error.__cause__, UnicodeDecodeError):
+                                raise _cdc_text_error(frame, error, start_lsn) from error
                             raise _stale_capture_label_error(frame, error, start_lsn) from error
                         if max_poll_bytes and not (
                             # A spilled transaction's changes are not retained.
@@ -10317,6 +10481,10 @@ def register_lakeflow_source(spark):
                 lease_lost = getattr(self, "_connection_lease_lost", None)
                 if lease_lost is None or not lease_lost.is_set():
                     for native in captures:
+                        if _transport_closed(self.transport):
+                            # A failed call closed the connection, and the CDC session with
+                            # it: the calls left could fail only for want of a connection.
+                            break
                         try:
                             _expect_zero(
                                 self.transport.execute(
@@ -10327,15 +10495,17 @@ def register_lakeflow_source(spark):
                             )
                         except Exception as error:  # preserve an active CDC failure
                             cleanup_errors.append(error)
-                    try:
-                        _expect_zero(
-                            self.transport.execute(
-                                f"EXECUTE FUNCTION {cdc_routine('cdc_closesess')}(?)", (session,)
-                            ),
-                            "cdc_closesess",
-                        )
-                    except Exception as error:  # preserve an active CDC failure
-                        cleanup_errors.append(error)
+                    if not _transport_closed(self.transport):
+                        try:
+                            _expect_zero(
+                                self.transport.execute(
+                                    f"EXECUTE FUNCTION {cdc_routine('cdc_closesess')}(?)",
+                                    (session,),
+                                ),
+                                "cdc_closesess",
+                            )
+                        except Exception as error:  # preserve an active CDC failure
+                            cleanup_errors.append(error)
                 # Put the timeout back after a lost lease too: the client keeps it for every
                 # later connection, so a skipped restore made it the new default.
                 if set_socket_timeout is not None and previous_socket_timeout is not None:
@@ -10669,6 +10839,22 @@ def register_lakeflow_source(spark):
     # What a NULL can still break is keyset snapshot paging, which compares key values and can
     # skip the row or fail; snapshot.scan=cursor avoids that. Default false (stay key-less).
     _ALLOW_NULLABLE_INDEX_OPTION = "allow.nullable.index"
+
+    # The options the connector takes from a table's own options only, never from the
+    # connection's (see InformixLakeflowConnect._refuse_connection_table_options).
+    _TABLE_ONLY_OPTIONS = (
+        "decimal.variable.type",
+        "decimal.variable.column.type",
+        "snapshot.filter",
+        "row_filter",
+        "include_columns",
+        "exclude_columns",
+        "transform_columns",
+        "rename_columns",
+        "snapshot.isolation",
+        "primary.keys",
+        "allow.nullable.index",
+    )
 
 
     class _DescendingKey:
@@ -11495,9 +11681,7 @@ def register_lakeflow_source(spark):
             if limit is not None and abs(fallback) > limit:
                 # 450: Option '{}' gives {} the fallback {} for {}, which is more than a {}
                 # column holds
-                raise InformixError(
-                    _m(450, option, name, fallback, column.name, column.type_name)
-                )
+                raise InformixError(_m(450, option, name, fallback, column.name, column.type_name))
         _check_function_literals(name, [literal[1] for literal in literals], option)
         return kind if result == "same" else result
 
@@ -13267,9 +13451,10 @@ def register_lakeflow_source(spark):
         # ---- consumer side ------------------------------------------------------
 
         def subscribe(self, identity, table, capture, checkpoint_commit_lsn, floor_lsn, owner=None):
-            # ``owner`` names the flow asking, where several processes share the shard
-            # (cdc.shared.session=host). Returns False when another flow holds the table's
-            # place: this one then reads directly.
+            # ``owner`` names the flow asking (each connector instance has its own). Returns
+            # False when another flow holds the table's place: this one then reads directly,
+            # and must not take a view either, which would cut the other's buffer at its own
+            # checkpoint.
             with self.condition:
                 existing = self.subscribers.get(identity)
                 if (
@@ -13291,8 +13476,8 @@ def register_lakeflow_source(spark):
                 ):
                     # Another flow reading the table under other options (a schema change
                     # changes the capture): the shard keeps the first one's table, buffer and
-                    # coverage, and this one reads directly, rejecting the view's layout.
-                    return
+                    # coverage, and this one reads directly.
+                    return False
                 if (
                     existing is not None
                     and existing["capture"] != capture
@@ -13303,7 +13488,7 @@ def register_lakeflow_source(spark):
                     # changed. Taking it for a schema change, each flow dropped the other's
                     # buffer and coverage at every poll, and neither was ever served. The
                     # shard keeps the first one's, and this one reads directly.
-                    return
+                    return False
                 if existing is not None and existing["capture"] != capture:
                     # The table's columns changed (its consumer moved to a new schema): what
                     # was buffered under the old capture lacks the new columns, so drop it and
@@ -13355,6 +13540,18 @@ def register_lakeflow_source(spark):
                 elif not self._covered(entry):
                     self.shared_restart = min(self.shared_restart, floor_lsn)
                 self.condition.notify_all()
+                return True
+
+        def poll(self, identity, table, capture, checkpoint_commit_lsn, floor_lsn, owner=None):
+            # Docstring: Subscribe and take the view in one hold of the lock, so no other flow's
+            # subscribe cuts the buffer between them; None where the flow reads directly.
+
+            with self.condition:
+                if not self.subscribe(
+                    identity, table, capture, checkpoint_commit_lsn, floor_lsn, owner
+                ):
+                    return None
+                return self.snapshot(identity, checkpoint_commit_lsn)
 
         @staticmethod
         def _covered(entry) -> bool:
@@ -13753,11 +13950,6 @@ def register_lakeflow_source(spark):
         )
 
 
-    # Names this process to a shard several processes share: each flow's reader runs in a
-    # process of its own.
-    _SHARD_OWNER = secrets.token_hex(8)
-
-
     def _host_shard_local_poll(
         key, reader_factory, config, identity, table, capture, commit, floor, owner=None
     ):
@@ -13765,9 +13957,7 @@ def register_lakeflow_source(spark):
         # None for a flow the shard does not serve because another holds the table's place.
 
         shard = _shared_cdc_shard(key, reader_factory=reader_factory, **config)
-        if shard.subscribe(identity, table, capture, commit, floor, owner or _SHARD_OWNER) is False:
-            return None
-        return shard.snapshot(identity, commit)
+        return shard.poll(identity, table, capture, commit, floor, owner)
 
 
     def _host_shard_socket_timeouts(sock) -> None:
@@ -14044,21 +14234,23 @@ def register_lakeflow_source(spark):
         commit,
         floor,
         endpoints: _HostShardEndpoints | None = None,
+        owner: str | None = None,
     ):
         # Docstring: A host-shared shard's view for one consumer poll, or None to read directly.
         #
         # Leads the shard when nobody does, polls the leader otherwise, and takes over when
         # the leader is gone. Where the host can't share at all, shares within the process.
+        # ``owner`` names the flow polling (see _SharedCdcShard.subscribe).
 
         endpoints = _HOST_SHARD_ENDPOINTS if endpoints is None else endpoints
-        local = (key, reader_factory, config, identity, table, capture, commit, floor)
+        local = (key, reader_factory, config, identity, table, capture, commit, floor, owner)
         # The leader sends only transactions after those this follower holds from earlier
         # polls, so each crosses the socket once. A checkpoint moved back past them, a floor
         # moved back (an older open transaction the view they came from lacked), a new capture
         # (they were decoded under the old one), or a poll without a view, starts over with
         # the whole buffer; leading drops them.
         held_commit, held_floor, held_capture, held = endpoints.mirrors.pop(
-            (key, identity), (commit, floor, capture, ())
+            (key, identity, owner), (commit, floor, capture, ())
         )
         if key in endpoints.leading or endpoints.unavailable:
             return _host_shard_local_poll(*local)
@@ -14077,7 +14269,7 @@ def register_lakeflow_source(spark):
             "commit": commit,
             "floor": floor,
             "after": held[-1].commit_lsn if held else None,
-            "owner": _SHARD_OWNER,
+            "owner": owner,
         }
         try:
             status, payload = _host_shard_request(endpoints, key, request)
@@ -14105,7 +14297,7 @@ def register_lakeflow_source(spark):
             return None
         view = _unwire_view(payload)
         committed = [tx for tx in held if tx.commit_lsn > commit] + view.committed
-        endpoints.mirrors[(key, identity)] = (commit, floor, capture, tuple(committed))
+        endpoints.mirrors[(key, identity, owner)] = (commit, floor, capture, tuple(committed))
         return replace(view, committed=committed)
 
 
@@ -14768,18 +14960,18 @@ def register_lakeflow_source(spark):
         # serverless Lakeflow pipeline execution have been exercised.
 
         def __init__(self, options: dict[str, str]) -> None:
-            # A parameter left blank is one not set: a form sends "" for a field nobody
+            # A parameter left empty is one not set: a form sends "" for a field nobody
             # filled in, and a number or flag read from "" would fail here or, later, on a
-            # worker. The escape character is the one whose blank means something.
+            # worker. The same rule as a table's options (_options_set): only "" counts, and
+            # the escape character is the one whose empty value means something. A value of
+            # blanks is something typed, judged as given; it was dropped here but judged in a
+            # table's options, so the same blank was unset at read time and an error at
+            # registration.
             with contextlib.suppress(TypeError, AttributeError):
                 for name in [
                     name
                     for name, value in options.items()
-                    if isinstance(value, str)
-                    and not value.strip()
-                    and name.lower() != _UNL_ESCAPE_OPTION
-                    # A delimiter of one blank character, a tab say, is a delimiter.
-                    and not (name.lower() == _UNL_DELIMITER_OPTION and value != "")
+                    if isinstance(value, str) and value == "" and name.lower() != _UNL_ESCAPE_OPTION
                 ]:
                     del options[name]
             super().__init__(options)
@@ -14866,7 +15058,11 @@ def register_lakeflow_source(spark):
                 ),
                 (_UNL_SPLIT_BYTES_OPTION, str(_UNL_SPLIT_TARGET_BYTES), 1),
             ):
-                if int(options.get(name, default)) < minimum:
+                try:
+                    value = int(options.get(name, default))
+                except (TypeError, ValueError) as error:
+                    raise ValueError(f"Option '{name}' must be a whole number") from error
+                if value < minimum:
                     raise ValueError(f"Option '{name}' must be >= {minimum}")
             # The state project's capacity, checked here rather than when a worker first
             # provisions it.
@@ -14889,6 +15085,15 @@ def register_lakeflow_source(spark):
             # Startup jitter is a float (fractional seconds), validated here rather than in the
             # integer loop above; 0 disables it.
             _validate_nonneg_float_option(options, _CONNECTION_STARTUP_JITTER_OPTION)
+            # Read as a float where a CDC session is set up, which a negative value passed as
+            # the 30 s floor and text failed only then.
+            if "cdc.read.timeout.seconds" in options:
+                try:
+                    cdc_read_timeout = float(options["cdc.read.timeout.seconds"])
+                except (TypeError, ValueError) as error:
+                    raise ValueError("Option 'cdc.read.timeout.seconds' must be a number") from error
+                if not math.isfinite(cdc_read_timeout) or cdc_read_timeout <= 0:
+                    raise ValueError("Option 'cdc.read.timeout.seconds' must be > 0")
             # Shared-reader thread count defaults to a quarter of the connection budget, so it is
             # validated here rather than in the static-default loop above.
             if _SHARED_CDC_THREADS_OPTION in options and int(options[_SHARED_CDC_THREADS_OPTION]) < 1:
@@ -14901,6 +15106,7 @@ def register_lakeflow_source(spark):
             # Validate boolean capacity options eagerly (they are otherwise only
             # checked on first read, deep inside a running flow).
             _option_bool(options, "snapshot.incremental.blocking", True)
+            _option_bool(options, "connection.backlog.hint.enabled", True)
             _shared_cdc_mode(options)
             # Validate the .unl / HPL DELIMITED field format eagerly (single-character
             # delimiter and optionally-empty escape, which must differ), rather than only
@@ -14986,6 +15192,8 @@ def register_lakeflow_source(spark):
                 # 166: Option 'capacity.retry.max.delay.seconds' must be >= 0
                 raise ValueError(_m(166))
             self._bridge_instance: InformixBridge | None = None
+            # This flow's name to a shared CDC shard (see _shared_cdc_snapshot).
+            self._shard_owner = secrets.token_hex(8)
             self._tables: dict[str, Table] | None = None
             self._tables_complete = False
             # Memoizes the key-index directions adopted for a primary.keys override,
@@ -15298,6 +15506,7 @@ def register_lakeflow_source(spark):
 
         def read_table_metadata(self, table_name: str, table_options: dict[str, str]) -> dict:
             table_options = _options_set(table_options)
+            self._refuse_connection_table_options(table_options)
             with self._metadata_session_lock, self._metadata_access():
                 table = self._registration_table(table_name, table_options)
                 _ensure_materializable(table, table_options)
@@ -15331,6 +15540,23 @@ def register_lakeflow_source(spark):
                         "ingestion_type": "cdc_with_deletes",
                     }
                 return result
+
+        def _refuse_connection_table_options(self, table_options: dict[str, str]) -> None:
+            # Docstring: Fail a table option set on the connection rather than in the table's
+            # configuration.
+            #
+            # The pipeline asks for a table's metadata with the table's configuration alone,
+            # while its reads get the connection's options as well. A table option the connector
+            # takes from the table's options only, set on the connection, then reached the reads
+            # and not the metadata: primary.keys keyed the stream of a table registered without
+            # a key, so its deletes were dropped, and rename_columns renamed the columns but not
+            # the keys merged by. Set the same in both, it is the table's own.
+
+            for name in _TABLE_ONLY_OPTIONS:
+                if name in self.options and table_options.get(name) != self.options[name]:
+                    # 453: Option '{}' is a table option but is set on the connection: set it in
+                    # the table_configuration of each table it is for
+                    raise ValueError(_m(453, name))
 
         def _registration_table(self, table_name: str, table_options: dict[str, str]) -> Table:
             # Docstring: Resolve one configured table with a targeted catalog lookup.
@@ -15904,7 +16130,7 @@ def register_lakeflow_source(spark):
                     if rows is not None:
                         self._partition_embedded_rows.clear()
                         self._partition_embedded_rows[self._partition_offset_key(start_offset)] = (
-                            self._encode_embedded_rows(rows)
+                            self._encode_embedded_output(rows, table_options, lambda: table.columns)
                         )
                     return end
 
@@ -15964,9 +16190,15 @@ def register_lakeflow_source(spark):
                 # get_partitions serves page 0 from the stage, so the driver never reads it.
                 self._partition_page_batches[self._partition_offset_key(start_offset)] = rows.page_batch
                 return next_offset
+
+            def columns():
+                return self._table(table_name, table_options).columns
+
             self._partition_embedded_rows[self._partition_offset_key(start_offset)] = (
                 # A spilled transaction stays on its pages, which get_partitions hands to executors.
-                rows if isinstance(rows, _SpilledRows) else self._encode_embedded_rows(rows)
+                rows
+                if isinstance(rows, _SpilledRows)
+                else self._encode_embedded_output(rows, table_options, columns)
             )
             return next_offset
 
@@ -16099,7 +16331,9 @@ def register_lakeflow_source(spark):
                             start_record,
                             stop_record=end_record if end_split == start_split else None,
                         )
-                        encoded = self._encode_embedded_rows(rows)
+                        encoded = self._encode_embedded_output(
+                            rows, table_options, lambda: table.columns
+                        )
                     return self._embedded_descriptors(table, encoded)
                 # The window is whatever latest_offset logged: up to pages-per-batch splits,
                 # ending early before a gzip split that is served in record windows.
@@ -16199,7 +16433,11 @@ def register_lakeflow_source(spark):
                 rows = self._replay_embedded_range(
                     table_name, start_offset or {}, end_offset or {}, table_options
                 )
-                encoded = rows if isinstance(rows, _SpilledRows) else self._encode_embedded_rows(rows)
+                encoded = (
+                    rows
+                    if isinstance(rows, _SpilledRows)
+                    else self._encode_embedded_output(rows, table_options, lambda: table.columns)
+                )
             if isinstance(encoded, _SpilledRows):
                 return encoded.descriptors(self._transform_descriptor_fields(table))
             return self._embedded_descriptors(table, encoded)
@@ -16228,13 +16466,21 @@ def register_lakeflow_source(spark):
         ) -> Iterator[dict]:
             table_options = _options_set(table_options)
             rows = self._read_partition_rows(partition, table_options)
-            return self._output_rows(rows, table_options, lambda: _descriptor_columns(partition))
+            return self._output_rows(
+                rows,
+                table_options,
+                lambda: _descriptor_columns(partition),
+                # Embedded rows were transformed on the driver (see _encode_embedded_output).
+                transform=not partition.get("transformed"),
+            )
 
         def _output_rows(
             self,
             rows: Iterator[dict],
             table_options: dict[str, str],
             columns: Callable[[], Iterable[Column]] | None = None,
+            *,
+            transform: bool = True,
         ) -> Iterator[dict]:
             # Docstring: Rows as they leave the connector: transformed, then renamed.
             #
@@ -16243,20 +16489,47 @@ def register_lakeflow_source(spark):
             # lookup -- the reader's cached table, or descriptor metadata on an executor -- waits
             # until then.
 
-            transforms = _column_transforms(table_options)
-            if transforms:
-                key = self.options.get(_TRANSFORM_HASH_KEY_OPTION) or table_options.get(
-                    _TRANSFORM_HASH_KEY_OPTION
-                )
-                context = {
-                    "hash_key": key.encode("utf-8") if key else None,
-                    "encoding": self._source_encoding(table_options),
-                    "columns": columns,
-                    # The table options alone, as the schema reads them (see _number_for_column).
-                    "options": table_options,
-                }
-                rows = _transformed_rows(rows, transforms, context)
+            if transform:
+                rows = self._transformed_output(rows, table_options, columns)
             return _renamed_rows(rows, _column_renames(table_options))
+
+        def _transformed_output(
+            self,
+            rows: Iterator[dict],
+            table_options: dict[str, str],
+            columns: Callable[[], Iterable[Column]] | None,
+        ) -> Iterator[dict]:
+            # Docstring: ``rows`` with transform_columns applied (source names).
+
+            transforms = _column_transforms(table_options)
+            if not transforms:
+                return rows
+            key = self.options.get(_TRANSFORM_HASH_KEY_OPTION) or table_options.get(
+                _TRANSFORM_HASH_KEY_OPTION
+            )
+            context = {
+                "hash_key": key.encode("utf-8") if key else None,
+                "encoding": self._source_encoding(table_options),
+                "columns": columns,
+                # The table options alone, as the schema reads them (see _number_for_column).
+                "options": table_options,
+            }
+            return _transformed_rows(rows, transforms, context)
+
+        def _encode_embedded_output(
+            self,
+            rows: Iterable[dict[str, Any]],
+            table_options: dict[str, str],
+            columns: Callable[[], Iterable[Column]],
+        ) -> list[Any]:
+            # Docstring: Rows for an embedded partition descriptor, transformed here on the driver.
+            #
+            # The descriptor travels from the driver through Spark to an executor. Encoded as
+            # read, it carried the raw values transform_columns is there to keep out of Spark;
+            # transformed here, it carries what the destination gets, and the executor only
+            # renames (the descriptor says ``transformed``).
+
+            return self._encode_embedded_rows(self._transformed_output(rows, table_options, columns))
 
         def _source_encoding(self, table_options: dict[str, str]) -> str:
             # Docstring: The database code set's Python encoding for a table: the connection's
@@ -16279,8 +16552,10 @@ def register_lakeflow_source(spark):
                 ]
             }
 
-        def _embedded_descriptor(self, table: Table, encoded) -> dict[str, Any]:
-            return {"kind": "embedded", "rows": encoded, **self._transform_descriptor_fields(table)}
+        @staticmethod
+        def _embedded_descriptor(_table: Table, encoded) -> dict[str, Any]:
+            # Its rows are transformed already (see _encode_embedded_output).
+            return {"kind": "embedded", "rows": encoded, "transformed": True}
 
         def _embedded_descriptors(self, table: Table, encoded: list[Any]) -> list[dict[str, Any]]:
             # Docstring: An embedded microbatch as descriptors of at most
@@ -19961,8 +20236,7 @@ def register_lakeflow_source(spark):
             usable = {
                 column.name.lower(): column.name
                 for column in table.columns
-                if column.type_name in _INDEX_SCAN_KEY_TYPES
-                and not _is_variable_scale_decimal(column)
+                if column.type_name in _INDEX_SCAN_KEY_TYPES and not _is_variable_scale_decimal(column)
             }
             chosen = None
             if named:
@@ -20319,7 +20593,7 @@ def register_lakeflow_source(spark):
             follows = not table.primary_keys or self._append_only_table(table, options)
             names = [column.name for column in table.columns]
             isolation = _SNAPSHOT_ISOLATION_SQL[_DEFAULT_SNAPSHOT_ISOLATION]
-            capture = _capture_descriptor(table, _client_encoding(self.options))
+            capture = _capture_descriptor(table, _database_encoding(self.options))
 
             def token(row):
                 shaped = _framework_row(_coerce_variable_decimal_values(row, table, options))
@@ -20889,8 +21163,7 @@ def register_lakeflow_source(spark):
                         for row in (() if staged_at is None else staged_rows(boundary, staged_at))
                         if _index_scan_key(row, keys) == key
                         and not (
-                            relocated
-                            and _index_scan_staged_key(row, table.primary_keys) in relocated
+                            relocated and _index_scan_staged_key(row, table.primary_keys) in relocated
                         )
                     )
                     saw.subtract(state)
@@ -21451,7 +21724,7 @@ def register_lakeflow_source(spark):
             # re-call with the same X adopts the same winner; a table already initialized at a
             # different LSN loses the election and fails closed (run a full refresh).
 
-            capture = _capture_descriptor(table, _client_encoding(self.options))
+            capture = _capture_descriptor(table, _database_encoding(self.options))
             self._bridge.prepare_initial_capture([table.native_identity])
             self._bridge.validate_initial_lsn(capture, boundary)
             node = _schema_state(table, boundary)
@@ -23009,7 +23282,7 @@ def register_lakeflow_source(spark):
             threads = self._shared_cdc_thread_count()
             shard_id = int(hashlib.sha256(table.native_identity.encode()).hexdigest(), 16) % threads
             key = (self._lakebase_state_namespace(), pipeline_scope, channel, shard_id)
-            capture = _capture_descriptor(table, _client_encoding(self.options))
+            capture = _capture_descriptor(table, _database_encoding(self.options))
             checkpoint_commit = int(checkpoint["commit_lsn"])
             floor = int(checkpoint.get("begin_lsn") or checkpoint["commit_lsn"])
             config = {
@@ -23025,6 +23298,11 @@ def register_lakeflow_source(spark):
                 ),
             }
             reader_factory = self._shared_cdc_reader_factory()
+            # Names this flow to the shard: two flows reading the table with one layout (two
+            # destinations, say) share its buffer only through the first, the other reading
+            # directly. Kept through pickling, so the flow's reader is the same owner wherever
+            # it runs; a connector built without __init__ gets one here.
+            owner = self.__dict__.setdefault("_shard_owner", secrets.token_hex(8))
             replay_stop = self._replay_stop_lsn(options)
             deadline = (
                 time.monotonic()
@@ -23042,11 +23320,13 @@ def register_lakeflow_source(spark):
                         capture,
                         checkpoint_commit,
                         floor,
+                        owner=owner,
                     )
                 else:
                     shard = _shared_cdc_shard(key, reader_factory=reader_factory, **config)
-                    shard.subscribe(table.native_identity, table, capture, checkpoint_commit, floor)
-                    view = shard.snapshot(table.native_identity, checkpoint_commit)
+                    view = shard.poll(
+                        table.native_identity, table, capture, checkpoint_commit, floor, owner
+                    )
                 # A fingerprint mismatch means a schema transition is in flight; defer to the
                 # direct-read path, which owns the transition/replay logic. So does a view of
                 # another layout than this reader's: two flows can read one table under different
@@ -23318,7 +23598,7 @@ def register_lakeflow_source(spark):
                 raw_records = self._read_changes_with_reconnect(
                     [
                         _capture_descriptor(
-                            table if past_step else capture_table, _client_encoding(self.options)
+                            table if past_step else capture_table, _database_encoding(self.options)
                         )
                     ],
                     restart,
@@ -23610,7 +23890,7 @@ def register_lakeflow_source(spark):
                 # retained/current range is [{}, {}]
                 raise InformixError(_m(289, table.exposed_name, checkpoint_lsn, minimum, current))
             self._bridge.validate_initial_lsn(
-                _capture_descriptor(table, _client_encoding(self.options)), checkpoint_lsn
+                _capture_descriptor(table, _database_encoding(self.options)), checkpoint_lsn
             )
             authoritative = self._find_immutable_schema_record(
                 table, checkpoint_schema_id, pipeline_scope
@@ -23864,7 +24144,7 @@ def register_lakeflow_source(spark):
                             # 295: Current LSN {} precedes checkpoint LSN {} for '{}'
                             raise InformixError(_m(295, transition, checkpoint_lsn, table.exposed_name))
                         self._bridge.validate_initial_lsn(
-                            _capture_descriptor(table, _client_encoding(self.options)),
+                            _capture_descriptor(table, _database_encoding(self.options)),
                             transition,
                         )
                     except InformixError as error:
@@ -24592,7 +24872,7 @@ def register_lakeflow_source(spark):
                             value = self._immutable_lsn(snapshot, "snapshot_lsn", table.exposed_name)
                     if record is not None:
                         self._bridge.validate_initial_lsn(
-                            _capture_descriptor(table, _client_encoding(self.options)), value
+                            _capture_descriptor(table, _database_encoding(self.options)), value
                         )
                         if owner:
                             schema_winner = self._publish_immutable_head(
@@ -24608,7 +24888,7 @@ def register_lakeflow_source(spark):
                 if owner:
                     value = self._bridge.prepare_initial_capture([table.native_identity])
                     self._bridge.validate_initial_lsn(
-                        _capture_descriptor(table, _client_encoding(self.options)), value
+                        _capture_descriptor(table, _database_encoding(self.options)), value
                     )
                     self._publish_immutable_head(
                         namespace,
@@ -25236,6 +25516,15 @@ def register_lakeflow_source(spark):
             raise InformixError(f"{operation} failed with status {status}")
 
 
+    def _transport_closed(transport) -> bool:
+        # Docstring: Whether the SQLI client has closed its connection, as it does when a call
+        # fails or times out (state POISONED or CLOSED). A transport without a state counts
+        # as open.
+
+        state = getattr(getattr(transport, "state", None), "name", None)
+        return state in ("POISONED", "CLOSED")
+
+
     def _is_timeout_error(error: BaseException | None) -> bool:
         # Docstring: Report whether ``error`` (or anything it wraps) is a socket read timeout.
         #
@@ -25642,13 +25931,18 @@ def register_lakeflow_source(spark):
 
 
     def _database_encoding(options: dict[str, str]) -> str:
-        # Docstring: The database code set's Python encoding: what LENGTH counts bytes in.
+        # Docstring: The database code set's Python encoding: what LENGTH counts bytes in, and
+        # what the server sends every text in, query results and change records alike.
 
         locale = options.get("db_locale") or options.get("DB_LOCALE") or options.get("db.locale")
         return informix_locale_encoding(locale or "en_US.819")
 
 
     def _client_encoding(options: dict[str, str]) -> str:
+        # Docstring: The codeset of an extract file (.unl, HPL): CLIENT_LOCALE's, which the
+        # dbaccess that wrote it converted the database's text to. Not the server's: it sends
+        # text in the database codeset (_database_encoding).
+        #
         # Spark lowercases option keys, so ``CLIENT_LOCALE`` arrives as
         # ``client_locale``; check that first, then the original-case / dotted forms.
         locale = (
@@ -25661,6 +25955,8 @@ def register_lakeflow_source(spark):
 
 
     def _capture_descriptor(table: Table, encoding: str = "utf-8") -> dict[str, Any]:
+        # ``encoding`` is the database codeset's (_database_encoding): a change record carries
+        # text as the database holds it, whatever the session's CLIENT_LOCALE (probed on 14.10).
         return {
             "identity": table.native_identity,
             "logical_identity": table.identity,
@@ -26000,9 +26296,19 @@ def register_lakeflow_source(spark):
         def field() -> str:
             return _UnloadEmpty(" ") if empty else "".join(value)
 
-        # The line's own terminator only: a carriage return before it may be data.
-        line = line[:-1] if line.endswith("\n") else line
-        line = line[:-1] if line.endswith("\r") else line
+        def escaped_at(index: int) -> bool:
+            # Whether an odd run of escapes precedes line[index], making it data.
+            run = 0
+            while index - run > 0 and line[index - run - 1] == escape:
+                run += 1
+            return run % 2 == 1
+
+        # The line's own terminator only, where the caller left it on. A newline or carriage
+        # return after an escape is data: an HPL record has no trailing delimiter, so its last
+        # value can end in one, and the record splitter has taken the terminator off already.
+        for terminator in ("\n", "\r"):
+            if line.endswith(terminator) and not (escape and escaped_at(len(line) - 1)):
+                line = line[:-1]
         for character in line:
             if escape and escaped:
                 empty = character == " " and not value
@@ -26016,6 +26322,10 @@ def register_lakeflow_source(spark):
             else:
                 empty = False
                 value.append(character)
+        if escape and escaped:
+            # 452: An UNLOAD record ends in a lone escape character '{}': the extract is cut
+            # short, or was written with another escape
+            raise InformixError(_m(452, escape))
         # Short of ``fields``, an empty final field is real: HPL writes no trailing delimiter,
         # so a NULL last column leaves the record ending in a delimiter, as UNLOAD's does.
         if value or (fields is not None and len(values) < fields):

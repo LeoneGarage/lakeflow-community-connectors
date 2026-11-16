@@ -1496,6 +1496,65 @@ class LakebaseProjectNamingTests(unittest.TestCase):
         lock.acquire.assert_called_once_with(timeout=0.25)
         lock.release.assert_not_called()
 
+    def test_provisioning_is_redone_for_another_database_or_password(self):
+        # Provisioning runs once per process, and was cached by project alone: a second
+        # connection on the project with another lakebase.database, or a changed
+        # lakebase.password in a warm process, found it done, and never set up its schema or
+        # repaired the role, so every connect failed.
+        lakebase_state.LakebaseState._provisioned.clear()
+        self.addCleanup(lakebase_state.LakebaseState._provisioned.clear)
+        logins, schemas = [], []
+
+        def state(**options):
+            made = lakebase_state.LakebaseState(
+                {"lakebase.project.id": "shared", "lakebase.password": "pw", **options}, "id"
+            )
+            made._api_client = mock.Mock()
+            made._ensure_password_login = lambda facts: logins.append(made._password)
+            made._open = mock.Mock(return_value=mock.MagicMock())
+            return made
+
+        with (
+            mock.patch.object(lakebase_state, "ensure_project", return_value={"host": "h"}),
+            mock.patch.object(
+                lakebase_state, "ensure_schema", side_effect=lambda c: schemas.append(c)
+            ),
+        ):
+            state().provision()
+            state().provision()
+            state(**{"lakebase.database": "other"}).provision()
+            state(**{"lakebase.password": "rotated"}).provision()
+
+        self.assertEqual(logins, ["pw", "pw", "rotated"])
+        self.assertEqual(len(schemas), 3)
+        # The cache holds the password only as a digest.
+        self.assertNotIn("rotated", repr(lakebase_state.LakebaseState._provisioned))
+
+    def test_a_connect_the_provisioning_no_longer_fits_provisions_again(self):
+        # A rejected password or a host that no longer resolves means the cached provisioning
+        # is stale: it is dropped, so the next connect repairs it. Any other failure keeps
+        # it, since provisioning again needs workspace credentials a plain retry does not.
+        lakebase_state.LakebaseState._provisioned.clear()
+        self.addCleanup(lakebase_state.LakebaseState._provisioned.clear)
+        state = lakebase_state.LakebaseState(
+            {"lakebase.project.id": "shared", "lakebase.password": "pw"}, "id"
+        )
+        facts = {"host": "h"}
+        lakebase_state.LakebaseState._provisioned[state._provision_key()] = facts
+
+        state._open = mock.Mock(side_effect=RuntimeError("timeout expired"))
+        with self.assertRaises(RuntimeError):
+            state.connect()
+        self.assertIs(lakebase_state.LakebaseState._provisioned[state._provision_key()], facts)
+
+        state._open = mock.Mock(
+            side_effect=RuntimeError('password authentication failed for user "informix_state"')
+        )
+        with self.assertRaises(RuntimeError):
+            state.connect()
+        self.assertNotIn(state._provision_key(), lakebase_state.LakebaseState._provisioned)
+        self.assertIsNone(state._facts)
+
     def test_provisioning_timeout_must_be_positive(self):
         with self.assertRaisesRegex(ValueError, "lakebase.provision.timeout.seconds"):
             lakebase_state.LakebaseState({"lakebase.provision.timeout.seconds": "0"}, "identity")
@@ -2763,6 +2822,31 @@ class StagingCredentialProviderTests(unittest.TestCase):
         api.create_error = 500  # refresh mint fails
         now["t"] = 600.0
         self.assertEqual(provider.bearer(), "dapi-1", "a failed refresh must keep the live token")
+
+    def test_a_failed_refresh_is_tried_again_a_minute_on_not_at_every_call(self):
+        # Every Files API request asks for the bearer. After a failed refresh each asked for
+        # another token, every 4 MiB chunk of a read, with a warning, for the half of the
+        # token's lifetime that was left.
+        api = _StagingTokenApi()
+        now = {"t": 0.0}
+        provider, _ = self._provider(api, clock=lambda: now["t"], lifetime_seconds=1000)
+        provider.bearer()
+        api.create_error = 500
+
+        def creates():
+            return sum(1 for _, path, _ in api.calls if path == "/api/2.0/token/create")
+
+        now["t"] = 600.0
+        with self.assertLogs(lakebase_state.__name__, "WARNING"):
+            provider.bearer()
+        tried = creates()
+        for step in range(5):
+            now["t"] = 600.0 + step * 10
+            self.assertEqual(provider.bearer(), "dapi-1")
+        self.assertEqual(creates(), tried)
+        api.create_error = None
+        now["t"] = 661.0
+        self.assertEqual(provider.bearer(), "dapi-2")
 
     def test_first_mint_unavailable_propagates(self):
         api = _StagingTokenApi()

@@ -417,7 +417,9 @@ def _workspace_credentials(options: dict[str, str]) -> tuple[str, str]:
         client = WorkspaceClient()
         host = host or client.config.host or ""
         if not token:
-            scheme, _, value = str((client.config.authenticate() or {}).get("Authorization", "")).partition(" ")
+            scheme, _, value = str(
+                (client.config.authenticate() or {}).get("Authorization", "")
+            ).partition(" ")
             token = value.strip() if scheme.lower() == "bearer" else ""
         if not host or not token:
             raise LakebaseStateError(
@@ -669,6 +671,11 @@ def revoke_stale_staging_tokens(
                 _LOGGER.debug("Could not revoke stale staging token %s", token_id, exc_info=True)
 
 
+# How long a staging token refresh that failed waits before it is tried again; the token
+# it would have replaced is still valid then (refreshed at half its lifetime).
+_STAGING_TOKEN_REFRESH_RETRY_SECONDS = 60.0
+
+
 class StagingCredentialProvider:
     # Docstring: Supplies a Files-API bearer token, refreshing it before it can expire.
     #
@@ -715,6 +722,8 @@ class StagingCredentialProvider:
         self._token: str | None = None
         self._token_id = ""
         self._minted_at = 0.0
+        # When a refresh that failed may be tried again (clock time); 0 until one fails.
+        self._refresh_retry_at = 0.0
         # Set when a token was rejected and nothing could mint a successor, so an
         # ``auto`` staging transport can fall back to FUSE; cleared by the next mint.
         self.rejected = False
@@ -732,12 +741,18 @@ class StagingCredentialProvider:
                 # First mint uses the carried bootstrap credential; a failure here is
                 # fatal for REST and surfaces as StagingTokenUnavailable to the caller.
                 self._mint(self._bootstrap_token)
-            elif now - self._minted_at >= self._refresh_after:
+            elif now - self._minted_at >= self._refresh_after and now >= self._refresh_retry_at:
                 try:
                     self._mint(self._token)
                 except Exception:  # noqa: BLE001 - keep the still-valid token on refresh failure
+                    # Tried again a minute on, not on the next call: every Files API
+                    # request calls here, each 4 MiB chunk of a read included, and each
+                    # failed refresh is a token request retried up to four times.
+                    self._refresh_retry_at = now + _STAGING_TOKEN_REFRESH_RETRY_SECONDS
                     _LOGGER.warning(
-                        "Snapshot-staging token refresh failed; reusing the current token",
+                        "Snapshot-staging token refresh failed; reusing the current token and "
+                        "trying again in %g s",
+                        _STAGING_TOKEN_REFRESH_RETRY_SECONDS,
                         exc_info=True,
                     )
             return self._token or ""
@@ -1198,6 +1213,23 @@ def seed_slots(connection: Any, namespace: str, slot_count: int) -> None:
     connection.commit()
 
 
+def _stale_provisioning_error(error: BaseException) -> bool:
+    # Docstring: Whether a failed state connect says the provisioning it used no longer holds:
+    # a rejected password (Postgres words an absent role the same way) or a host that no
+    # longer resolves.
+
+    text = str(error).lower()
+    return any(
+        part in text
+        for part in (
+            "password authentication failed",
+            "could not translate host name",
+            "name or service not known",
+            "nodename nor servname provided",
+        )
+    )
+
+
 class LakebaseState:
     # Docstring: Connection factory and provisioning entry point for Lakebase state.
     #
@@ -1205,7 +1237,8 @@ class LakebaseState:
     # per process behind a lock, so the 60-odd flows a pipeline starts converge on
     # a single set of control-plane calls instead of each issuing their own.
 
-    _provisioned: dict[str, dict[str, Any]] = {}
+    # Keyed by project, database and password (see _provision_key).
+    _provisioned: dict[tuple[str, str, str], dict[str, Any]] = {}
     # Held in a dict and built on first use rather than at class creation. Spark
     # cloudpickles the reader class, and the merged single-file deployment puts this
     # class in the same namespace the reader closes over, so a lock alive at import
@@ -1269,6 +1302,16 @@ class LakebaseState:
     def project_id(self) -> str:
         return self._project_id
 
+    def _provision_key(self) -> tuple[str, str, str]:
+        # Docstring: What one provisioning in this process covers: the project, and the
+        # database and state-role password it made ready. Keyed by the project alone, a
+        # second connection on the project with another lakebase.database, or a changed
+        # lakebase.password in a warm process, skipped the role repair and schema setup and
+        # failed every connect. The password goes in as a digest, not as itself.
+
+        digest = hashlib.sha256(self._password.encode("utf-8")).hexdigest()
+        return (self._project_id, self._database, digest)
+
     def _api_client(self) -> _WorkspaceApi:
         if self._api is None:
             host, token = _workspace_credentials(self._options)
@@ -1278,7 +1321,8 @@ class LakebaseState:
     def provision(self) -> dict[str, Any]:
         # Docstring: Idempotently ensure the project, endpoint, and schema all exist.
 
-        cached = LakebaseState._provisioned.get(self._project_id)
+        key = self._provision_key()
+        cached = LakebaseState._provisioned.get(key)
         if cached is not None:
             self._facts = cached
             return cached
@@ -1290,7 +1334,7 @@ class LakebaseState:
                 f"waiting for the provisioning lock for project {self._project_id}"
             )
         try:
-            cached = LakebaseState._provisioned.get(self._project_id)
+            cached = LakebaseState._provisioned.get(key)
             if cached is not None:
                 self._facts = cached
                 return cached
@@ -1310,7 +1354,7 @@ class LakebaseState:
                 ensure_schema(connection)
             finally:
                 connection.close()
-            LakebaseState._provisioned[self._project_id] = facts
+            LakebaseState._provisioned[key] = facts
             return facts
         except LakebaseStateError as error:
             raise LakebaseStateError(
@@ -1380,7 +1424,21 @@ class LakebaseState:
         # Always the state role: its password needs no control-plane call and
         # cannot expire mid-stream. The admin identity is reached only through
         # ``_connect_as_admin``, during provisioning.
-        return self._open(facts, self._user_id, self._password)
+        try:
+            return self._open(facts, self._user_id, self._password)
+        except Exception as error:
+            if _stale_provisioning_error(error):
+                # The project was re-created under another host since this process
+                # provisioned it, or the role's password changed under it: provisioned
+                # once per process, every later connect failed. Forget it, so the next
+                # connect provisions again and repairs the role. Not for other failures:
+                # provisioning needs the workspace API, whose credentials a long-running
+                # reader may no longer hold, where a plain retry would have worked.
+                key = self._provision_key()
+                if LakebaseState._provisioned.get(key) is facts:
+                    LakebaseState._provisioned.pop(key, None)
+                self._facts = None
+            raise
 
     def collect_unused_projects(self, retention_days: int, interval_hours: float) -> int:
         # Docstring: Delete inactive, auto-named connector projects once per scan interval.
@@ -1488,7 +1546,8 @@ class LakebaseState:
             finally:
                 if connection is not None:
                     connection.close()
-            LakebaseState._provisioned.pop(project_id, None)
+            for key in [key for key in LakebaseState._provisioned if key[0] == project_id]:
+                LakebaseState._provisioned.pop(key, None)
             deleted += 1
         return deleted
 
