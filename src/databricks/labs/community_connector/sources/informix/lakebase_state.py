@@ -1530,6 +1530,29 @@ class LakebaseState:
                     continue
                 if float(last_used) >= time.time() - retention_days * 86400:
                     continue
+                # Table activity alone said a project was idle while a reader used it: a
+                # stream outside a pipeline records none, and a pipeline resumed after a
+                # long stop waits for a slot before it records any. Anything else that
+                # moved within the retention keeps it: a lease renewed, a reader waiting,
+                # a backlog hint, a state record written.
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT
+                          EXISTS (SELECT 1 FROM conn_slots
+                                  WHERE renewed_at > now() - %s * interval '1 day'),
+                          EXISTS (SELECT 1 FROM slot_waiters
+                                  WHERE heartbeat_at > now() - %s * interval '1 day'),
+                          EXISTS (SELECT 1 FROM backlog_hints
+                                  WHERE updated_at > now() - %s * interval '1 day'),
+                          EXISTS (SELECT 1 FROM state_records
+                                  WHERE created_at > now() - %s * interval '1 day')
+                        """,
+                        (float(retention_days),) * 4,
+                    )
+                    recent = cursor.fetchone()
+                if any(recent):
+                    continue
                 connection.close()
                 connection = None
                 # On a read's path: the delete is asked for and given a minute, not the

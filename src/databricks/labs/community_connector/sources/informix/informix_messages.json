@@ -455,5 +455,8 @@
 "Option '{}' is a table option but is set on the connection: set it in the table_configuration of each table it is for",
 "Unable to decode text in an Informix CDC record from {} as {}, the codeset of DB_LOCALE: {}. Either the table holds a value that is not text in the database's codeset, written by a client that did not convert it. Or the record is not of this capture, which happens when the restart position ({}, logical log {}) lies in a log file whose space Informix has since reused for other tables: then run a full refresh.",
 "DB_LOCALE is '{}' but database '{}' has the locale '{}': set DB_LOCALE to it, since Informix sends the database's text in its codeset",
-"Could not read the locale of the database from sysmaster ({}); its text is decoded in the codeset of DB_LOCALE without that check"
+"Could not read the locale of the database from sysmaster ({}); its text is decoded in the codeset of DB_LOCALE without that check",
+"'{}' or '{}' changed for '{}'; run a full refresh so every row lands as the new type",
+"Option 'decimal.variable.column.type' names {}, which is not a variable-scale DECIMAL column '{}' has or selects",
+"Option 'decimal.variable.column.type' names column {} more than once"
 ]

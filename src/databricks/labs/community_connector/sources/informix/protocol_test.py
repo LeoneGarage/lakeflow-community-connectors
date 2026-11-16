@@ -1638,6 +1638,30 @@ class SqliPacketTests(unittest.TestCase):
 
         self.assertEqual(client._read_tuple(description), {"text": "hello", "enabled": True})
 
+    def test_a_negative_variable_tuple_length_is_refused(self):
+        # -4 to -1 left the slice inside its own 5-byte header, which passed the bounds
+        # check: the BOOLEAN decoded its header byte, and every later column was misread.
+        for length in (-1, -4):
+            payload = (
+                b"\x00" + struct.pack(">i", length) + b"\x00" + struct.pack(">i", 5) + b"hello"
+            )
+            transcript = struct.pack(">hi", 0, len(payload)) + payload
+            if len(payload) & 1:
+                transcript += b"\x00"
+            client = InformixSqliClient("host", 9088, "db", "user", "password")
+            client._input = io.BytesIO(transcript)
+            description = ResultDescription(
+                2,
+                7,
+                len(payload),
+                (ResultColumn("enabled", 0, 45, 0, 1), ResultColumn("text", 9, 43, 0, 100)),
+            )
+            with (
+                self.subTest(length=length),
+                self.assertRaisesRegex(SqliProtocolError, "negative variable tuple length"),
+            ):
+                client._read_tuple(description)
+
     def test_live_feature62_prepare_and_fixed_open_fetch_goldens(self):
         prepare = encode_prepare("x" * 38, parameter_count=0, long_sql_length=True)
         self.assertEqual(len(prepare), 52)

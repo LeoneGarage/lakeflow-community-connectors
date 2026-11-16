@@ -241,7 +241,9 @@ _SQL_RESERVED_NAMES = frozenset(
     from group having hour in index insert interval into is join key last left like limit
     matches max middle min minute month not null of on or order outer primary references
     right second select set skip sum sysdate table then to today top union unique update
-    user values when where with year""".split()
+    user values when where with year true false sitename dbservername current_role
+    default_role rowid rownum cast cross inner full natural using intersect except minus
+    connect prior start""".split()
 )
 
 
@@ -2087,13 +2089,14 @@ class PurePythonInformixBridge:
             command("EXECUTE PROCEDURE ifx_allow_newline('t')")
         except Exception as error:  # pylint: disable=broad-except
             # A refusal ends the session: connect again, and do not ask a second time.
-            # A broken connection is no refusal (see _session_probe_failed).
-            if not isinstance(error, (SqliTransportError, OSError)):
-                self._newline_refused = True
-                # 446: Informix did not allow newlines in quoted strings for this session
-                # ({}); a string value that holds a newline fails with SQL error -282
-                logging.getLogger(__name__).warning(_m(446, error))
+            # A broken connection or a lost lease is no refusal: _session_probe_failed
+            # raises for those, before anything is marked (a lease shutdown closing the
+            # client shows as "session is not open", which is neither).
             self._session_probe_failed(error)
+            self._newline_refused = True
+            # 446: Informix did not allow newlines in quoted strings for this session
+            # ({}); a string value that holds a newline fails with SQL error -282
+            logging.getLogger(__name__).warning(_m(446, error))
 
     def _check_database_locale(self) -> None:
         # Docstring: Fail a DB_LOCALE whose codeset is not the database's.
@@ -2119,13 +2122,12 @@ class PurePythonInformixBridge:
             )
         except Exception as error:  # pylint: disable=broad-except
             # A refusal ends the session: connect again, and do not ask a second time.
-            # A broken connection is no refusal (see _session_probe_failed).
-            if not isinstance(error, (SqliTransportError, OSError)):
-                self._database_locale_checked = True
-                # 456: Could not read the locale of the database from sysmaster ({}); its
-                # text is decoded in the codeset of DB_LOCALE without that check
-                logging.getLogger(__name__).warning(_m(456, error))
+            # A broken connection or a lost lease raises first (see above).
             self._session_probe_failed(error)
+            self._database_locale_checked = True
+            # 456: Could not read the locale of the database from sysmaster ({}); its
+            # text is decoded in the codeset of DB_LOCALE without that check
+            logging.getLogger(__name__).warning(_m(456, error))
             return
         row = rows[0] if isinstance(rows, list) and rows else {}
         actual = str((row.get("dbs_collate") if isinstance(row, dict) else "") or "").strip()
@@ -3417,6 +3419,11 @@ class PurePythonInformixBridge:
             )[0]
             return int(_field(row, "utc", 0))
         except Exception as error:
+            lease_lost = getattr(self, "_connection_lease_lost", None)
+            if lease_lost is not None and lease_lost.is_set():
+                # The slot's lease went: that is for the operation guard to report, not a
+                # probe the source refused.
+                raise
             # The failed statement poisoned the SQLI client: drop the transport, keeping
             # the slot, so the next statement reconnects rather than failing on it. A
             # source that answered with an error isn't asked again for a while: the
@@ -5448,7 +5455,9 @@ def _apply_column_transforms(
             raise InformixError(_m(95, option, name, _expression_column(operand)))
         _expression_kind(operand, columns, option, table.exposed_name, filtering=False)
         uses_hash = uses_hash or "HASH" in _operand_functions(operand)
-        if name in table.primary_keys and canonical != f"HASH({name})":
+        # By the parsed expression, not its text: a name canonical text quotes ("date",
+        # "a+b") made HASH("date") differ from HASH(date), and refused a hashed key.
+        if name in table.primary_keys and operand != ("fn", "HASH", (name,)):
             # 96: Option '{}' may only HASH key column {}: any other change could map two keys to
             # one, and deletes would remove the wrong rows
             raise InformixError(_m(96, option, name))
@@ -6987,6 +6996,11 @@ class Table:
     # id of the HASH key they use; fingerprinted like the renames.
     column_transforms: tuple[tuple[str, str], ...] | None = None
     transform_key_id: str | None = None
+    # The Spark types decimal.variable.type and decimal.variable.column.type give its
+    # variable-scale DECIMAL columns, as sorted (column, type) pairs for those that differ
+    # from the default, or None; fingerprinted like the transforms, since rows already
+    # landed and staged pages hold values of the old type.
+    decimal_targets: tuple[tuple[str, str], ...] | None = None
 
     @property
     def exposed_name(self) -> str:
@@ -7084,6 +7098,11 @@ class Table:
             column_transforms=transforms,
             transform_key_id=(
                 None if raw.get("transform_key_id") is None else str(raw["transform_key_id"])
+            ),
+            decimal_targets=(
+                None
+                if raw.get("decimal_targets") is None
+                else tuple((str(name), str(target)) for name, target in raw["decimal_targets"])
             ),
         )
 
@@ -10045,17 +10064,39 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # the registration one, outside connection capacity: queued for a slot among a
         # starting pipeline's flows, a wait that gave up would leave the table on the simple
         # reader for the whole stream.
-        try:
-            with self._metadata_access():
-                table = self._registration_table(table_name, self.options)
-            return bool(_cdc_capable(table) or self._append_only_table(table, self.options))
-        except Exception:  # pylint: disable=broad-except
-            # 174: Informix reads '{}' with the simple stream reader: its table lookup failed
-            logging.getLogger(__name__).warning(
-                _m(174, table_name),
-                exc_info=True,
-            )
-            return False
+        # Read as a table's options are everywhere else (_options_set).
+        options = _options_set(self.options)
+        attempt = 0
+        while True:
+            try:
+                with self._metadata_access():
+                    table = self._registration_table(table_name, options)
+                return bool(_cdc_capable(table) or self._append_only_table(table, options))
+            except (SqliTransportError, OSError):
+                # A dropped connection, on a stream runner that starts cold: taken for a
+                # failed lookup, it left the flow on the simple reader for the whole update,
+                # and a file snapshot part-way through a serve then failed with 423, which
+                # asks for stream.partitioned=true. Retried as a snapshot read is; a source
+                # that stays down fails the flow, as its reads would.
+                if attempt >= _SNAPSHOT_RECONNECT_MAX_RETRIES:
+                    raise
+                reset = getattr(self._bridge, "reset_transport", None)
+                if reset is not None:
+                    reset()
+                time.sleep(
+                    min(
+                        _SNAPSHOT_RECONNECT_BASE_SECONDS * (2**attempt),
+                        _SNAPSHOT_RECONNECT_MAX_SECONDS,
+                    )
+                )
+                attempt += 1
+            except Exception:  # pylint: disable=broad-except
+                # 174: Informix reads '{}' with the simple stream reader: its table lookup failed
+                logging.getLogger(__name__).warning(
+                    _m(174, table_name),
+                    exc_info=True,
+                )
+                return False
 
     def _snapshot_page_batch(
         self, table: Table, effective_start: dict, table_options: dict[str, str]
@@ -11695,6 +11736,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         table = self._ingested_columns(table, table_options, override)
         table = self._apply_key_options(table, table_options, override)
         _ensure_selected_keys(table)
+        table = _apply_decimal_targets(table, table_options)
         table = _apply_row_filter(table, table_options.get(_ROW_FILTER_OPTION))
         table = _apply_column_transforms(
             table,
@@ -12422,8 +12464,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def _cleanup_completed_snapshot_stage(self, table: Table, checkpoint: dict[str, Any]) -> None:
         validated = _validated_offset(checkpoint)
         # The scope that staged the pages: a snapshot finished in a later update than it
-        # started keeps the starting update's scope on its offsets.
-        scope = self._offset_scopes(validated)[1]
+        # started keeps the starting update's scope on its offsets, and one served for a
+        # relocation names the capturing flow's (see _naming_scan).
+        staged = validated.get("staged_scope")
+        if isinstance(staged, str) and _PIPELINE_SCOPE.fullmatch(staged):
+            scope = staged
+        else:
+            scope = self._offset_scopes(validated)[1]
         schema_id = str(validated["schema_id"])
         path = self._snapshot_stage_namespace(table, scope, schema_id)
         if path in self._cleaned_snapshot_stages:
@@ -13342,6 +13389,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             manifest = self._read_snapshot_stage_manifest(table, stage_scope, schema_id)
         if manifest and manifest.get("index_scan"):
             end["scan_scope"], end["scan_schema"] = stage_scope, schema_id
+        if end.get("pipeline_scope") and stage_scope != end["pipeline_scope"]:
+            # Pages staged under another flow's scope (a table.migration relocation): the
+            # first stream read cleans them up from there. Without the name it looked
+            # under the flow's own scope, and the last batch's pages waited for the
+            # retention sweep.
+            end["staged_scope"] = stage_scope
         return end
 
     def _incremental_datetime_chunk_exprs(
@@ -13432,12 +13485,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             logging.getLogger(__name__).warning(
                 _m(232, table.exposed_name, incremental.get("scope"), self._registration_scope),
             )
-            chunk_exprs, viable = self._incremental_datetime_chunk_exprs(table, options)
-            if viable:
-                checkpoint = dict(checkpoint)
-                checkpoint["incremental"] = self._rebound_incremental_block(
-                    table, incremental, chunk_exprs
-                )
+            # In the expressions the copy pages by, the checkpoint's own (see
+            # _next_incremental_chunk), not those today's options would give: with
+            # snapshot.incremental.datetime.as.string turned off mid-copy the bound was
+            # left stale, and turned on, recaptured in another space than the cursor.
+            checkpoint = dict(checkpoint)
+            checkpoint["incremental"] = self._rebound_incremental_block(
+                table, incremental, dict(incremental.get("chunk_exprs") or {})
+            )
         return self._read_incremental_step(table, checkpoint, options)
 
     def _begin_incremental(
@@ -15631,6 +15686,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             return None
         try:
             value = getter()  # pylint: disable=not-callable
+        except ConnectionCapacityUnavailable:
+            # Not a time the source could not tell: the read has no slot, or lost its lease.
+            # Taken for None, the loss was cleared unseen, or the read then waited the whole
+            # connection wait a second time.
+            raise
         except Exception:
             return None
         return int(value) if value is not None else None
@@ -19827,6 +19887,10 @@ def _variable_decimal_column_overrides(
             # 340: Option 'decimal.variable.column.type' entries must be 'column:type' pairs; got
             # {!r}
             raise ValueError(_m(340, entry))
+        if name in overrides:
+            # The later entry won, quietly.
+            # 459: Option 'decimal.variable.column.type' names column {} more than once
+            raise ValueError(_m(459, name))
         overrides[name] = _parse_variable_decimal_type(spec, option="decimal.variable.column.type")
     return overrides
 
@@ -19846,6 +19910,36 @@ def _variable_decimal_target(
         options.get("decimal.variable.type", _VARIABLE_DECIMAL_DEFAULT),
         option="decimal.variable.type",
     )
+
+
+def _apply_decimal_targets(table: Table, options: dict[str, str]) -> Table:
+    # Docstring: Record the types decimal.variable.type and decimal.variable.column.type give
+    # the table's variable-scale DECIMAL columns (Table.decimal_targets), and refuse a
+    # decimal.variable.column.type entry for a column that is not one.
+    #
+    # A misspelt name was ignored, and the column landed as the default type.
+
+    variable = [column for column in table.columns if _is_variable_scale_decimal(column)]
+    names = {column.name for column in variable}
+    for name in _variable_decimal_column_overrides(options):
+        if name not in names:
+            # 458: Option 'decimal.variable.column.type' names {}, which is not a
+            # variable-scale DECIMAL column '{}' has or selects
+            raise InformixError(_m(458, name, table.exposed_name))
+    default = _parse_variable_decimal_type(
+        _VARIABLE_DECIMAL_DEFAULT, option="decimal.variable.type"
+    )
+    targets = []
+    for column in variable:
+        target = _variable_decimal_target(column, options)
+        if target != default:
+            kind, precision, scale = target
+            text = f"decimal({precision},{scale})" if kind == "decimal" else kind
+            targets.append((column.name, text))
+    recorded = tuple(sorted(targets)) or None
+    if table.decimal_targets == recorded:
+        return table
+    return replace(table, decimal_targets=recorded)
 
 
 def _validate_variable_decimal_options(options: dict[str, str]) -> None:
@@ -21275,6 +21369,8 @@ def _schema_fingerprint(table: Table) -> str:
         parts += (("column_renames", table.column_renames),)
     if table.column_transforms is not None:
         parts += (("column_transforms", table.column_transforms, table.transform_key_id),)
+    if table.decimal_targets is not None:
+        parts += (("decimal_targets", table.decimal_targets),)
     return hashlib.sha256(repr(parts).encode("utf-8")).hexdigest()
 
 
@@ -21331,6 +21427,11 @@ def _schema_state(
                     "column_transforms": [list(pair) for pair in table.column_transforms],
                     "transform_key_id": table.transform_key_id,
                 }
+            ),
+            **(
+                {}
+                if table.decimal_targets is None
+                else {"decimal_targets": [list(pair) for pair in table.decimal_targets]}
             ),
         },
     }
@@ -21406,6 +21507,11 @@ def _carry_table_options(fresh: Table, previous: Table) -> Table:
     _ensure_selected_keys(fresh)
     fresh = _apply_row_filter(fresh, previous.row_filter)
     fresh = _apply_column_renames(fresh, previous.column_renames)
+    if previous.decimal_targets is not None:
+        # Those of the columns still there: a dropped column takes its entry with it.
+        names = {column.name for column in fresh.columns}
+        kept = tuple(pair for pair in previous.decimal_targets if pair[0] in names)
+        fresh = replace(fresh, decimal_targets=kept or None)
     carried = _recorded_transforms(previous.column_transforms)
     return _apply_column_transforms(fresh, carried, None, key_id=previous.transform_key_id)
 
@@ -21764,6 +21870,26 @@ def _ensure_compatible_schema_change(
     ):
         # 385: '{}' changed for '{}'; run a full refresh so every row lands under the new names
         raise InformixError(_m(385, _RENAME_COLUMNS_OPTION, name))
+    if (
+        previous.decimal_targets is not None
+        and previous.decimal_targets != current.decimal_targets
+        and not _decimal_targets_cleanup_only(previous, current)
+    ):
+        # A schema recorded before the types were (None) takes them up. Otherwise rows
+        # already landed, and staged pages, hold values of the old type.
+        # 457: '{}' or '{}' changed for '{}'; run a full refresh so every row lands as the new
+        # type
+        raise InformixError(_m(457, "decimal.variable.type", "decimal.variable.column.type", name))
+
+
+def _decimal_targets_cleanup_only(previous: Table, current: Table) -> bool:
+    # Docstring: Whether the variable-DECIMAL types changed only by columns the table no
+    # longer has (an entry left for a dropped column, or taken out after it).
+
+    names = {column.name for column in current.columns}
+    before = {name: target for name, target in previous.decimal_targets or () if name in names}
+    after = {name: target for name, target in current.decimal_targets or () if name in names}
+    return before == after
 
 
 def _selection_cleanup_only(previous: Table, current: Table) -> bool:

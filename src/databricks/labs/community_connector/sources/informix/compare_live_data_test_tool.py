@@ -289,6 +289,13 @@ def source_export_command(args: argparse.Namespace, run_id: str) -> str:
         f"AND i.idxname=c.idxname AND t.tabname IN ({table_literals}) "
         "ORDER BY t.tabname;"
     )
+    # The parts above are column numbers: their names, to key the compare by.
+    sql_statements.append(
+        f"UNLOAD TO '{remote}/key_columns.unl' DELIMITER '|' "
+        "SELECT t.tabname,c.colno,c.colname FROM systables t,syscolumns c "
+        f"WHERE c.tabid=t.tabid AND t.tabname IN ({table_literals}) "
+        "ORDER BY t.tabname,c.colno;"
+    )
     sql = "\n".join(sql_statements) + "\n"
     encoded_sql = __import__("base64").b64encode(sql.encode()).decode()
     environment = (
@@ -367,8 +374,13 @@ def destination_schema(args: argparse.Namespace) -> list[dict[str, Any]]:
     )
 
 
+def _key_names(columns: list[str], key: "list[str] | int") -> list[str]:
+    # A key given as a count (as callers before key_columns did) is the leading columns.
+    return list(columns[:key]) if isinstance(key, int) else list(key)
+
+
 def destination_rows(
-    args: argparse.Namespace, table: str, columns: list[str], key_count: int
+    args: argparse.Namespace, table: str, columns: list[str], key_columns: "list[str] | int"
 ) -> list[dict[str, Any]]:
     def quote(column: str) -> str:
         return "`" + column.replace("`", "``") + "`"
@@ -376,7 +388,7 @@ def destination_rows(
     projection = ",".join(
         f"CAST({quote(column)} AS STRING) AS {quote(column)}" for column in columns
     )
-    ordering = columns[:key_count] or columns
+    ordering = _key_names(columns, key_columns) or columns
     order_by = ",".join(quote(column) for column in ordering)
     rows: list[dict[str, Any]] = []
     page_number = 0
@@ -524,15 +536,41 @@ def primary_key_counts(path: pathlib.Path) -> dict[str, int]:
     return result
 
 
+def primary_key_columns(
+    keys_path: pathlib.Path, columns_path: pathlib.Path
+) -> dict[str, list[str]]:
+    """Each table's primary-key columns by name, in key order.
+
+    The key's parts are column numbers (negative for a descending column). Taken as a
+    count of leading columns, a key on later columns, (col2, col4) say, keyed the compare
+    on the wrong ones."""
+
+    names: dict[tuple[str, int], str] = {}
+    for line in columns_path.read_text(encoding=UNLOAD_ENCODING).splitlines():
+        values = parse_unload_line(line)
+        if len(values) >= 3:
+            names[(values[0], int(values[1]))] = values[2]
+    result = {}
+    for line in keys_path.read_text(encoding=UNLOAD_ENCODING).splitlines():
+        values = parse_unload_line(line)
+        if not values:
+            continue
+        parts = [abs(int(value or 0)) for value in values[1:]]
+        result[values[0]] = [names[(values[0], part)] for part in parts if part]
+    return result
+
+
 def compare_table(
     table: str,
     source_file: pathlib.Path,
     destination: list[dict[str, Any]],
     columns: list[str],
     types: dict[str, str],
-    key_count: int,
+    key_columns: "list[str] | int",
     destination_pipe: pathlib.Path,
 ) -> dict[str, Any]:
+    key_columns = _key_names(columns, key_columns)
+    key_count = len(key_columns)
     source = []
     for number, line in enumerate(
         iter_unload_records(source_file.read_text(encoding=UNLOAD_ENCODING)), 1
@@ -591,7 +629,6 @@ def compare_table(
             "mismatch_examples": [],
         }
 
-    key_columns = columns[:key_count]
     key = lambda row: tuple(normalize(row.get(c), types[c]) for c in key_columns)
     source_by_key = {key(row): row for row in source}
     destination_by_key = {key(row): row for row in destination}
@@ -723,12 +760,14 @@ def main() -> int:
         # each destination table starts fetching as soon as the export lands.
         source_root = output / run_id
 
-        def export_source() -> dict[str, int]:
+        def export_source() -> dict[str, list[str]]:
             progress("Exporting Informix tables...")
             wait_ssm(args, send_ssm(args, source_export_command(args, run_id)))
             progress("Transferring Informix export...")
             transfer_source_archive(args, run_id, output)
-            return primary_key_counts(source_root / "primary_keys.unl")
+            return primary_key_columns(
+                source_root / "primary_keys.unl", source_root / "key_columns.unl"
+            )
 
         def read_schema() -> list[dict[str, Any]]:
             progress("Reading destination schema...")
@@ -766,7 +805,7 @@ def main() -> int:
         results_by_table: dict[str, dict[str, Any]] = {}
 
         def extract_and_compare(table: str) -> dict[str, Any]:
-            rows = destination_rows(args, table, columns[table], keys.get(table, 0))
+            rows = destination_rows(args, table, columns[table], keys.get(table, []))
             progress(f"{table}: destination extraction complete ({len(rows)} rows)")
             return compare_table(
                 table,
@@ -774,7 +813,7 @@ def main() -> int:
                 rows,
                 columns[table],
                 types[table],
-                keys.get(table, 0),
+                keys.get(table, []),
                 output / f"{table}.destination.unl",
             )
 

@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import pickle
+import pathlib
 import random as random_module
 import shutil
 import socket
@@ -6191,6 +6192,8 @@ class LakeflowContractTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "-272"):
             refused._connect_transport()
         self.assertEqual(refused.transport.connects, 1)
+        # Nor is the check marked done: a lease shutdown closing the client is no refusal.
+        self.assertFalse(refused.__dict__.get("_database_locale_checked"))
 
     def test_sysmaster_is_asked_for_the_database_by_its_folded_name(self):
         # Informix folds a database name to lower case: database "TESTDB" opened testdb,
@@ -6260,6 +6263,95 @@ class LakeflowContractTests(unittest.TestCase):
                 connector._snapshot_drain_reader_factory(),
             ):
                 self.assertNotIn(rank, factory().options)
+
+    def test_a_snapshot_time_that_finds_no_slot_is_not_taken_for_none(self):
+        # Taken for a time the source could not tell, a lost lease was cleared unseen, or
+        # the snapshot then waited the whole connection wait a second time.
+        connector = self.connector(FakeBridge())
+        connector._bridge_instance.current_utc_time = mock.Mock(
+            side_effect=informix_module.ConnectionCapacityUnavailable("no slot")
+        )
+        with self.assertRaises(informix_module.ConnectionCapacityUnavailable):
+            connector._source_utc_time()
+        connector._bridge_instance.current_utc_time = mock.Mock(side_effect=RuntimeError("-201"))
+        self.assertIsNone(connector._source_utc_time())
+
+    def test_a_dropped_connection_during_the_partitioned_reader_lookup_is_retried(self):
+        # On a stream runner that starts cold, a drop left the flow on the simple reader for
+        # the whole update.
+        connector = self._partitioned_connector()
+        real = connector._registration_table
+        calls = []
+
+        def flaky(name, options):
+            calls.append(name)
+            if len(calls) == 1:
+                raise informix_module.SqliTransportError("truncated SQLI stream")
+            return real(name, options)
+
+        connector._registration_table = flaky
+        with mock.patch.object(informix_module.time, "sleep"):
+            self.assertTrue(connector.is_partitioned("app.orders"))
+        self.assertEqual(len(calls), 2)
+        # A source that stays down fails the flow instead.
+        connector._registration_table = mock.Mock(
+            side_effect=informix_module.SqliTransportError("down")
+        )
+        with (
+            mock.patch.object(informix_module.time, "sleep"),
+            self.assertRaises(informix_module.SqliTransportError),
+        ):
+            connector.is_partitioned("app.orders")
+
+    def test_pages_staged_under_another_flows_scope_are_cleaned_from_there(self):
+        # A table.migration relocation serves pages staged under the capturing flow's scope:
+        # the stream offset it ends on names that scope, and the cleanup looks there.
+        connector = self.connector(FakeBridge())
+        table = connector._table("app.orders", {})
+        other = hashlib.sha256(b"capturing flow").hexdigest()[:32]
+        end = connector._naming_scan(
+            {"pipeline_scope": connector._registration_scope}, table, other, "1" * 32, {}
+        )
+        self.assertEqual(end["staged_scope"], other)
+        self.assertNotIn(
+            "staged_scope",
+            connector._naming_scan({"pipeline_scope": other}, table, other, "1" * 32, {}),
+        )
+        looked = []
+        with mock.patch.object(
+            connector,
+            "_snapshot_stage_namespace",
+            side_effect=lambda t, scope, schema: looked.append(scope) or "/nonexistent/stage",
+        ):
+            connector._cleanup_completed_snapshot_stage(table, {**_stream_offset(), **end})
+        self.assertEqual(looked, [other])
+
+    def test_a_foreign_incremental_bound_is_recaptured_in_the_copys_own_expressions(self):
+        # With snapshot.incremental.datetime.as.string turned off mid-copy the bound was left
+        # stale, and paging went on in the checkpoint's expressions against it.
+        connector = self.connector(FakeBridge())
+        table = connector._table("app.orders", {})
+        start = _incremental_reader_offset()
+        start["incremental"] = {
+            **start["incremental"],
+            "chunk_exprs": {"id": "expr(id)"},
+            "scope": hashlib.sha256(b"earlier update").hexdigest()[:32],
+        }
+        seen = []
+        with (
+            mock.patch.object(connector, "_incremental_bound_is_foreign", return_value=True),
+            mock.patch.object(
+                connector, "_incremental_datetime_chunk_exprs", return_value=({}, False)
+            ),
+            mock.patch.object(
+                connector,
+                "_rebound_incremental_block",
+                side_effect=lambda t, block, exprs: seen.append(exprs) or dict(block),
+            ),
+            mock.patch.object(connector, "_read_incremental_step", return_value=(iter(()), {})),
+        ):
+            connector._read_incremental(table, start, {})
+        self.assertEqual(seen, [{"id": "expr(id)"}])
 
     def test_a_new_registration_scope_drops_the_staging_client(self):
         # Its token was minted for the update the earlier scope names, which the new
@@ -23896,6 +23988,132 @@ class UnloadHelperTests(unittest.TestCase):
         self.assertEqual(parse("a;;c", delimiter=";"), ["a", "", "c"])
         # An empty escape disables escape processing: a backslash is literal data.
         self.assertEqual(parse("a\\|b", escape=""), ["a\\", "b"])
+
+    def test_the_reserved_names_include_informixs_own_words(self):
+        for word in ("true", "sitename", "dbservername", "current_role", "rownum", "cross"):
+            self.assertEqual(informix_module._sql_name(word), f'"{word}"')
+
+    def test_a_shard_refresh_keeps_a_tables_variable_decimal_types(self):
+        # A catalog re-read knows nothing of table options: without the carry the types
+        # went, the fingerprint changed, and every consumer read directly.
+        columns = [
+            {"name": "id", "type_name": "INTEGER", "length": 4, "nullable": False},
+            {
+                "name": "amount",
+                "type_name": "DECIMAL",
+                "length": 32,
+                "precision": 32,
+                "scale": 255,
+                "nullable": True,
+            },
+        ]
+        fresh = Table.parse({**_table(), "columns": columns}, "demo")
+        previous = informix_module._apply_decimal_targets(
+            fresh, {"decimal.variable.type": "string"}
+        )
+        carried = informix_module._carry_table_options(fresh, previous)
+        self.assertEqual(carried.decimal_targets, previous.decimal_targets)
+        self.assertEqual(
+            informix_module._schema_fingerprint(carried),
+            informix_module._schema_fingerprint(previous),
+        )
+
+    def test_the_compare_tool_keys_a_table_by_its_key_columns_by_name(self):
+        # The key's parts are column numbers. Taken as a count of leading columns, a key
+        # on (b, d) keyed the compare on (a, b): rows sharing those collapsed, hiding
+        # missing ones.
+        from databricks.labs.community_connector.sources.informix import (
+            compare_live_data_test_tool as tool,
+        )
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = pathlib.Path(folder)
+            (root / "primary_keys.unl").write_text("t|2|-4|0|\n", encoding="latin-1")
+            (root / "key_columns.unl").write_text(
+                "t|1|a|\nt|2|b|\nt|3|c|\nt|4|d|\n", encoding="latin-1"
+            )
+            keys = tool.primary_key_columns(root / "primary_keys.unl", root / "key_columns.unl")
+            self.assertEqual(keys, {"t": ["b", "d"]})
+            (root / "t.unl").write_text("1|1|x|1|\n1|1|y|2|\n", encoding="latin-1")
+            columns = ["a", "b", "c", "d"]
+            types = dict.fromkeys(columns, "STRING")
+            destination = [{"a": "1", "b": "1", "c": "x", "d": "1"}]
+            result = tool.compare_table(
+                "t", root / "t.unl", destination, columns, types, keys["t"], root / "t.dest.unl"
+            )
+            self.assertEqual(result["missing_rows"], 1)
+            # A count still means the leading columns.
+            self.assertEqual(tool._key_names(columns, 2), ["a", "b"])
+
+    def test_a_hashed_key_column_may_have_a_name_that_needs_quoting(self):
+        # HASH("date") on a key named date was refused: its canonical text quotes the name,
+        # and was compared with HASH(date).
+        table = Table.parse(
+            {
+                **_table(primary_keys=("date",)),
+                "columns": [
+                    {"name": "date", "type_name": "VARCHAR", "length": 10, "nullable": False},
+                    {"name": "value", "type_name": "VARCHAR", "length": 10, "nullable": True},
+                ],
+            },
+            "demo",
+        )
+        transforms = informix_module._column_transforms(
+            {"transform_columns": '{"date": "HASH(\\"date\\")"}'}
+        )
+        hashed = informix_module._apply_column_transforms(table, transforms, "k" * 16)
+        self.assertEqual(hashed.column_transforms, (("date", 'HASH("date")'),))
+        with self.assertRaisesRegex(InformixError, "may only HASH key column"):
+            informix_module._apply_column_transforms(
+                table,
+                informix_module._column_transforms(
+                    {"transform_columns": '{"date": "UPPER(\\"date\\")"}'}
+                ),
+                "k" * 16,
+            )
+
+    def test_a_variable_decimal_option_names_columns_the_table_has_and_is_fingerprinted(self):
+        columns = [
+            {"name": "id", "type_name": "INTEGER", "length": 4, "nullable": False},
+            {
+                "name": "amount",
+                "type_name": "DECIMAL",
+                "length": 32,
+                "precision": 32,
+                "scale": 255,
+                "nullable": True,
+            },
+            {
+                "name": "price",
+                "type_name": "DECIMAL",
+                "length": 10,
+                "precision": 10,
+                "scale": 2,
+                "nullable": True,
+            },
+        ]
+        table = Table.parse({**_table(), "columns": columns}, "demo")
+        apply = informix_module._apply_decimal_targets
+        self.assertIsNone(apply(table, {}).decimal_targets)
+        typed = apply(table, {"decimal.variable.type": "string"})
+        self.assertEqual(typed.decimal_targets, (("amount", "string"),))
+        self.assertNotEqual(
+            informix_module._schema_fingerprint(typed), informix_module._schema_fingerprint(table)
+        )
+        # The default, written out, is no change.
+        self.assertIsNone(apply(table, {"decimal.variable.type": "decimal(38,18)"}).decimal_targets)
+        for raw, message in (
+            ("amout:string", "names amout"),
+            ("price:string", "names price"),
+            ("amount:string,amount:double", "more than once"),
+        ):
+            with self.subTest(raw), self.assertRaisesRegex((InformixError, ValueError), message):
+                apply(table, {"decimal.variable.column.type": raw})
+        # Recorded in the schema state, and read back.
+        state = informix_module._schema_state(typed, 100)
+        self.assertEqual(
+            Table.parse(state["table"], "demo").decimal_targets, (("amount", "string"),)
+        )
 
     def test_catalog_names_are_quoted_in_sql_where_informix_would_read_them_otherwise(self):
         # Informix folds a bare name to lower case and reads an SQL word as SQL: a name the

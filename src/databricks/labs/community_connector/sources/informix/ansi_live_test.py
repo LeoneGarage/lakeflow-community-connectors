@@ -44,7 +44,8 @@ class AnsiSnapshotLiveTest(unittest.TestCase):
         try:
             ansi_rows = bridge.transport.execute(
                 "SELECT is_ansi FROM sysmaster:sysdatabases WHERE name = ?",
-                (options["database"],),
+                # sysmaster holds the name folded to lower case.
+                (str(options["database"]).lower(),),
             )
             self.assertEqual(len(ansi_rows), 1)
             self.assertEqual(int(_field(ansi_rows[0], "is_ansi", 0)), 1)
@@ -561,7 +562,8 @@ class ScalarTypesLiveTest(unittest.TestCase):
     def _database_is_ansi(bridge) -> bool:
         rows = bridge.transport.execute(
             "SELECT is_ansi FROM sysmaster:sysdatabases WHERE name = ?",
-            (bridge.config["database"],),
+            # sysmaster holds the name folded to lower case.
+            (str(bridge.config["database"]).lower(),),
         )
         if len(rows) != 1:
             raise AssertionError("could not determine live scalar database transaction mode")

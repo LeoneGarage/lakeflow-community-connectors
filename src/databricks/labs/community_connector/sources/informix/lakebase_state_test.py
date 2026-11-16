@@ -1465,6 +1465,17 @@ class LakebaseStateRecordTests(unittest.TestCase):
         connection.commit.assert_called_once()
 
 
+def _answer_sweep_queries(cursor, recent=(False, False, False, False)):
+    """Answer a project sweep's two queries: table activity long ago, then whether anything
+    else moved within the retention (nothing, unless ``recent`` says so)."""
+
+    def fetchone():
+        sql = str(cursor.execute.call_args.args[0]) if cursor.execute.call_args else ""
+        return tuple(recent) if "EXISTS" in sql else (1, 1, 1.0)
+
+    cursor.fetchone.side_effect = fetchone
+
+
 class LakebaseProjectNamingTests(unittest.TestCase):
     def test_project_id_is_stable_and_dns_compliant(self):
         first = lakebase_state.project_id_for_connection("host\x009088\x00server")
@@ -1588,7 +1599,7 @@ class LakebaseProjectNamingTests(unittest.TestCase):
         state._api_client = mock.Mock(return_value=api)
         connection = mock.MagicMock()
         cursor = connection.cursor.return_value.__enter__.return_value
-        cursor.fetchone.return_value = (1, 1, 1.0)
+        _answer_sweep_queries(cursor)
         state._open = mock.Mock(return_value=connection)
         state._admin_user = mock.Mock(return_value="admin")
 
@@ -1607,6 +1618,42 @@ class LakebaseProjectNamingTests(unittest.TestCase):
         api.request.assert_any_call("DELETE", "/api/2.0/postgres/projects/informix-state-old")
         connection.close.assert_called_once()
 
+    def test_a_project_with_recent_activity_of_another_kind_is_kept(self):
+        # Table activity alone said a project was idle while a reader used it: a stream
+        # outside a pipeline records none, and a pipeline resumed after a long stop waits
+        # for a slot first. A renewed lease, a waiting reader, a backlog hint or a new state
+        # record within the retention keeps it.
+        for recent in (
+            (True, False, False, False),
+            (False, True, False, False),
+            (False, False, True, False),
+            (False, False, False, True),
+        ):
+            with self.subTest(recent=recent):
+                lakebase_state.LakebaseState._project_gc_checked.clear()
+                state = lakebase_state.LakebaseState({}, "current")
+                api = mock.MagicMock()
+                api.request.side_effect = [{"projects": [{"name": "projects/informix-state-old"}]}]
+                state._api_client = mock.Mock(return_value=api)
+                connection = mock.MagicMock()
+                _answer_sweep_queries(connection.cursor.return_value.__enter__.return_value, recent)
+                state._open = mock.Mock(return_value=connection)
+                state._admin_user = mock.Mock(return_value="admin")
+                with (
+                    mock.patch.object(
+                        lakebase_state,
+                        "_endpoint_facts",
+                        return_value={"endpoint": "endpoint", "host": "host"},
+                    ),
+                    mock.patch.object(lakebase_state, "generate_credential", return_value="token"),
+                    mock.patch.object(lakebase_state.time, "time", return_value=100_000_000),
+                ):
+                    self.assertEqual(state.collect_unused_projects(90, 24), 0)
+                self.assertNotIn(
+                    mock.call("DELETE", "/api/2.0/postgres/projects/informix-state-old"),
+                    api.request.call_args_list,
+                )
+
     def test_the_project_sweep_reads_every_page_and_as_the_state_role(self):
         # The listing comes in pages, and the records belong to the state role: the
         # provisioning identity takes that role to read them, granting it to itself first
@@ -1622,7 +1669,7 @@ class LakebaseProjectNamingTests(unittest.TestCase):
         state._api_client = mock.Mock(return_value=api)
         connection = mock.MagicMock()
         cursor = connection.cursor.return_value.__enter__.return_value
-        cursor.fetchone.return_value = (1, 1, 1.0)
+        _answer_sweep_queries(cursor)
         refused = [True]
 
         def execute(statement, *args):
@@ -1709,7 +1756,7 @@ class LakebaseProjectNamingTests(unittest.TestCase):
         state._api_client = mock.Mock(return_value=api)
         connection = mock.MagicMock()
         cursor = connection.cursor.return_value.__enter__.return_value
-        cursor.fetchone.return_value = (1, 1, 1.0)
+        _answer_sweep_queries(cursor)
         state._open = mock.Mock(return_value=connection)
         state._admin_user = mock.Mock(return_value="admin")
 

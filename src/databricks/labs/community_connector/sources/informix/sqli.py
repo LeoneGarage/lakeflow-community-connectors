@@ -2005,7 +2005,14 @@ class InformixSqliClient:
             elif variable_layout and kind in {40, 41, 43, 45, 46}:
                 if start + 5 > len(payload):
                     raise SqliProtocolError("truncated complex variable tuple")
-                limit = start + 5 + struct.unpack_from(">i", payload, start + 1)[0]
+                envelope = struct.unpack_from(">i", payload, start + 1)[0]
+                if envelope < 0:
+                    # -4 to -1 left the slice inside its own 5-byte header, which passed
+                    # the bounds check, decoded as a value, and misaligned the row.
+                    raise SqliProtocolError(
+                        f"negative variable tuple length {envelope} for column {column.name!r}"
+                    )
+                limit = start + 5 + envelope
             elif variable_layout:
                 limit = start + _fixed_result_size(column)
             else:
