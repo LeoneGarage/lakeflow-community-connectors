@@ -1250,11 +1250,12 @@ def validate_lakebase_options(options: dict[str, str]) -> None:
     # as the state was first opened, deep inside a read.
 
     project_id = options.get("lakebase.project.id", "").strip()
-    # The id goes into workspace API paths and queries as it is.
-    if project_id and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", project_id) is None:
+    # The id goes into workspace API paths and queries as it is. Lakebase's rule: a
+    # leading digit or a trailing hyphen passed here and failed at the project API.
+    if project_id and re.fullmatch(r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?", project_id) is None:
         raise LakebaseStateError(
             "lakebase.project.id must be 1 to 63 lowercase letters, digits or hyphens, "
-            "starting with a letter or digit"
+            "starting with a letter and ending with a letter or digit"
         )
     raw = options.get("lakebase.provision.timeout.seconds", _DEFAULT_PROVISION_TIMEOUT_SECONDS)
     try:

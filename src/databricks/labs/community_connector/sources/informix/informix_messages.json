@@ -463,5 +463,8 @@
 "The snapshot of {} pages by its key and reached a NULL in key column {}; paging by key can't go past it: set snapshot.scan: cursor for this table",
 "Tables '{}' and '{}' of this pipeline both read Informix table {}, and two flows of one table would share its change and snapshot state; read each Informix table through one source_table per pipeline",
 "A row of '{}' has NULL in NOT NULL key column {}, which would merge distinct keys into one: '{}=null' turned a string holding a NUL byte into NULL, or the row image is incomplete",
-"Informix schema change for '{}' widened column {}, whose transform lands it as {} and would now land it as {}, which Delta can't widen in place; run a full refresh"
+"Informix schema change for '{}' widened column {}, whose transform lands it as {} and would now land it as {}, which Delta can't widen in place; run a full refresh",
+"Informix table '{}' no longer has column(s) {}, which its index-ordered snapshot paged by, while the stream has yet to pass the snapshot's end; run a full refresh",
+"Transform of column {} gives {}, which has more integer digits than a DECIMAL(38), Spark's largest, holds",
+"Informix offset has an invalid staged_scope; run a full refresh with this connector version"
 ]

@@ -2484,6 +2484,52 @@ class LakeflowContractTests(unittest.TestCase):
         )
         self.assertEqual(list(tx.records), [other])
 
+    def test_a_change_without_the_column_the_scan_paged_by_fails_for_a_full_refresh(self):
+        # Informix returns a row logged before a column was dropped without it: replayed
+        # after the scan's index column went, a change had no value to place by, and the
+        # read failed with a KeyError.
+        scan = {
+            "index_scan": {
+                "keys": ["id"],
+                "descending": [False],
+                "pages": [[None, 100, 110]],
+                "end": 210,
+                "suppress": [],
+                "keep": [],
+                "settled": [],
+                "time": None,
+            }
+        }
+        connector = self.connector(_IndexScanSource(random_module.Random(1)))
+        connector._read_snapshot_stage_manifest = lambda *_: scan
+        connector._offset_scopes = lambda checkpoint: ("scope", "scope")
+        keyless = Table.parse(_table(primary_keys=()), "demo")
+        transactions = informix_module._transaction_batch(
+            [
+                {"op": "BEGIN", "tx_id": 1, "lsn": 150},
+                {"op": "INSERT", "tx_id": 1, "lsn": 151, "table": keyless.name, "row": {"x": 1}},
+                {"op": "COMMIT", "tx_id": 1, "lsn": 152},
+            ]
+        )[0]
+        with self.assertRaisesRegex(
+            InformixError, "no longer has column\\(s\\) id, which its index-ordered snapshot"
+        ):
+            connector._drop_scanned_changes(
+                keyless, {"commit_lsn": "90", "schema_id": "s"}, {}, transactions
+            )
+
+    def test_the_moved_row_index_keys_a_number_by_its_value(self):
+        # As text, the 7 a scan recorded and the 7.00 of the same row after its key column
+        # was widened to DECIMAL(12,2) were two keys. An integer keeps its form, so a scan
+        # recorded before this reads the same.
+        text = informix_module._index_scan_key_text
+        self.assertEqual(text([7, "a"]), '[7, "a"]')
+        self.assertEqual(text([Decimal("7.00")]), text([7]))
+        self.assertEqual(text([Decimal("7.50")]), text([Decimal("7.5000")]))
+        self.assertNotEqual(text([Decimal("7.5")]), text([7]))
+        long = Decimal("1234567890123456789012345678901.5")
+        self.assertEqual(json.loads(text([long])), ["1234567890123456789012345678901.5"])
+
     def test_the_stream_passes_on_the_half_of_an_index_update_the_scan_lacks(self):
         # Two pages: ids up to 5, read between 100 and 110, and the rest, read between 200
         # and 210. An UPDATE that committed at 150 moved a row between them.
@@ -6463,6 +6509,9 @@ class LakeflowContractTests(unittest.TestCase):
             ({"lakebase.provision.timeout.seconds": "soon"}, "must be a number"),
             ({"lakebase.provision.timeout.seconds": "0"}, "must be > 0"),
             ({"lakebase.project.id": "Not_An_Id"}, "lakebase.project.id must be"),
+            # Lakebase's rule: a letter first and a letter or digit last.
+            ({"lakebase.project.id": "my-project-"}, "ending with a letter or digit"),
+            ({"lakebase.project.id": "7-projects"}, "starting with a letter"),
             ({"padVarchar": "maybe"}, "padVarchar"),
             ({"redirect.allowlist": "host-without-port"}, "host:numeric-port"),
             ({"bridge.factory": "module:make"}, "cannot name code to load"),
@@ -8500,6 +8549,15 @@ class LakeflowContractTests(unittest.TestCase):
                 corrupt["update_fingerprint"] = bad
                 with self.assertRaisesRegex(ValueError, "invalid update_fingerprint"):
                     informix_module._validated_offset(corrupt)
+
+    def test_an_offset_with_a_bad_staged_scope_is_refused_as_the_other_scopes_are(self):
+        # A malformed staged_scope was passed over for the flow's own scope, where the
+        # pages it named were not.
+        offset = dict(_stream_offset())
+        informix_module._validated_offset({**offset, "staged_scope": offset["pipeline_scope"]})
+        for bad in ("../elsewhere", 7, ""):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "invalid staged_scope"):
+                informix_module._validated_offset({**offset, "staged_scope": bad})
 
     def test_a_streak_only_offset_is_recognised_as_a_retry_offset(self):
         # A capacity-miss offset carries only bookkeeping keys. If backlog_streak
@@ -27352,14 +27410,44 @@ class SchemaEvolutionTests(_TableOptionTestCase):
             recorded, gen1, extend_wildcard_key=True, wildcard_except=("audit_ts",)
         )
         # A record from before the lists were kept falls back to the live one.
-        legacy = dataclasses.replace(recorded, key_wildcard_except=())
+        state["table"].pop("key_wildcard_except")
+        legacy = informix_module._table_from_schema_state(state, "demo")
+        self.assertIsNone(legacy.key_wildcard_except)
         with self.assertRaisesRegex(InformixError, "changed table identity or primary keys"):
             informix_module._ensure_compatible_schema_change(
                 legacy,
-                dataclasses.replace(gen1, key_wildcard_except=()),
+                dataclasses.replace(gen1, key_wildcard_except=None),
                 extend_wildcard_key=True,
                 wildcard_except=("audit_ts",),
             )
+
+    def test_a_bare_wildcard_step_is_judged_by_its_own_empty_except_list(self):
+        # Under a bare "*" the recorded list is empty, which read as unknown and took the
+        # live one: with d dropped and back under "* except(d)", the step that dropped it
+        # read d as never in the key, and failed as a key change.
+        def wildcard(columns, keys, excepted):
+            return dataclasses.replace(
+                self.table(columns, keys=keys),
+                key_override=True,
+                key_wildcard=True,
+                key_wildcard_except=excepted,
+            )
+
+        gen0 = wildcard([self.ID, self.column("d")], ("id", "d"), ())
+        gen1 = wildcard([self.ID], ("id",), ())
+        state = informix_module._schema_state(gen0, 100)
+        self.assertEqual(state["table"]["key_wildcard_except"], [])
+        recorded = informix_module._table_from_schema_state(state, "demo")
+        self.assertEqual(recorded.key_wildcard_except, ())
+        informix_module._ensure_compatible_schema_change(
+            recorded,
+            informix_module._table_from_schema_state(
+                informix_module._schema_state(gen1, 200), "demo"
+            ),
+            extend_wildcard_key=True,
+            shrink_wildcard_key=True,
+            wildcard_except=("d",),
+        )
 
 
 class RowFilterTests(_TableOptionTestCase):
@@ -27894,6 +27982,19 @@ class ColumnTransformTests(_TableOptionTestCase):
         self.assertEqual(apply("TRUNC", 12.34, [2], {}), 12.34)
         self.assertEqual(apply("ROUND", Decimal("1.15"), [1], {}), Decimal("1.2"))
 
+    def test_a_transform_past_38_integer_digits_fails_by_name(self):
+        # ROUND to a negative digit of a DECIMAL(38,0) has no digit for the carry: 38 nines
+        # to the ten is 10^38, which no Spark decimal holds, and the batch failed in Spark.
+        operand = ("fn", "ROUND", ("v", ("number", Decimal(-1))))
+        transforms = (("v", "ROUND(v, -1)", operand),)
+        context = {"encoding": "utf-8", "hash_key": b""}
+        rows = informix_module._transformed_rows(
+            iter([{"v": Decimal("9" * 37)}, {"v": Decimal("9" * 38)}]), transforms, context
+        )
+        self.assertEqual(next(rows)["v"], Decimal(10) ** 37)
+        with self.assertRaisesRegex(InformixError, "more integer digits than a DECIMAL\\(38\\)"):
+            next(rows)
+
     def test_a_fallback_on_a_wide_decimal_keeps_its_digits(self):
         # A DECIMAL(32,10) fallback holds 30 digits, past Python's default 28.
         raw = _table()
@@ -28137,6 +28238,35 @@ class ColumnTransformTests(_TableOptionTestCase):
         rows = list(connector.read_partition("app.orders", partition, dict(options)))
         self.assertEqual([(row["id"], row["extra"]) for row in rows], [(3, 0)])
         self.assertIs(type(rows[0]["extra"]), int)
+
+    def test_an_executor_split_refuses_a_null_in_a_not_null_key_as_the_driver_does(self):
+        # The split's stand-in table had no key, so the NULL key check the driver's .unl
+        # paths make never ran there: an empty key field landed as a NULL key.
+        connector = self.connector(_ProjectingBridge())
+        path = os.path.join(self._shared_state.name, "orders_keys.unl")
+        with open(path, "wb") as handle:
+            handle.write(b"|c||\n")
+        partition = {
+            "kind": "unl_split",
+            "path": path,
+            "start_byte": 0,
+            "end_byte": os.path.getsize(path),
+            "gzip": False,
+            "columns": [
+                {"name": "id", "type_name": "INTEGER", "nullable": False},
+                {"name": "value", "type_name": "VARCHAR", "length": 20},
+                {"name": "extra", "type_name": "INTEGER"},
+            ],
+            "snapshot_lsn": 100,
+            "exposed_name": "app.orders",
+            "primary_keys": ["id"],
+        }
+        with self.assertRaisesRegex(InformixError, "NULL in NOT NULL key column id"):
+            list(connector.read_partition("app.orders", partition, {}))
+        # A descriptor from before the key rode along reads as before.
+        del partition["primary_keys"]
+        rows = list(connector.read_partition("app.orders", partition, {}))
+        self.assertEqual([row["id"] for row in rows], [None])
 
     def test_a_transform_keeps_a_not_null_column_not_null_unless_it_can_null(self):
         connector = self.keyed(_ProjectingBridge())

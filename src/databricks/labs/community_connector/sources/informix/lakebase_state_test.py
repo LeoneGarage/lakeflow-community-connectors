@@ -27,7 +27,6 @@ import time
 import types
 import unittest
 from unittest import mock
-from unittest import mock
 
 from databricks.labs.community_connector.sources.informix import lakebase_state
 from databricks.labs.community_connector.sources.informix import (  # noqa: F401

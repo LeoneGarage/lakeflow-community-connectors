@@ -2442,7 +2442,6 @@ class PurePythonInformixBridge:
             )
             self._seeded_connection_limit = seeded
         owner = secrets.token_hex(16)
-        scope = self.options.get("_informix.pipeline.scope") or None
         deadline = time.monotonic() + connection_wait_timeout
         # Slot-wait liveness (the two daemon roles). A daemon is not a consumer microbatch: it must
         # not fail merely because the pool is *full* -- only when it is *wedged*. So its deadline is
@@ -2499,7 +2498,6 @@ class PurePythonInformixBridge:
                     owner,
                     slot_count=slot_count,
                     floor=floor,
-                    scope=scope,
                     lease_seconds=_CONNECTION_SLOT_LEASE_SECONDS,
                     ticket_id=ticket_id,
                     waiter_ttl=_LAKEBASE_WAITER_TTL_SECONDS,
@@ -4801,12 +4799,31 @@ def _index_scan_row_key(
     shaped = _framework_row(
         _coerce_variable_decimal_values({name: row[name] for name in names}, table, options)
     )
-    return json.dumps([shaped[name] for name in names], default=str)
+    return _index_scan_key_text([shaped[name] for name in names])
 
 
 def _index_scan_staged_key(row: dict[str, Any], names: Sequence[str]) -> str:
     # Docstring: The same of a staged row: _index_scan_row_key of the row it was shaped from.
-    return json.dumps([row[name] for name in names], default=str)
+    return _index_scan_key_text([row[name] for name in names])
+
+
+def _index_scan_key_text(values: Sequence[Any]) -> str:
+    # Docstring: Key values as the scan's moved-row index names them.
+    #
+    # A number by its value, as Informix compares it: as text, the 7 a scan recorded and
+    # the 7.00 of the same row after its key column was widened to DECIMAL(12,2) were two
+    # keys, and the stream missed the row's entry. An integer keeps its form.
+
+    def value(item: Any) -> Any:
+        if isinstance(item, Decimal) and item.is_finite():
+            if item == item.to_integral_value():
+                return int(item)
+            with localcontext() as context:
+                context.prec = 80
+                return format(item.normalize(), "f")
+        return item
+
+    return json.dumps([value(item) for item in values], default=str)
 
 
 def _moved_rows_of_page(moved: dict[str, Any] | None, page_index: int) -> dict[str, Any] | None:
@@ -5778,6 +5795,13 @@ def _transformed_rows(rows: Iterator[dict], transforms: tuple | None, context: d
                     # 451: Transform of column {} gives {}, which is outside the range of
                     # a 64-bit integer
                     raise InformixError(_m(451, name, value))
+                if isinstance(value, Decimal) and value.is_finite() and value.adjusted() >= 38:
+                    # ROUND to a negative digit of a DECIMAL(38,0) (decimal.variable.type:
+                    # decimal(38,0)) has no digit left for the carry: 38 nines to the ten
+                    # is 10^38, which failed the batch in Spark.
+                    # 466: Transform of column {} gives {}, which has more integer digits
+                    # than a DECIMAL(38), Spark's largest, holds
+                    raise InformixError(_m(466, name, value))
                 out[name] = _framework_value(value)
         return out
 
@@ -7244,7 +7268,9 @@ class Table:
     # The columns a ``"* except(...)"`` wildcard leaves out of the key, kept so a refresh
     # re-expands it the same way; empty for a bare ``*``. Not fingerprinted: the resolved
     # primary_keys are, so changing the list changes the key and needs a full refresh.
-    key_wildcard_except: tuple[str, ...] = ()
+    # None where no primary.keys option set it, or a recorded schema doesn't say: an empty
+    # list is a bare "*" (see _ensure_compatible_schema_change).
+    key_wildcard_except: tuple[str, ...] | None = None
     # Per-column key index direction, parallel to primary_keys: True == DESC.
     # Empty means all-ascending (the common case) -- paging then uses the default
     # lexicographic order untouched. A mixed/descending key carries the full
@@ -7404,7 +7430,11 @@ class Table:
             decimal_default=(
                 None if raw.get("decimal_default") is None else str(raw["decimal_default"])
             ),
-            key_wildcard_except=tuple(str(name) for name in raw.get("key_wildcard_except") or ()),
+            key_wildcard_except=(
+                None
+                if raw.get("key_wildcard_except") is None
+                else tuple(str(name) for name in raw["key_wildcard_except"])
+            ),
         )
 
 
@@ -12844,11 +12874,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # The scope that staged the pages: a snapshot finished in a later update than it
         # started keeps the starting update's scope on its offsets, and one served for a
         # relocation names the capturing flow's (see _naming_scan).
-        staged = validated.get("staged_scope")
-        if isinstance(staged, str) and _PIPELINE_SCOPE.fullmatch(staged):
-            scope = staged
-        else:
-            scope = self._offset_scopes(validated)[1]
+        scope = validated.get("staged_scope") or self._offset_scopes(validated)[1]
         schema_id = str(validated["schema_id"])
         path = self._snapshot_stage_namespace(table, scope, schema_id)
         if path in self._cleaned_snapshot_stages:
@@ -15922,6 +15948,20 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
 
         def held(tx, row, lsn) -> bool:
             # Whether the scan's pages hold the change to ``row`` named by ``lsn``.
+            #
+            # Informix returns a row logged before a column was dropped without it, so a
+            # change replayed after the scan's index column went had no value to place
+            # by (a KeyError). Nothing says then whether the pages hold it.
+            missing = [
+                name
+                for name in dict.fromkeys((*keys, *(moved["keys"] if relocated else ())))
+                if name not in row
+            ]
+            if missing:
+                # 465: Informix table '{}' no longer has column(s) {}, which its
+                # index-ordered snapshot paged by, while the stream has yet to pass the
+                # snapshot's end; run a full refresh
+                raise InformixError(_m(465, table.exposed_name, ", ".join(missing)))
             window = relocated and relocated.get(
                 _index_scan_row_key(row, table, options, moved["keys"])
             )
@@ -16900,12 +16940,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         if selected is not None:
             wanted = set(selected)
             columns = tuple(column for column in catalog if column.name in wanted)
+        # The key goes into nothing but the NULL key check: without it, a NULL in a NOT
+        # NULL key column the driver's paths refuse landed from an executor.
         table = Table(
             database="",
             owner="",
             name=str(partition.get("exposed_name", "")),
             columns=columns,
-            primary_keys=(),
+            primary_keys=tuple(str(name) for name in partition.get("primary_keys") or ()),
             catalog_columns=catalog if selected is not None else (),
             row_filter=partition.get("row_filter"),
         )
@@ -17038,6 +17080,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     else {"selected": [column.name for column in table.columns]}
                 ),
                 **({} if table.row_filter is None else {"row_filter": table.row_filter}),
+                # For the NULL key check the driver's paths make (_refuse_null_key).
+                **({"primary_keys": list(table.primary_keys)} if table.primary_keys else {}),
                 "snapshot_lsn": snapshot_lsn,
                 "exposed_name": table.exposed_name,
                 "encoding": encoding,
@@ -21842,11 +21886,12 @@ def _schema_state(
             **({} if table.decimal_default is None else {"decimal_default": table.decimal_default}),
             # Not fingerprinted (the key it gives is): kept so a replayed step is judged by
             # the except list it was taken under, not the live one (see
-            # _ensure_compatible_schema_change).
+            # _ensure_compatible_schema_change). An empty one (a bare "*") included: left
+            # out, it read as unknown.
             **(
-                {"key_wildcard_except": list(table.key_wildcard_except)}
-                if table.key_wildcard_except
-                else {}
+                {}
+                if table.key_wildcard_except is None
+                else {"key_wildcard_except": list(table.key_wildcard_except)}
             ),
         },
     }
@@ -21963,7 +22008,7 @@ def _wildcard_key(columns: Iterable[Column], excepted: Iterable[str]) -> list[st
     # Matched ignoring case, as Informix folds an undelimited identifier to lower case, so
     # "* except(Note)" leaves out a column catalogued as ``note``.
 
-    folded = {name.casefold() for name in excepted}
+    folded = {name.casefold() for name in excepted or ()}
     return [column.name for column in columns if column.name.casefold() not in folded]
 
 
@@ -21978,7 +22023,7 @@ def _ensure_excepted_columns_exist(table: Table, excepted: Iterable[str]) -> Non
     # ahead; add it to the list once it exists, before the pipeline restarts.
 
     known = {column.name.casefold() for column in table.catalog_columns or table.columns}
-    missing = [name for name in excepted if name.casefold() not in known]
+    missing = [name for name in excepted or () if name.casefold() not in known]
     if missing:
         # 374: Option '{}' excepts column(s) that '{}' does not have: {}
         raise InformixError(_m(374, _PRIMARY_KEYS_OPTION, table.exposed_name, (", ".join(missing))))
@@ -22138,7 +22183,7 @@ def _ensure_compatible_schema_change(
     *,
     extend_wildcard_key: bool = False,
     shrink_wildcard_key: bool = False,
-    wildcard_except: tuple[str, ...] = (),
+    wildcard_except: tuple[str, ...] | None = (),
 ) -> None:
     # Docstring: Fail closed unless the stream can adopt ``current`` without a full refresh.
     #
@@ -22214,8 +22259,15 @@ def _ensure_compatible_schema_change(
     # were kept) by ``wildcard_except``, the live table's: by the live list alone, a step
     # replayed after an edit the README asks for (a dropped column taken out of the list)
     # read as a key change. A changed except list fails here as any other key change does.
-    previous_except = previous.key_wildcard_except or wildcard_except
-    current_except = current.key_wildcard_except or wildcard_except
+    # By "is None", not truthiness: a bare "*" recorded as such has the empty list, and read
+    # as unknown it took the live list, say "* except(d)" after a dropped d came back.
+    wildcard_except = tuple(wildcard_except or ())
+    previous_except = (
+        wildcard_except if previous.key_wildcard_except is None else previous.key_wildcard_except
+    )
+    current_except = (
+        wildcard_except if current.key_wildcard_except is None else current.key_wildcard_except
+    )
     wildcard_shaped = previous.primary_keys == tuple(
         _wildcard_key(previous.columns, previous_except)
     )
@@ -22543,6 +22595,16 @@ def _validated_offset(offset: dict[str, Any]) -> dict[str, Any]:
         # 445: Informix offset has an invalid scan_scope or scan_schema; run a full
         # refresh with this connector version
         raise ValueError(_m(445))
+    # staged_scope names the update whose staged pages the stream cleans up (see
+    # _naming_scan): checked as the other scopes are, where a bad one was passed over
+    # for the flow's own scope and its pages waited for the retention sweep.
+    staged_scope = result.get("staged_scope")
+    if staged_scope is not None and (
+        not isinstance(staged_scope, str) or _PIPELINE_SCOPE.fullmatch(staged_scope) is None
+    ):
+        # 467: Informix offset has an invalid staged_scope; run a full refresh with this
+        # connector version
+        raise ValueError(_m(467))
     trigger_generation = result.get("trigger_generation")
     if trigger_generation is not None and (
         not isinstance(trigger_generation, str)
