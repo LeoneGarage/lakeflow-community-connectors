@@ -7293,6 +7293,10 @@ def register_lakeflow_source(spark):
     # Predecessor hops a same-position channel start may follow back to its first schema.
     _MAX_SCHEMA_DESCENT = 256
     _INFORMIX_REGISTRATION_CONTEXT: dict[str, Any] = {"scope": None, "request": None}
+    # How old the driver's captured workspace credential may get before the driver, packing a
+    # registration, captures it again: the ambient token lasts about an hour.
+    _CREDENTIAL_RECAPTURE_SECONDS = 900.0
+    _CREDENTIAL_CAPTURED: dict[str, float] = {}
     # An index-ordered snapshot records its progress beside its staged pages, so that a restart
     # after a failure continues from the last page instead of the table's first row. The
     # record of an earlier update is used only while it is this recent: its pages are swept
@@ -7665,11 +7669,23 @@ def register_lakeflow_source(spark):
             except (AttributeError, TypeError):
                 pass
         held = _INFORMIX_REGISTRATION_CONTEXT["scope"]
+        now = time.monotonic()
         if held is None or (running is not None and running != held):
             capture_workspace_credentials()
+            _CREDENTIAL_CAPTURED["at"] = now
             scope, request = _registration_identity(spark_session)
             _INFORMIX_REGISTRATION_CONTEXT["request"] = request
             _INFORMIX_REGISTRATION_CONTEXT["scope"] = scope
+        elif (
+            spark_session is not None
+            and now - _CREDENTIAL_CAPTURED.get("at", now) >= _CREDENTIAL_RECAPTURE_SECONDS
+        ):
+            # The same update, or a session outside a pipeline, packing a registration again
+            # (a flow restarted, say): the token captured when it began lasts about an hour,
+            # and a process first reaching the control plane after that failed with it.
+            # Captured again here, on the driver; a failed capture keeps the one held.
+            capture_workspace_credentials()
+            _CREDENTIAL_CAPTURED["at"] = now
         return {
             "scope": _INFORMIX_REGISTRATION_CONTEXT["scope"],
             "request": _INFORMIX_REGISTRATION_CONTEXT["request"],
@@ -19653,9 +19669,10 @@ def register_lakeflow_source(spark):
                 return
             self._retention_swept.add(identity)
             connection_key, table_key = self._table_state_keys_for(identity)
-            root = os.path.join(location, connection_key, table_key, "snapshot-page-data")
             self._snapshot_cleanup_executor().submit(
-                self._sweep_stale_snapshot_stages, root, float(retention)
+                self._sweep_table_staging,
+                os.path.join(location, connection_key, table_key),
+                float(retention),
             )
 
         @staticmethod
@@ -19672,6 +19689,41 @@ def register_lakeflow_source(spark):
                 for schema in _staging_subdirectories(scope):
                     for run in _staging_subdirectories(os.path.join(schema, "runs")):
                         InformixLakeflowConnect._remove_stale_stage_run(run, cutoff)
+
+        @staticmethod
+        def _sweep_stale_scan_progress(root: str, retention_seconds: float) -> None:
+            # Docstring: Delete the index-ordered scans' progress (``snapshot-scan/``) under a
+            # table's staging root once it is older than the retention window and the scan
+            # resume window both.
+            #
+            # A finished scan's progress goes when its stream commits (_discard_scan_progress),
+            # but that of a dropped table, a deleted pipeline, or a stream outside a pipeline
+            # (whose random scope no later run resumes) was kept for good. A record still young
+            # enough for a restart to continue from is never selected.
+
+            cutoff = time.time() - max(float(retention_seconds), float(_SCAN_RESUME_SECONDS))
+            for scope in _staging_subdirectories(root):
+                for schema in _staging_subdirectories(scope):
+                    for boundary in _staging_subdirectories(schema):
+                        InformixLakeflowConnect._remove_stale_stage_run(boundary, cutoff)
+            try:
+                with os.scandir(root) as entries:
+                    pointers = [
+                        entry.path
+                        for entry in entries
+                        if entry.name.endswith(".json")
+                        and entry.is_file(follow_symlinks=False)
+                        and entry.stat(follow_symlinks=False).st_mtime < cutoff
+                    ]
+            except OSError:
+                return  # nothing recorded there, or unreadable
+            for pointer in pointers:
+                with contextlib.suppress(FileNotFoundError):
+                    try:
+                        os.remove(pointer)
+                    except OSError:
+                        # 227: Cannot remove stale Informix snapshot run: {}
+                        logging.getLogger(__name__).warning(_m(227, pointer), exc_info=True)
 
         @staticmethod
         def _remove_stale_stage_run(run: str, cutoff: float) -> None:
@@ -19731,9 +19783,18 @@ def register_lakeflow_source(spark):
         @staticmethod
         def _sweep_connection_staging(root: str, retention_seconds: float) -> None:
             for table in _staging_subdirectories(root):
-                InformixLakeflowConnect._sweep_stale_snapshot_stages(
-                    os.path.join(table, "snapshot-page-data"), float(retention_seconds)
-                )
+                InformixLakeflowConnect._sweep_table_staging(table, retention_seconds)
+
+        @staticmethod
+        def _sweep_table_staging(root: str, retention_seconds: float) -> None:
+            # Docstring: The age-based sweep of one table's staging root: its staged runs and
+            # its index-ordered scans' progress.
+            InformixLakeflowConnect._sweep_stale_snapshot_stages(
+                os.path.join(root, "snapshot-page-data"), float(retention_seconds)
+            )
+            InformixLakeflowConnect._sweep_stale_scan_progress(
+                os.path.join(root, "snapshot-scan"), float(retention_seconds)
+            )
 
         def _read_snapshot_stage_manifest(
             self, table: Table, pipeline_scope: str, schema_id: str

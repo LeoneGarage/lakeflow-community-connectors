@@ -854,8 +854,15 @@ def main() -> int:
         report_path = output / "comparison.json"
         report_path.write_text(json.dumps(report, indent=2, default=str))
         progress(f"Report: {report_path}")
+        # Duplicate keys too: a keyed target with two rows for one key differs from the
+        # source, though its other counts can all be 0.
         differences = any(
-            row["missing_rows"] or row["extra_rows"] or row["mismatched_rows"] for row in report
+            row["missing_rows"]
+            or row["extra_rows"]
+            or row["mismatched_rows"]
+            or row.get("duplicate_source_keys")
+            or row.get("duplicate_destination_keys")
+            for row in report
         )
         return 1 if args.fail_on_difference and differences else 0
     finally:

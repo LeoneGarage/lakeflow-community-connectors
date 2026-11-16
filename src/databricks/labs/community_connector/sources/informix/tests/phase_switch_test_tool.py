@@ -46,13 +46,11 @@ def main() -> None:
     # size to separate chunk-writes from streamed changes.
     CHUNK_MIN = 500
 
-
     def api(m, p, pl=None):
         a = ["databricks", "api", m, p, "--profile", _ARGS.profile]
         if pl is not None:
             a += ["--json", json.dumps(pl)]
         return json.loads(subprocess.run(a, capture_output=True, text=True, check=True).stdout)
-
 
     def q(stmt):
         d = api(
@@ -70,15 +68,17 @@ def main() -> None:
             raise RuntimeError(d["status"])
         return d.get("result", {}).get("data_array", [])
 
-
     def newest_update_start():
         update = api("get", f"/api/2.0/pipelines/{PIPELINE_ID}/updates?max_results=1")["updates"][0]
         started = datetime.fromtimestamp(int(update["creation_time"]) / 1000, UTC)
         return started.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
-
     RUN_START = _ARGS.run_start or newest_update_start()
-
+    # It goes into SQL as a literal: a timestamp, or nothing.
+    try:
+        datetime.fromisoformat(str(RUN_START).replace("Z", "+00:00"))
+    except ValueError:
+        raise SystemExit(f"--run-start must be an ISO timestamp, got {RUN_START!r}") from None
 
     def rows_written(op, mj):
         if not mj:
@@ -96,7 +96,6 @@ def main() -> None:
             int(m.get(k, "0") or 0)
             for k in ("numOutputRows", "numInsertedRows", "numUpdatedRows", "numDeletedRows")
         )
-
 
     def analyze(t):
         hist = q(
@@ -124,21 +123,20 @@ def main() -> None:
                     break
         return t, last_chunk_ts, n_chunk, max_chunk, first_stream_after
 
-
     res = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
         for f in concurrent.futures.as_completed({ex.submit(analyze, t): t for t in TABLES}):
             t, lc, nc, mx, fs = f.result()
             res[t] = (lc, nc, mx, fs)
 
-
     def syd(z):
         if z is None:
             return "-"
         return (
-            datetime.fromisoformat(z.replace("Z", "+00:00")).astimezone(SYD).strftime("%m-%d %H:%M:%S")
+            datetime.fromisoformat(z.replace("Z", "+00:00"))
+            .astimezone(SYD)
+            .strftime("%m-%d %H:%M:%S")
         )
-
 
     print(f"Run started: {syd(RUN_START)} AEST ({RUN_START})\n")
     print(

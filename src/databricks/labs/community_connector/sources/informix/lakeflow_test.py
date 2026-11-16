@@ -3433,6 +3433,55 @@ class LakeflowContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "'padVarchar'"):
             config({**base, "padvarchar": "maybe"})
 
+    def test_stale_index_scan_progress_is_swept_with_the_staging(self):
+        # A finished scan's progress goes when its stream commits; that of a dropped
+        # table, a deleted pipeline, or a stream outside a pipeline stayed for good. A
+        # record still young enough to resume from is kept.
+        root = os.path.join(self._shared_state.name, "conn", "tbl", "snapshot-scan")
+        old, young = time.time() - 9 * 86400, time.time() - 3600
+        paths = {}
+        for name, at in (("old", old), ("young", young)):
+            directory = os.path.join(root, f"{name}-scope", "schema", "100")
+            os.makedirs(directory)
+            head = os.path.join(directory, "head.json")
+            pointer = os.path.join(root, f"{name}-pipeline.json")
+            for path in (head, pointer):
+                with open(path, "w") as handle:
+                    handle.write("{}")
+                os.utime(path, (at, at))
+            os.utime(directory, (at, at))
+            paths[name] = (directory, pointer)
+        InformixLakeflowConnect._sweep_connection_staging(
+            os.path.join(self._shared_state.name, "conn"), 7 * 86400
+        )
+        self.assertFalse(os.path.exists(paths["old"][0]))
+        self.assertFalse(os.path.exists(paths["old"][1]))
+        self.assertTrue(os.path.exists(paths["young"][0]))
+        self.assertTrue(os.path.exists(paths["young"][1]))
+
+    def test_the_driver_captures_its_workspace_credential_again_once_it_is_old(self):
+        # Captured once per update, or once per session outside a pipeline: the ambient
+        # token lasts about an hour, and a process first reaching the control plane after
+        # that (a restarted flow, say) was handed the expired one.
+        session = mock.Mock()
+        session.conf.get.return_value = None
+        saved = dict(informix_module._INFORMIX_REGISTRATION_CONTEXT)
+        self.addCleanup(informix_module._INFORMIX_REGISTRATION_CONTEXT.update, saved)
+        self.addCleanup(informix_module._CREDENTIAL_CAPTURED.clear)
+        informix_module._INFORMIX_REGISTRATION_CONTEXT.update({"scope": "a" * 32, "request": None})
+        informix_module._CREDENTIAL_CAPTURED["at"] = 1000.0
+        with mock.patch.object(informix_module, "capture_workspace_credentials") as capture:
+            with mock.patch.object(informix_module.time, "monotonic", return_value=1500.0):
+                informix_module._driver_registration(session)
+            capture.assert_not_called()
+            with mock.patch.object(informix_module.time, "monotonic", return_value=1900.0):
+                informix_module._driver_registration(None)
+                capture.assert_not_called()
+                informix_module._driver_registration(session)
+            capture.assert_called_once()
+        self.assertEqual(informix_module._CREDENTIAL_CAPTURED["at"], 1900.0)
+        self.assertEqual(informix_module._INFORMIX_REGISTRATION_CONTEXT["scope"], "a" * 32)
+
     def test_a_connector_from_the_package_carries_the_registration_to_executors(self):
         # An executor is handed readers, not the class, and imports the module afresh: the
         # connector's pickled state brings what the driver gathered.
@@ -11985,10 +12034,13 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(len(rec.submitted), 1)
         fn, args = rec.submitted[0]
-        self.assertEqual(fn, connector._sweep_stale_snapshot_stages)
+        # The table's staging root: its staged runs and its scans' progress are swept.
+        self.assertEqual(fn, connector._sweep_table_staging)
         root = args[0]
         self.assertTrue(root.startswith(connector._snapshot_staging_location))
-        self.assertTrue(root.endswith("snapshot-page-data"))
+        self.assertEqual(
+            os.path.dirname(os.path.dirname(root)), connector._snapshot_staging_location.rstrip("/")
+        )
 
     def test_maybe_sweep_is_a_noop_without_a_staging_location(self):
         connector = self.connector()
