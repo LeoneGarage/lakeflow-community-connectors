@@ -272,7 +272,8 @@ def _unload_records(out: str) -> list[list[str]]:
 
 
 def _unload_value(value: str) -> str | None:
-    return None if value == "" else value
+    # An empty field is a NULL; UNLOAD's escaped space (C.UnloadEmpty) is the empty string.
+    return None if value == "" and not isinstance(value, C.UnloadEmpty) else str(value)
 
 
 class _ModelOnlyInformix:

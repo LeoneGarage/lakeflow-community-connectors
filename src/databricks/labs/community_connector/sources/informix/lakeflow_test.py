@@ -6105,6 +6105,174 @@ class LakeflowContractTests(unittest.TestCase):
             {codecs.lookup(d["encoding"]).name for d in capture["descriptors"]}, {"iso8859-1"}
         )
 
+    def _setup_bridge(self, transport, database="testdb"):
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.transport = transport
+        bridge.options = {"_informix.bypass.connection.capacity": "true"}
+        bridge.config = {"database": database}
+        return bridge
+
+    def test_a_session_whose_setup_fails_after_login_is_closed(self):
+        # A check after the login failing left the session open on the server while its
+        # slot went to another reader: release_connection skips a bridge not connected.
+        class Transport:
+            db_locale = "en_US.819"
+
+            def __init__(self):
+                self.closed = 0
+
+            def connect(self):
+                pass
+
+            def close(self):
+                self.closed += 1
+
+            def execute(self, sql, parameters=()):
+                return [{"dbs_collate": "en_US.utf8"}]
+
+        bridge = self._setup_bridge(Transport())
+        bridge._newline_refused = True
+        bridge._connected = False
+        bridge._connect_lock = threading.RLock()
+        bridge._apply_startup_jitter = lambda: None
+        released = []
+        bridge._release_connection_slot = lambda: released.append(True)
+
+        with self.assertRaisesRegex(InformixError, "DB_LOCALE is"):
+            bridge._ensure_connected()
+
+        self.assertEqual(bridge.transport.closed, 1)
+        self.assertEqual(released, [True])
+        self.assertFalse(bridge._connected)
+
+    def test_a_broken_connection_during_session_setup_is_no_refusal(self):
+        # A socket that broke during the locale read or ifx_allow_newline was taken for
+        # the server refusing the statement: the check was off for good, and the bridge
+        # connected again, even with its slot's lease lost.
+        class Transport:
+            db_locale = "en_US.819"
+
+            def __init__(self, query_error=None, command_error=None):
+                self.query_error, self.command_error = query_error, command_error
+                self.connects = 0
+
+            def connect(self):
+                self.connects += 1
+
+            def close(self):
+                pass
+
+            def execute(self, sql, parameters=()):
+                if self.query_error:
+                    raise self.query_error
+                return [{"dbs_collate": "en_US.819"}]
+
+            def execute_command(self, sql):
+                if self.command_error:
+                    raise self.command_error
+
+        broken = self._setup_bridge(
+            Transport(query_error=informix_module.SqliTransportError("reset"))
+        )
+        with self.assertRaises(informix_module.SqliTransportError):
+            broken._connect_transport()
+        self.assertFalse(broken.__dict__.get("_database_locale_checked"))
+        self.assertEqual(broken.transport.connects, 1)
+
+        timed_out = self._setup_bridge(Transport(command_error=TimeoutError("timed out")))
+        with self.assertRaises(TimeoutError):
+            timed_out._connect_transport()
+        self.assertFalse(timed_out.__dict__.get("_newline_refused"))
+
+        refused = self._setup_bridge(Transport(query_error=RuntimeError("-272")))
+        refused._newline_refused = True
+        refused._connection_lease_lost = threading.Event()
+        refused._connection_lease_lost.set()
+        with self.assertRaisesRegex(RuntimeError, "-272"):
+            refused._connect_transport()
+        self.assertEqual(refused.transport.connects, 1)
+
+    def test_sysmaster_is_asked_for_the_database_by_its_folded_name(self):
+        # Informix folds a database name to lower case: database "TESTDB" opened testdb,
+        # and sysmaster then had no row for 'TESTDB'.
+        seen = []
+
+        class Transport:
+            db_locale = "en_US.819"
+
+            def connect(self):
+                pass
+
+            def execute(self, sql, parameters=()):
+                seen.append(parameters)
+                return [{"dbs_collate": "en_US.819", "is_buff_log": 0}]
+
+        bridge = self._setup_bridge(Transport(), database="TESTDB")
+        bridge._newline_refused = True
+        bridge._connect_transport()
+        bridge._connected = True
+        self.assertFalse(bridge.buffered_logging())
+        self.assertEqual(seen, [("testdb",), ("testdb",)])
+
+    def test_the_connector_leaves_the_callers_options_as_they_were(self):
+        given = {
+            "database": "demo",
+            "snapshot.staging.location": self._shared_state.name,
+            "lakebase.password": "test-state-password",
+            "port": "",
+        }
+        InformixLakeflowConnect(given)
+        self.assertEqual(given["port"], "")
+        # A read-only mapping too: its empty values were left in, the deletes failing.
+        connector = InformixLakeflowConnect(types.MappingProxyType(dict(given)))
+        self.assertNotIn("port", connector.options)
+        for option, value in (("encrypt", "maybe"), ("redirect.enabled", "sometimes")):
+            with self.assertRaisesRegex(ValueError, option):
+                InformixLakeflowConnect({**given, option: value})
+        with self.assertRaisesRegex(InformixError, "kerberos"):
+            InformixLakeflowConnect({**given, "authentication.mode": "kerberos"})
+        with self.assertRaisesRegex(ValueError, "capacity.retry.max.retries"):
+            InformixLakeflowConnect({**given, "capacity.retry.max.retries": "0"})
+
+    def test_a_tables_option_is_read_whatever_the_case_it_is_written_in(self):
+        # Spark lower-cases a read's option names; read_table_metadata gets a table's
+        # configuration as written. "Primary.Keys" keyed the stream but not the
+        # registration, which then had no delete flow.
+        connector, _ = self._keyless_connector()
+        metadata = connector.read_table_metadata("app.orders", {"Primary.Keys": "id"})
+        self.assertEqual(metadata["ingestion_type"], "cdc_with_deletes")
+        self.assertEqual(metadata["primary_keys"], ["id"])
+
+    def test_a_tables_text_is_measured_in_the_connections_database_codeset(self):
+        connector = self.connector(FakeBridge(), **{"DB_LOCALE": "en_US.819"})
+        self.assertEqual(
+            codecs.lookup(connector._source_encoding({"DB_LOCALE": "en_US.utf8"})).name,
+            "iso8859-1",
+        )
+
+    def test_daemon_readers_do_not_keep_the_backlog_rank_of_the_read_that_started_them(self):
+        connector = self.connector(FakeBridge(), shared_cdc=True)
+        rank = informix_module._CONNECTION_ATTEMPT_RANK_OPTION
+        with connector._capacity_attempt({"backlog_rank": 3}):
+            self.assertIn(rank, connector.options)
+            for factory in (
+                connector._shared_cdc_reader_factory(),
+                connector._snapshot_drain_reader_factory(),
+            ):
+                self.assertNotIn(rank, factory().options)
+
+    def test_a_new_registration_scope_drops_the_staging_client(self):
+        # Its token was minted for the update the earlier scope names, which the new
+        # update revokes.
+        connector = self.connector(FakeBridge())
+        client = object()
+        connector._staging_files_api, connector._staging_transport_resolved = client, True
+        connector.set_registration_scope(connector._registration_scope)
+        self.assertIs(connector._staging_files_api, client)
+        connector.set_registration_scope(hashlib.sha256(b"next update").hexdigest()[:32])
+        self.assertIsNone(connector._staging_files_api)
+        self.assertFalse(connector._staging_transport_resolved)
+
     def test_initial_lsn_validation_activates_without_reading_lodata(self):
         class ActivationTransport:
             def __init__(self):
@@ -8560,9 +8728,14 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(connector._effective_start_offset({"dropped_mount_retry_count": 2}), {})
 
     def test_dropped_mount_max_retries_rejects_a_useless_bound(self):
-        connector = self.connector(FakeBridge(), **{"dropped.mount.max.retries": "0"})
-        with self.assertRaises(ValueError):
-            connector._dropped_mount_max_retries()
+        # Refused when the connector is built: read only when a mount drops, a bad value
+        # waited for the fault to fail the read.
+        for value in ("0", "x"):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "dropped.mount.max.retries"),
+            ):
+                self.connector(FakeBridge(), **{"dropped.mount.max.retries": value})
 
     def test_an_unrelated_os_error_still_fails_the_read(self):
         """The boundary must not swallow genuine filesystem faults."""
@@ -19941,6 +20114,17 @@ class SharedCdcShardTests(unittest.TestCase):
         view = shard.poll(self.id_a, self.table_a, capture, 0, 0, "one")
         self.assertEqual([tx.tx_id for tx in view.committed], [1])
 
+    def test_a_shard_keeps_the_shortest_timeout_and_largest_budget_asked_for(self):
+        # Each poll configured the shard with its own table's cdc.timeout and
+        # cdc.max.records, so the shared session flipped between them with poll order.
+        shard = _SharedCdcShard()
+        base = {"reader_factory": lambda: None, "buffer_cap": 10, "subscriber_ttl": 60}
+        shard.configure(timeout_seconds=30, max_records=64, **base)
+        self.assertEqual((shard.timeout_seconds, shard.max_records), (30, 64))
+        shard.configure(timeout_seconds=5, max_records=256, **base)
+        shard.configure(timeout_seconds=30, max_records=64, **base)
+        self.assertEqual((shard.timeout_seconds, shard.max_records), (5, 256))
+
     def _shard_with_two_tables(self):
         shard = _SharedCdcShard()
         shard.subscribe(self.id_a, self.table_a, _capture_descriptor(self.table_a), 0, 0)
@@ -23712,6 +23896,68 @@ class UnloadHelperTests(unittest.TestCase):
         self.assertEqual(parse("a;;c", delimiter=";"), ["a", "", "c"])
         # An empty escape disables escape processing: a backslash is literal data.
         self.assertEqual(parse("a\\|b", escape=""), ["a\\", "b"])
+
+    def test_catalog_names_are_quoted_in_sql_where_informix_would_read_them_otherwise(self):
+        # Informix folds a bare name to lower case and reads an SQL word as SQL: a name the
+        # catalog holds with upper case, or named like a keyword, went out bare.
+        name = informix_module._sql_name
+        self.assertEqual(name("orders"), "orders")
+        for given in ("OrderID", "HCF_gbc", "order", "today", "HCF+gbc", "a.b"):
+            self.assertEqual(name(given), '"' + given + '"')
+        self.assertEqual(name('x"y'), '"x""y"')
+        # Identity strings, which state keys and CDC names use, keep their form.
+        self.assertEqual(informix_module._join_identity("HCF_gbc", "orders"), "HCF_gbc.orders")
+
+    def test_a_lookup_names_upper_case_columns_delimited(self):
+        seen = []
+
+        class Transport:
+            def execute(self, sql, parameters=()):
+                seen.append(sql)
+                return []
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.transport = Transport()
+        bridge.options = {}
+        with mock.patch.object(
+            bridge, "_repeatable_read_transaction", return_value=contextlib.nullcontext()
+        ):
+            bridge.rows_by_values(
+                "demo.SALES.Orders", ["OrderID", "date"], ["OrderID"], [(1,)], "X"
+            )
+        self.assertIn('"OrderID"', seen[0])
+        self.assertIn('"date"', seen[0])
+        self.assertIn('"SALES"."Orders"', seen[0])
+
+    def test_a_row_filter_can_name_a_column_in_double_quotes(self):
+        # A column whose name holds "+" or ".", or is a keyword of the grammar, could not
+        # be named at all.
+        tree = informix_module._parse_row_filter('"a+b" = 1 AND "null" IS NULL')
+        text = informix_module._row_filter_text(tree)
+        self.assertIn('"a+b" = 1', text)
+        self.assertIn('"null" IS NULL', text)
+        self.assertEqual(informix_module._parse_row_filter(text), tree)
+        # A name that could be written bare keeps its text, and so its fingerprint.
+        self.assertEqual(
+            informix_module._row_filter_text(informix_module._parse_row_filter("upper = 1")),
+            "upper = 1",
+        )
+
+    def test_round_on_a_38_digit_decimal_keeps_room_for_its_carry(self):
+        DecimalType = informix_module.DecimalType
+
+        def rounded(inner, text):
+            operand = informix_module._RowFilterParser(text).parse_operand()
+            with mock.patch.object(informix_module, "_spark_type", return_value=inner):
+                return informix_module._transform_spark_type(operand, None, {})
+
+        wide = DecimalType(38, 18)
+        self.assertEqual(rounded(wide, "ROUND(v, 0)"), DecimalType(38, 0))
+        self.assertEqual(rounded(wide, "ROUND(v)"), DecimalType(38, 0))
+        self.assertEqual(rounded(wide, "ROUND(v, 2)"), DecimalType(38, 2))
+        self.assertEqual(rounded(wide, "ROUND(v, -3)"), DecimalType(38, 0))
+        self.assertEqual(rounded(wide, "ROUND(v, 18)"), wide)
+        self.assertEqual(rounded(DecimalType(10, 2), "ROUND(v, 0)"), DecimalType(11, 2))
 
     def test_an_hpl_record_whose_last_value_ends_in_a_newline_keeps_it(self):
         # HPL writes no trailing delimiter, so a last value ending in a newline ends the

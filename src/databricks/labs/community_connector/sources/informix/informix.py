@@ -232,6 +232,38 @@ def _sql_identifier(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
 
 
+# Words Informix reads as SQL rather than as a name where a column or table name stands
+# (a column named "order" or "today" bare in a query): sent delimited, as
+# _sql_name sends them. Delimiting a real name is always safe under DELIMIDENT.
+_SQL_RESERVED_NAMES = frozenset(
+    """all and any as asc avg between by case check constraint count create current date
+    datetime day default delete desc distinct drop else end escape exists first for fraction
+    from group having hour in index insert interval into is join key last left like limit
+    matches max middle min minute month not null of on or order outer primary references
+    right second select set skip sum sysdate table then to today top union unique update
+    user values when where with year""".split()
+)
+
+
+def _sql_name(identifier: str) -> str:
+    # Docstring: Render a catalog name for SQL text: bare only when Informix reads it back
+    # as the same name.
+    #
+    # Informix folds a bare name to lower case, so a name the catalog holds with upper
+    # case (a table or column created delimited, an owner in an ANSI database) was not
+    # found bare, and a name that is a word of SQL was read as SQL. Under DELIMIDENT, which
+    # every session sets, a delimited name is the catalog's name exactly. Identity strings
+    # (_join_identity) keep _sql_identifier's form, which state keys and CDC names use.
+
+    if (
+        _BARE_IDENTIFIER.fullmatch(identifier)
+        and identifier == identifier.lower()
+        and identifier not in _SQL_RESERVED_NAMES
+    ):
+        return identifier
+    return '"' + identifier.replace('"', '""') + '"'
+
+
 def _join_identity(*components: str) -> str:
     # Docstring: Join identity components with ``.``, delimiting any component that is not a
     # valid undelimited identifier so the result round-trips through
@@ -2008,8 +2040,35 @@ class PurePythonInformixBridge:
                 self._connect_transport()
                 self._connected = True
             except Exception:
+                # The session may be open already: a check after the login failed. Not
+                # closed, it stayed open on the server while its slot went to another
+                # reader, outside max.concurrent.connections, and release_connection
+                # skips a bridge that is not connected.
+                close = getattr(self.transport, "close", None)
+                if callable(close):
+                    with contextlib.suppress(Exception):
+                        close()
                 self._release_connection_slot()
                 raise
+
+    def _session_probe_failed(self, error: BaseException) -> None:
+        # Docstring: After a session setup statement failed: raise if the connection broke or
+        # its slot's lease was lost; otherwise connect again, since a refused statement ends
+        # the SQLI session. A broken connection is not taken for a refusal: the caller
+        # retries, and the probe runs again on the next connection.
+
+        if isinstance(error, (SqliTransportError, OSError)):
+            raise error
+        lease_lost = getattr(self, "_connection_lease_lost", None)
+        if lease_lost is not None and lease_lost.is_set():
+            raise error
+        close = getattr(self.transport, "close", None)
+        if callable(close):
+            with contextlib.suppress(Exception):
+                close()
+        connect = getattr(self.transport, "connect", None)
+        if callable(connect):
+            connect()
 
     def _connect_transport(self) -> None:
         connect = getattr(self.transport, "connect", None)
@@ -2027,17 +2086,14 @@ class PurePythonInformixBridge:
         try:
             command("EXECUTE PROCEDURE ifx_allow_newline('t')")
         except Exception as error:  # pylint: disable=broad-except
-            # An error ends the session: connect again, and do not ask a second time.
-            self._newline_refused = True
-            # 446: Informix did not allow newlines in quoted strings for this session
-            # ({}); a string value that holds a newline fails with SQL error -282
-            logging.getLogger(__name__).warning(_m(446, error))
-            close = getattr(self.transport, "close", None)
-            if callable(close):
-                with contextlib.suppress(Exception):
-                    close()
-            if connect:
-                connect()
+            # A refusal ends the session: connect again, and do not ask a second time.
+            # A broken connection is no refusal (see _session_probe_failed).
+            if not isinstance(error, (SqliTransportError, OSError)):
+                self._newline_refused = True
+                # 446: Informix did not allow newlines in quoted strings for this session
+                # ({}); a string value that holds a newline fails with SQL error -282
+                logging.getLogger(__name__).warning(_m(446, error))
+            self._session_probe_failed(error)
 
     def _check_database_locale(self) -> None:
         # Docstring: Fail a DB_LOCALE whose codeset is not the database's.
@@ -2059,21 +2115,17 @@ class PurePythonInformixBridge:
         try:
             rows = execute(
                 "SELECT dbs_collate FROM sysmaster:sysdbslocale WHERE dbs_dbsname = ?",
-                (database,),
+                (_sysmaster_database_name(database),),
             )
         except Exception as error:  # pylint: disable=broad-except
-            # An error ends the session: connect again, and do not ask a second time.
-            self._database_locale_checked = True
-            # 456: Could not read the locale of the database from sysmaster ({}); its
-            # text is decoded in the codeset of DB_LOCALE without that check
-            logging.getLogger(__name__).warning(_m(456, error))
-            close = getattr(self.transport, "close", None)
-            if callable(close):
-                with contextlib.suppress(Exception):
-                    close()
-            connect = getattr(self.transport, "connect", None)
-            if callable(connect):
-                connect()
+            # A refusal ends the session: connect again, and do not ask a second time.
+            # A broken connection is no refusal (see _session_probe_failed).
+            if not isinstance(error, (SqliTransportError, OSError)):
+                self._database_locale_checked = True
+                # 456: Could not read the locale of the database from sysmaster ({}); its
+                # text is decoded in the codeset of DB_LOCALE without that check
+                logging.getLogger(__name__).warning(_m(456, error))
+            self._session_probe_failed(error)
             return
         row = rows[0] if isinstance(rows, list) and rows else {}
         actual = str((row.get("dbs_collate") if isinstance(row, dict) else "") or "").strip()
@@ -3176,7 +3228,7 @@ class PurePythonInformixBridge:
         self._ensure_connected()
         row = self.transport.execute(
             "SELECT is_buff_log FROM sysmaster:sysdatabases WHERE name = ?",
-            (self.config["database"],),
+            (_sysmaster_database_name(self.config["database"]),),
         )[0]
         return bool(int(_field(row, "is_buff_log", 0) or 0))
 
@@ -3196,15 +3248,15 @@ class PurePythonInformixBridge:
             rows = self.transport.execute(
                 f"SELECT {f'SKIP {int(skip)} ' if skip else ''}"
                 f"{f'FIRST {int(limit)} ' if limit else ''}"
-                f"{','.join(_sql_identifier(column) for column in columns)} "
-                f"FROM {database}:{_sql_identifier(owner)}.{_sql_identifier(name)} WHERE "
+                f"{','.join(_sql_name(column) for column in columns)} "
+                f"FROM {database}:{_sql_name(owner)}.{_sql_name(name)} WHERE "
                 + (
                     "("
-                    + " OR ".join(f"{_sql_identifier(key)} IS NULL" for key in keys)
+                    + " OR ".join(f"{_sql_name(key)} IS NULL" for key in keys)
                     + ")"
-                    + "".join(f" AND {_sql_identifier(key)} IS NOT NULL" for key in present)
+                    + "".join(f" AND {_sql_name(key)} IS NOT NULL" for key in present)
                     if values is None
-                    else " AND ".join(f"{_sql_identifier(key)} = ?" for key in keys)
+                    else " AND ".join(f"{_sql_name(key)} = ?" for key in keys)
                 ),
                 tuple(values or ()),
             )
@@ -3236,8 +3288,8 @@ class PurePythonInformixBridge:
         # may be an index value alone; a set that names a row by its key is small.
         select = (
             f"SELECT {f'FIRST {int(limit)} ' if limit and len(value_sets) == 1 else ''}"
-            f"{','.join(_sql_identifier(column) for column in columns)} "
-            f"FROM {database}:{_sql_identifier(owner)}.{_sql_identifier(name)} WHERE "
+            f"{','.join(_sql_name(column) for column in columns)} "
+            f"FROM {database}:{_sql_name(owner)}.{_sql_name(name)} WHERE "
         )
         with self._repeatable_read_transaction(isolation):
             rows = self.transport.execute(
@@ -3245,7 +3297,7 @@ class PurePythonInformixBridge:
                     select
                     + "("
                     + " AND ".join(
-                        f"{_sql_identifier(key)} " + ("IS NULL" if value is None else "= ?")
+                        f"{_sql_name(key)} " + ("IS NULL" if value is None else "= ?")
                         for key, value in zip(keys, values, strict=True)
                     )
                     + ")"
@@ -3637,14 +3689,14 @@ class PurePythonInformixBridge:
 
         def order_term(key: str) -> str:
             # Names are validated, but one with "+" or "." must be sent delimited.
-            return chunk_exprs.get(key) or _sql_identifier(key)
+            return chunk_exprs.get(key) or _sql_name(key)
 
         def order_clause(index: int, key: str) -> str:
             return f"{order_term(key)} DESC" if is_descending(index) else order_term(key)
 
         alias_names = [f"__chunk_{key}" for key in primary_keys if key in chunk_exprs]
-        projection = [_sql_identifier(column) for column in columns] + [
-            f"{chunk_exprs[key]} AS {_sql_identifier(f'__chunk_{key}')}"
+        projection = [_sql_name(column) for column in columns] + [
+            f"{chunk_exprs[key]} AS {_sql_name(f'__chunk_{key}')}"
             for key in primary_keys
             if key in chunk_exprs
         ]
@@ -3661,7 +3713,7 @@ class PurePythonInformixBridge:
         sql = (
             f"SELECT {{+FIRST_ROWS({int(limit)})}} {window}FIRST {int(limit)} "
             f"{','.join(projection)} "
-            f"FROM {database}:{_sql_identifier(owner)}.{_sql_identifier(name)}"
+            f"FROM {database}:{_sql_name(owner)}.{_sql_name(name)}"
         )
         parameters: list[Any] = []
         predicates = [f"({snapshot_filter})"] if snapshot_filter else []
@@ -3790,7 +3842,7 @@ class PurePythonInformixBridge:
         if is_ansi is not False:
             ansi_rows = self.transport.execute(
                 "SELECT is_ansi FROM sysmaster:sysdatabases WHERE name = ?",
-                (self.config["database"],),
+                (_sysmaster_database_name(self.config["database"]),),
             )
             if len(ansi_rows) != 1:
                 # 47: Could not determine transaction mode for database {!r}
@@ -3912,21 +3964,19 @@ class PurePythonInformixBridge:
                 # 49: Unsafe max-key identifier {!r}
                 raise InformixError(_m(49, identifier))
         chunk_exprs = dict(chunk_exprs or {})
-        table_ref = f"{database}:{_sql_identifier(owner)}.{_sql_identifier(name)}"
+        table_ref = f"{database}:{_sql_name(owner)}.{_sql_name(name)}"
         if primary_keys and not chunk_exprs:
             return self._max_key_stepwise(
                 table_ref, list(primary_keys), snapshot_filter, list(key_descending or [])
             )
         select_terms = [
-            f"{chunk_exprs[key]} AS {_sql_identifier(f'__chunk_{key}')}"
+            f"{chunk_exprs[key]} AS {_sql_name(f'__chunk_{key}')}"
             if key in chunk_exprs
-            else _sql_identifier(key)
+            else _sql_name(key)
             for key in primary_keys
         ]
         result_names = [f"__chunk_{key}" if key in chunk_exprs else key for key in primary_keys]
-        order = ",".join(
-            f"{chunk_exprs.get(key) or _sql_identifier(key)} DESC" for key in primary_keys
-        )
+        order = ",".join(f"{chunk_exprs.get(key) or _sql_name(key)} DESC" for key in primary_keys)
         # {+FIRST_ROWS(1)} steers the optimizer to minimize time-to-first-row so a
         # DESC ordering is served by an index read (row 1 returns immediately)
         # rather than a full scan + top-sort. It is a `{+ }` comment, so a server
@@ -3978,13 +4028,13 @@ class PurePythonInformixBridge:
                 predicates = [f"({snapshot_filter})"] if snapshot_filter else []
                 params: list[Any] = []
                 for previous in range(index):
-                    predicates.append(f"{_sql_identifier(primary_keys[previous])} = ?")
+                    predicates.append(f"{_sql_name(primary_keys[previous])} = ?")
                     params.append(resolved[previous])
                 where = f" WHERE {' AND '.join(predicates)}" if predicates else ""
                 # The last value in paging order is the min of a DESC column, the
                 # max of an ASC one; fetch it by ordering opposite the index.
                 fetch_order = "ASC" if index < len(descending) and descending[index] else "DESC"
-                term = _sql_identifier(key)
+                term = _sql_name(key)
                 sql = (
                     f"SELECT {{+FIRST_ROWS(1)}} FIRST 1 {term} "
                     f"FROM {table_ref}{where} ORDER BY {term} {fetch_order}"
@@ -4108,8 +4158,8 @@ class PurePythonInformixBridge:
                     page_index += 1
 
                 execute_pages(
-                    f"SELECT {','.join(_sql_identifier(column) for column in columns)} "
-                    f"FROM {database}:{_sql_identifier(owner)}.{_sql_identifier(name)}"
+                    f"SELECT {','.join(_sql_name(column) for column in columns)} "
+                    f"FROM {database}:{_sql_name(owner)}.{_sql_name(name)}"
                     + (f" WHERE ({snapshot_filter})" if snapshot_filter else ""),
                     (),
                     page_size,
@@ -5429,7 +5479,18 @@ def _transform_spark_type(operand: str | tuple, column: "Column", options: dict[
     inner = _transform_spark_type(operand[2][0], column, options)
     if name == "ROUND" and isinstance(inner, DecimalType):
         # Rounding up can carry into one more integer digit (999.99 to 1000).
-        return DecimalType(min(inner.precision + 1, 38), inner.scale)
+        if inner.precision < 38:
+            return DecimalType(inner.precision + 1, inner.scale)
+        # Spark has no 39th digit. Rounding to the scale or past it takes nothing off and
+        # carries nothing; rounding to fewer places frees the digits it takes off, so the
+        # type keeps those places only and has room for the carry (a DECIMAL(38,18) of
+        # twenty nines and a half rounded to 0 places is 10^20, which needs 39 digits at
+        # scale 18).
+        literals = operand[2][1:]
+        digits = int(literals[0][1]) if literals else 0
+        if digits >= inner.scale:
+            return inner
+        return DecimalType(38, max(digits, 0))
     if name == "ROUND" and isinstance(inner, IntegerType):
         # To a negative digit it can pass the largest INTEGER (2147483647 to the
         # thousand is 2147484000): the column lands as a BIGINT then.
@@ -5516,7 +5577,9 @@ _ROW_FILTER_LIKE_ESCAPE = "\\"
 _ROW_FILTER_LIKE_CACHE: dict[tuple[str, str], re.Pattern] = {}
 _ROW_FILTER_TOKEN = re.compile(
     r"\s*(?:(?P<number>-?\d+(?:\.\d+)?)|(?P<string>'(?:[^']|'')*')"
-    r"|(?P<op><>|!=|<=|>=|=|<|>)|(?P<punct>[(),])|(?P<word>[^\W\d][\w$]*))",
+    r"|(?P<op><>|!=|<=|>=|=|<|>)|(?P<punct>[(),])|(?P<word>[^\W\d][\w$]*)"
+    # A column name in double quotes: one that holds "+" or ".", or is a word of SQL.
+    r'|(?P<quoted>"(?:[^"]|"")+"))',
     re.UNICODE,
 )
 _ROW_FILTER_TEMPORAL = re.compile(
@@ -5587,7 +5650,12 @@ def _expression_text(operand: str | tuple) -> str:
     # Docstring: Canonical text of an operand: a column name or NAME(operand, literals).
 
     if isinstance(operand, str):
-        return operand
+        # Delimited only where it would not parse back bare, a name with "+" or "." or a
+        # keyword of the grammar: those could not be written before, so every filter
+        # that could keeps its text, and its fingerprint.
+        bare = _BARE_IDENTIFIER.fullmatch(operand) and operand.upper() not in _ROW_FILTER_KEYWORDS
+        return operand if bare else '"' + operand.replace('"', '""') + '"'
+
     _, name, arguments = operand
     parts = [_expression_text(arguments[0])]
     parts += [_row_filter_literal_text(literal) for literal in arguments[1:]]
@@ -5716,7 +5784,7 @@ def _expression_sql(operand: str | tuple, columns: dict[str, "Column"], literal)
     # Docstring: Render a filter operand as Informix SQL; ``literal`` renders its literals.
 
     if isinstance(operand, str):
-        return _sql_identifier(columns[operand].name)
+        return _sql_name(columns[operand].name)
     _, name, arguments = operand
     base = columns[_expression_column(operand)]
     parts = [_expression_sql(arguments[0], columns, literal)]
@@ -6066,6 +6134,12 @@ class _RowFilterParser:
 
     def parse_operand(self) -> str | tuple:
         kind, name = self.take()
+        if kind == "quoted":
+            # A delimited name is a column's name as written, never a function or a keyword.
+            name = str(name)[1:-1].replace('""', '"')
+            if not _IDENTIFIER.fullmatch(name):
+                self.fail(f"expected a column name, found {name!r}")
+            return name
         if kind != "word" or not _IDENTIFIER.fullmatch(str(name)):
             self.fail(f"expected a column name, found {name!r}")
         upper = str(name).upper()
@@ -7436,11 +7510,21 @@ class _SharedCdcShard:
     def configure(
         self, *, reader_factory, timeout_seconds, max_records, buffer_cap, subscriber_ttl
     ):
+        # Every poll configures the shard with its own table's cdc.timeout and
+        # cdc.max.records, which are table options. Taken as given, the shared session
+        # flipped between the tables' values with the order of their polls. It keeps the
+        # shortest timeout and the largest record budget any of them asked for: neither
+        # makes a read wrong, only an idle read shorter or a read larger.
         with self.condition:
             if self.reader_factory is None:
                 self.reader_factory = reader_factory
-            self.timeout_seconds = timeout_seconds
-            self.max_records = max_records
+            if not self.__dict__.get("_read_settings_given"):
+                self._read_settings_given = True
+                self.timeout_seconds = timeout_seconds
+                self.max_records = max_records
+            else:
+                self.timeout_seconds = min(self.timeout_seconds, timeout_seconds)
+                self.max_records = max(self.max_records, max_records)
             self.buffer_cap = buffer_cap
             self.subscriber_ttl = subscriber_ttl
 
@@ -8930,23 +9014,34 @@ class _DeferredStagedPage:
 
 
 def _options_set(options: Any) -> Any:
-    # Docstring: ``options`` without the ones left empty. An empty value is one not set: a
-    # form sends "" for a field nobody filled in. Read as set, it shadowed the
-    # connection's value with the default, or failed as an invalid one. The escape
-    # character is the one whose empty value means something. Only "" counts: a value of
-    # blanks is something typed, and is judged as given (a tab is a delimiter, and a
-    # column list of one blank is a mistake to report). The same object when none is empty.
+    # Docstring: A table's options as the connector reads them: without the ones left empty,
+    # under lower-case names. An empty value is one not set: a form sends "" for a field
+    # nobody filled in. Read as set, it shadowed the connection's value with the default,
+    # or failed as an invalid one. The escape character is the one whose empty value means
+    # something. Only "" counts: a value of blanks is something typed, and is judged as
+    # given (a tab is a delimiter, and a column list of one blank is a mistake to report).
+    #
+    # Lower case because Spark hands a read its options under lower-case names while the
+    # pipeline hands read_table_metadata a table's configuration as written: a key such
+    # as "Primary.Keys" keyed the stream but not the registration, which then had no
+    # delete flow. Every option the connector reads has a lower-case name. The same object
+    # when nothing changes.
     try:
-        empty = {
-            name
-            for name, value in options.items()
-            if isinstance(value, str) and value == "" and name.lower() != _UNL_ESCAPE_OPTION
-        }
+        items = list(options.items())
     except (TypeError, AttributeError):
         return options
-    if not empty:
+    empty = {
+        name
+        for name, value in items
+        if isinstance(value, str) and value == "" and str(name).lower() != _UNL_ESCAPE_OPTION
+    }
+    if not empty and all(not isinstance(name, str) or name == name.lower() for name, _ in items):
         return options
-    return {name: value for name, value in options.items() if name not in empty}
+    return {
+        (name.lower() if isinstance(name, str) else name): value
+        for name, value in items
+        if name not in empty
+    }
 
 
 class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
@@ -8963,6 +9058,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # blanks is something typed, judged as given; it was dropped here but judged in a
         # table's options, so the same blank was unset at read time and an error at
         # registration.
+        #
+        # On a copy: the caller's mapping is left as it was, and a read-only one is no
+        # longer left with its empty values (its deletes failed, quietly).
+        options = options.copy() if callable(getattr(options, "copy", None)) else dict(options)
         with contextlib.suppress(TypeError, AttributeError):
             for name in [
                 name
@@ -9053,6 +9152,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 1,
             ),
             (_UNL_SPLIT_BYTES_OPTION, str(_UNL_SPLIT_TARGET_BYTES), 1),
+            (_UNL_GZIP_RECORDS_OPTION, "0", 0),
+            # Read only when a fault comes: a bad value must not wait for one.
+            ("dropped.mount.max.retries", str(_DROPPED_MOUNT_MAX_RETRIES), 1),
+            ("capacity.retry.max.retries", str(_CAPACITY_RETRY_MAX_RETRIES), 1),
         ):
             try:
                 value = int(options.get(name, default))
@@ -9103,6 +9206,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # checked on first read, deep inside a running flow).
         _option_bool(options, "snapshot.incremental.blocking", True)
         _option_bool(options, "connection.backlog.hint.enabled", True)
+        # Read when the first connection is made, deep inside a read: checked here instead.
+        _option_bool(options, "encrypt", True)
+        _option_bool(options, "redirect.enabled", False)
+        _database_encoding(options)
+        _client_encoding(options)
+        if str(options.get("authentication.mode", "password")).lower() not in {"password", "pam"}:
+            # 14: Authentication mode {!r} is unsupported; use password or pam.
+            raise InformixError(_m(14, options.get("authentication.mode")))
         _shared_cdc_mode(options)
         # Validate the .unl / HPL DELIMITED field format eagerly (single-character
         # delimiter and optionally-empty escape, which must differ), rather than only
@@ -9300,6 +9411,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             self._trigger_available_now = False
             for name in _SCAN_CACHES:
                 self.__dict__.pop(name, None)
+            # The staging client is the update's too: its token was minted for the update
+            # the earlier scope names, and the new update revokes earlier updates' tokens.
+            self._staging_files_api = None
+            self._staging_transport_resolved = False
         self._registration_scope = scope
 
     def _pipeline_scope(self, checkpoint: dict[str, Any] | None = None) -> str:
@@ -10528,11 +10643,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return self._encode_embedded_rows(self._transformed_output(rows, table_options, columns))
 
     def _source_encoding(self, table_options: dict[str, str]) -> str:
-        # Docstring: The database code set's Python encoding for a table: the connection's
-        # DB_LOCALE, which a table option may override. LENGTH counts bytes in it and a CHAR
+        # Docstring: The database code set's Python encoding: the connection's DB_LOCALE, the
+        # one the SQLI client and the CDC capture use. LENGTH counts bytes in it and a CHAR
         # operand is re-padded to its byte width, on the snapshot, file, and CDC paths alike.
+        # DB_LOCALE is no table option, so ``table_options`` is not read.
 
-        return _database_encoding({**self.options, **table_options})
+        del table_options
+        return _database_encoding(self.options)
 
     @staticmethod
     def _transform_descriptor_fields(table: Table) -> dict[str, Any]:
@@ -13272,9 +13389,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             return {}, False
         exprs: dict[str, str] = {}
         for column in datetime_keys:
-            expr = datetime_order_preserving_cast(
-                _sql_identifier(column.name), int(column.length or 0)
-            )
+            expr = datetime_order_preserving_cast(_sql_name(column.name), int(column.length or 0))
             if expr is None:
                 return {}, False
             exprs[column.name] = expr
@@ -14857,7 +14972,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         nullable = [name for name in keys if name in optional]
         lead = nullable[:1] if nullable[:1] == list(keys[:1]) else []
         rest = nullable[len(lead) :]
-        present = " AND ".join(f"{_sql_identifier(name)} IS NOT NULL" for name in nullable)
+        present = " AND ".join(f"{_sql_name(name)} IS NOT NULL" for name in nullable)
 
         def null_rows(limit=None):
             # Them all, or one more than ``limit`` of them at most.
@@ -17161,6 +17276,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # per-read attempt budget so it cannot cap the slot wait below that window.
         reader_options.pop(_CONNECTION_ATTEMPT_BUDGET_OPTION, None)
         reader_options.pop(_REPLAY_CONNECTION_WAIT_BUDGET_OPTION, None)
+        # And the backlog rank of the read that happened to start it: kept, the daemon
+        # swept for a slot at that read's pace for as long as it lived.
+        reader_options.pop(_CONNECTION_ATTEMPT_RANK_OPTION, None)
         cls = type(self)
         return lambda: cls(reader_options)
 
@@ -17258,6 +17376,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # wait below the window and send the daemon back to the end of the queue.
         reader_options.pop(_CONNECTION_ATTEMPT_BUDGET_OPTION, None)
         reader_options.pop(_REPLAY_CONNECTION_WAIT_BUDGET_OPTION, None)
+        # And the backlog rank of the read that happened to start it: kept, the daemon
+        # swept for a slot at that read's pace for as long as it lived.
+        reader_options.pop(_CONNECTION_ATTEMPT_RANK_OPTION, None)
         cls = type(self)
         # The shard is keyed by this reader's scope, and its reads spill under it.
         scope = self._registration_scope
@@ -19510,6 +19631,15 @@ def _expect_zero(rows: list[Any], operation: str) -> None:
     status = int(_field(rows[0], "status", 0))
     if status != 0:
         raise InformixError(f"{operation} failed with status {status}")
+
+
+def _sysmaster_database_name(database: str) -> str:
+    # Docstring: A database's name as sysmaster holds it. Informix folds a database name to
+    # lower case, so a connection's ``database: TESTDB`` opened testdb, and then found no
+    # row for 'TESTDB': the snapshot could not tell its transaction mode, and the
+    # DB_LOCALE check was skipped.
+
+    return str(database).lower()
 
 
 def _transport_closed(transport) -> bool:

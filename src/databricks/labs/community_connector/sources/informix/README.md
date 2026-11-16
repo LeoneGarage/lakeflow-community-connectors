@@ -1418,7 +1418,10 @@ an object from column name to an expression over that column:
 - **Types:** a transform lands as its result's type: strings for string functions,
   `MASK`, and `HASH`; integers for `LENGTH`, `CHAR_LENGTH`, `YEAR`, `MONTH`, `DAY`, and
   `WEEKDAY`; and the column's own type otherwise. `ROUND` on a decimal adds one digit of
-  precision, since rounding up can carry, and `ROUND` of an `INTEGER` to a negative digit
+  precision, since rounding up can carry. A decimal of 38 digits, Spark's most, has none to
+  add: rounded to fewer places than its scale, it lands with those places only (a
+  variable-scale `DECIMAL` under the default `decimal(38,18)` rounded to 0 places lands
+  as `DECIMAL(38,0)`). `ROUND` of an `INTEGER` to a negative digit
   lands as a `BIGINT` for the same reason (2147483647 to the thousand is 2147484000). A
   transformed column is nullable when its source
   column is, or when `NULLIFY` or `SUBSTR` (NULL past the end) can produce NULL; `HASH` on
@@ -1486,7 +1489,9 @@ on change images. That limits it to:
   `TIMESTAMP` can't be more precise than the column's `DATETIME` qualifier.
 - **Columns:** numeric (except `FLOAT` and `SMALLFLOAT`), `CHAR`, `NCHAR`, `VARCHAR`,
   `LVARCHAR`, `NVARCHAR`, `BOOLEAN`, `DATE`, and `DATETIME YEAR TO DAY` or finer. Each
-  value must match its column's type.
+  value must match its column's type. Put a column's name in double quotes when it holds
+  `+` or `.` or is one of the words above (`"unit+price" > 0`, `"null" IS NULL`); a name
+  in quotes is always a column, never a function.
 - **Strings:** compare by code point with trailing spaces ignored, which is Informix's
   `CHAR` and `VARCHAR` order in ISO 8859-1 and UTF-8 databases. `NCHAR` and `NVARCHAR`
   collate by locale, so they only take `=`, `<>`, `IN`, and `LIKE`.
@@ -1848,6 +1853,9 @@ set -euo pipefail
 # database's text to it. Without it dbaccess writes in its own default, en_US.819
 # (Latin-1), and non-ASCII text fails to decode.
 export CLIENT_LOCALE="${CLIENT_LOCALE:-en_US.utf8}"
+# Dates as YYYY-MM-DD: the connector reads that, or MM/DD/YYYY, so a day-first DBDATE
+# (DMY4/, common outside the US) swapped day and month, and a two-digit year failed.
+export DBDATE=Y4MD-
 DB="${1:?usage: extract_unl.sh <database> <outdir> <table> [table ...]}"
 OUTDIR="${2:?output directory}"
 shift 2
@@ -1954,6 +1962,9 @@ set -euo pipefail
 # database's text to it. Without it dbaccess writes in its own default, en_US.819
 # (Latin-1), and non-ASCII text fails to decode.
 export CLIENT_LOCALE="${CLIENT_LOCALE:-en_US.utf8}"
+# Dates as YYYY-MM-DD: the connector reads that, or MM/DD/YYYY, so a day-first DBDATE
+# (DMY4/, common outside the US) swapped day and month, and a two-digit year failed.
+export DBDATE=Y4MD-
 DB="${1:?usage: extract_unl_multi.sh <database> <outdir> <files> <table> <split_key>}"
 OUTDIR="${2:?output directory}"
 FILES="${3:?number of files (N)}"

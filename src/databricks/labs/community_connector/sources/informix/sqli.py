@@ -549,12 +549,22 @@ def encode_normal_auth_request(
     encoding: str = "utf-8",
 ) -> bytes:
     prefix = encode_normal_auth_prefix(username, password, server_name, database, encoding)
+    # The host's name and working directory are for the server's session list only: one
+    # the login's codec can't spell, or a working directory that is gone, failed the login.
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = ""
+
+    def spelled(text: str) -> str:
+        return text.encode(encoding, "replace").decode(encoding)
+
     tail = encode_asc_tail(
         properties,
-        hostname=socket.gethostname(),
+        hostname=spelled(socket.gethostname()),
         process_id=os.getpid(),
         thread_id=threading.get_ident() & 0x7FFFFFFF,
-        cwd=os.getcwd(),
+        cwd=spelled(cwd),
         encoding=encoding,
     )
     return encode_session_packet(1, prefix + tail)
@@ -764,8 +774,11 @@ def _retained_size(value: object, seen: set[int] | None = None) -> int:
     return size
 
 
-def _connector_sql(sql: str, parameters: tuple) -> str:
+def _connector_sql(sql: str, parameters: tuple, encoding: str = "utf-8") -> str:
     # Docstring: Bind only connector-owned scalar values using strict SQL literals.
+    #
+    # ``encoding`` is the one the statement goes out in (the database codeset's): a
+    # string literal's bound counts its bytes there, quotes doubled.
 
     result: list[str] = []
     parameter_index = 0
@@ -856,9 +869,12 @@ def _connector_sql(sql: str, parameters: tuple) -> str:
             # MDY uses numeric components and is therefore locale-independent.
             literal = f"MDY({value.month},{value.day},{value.year})"
         elif isinstance(value, str):
-            if "\0" in value or len(value.encode("utf-8")) > 32767:
+            escaped = value.replace("'", "''")
+            # Counted as sent: in UTF-8 a Latin-1 database's accented value was twice its
+            # size, and before doubling its quotes a value of many was half of it.
+            if "\0" in value or len(escaped.encode(encoding)) > 32767:
                 raise ValueError("unsafe connector SQL string literal")
-            literal = "'" + value.replace("'", "''") + "'"
+            literal = "'" + escaped + "'"
         else:
             raise TypeError(f"unsupported connector SQL value {type(value).__name__}")
         result.append(literal)
@@ -1652,7 +1668,7 @@ class InformixSqliClient:
         # Connector queries are fixed templates. Literalizing their bounded scalar
         # values avoids depending on the separate input-parameter descriptor that
         # the native protocol uses to choose VARCHAR bind widths.
-        sql = _connector_sql(sql, parameters)
+        sql = _connector_sql(sql, parameters, self._text_encoding)
         if _statement_keyword(sql) in _NON_ROW_STATEMENTS:
             self.execute_command(sql)
             return []
@@ -1746,7 +1762,7 @@ class InformixSqliClient:
 
         if page_size < 1:
             raise ValueError("page_size must be positive")
-        sql = _connector_sql(sql, parameters)
+        sql = _connector_sql(sql, parameters, self._text_encoding)
         if _statement_keyword(sql) in _NON_ROW_STATEMENTS:
             raise ValueError("execute_pages requires a row-producing statement")
         _, output_stream = self._require_open()

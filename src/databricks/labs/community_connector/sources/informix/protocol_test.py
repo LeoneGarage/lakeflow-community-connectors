@@ -594,6 +594,28 @@ class SqliPacketTests(unittest.TestCase):
             "é",
         )
 
+    def test_a_string_literal_is_bounded_as_it_is_sent(self):
+        # In the database codeset, quotes doubled: in UTF-8 a Latin-1 database's accented
+        # value counted twice its size, and a value of quotes half of it.
+        accented = "é" * 20000
+        self.assertTrue(
+            _sqli._connector_sql("SELECT ?", (accented,), "iso8859-1").startswith("SELECT 'é")
+        )
+        with self.assertRaises(ValueError):
+            _sqli._connector_sql("SELECT ?", (accented,), "utf-8")
+        with self.assertRaises(ValueError):
+            _sqli._connector_sql("SELECT ?", ("'" * 20000,), "iso8859-1")
+
+    def test_the_login_survives_a_host_name_or_directory_it_cannot_spell(self):
+        with (
+            patch("os.getcwd", side_effect=FileNotFoundError("gone")),
+            patch("socket.gethostname", return_value="hôte-€"),
+        ):
+            packet = _sqli.encode_normal_auth_request(
+                "user", "secret", "server", "db", {}, encoding="iso8859-1"
+            )
+        self.assertIn("hôte-?".encode("latin-1"), packet)
+
     def test_execute_routes_non_row_statements_to_command_path(self):
         client = InformixSqliClient("host", 9088, "db", "user", "password")
         with patch.object(client, "execute_command") as execute_command:
