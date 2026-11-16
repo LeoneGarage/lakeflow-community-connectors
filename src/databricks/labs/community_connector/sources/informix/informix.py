@@ -980,6 +980,11 @@ _REPLAY_REESTABLISHED = "_informix.replay.reestablished"
 # The end a replayed initial range logged, as JSON: a file snapshot's first batch is
 # served again at the boundary that end names (_replayed_unl_boundary).
 _REPLAY_INITIAL_END_OPTION = "_informix.replay.initial.end"
+# Set on the read that replays auto_snapshot's resnapshot of an expired checkpoint: like an
+# initial range's, it leaves the delete floor as the logged batch published it.
+_REPLAY_RESNAPSHOT_OPTION = "_informix.replay.resnapshot"
+# The floor_seed of the end a replayed delete range logged (see _confirmed_floor_seed).
+_REPLAY_END_SEED_OPTION = "_informix.replay.end.seed"
 # Distinguish JSON null (replay the copy-completing range through max_pk) from
 # an absent option (ordinary one-page incremental read).
 _REPLAY_DRAIN_TO_MAX_PK = object()
@@ -1225,8 +1230,10 @@ def _snapshot_position(offset: Any) -> tuple | None:
     )
 
 
-def _replayed_initial_range(options: Any) -> bool:
-    # Docstring: Whether this read replays an initial range, a first batch Spark logged.
+def _replay_keeps_floor(options: Any) -> bool:
+    # Docstring: Whether this read replays a batch that established a boundary: an initial
+    # range, a first batch Spark logged, or auto_snapshot's resnapshot of an expired
+    # checkpoint.
     #
     # Such a replay may establish a newer boundary than the batch had (an incremental
     # copy's, a cdc_only start, a snapshot taken again), but Spark goes on from the end it
@@ -1235,7 +1242,47 @@ def _replayed_initial_range(options: Any) -> bool:
     # were never applied. The floor the logged batch published stays: it is that batch's
     # boundary, at or below where the stream goes on.
 
-    return bool(options) and options.get(_REPLAY_INITIAL_END_OPTION) is not None
+    return bool(options) and (
+        options.get(_REPLAY_INITIAL_END_OPTION) is not None
+        or options.get(_REPLAY_RESNAPSHOT_OPTION) is not None
+    )
+
+
+def _open_state_connection(connection: Any) -> Any:
+    # Docstring: ``connection`` while it is open, rolled back first when a failed statement
+    # left its transaction aborted, else None.
+    #
+    # The state statements commit only when they succeed, so one that fails (a lock or
+    # statement timeout, a permission error) leaves the transaction aborted, and every
+    # statement after it on the connection failed with InFailedSqlTransaction until a
+    # rollback. The best-effort callers swallow the first error, so the next mandatory
+    # operation failed instead. 3 is libpq's PQTRANS_INERROR, which psycopg2 and psycopg
+    # both report as the transaction status.
+
+    if connection is None:
+        return None
+    try:
+        if connection.closed:
+            return None
+        if getattr(getattr(connection, "info", None), "transaction_status", None) == 3:
+            connection.rollback()
+    except Exception:  # pylint: disable=broad-except
+        # Gone, or a rollback that failed: a new connection serves instead.
+        with contextlib.suppress(Exception):
+            connection.close()
+        return None
+    return connection
+
+
+def _resnapshot_range(start: Any, end: Any) -> bool:
+    # Docstring: Whether ``start`` is a stream position below ``end``'s LSN, as auto_snapshot's
+    # resnapshot of an expired checkpoint starts: where ``end`` is a staged snapshot's, that
+    # batch is the only one to reach a snapshot's boundary from below it.
+
+    try:
+        return start.get("phase") == "stream" and int(start["commit_lsn"]) < int(end["commit_lsn"])
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
 
 
 def _replay_reader_range(reader, start, end):
@@ -1326,7 +1373,9 @@ def _replay_between_offsets(start, end, read, options, connector_options, staged
     previous_pk = options.get(_REPLAY_STOP_PK_OPTION)
     previous_wait_budget = options.get(_REPLAY_CONNECTION_WAIT_BUDGET_OPTION)
     previous_end = options.get(_REPLAY_INITIAL_END_OPTION)
+    previous_seed = options.get(_REPLAY_END_SEED_OPTION)
     options[_REPLAY_STOP_LSN_OPTION] = str(stop)
+    options[_REPLAY_END_SEED_OPTION] = str((end or {}).get("floor_seed") or "")
     if initial_range:
         options[_REPLAY_INITIAL_END_OPTION] = json.dumps(end, sort_keys=True)
     if replaying_chunk:
@@ -1341,9 +1390,14 @@ def _replay_between_offsets(start, end, read, options, connector_options, staged
             # pages after it come from one snapshot.
             position = {k: v for k, v in end["snapshot"].items() if k != "record_index"}
             replay_start = {**end, "snapshot": {**position, "page_index": 0, "last_pk": []}}
-        elif initial_range and staged_start is not None and end.get("phase") == "stream":
+        elif (
+            staged_start is not None
+            and end.get("phase") == "stream"
+            and (initial_range or _resnapshot_range(start, end))
+        ):
             # One whose snapshot staged a page or none ended in the stream phase: the
-            # connector recognises it by the snapshot's manifest.
+            # connector recognises it by the snapshot's manifest. So is auto_snapshot's
+            # resnapshot of an expired checkpoint, which starts from that checkpoint.
             replay_start = staged_start(end) or replay_start
         record_parts = []
         configured_wait = float(
@@ -1523,6 +1577,10 @@ def _replay_between_offsets(start, end, read, options, connector_options, staged
             options.pop(_REPLAY_INITIAL_END_OPTION, None)
         else:
             options[_REPLAY_INITIAL_END_OPTION] = previous_end
+        if previous_seed is None:
+            options.pop(_REPLAY_END_SEED_OPTION, None)
+        else:
+            options[_REPLAY_END_SEED_OPTION] = previous_seed
 
 
 def _registration_identity(spark_session: Any | None) -> tuple[str, str | None]:
@@ -1577,14 +1635,13 @@ def _driver_registration(spark_session: Any | None = None) -> dict[str, Any]:
         scope, request = _registration_identity(spark_session)
         _INFORMIX_REGISTRATION_CONTEXT["request"] = request
         _INFORMIX_REGISTRATION_CONTEXT["scope"] = scope
-    elif (
-        spark_session is not None
-        and now - _CREDENTIAL_CAPTURED.get("at", now) >= _CREDENTIAL_RECAPTURE_SECONDS
-    ):
+    elif now - _CREDENTIAL_CAPTURED.get("at", now) >= _CREDENTIAL_RECAPTURE_SECONDS:
         # The same update, or a session outside a pipeline, packing a registration again
-        # (a flow restarted, say): the token captured when it began lasts about an hour,
-        # and a process first reaching the control plane after that failed with it.
-        # Captured again here, on the driver; a failed capture keeps the one held.
+        # (a flow restarted, say, or a connector pickled for a worker, which asks with no
+        # session): the token captured when it began lasts about an hour, and a process
+        # first reaching the control plane after that failed with it. Captured again here,
+        # in the process that captured it, the only one with a capture time; a process that
+        # was handed the credentials hands the same on. A failed capture keeps the one held.
         capture_workspace_credentials()
         _CREDENTIAL_CAPTURED["at"] = now
     return {
@@ -2265,13 +2322,9 @@ class PurePythonInformixBridge:
         # table's reads sequentially, and the endpoint permits 450 connections
         # (measured), which is ample for a pipeline's flows.
 
-        connection = getattr(self, "_lakebase_conn", None)
+        connection = _open_state_connection(getattr(self, "_lakebase_conn", None))
         if connection is not None:
-            try:
-                if not connection.closed:
-                    return connection
-            except Exception:
-                pass
+            return connection
         connection = self._lakebase().connect()
         self._lakebase_conn = connection
         return connection
@@ -7859,7 +7912,7 @@ def _spilled_page_rows(read_page, part, page_index, tx, table, options, **shape)
     committed = CommittedTransaction(
         int(tx[0]), int(tx[1]), int(tx[2]), int(tx[3]), tuple(buffer.records), tx[4]
     )
-    for row in _project_transaction(committed, table, **shape):
+    for row in _project_transaction(committed, table, **shape, options=options):
         yield _coerce_variable_decimal_values(row, table, options)
 
 
@@ -10275,10 +10328,26 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             self.options.get(_PROMOTE_UNIQUE_INDEX_OPTION, ""),
         )
 
+    def _scope_from_checkpoint(self, offset: Any) -> None:
+        # Docstring: With no registration (the connector used outside a pipeline), take the
+        # scope a resumed checkpoint names, so that every step of the read runs under it.
+        #
+        # Each step asks for the scope on its own, and a few had the checkpoint to fall back
+        # to: the others, earlier on the same read, failed it with 168.
+
+        scope = offset.get("pipeline_scope") if isinstance(offset, dict) else None
+        if (
+            self._registration_scope is None
+            and isinstance(scope, str)
+            and _PIPELINE_SCOPE.fullmatch(scope)
+        ):
+            self.set_registration_scope(scope)
+
     def read_table(
         self, table_name: str, start_offset: dict, table_options: dict[str, str]
     ) -> tuple[Iterator[dict], dict]:
         table_options = _options_set(table_options)
+        self._scope_from_checkpoint(start_offset)
         rows, offset = self._read_upserts(table_name, start_offset, table_options)
 
         def columns():
@@ -10482,7 +10551,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                         # A replayed range from a start the log no longer holds cannot be
                         # reproduced; it resnapshots, as an initial range does. Spark goes on
                         # from the end it logged, so one with no copy cursor drains the copy.
-                        {_REPLAY_STOP_PK_OPTION: "null", **table_options}
+                        {
+                            _REPLAY_STOP_PK_OPTION: "null",
+                            _REPLAY_RESNAPSHOT_OPTION: "1",
+                            **table_options,
+                        }
                         if replaying
                         else table_options,
                         pipeline_scope_override=self._resnapshot_scope(table, effective_start),
@@ -10713,9 +10786,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # serverless's 1 GB Python limit for a wide table. Recognised from the (start, end)
         # pair alone, so a batch re-planned after a driver restart is served the same way:
         # an empty start, and the end _staged_snapshot_result emits after page 0 of the
-        # manifest pinned at that LSN. Same tuple as _snapshot_page_batch.
+        # manifest pinned at that LSN. Same tuple as _snapshot_page_batch. So is
+        # auto_snapshot's resnapshot of an expired checkpoint, whose start is that checkpoint:
+        # re-planned in a later update, it took another snapshot, newer than the end Spark
+        # goes on from.
 
-        if effective_start or not end_offset or "incremental" in end_offset:
+        if not end_offset or "incremental" in end_offset:
+            return None
+        if effective_start and not _resnapshot_range(effective_start, end_offset):
             return None
         if self._is_delete_flow() or self._table_migration(table_options):
             return None
@@ -10905,6 +10983,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     ) -> dict:
         table_options = _options_set(table_options)
         start_offset = start_offset or {}
+        self._scope_from_checkpoint(start_offset)
         effective_start = self._effective_start_offset(start_offset)
         end = self._served_offset(table_name, table_options, start_offset, effective_start)
         if end is not None:
@@ -11142,6 +11221,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # fall back to read_table (a single non-partitioned batch).
             # 175: Informix does not support partitioned batch reads
             raise NotImplementedError(_m(175))
+        self._scope_from_checkpoint(start_offset)
         if start_offset == end_offset:
             return []
         # A metadata lookup, as in latest_offset: no capacity wait if the table is not cached
@@ -11362,6 +11442,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         self, table_name: str, start_offset: dict, table_options: dict[str, str]
     ) -> tuple[Iterator[dict], dict]:
         table_options = _options_set(table_options)
+        self._scope_from_checkpoint(start_offset)
         rows, offset = self._read_deletes(table_name, start_offset, table_options)
 
         def columns():
@@ -12622,33 +12703,41 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # That is told from the floor alone, before this update's start: read on, the old
         # position could fail on a log that no longer holds it.
         #
-        # A replay repeats the batch Spark logged: the one that started again ends at the
-        # new floor, and any other read the range under the earlier floor, which it reads
-        # once more. A pipeline with no floor of its own (one a table.migration seed came
-        # to) keeps the position, which another pipeline's floor confirmed.
+        # A replay repeats the batch Spark logged, told by the end it logged: one that read
+        # on from the seed carries it, or, the floor confirmed, ends below a floor replaced
+        # since without it; one that started again carries another floor's seed or none.
+        # A seed from another pipeline (a table.migration checkpoint) is one that pipeline's
+        # floor confirmed: this pipeline's floor says nothing of it, and the position stands.
 
         seeded = start_offset["floor_seed"]
+        unmarked = {k: v for k, v in start_offset.items() if k != "floor_seed"}
+        pipeline = self._pipeline_id(self._pipeline_scope(start_offset))
+        if self._pipeline_id(seeded) != pipeline:
+            return unmarked, None
         record = self._read_immutable_head(
-            self._immutable_namespace(
-                table, "delete-floor", self._pipeline_id(self._pipeline_scope())
-            )
+            self._immutable_namespace(table, "delete-floor", pipeline)
         )
         current = None if record is None else record.get("snapshot_scope")
         if current is None:
             return start_offset, seeded
         if current != seeded:
             stop = self._replay_stop_lsn(table_options)
-            if stop is not None and stop != self._immutable_lsn(
-                record, "start_lsn", table.exposed_name
-            ):
+            logged = table_options.get(_REPLAY_END_SEED_OPTION) or None
+            if stop is not None and logged == seeded:
                 return start_offset, seeded
+            if (
+                stop is not None
+                and logged is None
+                and stop < self._immutable_lsn(record, "start_lsn", table.exposed_name)
+            ):
+                return unmarked, None
             # 291: Informix delete channel for '{}' started at a snapshot floor that update {}
             # has since replaced; it starts again at the new one
             logging.getLogger(__name__).warning(_m(291, table.exposed_name, current))
             return {}, None
-        if self._read_upsert_channel_start(table, self._pipeline_scope()) is None:
+        if self._read_upsert_channel_start(table, self._pipeline_scope(start_offset)) is None:
             return start_offset, seeded
-        return {k: v for k, v in start_offset.items() if k != "floor_seed"}, None
+        return unmarked, None
 
     def _read_table_deletes_from(
         self,
@@ -13134,7 +13223,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             high_water,
             high_water,
             pipeline_scope,
-            floor=not _replayed_initial_range(table_options),
+            floor=not _replay_keeps_floor(table_options),
         )
         return iter(()), _offset(
             high_water,
@@ -14377,7 +14466,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             pipeline_scope,
             chunk_exprs,
             _snapshot_filter(options),
-            floor=not _replayed_initial_range(options),
+            floor=not _replay_keeps_floor(options),
         )
         high_water = int(incremental["boundary_lsn"])
         seed = _offset(
@@ -14938,7 +15027,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 # An index-ordered scan an earlier update began is carried on under that
                 # update's scope, unless this update is a full refresh (see above). The
                 # reader decides; the drain worker it hands the scan to is given the scope.
-                pipeline_scope = self._adopted_scan_scope(table, pipeline_scope)
+                pipeline_scope = self._adopted_scan_scope(table, pipeline_scope, options)
             # Validate the complete snapshot contract before _initial_lsn()
             # enables full-row logging or publishes durable initialization.
             high_water = self._initial_lsn(table, scope=pipeline_scope)
@@ -15195,7 +15284,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 high_water,
                 snapshot_lsn,
                 pipeline_scope,
-                floor=not _replayed_initial_range(options),
+                floor=not _replay_keeps_floor(options),
             )
             # The rows a scan read again are in the count twice, once for each page that
             # holds them: the manifest counts the rows the pages serve.
@@ -15455,9 +15544,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # used
             logging.getLogger(__name__).info(_m(440, table.exposed_name, why))
 
-    def _adopted_scan_scope(self, table, scope: str) -> str:
+    def _adopted_scan_scope(self, table, scope: str, options: dict[str, str]) -> str:
         # Docstring: The scope a snapshot with no checkpoint runs under: that of an earlier
         # update of this pipeline whose index-ordered scan it continues, else its own.
+        #
+        # Taken only where the scan can go on from what it recorded: under that scope the
+        # snapshot reads that update's initialization, which names the table's layout then,
+        # so a changed layout failed every restart (316); and a scan that cannot resume
+        # (another index, a cursor scan, a byte limit) started again beside the pages that
+        # one staged, and on a quiet log at the same boundary met them (218).
 
         pointer = self._read_progress_file(self._scan_pointer_path(table, scope))
         recorded = None if pointer is None else pointer.get("scope")
@@ -15483,7 +15578,21 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     table, recorded, str(pointer["schema_id"]), int(pointer["boundary"])
                 )
                 touched = os.path.getmtime(self._latest_progress_file(directory))
-                if time.time() - touched > _SCAN_RESUME_SECONDS:
+                head = self._read_progress_file(os.path.join(directory, "head.json")) or {}
+                initialization = self._read_immutable_head(
+                    self._immutable_namespace(table, "initialization", recorded)
+                )
+                layout = ((initialization or {}).get("schema") or {}).get("fingerprint")
+                index = self._scan_index(table, options)
+                if layout != _schema_fingerprint(table):
+                    why = "the table's columns or options have changed since"
+                elif index is None or [head.get("keys"), head.get("descending")] != [
+                    list(part) for part in index
+                ]:
+                    why = "the index it paged by is not the one this snapshot pages by"
+                elif self._table_int_option(options, "snapshot.max.bytes", 0, minimum=0):
+                    why = "a snapshot with snapshot.max.bytes set does not go on from one"
+                elif time.time() - touched > _SCAN_RESUME_SECONDS:
                     why = "it was last written to too long ago"
                 elif self._bridge.minimum_lsn() > int(pointer["initial"]):
                     # That update's capture began there, and its changes are read again.
@@ -16885,7 +16994,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 high_water,
                 high_water,
                 pipeline_scope,
-                floor=not _replayed_initial_range(options),
+                floor=not _replay_keeps_floor(options),
             )
             self._pin_unl_extract(table, options, pipeline_scope, schema_id, high_water)
             return table, schema_id, high_water
@@ -16913,7 +17022,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             boundary,
             boundary,
             pipeline_scope,
-            floor=not _replayed_initial_range(options),
+            floor=not _replay_keeps_floor(options),
         )
         self._pin_unl_extract(table, options, pipeline_scope, schema_id, boundary)
         return table, schema_id, boundary
@@ -18835,6 +18944,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 deletes,
                 tombstones=tombstones,
                 encoding=self._source_encoding(options),
+                options=options,
             )
             projected = [
                 _coerce_variable_decimal_values(row, shape_table, options) for row in projected
@@ -19428,7 +19538,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         try:
             self._publish_immutable_head(
                 namespace,
-                {"created_at": time.time(), "error": str(error)},
+                # The scope as well as the key: the update's cleanup and the stale-pipeline
+                # sweep find a record by it, and kept this one forever.
+                {"created_at": time.time(), "error": str(error), "scope": self._registration_scope},
                 record_type="schema-rejection",
             )
         except Exception as publish_error:  # pylint: disable=broad-except
@@ -20082,7 +20194,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         *,
         floor: bool = True,
     ) -> None:
-        # ``floor`` False leaves the delete floor as it is (see _replayed_initial_range).
+        # ``floor`` False leaves the delete floor as it is (see _replay_keeps_floor).
         winner = self._publish_immutable_head(
             self._immutable_namespace(table, "snapshots", pipeline_scope, schema_id),
             {
@@ -20156,13 +20268,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # serves slot operations while a read is in flight, and sharing one across
         # both would serialise state reads behind slot maintenance.
 
-        connection = getattr(self, "_lakebase_conn", None)
+        connection = _open_state_connection(getattr(self, "_lakebase_conn", None))
         if connection is not None:
-            try:
-                if not connection.closed:
-                    return connection
-            except Exception:
-                pass
+            return connection
         state = getattr(self, "_lakebase_state", None)
         if state is None:
             identity = "\0".join(
@@ -20791,8 +20899,9 @@ def _unsupported_column(column: Column) -> bool:
 # Key types whose values can't be rendered back into SQL as exact keyset literals, so a
 # snapshot pages them by position instead: partial DATETIME and INTERVAL literals don't
 # all parse back, and a float has no exact decimal literal (nor any rendering at all).
-_FLOAT_KEY_TYPES = frozenset({"FLOAT", "SMALLFLOAT"})
-_FLOAT_TYPES = _FLOAT_KEY_TYPES | {"DOUBLE", "DOUBLE PRECISION", "REAL"}
+# Every name a float type may have: one left out passed the keyset guards and failed in
+# rendering instead.
+_FLOAT_KEY_TYPES = _UNLOAD_FLOAT_TYPES
 # A BOOLEAN has no order to page by: Informix compares it for equality only, and its
 # literals are 't' and 'f', which a bound value is not rendered as.
 _BOOLEAN_KEY_TYPES = frozenset({"BOOLEAN", "BOOL"})
@@ -21182,6 +21291,7 @@ def _project_transaction(
     deletes: bool,
     tombstones: bool = False,
     encoding: str = "latin-1",
+    options: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     # Docstring: Project one committed transaction onto one output channel.
     #
@@ -21208,8 +21318,24 @@ def _project_transaction(
     # is dropped, an UPDATE that moves a row out of the filter is a delete of its
     # before-image, and one that moves a row in is an upsert of its after-image alone --
     # its old key was never landed, so there is no old key to delete.
+    #
+    # An UPDATE changes the key as the key lands: a variable-scale DECIMAL key column is
+    # coerced to its target type (``options``), which can round 12.1 and 12.2 to one 12,
+    # and a delete of the old key at the update's LSN then tied with its upsert and could
+    # remove the row.
 
     predicate = _row_filter_predicate(table, encoding)
+    coerced = options is not None and any(
+        _is_variable_scale_decimal(column)
+        for column in table.columns
+        if column.name in table.primary_keys
+    )
+
+    def landed_key(row):
+        if coerced and row is not None:
+            row = _coerce_variable_decimal_values(row, table, options)
+        return _key(row, table)
+
     output = []
     for record in tx.records:
         if not _record_matches(record, table):
@@ -21236,7 +21362,7 @@ def _project_transaction(
             if op == "UPDATE" and not is_in:
                 op = "DELETE"
             entered = op == "UPDATE" and not was_in
-        key_changed = op == "UPDATE" and not entered and _key(before, table) != _key(after, table)
+        key_changed = op == "UPDATE" and not entered and landed_key(before) != landed_key(after)
         if deletes:
             if op == "DELETE" or key_changed:
                 output.append(_shape_delete(before, table, record, tx))
@@ -21562,7 +21688,9 @@ class _UnloadEmpty(str):
     pass
 
 
-def _unload_value(text: str, type_name: str, qualifier: int | None = None) -> Any:
+def _unload_value(
+    text: str, type_name: str, qualifier: int | None = None, scale: int | None = None
+) -> Any:
     # Docstring: Convert one UNLOAD field to the Python value the live snapshot would yield.
     #
     # Keyed on the column's Informix ``type_name`` so ``_shape_snapshot`` (which
@@ -21571,7 +21699,8 @@ def _unload_value(text: str, type_name: str, qualifier: int | None = None) -> An
     # ``qualifier`` is a DATETIME column's qualifier (``Column.length``): with it, every
     # qualifier renders as the live and CDC decoders render it. Exotic/binary types and
     # locale-sensitive date formats are best-effort and must be validated against the
-    # count/data-compare tool in live mode.
+    # count/data-compare tool in live mode. ``scale`` is a DECIMAL or MONEY column's: UNLOAD
+    # writes a DECIMAL(12,2) 7.00 as 7.0, which is quantized back to the column's scale.
 
     if text == "":
         return None
@@ -21588,7 +21717,13 @@ def _unload_value(text: str, type_name: str, qualifier: int | None = None) -> An
     if upper in _UNLOAD_INT_TYPES:
         return int(text)
     if upper.startswith(("DECIMAL", "NUMERIC", "MONEY")):
-        return Decimal(text)
+        value = Decimal(text)
+        if scale is None or scale == 0xFF or not value.is_finite():
+            return value
+        with localcontext() as decimal_context:
+            # Not the default context's 28 digits, which a DECIMAL(32) passes.
+            decimal_context.prec = 80
+            return value.quantize(Decimal(1).scaleb(-scale))
     if upper in _UNLOAD_FLOAT_TYPES:
         return float(text)
     if upper == "DATE":
@@ -21995,7 +22130,9 @@ def _shape_unl_record(
     position = {column.name: index for index, column in enumerate(catalog)}
     row = {
         column.name: apply_null_byte(
-            _unload_value(fields[position[column.name]], column.type_name, column.length),
+            _unload_value(
+                fields[position[column.name]], column.type_name, column.length, column.scale
+            ),
             null_byte,
         )
         for column in table.columns
@@ -22749,8 +22886,8 @@ def _refuse_float_key_mid_copy(previous: Table, current: Table) -> None:
     for column in current.columns:
         if (
             column.name in current.primary_keys
-            and column.type_name in _FLOAT_TYPES
-            and before.get(column.name, column.type_name) not in _FLOAT_TYPES
+            and column.type_name in _FLOAT_KEY_TYPES
+            and before.get(column.name, column.type_name) not in _FLOAT_KEY_TYPES
         ):
             # 468: Key column {} of '{}' became {} while the table's incremental snapshot was
             # copying, and a float key cannot page the copy; run a full refresh

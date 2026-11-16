@@ -998,6 +998,74 @@ class LakeflowContractTests(unittest.TestCase):
         _drain_snapshots_inline(connector)
         return connector if shared_cdc else _read_cdc_directly(connector)
 
+    def test_a_state_transaction_a_failed_statement_aborted_is_rolled_back_on_reuse(self):
+        # A best-effort state write that failed (a lock timeout, say) left the connection's
+        # transaction aborted, and the next mandatory operation on it failed with
+        # InFailedSqlTransaction. A connection is rolled back before it serves again, the
+        # connector's and its bridge's alike; one whose rollback fails is replaced.
+        class Connection:
+            closed = False
+
+            def __init__(self, failing=False):
+                self.info = types.SimpleNamespace(transaction_status=3)
+                self.failing = failing
+                self.rollbacks = 0
+
+            def rollback(self):
+                if self.failing:
+                    raise OSError("server closed the connection")
+                self.rollbacks += 1
+                self.info.transaction_status = 0
+
+            def close(self):
+                self.closed = True
+
+        connector = self.connector(FakeBridge())
+        bridge = object.__new__(PurePythonInformixBridge)
+        for owner in (connector, bridge):
+            with self.subTest(owner=type(owner).__name__):
+                connection = owner._lakebase_conn = Connection()
+                self.assertIs(owner._lakebase_connection(), connection)
+                self.assertIs(owner._lakebase_connection(), connection)
+                self.assertEqual(connection.rollbacks, 1)
+        broken = bridge._lakebase_conn = Connection(failing=True)
+        fresh = Connection()
+        fresh.info.transaction_status = 0
+        bridge._lakebase = lambda: types.SimpleNamespace(connect=lambda: fresh)
+        self.assertIs(bridge._lakebase_connection(), fresh)
+        self.assertTrue(broken.closed)
+        # 3 is the status both drivers report for an aborted transaction.
+        with contextlib.suppress(ImportError):
+            import psycopg2.extensions  # noqa: PLC0415
+
+            self.assertEqual(psycopg2.extensions.TRANSACTION_STATUS_INERROR, 3)
+
+    def test_a_connector_with_no_registration_resumes_under_its_checkpoints_scope(self):
+        # Used outside a pipeline, a connector has no registration scope. A few steps of a
+        # read fell back to the checkpoint's, and the ones before them failed the read with
+        # 168. The whole read runs under the checkpoint's scope; with none to resume, the
+        # read still fails.
+        bridge = FakeBridge()
+        _, offset = self.connector(bridge).read_table("app.orders", {}, {})
+        self.assertEqual(offset["phase"], "stream")
+        resumed = self.connector(bridge)
+        resumed._registration_scope = None
+        bridge.now = 110
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 101},
+            {"op": "INSERT", "tx_id": 7, "lsn": 102, "row": {"id": 9, "value": "i"}},
+            {"op": "COMMIT", "tx_id": 7, "lsn": 103},
+        ]
+
+        rows, end = resumed.read_table("app.orders", offset, {})
+
+        self.assertEqual([row["id"] for row in rows], [9])
+        self.assertEqual(end["pipeline_scope"], offset["pipeline_scope"])
+        fresh = self.connector(bridge)
+        fresh._registration_scope = None
+        with self.assertRaisesRegex(InformixError, "no registration or checkpoint scope"):
+            fresh.read_table("app.orders", {}, {})
+
     def test_close_releases_bridge_connection_and_capacity_slot(self):
         bridge = FakeBridge()
         connector = self.connector(bridge)
@@ -1959,8 +2027,9 @@ class LakeflowContractTests(unittest.TestCase):
 
     def test_a_float_key_is_copied_by_the_blocking_snapshot(self):
         # A keyset bound renders the last key into SQL, and a float has no exact literal
-        # (the renderer raises TypeError on one), so a float key pages by position.
-        for type_name in ("FLOAT", "SMALLFLOAT"):
+        # (the renderer raises TypeError on one), so a float key pages by position, under
+        # any of its names: DOUBLE, DOUBLE PRECISION and REAL passed the guard and failed.
+        for type_name in ("FLOAT", "SMALLFLOAT", "DOUBLE", "DOUBLE PRECISION", "REAL"):
             with self.subTest(type_name=type_name):
                 raw = _table()
                 raw["columns"][0] = {"name": "id", "type_name": type_name}
@@ -3506,25 +3575,32 @@ class LakeflowContractTests(unittest.TestCase):
     def test_the_driver_captures_its_workspace_credential_again_once_it_is_old(self):
         # Captured once per update, or once per session outside a pipeline: the ambient
         # token lasts about an hour, and a process first reaching the control plane after
-        # that (a restarted flow, say) was handed the expired one.
+        # that (a restarted flow, say) was handed the expired one. Also when a connector is
+        # pickled for a worker, which asks with no session. A process that was handed the
+        # credentials has no capture time, and hands the same on.
         session = mock.Mock()
         session.conf.get.return_value = None
         saved = dict(informix_module._INFORMIX_REGISTRATION_CONTEXT)
         self.addCleanup(informix_module._INFORMIX_REGISTRATION_CONTEXT.update, saved)
         self.addCleanup(informix_module._CREDENTIAL_CAPTURED.clear)
         informix_module._INFORMIX_REGISTRATION_CONTEXT.update({"scope": "a" * 32, "request": None})
-        informix_module._CREDENTIAL_CAPTURED["at"] = 1000.0
-        with mock.patch.object(informix_module, "capture_workspace_credentials") as capture:
-            with mock.patch.object(informix_module.time, "monotonic", return_value=1500.0):
-                informix_module._driver_registration(session)
-            capture.assert_not_called()
-            with mock.patch.object(informix_module.time, "monotonic", return_value=1900.0):
-                informix_module._driver_registration(None)
-                capture.assert_not_called()
-                informix_module._driver_registration(session)
-            capture.assert_called_once()
-        self.assertEqual(informix_module._CREDENTIAL_CAPTURED["at"], 1900.0)
+        for asker in (session, None):
+            with self.subTest(session=asker is not None):
+                informix_module._CREDENTIAL_CAPTURED["at"] = 1000.0
+                with mock.patch.object(informix_module, "capture_workspace_credentials") as capture:
+                    with mock.patch.object(informix_module.time, "monotonic", return_value=1500.0):
+                        informix_module._driver_registration(asker)
+                    capture.assert_not_called()
+                    with mock.patch.object(informix_module.time, "monotonic", return_value=1900.0):
+                        informix_module._driver_registration(asker)
+                    capture.assert_called_once()
+                self.assertEqual(informix_module._CREDENTIAL_CAPTURED["at"], 1900.0)
         self.assertEqual(informix_module._INFORMIX_REGISTRATION_CONTEXT["scope"], "a" * 32)
+        informix_module._CREDENTIAL_CAPTURED.clear()
+        with mock.patch.object(informix_module, "capture_workspace_credentials") as capture:
+            with mock.patch.object(informix_module.time, "monotonic", return_value=9000.0):
+                informix_module._driver_registration(None)
+        capture.assert_not_called()
 
     def test_a_connector_from_the_package_carries_the_registration_to_executors(self):
         # An executor is handed readers, not the class, and imports the module afresh: the
@@ -3715,6 +3791,43 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertIsNone(
             informix_module._shape_snapshot({"id": None, "value": "a"}, 100, nullable, {})["id"]
         )
+
+    def test_an_update_whose_key_lands_unchanged_lands_no_delete(self):
+        # A variable-scale DECIMAL key column lands as its target type: under integer, 12.1
+        # and 12.2 are both 12. The UPDATE was taken for a key change, and the delete of
+        # the old key, at the update's own LSN, tied with its upsert and could remove the
+        # row. A change of the key as it lands is still one.
+        connector = self.connector(FakeBridge())
+        keyed = connector._table("app.orders", {})
+        table = dataclasses.replace(
+            keyed,
+            columns=tuple(
+                dataclasses.replace(c, type_name="DECIMAL", precision=5, scale=0xFF)
+                if c.name == "id"
+                else c
+                for c in keyed.columns
+            ),
+        )
+        options = {"decimal.variable.column.type": "id:integer"}
+
+        def landed(after_id, deletes):
+            record = {
+                "op": "UPDATE",
+                "lsn": 141,
+                "before": {"id": Decimal("12.1"), "value": "a"},
+                "after": {"id": after_id, "value": "b"},
+                "table": "demo:app.orders",
+                "tx_id": 7,
+            }
+            transaction = informix_module.CommittedTransaction(7, 100, 150, 100, (record,))
+            rows = informix_module._project_transaction(
+                transaction, table, deletes, options=options
+            )
+            return [row[informix_module.OP] for row in rows]
+
+        self.assertEqual(landed(Decimal("12.2"), True), [])
+        self.assertEqual(landed(Decimal("12.2"), False), ["u"])
+        self.assertEqual(landed(Decimal("13.2"), True), ["d"])
 
     def test_half_of_an_index_update_lands_as_the_delete_or_insert_it_is(self):
         # What the stream passes on for a keyless table when the scan holds one half of
@@ -4116,7 +4229,7 @@ class LakeflowContractTests(unittest.TestCase):
             mock.patch.object(connector, "_discard_scan_progress") as discard,
         ):
             with self.assertRaises(OSError):
-                connector._adopted_scan_scope(table, scope)
+                connector._adopted_scan_scope(table, scope, {})
         discard.assert_not_called()
 
     def test_an_index_scan_that_cannot_record_its_progress_still_completes(self):
@@ -4240,6 +4353,34 @@ class LakeflowContractTests(unittest.TestCase):
                 )
                 self.assertEqual(glob.glob(pointers, recursive=True), [])
 
+    def test_an_index_scan_is_taken_up_only_where_it_can_go_on_from_its_record(self):
+        # A failed index-ordered scan was taken up under its update's scope whatever had
+        # changed since. A changed layout then failed every restart against that update's
+        # initialization (316); another index or a cursor scan started again beside the
+        # pages it had staged, and on a quiet log at the same boundary met them (218). Such
+        # a scan is discarded, and the snapshot runs under this update's scope.
+        for number, (spoil, extra, reason) in enumerate(
+            (
+                ("layout", {"rename_columns": '{"value": "label"}'}, "columns or options have"),
+                ("index", {"snapshot.scan": "cursor"}, "index it paged by"),
+            )
+        ):
+            pipeline = uuid.UUID(int=120 + number)
+            scopes = [f"{pipeline}_@_{uuid.UUID(int=update)}" for update in (2, 3)]
+            with self.subTest(spoil=spoil):
+                bridge, options, _ = self._failed_index_scan(scopes[0])
+                # A quiet log: a scan started again lands on the failed one's boundary.
+                bridge.now -= 3 * 4096
+                later = self.connector(bridge)
+                later.set_registration_scope(scopes[1])
+                later.set_update_request("continue")
+                with self.assertLogs(informix_module.__name__, "INFO") as logs:
+                    ids, offset = self._snapshot_ids(later, {**options, **extra})
+
+                self.assertEqual(sorted(ids), list(range(1, 8)))
+                self.assertEqual(offset["pipeline_scope"], scopes[1])
+                self.assertTrue(any(reason in line for line in logs.output), logs.output)
+
     def test_an_index_scan_is_taken_up_only_while_its_record_is_recent_and_its_log_kept(self):
         for number, (spoil, reason) in enumerate(
             (
@@ -4258,7 +4399,9 @@ class LakeflowContractTests(unittest.TestCase):
                     bridge.minimum = bridge.now + 10_000
                     table = Table.parse(bridge.tables[0], "demo")
                     with self.assertLogs(informix_module.__name__, "INFO") as logs:
-                        self.assertEqual(later._adopted_scan_scope(table, scopes[1]), scopes[1])
+                        self.assertEqual(
+                            later._adopted_scan_scope(table, scopes[1], options), scopes[1]
+                        )
                 else:
                     with (
                         mock.patch.object(informix_module, "_SCAN_RESUME_SECONDS", -1),
@@ -12870,6 +13013,40 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(self._replay_in_a_later_update(bridge, options, start, end), [1, 2, 3])
 
+    def test_a_one_page_resnapshot_replayed_later_serves_its_stage(self):
+        # The resnapshot of an expired checkpoint fitted one page, so its batch ended in the
+        # stream phase, as an initial one-page snapshot's does. Replayed in a later update
+        # from that checkpoint, it took another snapshot, newer than the end Spark goes on
+        # from, and the rows added since came again from CDC. Both readers serve the stage
+        # Spark's end names, as they do an initial range's.
+        bridge, options, start, served, end = self._blocking_resnapshot([{"id": 1, "value": "a"}])
+        self.assertEqual(end["phase"], "stream")
+        bridge.rows += [{"id": 2, "value": "b"}, {"id": 3, "value": "c"}]
+        bridge.now = 170
+        snapshots = len(bridge.snapshot_calls)
+        restarted = self.connector(bridge, registration_scope="u2")
+
+        class TriggerBase:
+            pass
+
+        class LakeflowStreamReader(_informix_available_now_base(TriggerBase)):
+            def __init__(inner):  # pylint: disable=no-self-argument
+                inner.lakeflow_connect = restarted
+                inner.options = {"tableName": "app.orders", **options}
+
+            def read(inner, offset):  # pylint: disable=no-self-argument
+                return restarted.read_table("app.orders", offset, dict(inner.options))
+
+        replayed = [row["id"] for row in LakeflowStreamReader().readBetweenOffsets(start, end)]
+
+        self.assertEqual(replayed, served)
+        self.assertEqual(len(bridge.snapshot_calls), snapshots)
+        table = restarted._table("app.orders", dict(options))
+        self.assertIsNotNone(restarted._bootstrap_page_batch(table, start, end, dict(options)))
+        # A range of the stream after it is no first batch.
+        later = dict(end, commit_lsn="160", begin_lsn="160", change_lsn="160")
+        self.assertIsNone(restarted._bootstrap_page_batch(table, end, later, dict(options)))
+
     def test_a_copy_finished_in_its_first_batch_replays_to_its_bound(self):
         # The copy fitted one chunk, so its first batch finished it and neither offset
         # carries a copy block. Rows were inserted below the bound before the replay: it
@@ -18972,6 +19149,20 @@ class LakeflowContractTests(unittest.TestCase):
             )
             list(rows)
 
+    def test_a_recorded_refusal_names_its_scope_for_the_cleanup_that_finds_it(self):
+        # The update's cleanup and the stale-pipeline sweep find a record by the scope in
+        # it; a refusal had it in its key alone, and was kept forever.
+        connector = self.connector(FakeBridge())
+        table = connector._table("app.orders", {})
+        connector._publish_schema_rejection(table, "1" * 32, InformixError("refused"))
+
+        record = connector._read_immutable_head(
+            connector._schema_rejection_namespace(table, "1" * 32)
+        )
+
+        self.assertEqual(record["scope"], connector._pipeline_scope())
+        self.assertEqual(connector._schema_rejection(table, "1" * 32), "refused")
+
     def test_delete_reader_fails_with_any_refusal_the_upsert_reader_records(self):
         bridge = FakeBridge()
         checkpoint = self._checkpoint_then_add_a_column(bridge, {})
@@ -19208,66 +19399,113 @@ class LakeflowContractTests(unittest.TestCase):
     def test_a_replay_repeats_a_batch_read_under_a_floor_replaced_since(self):
         # The batch read deletes under the floor it started at; a full refresh replaced the
         # floor before it committed. Its replay reads the same range again: started at the
-        # new floor instead, it never reached the end Spark logged, on every restart.
-        bridge = FakeBridge()
-        reader = self._floor_updates(bridge)
-        reader(2, "full_refresh").read_table("app.orders", {}, {})
-        delete = reader(3)
-        _, seeded = delete.read_table_deletes("app.orders", {}, {})
-        bridge.now = 110
-        bridge.changes = [
-            {"op": "BEGIN", "tx_id": 7, "lsn": 101},
-            {"op": "DELETE", "tx_id": 7, "lsn": 102, "row": {"id": 1, "value": "a"}},
-            {"op": "COMMIT", "tx_id": 7, "lsn": 103},
-        ]
-        _, logged = delete.read_table_deletes("app.orders", seeded, {})
-        self.assertEqual(logged["commit_lsn"], "103")
-        bridge.now = 120
-        _, new = reader(4, "full_refresh").read_table("app.orders", {}, {})
-        later = reader(5)
-        later.read_table("app.orders", new, {})  # this update's upsert start is published
-        replay_options = {}
+        # new floor instead, it never reached the end Spark logged, on every restart. Also
+        # where the new floor is the very LSN the batch ended at, which the replay took for
+        # the end of a batch that had started again there.
+        for floor_lsn in (120, 103):
+            with self.subTest(floor_lsn=floor_lsn):
+                bridge = FakeBridge()
+                reader = self._floor_updates(bridge)
+                reader(2, "full_refresh").read_table("app.orders", {}, {})
+                delete = reader(3)
+                _, seeded = delete.read_table_deletes("app.orders", {}, {})
+                bridge.now = 110
+                bridge.changes = [
+                    {"op": "BEGIN", "tx_id": 7, "lsn": 101},
+                    {"op": "DELETE", "tx_id": 7, "lsn": 102, "row": {"id": 1, "value": "a"}},
+                    {"op": "COMMIT", "tx_id": 7, "lsn": 103},
+                ]
+                _, logged = delete.read_table_deletes("app.orders", seeded, {})
+                self.assertEqual(logged["commit_lsn"], "103")
+                bridge.now = floor_lsn
+                _, new = reader(4, "full_refresh").read_table("app.orders", {}, {})
+                self.assertEqual(new["commit_lsn"], str(floor_lsn))
+                bridge.now = 120
+                later = reader(5)
+                later.read_table("app.orders", new, {})  # this update's upsert start
+                replay_options = {}
 
-        replayed = list(
-            informix_module._replay_between_offsets(
-                seeded,
-                logged,
-                lambda offset: later.read_table_deletes("app.orders", offset, replay_options),
-                replay_options,
-                later.options,
-            )
-        )
+                replayed = list(
+                    informix_module._replay_between_offsets(
+                        seeded,
+                        logged,
+                        lambda offset, later=later, replay_options=replay_options: (
+                            later.read_table_deletes("app.orders", offset, replay_options)
+                        ),
+                        replay_options,
+                        later.options,
+                    )
+                )
 
-        self.assertEqual([(row["id"], row["_informix_op"]) for row in replayed], [(1, "d")])
+                self.assertEqual([(row["id"], row["_informix_op"]) for row in replayed], [(1, "d")])
 
-    def test_a_seeded_delete_position_keeps_its_mark_where_the_pipeline_has_no_floor(self):
-        # A table.migration seed carries a position another pipeline's floor confirmed to a
-        # pipeline that has taken no snapshot of its own: it reads on, rather than start
-        # again and lose the deletes between the two pipelines' checkpoints.
+    def test_a_replayed_delete_batch_is_told_by_the_end_it_logged(self):
+        # Whether the batch read on from its seed or started again at a floor that replaced
+        # it, from the end Spark logged: read on, it carried the seed, or ended below the
+        # new floor once the floor was confirmed; started again, it carried the new floor's
+        # seed, or none where it began at the update's start, that floor having left the
+        # log. Its LSN alone told a batch that started again at the start from one that read
+        # on, so its replay read on from a position the log no longer held.
         bridge = FakeBridge()
         reader = self._floor_updates(bridge)
         reader(2, "full_refresh").read_table("app.orders", {}, {})
         _, seeded = reader(3).read_table_deletes("app.orders", {}, {})
-        other = self.connector(bridge)
-        other.set_registration_scope(f"{uuid.UUID(int=99)}_@_{uuid.UUID(int=4)}")
-        other.set_update_request("continue")
-        # Its upsert flow, migrated too, has read in this update: the start that made the
-        # reader weigh the floor, and the absent one read as replaced.
-        table = other._table("app.orders", {})
-        other._publish_upsert_channel_start(
-            table, 101, "1" * 32, _schema_fingerprint(table), other._pipeline_scope()
+        bridge.now = 120
+        _, new = reader(4, "full_refresh").read_table("app.orders", {}, {})
+        later = reader(5)
+        table = later._table("app.orders", {})
+        unmarked = {k: v for k, v in seeded.items() if k != "floor_seed"}
+        stop, end_seed = (
+            informix_module._REPLAY_STOP_LSN_OPTION,
+            informix_module._REPLAY_END_SEED_OPTION,
         )
-        bridge.now = 110
-        bridge.changes = [
-            {"op": "BEGIN", "tx_id": 7, "lsn": 101},
-            {"op": "DELETE", "tx_id": 7, "lsn": 102, "row": {"id": 1, "value": "a"}},
-            {"op": "COMMIT", "tx_id": 7, "lsn": 103},
-        ]
+        for options, expected in (
+            ({stop: "130", end_seed: seeded["floor_seed"]}, (seeded, seeded["floor_seed"])),
+            ({stop: "110", end_seed: ""}, (unmarked, None)),
+            ({stop: "130", end_seed: ""}, ({}, None)),
+            ({stop: "130", end_seed: new["pipeline_scope"]}, ({}, None)),
+            ({}, ({}, None)),
+        ):
+            with self.subTest(options=options):
+                self.assertEqual(later._confirmed_floor_seed(table, seeded, options), expected)
 
-        rows, end = other.read_table_deletes("app.orders", seeded, {})
+    def test_a_delete_position_seeded_in_another_pipeline_reads_on_there(self):
+        # A table.migration checkpoint carries a position another pipeline's floor seeded
+        # and confirmed. This pipeline's floor says nothing of it: weighed against an old
+        # floor of this pipeline's, it started the delete flow again, at this update's start
+        # where that floor had left the log, and the deletes before it were lost. It reads
+        # on, the mark dropped, with or without a floor here.
+        for own_floor in (False, True):
+            with self.subTest(own_floor=own_floor):
+                bridge = FakeBridge()
+                reader = self._floor_updates(bridge)
+                reader(2, "full_refresh").read_table("app.orders", {}, {})
+                _, seeded = reader(3).read_table_deletes("app.orders", {}, {})
+                other = self.connector(bridge)
+                other.set_registration_scope(f"{uuid.UUID(int=99)}_@_{uuid.UUID(int=4)}")
+                other.set_update_request("continue")
+                table = other._table("app.orders", {})
+                if own_floor:
+                    # From before: a snapshot the log no longer holds.
+                    other._publish_delete_snapshot_floor(
+                        table, "1" * 32, 50, f"{uuid.UUID(int=99)}_@_{uuid.UUID(int=3)}"
+                    )
+                    bridge.minimum = 60
+                # Its upsert flow, migrated too, has read in this update, after the delete.
+                other._publish_upsert_channel_start(
+                    table, 104, "1" * 32, _schema_fingerprint(table), other._pipeline_scope()
+                )
+                bridge.now = 110
+                bridge.changes = [
+                    {"op": "BEGIN", "tx_id": 7, "lsn": 101},
+                    {"op": "DELETE", "tx_id": 7, "lsn": 102, "row": {"id": 1, "value": "a"}},
+                    {"op": "COMMIT", "tx_id": 7, "lsn": 103},
+                ]
 
-        self.assertEqual([(row["id"], row["_informix_op"]) for row in rows], [(1, "d")])
-        self.assertEqual(end["floor_seed"], seeded["floor_seed"])
+                rows, end = other.read_table_deletes("app.orders", seeded, {})
+
+                self.assertEqual([(row["id"], row["_informix_op"]) for row in rows], [(1, "d")])
+                self.assertNotIn("floor_seed", end)
 
     def test_a_triggered_delete_reader_sets_the_boundary_its_upsert_reader_then_shares(self):
         # A delete flow started ahead of its upsert flow does not wait for it, in a flow
@@ -20086,6 +20324,50 @@ class IncrementalSnapshotTests(unittest.TestCase):
                 self.assertEqual(seeded["commit_lsn"], "90")
                 rows, _ = later.read_table_deletes("app.orders", seeded, dict(options))
                 self.assertEqual([(row["id"], row["_informix_op"]) for row in rows], [(10, "d")])
+
+    def test_an_auto_snapshot_resnapshot_replayed_later_leaves_the_delete_floor(self):
+        # auto_snapshot replaced an expired checkpoint with a snapshot at 150, and the batch
+        # was replayed in a later update, which resnapshots at 170. Spark goes on from 150:
+        # published under the later update, 170 replaced the floor whatever its LSN and
+        # started the delete flow above the deletes between. The floor stays the batch's.
+        bridge = FakeBridge()
+        bridge.minimum = 91
+        bridge.now = 150
+        pipeline = f"{uuid.UUID(int=34)}"
+
+        def reader(update):
+            connector = self.connector(bridge)
+            connector.set_registration_scope(f"{pipeline}_@_{uuid.UUID(int=update)}")
+            connector.set_update_request("continue")
+            return connector
+
+        checkpoint = _stream_offset(90)
+        checkpoint["pipeline_scope"] = f"{pipeline}_@_{uuid.UUID(int=1)}"
+        options = {"snapshot.mode": "auto_snapshot", "snapshot.page.size": "1"}
+        _, end = reader(2).read_table("app.orders", checkpoint, dict(options))
+        self.assertEqual(end["commit_lsn"], "150")
+        bridge.now = 170
+        later = reader(3)
+        replay_options = dict(options)
+
+        list(
+            informix_module._replay_between_offsets(
+                checkpoint,
+                end,
+                lambda offset: later.read_table("app.orders", offset, replay_options),
+                replay_options,
+                later.options,
+            )
+        )
+
+        table = Table.parse(_table(), "demo")
+        floor = later._read_immutable_head(
+            later._immutable_namespace(table, "delete-floor", pipeline)
+        )
+        self.assertEqual(
+            (floor["start_lsn"], floor["snapshot_scope"]),
+            ("150", f"{pipeline}_@_{uuid.UUID(int=2)}"),
+        )
 
     def test_a_mid_copy_replay_in_a_later_update_keeps_its_batchs_bound(self):
         # Rows from the cursor Spark logged up were deleted before a later update replayed
@@ -25425,6 +25707,13 @@ class UnloadHelperTests(unittest.TestCase):
         self.assertIsNone(value("", "INTEGER"))
         self.assertEqual(value("42", "INTEGER"), 42)
         self.assertEqual(value("3.14", "DECIMAL(6,2)"), Decimal("3.14"))
+        # UNLOAD writes a DECIMAL(12,2) 7.00 as 7.0; the live decoders give 7.00, which the
+        # column's scale restores. A variable-scale one (0xFF) keeps what was written.
+        for type_name in ("DECIMAL", "MONEY"):
+            self.assertEqual(str(value("7.0", type_name, None, 2)), "7.00")
+        self.assertEqual(str(value("1.5", "DECIMAL", None, 0xFF)), "1.5")
+        long = "1234567890123456789012345678.5"
+        self.assertEqual(str(value(long, "DECIMAL", None, 2)), long + "0")
         self.assertEqual(value("2.5", "FLOAT"), 2.5)
         self.assertEqual(value("2024-01-15", "DATE"), date(2024, 1, 15))
         self.assertEqual(

@@ -98,11 +98,14 @@ few empty batches with no offset, in every update, and the table's deletes were 
 applied.) It keeps a mark of which snapshot the floor was until the upsert reader has
 published this update's start. If the floor is another snapshot's (a full refresh ended
 before the table's flows ran, and this update snapshots it), the delete reader starts
-again at the new floor, without waiting for that start; the replay of a batch it read
-under the earlier floor reads that range again. A pipeline with no floor of its own, one
-a `table.migration` seed came to, keeps the mark and reads on. A replayed first batch of
-a table, which may establish a newer boundary than the batch had, leaves the floor as
-that batch published it, since Spark goes on from where the batch ended. In a full
+again at the new floor, without waiting for that start; a replayed batch does what the
+batch did, told by the end it logged (one read under the earlier floor carries its mark,
+or ends below the new floor). A position another pipeline seeded, which a
+`table.migration` checkpoint brings, reads on, its mark dropped: that pipeline's floor
+confirmed it, and this pipeline's says nothing of it. A replayed first batch of a table,
+or of auto_snapshot's resnapshot of an expired checkpoint, which may establish a newer
+boundary than the batch had, leaves the floor as that batch published it, since Spark
+goes on from where the batch ended. In a full
 refresh (a refresh of selected tables counts as one for every table, see below), on the
 first run, or where the floor's column layout is not the table's current one, the delete
 reader waits as
@@ -495,6 +498,8 @@ Because the exponent floats, no single fixed `DecimalType(precision, scale)` can
 
 Use `decimal.variable.column.type` to override the global choice per column, e.g. `agt_no:decimal(9,0),bnk_acct_no:string`. Explicit fixed-scale `DECIMAL(p,s)` columns are unaffected and always map to `DecimalType(p,s)`.
 
+A variable-scale key column (a real key, a `primary.keys` override, `*` included) lands as its target type too, and that type is the key the pipeline merges on. Choose one that keeps every key value apart: under `integer` the keys 12.1 and 12.2 both land as 12, one target row, and a delete of either removes it; `string` keeps every value exact. An update that changes the source key but not the landed one is an update of that row, not a delete and an insert.
+
 Set `scalar.types.live.validation=true` and `scalar.types.test.table=owner.table` in an opt-in live test configuration to validate snapshot and CDC decoding against a populated, dedicated mutable table containing `INT8`, `SERIAL8`, `DATETIME`, `LVARCHAR`, and `BOOLEAN` columns. Snapshot validation opens separate `padVarchar=false` and `padVarchar=true` sessions, so VARCHARs beside LVARCHAR/BOOLEAN columns are exercised in both modes; include a VARCHAR column before and after them to catch a misaligned tuple. Provide `scalar.types.expected.snapshot` and `scalar.types.expected.cdc` as JSON objects containing exact non-null wire boundaries: a signed INT8 extreme, a positive generated SERIAL8 value, an LVARCHAR occupying its catalog maximum in the database's codeset (`DB_LOCALE`), a DATETIME preserving its declared fractional precision, and a Boolean value. INT8 exercises the shared signed-magnitude extreme without advancing the SERIAL8 generator to exhaustion. Provide corresponding null-sentinel cases in `scalar.types.expected.null.snapshot` and `scalar.types.expected.null.cdc`; each must include every required column and set every nullable scalar column to JSON `null`. Configure committed mutations with `scalar.types.mutation.sql` and `scalar.types.null.mutation.sql`, plus one idempotent `scalar.types.cleanup.sql` statement that removes both mutations. The test commits every statement explicitly in ANSI and non-ANSI databases and preserves all primary, rollback, cleanup, and close failures.
 
 This regression passed against Informix 15.0.FC0DE in an ANSI-mode database over
@@ -729,7 +734,10 @@ from the start, when:
 - the API cannot be asked, so it is unknown what the update was started for;
 - the record was last written more than 24 hours ago;
 - the logical log the scan began in is no longer kept;
-- the table's schema or the index paged by has changed.
+- the table's schema, or an option that changes its layout (`rename_columns`, say), has
+  changed;
+- the snapshot would page by another index, or by the cursor (`snapshot.scan: cursor`);
+- `snapshot.max.bytes` is set.
 
 Once the snapshot's first batch is committed the record is removed: a restart then goes
 on from the committed offset, as before. A scan under `snapshot.max.bytes` keeps no
@@ -1289,27 +1297,27 @@ Full definitions are in [Connection parameters](#connection-parameters).
 
 ## Table configuration
 
+The pipeline spec, as the ingest file's `pipeline_spec` holds it:
+
 ```json
 {
-  "pipeline_spec": {
-    "connection_name": "informix_sales",
-    "object": [
-      {
-        "table": {
-          "source_table": "orders",
-          "destination_table": "orders",
-          "table_configuration": {
-            "qualified_source_table": "informix.orders",
-            "decimal.variable.type": "decimal(38,18)",
-            "snapshot.mode": "initial",
-            "snapshot.page.size": "2000",
-            "max.records.per.batch": "2000",
-            "sequence_by": "_informix_change_lsn"
-          }
+  "connection_name": "informix_sales",
+  "objects": [
+    {
+      "table": {
+        "source_table": "orders",
+        "destination_table": "orders",
+        "table_configuration": {
+          "qualified_source_table": "informix.orders",
+          "decimal.variable.type": "decimal(38,18)",
+          "snapshot.mode": "initial",
+          "snapshot.page.size": "2000",
+          "max.records.per.batch": "2000",
+          "sequence_by": "_informix_change_lsn"
         }
       }
-    ]
-  }
+    }
+  ]
 }
 ```
 
