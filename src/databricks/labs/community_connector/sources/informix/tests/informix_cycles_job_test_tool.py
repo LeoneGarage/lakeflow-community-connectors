@@ -1,20 +1,22 @@
 # Databricks notebook source
 # Informix restart/run/compare cycles as a Databricks Job (serverless), so they run with no
 # laptop attached. Each cycle: restart the demo Informix container and wait for its CDC
-# workload; run informix-pipeline as a triggered full refresh and a triggered update of
-# RUN_MINUTES each, N continuous updates of RUN_MINUTES each and one more of FINAL_MINUTES;
-# compare counts, and if they differ run one more continuous update of EXTRA_MINUTES and
-# compare again; then compare the data. The full refresh runs past RUN_MINUTES when the
-# keyless tables (DRAIN_TABLES) have not drained by then, so their snapshots never restart.
+# workload; run informix-pipeline in triggered updates only, a full refresh and then one
+# update after another, each to its end, until TRIGGERED_MINUTES have passed since the
+# workload started and one of them started after the workload had ended; compare counts,
+# and if they differ run one more triggered update and compare again; then compare the
+# data. No update is continuous: a triggered update ends once each flow has read up to the
+# position the update began at, so a flow that gives up early, or waits for another, shows
+# as a difference instead of being caught up by a continuous run before the compares.
 #
-# With resume_test=true (the default) the full refresh is instead stopped on purpose, part-way
+# With resume_test=true (the default) the full refresh is stopped on purpose, part-way
 # through the index-ordered snapshot of RESUME_TABLE: as soon as that scan has recorded a few
 # pages on the staging Volume. The triggered update after it must go on from the last page
-# instead of reading the table again, and runs until the keyless tables have drained. Whether
-# it did shows in the target: a snapshot row carries the time its scan began, which is before
-# the second update started only if that update took the first one's scan up. The outcome is
-# part of the cycle's verdict (NO RESUME when the second update started the scan over), next
-# to the compares, which show that the resumed snapshot and the stream still add up.
+# instead of reading the table again. Whether it did shows in the target: a snapshot row
+# carries the time its scan began, which is before the second update started only if that
+# update took the first one's scan up. The outcome is part of the cycle's verdict (NO RESUME
+# when the second update started the scan over), next to the compares, which show that the
+# resumed snapshot and the stream still add up.
 #
 # Every pipeline start and end, each cycle's verdict and the final summary go to the run's
 # output and to main.informix_cycles.events / main.informix_cycles.cycles. The Informix side
@@ -34,8 +36,8 @@
 # and stays stopped. The notebook still exits normally, since a failed task is retried as a
 # fresh run that restarts the container. stop_on_mismatch=false runs every cycle regardless.
 #
-# Parameters: cycles, run_minutes, continuous_runs, final_minutes (0 skips the final run),
-# extra_minutes, pipeline_name (default informix-pipeline), stop_on_mismatch (default true),
+# Parameters: cycles, triggered_minutes (default 35, counted from the workload's start; the
+# workload runs 30), pipeline_name (default informix-pipeline), stop_on_mismatch (default true),
 # resume_test (default true), staging_location (the connection's snapshot.staging.location,
 # where the scan's progress is read from; without access to it the resume test is skipped),
 # and smoke=true, which checks AWS, SSM, the pipeline API, both compares and the event
@@ -53,20 +55,17 @@ import sys
 import time
 
 dbutils.widgets.text("cycles", "5")
-dbutils.widgets.text("run_minutes", "5")
-dbutils.widgets.text("continuous_runs", "3")
-dbutils.widgets.text("final_minutes", "10")
-dbutils.widgets.text("extra_minutes", "8")
+dbutils.widgets.text("triggered_minutes", "35")
 dbutils.widgets.dropdown("smoke", "false", ["false", "true"])
 dbutils.widgets.text("pipeline_name", "informix-pipeline")
 dbutils.widgets.dropdown("stop_on_mismatch", "true", ["true", "false"])
 dbutils.widgets.dropdown("resume_test", "true", ["true", "false"])
 dbutils.widgets.text("staging_location", "/Volumes/members/connector_bronze/informix_cdc_state")
 CYCLES = int(dbutils.widgets.get("cycles"))
-RUN_SECONDS = int(float(dbutils.widgets.get("run_minutes")) * 60)
-CONTINUOUS_RUNS = int(dbutils.widgets.get("continuous_runs"))
-FINAL_SECONDS = int(float(dbutils.widgets.get("final_minutes")) * 60)
-EXTRA_SECONDS = int(float(dbutils.widgets.get("extra_minutes")) * 60)
+TRIGGERED_SECONDS = int(float(dbutils.widgets.get("triggered_minutes")) * 60)
+# A triggered update ends by itself; one still running after this long is stopped, and the
+# compares show what it left undone.
+UPDATE_CAP_SECONDS = 3600
 SMOKE = dbutils.widgets.get("smoke") == "true"
 PIPELINE_NAME = dbutils.widgets.get("pipeline_name")
 STOP_ON_MISMATCH = dbutils.widgets.get("stop_on_mismatch") == "true"
@@ -79,8 +78,7 @@ EVENTS = f"{SCHEMA}.events"
 RESULTS = f"{SCHEMA}.cycles"
 TERMINAL = {"COMPLETED", "FAILED", "CANCELED"}
 # Keyless tables whose one-pass snapshot restarts from its first row if the full-refresh
-# run stops mid-drain: that run stops at RUN_MINUTES if both have drained by then, and
-# otherwise waits until they have.
+# run stops mid-drain; the resume test checks one of them has not drained yet when it stops.
 DRAIN_TABLES = ("tw900_member_tag", "tw901_claim_note")
 # The resume test's table: keyless with a non-unique index, so its snapshot pages by that
 # index and records each page it stages; the demo seeds it large enough to take several.
@@ -119,10 +117,9 @@ def event(cycle, kind, message):
 event(
     0,
     "start",
-    f"run {RUN_ID}: {CYCLES} cycles, {CONTINUOUS_RUNS} continuous runs of "
-    f"{RUN_SECONDS // 60} min, final run {FINAL_SECONDS // 60} min, "
-    f"extra run {EXTRA_SECONDS // 60} min, smoke={SMOKE}, stop_on_mismatch={STOP_ON_MISMATCH}, "
-    f"resume_test={RESUME_TEST}",
+    f"run {RUN_ID}: {CYCLES} cycles, triggered updates only, until "
+    f"{TRIGGERED_SECONDS // 60} min after the workload starts, smoke={SMOKE}, "
+    f"stop_on_mismatch={STOP_ON_MISMATCH}, resume_test={RESUME_TEST}",
 )
 
 # COMMAND ----------
@@ -301,27 +298,7 @@ def undrained():
     return pending
 
 
-def wait_for_drains(cycle, label, update_id, start, state):
-    # Past RUN_MINUTES, keep the full-refresh run going until both keyless tables have
-    # drained: stopping it mid-drain would make the next run start their snapshots over.
-    pending = undrained() if state == "RUNNING" else list(DRAIN_TABLES)
-    if pending:
-        event(cycle, "draining", f"{label}: waiting for {', '.join(pending)} to drain")
-    while pending and state not in TERMINAL:
-        time.sleep(15)
-        state = update_info(update_id)["state"]
-        if state == "RUNNING":
-            pending = undrained()
-    if pending and state in TERMINAL:
-        # An update that ended between two polls may have drained without one seeing it.
-        pending = undrained()
-    if not pending:
-        minutes = (time.time() - start) / 60
-        event(cycle, "drained", f"{label}: {', '.join(DRAIN_TABLES)} drained by {minutes:.1f} min")
-    return state
-
-
-def run_for(cycle, label, update_id, seconds, from_creation=True, until_drained=False):
+def run_for(cycle, label, update_id, seconds, from_creation=True):
     info = update_info(update_id)
     start = int(info["creation_time"]) / 1000 if from_creation else time.time()
     deadline = start + seconds
@@ -329,12 +306,9 @@ def run_for(cycle, label, update_id, seconds, from_creation=True, until_drained=
     while time.time() < deadline and state not in TERMINAL:
         time.sleep(15)
         state = update_info(update_id)["state"]
-    if until_drained and state not in TERMINAL:
-        state = wait_for_drains(cycle, label, update_id, start, state)
     minutes = round((time.time() - start) / 60, 1)
     if state in TERMINAL:
-        # "ended before" marks an early end for the dashboard; a full-refresh run waiting
-        # for the drains can also end by itself after RUN_MINUTES.
+        # "ended before" marks an end before the cap, as every triggered update should.
         when = f"before {seconds // 60}" if time.time() < deadline else f"after {minutes}"
         event(cycle, "ended", f"{label}: update {update_id} ended {when} minutes: {state}")
         if state == "FAILED":
@@ -518,71 +492,66 @@ def restart_container(cycle):
         count = out.strip().splitlines()[-1] if out.strip() else "?"
         if count.isdigit() and int(count) > 0:
             event(cycle, "restart", f"incremental workload running ({count} processes)")
-            return
+            return time.time()
         time.sleep(30)
     raise RuntimeError("the Informix workload did not start within 25 minutes")
 
 
-def pipeline_runs(cycle):
+def workload_running():
+    out = ssm(
+        "docker exec informix-cdc sh -c "
+        "'ps -ef | grep -v grep | grep -c newhealth_cdc_workload; true' 2>&1; true",
+        120,
+    )
+    count = out.strip().splitlines()[-1] if out.strip() else "?"
+    # Unknown counts as running: only an update started once it has ended reads its last
+    # changes.
+    return not (count.isdigit() and int(count) == 0)
+
+
+def pipeline_runs(cycle, workload_started):
+    # Triggered updates only: the full refresh, then one update after another, each to its
+    # end, until TRIGGERED_MINUTES have passed since the workload started and one of them
+    # started after the workload had ended (it alone reads the workload's last changes).
     event(cycle, "cycle", "pipeline runs starting")
     set_continuous(cycle, False)
+    deadline = workload_started + TRIGGERED_SECONDS
     stopped = None
-    for run, full_refresh in ((1, True), (2, False)):
+    after_workload = False
+    run = 1
+    while run <= 2 or time.time() < deadline or not after_workload:
+        full_refresh = run == 1
         kind = "triggered full-refresh" if full_refresh else "triggered"
-        event(cycle, "starting", f"run {run}: starting {kind} update")
+        ended = not workload_running()
+        elapsed = (time.time() - workload_started) / 60
+        event(
+            cycle,
+            "starting",
+            f"run {run}: starting {kind} update, {elapsed:.1f} min after the workload started"
+            + (", which has ended" if ended else ""),
+        )
         update_id = start_update(cycle, f"run {run}", full_refresh)
+        after_workload = after_workload or ended
         event(cycle, "started", f"run {run}: started {kind} update {update_id}")
         if full_refresh and RESUME_TEST:
             stopped = stop_part_way(cycle, f"run {run}", update_id)
             if stopped:
                 if stopped["state"] == "FAILED":
                     fail_pipeline(cycle, f"run {run}", update_id)
+                run += 1
                 continue
-        # The run after a stopped full refresh has the keyless tables' snapshots to finish.
-        run_for(
-            cycle,
-            f"run {run}",
-            update_id,
-            RUN_SECONDS,
-            until_drained=full_refresh or bool(stopped),
-        )
-        if stopped:
+        run_for(cycle, f"run {run}", update_id, UPDATE_CAP_SECONDS)
+        if stopped and run == 2:
             RESUME_RESULTS[cycle] = resume_check(cycle, stopped, update_id)
-    before = latest_update()
-    event(
-        cycle, "starting", "run 3: starting continuous update (switching to continuous starts it)"
-    )
-    set_continuous(cycle, True)
-    update_id = None
-    for _ in range(12):
-        candidate = latest_update()
-        if candidate and candidate != before:
-            update_id = candidate
-            break
-        time.sleep(5)
-    update_id = update_id or start_update(cycle, "run 3")
-    event(cycle, "started", f"run 3: started continuous update {update_id}")
-    run_for(cycle, "run 3", update_id, RUN_SECONDS)
-    for run in range(4, 3 + CONTINUOUS_RUNS):
-        event(cycle, "starting", f"run {run}: starting continuous update")
-        update_id = start_update(cycle, f"run {run}")
-        event(cycle, "started", f"run {run}: started continuous update {update_id}")
-        run_for(cycle, f"run {run}", update_id, RUN_SECONDS)
-    if FINAL_SECONDS:
-        run = 3 + CONTINUOUS_RUNS
-        minutes = FINAL_SECONDS // 60
-        event(cycle, "starting", f"run {run}: starting continuous update ({minutes} min)")
-        update_id = start_update(cycle, f"run {run}")
-        event(cycle, "started", f"run {run}: started continuous update {update_id}")
-        run_for(cycle, f"run {run}", update_id, FINAL_SECONDS)
+        run += 1
 
 
 def extra_run(cycle):
-    # One more continuous run. An update that fails fails the run, as in any other.
-    event(cycle, "starting", "extra run: starting continuous update")
+    # One more triggered update, to its end. An update that fails fails the run.
+    event(cycle, "starting", "extra run: starting triggered update")
     update_id = start_update(cycle, "extra run")
-    event(cycle, "started", f"extra run: started continuous update {update_id}")
-    run_for(cycle, "extra run", update_id, EXTRA_SECONDS, False)
+    event(cycle, "started", f"extra run: started triggered update {update_id}")
+    run_for(cycle, "extra run", update_id, UPDATE_CAP_SECONDS)
 
 
 def count_compare(cycle):
@@ -684,14 +653,14 @@ summary = []
 for cycle in range(1, CYCLES + 1):
     event(cycle, "cycle", f"cycle {cycle} of {CYCLES} starting")
     stop_and_wait()
-    restart_container(cycle)
-    pipeline_runs(cycle)
+    workload_started = restart_container(cycle)
+    pipeline_runs(cycle, workload_started)
     stop_and_wait()
     event(cycle, "counts", "comparing counts")
     first, counts_ok, _ = count_compare(cycle)
     final, extra = first, False
     if not counts_ok:
-        event(cycle, "counts", f"counts differ: {first}; one more continuous run")
+        event(cycle, "counts", f"counts differ: {first}; one more triggered run")
         extra = True
         extra_run(cycle)
         stop_and_wait()
@@ -709,7 +678,7 @@ for cycle in range(1, CYCLES + 1):
         verdict = "MATCH"
     message = (
         f"CYCLE {cycle} {verdict} | first count: {first}"
-        + (" | extra continuous run, then" if extra else "")
+        + (" | extra triggered run, then" if extra else "")
         + f" | count compare: {final} | {line}"
         + (f" | resume: {resume}" if resume else "")
     )
