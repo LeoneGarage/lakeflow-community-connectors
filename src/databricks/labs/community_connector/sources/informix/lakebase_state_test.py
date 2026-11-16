@@ -497,7 +497,11 @@ class _FakeCursor:
                 current, proposed = int(existing["start_lsn"]), int(candidate["start_lsn"])
                 if minimum_lsn and current <= proposed:
                     return
-                if maximum_lsn and current >= proposed:
+                another_update = (
+                    "snapshot_scope" in candidate
+                    and existing.get("snapshot_scope") != candidate["snapshot_scope"]
+                )
+                if maximum_lsn and current >= proposed and not another_update:
                     return
             self._database.records[key] = args["record"]
             self._database.record_types.setdefault(key, args.get("record_type", "generic"))
@@ -1197,6 +1201,33 @@ class LakebaseStateRecordTests(unittest.TestCase):
                 record_type="delete-floor",
             )
             self.assertEqual(winner["start_lsn"], expected, lsn)
+
+    def test_a_later_update_replaces_the_floor_whatever_its_lsn(self):
+        # A full refresh after the source reinitialized its log, or from an older extract,
+        # snapshots at a lower boundary: kept at the earlier, higher floor, a delete flow
+        # bootstrapping later started past deletes it had to apply. Within one update the
+        # publishers still converge on the highest.
+        publish = lakebase_state.publish_maximum_lsn_state_record
+        for scope, lsn, expected in (
+            ("update-1", 120, "120"),
+            ("update-2", 100, "100"),
+            ("update-2", 90, "100"),
+            ("update-2", 110, "110"),
+        ):
+            winner = publish(
+                self.connection,
+                "ns",
+                "floor",
+                {**self._floor_record(lsn), "snapshot_scope": scope},
+                record_type="delete-floor",
+            )
+            self.assertEqual(
+                (winner["start_lsn"], winner["snapshot_scope"]),
+                (expected, "update-2" if expected != "120" else "update-1"),
+            )
+        self.assertIn(
+            "EXCLUDED.record ? 'snapshot_scope'", lakebase_state._PUBLISH_MAXIMUM_LSN_RECORD
+        )
 
     def test_maximum_lsn_record_compares_numerically(self):
         # LSNs are stored as strings; "1000" must beat "999" (lexicographically it would not).
@@ -2336,6 +2367,45 @@ class LakebaseProjectCreationTests(unittest.TestCase):
         api.await_operation.assert_has_calls(
             [mock.call({"name": "operations/purge"}), mock.call({"done": True})]
         )
+
+    def test_a_failed_creation_is_not_taken_for_a_concurrent_one(self):
+        # The creation's operation failed while the project it left is visible: its error,
+        # not the endpoint wait's timeout, is what the caller gets.
+        api = mock.MagicMock()
+        api.request.side_effect = [None, {"name": "operations/create"}, {"name": "projects/p"}]
+        api.await_operation.side_effect = lakebase_state.LakebaseStateError(
+            "operation failed: quota exceeded"
+        )
+
+        with (
+            mock.patch.object(lakebase_state, "_endpoint_facts") as facts,
+            self.assertRaisesRegex(lakebase_state.LakebaseStateError, "quota exceeded"),
+        ):
+            lakebase_state.ensure_project(api, "proj")
+        facts.assert_not_called()
+
+    def test_a_creation_conflict_goes_on_with_the_project_another_worker_created(self):
+        api = mock.MagicMock()
+        api.request.side_effect = [
+            None,
+            lakebase_state.LakebaseStateError("ALREADY_EXISTS"),
+            {"name": "projects/proj"},
+        ]
+
+        with mock.patch.object(
+            lakebase_state, "_endpoint_facts", return_value={"host": "host"}
+        ) as facts:
+            self.assertEqual(lakebase_state.ensure_project(api, "proj"), {"host": "host"})
+        facts.assert_called_once()
+        api.await_operation.assert_not_called()
+        # A deleted project's tombstone is no such project.
+        api.request.side_effect = [
+            None,
+            lakebase_state.LakebaseStateError("ALREADY_EXISTS"),
+            {"name": "projects/proj", "delete_time": "2026-08-10T06:51:32Z"},
+        ]
+        with self.assertRaisesRegex(lakebase_state.LakebaseStateError, "ALREADY_EXISTS"):
+            lakebase_state.ensure_project(api, "proj")
 
     def test_deleted_project_must_disappear_after_purge(self):
         api = mock.MagicMock()

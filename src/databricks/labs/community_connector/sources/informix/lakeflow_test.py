@@ -2529,6 +2529,10 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertNotEqual(text([Decimal("7.5")]), text([7]))
         long = Decimal("1234567890123456789012345678901.5")
         self.assertEqual(json.loads(text([long])), ["1234567890123456789012345678901.5"])
+        # The 7 an INTEGER key widened to FLOAT decodes as 7.0; a fraction keeps its form.
+        self.assertEqual(text([7.0]), text([7]))
+        self.assertEqual(text([7.5]), "[7.5]")
+        self.assertEqual(text([float("nan")]), "[NaN]")
 
     def test_the_stream_passes_on_the_half_of_an_index_update_the_scan_lacks(self):
         # Two pages: ids up to 5, read between 100 and 110, and the rest, read between 200
@@ -3929,6 +3933,40 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(list(deletes), [])
         self.assertEqual(seeded["phase"], "stream")
         self.assertEqual(seeded["commit_lsn"], offset["commit_lsn"])
+
+    def test_an_index_scan_retries_a_read_whose_connection_dropped_in_place(self):
+        # A connection reset during the scan's page read or change poll: the transport is
+        # reset and the same read issued again, as for the other snapshot reads, rather
+        # than failing the drain and following the log from the snapshot LSN once more.
+        bridge = _KeylessIndexBridge()
+        bridge.rows = [{"id": number, "value": "v"} for number in range(1, 6)]
+        options = {"snapshot.mode": "initial", "keyless.snapshot.page.size": "2"}
+        bridge.reset_calls = 0
+        bridge.reset_transport = lambda: setattr(bridge, "reset_calls", bridge.reset_calls + 1)
+        dropped = []
+
+        def dropping(read):
+            def call(*args, **kwargs):
+                if read.__name__ not in dropped:
+                    dropped.append(read.__name__)
+                    raise informix_module.SqliProtocolError("truncated SQLI stream")
+                return read(*args, **kwargs)
+
+            return call
+
+        bridge.snapshot_chunk = dropping(bridge.snapshot_chunk)
+        bridge.read_changes = dropping(bridge.read_changes)
+        connector = self.connector(bridge)
+
+        with (
+            mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0),
+            mock.patch.object(informix_module, "_SNAPSHOT_RECONNECT_BASE_SECONDS", 0),
+        ):
+            ids, _ = self._snapshot_ids(connector, options)
+
+        self.assertEqual(ids, [1, 2, 3, 4, 5])
+        self.assertEqual(sorted(dropped), ["read_changes", "snapshot_chunk"])
+        self.assertEqual(bridge.reset_calls, 2)
 
     def test_an_index_scan_that_had_read_its_last_page_only_settles_when_taken_up(self):
         # The scan failed while reading the table's changes at its end, with every page
@@ -6942,6 +6980,44 @@ class LakeflowContractTests(unittest.TestCase):
         # Raised to the 60s CDC default for the control-plane calls, then restored.
         self.assertEqual(transport.timeouts, [60.0, 30.0])
 
+    def test_initial_lsn_validation_restores_the_socket_timeout_when_no_session_opens(self):
+        # A sysenv read that times out (the startup storm's stall) or a cdc_opensess that
+        # fails leaves no session to tear down; the raised timeout is still put back.
+        for failing, error in (("sysenv", TimeoutError), ("cdc_opensess", InformixError)):
+            with self.subTest(failing=failing):
+
+                class TimedTransport:
+                    def __init__(self):
+                        self.socket_timeout = 30.0
+                        self.timeouts = []
+
+                    def set_socket_timeout(self, timeout):
+                        self.socket_timeout = timeout
+                        self.timeouts.append(timeout)
+
+                    def execute(self, sql, parameters=(), failing=failing):
+                        if failing in sql and failing == "sysenv":
+                            raise TimeoutError("The read operation timed out")
+                        if "sysenv" in sql:
+                            return [{"env_value": "demo_server"}]
+                        if "cdc_opensess" in sql:
+                            return [{"session_id": -1}]
+                        return [{"status": 0}]
+
+                transport = TimedTransport()
+                bridge = object.__new__(PurePythonInformixBridge)
+                bridge.transport = transport
+                bridge.options = {}
+                bridge._ensure_connected = lambda: None
+
+                with self.assertRaises(error):
+                    bridge._validate_initial_lsn_once(
+                        {"identity": "demo:app.orders", "columns": ["id"]}, 80
+                    )
+
+                self.assertEqual(transport.timeouts, [60.0, 30.0])
+                self.assertEqual(transport.socket_timeout, 30.0)
+
     def test_initial_lsn_validation_honors_cdc_read_timeout_option(self):
         class TimedTransport:
             def __init__(self):
@@ -8744,6 +8820,28 @@ class LakeflowContractTests(unittest.TestCase):
         # Must not leak past the read.
         self.assertNotIn("_informix.connection.attempt.budget.seconds", connector.options)
 
+    def test_a_batch_read_raises_on_a_capacity_or_volume_failure_instead_of_reading_nothing(self):
+        # A batch read (no offset) has no checkpoint to try again from. Its empty batch,
+        # read by apply_changes_from_snapshot for a snapshot-only table, deleted every
+        # row of the target.
+        for error in (
+            ConnectionCapacityUnavailable("capacity exhausted"),
+            informix_module.SharedStateAccessUnavailable("staging unavailable"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                bridge = FakeBridge()
+                bridge.get_table = mock.Mock(side_effect=error)
+                connector = self.connector(bridge)
+                with (
+                    mock.patch.object(informix_module.time, "sleep"),
+                    self.assertRaises(type(error)),
+                ):
+                    connector.read_table("app.orders", None, {})
+                # A stream still yields and tries again from its checkpoint.
+                with mock.patch.object(informix_module.time, "sleep"):
+                    rows, offset = connector.read_table("app.orders", _stream_offset(), {})
+                self.assertEqual(list(rows), [])
+
     def test_zero_capacity_retry_delay_blocks_fully_but_still_yields_for_continuous(self):
         # A continuous flow with delay=0 opts into the full connection.wait.timeout
         # acquisition wait (budget None = block fully), giving each read the
@@ -9886,6 +9984,47 @@ class LakeflowContractTests(unittest.TestCase):
             {row[informix_module.COMMIT_LSN] for row in replayed},
             {informix_module._sortable_lsn(int(end["snapshot_lsn"]))},
         )
+
+    def test_a_simple_reader_replay_of_a_one_page_or_empty_snapshot_serves_its_stage(self):
+        # A staged snapshot of one page or none ends its first batch in the stream phase.
+        # Replayed in a later update by the simple reader, it serves the stage Spark's end
+        # names, not a newer snapshot: the rows inserted since come from CDC alone.
+        for pipeline, seeded in (
+            ("11111111-1111-1111-1111-111111111111", []),
+            ("44444444-4444-4444-4444-444444444444", [1, 2, 3]),
+        ):
+            with self.subTest(rows=len(seeded)):
+                bridge = FakeBridge()
+                bridge.rows = [{"id": i, "value": f"v{i}"} for i in seeded]
+
+                def connector(update, bridge=bridge, pipeline=pipeline):
+                    reader = self.connector(bridge)
+                    reader.set_registration_scope(f"{pipeline}_@_{update}")
+                    return reader
+
+                first = connector("22222222-2222-2222-2222-222222222222")
+                _, end = first.read_table("app.orders", {}, {})
+                self.assertEqual(end["phase"], "stream")
+                bridge.rows.append({"id": 9, "value": "late"})
+                bridge.now = 110
+                snapshots = len(bridge.snapshot_calls)
+                restarted = connector("33333333-3333-3333-3333-333333333333")
+
+                class TriggerBase:
+                    pass
+
+                class LakeflowStreamReader(_informix_available_now_base(TriggerBase)):
+                    def __init__(inner):  # pylint: disable=no-self-argument
+                        inner.lakeflow_connect = restarted
+                        inner.options = {"tableName": "app.orders"}
+
+                    def read(inner, start):  # pylint: disable=no-self-argument
+                        return restarted.read_table("app.orders", start, dict(inner.options))
+
+                replayed = list(LakeflowStreamReader().readBetweenOffsets({}, end))
+
+                self.assertEqual([row["id"] for row in replayed], seeded)
+                self.assertEqual(len(bridge.snapshot_calls), snapshots)
 
     def test_a_simple_reader_replay_of_a_multi_page_batch_serves_every_page(self):
         # stream.partitioned switched off while a batch of several staged pages is
@@ -24063,6 +24202,31 @@ class NullableIndexPromotionTests(unittest.TestCase):
         self.assertEqual(refreshed.primary_keys, ("code",))
         self.assertTrue(refreshed.key_from_nullable_index)
 
+    def test_refresh_keeps_an_override_over_a_promoted_key_from_the_table(self):
+        # primary.keys applied over a promoted nullable index: the key is not the option's
+        # alone, so the snapshot pages by it. The catalog's re-read has no key, and the
+        # refresh kept the classification rather than reading the table as keyless.
+        connector = object.__new__(InformixLakeflowConnect)
+        connector._tables = None
+        connector._override_direction_cache = {}
+        connector._bridge_instance = self._catalog_bridge()
+        table = informix_module.Table.parse(
+            self._catalog_bridge()._describe_table("app", "orders"), "demo"
+        )
+        keyed = connector._apply_key_options(
+            table, {"allow.nullable.index": "true", "primary.keys": "id"}
+        )
+        self.assertFalse(keyed.key_only_from_option)
+
+        refreshed = connector._refresh_table_schema(keyed, None)
+
+        self.assertEqual(refreshed.primary_keys, ("id",))
+        self.assertFalse(refreshed.key_only_from_option)
+        self.assertEqual(
+            informix_module._schema_fingerprint(refreshed),
+            informix_module._schema_fingerprint(keyed),
+        )
+
 
 class MixedDirectionKeyTests(unittest.TestCase):
     """A key index with a DESC column is paged in the index's own order so a forward
@@ -24364,6 +24528,29 @@ class AsyncStagePipelineTests(unittest.TestCase):
         pipeline = informix_module._AsyncStagePipeline(boom)
         pipeline.submit(10, 0, [{"id": 0}])
         pipeline.shutdown()  # must join without raising, so a primary error can win
+
+    def test_shutdown_uploads_no_page_still_queued(self):
+        # The fetch failed with page 0 uploading and page 1 queued: page 1 is not uploaded
+        # while the caller waits, holding the snapshot's transaction and slot.
+        import threading as _threading
+
+        release, started, seen = _threading.Event(), _threading.Event(), []
+
+        def slow(_lsn, index, _rows):
+            if index == 0:
+                started.set()
+                release.wait(2.0)
+            seen.append(index)
+
+        pipeline = informix_module._AsyncStagePipeline(slow, queue_size=1)
+        pipeline.submit(10, 0, [{"id": 0}])
+        self.assertTrue(started.wait(2.0))
+        pipeline.submit(10, 1, [{"id": 1}])
+        _threading.Timer(0.2, release.set).start()
+
+        pipeline.shutdown()
+
+        self.assertEqual(seen, [0])
 
     def test_close_without_any_submit_is_a_noop(self):
         pipeline = informix_module._AsyncStagePipeline(lambda *_a: None)
@@ -27139,6 +27326,31 @@ class SchemaEvolutionTests(_TableOptionTestCase):
         rows, resumed = self.connector(bridge).read_table("app.orders", checkpoint, options)
         list(rows)
 
+        self.assertNotEqual(resumed["schema_id"], checkpoint["schema_id"])
+
+    def test_a_key_widened_to_float_during_an_incremental_copy_needs_a_full_refresh(self):
+        # A float key can't page the copy, so the change is refused before its schema step is
+        # recorded rather than failing every batch after it. Once the copy has finished, the
+        # stream carries on (an integer to FLOAT is a widening).
+        options = {"snapshot.mode": "incremental", "snapshot.page.size": "1"}
+        bridge = FakeBridge()
+        connector = self.connector(bridge)
+        _, checkpoint = connector.read_table("app.orders", {}, options)
+        self.assertIn("incremental", checkpoint, "the copy must still be in progress")
+        bridge.tables[0]["columns"][0]["type_name"] = "FLOAT"
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+
+        with self.assertRaisesRegex(
+            InformixError, "Key column id of .* became FLOAT .* run a full refresh"
+        ):
+            rows, _ = self.connector(bridge).read_table("app.orders", checkpoint, options)
+            list(rows)
+
+        copied = {**checkpoint}
+        copied.pop("incremental")
+        rows, resumed = self.connector(bridge).read_table("app.orders", copied, options)
+        list(rows)
         self.assertNotEqual(resumed["schema_id"], checkpoint["schema_id"])
 
     def test_a_widened_column_transitions_a_running_stream(self):

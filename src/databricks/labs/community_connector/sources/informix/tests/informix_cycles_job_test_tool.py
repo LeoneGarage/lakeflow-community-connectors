@@ -363,11 +363,13 @@ def _scan_progress():
     # (None, 0). The connector keeps, on the staging Volume, snapshot-scan/<pipeline>.json
     # naming the update whose scan it is, and one file per page read beside it.
     if not _SCAN_POINTER:
-        _SCAN_POINTER.extend(
-            path
-            for path in glob.glob(f"{STAGING}/*/*/snapshot-scan/{PIPELINE_ID}.json")
-            if RESUME_TABLE in pathlib.Path(path).read_text()
-        )
+        for path in glob.glob(f"{STAGING}/*/*/snapshot-scan/{PIPELINE_ID}.json"):
+            try:
+                if RESUME_TABLE in pathlib.Path(path).read_text():
+                    _SCAN_POINTER.append(path)
+            except OSError:
+                # Another table's scan ended between the listing and the read.
+                continue
     for path in _SCAN_POINTER[:1]:
         try:
             pointer = json.loads(pathlib.Path(path).read_text())

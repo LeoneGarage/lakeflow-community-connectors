@@ -466,5 +466,6 @@
 "Informix schema change for '{}' widened column {}, whose transform lands it as {} and would now land it as {}, which Delta can't widen in place; run a full refresh",
 "Informix table '{}' no longer has column(s) {}, which its index-ordered snapshot paged by, while the stream has yet to pass the snapshot's end; run a full refresh",
 "Transform of column {} gives {}, which has more integer digits than a DECIMAL(38), Spark's largest, holds",
-"Informix offset has an invalid staged_scope; run a full refresh with this connector version"
+"Informix offset has an invalid staged_scope; run a full refresh with this connector version",
+"Key column {} of '{}' became {} while the table's incremental snapshot was copying, and a float key cannot page the copy; run a full refresh"
 ]

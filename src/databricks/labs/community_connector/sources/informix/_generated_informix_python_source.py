@@ -1782,6 +1782,22 @@ def register_lakeflow_source(spark):
                     body,
                     **deadline_kwargs,
                 )
+            except LakebaseStateError:
+                # A concurrent worker may have created it between our GET and POST.
+                # Re-reading is the check that matters; only a still-absent project
+                # (or a deleted one's tombstone) is a real failure.
+                found = api.request(
+                    "GET",
+                    f"/api/2.0/postgres/projects/{project_id}",
+                    tolerate_missing=True,
+                    **deadline_kwargs,
+                )
+                if found is None or found.get("delete_time"):
+                    raise
+            else:
+                # The creation this worker started failing is its own error, not another
+                # worker's creation: a failed project can still be visible, and taking it for
+                # one left the endpoint wait to time out in place of the error.
                 if deadline is None:
                     api.await_operation(created)
                 else:
@@ -1793,20 +1809,6 @@ def register_lakeflow_source(spark):
                     max_cu,
                     suspend_seconds,
                 )
-            except LakebaseStateError:
-                # A concurrent worker may have created it between our GET and POST.
-                # Re-reading is the check that matters; only a still-absent project
-                # is a real failure.
-                if (
-                    api.request(
-                        "GET",
-                        f"/api/2.0/postgres/projects/{project_id}",
-                        tolerate_missing=True,
-                        **deadline_kwargs,
-                    )
-                    is None
-                ):
-                    raise
         return _endpoint_facts(api, project_id, deadline=deadline)
 
 
@@ -3627,11 +3629,15 @@ def register_lakeflow_source(spark):
     """
 
 
-    # Scope-independent counterpart of the minimum publisher: converge one key on the
-    # *highest* start_lsn, and match on table alone (no scope) because the record is
-    # shared across every update scope for the table. Used for the delete-bootstrap
-    # snapshot floor, which must move forward only when a resnapshot repopulates the
-    # destination as-of a later boundary.
+    # Counterpart of the minimum publisher, for a record shared across every update scope
+    # for the table: the delete-bootstrap snapshot floor. Publishers of one update converge on
+    # the *highest* start_lsn; a record from another update replaces it whatever its
+    # start_lsn. That update took a snapshot of its own, the one the destination now holds,
+    # and its boundary can be lower: a full refresh after the source reinitialized its logical
+    # log, or from an extract whose boundary predates the last snapshot. Kept at the higher,
+    # older floor, a delete flow bootstrapping later started past deletes it had to apply. A
+    # record without a snapshot_scope keeps the highest only. Not "scope": records carrying
+    # that are a finished update's, and its cleanup deletes them.
     _PUBLISH_MAXIMUM_LSN_RECORD = """
     INSERT INTO state_records (namespace, record_key, record, record_type)
     VALUES (%(namespace)s, %(record_key)s, %(record)s::jsonb, %(record_type)s)
@@ -3640,8 +3646,11 @@ def register_lakeflow_source(spark):
     WHERE state_records.record_type = EXCLUDED.record_type
       AND state_records.record->>'format_version' = EXCLUDED.record->>'format_version'
       AND state_records.record->>'table' = EXCLUDED.record->>'table'
-      AND (state_records.record->>'start_lsn')::numeric
-          < (EXCLUDED.record->>'start_lsn')::numeric
+      AND ((state_records.record->>'start_lsn')::numeric
+             < (EXCLUDED.record->>'start_lsn')::numeric
+           OR (EXCLUDED.record ? 'snapshot_scope'
+               AND state_records.record->>'snapshot_scope'
+                   IS DISTINCT FROM EXCLUDED.record->>'snapshot_scope'))
     RETURNING record
     """
 
@@ -7372,7 +7381,7 @@ def register_lakeflow_source(spark):
         )
 
 
-    def _replay_between_offsets(start, end, read, options, connector_options):
+    def _replay_between_offsets(start, end, read, options, connector_options, staged_start=None):
         # Docstring: Replay ``[start, end)`` by reading to ``end`` and stopping there.
         #
         # Shared by the simple reader's ``readBetweenOffsets`` and the partitioned reader's
@@ -7393,6 +7402,8 @@ def register_lakeflow_source(spark):
         # bounds are injected into ``options`` (the dict that read consults, restored on
         # exit) because read_table has no ``end`` parameter and thirty connectors
         # implement it. ``connector_options`` supplies the connection-wait default.
+        # ``staged_start(end)``, the simple reader's, gives the start that serves an initial
+        # range from the snapshot its first batch staged, or None (_staged_first_batch_start).
 
         positional_keys = {
             "commit_lsn",
@@ -7448,6 +7459,10 @@ def register_lakeflow_source(spark):
                 # pages after it come from one snapshot.
                 position = {k: v for k, v in end["snapshot"].items() if k != "record_index"}
                 replay_start = {**end, "snapshot": {**position, "page_index": 0, "last_pk": []}}
+            elif initial_range and staged_start is not None and end.get("phase") == "stream":
+                # One whose snapshot staged a page or none ended in the stream phase: the
+                # connector recognises it by the snapshot's manifest.
+                replay_start = staged_start(end) or replay_start
             record_parts = []
             configured_wait = float(
                 options.get(
@@ -7776,12 +7791,20 @@ def register_lakeflow_source(spark):
                     # travels through the reader's options, which the framework copies into
                     # table_options on every read.
 
+                    staged = getattr(reader.lakeflow_connect, "_staged_first_batch_start", None)
+                    staged_start = None
+                    if callable(staged) and reader.options.get(_IS_DELETE_FLOW_OPTION) != "true":
+
+                        def staged_start(end_offset):
+                            return staged(reader.options.get("tableName"), end_offset, reader.options)
+
                     return _replay_between_offsets(
                         start,
                         end,
                         reader.read,
                         reader.options,
                         getattr(reader.lakeflow_connect, "options", {}),
+                        staged_start,
                     )
 
                 cls.prepareForTriggerAvailableNow = prepare_for_trigger
@@ -9713,18 +9736,25 @@ def register_lakeflow_source(spark):
             if set_socket_timeout is not None:
                 set_socket_timeout(max(float(previous_socket_timeout or 30), cdc_timeout))
 
-            server_row = self.transport.execute(
-                "SELECT env_value FROM sysmaster:sysenv WHERE env_name='INFORMIXSERVER'"
-            )[0]
-            server = str(_field(server_row, "env_value", 0))
-            session_row = self.transport.execute(
-                f"EXECUTE FUNCTION {cdc_routine('cdc_opensess')}(?, 0, 1, 1, 1, 1)",
-                (server,),
-            )[0]
-            session = int(_field(session_row, "session_id", 0))
-            if session < 0:
-                # 40: cdc_opensess failed with Informix error {}
-                raise InformixError(_m(40, session))
+            try:
+                server_row = self.transport.execute(
+                    "SELECT env_value FROM sysmaster:sysenv WHERE env_name='INFORMIXSERVER'"
+                )[0]
+                server = str(_field(server_row, "env_value", 0))
+                session_row = self.transport.execute(
+                    f"EXECUTE FUNCTION {cdc_routine('cdc_opensess')}(?, 0, 1, 1, 1, 1)",
+                    (server,),
+                )[0]
+                session = int(_field(session_row, "session_id", 0))
+                if session < 0:
+                    # 40: cdc_opensess failed with Informix error {}
+                    raise InformixError(_m(40, session))
+            except BaseException:
+                # No session to tear down, but the timeout is put back, as below: the client
+                # keeps it for every later connection.
+                if set_socket_timeout is not None and previous_socket_timeout is not None:
+                    set_socket_timeout(float(previous_socket_timeout))
+                raise
             native = capture["identity"]
             started = False
             primary_error: BaseException | None = None
@@ -10973,14 +11003,50 @@ def register_lakeflow_source(spark):
         return _index_scan_key_text([row[name] for name in names])
 
 
+    class _ScanReads:
+        # Docstring: The bridge as an index-ordered scan reads it: each read retried in place
+        # on a dropped connection (_snapshot_read_with_reconnect), as the other snapshot reads
+        # and the CDC polls are. A read advances nothing until it returns: the scan samples
+        # the log around its reads, and sorts a poll's changes after it.
+
+        _READS = frozenset(
+            {
+                "boundary_lsn",
+                "current_lsn",
+                "key_rows",
+                "read_changes",
+                "rows_by_values",
+                "snapshot_chunk",
+            }
+        )
+
+        def __init__(self, connector: Any, table: Table) -> None:
+            self._connector, self._table = connector, table
+
+        def __getattr__(self, name: str) -> Any:
+            attribute = getattr(self._connector._bridge, name)
+            if name not in self._READS:
+                return attribute
+
+            def read(*args: Any, **kwargs: Any) -> Any:
+                return self._connector._snapshot_read_with_reconnect(
+                    lambda: attribute(*args, **kwargs), table=self._table, operation=f"scan {name}"
+                )
+
+            return read
+
+
     def _index_scan_key_text(values: Sequence[Any]) -> str:
         # Docstring: Key values as the scan's moved-row index names them.
         #
         # A number by its value, as Informix compares it: as text, the 7 a scan recorded and
         # the 7.00 of the same row after its key column was widened to DECIMAL(12,2) were two
-        # keys, and the stream missed the row's entry. An integer keeps its form.
+        # keys, and the stream missed the row's entry. An integer keeps its form, and so does
+        # one an INTEGER key widened to FLOAT decodes as (7.0).
 
         def value(item: Any) -> Any:
+            if isinstance(item, float) and math.isfinite(item) and item.is_integer():
+                return int(item)
             if isinstance(item, Decimal) and item.is_finite():
                 if item == item.to_integral_value():
                     return int(item)
@@ -15459,12 +15525,14 @@ def register_lakeflow_source(spark):
         # only on the worker thread, and ``close`` joins that thread before the caller
         # reads them. A stage error is captured and re-raised at the next ``submit`` (so
         # the fetch loop stops early) and again at ``close``; ``shutdown`` joins without
-        # raising, for the path where a primary error is already propagating.
+        # raising, for the path where a primary error is already propagating, and stages
+        # none of the pages still queued: the failed drain's pages are never served.
 
         def __init__(self, stage: Callable[[int, int, list], None], *, queue_size: int = 1) -> None:
             self._stage = stage
             self._queue: queue.Queue = queue.Queue(maxsize=max(1, queue_size))
             self._error: BaseException | None = None
+            self._aborted = False
             self._started = False
             self._thread = threading.Thread(
                 target=self._run, name="informix-snapshot-uploader", daemon=True
@@ -15483,7 +15551,7 @@ def register_lakeflow_source(spark):
                 item = self._queue.get()
                 if item is None:
                     return
-                if self._error is not None:
+                if self._error is not None or self._aborted:
                     # Drain the backlog without processing once a page has failed; the
                     # error is surfaced to the caller through submit/close.
                     continue
@@ -15503,7 +15571,11 @@ def register_lakeflow_source(spark):
 
         def shutdown(self) -> None:
             # Docstring: Join the worker without raising -- for use while another error propagates.
+            #
+            # A page queued then is not uploaded: the caller still holds the snapshot's
+            # transaction and its connection slot while the worker runs.
 
+            self._aborted = True
             if self._started:
                 self._queue.put(None)
                 self._thread.join()
@@ -16346,8 +16418,11 @@ def register_lakeflow_source(spark):
             # Docstring: ``read_table`` under source column names; rename_columns is applied
             # only where rows leave the connector.
 
-            # The interface passes None on the first call of the first run, and a batch
-            # read always does.
+            # A batch read passes None, a stream its offset ({} at first). A batch has no
+            # checkpoint to try again from: the empty batch a stream yields on a capacity or
+            # Volume failure, read by apply_changes_from_snapshot (a snapshot-only table),
+            # deleted every row of the target, so a batch read raises instead.
+            batch = start_offset is None
             start_offset = start_offset or {}
             effective_start = self._effective_start_offset(start_offset)
             snapshot_mode = self._snapshot_mode(table_options)
@@ -16360,7 +16435,12 @@ def register_lakeflow_source(spark):
                 start_offset, replaying=replaying, replay_wait_budget=replay_wait_budget
             ):
                 return self._read_table_attempt(
-                    table_name, start_offset, effective_start, table_options, snapshot_mode
+                    table_name,
+                    start_offset,
+                    effective_start,
+                    table_options,
+                    snapshot_mode,
+                    batch=batch,
                 )
 
         def _read_table_attempt(
@@ -16371,6 +16451,8 @@ def register_lakeflow_source(spark):
             table_options: dict[str, str],
             snapshot_mode: str,
             attempt_index: int = 0,
+            *,
+            batch: bool = False,
         ) -> tuple[Iterator[dict], dict]:
             # Re-runs this attempt from the top after a transient shared-state failure.
             # Recursion rather than a loop because the failure surfaces from inside the
@@ -16384,6 +16466,7 @@ def register_lakeflow_source(spark):
                     table_options,
                     snapshot_mode,
                     attempt_index + 1,
+                    batch=batch,
                 )
 
             try:
@@ -16547,7 +16630,7 @@ def register_lakeflow_source(spark):
                     return self._reset_retry_counts(result, start_offset)
                 except (SharedStateAccessUnavailable, OSError) as error:
                     return self._volume_failure_result(
-                        error, read_again, table_options, attempt_index, start_offset
+                        error, read_again, table_options, attempt_index, start_offset, batch=batch
                     )
                 except ConnectionCapacityUnavailable:
                     # Continuous flows are permanent, so capacity pressure is the
@@ -16557,8 +16640,9 @@ def register_lakeflow_source(spark):
                     # fails loudly instead of silently replicating nothing. Only a
                     # triggered flow raises here -- it drains and releases its slot,
                     # so an exhausted wait is a genuine end-of-data failure and
-                    # yielding an empty batch would make AvailableNow stop early.
-                    if self._trigger_available_now:
+                    # yielding an empty batch would make AvailableNow stop early. A batch
+                    # read raises too: it has no next call to wait for (see _read_upserts).
+                    if self._trigger_available_now or batch:
                         raise
                     if self._replay_stop_lsn(table_options) is not None:
                         raise
@@ -16789,6 +16873,59 @@ def register_lakeflow_source(spark):
             if (page_count > 1) != (end["phase"] == "snapshot") or page_count < 0:
                 return None
             return (scope, schema_id, lsn, 0, min(1, page_count), page_count)
+
+        def _staged_first_batch_start(
+            self, table_name: str, end_offset: dict, table_options: dict[str, str]
+        ) -> dict | None:
+            # Docstring: The start that replays a one-page or empty staged snapshot's first
+            # batch from its stage, else None.
+            #
+            # The simple reader's counterpart of _bootstrap_page_batch. A first batch that
+            # staged more than one page ends in the snapshot phase, and _replay_between_offsets
+            # serves it from page 0 on its own; one that staged one page or none ends in the
+            # stream phase, like a first batch that staged nothing. Replayed in a later update
+            # from no position, it took another snapshot, newer than the end Spark goes on
+            # from: the changes between the two came once more on top of it, a keyless table's
+            # inserts twice and its deletes of rows the new snapshot lacks. Recognised as
+            # _bootstrap_page_batch does, by the manifest pinned at the end's LSN.
+
+            if not isinstance(end_offset, dict) or end_offset.get("phase") != "stream":
+                return None
+            if "incremental" in end_offset or "staged_scope" in end_offset:
+                return None
+            table_options = _options_set(table_options)
+            if (
+                self._is_delete_flow()
+                or self._table_migration(table_options)
+                or self._table_snapshot_source(table_options)
+            ):
+                return None
+            try:
+                end = _validated_offset(end_offset)
+            except Exception:  # pylint: disable=broad-except
+                return None
+            lsn = int(end["commit_lsn"])
+            if {int(end["begin_lsn"]), int(end["change_lsn"])} != {lsn} or end.get("tx_id") is not None:
+                return None
+            scope, schema_id = str(end["pipeline_scope"]), str(end["schema_id"])
+            with self._metadata_access():
+                table = self._table(table_name, table_options)
+                manifest = self._read_snapshot_stage_manifest(table, scope, schema_id)
+            if manifest is None or int(manifest["snapshot_lsn"]) != lsn:
+                return None
+            if int(manifest["page_count"]) > 1:
+                return None
+            # The offset the first batch's read began the serve from: what the stream end
+            # adds for the scan is the serve's to add again.
+            start = {k: v for k, v in end_offset.items() if k not in ("scan_scope", "scan_schema")}
+            start.update(
+                {
+                    "phase": "snapshot",
+                    "snapshot_lsn": str(lsn),
+                    "snapshot": {"last_pk": [], "page_index": 0},
+                }
+            )
+            return start
 
         def _embedded_read(
             self, table_name: str, start_offset: dict, table_options: dict[str, str]
@@ -17655,6 +17792,8 @@ def register_lakeflow_source(spark):
             options: dict[str, str],
             attempt_index: int,
             start_offset: dict,
+            *,
+            batch: bool = False,
         ) -> tuple[Iterator[dict], dict]:
             # Docstring: Answer a read whose shared-state Volume access failed.
             #
@@ -17673,6 +17812,9 @@ def register_lakeflow_source(spark):
             retried = self._retry_transient_volume_read(read_again, options, attempt_index)
             if retried is not None:
                 return self._retried_result(retried, start_offset)
+            if batch:
+                # No checkpoint to yield to: an empty batch is an empty snapshot.
+                raise error
             if dropped is None:
                 return iter(()), self._shared_state_retry_offset(start_offset)
             # 173: Informix snapshot staging Volume mount is not connected; yielding an empty
@@ -20660,6 +20802,25 @@ def register_lakeflow_source(spark):
                     # 246: Incremental snapshot boundary mismatch for '{}'
                     raise InformixError(_m(246, table.exposed_name))
                 page_index = int(checkpoint["snapshot"].get("page_index", -1))
+                if page_index == 0 and int(manifest["page_count"]) == 0:
+                    # The replay of an empty table's first batch (_staged_first_batch_start):
+                    # it served nothing and went on to the stream, as it does here.
+                    return iter(()), self._naming_scan(
+                        _offset(
+                            high_water,
+                            high_water,
+                            high_water,
+                            None,
+                            "stream",
+                            table,
+                            schema_id,
+                            pipeline_scope,
+                        ),
+                        table,
+                        stage_scope,
+                        schema_id,
+                        manifest,
+                    )
                 return self._staged_snapshot_result(
                     table,
                     pipeline_scope,
@@ -21370,7 +21531,7 @@ def register_lakeflow_source(spark):
             # staged for it, read back, show which of those changes the scan saw. Those are
             # dropped by their own log positions. ``scan`` goes into the snapshot's manifest.
 
-            bridge = self._bridge
+            bridge = _ScanReads(self, table)
             timeout = self._table_int_option(options, "cdc.timeout", 5, minimum=1)
             keys, descending = index
             # A table keyed by primary.keys alone and merged by it needs the index for paging
@@ -24302,6 +24463,7 @@ def register_lakeflow_source(spark):
                     # offset, laid out by the old key, so a wildcard key may only grow once
                     # the copy has finished and dropped that block.
                     allow_key_extension=not isinstance(checkpoint.get("incremental"), dict),
+                    copying=isinstance(checkpoint.get("incremental"), dict),
                     # Every offset records the update that wrote it, so a checkpoint from an
                     # earlier update marks this update's first read: the destination's merge
                     # key was read at its start and already reflects a dropped column.
@@ -24908,7 +25070,9 @@ def register_lakeflow_source(spark):
             owner: bool,
             allow_key_extension: bool = False,
             new_update: bool = False,
+            copying: bool = False,
         ) -> tuple[Table, Table, int, str]:
+            # copying: an incremental copy is still in progress (see _refuse_float_key_mid_copy).
             # A wildcard key may grow by the appended columns, and on the first read of a new
             # update shrink by the dropped ones (see _PRIMARY_KEYS_WILDCARD).
             extend_key = allow_key_extension and table.key_wildcard
@@ -24956,6 +25120,8 @@ def register_lakeflow_source(spark):
                         raise
                 if transition_record is None and owner:
                     try:
+                        if copying:
+                            _refuse_float_key_mid_copy(previous_table, table)
                         if set(table.primary_keys) - set(previous_table.primary_keys):
                             # The key grew: only safe when existing rows really hold NULL in
                             # the new columns at the source, as they will in the target. A
@@ -25018,6 +25184,9 @@ def register_lakeflow_source(spark):
                         shrink_wildcard_key=shrink_key,
                         wildcard_except=table.key_wildcard_except,
                     )
+                    if copying:
+                        # A step recorded before the copy's reader checked it, or by another.
+                        _refuse_float_key_mid_copy(previous_table, target_table)
                     self._ensure_recorded_path_to_live(
                         table,
                         target_table,
@@ -25419,11 +25588,12 @@ def register_lakeflow_source(spark):
             # restarts while staying isolated per pipeline. The schema generation the snapshot
             # was taken under rides inside the record rather than in the key, so a bootstrap
             # after a schema change can tell that its floor belongs to a superseded layout
-            # (and say so) instead of simply not finding one. Forward-moving: a resnapshot
-            # repopulates the destination as-of a later ``snapshot_lsn`` and must advance the
-            # floor -- under a new schema generation too -- while ordinary polls leave it
-            # untouched. The delete channel is idempotent, so a floor that lags a resnapshot in
-            # flight only causes a harmless re-read, never a lost or double delete.
+            # (and say so) instead of simply not finding one. Published with each snapshot:
+            # within one update the highest wins, and another update's replaces it whatever its
+            # LSN (see _PUBLISH_MAXIMUM_LSN_RECORD), since the destination now holds that
+            # snapshot, whose boundary can be lower (a log reinitialized, an older extract).
+            # Ordinary polls leave it untouched. The delete channel is idempotent, so a floor
+            # that lags only causes a harmless re-read; one left too high loses deletes.
 
             self._state_op_with_reconnect(
                 lambda: publish_maximum_lsn_state_record(
@@ -25436,6 +25606,8 @@ def register_lakeflow_source(spark):
                         "format_version": _IMMUTABLE_STATE_VERSION,
                         "record_type": "delete-floor",
                         "schema_id": schema_id,
+                        # Not "scope", which would have the update's cleanup delete it.
+                        "snapshot_scope": pipeline_scope,
                         "start_lsn": str(snapshot_lsn),
                         "table": table.native_identity,
                     },
@@ -26450,6 +26622,7 @@ def register_lakeflow_source(spark):
     # snapshot pages them by position instead: partial DATETIME and INTERVAL literals don't
     # all parse back, and a float has no exact decimal literal (nor any rendering at all).
     _FLOAT_KEY_TYPES = frozenset({"FLOAT", "SMALLFLOAT"})
+    _FLOAT_TYPES = _FLOAT_KEY_TYPES | {"DOUBLE", "DOUBLE PRECISION", "REAL"}
     # A BOOLEAN has no order to page by: Informix compares it for equality only, and its
     # literals are 't' and 'f', which a bound value is not rendered as.
     _BOOLEAN_KEY_TYPES = frozenset({"BOOLEAN", "BOOL"})
@@ -28266,7 +28439,10 @@ def register_lakeflow_source(spark):
             key_wildcard=overridden.key_wildcard,
             key_wildcard_except=overridden.key_wildcard_except,
             key_descending=descending,
-            key_only_from_option=not fresh.primary_keys,
+            # As the option was applied: a key a nullable index gave the table before it,
+            # which the catalog's re-read no longer has, still makes the option's key not its
+            # only one.
+            key_only_from_option=overridden.key_only_from_option and not fresh.primary_keys,
         )
 
 
@@ -28386,6 +28562,27 @@ def register_lakeflow_source(spark):
             and previous.type_name in _SHORTENABLE_STRING_TYPES
             and _string_capacity(current) < _string_capacity(previous)
         )
+
+
+    def _refuse_float_key_mid_copy(previous: Table, current: Table) -> None:
+        # Docstring: Fail on a key column widened to a float while an incremental copy is
+        # in progress.
+        #
+        # SMALLINT and INTEGER widen to FLOAT, a key column too, but a float key can't page
+        # the copy (see _incremental_datetime_chunk_exprs), and the copy's next chunk passed
+        # its float cursor to SQL, which takes no float: every batch failed after the schema
+        # step was recorded. Refused before that step, as the other changes a copy can't take.
+
+        before = {column.name: column.type_name for column in previous.columns}
+        for column in current.columns:
+            if (
+                column.name in current.primary_keys
+                and column.type_name in _FLOAT_TYPES
+                and before.get(column.name, column.type_name) not in _FLOAT_TYPES
+            ):
+                # 468: Key column {} of '{}' became {} while the table's incremental snapshot was
+                # copying, and a float key cannot page the copy; run a full refresh
+                raise InformixError(_m(468, column.name, current.exposed_name, column.type_name))
 
 
     def _ensure_compatible_schema_change(

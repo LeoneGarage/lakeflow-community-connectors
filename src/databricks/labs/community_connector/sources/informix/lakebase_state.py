@@ -500,6 +500,22 @@ def ensure_project(
                 body,
                 **deadline_kwargs,
             )
+        except LakebaseStateError:
+            # A concurrent worker may have created it between our GET and POST.
+            # Re-reading is the check that matters; only a still-absent project
+            # (or a deleted one's tombstone) is a real failure.
+            found = api.request(
+                "GET",
+                f"/api/2.0/postgres/projects/{project_id}",
+                tolerate_missing=True,
+                **deadline_kwargs,
+            )
+            if found is None or found.get("delete_time"):
+                raise
+        else:
+            # The creation this worker started failing is its own error, not another
+            # worker's creation: a failed project can still be visible, and taking it for
+            # one left the endpoint wait to time out in place of the error.
             if deadline is None:
                 api.await_operation(created)
             else:
@@ -511,20 +527,6 @@ def ensure_project(
                 max_cu,
                 suspend_seconds,
             )
-        except LakebaseStateError:
-            # A concurrent worker may have created it between our GET and POST.
-            # Re-reading is the check that matters; only a still-absent project
-            # is a real failure.
-            if (
-                api.request(
-                    "GET",
-                    f"/api/2.0/postgres/projects/{project_id}",
-                    tolerate_missing=True,
-                    **deadline_kwargs,
-                )
-                is None
-            ):
-                raise
     return _endpoint_facts(api, project_id, deadline=deadline)
 
 
@@ -2345,11 +2347,15 @@ RETURNING record
 """
 
 
-# Scope-independent counterpart of the minimum publisher: converge one key on the
-# *highest* start_lsn, and match on table alone (no scope) because the record is
-# shared across every update scope for the table. Used for the delete-bootstrap
-# snapshot floor, which must move forward only when a resnapshot repopulates the
-# destination as-of a later boundary.
+# Counterpart of the minimum publisher, for a record shared across every update scope
+# for the table: the delete-bootstrap snapshot floor. Publishers of one update converge on
+# the *highest* start_lsn; a record from another update replaces it whatever its
+# start_lsn. That update took a snapshot of its own, the one the destination now holds,
+# and its boundary can be lower: a full refresh after the source reinitialized its logical
+# log, or from an extract whose boundary predates the last snapshot. Kept at the higher,
+# older floor, a delete flow bootstrapping later started past deletes it had to apply. A
+# record without a snapshot_scope keeps the highest only. Not "scope": records carrying
+# that are a finished update's, and its cleanup deletes them.
 _PUBLISH_MAXIMUM_LSN_RECORD = """
 INSERT INTO state_records (namespace, record_key, record, record_type)
 VALUES (%(namespace)s, %(record_key)s, %(record)s::jsonb, %(record_type)s)
@@ -2358,8 +2364,11 @@ SET record = EXCLUDED.record
 WHERE state_records.record_type = EXCLUDED.record_type
   AND state_records.record->>'format_version' = EXCLUDED.record->>'format_version'
   AND state_records.record->>'table' = EXCLUDED.record->>'table'
-  AND (state_records.record->>'start_lsn')::numeric
-      < (EXCLUDED.record->>'start_lsn')::numeric
+  AND ((state_records.record->>'start_lsn')::numeric
+         < (EXCLUDED.record->>'start_lsn')::numeric
+       OR (EXCLUDED.record ? 'snapshot_scope'
+           AND state_records.record->>'snapshot_scope'
+               IS DISTINCT FROM EXCLUDED.record->>'snapshot_scope'))
 RETURNING record
 """
 
