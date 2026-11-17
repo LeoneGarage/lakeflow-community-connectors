@@ -4,9 +4,11 @@ Informix is a database CDC connector, not an HTTP source, so it has no
 in-process HTTP simulator and does not subclass ``LakeflowConnectTests``.
 Its coverage lives in ``unittest.TestCase`` suites next to the connector:
 
-    - ``sources/informix/lakeflow_test.py``      (Lakeflow contract, snapshots)
-    - ``sources/informix/protocol_test.py``      (SQLI wire protocol, CDC)
-    - ``sources/informix/lakebase_state.py``     (Lakebase connection-slot state)
+    - ``sources/informix/lakeflow_test.py``        (Lakeflow contract, snapshots)
+    - ``sources/informix/protocol_test.py``        (SQLI wire protocol, CDC)
+    - ``sources/informix/lakebase_state_test.py``  (Lakebase connection-slot state)
+    - ``sources/informix/ansi_live_test.py``       (opt-in live regressions; they skip
+      without a live configuration, and its offline checks run)
 
 CI only collects ``tests/unit/sources/<source>/``, so this module discovers
 every ``unittest.TestCase`` in those source-local modules and re-exports it
@@ -32,6 +34,7 @@ with contextlib.suppress(ImportError):
     import pyspark.sql.types  # noqa: F401
 
 from databricks.labs.community_connector.sources.informix import (  # noqa: E402
+    ansi_live_test,
     lakebase_state_test,
     lakeflow_test,
     protocol_test,
@@ -41,6 +44,7 @@ _SOURCE_LOCAL_TEST_MODULES = (
     lakeflow_test,
     protocol_test,
     lakebase_state_test,
+    ansi_live_test,
 )
 
 for _module in _SOURCE_LOCAL_TEST_MODULES:
