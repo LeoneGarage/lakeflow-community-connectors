@@ -4704,14 +4704,16 @@ class LakeflowContractTests(unittest.TestCase):
     def test_what_an_update_was_started_for_comes_from_the_pipelines_api(self):
         # Spark gives an update no setting that says it is a full refresh (probed on
         # serverless: only spark.pipelines.updateId differs). The pipelines API does, and an
-        # automatic retry of a failed full refresh still carries the flag, with its cause.
+        # automatic retry of a failed full refresh still carries the flag, with its cause. A
+        # selective refresh is told apart: the tables it does not name keep their
+        # checkpoints, so a delete reader takes an update's start only in a whole one.
         for update, expected in (
             ({"full_refresh": True, "cause": "API_CALL"}, "full_refresh"),
             ({"full_refresh": True, "cause": "USER_ACTION"}, "full_refresh"),
             ({"full_refresh": True, "cause": "RETRY_ON_FAILURE"}, "continue"),
             (
                 {"full_refresh": False, "full_refresh_selection": ["t"], "cause": "API_CALL"},
-                "full_refresh",
+                "selective_refresh",
             ),
             (
                 {
@@ -19896,17 +19898,99 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertNotIn("floor_seed", confirmed)
         self.assertEqual(confirmed["commit_lsn"], end["commit_lsn"])
 
-    def test_a_delete_reader_waits_for_the_snapshot_of_a_full_refresh(self):
-        # The floor is the last snapshot's, and this update takes another: wait for it. An
-        # update the pipelines API can't say the purpose of starts at the floor.
+    def test_a_delete_reader_takes_a_whole_full_refreshs_start_itself(self):
+        # A full refresh has no snapshot floor to start at, so the delete reader waited for
+        # its upsert reader, and ended with nothing after five empty batches when that flow
+        # was queued, or was taking a blocking snapshot: the deletes committed while the
+        # refresh ran waited for the next update. In a refresh of the whole pipeline it takes
+        # the update's start itself, and the upsert reader's snapshot starts there. A refresh
+        # of some tables leaves the others' checkpoints, and a table read from an extract
+        # starts at the operator's boundary: those wait. An update the pipelines API can't
+        # describe starts at the floor.
         bridge = FakeBridge()
         reader = self._floor_updates(bridge)
         reader(2, "full_refresh").read_table("app.orders", {}, {})
-
-        _, waiting = reader(3, "full_refresh").read_table_deletes("app.orders", {}, {})
+        bridge.now = 120
+        deletes = reader(3, "full_refresh")
+        extract = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, extract, True)
+        _, waiting = reader(3, "full_refresh").read_table_deletes(
+            "app.orders", {}, {"snapshot.source": extract}
+        )
         self.assertNotIn("commit_lsn", waiting)
-        _, seeded = reader(4, None).read_table_deletes("app.orders", {}, {})
-        self.assertEqual(seeded["commit_lsn"], "90")
+
+        with self.assertLogs(informix_module.__name__, level="INFO") as logs:
+            _, seeded = deletes.read_table_deletes("app.orders", {}, {})
+
+        scope = f"{uuid.UUID(int=21)}_@_{uuid.UUID(int=3)}"
+        self.assertEqual((seeded["commit_lsn"], seeded["floor_seed"]), ("120", scope))
+        self.assertIn("took itself", "\n".join(logs.output))
+        bridge.now = 130
+        upsert = reader(3, "full_refresh")
+        upsert.read_table("app.orders", {}, {})
+        self.assertEqual(upsert._initial_lsn(Table.parse(_table(), "demo")), 120)
+        # The snapshot published its floor, then its start: the mark goes.
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 131},
+            {"op": "DELETE", "tx_id": 7, "lsn": 132, "row": {"id": 1, "value": "a"}},
+            {"op": "COMMIT", "tx_id": 7, "lsn": 133},
+        ]
+        rows, end = deletes.read_table_deletes("app.orders", seeded, {})
+        self.assertEqual([row["id"] for row in rows], [1])
+        self.assertNotIn("floor_seed", end)
+        _, waiting = reader(5, "selective_refresh").read_table_deletes("app.orders", {}, {})
+        self.assertNotIn("commit_lsn", waiting)
+        _, floor = reader(6, None).read_table_deletes("app.orders", {}, {})
+        self.assertEqual(floor["commit_lsn"], "130")
+
+    def test_a_replayed_first_batch_on_a_full_refreshs_own_start_lands_on_its_end(self):
+        # Spark replays the batch that took the update's start, in the same update after a
+        # driver restart or in the next one: it lands at or past the end it logged.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        reader(2, "full_refresh").read_table("app.orders", {}, {})
+        bridge.now = 120
+        _, seeded = reader(3, "full_refresh").read_table_deletes("app.orders", {}, {})
+        self.assertEqual(seeded["commit_lsn"], "120")
+        reader(3, "full_refresh").read_table("app.orders", {}, {})
+        for update, request in ((3, "full_refresh"), (4, "continue")):
+            with self.subTest(update=update):
+                replaying = reader(update, request)
+                options: dict[str, str] = {}
+
+                rows = informix_module._replay_between_offsets(
+                    {},
+                    seeded,
+                    lambda offset, replaying=replaying, options=options: (
+                        replaying.read_table_deletes("app.orders", offset, options)
+                    ),
+                    options,
+                    replaying.options,
+                )
+
+                self.assertEqual(list(rows), [])
+
+    def test_a_delete_reader_on_its_own_start_starts_again_where_its_upsert_reader_went_on(self):
+        # A table the refresh left (pipelines.reset.allowed=false) keeps its upsert
+        # checkpoint, which goes on from below the update's start: a delete reader that took
+        # that start skipped the deletes between. The upsert reader publishes its start with
+        # no floor of this update, and the delete reader starts again as one with no
+        # checkpoint, at the lower of the floor and that start.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        _, first = reader(2, "full_refresh").read_table("app.orders", {}, {})
+        bridge.now = 120
+        deletes = reader(3, "full_refresh")
+        _, seeded = deletes.read_table_deletes("app.orders", {}, {})
+        self.assertEqual(seeded["commit_lsn"], "120")
+        reader(3, "full_refresh").read_table("app.orders", dict(first), {})
+
+        with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
+            _, again = deletes.read_table_deletes("app.orders", seeded, {})
+
+        self.assertIn("went on from a checkpoint", "\n".join(logs.output))
+        self.assertEqual(again["commit_lsn"], "90")
+        self.assertNotIn("floor_seed", again)
 
     def test_a_delete_reader_seeded_at_a_replaced_floor_starts_again_at_the_new_one(self):
         # A full refresh emptied the target and ended before this table's flows ran. The

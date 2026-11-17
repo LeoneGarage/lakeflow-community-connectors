@@ -409,6 +409,11 @@ _DEFAULT_SNAPSHOT_MODE = "incremental"
 # The modes whose snapshot a snapshot.source extract serves: the extract is the table's
 # initial snapshot, and no other mode takes one from it.
 _UNL_SNAPSHOT_MODES = frozenset({"initial", "initial_only"})
+# What _update_request names a full refresh, of the whole pipeline or of some tables.
+_FULL_REFRESH_REQUESTS = frozenset({"full_refresh", "selective_refresh"})
+# The modes whose upsert reader starts a full refresh at the update's initialization
+# (_initial_lsn), which a delete reader may then take itself (_full_refresh_delete_seed).
+_OWN_START_SNAPSHOT_MODES = frozenset({"incremental", "auto_snapshot", "initial", "cdc_only"})
 _UNSUPPORTED_SNAPSHOT_MODES = frozenset({"configuration_based", "custom"})
 # Opt-in append-only ingestion, for a table Informix can capture but this connector
 # cannot merge -- in practice one without a primary key.
@@ -1176,18 +1181,24 @@ _SCAN_RESUME_SECONDS = 24 * 3600
 
 
 def _update_request(pipeline_id: str, update_id: str) -> str | None:
-    # Docstring: What this update was started for: ``"full_refresh"`` when a full refresh
-    # was asked for, ``"continue"`` otherwise, None when the pipelines API cannot say.
+    # Docstring: What this update was started for: ``"full_refresh"`` when a full refresh of
+    # the whole pipeline was asked for, ``"selective_refresh"`` for one of some tables,
+    # ``"continue"`` otherwise, None when the pipelines API cannot say.
     #
     # An automatic retry of a failed full refresh is itself marked a full refresh, with
     # the cause RETRY_ON_FAILURE: it carries on with what the failed update began, and so
-    # counts as "continue".
+    # counts as "continue". A selective refresh is told apart because its tables left out
+    # keep their checkpoints, which a whole one resets: a delete reader takes this update's
+    # start itself only in a whole one (_full_refresh_delete_seed).
 
     update = pipeline_update(pipeline_id, update_id)
     if update is None:
         return None
-    asked = bool(update.get("full_refresh") or update.get("full_refresh_selection"))
-    return "full_refresh" if asked and update.get("cause") != "RETRY_ON_FAILURE" else "continue"
+    if update.get("cause") == "RETRY_ON_FAILURE":
+        return "continue"
+    if update.get("full_refresh"):
+        return "full_refresh"
+    return "selective_refresh" if update.get("full_refresh_selection") else "continue"
 
 
 class _StateValidationCoordinator:
@@ -11744,6 +11755,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             and not self._upsert_channel_start_exists(table_name, table_options)
             # With a snapshot floor to start at, it need not wait (_delete_floor_seed).
             and not self._delete_floor_recorded(table_name, table_options)
+            # Nor in a whole full refresh, whose start it can take (_full_refresh_delete_seed).
+            and not self._full_refresh_delete_start(table_options, snapshot_mode)
         ):
             return iter(()), self._schema_node_fallback_offset(start_offset)
         replaying = self._replay_stop_lsn(table_options) is not None
@@ -12898,7 +12911,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # checkpoint may start at, told without opening Informix (see
         # _upsert_channel_start_exists).
 
-        if self._update_request == "full_refresh":
+        if self._update_request in _FULL_REFRESH_REQUESTS:
             return False
         identity = self._native_table_state_identity(
             table_options.get("qualified_source_table", table_name)
@@ -12939,7 +12952,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # told later, by its update (_confirmed_floor_seed), and the deletes read before
         # that are older than the rows the new snapshot lands, which they leave alone.
 
-        if self._update_request == "full_refresh":
+        if self._update_request in _FULL_REFRESH_REQUESTS:
             return None
         record = self._read_immutable_head(
             self._immutable_namespace(
@@ -12978,6 +12991,55 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             ),
             "update_fingerprint": fingerprint,
             "floor_seed": record["snapshot_scope"],
+        }
+
+    def _full_refresh_delete_start(self, table_options: dict[str, str], snapshot_mode: str) -> bool:
+        # Docstring: Whether a delete reader with no checkpoint takes this update's start
+        # itself when its upsert reader has published none (_full_refresh_delete_seed).
+        #
+        # In a full refresh of the whole pipeline, where every table's flows start over, and
+        # where the upsert reader starts at the update's initialization: not from a
+        # snapshot.source extract (its boundary is the operator's), nor under another mode.
+
+        return (
+            self._update_request == "full_refresh"
+            and snapshot_mode in _OWN_START_SNAPSHOT_MODES
+            and _PIPELINE_SCOPE.fullmatch(self._pipeline_scope()) is not None
+            and self._table_snapshot_source(table_options) is None
+        )
+
+    def _full_refresh_delete_seed(
+        self, table: Table, table_options: dict[str, str], snapshot_mode: str
+    ) -> dict | None:
+        # Docstring: The offset a delete reader with no checkpoint starts at in a whole full
+        # refresh before its upsert reader has published a start: this update's
+        # initialization, which it takes itself if nobody has.
+        #
+        # A full refresh has no snapshot floor to start at, so the reader waited for its
+        # upsert reader, and gave up after _SCHEMA_NODE_FALLBACK_RETRIES empty batches when
+        # that flow was queued behind others, or taking a blocking snapshot: the update ended
+        # it with nothing, and the deletes committed while the refresh ran, for hours
+        # perhaps, waited for the next update, replayed from the floor only while the log
+        # still held it. Either reader takes the initialization, elected once, and the
+        # upsert reader's snapshot starts there or later, so the deletes from it on are
+        # those the emptied target needs: earlier ones remove rows the snapshot does not
+        # hold. The mark names this update (floor_seed), whose snapshot publishes the floor
+        # and then the start; a start published with no floor of this update is an upsert
+        # reader's that went on from a checkpoint the refresh left (_confirmed_floor_seed).
+
+        if not self._full_refresh_delete_start(table_options, snapshot_mode):
+            return None
+        scope = self._pipeline_scope()
+        table = self._refresh_table_schema(table, None)
+        start = self._initial_lsn(table, scope=scope)
+        schema_id = self._snapshot_schema_ids[(scope, table.identity)]
+        # 476: Informix delete channel for '{}' starts at this full refresh's start {}, which it
+        # took itself: its upsert reader had not published one yet
+        logging.getLogger(__name__).info(_m(476, table.exposed_name, start))
+        return {
+            **_offset(start, start, start, None, "stream", table, schema_id, scope),
+            "update_fingerprint": _schema_fingerprint(table),
+            "floor_seed": scope,
         }
 
     def _confirmed_floor_seed(
@@ -13032,6 +13094,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 )
             ):
                 return unmarked, None
+            if seeded == self._pipeline_scope():
+                # Seeded at this update's own start (_full_refresh_delete_seed), whose snapshot
+                # has yet to publish its floor: read on while no start is published either.
+                if self._read_upsert_channel_start(table, seeded) is None:
+                    return start_offset, seeded
+                # 477: Informix delete channel for '{}' started at full refresh {}'s own start,
+                # and its upsert reader went on from a checkpoint instead (the refresh left
+                # the table); it starts again at the upsert reader's position
+                logging.getLogger(__name__).warning(_m(477, table.exposed_name, seeded))
+                return {}, None
             # 291: Informix delete channel for '{}' started at a snapshot floor that update {}
             # has since replaced; it starts again at the new one
             logging.getLogger(__name__).warning(_m(291, table.exposed_name, current))
@@ -13101,7 +13173,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 # schema node can start ahead of a resumed upsert checkpoint and
                 # permanently skip old-key deletes after a cancelled refresh. The
                 # pipeline's snapshot floor is never ahead of it: with one, start there.
-                seed = self._delete_floor_seed(table)
+                seed = self._delete_floor_seed(table) or self._full_refresh_delete_seed(
+                    table, table_options, snapshot_mode
+                )
                 if seed is not None:
                     return iter(()), seed
                 return iter(()), self._schema_node_fallback_offset(bootstrap_offset)

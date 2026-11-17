@@ -109,14 +109,29 @@ or ends below the new floor). A position another pipeline seeded, which a
 confirmed it, and this pipeline's says nothing of it. A replayed first batch of a table,
 or of auto_snapshot's resnapshot of an expired checkpoint, which may establish a newer
 boundary than the batch had, leaves the floor as that batch published it, since Spark
-goes on from where the batch ended. In a full
-refresh (a refresh of selected tables counts as one for every table, see below), on the
-first run, or where the floor's column layout is not the table's current one, the delete
-reader waits as
-described above; if a triggered update ends before the upsert reader has published, the
-next update starts the delete reader at the floor, so its deletes arrive one update late
-and none are lost. In a triggered update, whichever of a table's two readers comes first
-sets the position the update reads up to, so neither waits for the other.
+goes on from where the batch ended.
+
+In a full refresh of the whole pipeline (the first run included) there is no floor to
+start at, so a bootstrapping delete reader takes the update's start itself: the same
+elected initialization its upsert reader then snapshots from, which it records first if
+the upsert reader has not (enabling full-row logging and recording the table's layout,
+as the upsert reader would). The deletes from that start on are those the emptied target
+needs, and they are applied while the refresh runs, however long it takes; any earlier
+than the snapshot remove rows it does not hold. Its mark names this update until the
+snapshot publishes its floor. If the upsert reader instead goes on from a checkpoint the
+refresh left it (a table set not to reset), it publishes its start with no floor of this
+update, and the delete reader starts again at the lower of the floor and that start, with
+a warning in the event log. A table read from a `snapshot.source` extract, whose start is
+the extract's boundary, and the `recovery`, `initial_only` and `table.migration` paths do
+not take it.
+
+In a refresh of selected tables (which counts as a full refresh for every table, see
+below), or where the floor's column layout is not the table's current one, the delete
+reader waits as described above; if a triggered update ends before the upsert reader has
+published, the next update starts the delete reader at the floor, so its deletes arrive
+one update late and none are lost. In a triggered update, whichever of a table's two
+readers comes first sets the position the update reads up to, so neither waits for the
+other.
 
 ## Setup
 
