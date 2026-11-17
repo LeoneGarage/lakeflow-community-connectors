@@ -1066,6 +1066,35 @@ class LakeflowContractTests(unittest.TestCase):
         with self.assertRaisesRegex(InformixError, "no registration or checkpoint scope"):
             fresh.read_table("app.orders", {}, {})
 
+    def test_a_failed_state_operation_rolls_its_transaction_back(self):
+        # An error raised after a statement ran (a result that fails to parse, say) left
+        # the transaction open, holding its locks, and the next operation's commit
+        # committed it; a failure on a live connection left it aborted. The thread that ran
+        # the operation rolls it back; a connection lost is reconnected as before.
+        class Connection:
+            closed = False
+
+            def __init__(self):
+                self.rollbacks = 0
+
+            def rollback(self):
+                self.rollbacks += 1
+
+        connector = self.connector(FakeBridge())
+        with mock.patch.object(
+            informix_module, "connection_lost_error_types", return_value=(ConnectionError,)
+        ):
+            for error in (ValueError("unexpected row"), ConnectionError("serialization")):
+                with self.subTest(error=type(error).__name__):
+                    connection = connector._lakebase_conn = Connection()
+
+                    def thunk(error=error):
+                        raise error
+
+                    with self.assertRaises(type(error)):
+                        connector._state_op_with_reconnect(thunk, operation="test")
+                    self.assertEqual(connection.rollbacks, 1)
+
     def test_close_releases_bridge_connection_and_capacity_slot(self):
         bridge = FakeBridge()
         connector = self.connector(bridge)
@@ -1767,12 +1796,17 @@ class LakeflowContractTests(unittest.TestCase):
             "databricks.labs.community_connector.sources.informix."
             "_generated_informix_python_source"
         )
-        registry = mock.Mock()
-        spark = types.SimpleNamespace(dataSource=registry)
-        generated.register_lakeflow_source(spark)
-        source_class = registry.register.call_args.args[0]
+        # Registered again in the same process too, as a driver kept between updates does:
+        # the second registration's pickle carried the first one's reader wrapper, its
+        # hooks and what they close over, ~13 KB more, and passed the limit.
+        sizes = []
+        for _ in range(2):
+            registry = mock.Mock()
+            generated.register_lakeflow_source(types.SimpleNamespace(dataSource=registry))
+            sizes.append(len(cloudpickle.dumps(registry.register.call_args.args[0])))
 
-        self.assertLess(len(cloudpickle.dumps(source_class)), 1 << 20)
+        self.assertLess(max(sizes), 1 << 20)
+        self.assertLess(abs(sizes[1] - sizes[0]), 1024)
 
     def test_generated_source_drops_the_merge_prefix_and_annotations(self):
         # The merge nests the connector inside register_lakeflow_source, and the end of
@@ -3828,6 +3862,25 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(landed(Decimal("12.2"), True), [])
         self.assertEqual(landed(Decimal("12.2"), False), ["u"])
         self.assertEqual(landed(Decimal("13.2"), True), ["d"])
+        # The key columns alone are coerced: a delete lands no other column, and a value of
+        # one past its target's range failed the delete.
+        table = dataclasses.replace(
+            table,
+            columns=table.columns
+            + (Column(name="amount", type_name="DECIMAL", precision=32, scale=0xFF),),
+        )
+        options["decimal.variable.column.type"] = "id:integer,amount:integer"
+        record = {
+            "op": "UPDATE",
+            "lsn": 141,
+            "before": {"id": Decimal("12.1"), "value": "a", "amount": Decimal("1E+30")},
+            "after": {"id": Decimal("13.2"), "value": "b", "amount": Decimal("1")},
+            "table": "demo:app.orders",
+            "tx_id": 7,
+        }
+        transaction = informix_module.CommittedTransaction(7, 100, 150, 100, (record,))
+        rows = informix_module._project_transaction(transaction, table, True, options=options)
+        self.assertEqual([row[informix_module.OP] for row in rows], ["d"])
 
     def test_half_of_an_index_update_lands_as_the_delete_or_insert_it_is(self):
         # What the stream passes on for a keyless table when the scan holds one half of
@@ -13046,6 +13099,42 @@ class LakeflowContractTests(unittest.TestCase):
         # A range of the stream after it is no first batch.
         later = dict(end, commit_lsn="160", begin_lsn="160", change_lsn="160")
         self.assertIsNone(restarted._bootstrap_page_batch(table, end, later, dict(options)))
+
+    def test_a_partitioned_resnapshots_first_batch_leaves_page_0_to_the_stage(self):
+        # auto_snapshot replaced an expired checkpoint with a one-page blocking snapshot.
+        # latest_offset read page 0 on the driver and kept its rows for get_partitions,
+        # which served the page from the stage instead: read twice, and the driver's copy
+        # held until the next batch. Page 0 waits for get_partitions, as an initial
+        # snapshot's does.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": 1, "value": "a"}]
+        bridge.minimum = 91
+        bridge.now = 150
+        checkpoint = _stream_offset(90)
+        checkpoint["pipeline_scope"] = "f" * 32
+        options = {"snapshot.mode": "auto_snapshot", "snapshot.scan": "cursor"}
+        connector = self._partitioned_connector(bridge, registration_scope="u1")
+
+        end = connector.latest_offset("app.orders", dict(options), checkpoint)
+
+        self.assertEqual(end["phase"], "stream")
+        self.assertEqual(connector._partition_embedded_rows, {})
+        partitions = connector.get_partitions("app.orders", dict(options), checkpoint, end)
+        served = [
+            row["id"]
+            for partition in partitions
+            for row in connector.read_partition("app.orders", partition, dict(options))
+        ]
+        self.assertEqual(served, [1])
+
+    def test_a_resnapshot_range_is_told_from_where_its_start_restarts(self):
+        # A checkpoint inside a transaction that began before the log kept restarts at that
+        # begin, while its commit can be at or past the new snapshot's boundary.
+        end = dict(_stream_offset(150), begin_lsn="150", change_lsn="150", tx_id=None)
+        open_at = dict(_stream_offset(160), begin_lsn="80")
+        self.assertTrue(informix_module._resnapshot_range(open_at, end))
+        self.assertTrue(informix_module._resnapshot_range(_stream_offset(90), end))
+        self.assertFalse(informix_module._resnapshot_range(_stream_offset(160), end))
 
     def test_a_copy_finished_in_its_first_batch_replays_to_its_bound(self):
         # The copy fitted one chunk, so its first batch finished it and neither offset

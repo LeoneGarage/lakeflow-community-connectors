@@ -11,8 +11,6 @@ from databricks.labs.community_connector.sources.informix.informix import (
     _m,
     _replay_reader_range,
 )
-
-
 from databricks.labs.community_connector.sparkpds import LakeflowSource
 from databricks.labs.community_connector.sparkpds.lakeflow_datasource import (
     TABLE_NAME,

@@ -2035,8 +2035,10 @@ def register_lakeflow_source(spark):
         def sweep_claim(self, sweeps_earlier_updates: Any) -> None:
             # Docstring: Install how this provider asks whether its process is the one to
             # revoke earlier updates' tokens: each reader that takes the provider up gives
-            # its own, so the provider asks through one in use.
-            self._sweeps_earlier_updates = sweeps_earlier_updates
+            # its own, so the provider asks through one in use. Under the lock a mint holds,
+            # so a mint asks through one or the other, never a half-installed one.
+            with self._lock:
+                self._sweeps_earlier_updates = sweeps_earlier_updates
 
         def bearer(self) -> str:
             with self._lock:
@@ -2098,9 +2100,10 @@ def register_lakeflow_source(spark):
             # this process is the one to, earlier updates' tokens; best-effort inside the
             # helper. A refresh has only its own predecessor to revoke.
             earlier = not predecessor_id
-            if earlier and self._sweeps_earlier_updates is not None:
+            claim = self._sweeps_earlier_updates
+            if earlier and claim is not None:
                 try:
-                    earlier = bool(self._sweeps_earlier_updates())
+                    earlier = bool(claim())
                 except Exception:  # pylint: disable=broad-except
                     # Not knowing, sweep: a token left behind lives until it expires.
                     _LOGGER.debug("Could not claim the staging token sweep", exc_info=True)
@@ -7480,9 +7483,14 @@ def register_lakeflow_source(spark):
         # Docstring: Whether ``start`` is a stream position below ``end``'s LSN, as auto_snapshot's
         # resnapshot of an expired checkpoint starts: where ``end`` is a staged snapshot's, that
         # batch is the only one to reach a snapshot's boundary from below it.
+        #
+        # Measured from where the stream restarts, as _checkpoint_requires_snapshot measures:
+        # the begin of a transaction open at the checkpoint, whose commit can lie at or past
+        # the new boundary.
 
         try:
-            return start.get("phase") == "stream" and int(start["commit_lsn"]) < int(end["commit_lsn"])
+            restart = int(start.get("begin_lsn") or start["commit_lsn"])
+            return start.get("phase") == "stream" and restart < int(end["commit_lsn"])
         except (AttributeError, KeyError, TypeError, ValueError):
             return False
 
@@ -7960,6 +7968,13 @@ def register_lakeflow_source(spark):
     except NameError:
         _generated_trigger_base = None
     else:
+        # A second registration in one process (a driver kept between updates) finds the
+        # wrapper the first one installed: take the base it wraps. Kept, the first one's
+        # wrapper went into the pickle with its hooks and what they close over, and passed
+        # the planner's limit (~13 KB).
+        _generated_trigger_base = getattr(
+            _generated_trigger_base, "_informix_original_base", _generated_trigger_base
+        )
         # Avoid assigning this name in register_lakeflow_source(): doing so would
         # make the imported PySpark base an uninitialized local throughout that
         # function. Replace the generated module global instead.
@@ -8593,8 +8608,8 @@ def register_lakeflow_source(spark):
                         state = fresh
                         state.provision()
                         _LAKEBASE_WAITER_STATE[key] = state
-                    connection = _LAKEBASE_WAITER_CONNECTION.get(key)
-                    if connection is None or getattr(connection, "closed", False):
+                    connection = _open_state_connection(_LAKEBASE_WAITER_CONNECTION.get(key))
+                    if connection is None:
                         connection = state.connect()
                         _LAKEBASE_WAITER_CONNECTION[key] = connection
                     hints = read_backlog_hints(
@@ -17190,7 +17205,10 @@ def register_lakeflow_source(spark):
             end = self._served_offset(table_name, table_options, start_offset, effective_start)
             if end is not None:
                 return end
-            self._defer_staged_rows = not effective_start
+            # A first batch: from no position, or auto_snapshot's resnapshot of an expired
+            # checkpoint, which starts from it. Read on the driver, that one's page 0 was cached
+            # here and then served from the stage as well (_bootstrap_page_batch).
+            self._defer_staged_rows = not effective_start or effective_start.get("phase") == "stream"
             try:
                 rows, next_offset = self._embedded_read(table_name, start_offset, table_options)
             finally:
@@ -24539,13 +24557,24 @@ def register_lakeflow_source(spark):
             while True:
                 try:
                     return thunk()
-                except connection_lost as error:
+                except Exception as error:
                     connection = getattr(self, "_lakebase_conn", None)
                     try:
                         still_alive = connection is not None and not connection.closed
                     except Exception:  # pragma: no cover - a broken handle counts as dead
                         still_alive = False
-                    if still_alive or attempt >= _LAKEBASE_RECONNECT_MAX_RETRIES:
+                    if (
+                        still_alive
+                        or not isinstance(error, connection_lost)
+                        or attempt >= _LAKEBASE_RECONNECT_MAX_RETRIES
+                    ):
+                        if still_alive:
+                            # The failed operation's transaction, aborted, or left open by an
+                            # error raised after a statement ran: rolled back here, on the thread
+                            # that ran it, it neither holds its locks nor commits with the next
+                            # operation on the connection.
+                            with contextlib.suppress(Exception):
+                                connection.rollback()
                         raise
                     delay = min(
                         _LAKEBASE_RECONNECT_BASE_SECONDS * (2**attempt),
@@ -27527,7 +27556,7 @@ def register_lakeflow_source(spark):
         # remove the row.
 
         predicate = _row_filter_predicate(table, encoding)
-        coerced = options is not None and any(
+        coerced = any(
             _is_variable_scale_decimal(column)
             for column in table.columns
             if column.name in table.primary_keys
@@ -27535,7 +27564,11 @@ def register_lakeflow_source(spark):
 
         def landed_key(row):
             if coerced and row is not None:
-                row = _coerce_variable_decimal_values(row, table, options)
+                # The key columns alone: another column's value, which a delete never lands,
+                # could fail its coercion.
+                row = _coerce_variable_decimal_values(
+                    {name: row.get(name) for name in table.primary_keys}, table, options or {}
+                )
             return _key(row, table)
 
         output = []

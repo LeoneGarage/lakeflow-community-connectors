@@ -753,8 +753,10 @@ class StagingCredentialProvider:
     def sweep_claim(self, sweeps_earlier_updates: Any) -> None:
         # Docstring: Install how this provider asks whether its process is the one to
         # revoke earlier updates' tokens: each reader that takes the provider up gives
-        # its own, so the provider asks through one in use.
-        self._sweeps_earlier_updates = sweeps_earlier_updates
+        # its own, so the provider asks through one in use. Under the lock a mint holds,
+        # so a mint asks through one or the other, never a half-installed one.
+        with self._lock:
+            self._sweeps_earlier_updates = sweeps_earlier_updates
 
     def bearer(self) -> str:
         with self._lock:
@@ -816,9 +818,10 @@ class StagingCredentialProvider:
         # this process is the one to, earlier updates' tokens; best-effort inside the
         # helper. A refresh has only its own predecessor to revoke.
         earlier = not predecessor_id
-        if earlier and self._sweeps_earlier_updates is not None:
+        claim = self._sweeps_earlier_updates
+        if earlier and claim is not None:
             try:
-                earlier = bool(self._sweeps_earlier_updates())
+                earlier = bool(claim())
             except Exception:  # pylint: disable=broad-except
                 # Not knowing, sweep: a token left behind lives until it expires.
                 _LOGGER.debug("Could not claim the staging token sweep", exc_info=True)

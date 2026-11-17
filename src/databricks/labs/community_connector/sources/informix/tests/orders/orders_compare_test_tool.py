@@ -83,8 +83,9 @@ def main() -> int:
         print(
             f"{table} duplicate groups / most copies / rows in them:",
             query(
-                f"SELECT count(*), max(c), sum(c) FROM (SELECT count(*) c FROM {table} "
-                "GROUP BY order_id, sku, qty, price, note, updated_at HAVING count(*) > 1)"
+                # Every column, as the silver views take them (orders_silver.sql).
+                f"SELECT count(*), max(c), sum(c) FROM (SELECT *, count(*) c FROM {table} "
+                "GROUP BY ALL HAVING count(*) > 1)"
             ),
         )
     print(
@@ -97,12 +98,13 @@ def main() -> int:
         "counts per distinct row, groups / copies / fewest copies / unknown changes:",
         query(
             "SELECT count(*), sum(copies), min(copies), sum(other_changes) FROM (SELECT "
+            "* EXCEPT (_informix_op, _informix_change_lsn, _informix_commit_lsn, "
+            "_informix_tx_id, _informix_commit_time), "
             "sum(CASE WHEN _informix_op IN ('r', 'c', 'u') THEN 1 "
             "WHEN _informix_op = 'd' THEN -1 ELSE 0 END) AS copies, "
             "sum(CASE WHEN _informix_op IN ('r', 'c', 'u', 'd') THEN 0 ELSE 1 END) "
             f"AS other_changes FROM {args.bronze}.order_items "
-            "GROUP BY order_id, sku, qty, price, note, updated_at "
-            "HAVING copies <> 0 OR other_changes <> 0)"
+            "GROUP BY ALL HAVING copies <> 0 OR other_changes <> 0)"
         ),
     )
     print(
